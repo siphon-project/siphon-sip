@@ -864,7 +864,10 @@ mod tests {
         };
         let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
         let kinds = kinds(&steps);
-        let tee = kinds.iter().position(|k| *k == "detach").expect("tee detach");
+        let tee = kinds
+            .iter()
+            .position(|k| *k == "detach")
+            .expect("tee detach");
         let bridge = kinds
             .iter()
             .position(|k| *k == "detach_bridge")
@@ -880,8 +883,14 @@ mod tests {
             media_call_id: "cid".to_string(),
             from_tag: "tag".to_string(),
         };
-        assert_eq!(classify_media_failure(&step, false, true, "no tee here"), None);
-        assert_eq!(classify_media_failure(&step, true, false, "unknown call"), None);
+        assert_eq!(
+            classify_media_failure(&step, false, true, "no tee here"),
+            None
+        );
+        assert_eq!(
+            classify_media_failure(&step, true, false, "unknown call"),
+            None
+        );
     }
 
     #[test]
@@ -890,8 +899,14 @@ mod tests {
             media_call_id: "cid".to_string(),
             from_tag: "tag".to_string(),
         };
-        assert_eq!(classify_media_failure(&step, true, false, "unknown call"), None);
-        assert_eq!(classify_media_failure(&step, false, true, "no player"), None);
+        assert_eq!(
+            classify_media_failure(&step, true, false, "unknown call"),
+            None
+        );
+        assert_eq!(
+            classify_media_failure(&step, false, true, "no player"),
+            None
+        );
     }
 
     #[test]
@@ -907,13 +922,24 @@ mod tests {
             "stop_media error: call has no active media playback",
             "no playback 7 is running on this call",
         ] {
-            assert_eq!(classify_media_failure(&step, false, false, detail), None, "{detail}");
+            assert_eq!(
+                classify_media_failure(&step, false, false, detail),
+                None,
+                "{detail}"
+            );
             assert!(is_nothing_playing(detail));
         }
         // A real failure on the same step still stops the bridge.
-        assert!(!is_nothing_playing("media actor closed before the stop was applied"));
+        assert!(!is_nothing_playing(
+            "media actor closed before the stop was applied"
+        ));
         assert_eq!(
-            classify_media_failure(&step, false, false, "media actor closed before the stop was applied"),
+            classify_media_failure(
+                &step,
+                false,
+                false,
+                "media actor closed before the stop was applied"
+            ),
             Some(BridgeError::Unavailable(
                 "media actor closed before the stop was applied".to_string()
             ))
@@ -930,7 +956,9 @@ mod tests {
         };
         assert_eq!(
             classify_media_failure(&step, false, true, "backend cannot reoffer"),
-            Some(BridgeError::Unsupported("backend cannot reoffer".to_string()))
+            Some(BridgeError::Unsupported(
+                "backend cannot reoffer".to_string()
+            ))
         );
         // A vanished anchor session is not "nothing to do" — the bridge has no
         // media to renegotiate, so it is refused rather than formed blind.
@@ -957,7 +985,10 @@ mod tests {
             media_call_id: "cid".to_string(),
             from_tag: "tag".to_string(),
         };
-        assert_eq!(classify_media_failure(&step, true, false, "unknown call"), None);
+        assert_eq!(
+            classify_media_failure(&step, true, false, "unknown call"),
+            None
+        );
         assert_eq!(
             classify_media_failure(&step, false, false, "engine timeout"),
             Some(BridgeError::Unavailable("engine timeout".to_string()))
@@ -1064,7 +1095,10 @@ mod tests {
         );
         // No m= line: nothing to set a direction on.
         assert_eq!(
-            set_media_direction(b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n", MediaDirection::SendRecv),
+            set_media_direction(
+                b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n",
+                MediaDirection::SendRecv
+            ),
             b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n".to_vec()
         );
     }
@@ -1106,7 +1140,11 @@ mod tests {
         let mut unique = rendered.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), rendered.len(), "messages collide: {rendered:?}");
+        assert_eq!(
+            unique.len(),
+            rendered.len(),
+            "messages collide: {rendered:?}"
+        );
         assert!(rendered.iter().all(|message| !message.is_empty()));
     }
 
@@ -1132,7 +1170,10 @@ mod tests {
             "invalid_state"
         );
         assert_eq!(
-            BridgeError::AlreadyBridged { id: "ch".to_string() }.code(),
+            BridgeError::AlreadyBridged {
+                id: "ch".to_string()
+            }
+            .code(),
             "invalid_state"
         );
         assert_eq!(
@@ -1151,7 +1192,10 @@ mod tests {
             PeerHangupPolicy::parse("hangup"),
             Some(PeerHangupPolicy::Hangup)
         );
-        assert_eq!(PeerHangupPolicy::parse("hold"), Some(PeerHangupPolicy::Hold));
+        assert_eq!(
+            PeerHangupPolicy::parse("hold"),
+            Some(PeerHangupPolicy::Hold)
+        );
         assert_eq!(PeerHangupPolicy::parse("continue"), None);
         assert_eq!(PeerHangupPolicy::parse(""), None);
         assert_eq!(PeerHangupPolicy::default(), PeerHangupPolicy::Hangup);

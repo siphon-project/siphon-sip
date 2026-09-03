@@ -74,9 +74,10 @@ impl MediaLine {
     /// at the position of the first removed line (or appends if none existed).
     pub fn set_attrs_by_name(&mut self, name: &str, values: &[&str]) {
         // Find position of first match (for insertion point)
-        let first_pos = self.other_attrs
-            .iter()
-            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)));
+        let first_pos = self.other_attrs.iter().position(|line| {
+            line.strip_prefix("a=")
+                .is_some_and(|a| attr_matches_name(a, name))
+        });
 
         // Remove all matches
         self.other_attrs.retain(|line| {
@@ -85,16 +86,20 @@ impl MediaLine {
         });
 
         // Build new lines
-        let new_lines: Vec<String> = values.iter().map(|value| {
-            if value.is_empty() {
-                format!("a={name}")
-            } else {
-                format!("a={name}:{value}")
-            }
-        }).collect();
+        let new_lines: Vec<String> = values
+            .iter()
+            .map(|value| {
+                if value.is_empty() {
+                    format!("a={name}")
+                } else {
+                    format!("a={name}:{value}")
+                }
+            })
+            .collect();
 
         // Insert at original position, or append
-        let insert_pos = first_pos.unwrap_or(self.other_attrs.len())
+        let insert_pos = first_pos
+            .unwrap_or(self.other_attrs.len())
             .min(self.other_attrs.len());
         for (i, line) in new_lines.into_iter().enumerate() {
             self.other_attrs.insert(insert_pos + i, line);
@@ -127,11 +132,10 @@ impl MediaLine {
             format!("a={name}:{value}")
         };
         // Replace first match, or append.
-        if let Some(pos) = self
-            .other_attrs
-            .iter()
-            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)))
-        {
+        if let Some(pos) = self.other_attrs.iter().position(|line| {
+            line.strip_prefix("a=")
+                .is_some_and(|a| attr_matches_name(a, name))
+        }) {
             self.other_attrs[pos] = new_line;
         } else {
             self.other_attrs.push(new_line);
@@ -364,14 +368,16 @@ impl SdpBody {
 
     /// Replace all session-level `a=` attributes matching `name` with new values.
     pub fn session_set_attrs_by_name(&mut self, name: &str, values: &[&str]) {
-        let first_pos = self.session_lines
-            .iter()
-            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)));
+        let first_pos = self.session_lines.iter().position(|line| {
+            line.strip_prefix("a=")
+                .is_some_and(|a| attr_matches_name(a, name))
+        });
         self.session_lines.retain(|line| {
             line.strip_prefix("a=")
                 .map_or(true, |attr| !attr_matches_name(attr, name))
         });
-        let insert_pos = first_pos.unwrap_or(self.session_lines.len())
+        let insert_pos = first_pos
+            .unwrap_or(self.session_lines.len())
             .min(self.session_lines.len());
         for (i, value) in values.iter().enumerate() {
             let line = if value.is_empty() {
@@ -390,11 +396,10 @@ impl SdpBody {
         } else {
             format!("a={name}:{value}")
         };
-        if let Some(pos) = self
-            .session_lines
-            .iter()
-            .position(|line| line.strip_prefix("a=").is_some_and(|a| attr_matches_name(a, name)))
-        {
+        if let Some(pos) = self.session_lines.iter().position(|line| {
+            line.strip_prefix("a=")
+                .is_some_and(|a| attr_matches_name(a, name))
+        }) {
             self.session_lines[pos] = new_line;
         } else {
             self.session_lines.push(new_line);
@@ -510,7 +515,9 @@ fn parse_media_line(line: &str) -> MediaLine {
     let media_type = parts.first().unwrap_or(&"audio").to_string();
     let port = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let protocol = parts.get(2).unwrap_or(&"RTP/AVP").to_string();
-    let formats: Vec<u16> = parts.get(3..).unwrap_or(&[])
+    let formats: Vec<u16> = parts
+        .get(3..)
+        .unwrap_or(&[])
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
@@ -672,7 +679,10 @@ mod tests {
 
         let media = &sdp.media_sections[0];
         assert_eq!(media.formats, vec![0, 8, 97]);
-        assert!(!media.rtpmap.iter().any(|(_, c)| c.contains("telephone-event")));
+        assert!(!media
+            .rtpmap
+            .iter()
+            .any(|(_, c)| c.contains("telephone-event")));
     }
 
     #[test]
@@ -909,10 +919,7 @@ mod tests {
     fn media_get_attr() {
         let sdp = SdpBody::parse(SDP_WITH_ATTRS);
         let audio = &sdp.media_sections[0];
-        assert_eq!(
-            audio.get_attr("des"),
-            Some("qos mandatory local sendrecv")
-        );
+        assert_eq!(audio.get_attr("des"), Some("qos mandatory local sendrecv"));
         assert_eq!(audio.get_attr("ptime"), Some("20"));
         assert_eq!(audio.get_attr("sendrecv"), Some(""));
         assert_eq!(audio.get_attr("nonexistent"), None);
@@ -1038,10 +1045,7 @@ mod tests {
             Some("qos optional local sendrecv")
         );
         assert!(reparsed.session_has_attr("ice-lite"));
-        assert_eq!(
-            reparsed.media_sections[0].get_attr("ptime"),
-            Some("20")
-        );
+        assert_eq!(reparsed.media_sections[0].get_attr("ptime"), Some("20"));
     }
 
     #[test]
@@ -1057,10 +1061,7 @@ mod tests {
             }
         }
         let audio = &sdp.media_sections[0];
-        assert_eq!(
-            audio.get_attr("des"),
-            Some("qos optional local sendrecv")
-        );
+        assert_eq!(audio.get_attr("des"), Some("qos optional local sendrecv"));
     }
 
     // -----------------------------------------------------------------
@@ -1163,10 +1164,13 @@ mod tests {
         let mut sdp = SdpBody::parse(sdp_str);
 
         // Downgrade remote only
-        sdp.media_sections[0].set_attrs_by_name("des", &[
-            "qos mandatory local sendrecv",
-            "qos optional remote sendrecv",
-        ]);
+        sdp.media_sections[0].set_attrs_by_name(
+            "des",
+            &[
+                "qos mandatory local sendrecv",
+                "qos optional remote sendrecv",
+            ],
+        );
 
         let vals = sdp.media_sections[0].get_attrs_by_name("des");
         assert_eq!(vals.len(), 2);
@@ -1180,6 +1184,8 @@ mod tests {
     #[test]
     fn get_attrs_by_name_empty_when_missing() {
         let sdp = SdpBody::parse(SDP_WITH_ATTRS);
-        assert!(sdp.media_sections[0].get_attrs_by_name("nonexistent").is_empty());
+        assert!(sdp.media_sections[0]
+            .get_attrs_by_name("nonexistent")
+            .is_empty());
     }
 }

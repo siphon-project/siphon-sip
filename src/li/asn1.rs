@@ -177,9 +177,7 @@ pub fn encode_iri_pdu(
         iri_type,
         lawful_interception_identifier: OctetString::from(liid.as_bytes().to_vec()),
         communication_identity: CommunicationIdentity {
-            communication_identity_number: OctetString::from(
-                correlation_id.as_bytes().to_vec(),
-            ),
+            communication_identity_number: OctetString::from(correlation_id.as_bytes().to_vec()),
             network_identifier: None,
         },
         timestamp: system_time_to_generalized(timestamp),
@@ -238,9 +236,7 @@ pub fn encode_cc_pdu(
     let cc = CcPayload {
         lawful_interception_identifier: OctetString::from(liid.as_bytes().to_vec()),
         communication_identity: CommunicationIdentity {
-            communication_identity_number: OctetString::from(
-                correlation_id.as_bytes().to_vec(),
-            ),
+            communication_identity_number: OctetString::from(correlation_id.as_bytes().to_vec()),
             network_identifier: None,
         },
         timestamp: system_time_to_generalized(timestamp),
@@ -344,29 +340,39 @@ mod tests {
         // Decode inner IRI payload
         let iri = decode_iri_payload(&inner).unwrap();
         assert_eq!(iri.iri_type, IriType::Begin);
+        assert_eq!(iri.lawful_interception_identifier.as_ref(), b"LI-001");
         assert_eq!(
-            iri.lawful_interception_identifier.as_ref(),
-            b"LI-001"
-        );
-        assert_eq!(
-            iri.communication_identity.communication_identity_number.as_ref(),
+            iri.communication_identity
+                .communication_identity_number
+                .as_ref(),
             b"call-123@example.com"
         );
-        assert_eq!(
-            iri.sip_method,
-            Utf8String::from("INVITE")
-        );
+        assert_eq!(iri.sip_method, Utf8String::from("INVITE"));
         assert!(iri.status_code.is_none());
 
         // Verify party information
-        assert_eq!(iri.originating_party.party_qualifier, PartyQualifier::Originating);
         assert_eq!(
-            iri.originating_party.party_identity.sip_uri.as_ref().unwrap(),
+            iri.originating_party.party_qualifier,
+            PartyQualifier::Originating
+        );
+        assert_eq!(
+            iri.originating_party
+                .party_identity
+                .sip_uri
+                .as_ref()
+                .unwrap(),
             &Utf8String::from("sip:alice@example.com")
         );
-        assert_eq!(iri.terminating_party.party_qualifier, PartyQualifier::Terminating);
         assert_eq!(
-            iri.terminating_party.party_identity.sip_uri.as_ref().unwrap(),
+            iri.terminating_party.party_qualifier,
+            PartyQualifier::Terminating
+        );
+        assert_eq!(
+            iri.terminating_party
+                .party_identity
+                .sip_uri
+                .as_ref()
+                .unwrap(),
             &Utf8String::from("sip:bob@example.com")
         );
 
@@ -382,12 +388,7 @@ mod tests {
         let timestamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let rtp_payload = vec![0x80, 0x00, 0x01, 0x02, 0x03]; // fake RTP
 
-        let encoded = encode_cc_pdu(
-            "LI-001",
-            "call-123@example.com",
-            timestamp,
-            &rtp_payload,
-        );
+        let encoded = encode_cc_pdu("LI-001", "call-123@example.com", timestamp, &rtp_payload);
 
         let (version, pdu_type, inner) = decode_ps_pdu(&encoded).unwrap();
         assert_eq!(version, 1);
@@ -395,12 +396,11 @@ mod tests {
 
         // Decode inner CC payload
         let cc = decode_cc_payload(&inner).unwrap();
+        assert_eq!(cc.lawful_interception_identifier.as_ref(), b"LI-001");
         assert_eq!(
-            cc.lawful_interception_identifier.as_ref(),
-            b"LI-001"
-        );
-        assert_eq!(
-            cc.communication_identity.communication_identity_number.as_ref(),
+            cc.communication_identity
+                .communication_identity_number
+                .as_ref(),
             b"call-123@example.com"
         );
         assert_eq!(cc.payload_direction, PayloadDirection::Unknown);
@@ -429,16 +429,14 @@ mod tests {
 
         let iri = decode_iri_payload(&inner).unwrap();
         assert_eq!(iri.iri_type, IriType::End);
-        assert_eq!(
-            iri.status_code.as_ref().unwrap(),
-            &Integer::from(200)
-        );
+        assert_eq!(iri.status_code.as_ref().unwrap(), &Integer::from(200));
     }
 
     #[test]
     fn iri_with_raw_sip_message() {
         let timestamp = SystemTime::now();
-        let raw_sip = b"INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP/2.0/UDP pc33.atlanta.com\r\n\r\n";
+        let raw_sip =
+            b"INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP/2.0/UDP pc33.atlanta.com\r\n\r\n";
 
         let encoded = encode_iri_pdu(
             "LI-003",
@@ -461,7 +459,12 @@ mod tests {
     #[test]
     fn all_iri_types_roundtrip() {
         let timestamp = SystemTime::now();
-        for iri_type in [IriType::Begin, IriType::Continue, IriType::End, IriType::Report] {
+        for iri_type in [
+            IriType::Begin,
+            IriType::Continue,
+            IriType::End,
+            IriType::Report,
+        ] {
             let encoded = encode_iri_pdu(
                 "LI-ALL",
                 "call-all@example.com",

@@ -13,9 +13,12 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use crate::b2bua::actor::{CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo as LegTransport};
-use crate::dns::SipResolver;
+use crate::b2bua::actor::{
+    CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo as LegTransport,
+};
 use crate::config::Config;
+use crate::dns::SipResolver;
+use crate::hep::HepSender;
 use crate::proxy::core;
 use crate::proxy::session::{ClientBranch, ProxySession, ProxySessionStore};
 use crate::registrar::{Registrar, RegistrarConfig};
@@ -25,24 +28,22 @@ use crate::script::api::log::PyLogNamespace;
 use crate::script::api::registrar::PyRegistrar;
 use crate::script::api::reply::PyReply;
 use crate::script::api::request::{LocalDomains, PyRequest, RequestAction};
-use crate::script::engine::{HandlerKind, ScriptEngine, run_coroutine};
+use crate::script::engine::{run_coroutine, HandlerKind, ScriptEngine};
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::via::Via;
-use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
 use crate::sip::headers::SipHeaders;
-use crate::sip::uri::SipUri;
+use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
 use crate::sip::parser::{parse_sip_message_bytes, parse_uri_standalone};
+use crate::sip::uri::SipUri;
 use crate::sip::uri::{format_sip_host, split_host_port, strip_ipv6_brackets};
 use crate::transaction::key::TransactionKey;
-use crate::transaction::state::{
-    Action, TimerName,
-    IstEvent, NistEvent, IctEvent, NictEvent,
-};
-use crate::transaction::{TransactionManager, ServerEvent, ClientEvent};
+use crate::transaction::state::{Action, IctEvent, IstEvent, NictEvent, NistEvent, TimerName};
 use crate::transaction::timer::TimerConfig;
-use crate::hep::HepSender;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, StreamConnections, Transport};
+use crate::transaction::{ClientEvent, ServerEvent, TransactionManager};
 use crate::transport::pool::ConnectionPool;
+use crate::transport::{
+    ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, StreamConnections, Transport,
+};
 use crate::uac::UacSender;
 
 /// RTPEngine wiring produced by [`init_rtpengine`]: the media-control backend
@@ -145,7 +146,8 @@ struct DispatcherState {
     /// B2BUA header policy preset library — keyed by qualified name
     /// (e.g. `"transparent-b2bua@2026"`).  Built once at startup from
     /// [`crate::b2bua::header_policy::builtin_presets`].
-    header_policy_registry: Arc<std::collections::HashMap<String, Arc<crate::b2bua::header_policy::Preset>>>,
+    header_policy_registry:
+        Arc<std::collections::HashMap<String, Arc<crate::b2bua::header_policy::Preset>>>,
     /// Default header policy applied when the script doesn't pass
     /// `header_policy=` on `call.dial()`.  Resolved from
     /// `config.b2bua.default_header_policy`, falling back to
@@ -385,14 +387,24 @@ impl DrainState {
     /// Number of (transactions, b2bua_calls) currently active. Returns
     /// `(0, 0)` until the dispatcher has registered its managers.
     pub fn active_counts(&self) -> (usize, usize) {
-        let txs = self.transaction_manager.get().map(|tm| tm.count()).unwrap_or(0);
-        let calls = self.call_actors.get().map(|ca| ca.registry.call_count()).unwrap_or(0);
+        let txs = self
+            .transaction_manager
+            .get()
+            .map(|tm| tm.count())
+            .unwrap_or(0);
+        let calls = self
+            .call_actors
+            .get()
+            .map(|ca| ca.registry.call_count())
+            .unwrap_or(0);
         (txs, calls)
     }
 }
 
 impl Default for DrainState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DispatcherState {
@@ -465,10 +477,7 @@ impl DispatcherState {
     /// falls back to default routing rather than dropping the request —
     /// silently dropping would violate the "always answer" invariant, and an
     /// operator typo shouldn't blackhole calls.
-    fn resolve_send_socket(
-        &self,
-        spec: Option<&str>,
-    ) -> Option<crate::transport::SendSocket> {
+    fn resolve_send_socket(&self, spec: Option<&str>) -> Option<crate::transport::SendSocket> {
         let spec = spec?;
         match crate::transport::parse_send_socket(spec) {
             Ok((transport, addr)) => {
@@ -492,10 +501,7 @@ impl DispatcherState {
     /// Resolve the header policy for a B2BUA call.  Returns the per-call
     /// policy when the script attached one via `call.dial(header_policy=…)`,
     /// otherwise the configured default.
-    fn resolve_header_policy(
-        &self,
-        call_id: &str,
-    ) -> crate::b2bua::header_policy::ResolvedPolicy {
+    fn resolve_header_policy(&self, call_id: &str) -> crate::b2bua::header_policy::ResolvedPolicy {
         if let Some(call) = self.call_actors.get_call(call_id) {
             if let Some(ref p) = call.resolved_header_policy {
                 return (**p).clone();
@@ -549,7 +555,9 @@ pub async fn run(
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
     stream_connections: StreamConnections,
-    registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
+    registrar_event_rx: Option<
+        tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
+    >,
     diameter_incoming_rx: tokio::sync::mpsc::Receiver<(
         crate::diameter::peer::IncomingRequest,
         std::sync::Arc<crate::diameter::peer::DiameterPeer>,
@@ -623,17 +631,20 @@ pub async fn run(
 
     let tx_config = config.transaction.as_ref();
     let transaction_timeout = std::time::Duration::from_secs(
-        tx_config.map(|t| t.invite_timeout_secs as u64).unwrap_or(30) + 2,
+        tx_config
+            .map(|t| t.invite_timeout_secs as u64)
+            .unwrap_or(30)
+            + 2,
     );
-    let _non_invite_timeout = std::time::Duration::from_secs(
-        tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5),
-    );
+    let _non_invite_timeout =
+        std::time::Duration::from_secs(tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5));
 
     let timer_config = {
         let mut config = TimerConfig::default();
         if let Some(tx) = tx_config {
             config.auto_100_trying = tx.auto_emit_100_trying;
-            config.auto_100_delay = std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
+            config.auto_100_delay =
+                std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
         }
         config
     };
@@ -654,7 +665,9 @@ pub async fn run(
     let mut merged_advertised = advertised_addrs;
     if let Some(ref global_adv) = config.advertised_address {
         for &transport in listen_addrs.keys() {
-            merged_advertised.entry(transport).or_insert_with(|| global_adv.clone());
+            merged_advertised
+                .entry(transport)
+                .or_insert_with(|| global_adv.clone());
         }
     }
 
@@ -716,9 +729,9 @@ pub async fn run(
         call_actors,
         transaction_manager,
         timer_wheel: Arc::new(DashMap::new()),
-        b2bua_retransmits: Arc::new(
-            crate::b2bua::retransmit::B2buaRetransmits::new(timer_config),
-        ),
+        b2bua_retransmits: Arc::new(crate::b2bua::retransmit::B2buaRetransmits::new(
+            timer_config,
+        )),
         session_store: Arc::new(ProxySessionStore::new()),
         dns_resolver,
         hep_sender,
@@ -733,14 +746,23 @@ pub async fn run(
         default_refer_mode: config.b2bua.resolved_default_refer_mode(),
         accept_replaces: config.b2bua.replaces_takeover_enabled(),
         registrant_manager,
-        recording_manager: Arc::new(crate::siprec::RecordingManager::new(product_name, product_version)),
-        li_siprec_srs_uri: config.lawful_intercept.as_ref()
+        recording_manager: Arc::new(crate::siprec::RecordingManager::new(
+            product_name,
+            product_version,
+        )),
+        li_siprec_srs_uri: config
+            .lawful_intercept
+            .as_ref()
             .and_then(|li| li.siprec.as_ref())
             .map(|siprec| siprec.srs_uri.clone()),
-        li_siprec_rtpengine_profile: config.lawful_intercept.as_ref()
+        li_siprec_rtpengine_profile: config
+            .lawful_intercept
+            .as_ref()
             .and_then(|li| li.siprec.as_ref())
             .map(|siprec| siprec.rtpengine_profile.clone()),
-        srs_manager: config.srs.as_ref()
+        srs_manager: config
+            .srs
+            .as_ref()
             .filter(|srs_config| srs_config.enabled)
             .map(|srs_config| Arc::new(crate::srs::SrsManager::new(srs_config.clone()))),
         ipsec_manager,
@@ -751,7 +773,9 @@ pub async fn run(
         connection_pool,
         stream_connections,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
-        sdp_name: config.media.as_ref()
+        sdp_name: config
+            .media
+            .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
         call_event_receivers: Arc::new(DashMap::new()),
@@ -774,7 +798,9 @@ pub async fn run(
 
     // Hand the freshly-constructed manager handles to the drain coordinator
     // so the server's drain loop can poll active counts on shutdown.
-    let _ = drain.transaction_manager.set(Arc::clone(&state.transaction_manager));
+    let _ = drain
+        .transaction_manager
+        .set(Arc::clone(&state.transaction_manager));
     let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
     // Publish a handle to the running dispatcher + its tokio runtime so the
@@ -823,8 +849,7 @@ pub async fn run(
     // a Python handler bridges to the proxy/B2BUA ACR-START builders
     // without needing to thread state through every API surface.
     {
-        let params_store: Arc<DashMap<String, Vec<(String, String)>>> =
-            Arc::new(DashMap::new());
+        let params_store: Arc<DashMap<String, Vec<(String, String)>>> = Arc::new(DashMap::new());
         let writer_store = Arc::clone(&params_store);
         let reader_store = Arc::clone(&params_store);
         crate::diameter::rf_service::install_rf_param_channel(
@@ -879,7 +904,11 @@ pub async fn run(
     }
 
     // Spawn background task: RFC 4028 session timer refresh
-    if state.session_timer_config.as_ref().is_some_and(|c| c.enabled) {
+    if state
+        .session_timer_config
+        .as_ref()
+        .is_some_and(|c| c.enabled)
+    {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -889,15 +918,16 @@ pub async fn run(
                 let state = Arc::clone(&state);
                 tokio::task::spawn_blocking(move || {
                     session_timer_sweep(&state);
-                }).await.ok();
+                })
+                .await
+                .ok();
             }
         });
     }
 
     // Spawn background task: registrar change event → on_change handlers
     if let Some(registrar) = crate::script::api::registrar_arc() {
-        let mut event_receiver = registrar_event_rx
-            .unwrap_or_else(|| registrar.subscribe_events());
+        let mut event_receiver = registrar_event_rx.unwrap_or_else(|| registrar.subscribe_events());
         let state_for_events = Arc::clone(&state);
         let registrar = Arc::clone(registrar);
         tokio::spawn(async move {
@@ -948,19 +978,19 @@ pub async fn run(
                 // Invoke Python handlers in a blocking context
                 let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
-                    let handlers =
-                        engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
+                    let handlers = engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
 
                     pyo3::Python::attach(|python| {
-                        let py_items: Vec<_> = contacts.into_iter().filter_map(|contact| {
-                            match pyo3::Py::new(python, contact) {
+                        let py_items: Vec<_> = contacts
+                            .into_iter()
+                            .filter_map(|contact| match pyo3::Py::new(python, contact) {
                                 Ok(py) => Some(py.into_bound(python)),
                                 Err(error) => {
                                     error!("PyContact creation failed: {error}");
                                     None
                                 }
-                            }
-                        }).collect();
+                            })
+                            .collect();
                         let Ok(py_contacts) = pyo3::types::PyList::new(python, py_items) else {
                             error!("PyList creation failed for registrar on_change contacts");
                             return;
@@ -1033,9 +1063,8 @@ pub async fn run(
                 }
 
                 // Build state dict for the callback
-                let (expires_in, failure_count, registrar_uri) = registrant
-                    .entry_info(&aor)
-                    .unwrap_or((0, 0, String::new()));
+                let (expires_in, failure_count, registrar_uri) =
+                    registrant.entry_info(&aor).unwrap_or((0, 0, String::new()));
 
                 let event_type_str = event_type.to_string();
                 let state_ref = Arc::clone(&state_for_events);
@@ -1043,8 +1072,7 @@ pub async fn run(
                 // Invoke Python handlers in a blocking context
                 let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
-                    let handlers =
-                        engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
+                    let handlers = engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
 
                     pyo3::Python::attach(|python| {
                         let py_state = pyo3::types::PyDict::new(python);
@@ -1063,11 +1091,8 @@ pub async fn run(
 
                         for handler in handlers {
                             let callable = handler.callable.bind(python);
-                            let result = callable.call1((
-                                aor.as_str(),
-                                event_type_str.as_str(),
-                                &py_state,
-                            ));
+                            let result =
+                                callable.call1((aor.as_str(), event_type_str.as_str(), &py_state));
                             match result {
                                 Ok(ret) => {
                                     if handler.is_async {
@@ -1222,8 +1247,7 @@ pub async fn run(
                             "media engine reported media timeout (engine tore down call)"
                         );
                         let engine_state = state_for_events.engine.state();
-                        let handlers =
-                            engine_state.media_timeout_handlers(&call_id, &from_tag);
+                        let handlers = engine_state.media_timeout_handlers(&call_id, &from_tag);
                         if handlers.is_empty() {
                             continue;
                         }
@@ -1291,8 +1315,8 @@ pub async fn run(
                             "media engine recovered a real-time text increment"
                         );
                         let engine_state = state_for_events.engine.state();
-                        let handlers = engine_state
-                            .text_handlers(&text_event.call_id, &text_event.from_tag);
+                        let handlers =
+                            engine_state.text_handlers(&text_event.call_id, &text_event.from_tag);
                         if handlers.is_empty() {
                             continue;
                         }
@@ -1736,8 +1760,7 @@ pub async fn run(
                             "media engine detected a record tone"
                         );
                         let engine_state = state_for_events.engine.state();
-                        let handlers =
-                            engine_state.beep_handlers(&beep.call_id, &beep.from_tag);
+                        let handlers = engine_state.beep_handlers(&beep.call_id, &beep.from_tag);
                         if handlers.is_empty() {
                             continue;
                         }
@@ -1880,7 +1903,9 @@ pub async fn run(
                             }
                         }
                     }
-                    crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
+                    crate::rtpengine::events::RtpEngineEvent::Unknown {
+                        event, call_id, ..
+                    } => {
                         tracing::debug!(
                             %event,
                             ?call_id,
@@ -1950,9 +1975,7 @@ fn udp_egress_source(
     pin: Option<SocketAddr>,
 ) -> Option<SocketAddr> {
     match transport {
-        Transport::Udp => {
-            crate::script::api::ipsec::outbound_local_addr_for(destination).or(pin)
-        }
+        Transport::Udp => crate::script::api::ipsec::outbound_local_addr_for(destination).or(pin),
         _ => None,
     }
 }
@@ -2013,7 +2036,12 @@ fn sweep_b2bua_retransmits(state: &DispatcherState) {
 
     for event in state.b2bua_retransmits.due(std::time::Instant::now()) {
         match event {
-            Due::Send { key, data, target, attempt } => {
+            Due::Send {
+                key,
+                data,
+                target,
+                attempt,
+            } => {
                 debug!(
                     branch = %key.branch,
                     method = %key.method.as_str(),
@@ -2033,7 +2061,11 @@ fn sweep_b2bua_retransmits(state: &DispatcherState) {
                     state,
                 );
             }
-            Due::GaveUp { key, destination, attempts } => {
+            Due::GaveUp {
+                key,
+                destination,
+                attempts,
+            } => {
                 warn!(
                     branch = %key.branch,
                     method = %key.method.as_str(),
@@ -2069,9 +2101,7 @@ fn fire_expired_timers(state: &DispatcherState) {
         // only ever count against the originator — never a downstream relay/trunk
         // (whose failures would surface as ICT Timer B, deliberately not counted).
         if matches!(entry.name, TimerName::H) {
-            if let (Some(ban), Some(dest)) =
-                (crate::security::auto_ban(), entry.destination)
-            {
+            if let (Some(ban), Some(dest)) = (crate::security::auto_ban(), entry.destination) {
                 if ban.record_failure(dest.ip()) {
                     warn!(source = %dest.ip(), "auto-ban: source banned (non-ACK INVITE timeout)");
                 }
@@ -2092,7 +2122,10 @@ fn fire_expired_timers(state: &DispatcherState) {
         };
 
         if let Some(server_event) = event {
-            match state.transaction_manager.process_server_event(&entry.key, server_event) {
+            match state
+                .transaction_manager
+                .process_server_event(&entry.key, server_event)
+            {
                 Ok(actions) => {
                     process_timer_actions(
                         &actions,
@@ -2122,7 +2155,10 @@ fn fire_expired_timers(state: &DispatcherState) {
         };
 
         if let Some(client_event) = client_event {
-            match state.transaction_manager.process_client_event(&entry.key, client_event) {
+            match state
+                .transaction_manager
+                .process_client_event(&entry.key, client_event)
+            {
                 Ok(actions) => {
                     process_timer_actions(
                         &actions,
@@ -2196,7 +2232,14 @@ fn process_timer_actions_with_followups(
                 if let (Some(dest), Some(trans)) = (destination, transport) {
                     let conn_id = connection_id.unwrap_or_default();
                     if followups.is_empty() {
-                        send_message_from(message.clone(), trans, dest, conn_id, source_local_addr, state);
+                        send_message_from(
+                            message.clone(),
+                            trans,
+                            dest,
+                            conn_id,
+                            source_local_addr,
+                            state,
+                        );
                     } else {
                         send_frames_in_order_from(
                             Bytes::from(message.to_bytes()),
@@ -2212,15 +2255,18 @@ fn process_timer_actions_with_followups(
             }
             Action::StartTimer(name, duration) => {
                 let timer_id = format!("{}:{:?}", key, name);
-                state.timer_wheel.insert(timer_id, TimerEntry {
-                    key: key.clone(),
-                    name: *name,
-                    fires_at: std::time::Instant::now() + *duration,
-                    destination,
-                    transport,
-                    connection_id,
-                    source_local_addr,
-                });
+                state.timer_wheel.insert(
+                    timer_id,
+                    TimerEntry {
+                        key: key.clone(),
+                        name: *name,
+                        fires_at: std::time::Instant::now() + *duration,
+                        destination,
+                        transport,
+                        connection_id,
+                        source_local_addr,
+                    },
+                );
             }
             Action::CancelTimer(name) => {
                 let timer_id = format!("{}:{:?}", key, name);
@@ -2593,7 +2639,9 @@ pub(crate) async fn liveness_flow_failure_network_dereg(
     dereg_mode: crate::config::LivenessDeregMode,
 ) {
     if dereg_mode != crate::config::LivenessDeregMode::NetworkDereg
-        || !removed.iter().any(|(_, contact)| contact.flow_token.is_some())
+        || !removed
+            .iter()
+            .any(|(_, contact)| contact.flow_token.is_some())
     {
         return;
     }
@@ -2744,8 +2792,7 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         sa_by_ip.insert(row.ue_addr, row);
     }
     let context = LivenessDeregCtx::from_state(state, registrar);
-    let live_ips: std::collections::HashSet<std::net::IpAddr> =
-        sa_by_ip.keys().copied().collect();
+    let live_ips: std::collections::HashSet<std::net::IpAddr> = sa_by_ip.keys().copied().collect();
 
     // No live SAs, or the kernel use-time dump is unavailable on this platform
     // → nothing to age this sweep.  Still reconcile the liveness bookkeeping so
@@ -2951,7 +2998,13 @@ async fn liveness_probe_then_dereg(
             // inbound stamp raced or the answer arrived over UDP) and reset the
             // hysteresis counter so a later transient miss starts from zero.
             if let Some(now) = now_unix() {
-                liveness_note_alive(&context.last_seen, &context.misses, destination.ip(), &aor, now);
+                liveness_note_alive(
+                    &context.last_seen,
+                    &context.misses,
+                    destination.ip(),
+                    &aor,
+                    now,
+                );
             }
             debug!(aor = %aor, attempt, "registrar liveness: UE answered OPTIONS probe — keeping binding");
             return;
@@ -3056,7 +3109,11 @@ async fn send_liveness_network_dereg(context: &LivenessDeregCtx, aor: &str, cont
             return;
         }
     };
-    let scheme = if route_uri.scheme == "sips" { "sips" } else { "sip" };
+    let scheme = if route_uri.scheme == "sips" {
+        "sips"
+    } else {
+        "sip"
+    };
     let targets = context
         .dns_resolver
         .resolve(&route_uri.host, route_uri.port, scheme, Some("udp"))
@@ -3198,7 +3255,9 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     // letter, so the all-bytes scan only runs when the first byte already
     // looks like whitespace.
     if matches!(inbound.data.first(), Some(b'\r' | b'\n' | b' ')) {
-        let all_whitespace = inbound.data.iter()
+        let all_whitespace = inbound
+            .data
+            .iter()
             .all(|b| matches!(b, b'\r' | b'\n' | b' '));
         if all_whitespace {
             return;
@@ -3325,11 +3384,7 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
 /// Costs one `Option` test on a node with LI disabled, and one further
 /// emptiness check on a node with LI enabled but nothing provisioned, so the
 /// common case is a predictable branch rather than a lookup.
-fn intercept_message(
-    message: &SipMessage,
-    inbound: &InboundMessage,
-    state: &Arc<DispatcherState>,
-) {
+fn intercept_message(message: &SipMessage, inbound: &InboundMessage, state: &Arc<DispatcherState>) {
     let Some(li) = state.li_manager.as_ref() else {
         return;
     };
@@ -3357,13 +3412,7 @@ fn intercept_message(
     // Decided once per session, not once per message. See `check_session`:
     // this is what stops a warrant delivering the INVITE and then missing the
     // BYE, because a later message need not carry the target in matchable form.
-    let matches = li.check_session(
-        call_id,
-        request_uri.as_deref(),
-        from_uri,
-        to_uri,
-        source_ip,
-    );
+    let matches = li.check_session(call_id, request_uri.as_deref(), from_uri, to_uri, source_ip);
     if matches.is_empty() {
         // An unwarranted session is remembered as unwarranted, and that
         // memory has to be released when the dialog ends or the map would
@@ -3923,7 +3972,8 @@ fn handle_request(
         .and_then(|raw| Via::parse_multi(raw).ok())
         .and_then(|vias| vias.into_iter().next());
     let uac_branch = uac_via.as_ref().and_then(|v| v.branch.clone());
-    let uac_sent_by = uac_via.as_ref()
+    let uac_sent_by = uac_via
+        .as_ref()
         .map(|v| TransactionKey::format_sent_by(&v.host, v.port))
         .unwrap_or_default();
 
@@ -3963,11 +4013,7 @@ fn handle_request(
                 // Using both fields avoids ambiguity when a B2BUA (e.g. FreeSWITCH)
                 // reuses the same Call-ID for both call legs through this proxy.
                 let call_id = message.headers.get("Call-ID");
-                let from_tag = message
-                    .typed_from()
-                    .ok()
-                    .flatten()
-                    .and_then(|na| na.tag);
+                let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
                 if let (Some(cid), Some(ftag)) = (call_id, from_tag.as_deref()) {
                     if let Some(session_arc) = state.session_store.get_by_dialog_key(cid, ftag) {
                         handle_ack_via_session(inbound, message, session_arc, state);
@@ -3988,7 +4034,9 @@ fn handle_request(
                         // Grab the winning B-leg's anchored egress socket in the
                         // same pass — the ACK has to leave from where its INVITE
                         // did (flow-dialled legs; see `send_b2bua_to_bleg`).
-                        let (pending_ack, b_leg_local_addr) = if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
+                        let (pending_ack, b_leg_local_addr) = if let Some(mut call) =
+                            state.call_actors.get_call_mut(&internal_id)
+                        {
                             call.a_leg.initial_acked = true;
                             let mut b_leg_local_addr = None;
                             if let Some(b_leg) = call.winner.and_then(|i| call.b_legs.get_mut(i)) {
@@ -4099,15 +4147,28 @@ fn handle_request(
     // by To-tag must still flow so active calls can finish their renegotiation).
     // ACK/BYE/PRACK/CANCEL and all responses are unaffected.
     if method == "INVITE"
-        && state.is_draining.is_draining.load(std::sync::atomic::Ordering::Relaxed)
+        && state
+            .is_draining
+            .is_draining
+            .load(std::sync::atomic::Ordering::Relaxed)
         && !to_has_tag(&message)
     {
         debug!("draining — rejecting new INVITE with 503 Service Unavailable");
         let response = build_response(
-            &message, 503, "Service Unavailable",
-            state.server_header.as_deref(), &[],
+            &message,
+            503,
+            "Service Unavailable",
+            state.server_header.as_deref(),
+            &[],
         );
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -4122,12 +4183,19 @@ fn handle_request(
             "in-dialog request for a torn-down B2BUA call — 481",
         );
         let response = build_response(
-            &message, 481, "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(), &[],
+            &message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state.server_header.as_deref(),
+            &[],
         );
         send_message_from(
-            response, inbound.transport, inbound.remote_addr,
-            inbound.connection_id, Some(inbound.local_addr), state,
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
         );
         return;
     }
@@ -4136,14 +4204,16 @@ fn handle_request(
     let engine_state = state.engine.state();
     if method == "INVITE" && engine_state.has_b2bua_handlers() {
         // Detect re-INVITE (has To-tag + matches existing call)
-        let to_tag = message.headers.get("To")
-            .and_then(|t| t.split(';')
+        let to_tag = message.headers.get("To").and_then(|t| {
+            t.split(';')
                 .find(|p| p.trim().starts_with("tag="))
-                .map(|t| t.trim().trim_start_matches("tag=").to_string()));
+                .map(|t| t.trim().trim_start_matches("tag=").to_string())
+        });
         let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
 
         let is_reinvite = to_tag.is_some()
-            && sip_call_id.as_ref()
+            && sip_call_id
+                .as_ref()
                 .map(|cid| state.call_actors.find_by_sip_call_id(cid).is_some())
                 .unwrap_or(false);
 
@@ -4232,9 +4302,15 @@ fn handle_request(
         // tracked entry matches (e.g. A-leg PRACKs that originated from the
         // UAC's own 100rel handling, not from us).
         if let Some(rack) = crate::sip::headers::rseq::parse_rack(&message.headers) {
-            let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string()).unwrap_or_default();
+            let sip_call_id = message
+                .headers
+                .get("Call-ID")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             let key = (sip_call_id.clone(), rack.response_number);
-            let matched = state.reliable_provisionals.get(&key)
+            let matched = state
+                .reliable_provisionals
+                .get(&key)
                 .map(|r| Arc::clone(r.value()))
                 .filter(|entry| entry.cseq_num == rack.cseq_number);
             if let Some(entry) = matched {
@@ -4244,8 +4320,16 @@ fn handle_request(
                     call_id = %sip_call_id, rseq = rack.response_number,
                     "PRACK matches our reliable 1xx — cancelling retransmits and sending 200 OK"
                 );
-                let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                let response =
+                    build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
                 return;
             }
         }
@@ -4270,7 +4354,10 @@ fn handle_request(
     // The server transaction handles retransmission absorption and timer management.
     // ACK is excluded (handled by existing IST), as are requests going to B2BUA.
     let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
-    let server_key = match state.transaction_manager.new_server_transaction(&message, txn_transport) {
+    let server_key = match state
+        .transaction_manager
+        .new_server_transaction(&message, txn_transport)
+    {
         Ok(outcome) if !outcome.is_new => {
             // Another worker created this transaction between our
             // `handle_server_retransmit` check above and the create — i.e. a
@@ -4290,18 +4377,21 @@ fn handle_request(
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
                     let timer_id = format!("{}:{:?}", key, name);
-                    state.timer_wheel.insert(timer_id, TimerEntry {
-                        key: key.clone(),
-                        name: *name,
-                        fires_at: std::time::Instant::now() + *duration,
-                        // Server transaction timers send responses upstream (to UAC)
-                        destination: Some(inbound.remote_addr),
-                        transport: Some(inbound.transport),
-                        connection_id: Some(inbound.connection_id),
-                        // Retransmit cached responses on the same SA's
-                        // local endpoint (TS 33.203 §7.4).
-                        source_local_addr: Some(inbound.local_addr),
-                    });
+                    state.timer_wheel.insert(
+                        timer_id,
+                        TimerEntry {
+                            key: key.clone(),
+                            name: *name,
+                            fires_at: std::time::Instant::now() + *duration,
+                            // Server transaction timers send responses upstream (to UAC)
+                            destination: Some(inbound.remote_addr),
+                            transport: Some(inbound.transport),
+                            connection_id: Some(inbound.connection_id),
+                            // Retransmit cached responses on the same SA's
+                            // local endpoint (TS 33.203 §7.4).
+                            source_local_addr: Some(inbound.local_addr),
+                        },
+                    );
                 }
             }
             Some(key)
@@ -4326,8 +4416,21 @@ fn handle_request(
     // Check BEFORE invoking scripts — if MF == 0, reject immediately.
     if message.headers.max_forwards() == Some(0) {
         debug!(method = %method, "Max-Forwards is 0, rejecting with 483");
-        let response = build_response(&message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            &message,
+            483,
+            "Too Many Hops",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -4336,8 +4439,21 @@ fn handle_request(
 
     if handlers.is_empty() {
         warn!(method = %method, "no script handler registered");
-        let response = build_response(&message, 500, "No Script Handler", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            &message,
+            500,
+            "No Script Handler",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -4360,12 +4476,32 @@ fn handle_request(
     request.set_inbound_flow(inbound.local_addr, inbound.connection_id.0);
 
     // Call Python handlers
-    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body, auth_user) = Python::attach(|python| {
+    let (
+        action,
+        record_routed,
+        on_reply_cb,
+        on_failure_cb,
+        send_via_transport,
+        send_via_target,
+        reply_headers,
+        reply_body,
+        auth_user,
+    ) = Python::attach(|python| {
         let py_request = match Py::new(python, request) {
             Ok(py) => py,
             Err(error) => {
                 error!("failed to create PyRequest: {error}");
-                return (RequestAction::None, false, None, None, None, None, vec![], None, None);
+                return (
+                    RequestAction::None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    None,
+                    None,
+                );
             }
         };
 
@@ -4444,7 +4580,17 @@ fn handle_request(
         // caller — or normalised the identity afterwards — is what reaches the
         // CDR. Reading it before would always be empty.
         let auth_user = borrowed.get_auth_user().map(String::from);
-        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers, reply_body, auth_user)
+        (
+            action,
+            record_routed,
+            on_reply,
+            on_failure,
+            send_via_transport,
+            send_via_target,
+            reply_headers,
+            reply_body,
+            auth_user,
+        )
     });
 
     // Process the action
@@ -4474,13 +4620,25 @@ fn handle_request(
                     .remove(&format!("{}:{:?}", key, TimerName::Trying100));
             }
         }
-        RequestAction::Reply { code, reason, reliable } => {
-            let mut response = build_response(&message_guard, *code, reason, state.server_header.as_deref(), &reply_headers);
+        RequestAction::Reply {
+            code,
+            reason,
+            reliable,
+        } => {
+            let mut response = build_response(
+                &message_guard,
+                *code,
+                reason,
+                state.server_header.as_deref(),
+                &reply_headers,
+            );
 
             // Script-provided reply body — PIDF-LO, XCAP/Ut, custom failure body, etc.
             if let Some((body_bytes, content_type)) = &reply_body {
                 response.headers.set("Content-Type", content_type.clone());
-                response.headers.set("Content-Length", body_bytes.len().to_string());
+                response
+                    .headers
+                    .set("Content-Length", body_bytes.len().to_string());
                 response.body = body_bytes.clone();
             }
 
@@ -4519,15 +4677,24 @@ fn handle_request(
                     let rseq = crate::sip::headers::rseq::next_rseq();
                     // Merge 100rel into existing Require if present, else set fresh.
                     let new_require = match response.headers.get("Require") {
-                        Some(existing) if existing.split(',').any(|t| t.trim().eq_ignore_ascii_case("100rel")) =>
-                            existing.clone(),
+                        Some(existing)
+                            if existing
+                                .split(',')
+                                .any(|t| t.trim().eq_ignore_ascii_case("100rel")) =>
+                        {
+                            existing.clone()
+                        }
                         Some(existing) => format!("{}, 100rel", existing),
                         None => "100rel".to_string(),
                     };
                     response.headers.set("Require", new_require);
                     response.headers.set("RSeq", rseq.to_string());
                     arm_reliable_provisional_retransmit(
-                        rseq, &message_guard, response.clone(), &inbound, state,
+                        rseq,
+                        &message_guard,
+                        response.clone(),
+                        &inbound,
+                        state,
                     );
                     reliable_provisional_armed = true;
                 }
@@ -4560,7 +4727,9 @@ fn handle_request(
                         let ue_port = inbound.remote_addr.port();
                         let ipsec_manager = Arc::clone(ipsec_manager);
                         tokio::spawn(async move {
-                            if let Err(error) = ipsec_manager.delete_sa_pair(&ue_addr, ue_port).await {
+                            if let Err(error) =
+                                ipsec_manager.delete_sa_pair(&ue_addr, ue_port).await
+                            {
                                 warn!(ue = %ue_addr, %error, "IPsec: failed to delete SA pair");
                             }
                         });
@@ -4582,8 +4751,11 @@ fn handle_request(
             // They ride along as followups of the reply instead. Deferred
             // messages for any OTHER peer are untouched and still go out via
             // `flush_deferred_sends` at the end of the request.
-            let mut reply_followups: Vec<Bytes> = crate::script::api::proxy_utils::
-                drain_deferred_sends_for(inbound.remote_addr, inbound.transport)
+            let mut reply_followups: Vec<Bytes> =
+                crate::script::api::proxy_utils::drain_deferred_sends_for(
+                    inbound.remote_addr,
+                    inbound.transport,
+                )
                 .into_iter()
                 .map(|deferred| Bytes::from(deferred.message.to_bytes()))
                 .collect();
@@ -4599,7 +4771,9 @@ fn handle_request(
                     if key.method == crate::sip::message::Method::Invite {
                         Some(ServerEvent::Ist(IstEvent::TuProvisional(response.clone())))
                     } else {
-                        Some(ServerEvent::Nist(NistEvent::TuProvisional(response.clone())))
+                        Some(ServerEvent::Nist(NistEvent::TuProvisional(
+                            response.clone(),
+                        )))
                     }
                 } else if *code < 300 && key.method == crate::sip::message::Method::Invite {
                     Some(ServerEvent::Ist(IstEvent::Tu2xx(response.clone())))
@@ -4612,7 +4786,8 @@ fn handle_request(
                 if let Some(event) = server_event {
                     match state.transaction_manager.process_server_event(key, event) {
                         Ok(actions) => {
-                            sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                            sent_by_transaction =
+                                actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
                             process_timer_actions_with_followups(
                                 &actions,
                                 key,
@@ -4649,22 +4824,34 @@ fn handle_request(
             if !reply_followups.is_empty() {
                 if let Some(uac_sender) = crate::script::api::proxy_utils::uac_sender() {
                     for frame in std::mem::take(&mut reply_followups) {
-                        uac_sender.send_bytes(
-                            frame,
-                            inbound.remote_addr,
-                            inbound.transport,
-                        );
+                        uac_sender.send_bytes(frame, inbound.remote_addr, inbound.transport);
                     }
                 }
             }
-
         }
-        RequestAction::Relay { next_hop, flow, send_socket } => {
+        RequestAction::Relay {
+            next_hop,
+            flow,
+            send_socket,
+        } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
-                let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
-                send_message_from(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                let trying = build_response(
+                    &message_guard,
+                    100,
+                    "Trying",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    trying,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
             }
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             relay_request(
@@ -4682,15 +4869,47 @@ fn handle_request(
                 send_socket.as_ref(),
             );
         }
-        RequestAction::Fork { targets, flows, routes, strategy, send_socket } => {
+        RequestAction::Fork {
+            targets,
+            flows,
+            routes,
+            strategy,
+            send_socket,
+        } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
-                let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                let response = build_response(
+                    &message_guard,
+                    500,
+                    "No Targets",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
             } else {
                 if method == "INVITE" {
-                    let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
-                    send_message_from(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                    let trying = build_response(
+                        &message_guard,
+                        100,
+                        "Trying",
+                        state.server_header.as_deref(),
+                        &[],
+                    );
+                    send_message_from(
+                        trying,
+                        inbound.transport,
+                        inbound.remote_addr,
+                        inbound.connection_id,
+                        Some(inbound.local_addr),
+                        state,
+                    );
                 }
                 let fork_strategy = match strategy.as_str() {
                     "sequential" => crate::proxy::fork::ForkStrategy::Sequential,
@@ -4792,7 +5011,12 @@ fn relay_request(
                     return;
                 }
             };
-            (uri_string, flow.source_addr, transport, Some(flow.local_addr))
+            (
+                uri_string,
+                flow.source_addr,
+                transport,
+                Some(flow.local_addr),
+            )
         } else {
             // Determine target URI string (RFC 3261 §16.6 step 6):
             // 1. Explicit next-hop from script
@@ -4805,7 +5029,9 @@ fn relay_request(
                         route_uri
                     } else {
                         match &message.start_line {
-                            StartLine::Request(request_line) => request_line.request_uri.to_string(),
+                            StartLine::Request(request_line) => {
+                                request_line.request_uri.to_string()
+                            }
                             _ => {
                                 error!("relay called on non-request");
                                 return;
@@ -4833,14 +5059,32 @@ fn relay_request(
                         },
                         None => {
                             warn!(target = %target_uri_string, "cannot resolve relay target");
-                            let response = build_response(message, 502, "Bad Gateway", state.server_header.as_deref(), &[]);
-                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            let response = build_response(
+                                message,
+                                502,
+                                "Bad Gateway",
+                                state.server_header.as_deref(),
+                                &[],
+                            );
+                            send_message_from(
+                                response,
+                                inbound.transport,
+                                inbound.remote_addr,
+                                inbound.connection_id,
+                                Some(inbound.local_addr),
+                                state,
+                            );
                             return;
                         }
                     }
                 }
             };
-            (target_uri_string, target.address, target.transport.unwrap_or(inbound.transport), None)
+            (
+                target_uri_string,
+                target.address,
+                target.transport.unwrap_or(inbound.transport),
+                None,
+            )
         };
 
     // Apply force_send_via transport override from script (non-flow path only;
@@ -4896,8 +5140,21 @@ fn relay_request(
                 destination = %destination,
                 "relay loop detected — destination is ourselves"
             );
-            let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+            let response = build_response(
+                message,
+                482,
+                "Loop Detected",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     }
@@ -4907,8 +5164,21 @@ fn relay_request(
 
     // Decrement Max-Forwards
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
-        let response = build_response(message, 483, "Too Many Hops", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            message,
+            483,
+            "Too Many Hops",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -5037,14 +5307,12 @@ fn relay_request(
         let (host, port) = split_host_port(target_str);
         (format_sip_host(host), port)
     } else {
-        (state.via_host(&outbound_transport), Some(state.via_port(&outbound_transport)))
+        (
+            state.via_host(&outbound_transport),
+            Some(state.via_port(&outbound_transport)),
+        )
     };
-    let branch = core::add_via(
-        &mut relayed.headers,
-        &transport_str,
-        &via_host,
-        via_port,
-    );
+    let branch = core::add_via(&mut relayed.headers, &transport_str, &via_host, via_port);
 
     // Add Record-Route if the script requested it.
     // When bridging transports (e.g. TLS↔TCP), insert *two* Record-Route
@@ -5058,12 +5326,36 @@ fn relay_request(
             // in-dialog requests from each leg reach the correct listener.
             // The TLS-facing RR uses the advertised address when set, since
             // external peers may not be able to reach the internal bind IP.
-            let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let outbound_host = state.advertised_addrs.get(&outbound_transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
-            let inbound_host = state.advertised_addrs.get(&inbound.transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
-            let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
+            let outbound_port = state
+                .listen_addrs
+                .get(&outbound_transport)
+                .map(|a| a.port())
+                .unwrap_or(state.local_addr.port());
+            let inbound_port = state
+                .listen_addrs
+                .get(&inbound.transport)
+                .map(|a| a.port())
+                .unwrap_or(state.local_addr.port());
+            let outbound_host = state
+                .advertised_addrs
+                .get(&outbound_transport)
+                .map(|h| format_sip_host(h))
+                .unwrap_or_else(|| internal_host.clone());
+            let inbound_host = state
+                .advertised_addrs
+                .get(&inbound.transport)
+                .map(|h| format_sip_host(h))
+                .unwrap_or_else(|| internal_host.clone());
+            let rr_outbound = format!(
+                "sip:{}:{};transport={}",
+                outbound_host,
+                outbound_port,
+                transport_str.to_lowercase()
+            );
+            let rr_inbound = format!(
+                "sip:{}:{};transport={}",
+                inbound_host, inbound_port, inbound_transport_str
+            );
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
         } else {
@@ -5075,7 +5367,12 @@ fn relay_request(
             // Record-Route outright, and a P-CSCF's protected port must match or
             // the kernel SA selector drops the in-dialog request.
             let rr_port = via_port.unwrap_or_else(|| state.via_port(&outbound_transport));
-            let rr_uri = format!("sip:{}:{};transport={}", via_host, rr_port, transport_str.to_lowercase());
+            let rr_uri = format!(
+                "sip:{}:{};transport={}",
+                via_host,
+                rr_port,
+                transport_str.to_lowercase()
+            );
             core::add_record_route(&mut relayed.headers, &rr_uri);
         }
     }
@@ -5098,27 +5395,29 @@ fn relay_request(
     // in) and is updated below for TCP/TLS once the connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
-    let retransmit_source = client_retransmit_source(
-        outbound_transport,
-        destination,
-        flow,
-        send_socket,
-    );
+    let retransmit_source =
+        client_retransmit_source(outbound_transport, destination, flow, send_socket);
     let mut inserted_session_arc: Option<Arc<RwLock<ProxySession>>> = None;
-    let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
+    let client_key_opt = match state
+        .transaction_manager
+        .new_client_transaction(relayed, txn_transport)
+    {
         Ok((client_key, actions)) => {
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
                     let timer_id = format!("{}:{:?}", client_key, name);
-                    state.timer_wheel.insert(timer_id, TimerEntry {
-                        key: client_key.clone(),
-                        name: *name,
-                        fires_at: std::time::Instant::now() + *duration,
-                        destination: Some(destination),
-                        transport: Some(outbound_transport),
-                        connection_id: Some(placeholder_connection_id),
-                        source_local_addr: retransmit_source,
-                    });
+                    state.timer_wheel.insert(
+                        timer_id,
+                        TimerEntry {
+                            key: client_key.clone(),
+                            name: *name,
+                            fires_at: std::time::Instant::now() + *duration,
+                            destination: Some(destination),
+                            transport: Some(outbound_transport),
+                            connection_id: Some(placeholder_connection_id),
+                            source_local_addr: retransmit_source,
+                        },
+                    );
                 }
             }
 
@@ -5133,11 +5432,14 @@ fn relay_request(
                     record_routed,
                 );
                 session.add_client_key(client_key.clone());
-                session.set_client_branch(client_key.clone(), ClientBranch {
-                    destination,
-                    transport: outbound_transport,
-                    connection_id: placeholder_connection_id,
-                });
+                session.set_client_branch(
+                    client_key.clone(),
+                    ClientBranch {
+                        destination,
+                        transport: outbound_transport,
+                        connection_id: placeholder_connection_id,
+                    },
+                );
                 session.on_reply_callback = on_reply_callback;
                 session.on_failure_callback = on_failure_callback;
                 let arc = state.session_store.insert(session);
@@ -5232,13 +5534,18 @@ fn relay_request(
     // the UAC instead of the UAS.  The `Arc` keeps the session alive
     // across the index removal, so the write always lands.
     if connection_id != placeholder_connection_id {
-        if let (Some(client_key), Some(arc)) = (client_key_opt.as_ref(), inserted_session_arc.as_ref()) {
+        if let (Some(client_key), Some(arc)) =
+            (client_key_opt.as_ref(), inserted_session_arc.as_ref())
+        {
             if let Ok(mut session) = arc.write() {
-                session.set_client_branch(client_key.clone(), ClientBranch {
-                    destination,
-                    transport: outbound_transport,
-                    connection_id,
-                });
+                session.set_client_branch(
+                    client_key.clone(),
+                    ClientBranch {
+                        destination,
+                        transport: outbound_transport,
+                        connection_id,
+                    },
+                );
             }
         }
     }
@@ -5273,14 +5580,28 @@ fn relay_fork_request(
 
     if target_uris.is_empty() {
         warn!("fork: no valid target URIs");
-        let response = build_response(message, 500, "No Valid Targets", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            message,
+            500,
+            "No Valid Targets",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
-    let aggregator = Arc::new(std::sync::Mutex::new(
-        ForkAggregator::new(target_uris, strategy),
-    ));
+    let aggregator = Arc::new(std::sync::Mutex::new(ForkAggregator::new(
+        target_uris,
+        strategy,
+    )));
 
     // Create ProxySession (even without server_key, we need the aggregator)
     let srv_key = match server_key {
@@ -5362,7 +5683,11 @@ fn relay_fork_request(
     let branches_to_start: Vec<usize> = match strategy {
         crate::proxy::fork::ForkStrategy::Parallel => (0..targets.len()).collect(),
         crate::proxy::fork::ForkStrategy::Sequential => {
-            if targets.is_empty() { vec![] } else { vec![0] }
+            if targets.is_empty() {
+                vec![]
+            } else {
+                vec![0]
+            }
         }
     };
 
@@ -5475,7 +5800,10 @@ fn relay_fork_branch(
                 return;
             }
         };
-        (relay_target.address, relay_target.transport.unwrap_or(inbound.transport))
+        (
+            relay_target.address,
+            relay_target.transport.unwrap_or(inbound.transport),
+        )
     };
 
     // Loop detection — check all listen addresses (including per-transport)
@@ -5546,7 +5874,10 @@ fn relay_fork_branch(
             let (host, port) = pin.via_sent_by();
             (format_sip_host(&host), port)
         }
-        None => (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
+        None => (
+            state.via_host(&outbound_transport),
+            state.via_port(&outbound_transport),
+        ),
     };
     let branch = core::add_via(
         &mut relayed.headers,
@@ -5559,12 +5890,36 @@ fn relay_fork_branch(
         let internal_host = format_sip_host(&state.local_addr.ip().to_string());
         let inbound_transport_str = format!("{}", inbound.transport).to_lowercase();
         if inbound_transport_str != transport_str.to_lowercase() {
-            let outbound_port = state.listen_addrs.get(&outbound_transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let inbound_port = state.listen_addrs.get(&inbound.transport).map(|a| a.port()).unwrap_or(state.local_addr.port());
-            let outbound_host = state.advertised_addrs.get(&outbound_transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
-            let inbound_host = state.advertised_addrs.get(&inbound.transport).map(|h| format_sip_host(h)).unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!("sip:{}:{};transport={}", outbound_host, outbound_port, transport_str.to_lowercase());
-            let rr_inbound = format!("sip:{}:{};transport={}", inbound_host, inbound_port, inbound_transport_str);
+            let outbound_port = state
+                .listen_addrs
+                .get(&outbound_transport)
+                .map(|a| a.port())
+                .unwrap_or(state.local_addr.port());
+            let inbound_port = state
+                .listen_addrs
+                .get(&inbound.transport)
+                .map(|a| a.port())
+                .unwrap_or(state.local_addr.port());
+            let outbound_host = state
+                .advertised_addrs
+                .get(&outbound_transport)
+                .map(|h| format_sip_host(h))
+                .unwrap_or_else(|| internal_host.clone());
+            let inbound_host = state
+                .advertised_addrs
+                .get(&inbound.transport)
+                .map(|h| format_sip_host(h))
+                .unwrap_or_else(|| internal_host.clone());
+            let rr_outbound = format!(
+                "sip:{}:{};transport={}",
+                outbound_host,
+                outbound_port,
+                transport_str.to_lowercase()
+            );
+            let rr_inbound = format!(
+                "sip:{}:{};transport={}",
+                inbound_host, inbound_port, inbound_transport_str
+            );
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
         } else {
@@ -5573,7 +5928,12 @@ fn relay_fork_branch(
             // listener — instead of the raw bind IP, so an external peer can route
             // in-dialog requests back through the exact host:port we advertised
             // (Teams rejects an IP in Record-Route).
-            let rr_uri = format!("sip:{}:{};transport={}", via_host, via_port, transport_str.to_lowercase());
+            let rr_uri = format!(
+                "sip:{}:{};transport={}",
+                via_host,
+                via_port,
+                transport_str.to_lowercase()
+            );
             core::add_record_route(&mut relayed.headers, &rr_uri);
         }
     }
@@ -5599,26 +5959,28 @@ fn relay_fork_branch(
     // connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
-    let retransmit_source = client_retransmit_source(
-        outbound_transport,
-        destination,
-        flow,
-        send_socket,
-    );
-    let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
+    let retransmit_source =
+        client_retransmit_source(outbound_transport, destination, flow, send_socket);
+    let client_key_opt = match state
+        .transaction_manager
+        .new_client_transaction(relayed, txn_transport)
+    {
         Ok((client_key, actions)) => {
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
                     let timer_id = format!("{}:{:?}", client_key, name);
-                    state.timer_wheel.insert(timer_id, TimerEntry {
-                        key: client_key.clone(),
-                        name: *name,
-                        fires_at: std::time::Instant::now() + *duration,
-                        destination: Some(destination),
-                        transport: Some(outbound_transport),
-                        connection_id: Some(placeholder_connection_id),
-                        source_local_addr: retransmit_source,
-                    });
+                    state.timer_wheel.insert(
+                        timer_id,
+                        TimerEntry {
+                            key: client_key.clone(),
+                            name: *name,
+                            fires_at: std::time::Instant::now() + *duration,
+                            destination: Some(destination),
+                            transport: Some(outbound_transport),
+                            connection_id: Some(placeholder_connection_id),
+                            source_local_addr: retransmit_source,
+                        },
+                    );
                 }
             }
             state.session_store.register_fork_branch(
@@ -5672,8 +6034,19 @@ fn relay_fork_branch(
             SendOutcome::sent(cid)
         }
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
-        send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, send_socket.map(|pin| pin.addr), state)
+        let relay_target = RelayTarget {
+            address: destination,
+            transport: Some(outbound_transport),
+            server_name: None,
+        };
+        send_to_target(
+            data,
+            &relay_target,
+            inbound.transport,
+            inbound.connection_id,
+            send_socket.map(|pin| pin.addr),
+            state,
+        )
     };
     let connection_id = outcome.connection_id;
 
@@ -5808,52 +6181,58 @@ fn run_proxy_failure_handlers(
     py_request.set_local_port(inbound_local_addr.port());
     py_request.set_inbound_flow(inbound_local_addr, connection_id.0);
 
-    let (forwarded, action, on_reply_callback, on_failure_callback, send_via_transport, send_via_target) =
-        Python::attach(|python| {
-            let py_reply = match Py::new(python, reply) {
-                Ok(obj) => obj,
-                Err(error) => {
-                    error!("failed to create PyReply for on_failure: {error}");
-                    return (true, RequestAction::None, None, None, None, None);
-                }
-            };
-            let py_req = match Py::new(python, py_request) {
-                Ok(obj) => obj,
-                Err(error) => {
-                    error!("failed to create PyRequest for on_failure: {error}");
-                    return (true, RequestAction::None, None, None, None, None);
-                }
-            };
+    let (
+        forwarded,
+        action,
+        on_reply_callback,
+        on_failure_callback,
+        send_via_transport,
+        send_via_target,
+    ) = Python::attach(|python| {
+        let py_reply = match Py::new(python, reply) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyReply for on_failure: {error}");
+                return (true, RequestAction::None, None, None, None, None);
+            }
+        };
+        let py_req = match Py::new(python, py_request) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyRequest for on_failure: {error}");
+                return (true, RequestAction::None, None, None, None, None);
+            }
+        };
 
-            for handler in &failure_handlers {
-                let callable = handler.callable.bind(python);
-                match callable.call1((py_req.bind(python), py_reply.bind(python))) {
-                    Ok(ret) => {
-                        if handler.is_async {
-                            if let Err(error) = run_coroutine(python, &ret) {
-                                error!("async on_failure handler error: {error}");
-                                return (true, RequestAction::None, None, None, None, None);
-                            }
+        for handler in &failure_handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((py_req.bind(python), py_reply.bind(python))) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async on_failure handler error: {error}");
+                            return (true, RequestAction::None, None, None, None, None);
                         }
                     }
-                    Err(error) => {
-                        error!("on_failure handler error: {error}");
-                        return (true, RequestAction::None, None, None, None, None);
-                    }
+                }
+                Err(error) => {
+                    error!("on_failure handler error: {error}");
+                    return (true, RequestAction::None, None, None, None, None);
                 }
             }
+        }
 
-            let forwarded = py_reply.borrow(python).was_forwarded();
-            let mut borrowed = py_req.borrow_mut(python);
-            (
-                forwarded,
-                borrowed.action().clone(),
-                borrowed.take_on_reply_callback(),
-                borrowed.take_on_failure_callback(),
-                borrowed.via_transport_override().map(|s| s.to_string()),
-                borrowed.via_target_override().map(|s| s.to_string()),
-            )
-        });
+        let forwarded = py_reply.borrow(python).was_forwarded();
+        let mut borrowed = py_req.borrow_mut(python);
+        (
+            forwarded,
+            borrowed.action().clone(),
+            borrowed.take_on_reply_callback(),
+            borrowed.take_on_failure_callback(),
+            borrowed.via_transport_override().map(|s| s.to_string()),
+            borrowed.via_target_override().map(|s| s.to_string()),
+        )
+    });
 
     let response = match Arc::try_unwrap(response_arc) {
         Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
@@ -6119,7 +6498,10 @@ fn fail_branch_locally(
     // put back the Via this proxy stamped on the outbound request — the one the
     // transaction key was built from — or the injected response matches no
     // branch and is dropped as an orphan.
-    let branch_transport = branch.as_ref().map(|b| b.transport).unwrap_or(Transport::Udp);
+    let branch_transport = branch
+        .as_ref()
+        .map(|b| b.transport)
+        .unwrap_or(Transport::Udp);
     let via_value = format!(
         "SIP/2.0/{} {};branch={}",
         branch_transport, client_key.sent_by, client_key.branch,
@@ -6140,10 +6522,7 @@ fn fail_branch_locally(
             .map(|b| b.destination)
             .unwrap_or(inbound_local_addr),
         local_addr: inbound_local_addr,
-        connection_id: branch
-            .as_ref()
-            .map(|b| b.connection_id)
-            .unwrap_or_default(),
+        connection_id: branch.as_ref().map(|b| b.connection_id).unwrap_or_default(),
         transport: branch_transport,
         data: Bytes::new(),
     };
@@ -6186,7 +6565,13 @@ fn handle_response(
             if let Ok(vias) = Via::parse_multi(top_via_raw) {
                 if let Some(branch) = vias.first().and_then(|v| v.branch.as_deref()) {
                     if branch.starts_with("z9hG4bK-reg-") {
-                        handle_registrant_response(registrant, &message, status_code, branch, state);
+                        handle_registrant_response(
+                            registrant,
+                            &message,
+                            status_code,
+                            branch,
+                            state,
+                        );
                         return;
                     }
                 }
@@ -6201,7 +6586,9 @@ fn handle_response(
                 if branch.starts_with("z9hG4bK-rec-") {
                     if let Some(session_id) = state.recording_manager.session_for_branch(branch) {
                         if (200..300).contains(&status_code) {
-                            let to_tag = message.headers.get("To")
+                            let to_tag = message
+                                .headers
+                                .get("To")
                                 .and_then(|to| to.split("tag=").nth(1))
                                 .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string());
 
@@ -6209,8 +6596,11 @@ fn handle_response(
                             // by sending the SRS's answer SDP back to RTPEngine.
                             if !message.body.is_empty() {
                                 if let Some(ref rtpengine_set) = state.rtpengine_set {
-                                    if let Some((original_call_id, original_from_tag, original_to_tag)) =
-                                        state.recording_manager.original_call_info(&session_id)
+                                    if let Some((
+                                        original_call_id,
+                                        original_from_tag,
+                                        original_to_tag,
+                                    )) = state.recording_manager.original_call_info(&session_id)
                                     {
                                         info!(
                                             session_id = %session_id,
@@ -6224,9 +6614,12 @@ fn handle_response(
                                         match tokio::task::block_in_place(|| {
                                             tokio::runtime::Handle::current().block_on(
                                                 rtpengine_set.subscribe_answer(
-                                                    &original_call_id, &original_from_tag, &original_to_tag,
-                                                    &message.body, &flags,
-                                                )
+                                                    &original_call_id,
+                                                    &original_from_tag,
+                                                    &original_to_tag,
+                                                    &message.body,
+                                                    &flags,
+                                                ),
                                             )
                                         }) {
                                             Ok(_rewritten_sdp) => {
@@ -6253,10 +6646,9 @@ fn handle_response(
                             }
 
                             // Build and send ACK for 2xx (RFC 3261 §13.2.2.4).
-                            if let Some((ack, destination, transport)) =
-                                state.recording_manager.handle_success(
-                                    &session_id, to_tag, state.local_addr,
-                                )
+                            if let Some((ack, destination, transport)) = state
+                                .recording_manager
+                                .handle_success(&session_id, to_tag, state.local_addr)
                             {
                                 let data = Bytes::from(ack.to_bytes());
                                 let target = RelayTarget {
@@ -6264,10 +6656,19 @@ fn handle_response(
                                     transport: Some(transport),
                                     server_name: None,
                                 };
-                                send_to_target(data, &target, transport, ConnectionId::default(), None, state);
+                                send_to_target(
+                                    data,
+                                    &target,
+                                    transport,
+                                    ConnectionId::default(),
+                                    None,
+                                    state,
+                                );
                             }
                         } else if status_code >= 300 {
-                            state.recording_manager.handle_failure(&session_id, status_code);
+                            state
+                                .recording_manager
+                                .handle_failure(&session_id, status_code);
                         }
                     }
                     return;
@@ -6314,7 +6715,9 @@ fn handle_response(
                 }
             }
         }
-        debug!("absorbing 100 Trying from downstream (cancelled INVITE client Timer A; not forwarded)");
+        debug!(
+            "absorbing 100 Trying from downstream (cancelled INVITE client Timer A; not forwarded)"
+        );
         return;
     }
 
@@ -6361,7 +6764,14 @@ fn handle_response(
 
     // Check if this response belongs to a B2BUA call
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
-        handle_b2bua_response(&call_id, &branch, &mut message, status_code, inbound.remote_addr, state);
+        handle_b2bua_response(
+            &call_id,
+            &branch,
+            &mut message,
+            status_code,
+            inbound.remote_addr,
+            state,
+        );
         return;
     }
 
@@ -6378,12 +6788,17 @@ fn handle_response(
                         // arrival listener for a B→A re-INVITE) so it matches the source.
                         let outbound_port = a_leg_advertised_port(
                             zombie.local_addr,
-                            state.listen_addrs.get(&zombie.transport)
+                            state
+                                .listen_addrs
+                                .get(&zombie.transport)
                                 .map(|a| a.port())
                                 .unwrap_or(state.local_addr.port()),
                         );
-                        let cseq_num = cseq_raw.split_whitespace().next()
-                            .unwrap_or("1").to_string();
+                        let cseq_num = cseq_raw
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("1")
+                            .to_string();
                         let from = message.headers.from().cloned().unwrap_or_default();
                         let to = message.headers.to().cloned().unwrap_or_default();
                         let ack_uri = SipUri::new(zombie.destination.ip().to_string())
@@ -6419,7 +6834,14 @@ fn handle_response(
                             transport: Some(zombie.transport),
                             server_name: None,
                         };
-                        send_to_target(data, &target, zombie.transport, ConnectionId::default(), zombie.local_addr, state);
+                        send_to_target(
+                            data,
+                            &target,
+                            zombie.transport,
+                            ConnectionId::default(),
+                            zombie.local_addr,
+                            state,
+                        );
                         debug!(
                             call_id = sip_call_id,
                             "B2BUA: zombie re-ACK for post-teardown re-INVITE 200 OK retransmission"
@@ -6491,7 +6913,9 @@ fn handle_response(
 
     // Parse CSeq once for both transaction processing and session routing.
     let sent_by = TransactionKey::format_sent_by(&top_via.host, top_via.port);
-    let client_txn_key = message.headers.get("CSeq")
+    let client_txn_key = message
+        .headers
+        .get("CSeq")
         .and_then(|cseq_raw| crate::sip::headers::cseq::CSeq::parse(cseq_raw).ok())
         .map(|cseq| TransactionKey::new(branch.clone(), cseq.method, sent_by.clone()));
 
@@ -6536,15 +6960,18 @@ fn handle_response(
                             }
                             Action::StartTimer(name, duration) => {
                                 let timer_id = format!("{}:{:?}", key, name);
-                                state.timer_wheel.insert(timer_id, TimerEntry {
-                                    key: key.clone(),
-                                    name: *name,
-                                    fires_at: std::time::Instant::now() + *duration,
-                                    destination: None,
-                                    transport: None,
-                                    connection_id: None,
-                                    source_local_addr: None,
-                                });
+                                state.timer_wheel.insert(
+                                    timer_id,
+                                    TimerEntry {
+                                        key: key.clone(),
+                                        name: *name,
+                                        fires_at: std::time::Instant::now() + *duration,
+                                        destination: None,
+                                        transport: None,
+                                        connection_id: None,
+                                        source_local_addr: None,
+                                    },
+                                );
                             }
                             Action::ProtocolError(message) => {
                                 warn!(key = %key, "client transaction protocol error: {message}");
@@ -6573,7 +7000,22 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch, final_response_sent, record_routed, failure_retargets) = {
+            let (
+                source_addr,
+                inbound_local_addr,
+                connection_id,
+                transport,
+                server_key,
+                fork_agg,
+                branch_index,
+                original_request,
+                relay_on_reply,
+                relay_on_failure,
+                client_branch,
+                final_response_sent,
+                record_routed,
+                failure_retargets,
+            ) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -6608,15 +7050,23 @@ fn handle_response(
             // RFC 3261 §17.1.1.3: the client transaction MUST generate an ACK
             // for non-2xx final responses to INVITE, sent hop-by-hop to the
             // same downstream destination.
-            if status_code >= 300
-                && client_key.method == crate::sip::message::Method::Invite
-            {
+            if status_code >= 300 && client_key.method == crate::sip::message::Method::Invite {
                 match client_branch {
                     Some(ref cb) => {
-                        let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
+                        let ack = build_ack_for_non2xx(
+                            &original_request,
+                            &message,
+                            &branch,
+                            cb.transport,
+                            state.local_addr,
+                        );
                         send_to_target(
                             ack.to_bytes().into(),
-                            &RelayTarget { address: cb.destination, transport: Some(cb.transport), server_name: None },
+                            &RelayTarget {
+                                address: cb.destination,
+                                transport: Some(cb.transport),
+                                server_name: None,
+                            },
                             cb.transport,
                             cb.connection_id,
                             None,
@@ -6720,108 +7170,121 @@ fn handle_response(
                     // the request: (action, on_reply, on_failure, via transport,
                     // via target).  Scoped to that callback so an on_reply
                     // callback calling relay() can never be mistaken for one.
-                    Option<(RequestAction, Option<Py<PyAny>>, Option<Py<PyAny>>, Option<String>, Option<String>)>,
+                    Option<(
+                        RequestAction,
+                        Option<Py<PyAny>>,
+                        Option<Py<PyAny>>,
+                        Option<String>,
+                        Option<String>,
+                    )>,
                 );
-                let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome = Python::attach(|python| {
-                    let py_reply_obj = PyReply::new(Arc::clone(&msg_arc))
-                        .with_response_source(
+                let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome = Python::attach(
+                    |python| {
+                        let py_reply_obj = PyReply::new(Arc::clone(&msg_arc)).with_response_source(
                             inbound.remote_addr.ip().to_string(),
                             inbound.remote_addr.port(),
                         );
-                    let py_reply = match Py::new(python, py_reply_obj) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyReply for relay callback: {error}");
-                            return (true, None, None);
-                        }
-                    };
-                    let py_req = {
-                        let mut req = PyRequest::with_local_domains(
-                            Arc::clone(&req_arc),
-                            transport.to_string(),
-                            source_addr.ip().to_string(),
-                            source_addr.port(),
-                            Arc::clone(&state.local_domains),
-                        )
-                        .with_self_identity(Arc::clone(&state.self_identity));
-                        // Replay the inbound flow capture so
-                        // registrar.save(flow_token=…) /
-                        // request.relay(flow=…) called from the
-                        // on_reply / on_failure callback see the
-                        // same listener context as the on_request
-                        // handler did (P-CSCF Path-token MT routing
-                        // — TS 24.229 §5.2.7.2).
-                        req.set_local_port(inbound_local_addr.port());
-                        req.set_inbound_flow(inbound_local_addr, connection_id.0);
-                        match Py::new(python, req) {
+                        let py_reply = match Py::new(python, py_reply_obj) {
                             Ok(obj) => obj,
                             Err(error) => {
-                                error!("failed to create PyRequest for relay callback: {error}");
+                                error!("failed to create PyReply for relay callback: {error}");
                                 return (true, None, None);
                             }
-                        }
-                    };
-                    let mut retarget = None;
-
-                    // on_reply callback: (request, reply)
-                    if let Some(ref on_reply) = relay_on_reply {
-                        let callable = on_reply.bind(python);
-                        match callable.call1((py_req.bind(python), py_reply.bind(python))) {
-                            Ok(ret) => {
-                                if let Ok(true) = is_coroutine(python, &ret) {
-                                    if let Err(error) = run_coroutine(python, &ret) {
-                                        error!("async relay on_reply callback error: {error}");
-                                    }
+                        };
+                        let py_req = {
+                            let mut req = PyRequest::with_local_domains(
+                                Arc::clone(&req_arc),
+                                transport.to_string(),
+                                source_addr.ip().to_string(),
+                                source_addr.port(),
+                                Arc::clone(&state.local_domains),
+                            )
+                            .with_self_identity(Arc::clone(&state.self_identity));
+                            // Replay the inbound flow capture so
+                            // registrar.save(flow_token=…) /
+                            // request.relay(flow=…) called from the
+                            // on_reply / on_failure callback see the
+                            // same listener context as the on_request
+                            // handler did (P-CSCF Path-token MT routing
+                            // — TS 24.229 §5.2.7.2).
+                            req.set_local_port(inbound_local_addr.port());
+                            req.set_inbound_flow(inbound_local_addr, connection_id.0);
+                            match Py::new(python, req) {
+                                Ok(obj) => obj,
+                                Err(error) => {
+                                    error!(
+                                        "failed to create PyRequest for relay callback: {error}"
+                                    );
+                                    return (true, None, None);
                                 }
                             }
-                            Err(error) => {
-                                error!("relay on_reply callback error: {error}");
-                            }
-                        }
-                    }
+                        };
+                        let mut retarget = None;
 
-                    // on_failure callback: (request, code, reason)
-                    if status_code >= 400 {
-                        if let Some(ref on_failure) = relay_on_failure {
-                            let reason = best_error_reason(status_code);
-                            let callable = on_failure.bind(python);
-                            match callable.call1((py_req.bind(python), status_code, reason)) {
+                        // on_reply callback: (request, reply)
+                        if let Some(ref on_reply) = relay_on_reply {
+                            let callable = on_reply.bind(python);
+                            match callable.call1((py_req.bind(python), py_reply.bind(python))) {
                                 Ok(ret) => {
                                     if let Ok(true) = is_coroutine(python, &ret) {
                                         if let Err(error) = run_coroutine(python, &ret) {
-                                            error!("async relay on_failure callback error: {error}");
+                                            error!("async relay on_reply callback error: {error}");
                                         }
                                     }
                                 }
                                 Err(error) => {
-                                    error!("relay on_failure callback error: {error}");
+                                    error!("relay on_reply callback error: {error}");
                                 }
                             }
-                            // A per-relay on_failure callback may re-target the
-                            // request too, on the same terms as the global
-                            // `@proxy.on_failure` handler.  Read the action here
-                            // — inside the on_failure arm — so an on_reply
-                            // callback that calls relay() is never mistaken for
-                            // a failure retarget.
-                            let mut borrowed = py_req.borrow_mut(python);
-                            if matches!(
-                                borrowed.action(),
-                                RequestAction::Relay { .. } | RequestAction::Fork { .. }
-                            ) {
-                                retarget = Some((
-                                    borrowed.action().clone(),
-                                    borrowed.take_on_reply_callback(),
-                                    borrowed.take_on_failure_callback(),
-                                    borrowed.via_transport_override().map(|s| s.to_string()),
-                                    borrowed.via_target_override().map(|s| s.to_string()),
-                                ));
+                        }
+
+                        // on_failure callback: (request, code, reason)
+                        if status_code >= 400 {
+                            if let Some(ref on_failure) = relay_on_failure {
+                                let reason = best_error_reason(status_code);
+                                let callable = on_failure.bind(python);
+                                match callable.call1((py_req.bind(python), status_code, reason)) {
+                                    Ok(ret) => {
+                                        if let Ok(true) = is_coroutine(python, &ret) {
+                                            if let Err(error) = run_coroutine(python, &ret) {
+                                                error!("async relay on_failure callback error: {error}");
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("relay on_failure callback error: {error}");
+                                    }
+                                }
+                                // A per-relay on_failure callback may re-target the
+                                // request too, on the same terms as the global
+                                // `@proxy.on_failure` handler.  Read the action here
+                                // — inside the on_failure arm — so an on_reply
+                                // callback that calls relay() is never mistaken for
+                                // a failure retarget.
+                                let mut borrowed = py_req.borrow_mut(python);
+                                if matches!(
+                                    borrowed.action(),
+                                    RequestAction::Relay { .. } | RequestAction::Fork { .. }
+                                ) {
+                                    retarget = Some((
+                                        borrowed.action().clone(),
+                                        borrowed.take_on_reply_callback(),
+                                        borrowed.take_on_failure_callback(),
+                                        borrowed.via_transport_override().map(|s| s.to_string()),
+                                        borrowed.via_target_override().map(|s| s.to_string()),
+                                    ));
+                                }
                             }
                         }
-                    }
 
-                    let reply_ref = py_reply.borrow(python);
-                    (reply_ref.was_forwarded(), reply_ref.reject_action(), retarget)
-                });
+                        let reply_ref = py_reply.borrow(python);
+                        (
+                            reply_ref.was_forwarded(),
+                            reply_ref.reject_action(),
+                            retarget,
+                        )
+                    },
+                );
                 // A per-relay on_reply callback can reject too (same contract as
                 // the global `@proxy.on_reply` handler) — fail the in-progress
                 // INVITE upstream + CANCEL downstream.  Reached only when the
@@ -6844,7 +7307,9 @@ fn handle_response(
                 // The per-relay on_failure callback re-targeted the request —
                 // start it on the same server transaction instead of answering
                 // the UAC with this failure.
-                if let Some((action, on_reply_cb, on_failure_cb, via_transport, via_target)) = cb_retarget {
+                if let Some((action, on_reply_cb, on_failure_cb, via_transport, via_target)) =
+                    cb_retarget
+                {
                     let retargeted_request = match Arc::try_unwrap(req_arc) {
                         Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
                         Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -6960,11 +7425,17 @@ fn handle_response(
                         return;
                     }
                     crate::proxy::fork::ForkAction::Forward2xx => {
-                        debug!(status = status_code, "fork: forwarding 2xx, cancelling others");
+                        debug!(
+                            status = status_code,
+                            "fork: forwarding 2xx, cancelling others"
+                        );
                         cancel_other_fork_branches(client_key, &server_key, state);
                     }
                     crate::proxy::fork::ForkAction::Forward6xx => {
-                        debug!(status = status_code, "fork: forwarding 6xx, cancelling others");
+                        debug!(
+                            status = status_code,
+                            "fork: forwarding 6xx, cancelling others"
+                        );
                         cancel_other_fork_branches(client_key, &server_key, state);
                     }
                     crate::proxy::fork::ForkAction::ForwardProvisional(_code) => {
@@ -7076,7 +7547,14 @@ fn handle_response(
                         // request arrived on.  Pass the session's captured
                         // inbound_local_addr so the OutboundRouter hits the
                         // right per-listener UDP channel.
-                        send_message_from(outcome.response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
+                        send_message_from(
+                            outcome.response,
+                            transport,
+                            source_addr,
+                            connection_id,
+                            Some(inbound_local_addr),
+                            state,
+                        );
 
                         // CDR: both forwarded paths converge here (a retrying /
                         // suppressing on_failure handler already returned above),
@@ -7108,13 +7586,11 @@ fn handle_response(
                         return;
                     }
                     crate::proxy::fork::ForkAction::TryNext(next_index) => {
-                        debug!(next_index = next_index, "fork: trying next branch (sequential)");
-                        start_next_fork_branch(
-                            next_index,
-                            &session_arc,
-                            &server_key,
-                            state,
+                        debug!(
+                            next_index = next_index,
+                            "fork: trying next branch (sequential)"
                         );
+                        start_next_fork_branch(next_index, &session_arc, &server_key, state);
                         return;
                     }
                 }
@@ -7180,7 +7656,8 @@ fn handle_response(
                 } else {
                     Some(ServerEvent::Nist(NistEvent::TuProvisional(message.clone())))
                 }
-            } else if status_code < 300 && server_key.method == crate::sip::message::Method::Invite {
+            } else if status_code < 300 && server_key.method == crate::sip::message::Method::Invite
+            {
                 Some(ServerEvent::Ist(IstEvent::Tu2xx(message.clone())))
             } else if server_key.method == crate::sip::message::Method::Invite {
                 Some(ServerEvent::Ist(IstEvent::TuNon2xxFinal(message.clone())))
@@ -7192,8 +7669,12 @@ fn handle_response(
             // SendMessage, it handles delivery — we must not send again ourselves.
             let mut sent_by_transaction = false;
             if let Some(event) = server_event {
-                if let Ok(actions) = state.transaction_manager.process_server_event(&server_key, event) {
-                    sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                if let Ok(actions) = state
+                    .transaction_manager
+                    .process_server_event(&server_key, event)
+                {
+                    sent_by_transaction =
+                        actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
                     process_timer_actions(
                         &actions,
                         &server_key,
@@ -7213,7 +7694,14 @@ fn handle_response(
                     branch = %branch,
                     "forwarding response via session"
                 );
-                send_message_from(message, transport, source_addr, connection_id, Some(inbound_local_addr), state);
+                send_message_from(
+                    message,
+                    transport,
+                    source_addr,
+                    connection_id,
+                    Some(inbound_local_addr),
+                    state,
+                );
             }
 
             // Clean up on final response
@@ -7271,10 +7759,7 @@ fn run_reply_handlers(
 
     let message_arc = Arc::new(std::sync::Mutex::new(message));
     let reply = PyReply::new(Arc::clone(&message_arc))
-        .with_response_source(
-            response_source.ip().to_string(),
-            response_source.port(),
-        );
+        .with_response_source(response_source.ip().to_string(), response_source.port());
 
     // Build a PyRequest from the original request so scripts get (request, reply)
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));
@@ -7314,7 +7799,7 @@ fn run_reply_handlers(
 
         for handler in &reply_handlers {
             let callable = handler.callable.bind(python);
-            let result = callable.call1((py_request.bind(python), py_reply.bind(python),));
+            let result = callable.call1((py_request.bind(python), py_reply.bind(python)));
             match result {
                 Ok(ret) => {
                     if handler.is_async {
@@ -7364,7 +7849,9 @@ fn run_reply_handlers(
                 "PyReply still holds message arc (async Task frame retains \
                  Py<PyReply>); cloning"
             );
-            arc.lock().unwrap_or_else(|error| error.into_inner()).clone()
+            arc.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
         }
     };
 
@@ -7532,7 +8019,11 @@ fn resolve_candidates_inner(
 ) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return vec![RelayTarget { address: addr, transport: None, server_name: None }];
+        return vec![RelayTarget {
+            address: addr,
+            transport: None,
+            server_name: None,
+        }];
     }
 
     // Try parsing as a full SIP URI
@@ -7580,7 +8071,11 @@ fn resolve_candidates_inner(
                     .and_then(transport_from_token);
                 // All candidates from one URI share the target hostname — carry
                 // it for TLS SNI so a hostname-vhost peer routes the handshake.
-                RelayTarget { address: r.address, transport, server_name: Some(uri.host.clone()) }
+                RelayTarget {
+                    address: r.address,
+                    transport,
+                    server_name: Some(uri.host.clone()),
+                }
             })
             .collect();
     }
@@ -7810,7 +8305,10 @@ struct SendOutcome {
 
 impl SendOutcome {
     fn sent(connection_id: ConnectionId) -> Self {
-        Self { connection_id, delivery_failed: false }
+        Self {
+            connection_id,
+            delivery_failed: false,
+        }
     }
 
     fn failed() -> Self {
@@ -7839,8 +8337,17 @@ fn send_to_target(
 
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
-        let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(state.hep_local_addr(local, transport), destination, transport, &data);
+        let local = state
+            .listen_addrs
+            .get(&transport)
+            .copied()
+            .unwrap_or(state.local_addr);
+        hep.capture_outbound(
+            state.hep_local_addr(local, transport),
+            destination,
+            transport,
+            &data,
+        );
     }
 
     match transport {
@@ -7962,8 +8469,11 @@ fn send_to_target(
                 let data_clone = data;
                 let server_name = target.server_name.clone();
                 match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(pool.send_tls(destination, server_name.as_deref(), data_clone))
+                    tokio::runtime::Handle::current().block_on(pool.send_tls(
+                        destination,
+                        server_name.as_deref(),
+                        data_clone,
+                    ))
                 }) {
                     Ok(connection_id) => {
                         debug!(
@@ -8290,7 +8800,10 @@ fn build_rtpproxy_backend(
     let retries = rtpproxy_config.retries;
     let handle = tokio::runtime::Handle::current();
     match tokio::task::block_in_place(|| {
-        handle.block_on(crate::rtpengine::RtpProxyClientSet::new(instance_tuples, retries))
+        handle.block_on(crate::rtpengine::RtpProxyClientSet::new(
+            instance_tuples,
+            retries,
+        ))
     }) {
         Ok(set) => {
             info!(
@@ -8331,7 +8844,9 @@ pub fn spawn_rtpengine_health_check(
     let addresses = rtpengine_set.instance_addresses();
 
     if let Some(metrics) = crate::metrics::try_metrics() {
-        metrics.rtpengine_instances_total.set(total_instances as i64);
+        metrics
+            .rtpengine_instances_total
+            .set(total_instances as i64);
         // Pre-create the per-instance label series so they appear at zero
         // before the first probe completes.
         for address in &addresses {
@@ -8344,13 +8859,11 @@ pub fn spawn_rtpengine_health_check(
 
     info!(
         instances = total_instances,
-        interval_secs,
-        "starting RTPEngine health probe"
+        interval_secs, "starting RTPEngine health probe"
     );
 
     tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
@@ -8416,8 +8929,7 @@ fn build_response(
 ) -> SipMessage {
     use crate::script::api::request::ReplyHeaderOp;
 
-    let mut builder = SipMessageBuilder::new()
-        .response(status_code, reason.to_string());
+    let mut builder = SipMessageBuilder::new().response(status_code, reason.to_string());
 
     // Copy all Via headers (response routing depends on this)
     if let Some(vias) = request.headers.get_all("Via") {
@@ -8454,7 +8966,6 @@ fn build_response(
             }
         }
     }
-
 
     // Copy Expires header for REGISTER responses (RFC 3261 §10.3 step 8).
     // The registrar.save() method sets this on the request to communicate
@@ -8536,15 +9047,17 @@ fn build_ack_for_non2xx(
         _ => SipUri::new("invalid".to_string()),
     };
 
-    let mut builder = SipMessageBuilder::new()
-        .request(Method::Ack, request_uri);
+    let mut builder = SipMessageBuilder::new().request(Method::Ack, request_uri);
 
     // Via: only our own hop with the client transaction branch
     let transport_str = format!("{}", downstream_transport).to_uppercase();
     let host = format_sip_host(&local_addr.ip().to_string());
     builder = builder.via(format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str, host, local_addr.port(), branch
+        transport_str,
+        host,
+        local_addr.port(),
+        branch
     ));
 
     if let Some(from) = original_request.headers.from() {
@@ -8781,7 +9294,10 @@ fn ipsec_pin_transport(destination: SocketAddr, transport: Transport) -> Transpo
 /// reached via the dialog route set while the INVITE was forwarded to a
 /// non-Record-Routing I-CSCF).
 fn established_peer_in_candidates(cached_ip: std::net::IpAddr, candidates: &[RelayTarget]) -> bool {
-    candidates.is_empty() || candidates.iter().any(|target| target.address.ip() == cached_ip)
+    candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|target| target.address.ip() == cached_ip)
 }
 
 /// Resolve the destination for an in-dialog request, preferring the dialog's
@@ -8833,7 +9349,11 @@ fn resolve_in_dialog_flow_uri(
         }
     };
 
-    (destination, ipsec_pin_transport(destination, transport), connection_id)
+    (
+        destination,
+        ipsec_pin_transport(destination, transport),
+        connection_id,
+    )
 }
 
 /// Choose the wire destination for a B2BUA retry INVITE that supersedes a failed
@@ -9302,8 +9822,7 @@ fn sanitize_b2bua_response(
     // re-INVITE) to a port the dialog isn't anchored on. Falls back to via_port()
     // when the arrival socket is unknown (single-listener hosts, where they match).
     let a_leg_host = state.a_leg_advertised_host(a_leg_local_addr, &a_leg_transport);
-    let a_leg_port =
-        a_leg_advertised_port(a_leg_local_addr, state.via_port(&a_leg_transport));
+    let a_leg_port = a_leg_advertised_port(a_leg_local_addr, state.via_port(&a_leg_transport));
     let contact_value = format!(
         "<sip:{}:{};transport={}>",
         a_leg_host,
@@ -9370,7 +9889,9 @@ fn sanitize_b2bua_response(
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !response.body.is_empty() {
-        response.headers.set("Content-Length", response.body.len().to_string());
+        response
+            .headers
+            .set("Content-Length", response.body.len().to_string());
     }
 }
 
@@ -9539,7 +10060,13 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
 /// mutation before the message goes on the wire (after any rtpengine rewrite),
 /// so siphon's `o=` is what the peer actually sees. A malformed `o=` line (not
 /// the RFC-mandated six fields) is left untouched.
-fn stamp_sdp_origin(body: &mut Vec<u8>, name: &str, sess_id: u64, version: u64, addr: Option<&str>) {
+fn stamp_sdp_origin(
+    body: &mut Vec<u8>,
+    name: &str,
+    sess_id: u64,
+    version: u64,
+    addr: Option<&str>,
+) {
     if body.is_empty() {
         return;
     }
@@ -9634,8 +10161,7 @@ fn build_b2bua_ack_for_non2xx(
         .and_then(|uri| parse_uri_standalone(uri).ok())
         .unwrap_or_else(|| SipUri::new("invalid".to_string()));
 
-    let mut builder = SipMessageBuilder::new()
-        .request(Method::Ack, request_uri);
+    let mut builder = SipMessageBuilder::new().request(Method::Ack, request_uri);
 
     // Via: only our own hop with the client transaction branch.
     //
@@ -9726,7 +10252,12 @@ fn send_outbound_from(
         let local = source_local_addr
             .or_else(|| state.listen_addrs.get(&transport).copied())
             .unwrap_or(state.local_addr);
-        hep.capture_outbound(state.hep_local_addr(local, transport), destination, transport, &data);
+        hep.capture_outbound(
+            state.hep_local_addr(local, transport),
+            destination,
+            transport,
+            &data,
+        );
     }
 
     let outbound_message = OutboundMessage {
@@ -9759,7 +10290,9 @@ fn send_messages_in_order_from(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
-    let mut frames = messages.into_iter().map(|message| Bytes::from(message.to_bytes()));
+    let mut frames = messages
+        .into_iter()
+        .map(|message| Bytes::from(message.to_bytes()));
     let Some(first) = frames.next() else {
         return;
     };
@@ -9812,7 +10345,11 @@ fn send_frames_in_order_from(
         data: first,
         source_local_addr,
         server_name: None,
-        followups: if followups.is_empty() { None } else { Some(followups) },
+        followups: if followups.is_empty() {
+            None
+        } else {
+            Some(followups)
+        },
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
@@ -9844,7 +10381,14 @@ fn send_message_from(
         "sending message"
     );
 
-    send_outbound_from(data, transport, destination, connection_id, source_local_addr, state);
+    send_outbound_from(
+        data,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        state,
+    );
 }
 
 /// Drain deferred messages queued by presence.notify() etc. during the handler
@@ -9881,17 +10425,18 @@ fn flush_deferred_sends(_state: &DispatcherState) {
 /// The BYE uses only the target leg's dialog identifiers (Call-ID, From/To
 /// tags), route set, Contact, and CSeq. No headers from the originating leg
 /// are included.
-fn build_b2bua_bye(
-    leg: &crate::b2bua::actor::Leg,
-    state: &DispatcherState,
-) -> Option<SipMessage> {
+fn build_b2bua_bye(leg: &crate::b2bua::actor::Leg, state: &DispatcherState) -> Option<SipMessage> {
     let dialog = &leg.dialog;
 
     // R-URI: remote Contact (RFC 3261 §12.2.1.1)
-    let ruri = dialog.remote_contact.as_deref()
+    let ruri = dialog
+        .remote_contact
+        .as_deref()
         .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
         .unwrap_or_else(|| {
-            dialog.target_uri.as_deref()
+            dialog
+                .target_uri
+                .as_deref()
                 .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
                 .unwrap_or_else(|| SipUri::new("invalid".to_string()))
         });
@@ -9924,7 +10469,9 @@ fn build_b2bua_bye(
     let to_header = match &dialog.remote_to_uri {
         Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
         None => {
-            let to_uri = dialog.remote_contact.as_deref()
+            let to_uri = dialog
+                .remote_contact
+                .as_deref()
                 .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
             match &dialog.remote_tag {
                 Some(tag) => format!("<{}>;tag={}", to_uri, tag),
@@ -10076,11 +10623,15 @@ fn build_b2bua_prack_message(
     // provisional that established this early dialog (RFC 3261 §12.1.2), NOT the
     // To AoR. Falls back to the leg's stored remote_contact, then target_uri,
     // only when the provisional carried no Contact.
-    let ruri = target.remote_contact.as_deref()
+    let ruri = target
+        .remote_contact
+        .as_deref()
         .or(dialog.remote_contact.as_deref())
         .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
         .unwrap_or_else(|| {
-            dialog.target_uri.as_deref()
+            dialog
+                .target_uri
+                .as_deref()
                 .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
                 .unwrap_or_else(|| SipUri::new("invalid".to_string()))
         });
@@ -10108,7 +10659,9 @@ fn build_b2bua_prack_message(
         None => match &dialog.remote_to_uri {
             Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
             None => {
-                let to_uri = dialog.remote_contact.as_deref()
+                let to_uri = dialog
+                    .remote_contact
+                    .as_deref()
                     .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
                 match &dialog.remote_tag {
                     Some(tag) => format!("<{}>;tag={}", to_uri, tag),
@@ -10127,7 +10680,10 @@ fn build_b2bua_prack_message(
         .cseq(format!("{} PRACK", local_cseq))
         .header("Max-Forwards", "70".to_string())
         // RFC 3262 §7.2: RAck = "<rseq> <cseq-num> <cseq-method>".
-        .header("RAck", format!("{rseq} {response_cseq_num} {response_cseq_method}"));
+        .header(
+            "RAck",
+            format!("{rseq} {response_cseq_num} {response_cseq_method}"),
+        );
 
     if let Some(ref contact) = dialog.local_contact {
         builder = builder.header("Contact", contact.clone());
@@ -10248,12 +10804,12 @@ fn arm_b2bua_retransmit(
     // covers every site that emits a CANCEL (answer timeout, LCR ring timeout,
     // upstream CANCEL relay, deferred CANCEL drain) from one place.
     if method == crate::sip::message::Method::Cancel {
-        state.b2bua_retransmits.disarm(
-            &crate::b2bua::retransmit::RetransmitKey::new(
+        state
+            .b2bua_retransmits
+            .disarm(&crate::b2bua::retransmit::RetransmitKey::new(
                 branch.clone(),
                 crate::sip::message::Method::Invite,
-            ),
-        );
+            ));
     }
 
     state.b2bua_retransmits.arm(
@@ -10307,7 +10863,9 @@ fn disarm_b2bua_retransmit_for_response(message: &SipMessage, state: &Dispatcher
 
     state
         .b2bua_retransmits
-        .disarm(&crate::b2bua::retransmit::RetransmitKey::new(branch, method));
+        .disarm(&crate::b2bua::retransmit::RetransmitKey::new(
+            branch, method,
+        ));
 }
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
@@ -10379,9 +10937,7 @@ pub fn inject_python_singletons(config: &Config) {
     let py_log = PyLogNamespace::new();
 
     // Proxy utilities (rate limiter, sanity check, ENUM lookup, memory stats)
-    let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(
-        dns_resolver,
-    );
+    let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(dns_resolver);
 
     // Cache namespace (local LRU + optional Redis)
     let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(
@@ -10392,12 +10948,19 @@ pub fn inject_python_singletons(config: &Config) {
     // Store singletons in the global so install_siphon_module() will inject
     // them each time it (re-)creates the module.
     Python::attach(|python| {
-        if let Err(error) =
-            crate::script::api::set_rust_singletons(python, py_auth, py_registrar, py_log, py_proxy_utils, py_cache)
-        {
+        if let Err(error) = crate::script::api::set_rust_singletons(
+            python,
+            py_auth,
+            py_registrar,
+            py_log,
+            py_proxy_utils,
+            py_cache,
+        ) {
             error!("failed to store Rust singletons: {error}");
         } else {
-            info!("Rust-backed auth, registrar, log, proxy utils, and cache registered for injection");
+            info!(
+                "Rust-backed auth, registrar, log, proxy utils, and cache registered for injection"
+            );
         }
     });
 
@@ -10421,11 +10984,7 @@ fn rf_extract_icid(message: &SipMessage) -> Option<String> {
 /// missing (an in-dialog request without a From-tag would be malformed).
 fn rf_extract_dialog_parts(message: &SipMessage) -> Option<(String, String)> {
     let call_id = message.headers.get("Call-ID")?.to_string();
-    let from_tag = message
-        .typed_from()
-        .ok()
-        .flatten()
-        .and_then(|na| na.tag)?;
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag)?;
     Some((call_id, from_tag))
 }
 
@@ -10966,7 +11525,7 @@ fn spawn_rf_proxy_start_if_invite(
     session_arc: &Arc<std::sync::RwLock<crate::proxy::session::ProxySession>>,
 ) {
     use crate::diameter::rf_service::{
-        rf_icid_key, rf_dialog_key as build_rf_dialog_key, rf_session_storage_keys, RfRole,
+        rf_dialog_key as build_rf_dialog_key, rf_icid_key, rf_session_storage_keys, RfRole,
     };
 
     let charger = match state.rf_charger.as_ref() {
@@ -11018,9 +11577,8 @@ fn spawn_rf_proxy_start_if_invite(
     // Drained from the side-map keyed by the inbound dialog key so a
     // BGCF script that picked a gateway via gateway.select(...) can
     // stamp the trunk-group-id without writing the whole ACR by hand.
-    let drained_params = crate::diameter::rf_service::read_rf_charging_params(
-        &format!("{}\0{}", call_id, from_tag),
-    );
+    let drained_params =
+        crate::diameter::rf_service::read_rf_charging_params(&format!("{}\0{}", call_id, from_tag));
     crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained_params);
 
     // Resolve the RfRole from the request's role_of_node — defaults
@@ -11069,8 +11627,7 @@ fn spawn_rf_proxy_start_if_invite(
             .as_deref()
             .filter(|uri| local_predicate(uri))
             .filter(|_| {
-                charger.node_functionality()
-                    == Some(crate::diameter::ro::NodeFunctionality::SCscf)
+                charger.node_functionality() == Some(crate::diameter::ro::NodeFunctionality::SCscf)
             })
             .map(str::to_owned)
     } else {
@@ -11083,12 +11640,8 @@ fn spawn_rf_proxy_start_if_invite(
         // Dual-ACR (TS 32.260 §5.1): spawn the originating record
         // AND a parallel terminating record.  Each gets its own set
         // of storage keys (ICID + dialog fallback, both with `:term`).
-        let term_keys = rf_session_storage_keys(
-            icid.as_deref(),
-            &call_id,
-            &from_tag,
-            RfRole::Terminating,
-        );
+        let term_keys =
+            rf_session_storage_keys(icid.as_deref(), &call_id, &from_tag, RfRole::Terminating);
         // TERM-side dedupe: the terminating leg of an intra-node call reaches
         // this function on its own 2xx and resolves to the same `:term` key,
         // so without the in-flight reservation both it and this speculative
@@ -11146,12 +11699,7 @@ fn spawn_rf_proxy_start_if_invite(
     // to (orig for MO legs / S-CSCF dual-ACR primary; term for the
     // standalone MT leg of an intra-NF call where the same NF sees
     // both legs separately).
-    let primary_keys = rf_session_storage_keys(
-        icid.as_deref(),
-        &call_id,
-        &from_tag,
-        primary_role,
-    );
+    let primary_keys = rf_session_storage_keys(icid.as_deref(), &call_id, &from_tag, primary_role);
     let mut ims_primary = ims_data;
     // ims_data_from_request always sets a role, but defend against
     // future refactors that might leave it None.
@@ -11165,10 +11713,9 @@ fn spawn_rf_proxy_start_if_invite(
     // standalone terminating leg of an intra-node call is the callee — taking
     // the calling party unconditionally put the caller's IMPU on the callee's
     // record.
-    let primary_user_name =
-        crate::diameter::rf_service::served_party_identities(&ims_primary)
-            .into_iter()
-            .next();
+    let primary_user_name = crate::diameter::rf_service::served_party_identities(&ims_primary)
+        .into_iter()
+        .next();
     tokio::spawn(async move {
         let _reservation = primary_reservation;
         let session = match charger
@@ -11219,16 +11766,8 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
 
     let icid = rf_extract_icid(bye);
     let call_id = bye.headers.get("Call-ID").cloned();
-    let from_tag = bye
-        .typed_from()
-        .ok()
-        .flatten()
-        .and_then(|na| na.tag);
-    let to_tag = bye
-        .typed_to()
-        .ok()
-        .flatten()
-        .and_then(|na| na.tag);
+    let from_tag = bye.typed_from().ok().flatten().and_then(|na| na.tag);
+    let to_tag = bye.typed_to().ok().flatten().and_then(|na| na.tag);
 
     let candidates = rf_lookup_candidates(
         icid.as_deref(),
@@ -11447,10 +11986,7 @@ pub async fn ro_authorize_b2bua(
 
 /// Build a `SubscriberId` from a script `(id, type)` pair, inferring a `sip:`/
 /// `tel:` URI when the type is omitted (never mislabels a SIP URI as E.164).
-fn build_ro_subscriber(
-    id: &str,
-    id_type: Option<&str>,
-) -> crate::diameter::ro::SubscriberId {
+fn build_ro_subscriber(id: &str, id_type: Option<&str>) -> crate::diameter::ro::SubscriberId {
     use crate::diameter::ro::SubscriberId;
     match id_type.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("e164") | Some("msisdn") => SubscriberId::msisdn(id),
@@ -11515,11 +12051,7 @@ fn spawn_ro_b2bua_answer(state: &DispatcherState, internal_call_id: &str) {
 /// why a call ended, so both take it from [`parse_reason_cause`] / the SIP
 /// status via [`crate::diameter::rf::sip_status_to_cause_code`]. `None` means a
 /// normal end and is reported as `0`.
-fn spawn_ro_b2bua_stop(
-    state: &DispatcherState,
-    internal_call_id: &str,
-    cause_code: Option<i32>,
-) {
+fn spawn_ro_b2bua_stop(state: &DispatcherState, internal_call_id: &str, cause_code: Option<i32>) {
     if state.ro_charger.is_none() {
         return;
     }
@@ -11605,9 +12137,10 @@ fn spawn_rf_b2bua_start(
     // Drain any script-supplied charging params keyed by the A-leg
     // dialog (BGCF / MGCF auto-emit stamping trunk-group-id, etc.).
     if let Some((call_id, from_tag)) = rf_extract_dialog_parts(&invite_clone) {
-        let drained = crate::diameter::rf_service::read_rf_charging_params(
-            &format!("{}\0{}", call_id, from_tag),
-        );
+        let drained = crate::diameter::rf_service::read_rf_charging_params(&format!(
+            "{}\0{}",
+            call_id, from_tag
+        ));
         crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained);
     }
     // B2BUA mode → Role-of-Node = B2BUA_ROLE per TS 32.299 §7.2.149,
@@ -11667,11 +12200,7 @@ fn parse_reason_cause(message: &SipMessage) -> Option<i32> {
         .and_then(crate::diameter::rf::sip_status_to_cause_code)
 }
 
-fn spawn_rf_b2bua_stop(
-    state: &DispatcherState,
-    internal_call_id: &str,
-    cause_code: Option<i32>,
-) {
+fn spawn_rf_b2bua_stop(state: &DispatcherState, internal_call_id: &str, cause_code: Option<i32>) {
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
         _ => return,
@@ -11790,7 +12319,13 @@ fn cancel_fork_branches(
                 "fork: cancelling branch"
             );
 
-            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
+            send_outbound(
+                data,
+                client_branch.transport,
+                client_branch.destination,
+                client_branch.connection_id,
+                state,
+            );
         }
     }
 }
@@ -11863,7 +12398,10 @@ fn reject_pending_invite(
 
     let event = ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()));
     let mut sent_by_transaction = false;
-    if let Ok(actions) = state.transaction_manager.process_server_event(server_key, event) {
+    if let Ok(actions) = state
+        .transaction_manager
+        .process_server_event(server_key, event)
+    {
         sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
         process_timer_actions(
             &actions,
@@ -11880,7 +12418,14 @@ fn reject_pending_invite(
         // No live server transaction (or it emitted no SendMessage) — send the
         // error directly, pinning the inbound listener's local address so an
         // IPsec-protected response egresses on the right SA (TS 33.203 §7.4).
-        send_message_from(response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
+        send_message_from(
+            response,
+            transport,
+            source_addr,
+            connection_id,
+            Some(inbound_local_addr),
+            state,
+        );
     }
 }
 
@@ -11891,7 +12436,17 @@ fn start_next_fork_branch(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
-    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow, branch_path, send_socket) = {
+    let (
+        original_request,
+        record_routed,
+        source_addr,
+        connection_id,
+        transport,
+        agg,
+        branch_flow,
+        branch_path,
+        send_socket,
+    ) = {
         let session = match session_arc.read() {
             Ok(s) => s,
             Err(_) => return,
@@ -11906,7 +12461,11 @@ fn start_next_fork_branch(
             session.fork_flows.get(next_index).cloned().flatten(),
             // The failover branch's own Path route set — the whole reason
             // sequential forking across an AoR's bindings can work at all.
-            session.fork_routes.get(next_index).cloned().unwrap_or_default(),
+            session
+                .fork_routes
+                .get(next_index)
+                .cloned()
+                .unwrap_or_default(),
             session.fork_send_socket.clone(),
         )
     };
@@ -11921,7 +12480,10 @@ fn start_next_fork_branch(
             Ok(a) => a,
             Err(_) => return,
         };
-        agg_lock.branches.get(next_index).map(|b| b.target.to_string())
+        agg_lock
+            .branches
+            .get(next_index)
+            .map(|b| b.target.to_string())
     };
 
     if let Some(target_str) = target {
@@ -12008,7 +12570,11 @@ fn handle_cancel(
     // --- Try ProxySession-based CANCEL routing first ---
     // CANCEL shares the same Via branch as the INVITE it cancels.
     // Build the server key for the original INVITE transaction.
-    let invite_server_key = TransactionKey::new(uac_branch.to_string(), crate::sip::message::Method::Invite, uac_sent_by.to_string());
+    let invite_server_key = TransactionKey::new(
+        uac_branch.to_string(),
+        crate::sip::message::Method::Invite,
+        uac_sent_by.to_string(),
+    );
 
     // Already accepted a CANCEL for this INVITE — this is a retransmission
     // (RFC 3261 §9.2). Answer 200 as the CANCEL's own server transaction would
@@ -12018,7 +12584,14 @@ fn handle_cancel(
     if state.cancelled_invites.contains_key(&invite_server_key) {
         debug!(uac_branch = %uac_branch, "CANCEL retransmission — answering 200, side effects already done");
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -12029,8 +12602,21 @@ fn handle_cancel(
 
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
-    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+    let response = build_response(
+        &message,
+        481,
+        "Call/Transaction Does Not Exist",
+        state.server_header.as_deref(),
+        &[],
+    );
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
 }
 
 /// Remember that a CANCEL was accepted for `key`, for the 64×T1 window a
@@ -12287,8 +12873,21 @@ fn handle_cancel_via_session(
         Ok(s) => s,
         Err(_) => {
             error!("ProxySession lock poisoned during CANCEL handling");
-            let response = build_response(&message, 500, "Internal Server Error", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+            let response = build_response(
+                &message,
+                500,
+                "Internal Server Error",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     };
@@ -12330,7 +12929,13 @@ fn handle_cancel_via_session(
                 "forwarding CANCEL downstream via session"
             );
 
-            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
+            send_outbound(
+                data,
+                client_branch.transport,
+                client_branch.destination,
+                client_branch.connection_id,
+                state,
+            );
         }
     }
 
@@ -12455,8 +13060,14 @@ fn build_cancel_from_invite(invite: &SipMessage) -> Option<SipMessage> {
     // Everything else is dropped per RFC 3261 §9.1 + §20 (CANCEL is
     // hop-by-hop, carries no offer/answer, no dialog-establishing data).
     const KEEP: &[&str] = &[
-        "via", "from", "to", "call-id", "cseq",
-        "max-forwards", "route", "content-length",
+        "via",
+        "from",
+        "to",
+        "call-id",
+        "cseq",
+        "max-forwards",
+        "route",
+        "content-length",
     ];
     let to_remove: Vec<String> = cancel
         .headers
@@ -12472,12 +13083,10 @@ fn build_cancel_from_invite(invite: &SipMessage) -> Option<SipMessage> {
 }
 
 /// Handle CANCEL for a B2BUA call — cancel all pending B-legs.
-fn handle_b2bua_cancel(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
-    let sip_call_id = message.headers.get("Call-ID")
+fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
         .map(|s| s.to_string())
         .unwrap_or_default();
 
@@ -12485,8 +13094,21 @@ fn handle_b2bua_cancel(
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA CANCEL: no matching call");
-            let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+            let response = build_response(
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     };
@@ -12506,7 +13128,14 @@ fn handle_b2bua_cancel(
     if call.state != CallState::Calling && call.state != CallState::Ringing {
         debug!(call_id = %call_id, state = ?call.state, "B2BUA CANCEL: call already answered/terminated");
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         drop(call);
         return;
     }
@@ -12595,7 +13224,13 @@ fn handle_b2bua_cancel(
 
     // The 487 to the A-leg leaves on the socket the CANCEL (== the INVITE) arrived
     // on, so a multi-homed UDP host answers with a consistent source port.
-    let response_487 = build_response(&message, 487, "Request Terminated", state.server_header.as_deref(), &[]);
+    let response_487 = build_response(
+        &message,
+        487,
+        "Request Terminated",
+        state.server_header.as_deref(),
+        &[],
+    );
     send_message_from(
         response_487,
         a_leg.transport.transport,
@@ -12690,8 +13325,13 @@ fn run_b2bua_cancel_handlers(
         }
     };
 
-    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip, a_leg_transport)
-        .with_flow(a_leg_flow);
+    let py_call = PyCall::new(
+        call_id.to_string(),
+        invite_arc,
+        a_leg_source_ip,
+        a_leg_transport,
+    )
+    .with_flow(a_leg_flow);
 
     Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
@@ -12730,8 +13370,7 @@ fn set_b2bua_answer_deadline(call_id: &str, timeout_secs: u32, state: &Dispatche
     if timeout_secs == 0 {
         return;
     }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
     state.call_actors.set_answer_deadline(call_id, deadline);
 }
 
@@ -13096,14 +13735,19 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // Control-plane handoff deadline: a call parked under external control whose
     // controller never accepted + acted in time. Apply the parked default action
     // (503) instead of the 408 answer-timeout path.
-    let handoff = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| (call.is_handoff_pending(), call.control_app.clone().unwrap_or_default()));
+    let handoff = state.call_actors.get_call(call_id).map(|call| {
+        (
+            call.is_handoff_pending(),
+            call.control_app.clone().unwrap_or_default(),
+        )
+    });
     if let Some((true, app)) = handoff {
         warn!(call_id = %call_id, %app, "control plane: handoff deadline — no controller acted, applying default (503)");
-        crate::metrics::try_metrics()
-            .inspect(|m| m.control_handoff_timeouts_total.with_label_values(&[&app]).inc());
+        crate::metrics::try_metrics().inspect(|m| {
+            m.control_handoff_timeouts_total
+                .with_label_values(&[&app])
+                .inc()
+        });
         b2bua_reject_call(call_id, 503, "No Controller Response");
         return;
     }
@@ -13136,7 +13780,8 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 if !matches!(call.state, CallState::Calling | CallState::Ringing) {
                     return;
                 }
-                let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
+                let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> =
+                    Vec::new();
                 for b_leg in &call.b_legs {
                     // We are giving up on this call, so stop retransmitting the
                     // request that never drew a response. The CANCEL emitted
@@ -13177,9 +13822,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // LCR / sequential failover: the current carrier did not answer within its
     // ring timeout. If more carriers remain and 408 is a reroute cause for this
     // carrier, CANCEL this attempt and advance instead of failing the call.
-    if state.call_actors.has_pending_routes(call_id)
-        && b2bua_status_reroutes(call_id, 408, state)
-    {
+    if state.call_actors.has_pending_routes(call_id) && b2bua_status_reroutes(call_id, 408, state) {
         state.call_actors.record_route_failure(call_id, 408);
         // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1) and
         // mark them cancelled so their stray 487s are absorbed.
@@ -13259,8 +13902,13 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // Send 408 Request Timeout to the A-leg (final response to its INVITE).
     if let Some(invite_arc) = &a_leg_invite {
         if let Ok(invite) = invite_arc.lock() {
-            let mut response =
-                build_response(&invite, 408, "Request Timeout", state.server_header.as_deref(), &[]);
+            let mut response = build_response(
+                &invite,
+                408,
+                "Request Timeout",
+                state.server_header.as_deref(),
+                &[],
+            );
             // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
             // on our 1xx) so the final response terminates the same dialog.
             stamp_uas_to_tag(&mut response, &a_leg.dialog.local_tag);
@@ -13321,22 +13969,25 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
 ///
 /// Creates a Call object, invokes `@b2bua.on_invite`, and processes the
 /// script's action (dial, fork, reject).
-fn handle_b2bua_invite(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
-    let sip_call_id = message.headers.get("Call-ID")
+fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
         .unwrap_or(&"unknown".to_string())
         .clone();
-    let from_tag = message.headers.get("From")
+    let from_tag = message
+        .headers
+        .get("From")
         .and_then(|f| {
-            f.split(';').find(|p| p.trim().starts_with("tag="))
+            f.split(';')
+                .find(|p| p.trim().starts_with("tag="))
                 .map(|t| t.trim().trim_start_matches("tag=").to_string())
         })
         .unwrap_or_default();
 
-    let via_branch = message.headers.get("Via")
+    let via_branch = message
+        .headers
+        .get("Via")
         .and_then(|raw| Via::parse_multi(raw).ok())
         .and_then(|vias| vias.into_iter().next())
         .and_then(|v| v.branch)
@@ -13354,7 +14005,11 @@ fn handle_b2bua_invite(
     // SIP Call-ID, this is a retransmission — absorb it silently.
     // Without this check, each UDP retransmission would create a new call and
     // spawn duplicate B-leg INVITEs.
-    if state.call_actors.find_by_sip_call_id(&sip_call_id).is_some() {
+    if state
+        .call_actors
+        .find_by_sip_call_id(&sip_call_id)
+        .is_some()
+    {
         debug!(
             call_id = %sip_call_id,
             "B2BUA: absorbing INVITE retransmission (call already exists)"
@@ -13402,10 +14057,20 @@ fn handle_b2bua_invite(
                                 "B2BUA: rejecting INVITE with 486 — Replaces carries early-only but the dialog is confirmed"
                             );
                             let response = build_response(
-                                &message, 486, "Busy Here",
-                                state.server_header.as_deref(), &[],
+                                &message,
+                                486,
+                                "Busy Here",
+                                state.server_header.as_deref(),
+                                &[],
                             );
-                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            send_message_from(
+                                response,
+                                inbound.transport,
+                                inbound.remote_addr,
+                                inbound.connection_id,
+                                Some(inbound.local_addr),
+                                state,
+                            );
                             return;
                         }
                         if !confirmed {
@@ -13415,10 +14080,20 @@ fn handle_b2bua_invite(
                                 "B2BUA: rejecting INVITE with 486 — Replaces names a dialog that is not answered"
                             );
                             let response = build_response(
-                                &message, 486, "Busy Here",
-                                state.server_header.as_deref(), &[],
+                                &message,
+                                486,
+                                "Busy Here",
+                                state.server_header.as_deref(),
+                                &[],
                             );
-                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            send_message_from(
+                                response,
+                                inbound.transport,
+                                inbound.remote_addr,
+                                inbound.connection_id,
+                                Some(inbound.local_addr),
+                                state,
+                            );
                             return;
                         }
                         // Off unless the operator enabled it. Taking a party
@@ -13437,10 +14112,20 @@ fn handle_b2bua_invite(
                                 "B2BUA: declining INVITE with Replaces — b2bua.accept_replaces is not enabled"
                             );
                             let response = build_response(
-                                &message, 603, "Decline",
-                                state.server_header.as_deref(), &[],
+                                &message,
+                                603,
+                                "Decline",
+                                state.server_header.as_deref(),
+                                &[],
                             );
-                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            send_message_from(
+                                response,
+                                inbound.transport,
+                                inbound.remote_addr,
+                                inbound.connection_id,
+                                Some(inbound.local_addr),
+                                state,
+                            );
                             return;
                         }
                         debug!(
@@ -13469,7 +14154,14 @@ fn handle_b2bua_invite(
                             state.server_header.as_deref(),
                             &[],
                         );
-                        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                        send_message_from(
+                            response,
+                            inbound.transport,
+                            inbound.remote_addr,
+                            inbound.connection_id,
+                            Some(inbound.local_addr),
+                            state,
+                        );
                         return;
                     }
                 }
@@ -13487,7 +14179,14 @@ fn handle_b2bua_invite(
                     state.server_header.as_deref(),
                     &[],
                 );
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
                 return;
             }
         }
@@ -13537,7 +14236,9 @@ fn handle_b2bua_invite(
     ));
 
     // Capture the caller's Contact URI (remote_contact for A-leg)
-    if let Some(contact) = message.headers.get("Contact")
+    if let Some(contact) = message
+        .headers
+        .get("Contact")
         .or_else(|| message.headers.get("m"))
     {
         a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
@@ -13560,7 +14261,8 @@ fn handle_b2bua_invite(
     if let Some(to) = message.headers.to() {
         // Replace/add our tag (the INVITE's To may not have a tag yet)
         let tag_stripped = to.split(";tag=").next().unwrap_or(to);
-        a_leg.dialog.local_from_uri = Some(format!("{};tag={}", tag_stripped, a_leg.dialog.local_tag));
+        a_leg.dialog.local_from_uri =
+            Some(format!("{};tag={}", tag_stripped, a_leg.dialog.local_tag));
     }
     if let Some(from) = message.headers.from() {
         a_leg.dialog.remote_to_uri = Some(from.clone());
@@ -13637,7 +14339,20 @@ fn handle_b2bua_invite(
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None, None, None, None, None, false, None);
+                return (
+                    CallAction::None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                );
             }
         };
 
@@ -13648,19 +14363,45 @@ fn handle_b2bua_invite(
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             error!("async B2BUA on_invite handler error: {error}");
-                            return (CallAction::Reject {
-                                code: 500,
-                                reason: "Script Error".to_string(),
-                            }, None, None, false, false, None, None, None, None, None, false, None);
+                            return (
+                                CallAction::Reject {
+                                    code: 500,
+                                    reason: "Script Error".to_string(),
+                                },
+                                None,
+                                None,
+                                false,
+                                false,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
+                            );
                         }
                     }
                 }
                 Err(error) => {
                     error!("B2BUA on_invite handler error: {error}");
-                    return (CallAction::Reject {
-                        code: 500,
-                        reason: "Script Error".to_string(),
-                    }, None, None, false, false, None, None, None, None, None, false, None);
+                    return (
+                        CallAction::Reject {
+                            code: 500,
+                            reason: "Script Error".to_string(),
+                        },
+                        None,
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                    );
                 }
             }
         }
@@ -13668,7 +14409,9 @@ fn handle_b2bua_invite(
         let borrowed = call_obj.borrow(python);
         let action = borrowed.action().clone();
         let timer_override = borrowed.session_timer_override().cloned();
-        let credentials = borrowed.outbound_credentials().map(|(u, p)| (u.to_string(), p.to_string()));
+        let credentials = borrowed
+            .outbound_credentials()
+            .map(|(u, p)| (u.to_string(), p.to_string()));
         let li_record = borrowed.li_record();
         let preserve_cid = borrowed.preserve_call_id();
         let policy_input = borrowed.header_policy_input().cloned();
@@ -13678,11 +14421,26 @@ fn handle_b2bua_invite(
         let contact_ovr = borrowed.contact_override().map(String::from);
         let auth_passthrough = borrowed.auth_passthrough();
         let auth_user = borrowed.get_auth_user().map(String::from);
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr, auth_passthrough, auth_user)
+        (
+            action,
+            timer_override,
+            credentials,
+            li_record,
+            preserve_cid,
+            policy_input,
+            from_host_ovr,
+            to_host_ovr,
+            contact_user_ovr,
+            contact_ovr,
+            auth_passthrough,
+            auth_user,
+        )
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
-    state.call_actors.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
+    state
+        .call_actors
+        .set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
     // A caller that answered a digest challenge inside `@b2bua.on_invite`
     // (`auth.require_proxy_digest(call, …)`) authenticated after
@@ -13801,13 +14559,7 @@ fn handle_b2bua_invite(
     // new one to route, and the dial plan has no say in where it goes.
     if !matches!(action, CallAction::Reject { .. } | CallAction::None) {
         if let Some(pending) = state.call_actors.take_pending_replaces(&call_id) {
-            b2bua_bridge_inbound_replaces(
-                &inbound,
-                &message_guard,
-                &call_id,
-                &pending,
-                state,
-            );
+            b2bua_bridge_inbound_replaces(&inbound, &message_guard, &call_id, &pending, state);
             return;
         }
     }
@@ -13820,7 +14572,13 @@ fn handle_b2bua_invite(
         }
         CallAction::Reject { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
-            let mut response = build_response(&message_guard, code, &reason, state.server_header.as_deref(), &[]);
+            let mut response = build_response(
+                &message_guard,
+                code,
+                &reason,
+                state.server_header.as_deref(),
+                &[],
+            );
             // siphon is the UAS on the A-leg, so this locally-generated final
             // response needs the dialog's UAS To-tag (RFC 3261 §8.2.6.2) — same
             // as the 408-timeout path. Load-bearing for a digest challenge:
@@ -13834,11 +14592,25 @@ fn handle_b2bua_invite(
             {
                 stamp_uas_to_tag(&mut response, &local_tag);
             }
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, flow, route, send_socket, timeout } => {
+        CallAction::Dial {
+            target,
+            next_hop,
+            flow,
+            route,
+            send_socket,
+            timeout,
+        } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
@@ -13866,7 +14638,14 @@ fn handle_b2bua_invite(
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, flows, routes, strategy: _, send_socket, timeout } => {
+        CallAction::Fork {
+            targets,
+            flows,
+            routes,
+            strategy: _,
+            send_socket,
+            timeout,
+        } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             for (index, target) in targets.iter().enumerate() {
@@ -13898,7 +14677,11 @@ fn handle_b2bua_invite(
             }
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::RouteSequence { mut routes, send_socket, default_timeout } => {
+        CallAction::RouteSequence {
+            mut routes,
+            send_socket,
+            default_timeout,
+        } => {
             // LCR / sequential failover: dial the first routable carrier, keep
             // the rest as the call's failover queue, and advance on B-leg
             // reject/timeout (see b2bua_advance_route). Each attempt is a fresh
@@ -13924,8 +14707,21 @@ fn handle_b2bua_invite(
                 // No carrier was routable (e.g. every gateway group down and no
                 // explicit next-hop) — answer the A-leg 503 instead of stalling.
                 debug!(call_id = %call_id, "B2BUA: LCR — no routable carrier");
-                let response = build_response(&message_guard, 503, "No Route", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                let response = build_response(
+                    &message_guard,
+                    503,
+                    "No Route",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
                 state.call_actors.remove_call(&call_id);
                 state.call_event_receivers.remove(&call_id);
             }
@@ -13952,7 +14748,15 @@ fn handle_b2bua_invite(
             // confirmed and @b2bua.on_bye takes over when the UAC BYEs.
             debug!(call_id = %call_id, "B2BUA: UAS-mode answer already sent (imperative)");
         }
-        CallAction::Handover { app, on_lost, deadline_ms, vars, answer, profile, ws_uri } => {
+        CallAction::Handover {
+            app,
+            on_lost,
+            deadline_ms,
+            vars,
+            answer,
+            profile,
+            ws_uri,
+        } => {
             control_handover(
                 &call_id,
                 &message_guard,
@@ -14005,11 +14809,26 @@ fn control_handover(
     params: ControlHandoverParams<'_>,
     state: &DispatcherState,
 ) {
-    let ControlHandoverParams { app, on_lost, deadline_ms, vars, answer, profile, ws_uri } = params;
+    let ControlHandoverParams {
+        app,
+        on_lost,
+        deadline_ms,
+        vars,
+        answer,
+        profile,
+        ws_uri,
+    } = params;
 
     let reject_and_drop = |code: u16, reason: &str| {
         let response = build_response(invite, code, reason, state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         state.call_actors.remove_call(call_id);
         state.call_event_receivers.remove(call_id);
     };
@@ -14078,8 +14897,8 @@ fn control_handover(
             if !answer {
                 let deadline_ms = deadline_ms.unwrap_or_else(|| bus.handoff_deadline_ms());
                 if deadline_ms > 0 {
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_millis(deadline_ms);
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
                     state.call_actors.set_answer_deadline(call_id, deadline);
                 }
             }
@@ -14087,8 +14906,11 @@ fn control_handover(
         }
         crate::control::OfferOutcome::NoController => {
             warn!(call_id = %call_id, %app, answer, "handover: no controller available — applying default");
-            crate::metrics::try_metrics()
-                .inspect(|m| m.control_handoff_timeouts_total.with_label_values(&[app]).inc());
+            crate::metrics::try_metrics().inspect(|m| {
+                m.control_handoff_timeouts_total
+                    .with_label_values(&[app])
+                    .inc()
+            });
             if answer {
                 // The call was already answered + media-anchored; there is no
                 // controller to drive it, so tear it down cleanly (BYE + media
@@ -14117,7 +14939,9 @@ fn answer_first_anchor(
     state: &DispatcherState,
 ) -> Result<(), String> {
     let Some(backend) = state.rtpengine_set.as_ref() else {
-        return Err("answer-first requires a media backend (media.backend), none configured".to_string());
+        return Err(
+            "answer-first requires a media backend (media.backend), none configured".to_string(),
+        );
     };
     let Some(registry) = state.rtpengine_profiles.as_ref() else {
         return Err("answer-first requires media profiles, none configured".to_string());
@@ -14209,7 +15033,9 @@ fn answer_first_prepare(
     }
     let profile_name = profile.unwrap_or("voice_ai");
     let Some(entry) = registry.get(profile_name) else {
-        return Err(format!("unknown media profile '{profile_name}' for answer-first"));
+        return Err(format!(
+            "unknown media profile '{profile_name}' for answer-first"
+        ));
     };
     let mut flags = entry.answer.clone();
 
@@ -14312,8 +15138,12 @@ fn build_stasis_payload(
         // SDP is text; surface it directly when valid UTF-8 (avoids a base64 dep
         // on the control rail). Non-text bodies report their length only.
         match std::str::from_utf8(&invite.body) {
-            Ok(text) => Some(serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "text": text })),
-            Err(_) => Some(serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "bytes": invite.body.len() })),
+            Ok(text) => Some(
+                serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "text": text }),
+            ),
+            Err(_) => Some(
+                serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "bytes": invite.body.len() }),
+            ),
         }
     };
     serde_json::json!({
@@ -14489,7 +15319,10 @@ fn b2bua_send_b_leg_invite(
                 return;
             }
         };
-        (relay_target.address, relay_target.transport.unwrap_or(Transport::Udp))
+        (
+            relay_target.address,
+            relay_target.transport.unwrap_or(Transport::Udp),
+        )
     };
 
     // RFC 3261 §18.1.1 — bias an over-MTU UDP B-leg INVITE to TCP.  Skipped for a
@@ -14554,14 +15387,16 @@ fn b2bua_send_b_leg_invite(
     let (via_host, via_port) = b_leg_invite_sent_by(
         flow_local_addr,
         send_socket.map(|pin| pin.via_sent_by()),
-        || (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
+        || {
+            (
+                state.via_host(&outbound_transport),
+                state.via_port(&outbound_transport),
+            )
+        },
     );
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        outbound_transport,
-        via_host,
-        via_port,
-        branch,
+        outbound_transport, via_host, via_port, branch,
     );
 
     let mut b_leg_invite = original_request.clone();
@@ -14628,7 +15463,16 @@ fn b2bua_send_b_leg_invite(
             c.contact_user_override.clone(),
             c.contact_override.clone(),
         ),
-        None => (None, false, String::new(), String::new(), None, None, None, None),
+        None => (
+            None,
+            false,
+            String::new(),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+        ),
     };
 
     let b_leg_call_id = if let Some(forced) = forced_call_id {
@@ -14646,7 +15490,9 @@ fn b2bua_send_b_leg_invite(
     // Rewrite From for B-leg dialog:
     //  - Replace the tag with a fresh B-leg tag
     //  - Rewrite the URI host (default: mask A-leg identity with our own host)
-    if let Some(from) = b_leg_invite.headers.get("From")
+    if let Some(from) = b_leg_invite
+        .headers
+        .get("From")
         .or_else(|| b_leg_invite.headers.get("f"))
     {
         let old_pattern = format!("tag={}", a_leg_from_tag);
@@ -14660,15 +15506,18 @@ fn b2bua_send_b_leg_invite(
         // tenant from the From domain (a domainless call would otherwise land
         // in the downstream's unauthenticated/default routing context).
         // From header format: ["Display" ]<sip:user@host[:port][;params]>[;tag=...]
-        let from_host = from_host_override
-            .unwrap_or_else(|| state.via_host(&outbound_transport));
+        let from_host = from_host_override.unwrap_or_else(|| state.via_host(&outbound_transport));
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':'])
-                .unwrap_or(after_at.len());
+            let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
             let end_pos = at_pos + 1 + host_end;
-            new_from = format!("{}{}{}", &new_from[..at_pos + 1], from_host, &new_from[end_pos..]);
+            new_from = format!(
+                "{}{}{}",
+                &new_from[..at_pos + 1],
+                from_host,
+                &new_from[end_pos..]
+            );
         }
 
         b_leg_invite.headers.set("From", new_from);
@@ -14712,7 +15561,9 @@ fn b2bua_send_b_leg_invite(
     // Strip any To-tag (B-leg INVITE should not have one) and rewrite the To URI
     // host to match the dial target (topology hiding — A-leg advertised address
     // must not leak to B-leg).
-    if let Some(to) = b_leg_invite.headers.get("To")
+    if let Some(to) = b_leg_invite
+        .headers
+        .get("To")
         .or_else(|| b_leg_invite.headers.get("t"))
     {
         let mut new_to = to.clone();
@@ -14843,9 +15694,10 @@ fn b2bua_send_b_leg_invite(
                 .map(|timer_config| (timer_config.session_expires, timer_config.min_se))
         });
     if let Some((session_expires, min_se)) = session_timer {
-        b_leg_invite
-            .headers
-            .set("Session-Expires", format!("{session_expires};refresher=uac"));
+        b_leg_invite.headers.set(
+            "Session-Expires",
+            format!("{session_expires};refresher=uac"),
+        );
         b_leg_invite.headers.set("Min-SE", min_se.to_string());
         // `Supported` *is* a list header (RFC 3261 §7.3.1), so a second line is
         // legal — but it is still the same option tag twice on the wire. Merge
@@ -14860,7 +15712,9 @@ fn b2bua_send_b_leg_invite(
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {
-        b_leg_invite.headers.set("Content-Length", b_leg_invite.body.len().to_string());
+        b_leg_invite
+            .headers
+            .set("Content-Length", b_leg_invite.body.len().to_string());
     }
 
     // Register B-leg with call manager (Contact built above; local_contact must
@@ -14873,7 +15727,9 @@ fn b2bua_send_b_leg_invite(
         branch.clone(),
         LegTransport {
             remote_addr: destination,
-            connection_id: flow.map(|f| ConnectionId(f.connection_id)).unwrap_or_default(),
+            connection_id: flow
+                .map(|f| ConnectionId(f.connection_id))
+                .unwrap_or_default(),
             transport: outbound_transport,
             // Anchor the leg on the flow's socket so every later B-leg egress
             // leaves from the same place the INVITE did (the Via/Contact above
@@ -14979,8 +15835,19 @@ fn b2bua_send_b_leg_invite(
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
         }
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
-        send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), send_socket.map(|pin| pin.addr), state);
+        let relay_target = RelayTarget {
+            address: destination,
+            transport: Some(outbound_transport),
+            server_name: None,
+        };
+        send_to_target(
+            data,
+            &relay_target,
+            outbound_transport,
+            ConnectionId::default(),
+            send_socket.map(|pin| pin.addr),
+            state,
+        );
     }
 
     // Persist the fully hygiene-processed B-leg INVITE on the leg.
@@ -14997,34 +15864,32 @@ fn b2bua_send_b_leg_invite(
     // seq, so we can only emit it after the INVITE is on the wire and
     // its hygiene-processed form is stashed).
     let stored_invite = Arc::new(Mutex::new(b_leg_invite));
-    let deferred_cancel: Option<(SipMessage, Transport, SocketAddr)> =
-        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-            let result = if let Some(b_leg) = call.b_legs.last_mut() {
-                b_leg.dialog.local_cseq += 1;
-                b_leg.b_leg_invite = Some(stored_invite.clone());
-                if b_leg.pending_cancel {
-                    b_leg.pending_cancel = false;
-                    match stored_invite.lock() {
-                        Ok(guard) => build_cancel_from_invite(&guard).map(|c| (
-                            c,
-                            b_leg.transport.transport,
-                            b_leg.transport.remote_addr,
-                        )),
-                        Err(_) => {
-                            warn!(call_id = %call_id, "B2BUA: pending CANCEL drain — stored INVITE mutex poisoned");
-                            None
-                        }
+    let deferred_cancel: Option<(SipMessage, Transport, SocketAddr)> = if let Some(mut call) =
+        state.call_actors.get_call_mut(call_id)
+    {
+        let result = if let Some(b_leg) = call.b_legs.last_mut() {
+            b_leg.dialog.local_cseq += 1;
+            b_leg.b_leg_invite = Some(stored_invite.clone());
+            if b_leg.pending_cancel {
+                b_leg.pending_cancel = false;
+                match stored_invite.lock() {
+                    Ok(guard) => build_cancel_from_invite(&guard)
+                        .map(|c| (c, b_leg.transport.transport, b_leg.transport.remote_addr)),
+                    Err(_) => {
+                        warn!(call_id = %call_id, "B2BUA: pending CANCEL drain — stored INVITE mutex poisoned");
+                        None
                     }
-                } else {
-                    None
                 }
             } else {
                 None
-            };
-            result
+            }
         } else {
             None
         };
+        result
+    } else {
+        None
+    };
 
     if let Some((cancel_msg, b_transport, b_dest)) = deferred_cancel {
         debug!(call_id = %call_id, "B2BUA: draining deferred CANCEL after INVITE stash");
@@ -15214,8 +16079,7 @@ fn handle_registrant_response(
         }
     };
 
-    let is_aka =
-        registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
+    let is_aka = registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
 
     // A carrier / Teams Direct Routing registrar that rejects with a Retry-After
     // (RFC 3261 §20.33) is telling us exactly when to re-REGISTER — thread it
@@ -15228,10 +16092,14 @@ fn handle_registrant_response(
             // Parse granted expires: top-level Expires header first,
             // then Contact expires= parameter (RFC 3261 §10.2.4),
             // finally fall back to the originally requested value.
-            let expires = message.headers.get("Expires")
+            let expires = message
+                .headers
+                .get("Expires")
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .or_else(|| {
-                    message.headers.get("Contact")
+                    message
+                        .headers
+                        .get("Contact")
                         .and_then(|contact| parse_contact_expires(contact))
                 })
                 .unwrap_or(registrant.default_interval);
@@ -15254,9 +16122,10 @@ fn handle_registrant_response(
             // (+ RFC 3261 Timer F grace), so the SAs track the registration
             // lifetime (TS 33.203 §7.4).
             if is_aka && registrant.is_ipsec_entry(&aor) {
-                if let (Some(ipsec_manager), Some(ue_port_c)) =
-                    (state.ipsec_manager.clone(), registrant.ue_protected_client_port(&aor))
-                {
+                if let (Some(ipsec_manager), Some(ue_port_c)) = (
+                    state.ipsec_manager.clone(),
+                    registrant.ue_protected_client_port(&aor),
+                ) {
                     let ue_addr = state.local_addr.ip();
                     let hard_lifetime = (expires as u64) + 32;
                     tokio::spawn(async move {
@@ -15296,7 +16165,15 @@ fn handle_registrant_response(
                 // send so the kernel encrypts the protected REGISTER — both run
                 // ordered inside one spawned task (TS 33.203 §7.4).
                 if is_aka && registrant.is_ipsec_entry(&aor) {
-                    handle_registrant_ipsec_challenge(registrant, message, &aor, &challenge, status_code, retry_after, state);
+                    handle_registrant_ipsec_challenge(
+                        registrant,
+                        message,
+                        &aor,
+                        &challenge,
+                        status_code,
+                        retry_after,
+                        state,
+                    );
                     return;
                 }
 
@@ -15325,7 +16202,13 @@ fn handle_registrant_response(
 
                 if let Some((retry_message, _retry_branch, destination, transport)) = built {
                     let data = bytes::Bytes::from(retry_message.to_bytes());
-                    send_outbound(data, transport, destination, crate::transport::ConnectionId::default(), state);
+                    send_outbound(
+                        data,
+                        transport,
+                        destination,
+                        crate::transport::ConnectionId::default(),
+                        state,
+                    );
                 } else {
                     registrant.handle_failure(&aor, status_code, retry_after);
                 }
@@ -15385,7 +16268,9 @@ fn handle_registrant_ipsec_challenge(
         verify.as_deref(),
     );
     let (retry_message, destination, transport) = match built {
-        Some((retry_message, _branch, destination, transport)) => (retry_message, destination, transport),
+        Some((retry_message, _branch, destination, transport)) => {
+            (retry_message, destination, transport)
+        }
         None => {
             registrant.handle_failure(aor, status_code, retry_after);
             return;
@@ -15515,7 +16400,30 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_local_addr, b_leg_connection_id, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, b_leg_stored_from, b_leg_stored_to, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel, a_leg_local_addr) = match state.call_actors.get_call(call_id) {
+    let (
+        a_leg,
+        a_leg_invite,
+        b_leg_target,
+        b_leg_remote_contact,
+        _b_leg_local_contact,
+        b_leg_dialog,
+        b_leg_dest,
+        b_leg_local_addr,
+        b_leg_connection_id,
+        b_leg_index,
+        b_leg_stored_vias,
+        b_leg_stored_cseq,
+        b_leg_stored_from,
+        b_leg_stored_to,
+        call_state,
+        outbound_credentials,
+        li_record,
+        b_leg_handle_tx,
+        b_leg_stored_invite,
+        b_leg_local_cseq,
+        a_leg_supports_100rel,
+        a_leg_local_addr,
+    ) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -15532,8 +16440,12 @@ fn handle_b2bua_response(
             // The connection_id the original B-leg INVITE was sent on — reused
             // by the 401/407 retry path so the credentialed re-INVITE stays on
             // the same trunk member that issued the nonce (RFC 5923).
-            let connection_id = matching_b.map(|b| b.transport.connection_id).unwrap_or_default();
-            let stored_vias = matching_b.map(|b| b.stored_vias.clone()).unwrap_or_default();
+            let connection_id = matching_b
+                .map(|b| b.transport.connection_id)
+                .unwrap_or_default();
+            let stored_vias = matching_b
+                .map(|b| b.stored_vias.clone())
+                .unwrap_or_default();
             let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
             let stored_from = matching_b.and_then(|b| b.stored_from.clone());
             let stored_to = matching_b.and_then(|b| b.stored_to.clone());
@@ -15543,7 +16455,30 @@ fn handle_b2bua_response(
                 .map(|h| h.tx.clone());
             let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
             let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, b_local_addr, connection_id, matching_b_idx, stored_vias, stored_cseq, stored_from, stored_to, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel, call.a_leg_local_addr)
+            (
+                call.a_leg.clone(),
+                call.a_leg_invite.clone(),
+                target,
+                remote_contact,
+                local_contact,
+                dialog,
+                dest,
+                b_local_addr,
+                connection_id,
+                matching_b_idx,
+                stored_vias,
+                stored_cseq,
+                stored_from,
+                stored_to,
+                call.state.clone(),
+                call.outbound_credentials.clone(),
+                call.li_record,
+                handle_tx,
+                stored_invite,
+                local_cseq,
+                call.a_leg_supports_100rel,
+                call.a_leg_local_addr,
+            )
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -15621,12 +16556,10 @@ fn handle_b2bua_response(
             // PRACK is in flight or got delayed; one PRACK per (dialog, RSeq)
             // is correct. Fall through either way so the 1xx still reaches the
             // A-leg (Require/RSeq stripped in sanitize_b2bua_response below).
-            if state.call_actors.try_mark_prack_acked(
-                call_id,
-                idx,
-                dedup_key,
-                rseq.response_number,
-            ) {
+            if state
+                .call_actors
+                .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)
+            {
                 // Establish the FIRST early dialog's remote target on the
                 // canonical Dialog (§12.1.2 — set once, not updated by later
                 // provisionals) so the eventual 2xx / BYE / re-INVITE have a
@@ -15651,11 +16584,15 @@ fn handle_b2bua_response(
                 }
 
                 // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
-                let response_cseq_num: u32 = message.headers.cseq()
+                let response_cseq_num: u32 = message
+                    .headers
+                    .cseq()
                     .and_then(|c| c.split_whitespace().next())
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(1);
-                let response_cseq_method = message.headers.cseq()
+                let response_cseq_method = message
+                    .headers
+                    .cseq()
                     .and_then(|c| c.split_whitespace().nth(1))
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "INVITE".to_string());
@@ -15692,7 +16629,13 @@ fn handle_b2bua_response(
                                 %destination,
                                 "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
                             );
-                            send_b2bua_to_bleg(prack, prack_transport, destination, b_leg_local_addr, state);
+                            send_b2bua_to_bleg(
+                                prack,
+                                prack_transport,
+                                destination,
+                                b_leg_local_addr,
+                                state,
+                            );
                         }
                     }
                 }
@@ -15710,7 +16653,9 @@ fn handle_b2bua_response(
     // A-leg (the A-leg never sent a PRACK — siphon did, locally). The
     // CSeq method on the response distinguishes it from the INVITE 200.
     if (200..300).contains(&status_code)
-        && message.headers.cseq()
+        && message
+            .headers
+            .cseq()
             .and_then(|c| c.split_whitespace().nth(1))
             .map(|m| m.eq_ignore_ascii_case("PRACK"))
             .unwrap_or(false)
@@ -15725,7 +16670,10 @@ fn handle_b2bua_response(
     // Handle retransmitted 200 OK for already-completed re-INVITEs.
     // The entry was marked "reinvite_done:<dir>" after the first 200 OK was processed.
     // Just re-ACK the responder to stop retransmissions — don't forward again.
-    if let Some(done_direction) = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite_done:")) {
+    if let Some(done_direction) = b_leg_target
+        .as_deref()
+        .and_then(|t| t.strip_prefix("reinvite_done:"))
+    {
         if (200..300).contains(&status_code) {
             let is_a2b = done_direction == "a2b";
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
@@ -15745,32 +16693,46 @@ fn handle_b2bua_response(
                             ),
                             a_leg_advertised_port(
                                 a_leg.transport.local_addr,
-                                state.listen_addrs.get(&responder_transport)
+                                state
+                                    .listen_addrs
+                                    .get(&responder_transport)
                                     .map(|a| a.port())
                                     .unwrap_or(state.local_addr.port()),
                             ),
                         )
                     };
-                    let cseq_num = message.headers.cseq()
+                    let cseq_num = message
+                        .headers
+                        .cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
                     // RURI: extract Contact from the 200 OK message directly
                     // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
-                    let ack_uri = message.headers.get("Contact")
+                    let ack_uri = message
+                        .headers
+                        .get("Contact")
                         .or_else(|| message.headers.get("m"))
                         .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
-                        .or_else(|| if is_a2b {
-                            b_leg_remote_contact.as_deref()
-                                .and_then(|u| parse_uri_standalone(u).ok())
-                        } else {
-                            a_leg.dialog.remote_contact.as_deref()
-                                .and_then(|u| parse_uri_standalone(u).ok())
+                        .or_else(|| {
+                            if is_a2b {
+                                b_leg_remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            } else {
+                                a_leg
+                                    .dialog
+                                    .remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            }
                         })
-                        .unwrap_or_else(|| SipUri::new(responder_dest.ip().to_string())
-                            .with_port(responder_dest.port()));
+                        .unwrap_or_else(|| {
+                            SipUri::new(responder_dest.ip().to_string())
+                                .with_port(responder_dest.port())
+                        });
                     let ack = match SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
@@ -15795,12 +16757,25 @@ fn handle_b2bua_response(
                         }
                     };
                     if is_a2b {
-                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, b_leg_local_addr, state);
+                        send_b2bua_to_bleg(
+                            ack,
+                            responder_transport,
+                            responder_dest,
+                            b_leg_local_addr,
+                            state,
+                        );
                     } else {
                         // ACK to the A-leg responder — source it from the A-leg's
                         // anchored socket (multi-homed source-port parity; Via above
                         // matches). No-op for single-listener hosts.
-                        send_message_from(ack, responder_transport, responder_dest, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
+                        send_message_from(
+                            ack,
+                            responder_transport,
+                            responder_dest,
+                            a_leg.transport.connection_id,
+                            a_leg.transport.local_addr,
+                            state,
+                        );
                     }
                     debug!(
                         call_id = %call_id,
@@ -15821,7 +16796,10 @@ fn handle_b2bua_response(
     // Handle retransmitted responses for already-completed UPDATEs.
     // Per RFC 3311 §5.4 there is no ACK for UPDATE — just absorb the dup
     // and let the responder's non-INVITE server transaction stop on its own.
-    if b_leg_target.as_deref().is_some_and(|t| t.starts_with("update_done:")) {
+    if b_leg_target
+        .as_deref()
+        .is_some_and(|t| t.starts_with("update_done:"))
+    {
         debug!(
             call_id = %call_id,
             status = status_code,
@@ -15834,7 +16812,10 @@ fn handle_b2bua_response(
     // `reinvite:` arm because a bridged pair has no originator leg to forward
     // the answer to: both sides are the A-leg of their own call actor, so the
     // response is absorbed and drives the bridge's next step instead.
-    if let Some(stage) = b_leg_target.as_deref().and_then(|t| t.strip_prefix("bridge:")) {
+    if let Some(stage) = b_leg_target
+        .as_deref()
+        .and_then(|t| t.strip_prefix("bridge:"))
+    {
         handle_bridge_reinvite_response(
             call_id,
             stage,
@@ -15850,14 +16831,14 @@ fn handle_b2bua_response(
 
     // A retransmitted 200 for a bridge re-INVITE already handled: re-ACK it so
     // the responder's transaction stops, and do not re-run the bridge step.
-    if b_leg_target.as_deref().is_some_and(|t| t.starts_with("bridge_done:")) {
+    if b_leg_target
+        .as_deref()
+        .is_some_and(|t| t.starts_with("bridge_done:"))
+    {
         if (200..300).contains(&status_code) {
-            if let Some(ack) = build_ack_for_owned_leg(
-                &a_leg,
-                message,
-                &TransactionKey::generate_branch(),
-                state,
-            ) {
+            if let Some(ack) =
+                build_ack_for_owned_leg(&a_leg, message, &TransactionKey::generate_branch(), state)
+            {
                 let (destination, transport) = resolve_in_dialog_destination(
                     &a_leg.dialog.route_set,
                     state,
@@ -15884,7 +16865,9 @@ fn handle_b2bua_response(
 
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
     // Re-INVITE tracking legs don't have actors — handled directly below.
-    let reinvite_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("reinvite:"));
+    let reinvite_direction = b_leg_target
+        .as_deref()
+        .and_then(|t| t.strip_prefix("reinvite:"));
 
     if let Some(direction) = reinvite_direction {
         let is_a2b = direction == "a2b";
@@ -15897,14 +16880,24 @@ fn handle_b2bua_response(
         // (A-leg: its arrival listener; B-leg: its flow socket, when dialled
         // with `call.dial(flow=…)`).
         let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
-            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id, a_leg_local_addr)
+            (
+                a_leg.transport.remote_addr,
+                a_leg.transport.transport,
+                a_leg.transport.connection_id,
+                a_leg_local_addr,
+            )
         } else {
             // B→A: send response to winning B-leg
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
-                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr)
+                        (
+                            b.transport.remote_addr,
+                            b.transport.transport,
+                            ConnectionId::default(),
+                            b.transport.local_addr,
+                        )
                     } else {
                         warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
                         return;
@@ -15950,7 +16943,9 @@ fn handle_b2bua_response(
         // Capture responder's CSeq before we overwrite it with the originator's.
         // The ACK sent to the responder must use the responder's CSeq (the one used
         // in the forwarded re-INVITE), not the originator's.
-        let responder_cseq_num = message.headers.cseq()
+        let responder_cseq_num = message
+            .headers
+            .cseq()
             .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
             .unwrap_or_else(|| "1".to_string());
 
@@ -15988,7 +16983,14 @@ fn handle_b2bua_response(
         // for a siphon-originated re-INVITE — its response is absorbed, not
         // forwarded, and the ACK needs the responder's own Contact intact.
         if is_bridged_reinvite {
-            sanitize_b2bua_response(message, state, resp_transport, if is_a2b { a_leg_local_addr } else { None }, a_leg_supports_100rel, call_id);
+            sanitize_b2bua_response(
+                message,
+                state,
+                resp_transport,
+                if is_a2b { a_leg_local_addr } else { None },
+                a_leg_supports_100rel,
+                call_id,
+            );
         }
 
         // Track the ANSWERER's own endpoint SDP — raw, before the rtpengine
@@ -16016,9 +17018,11 @@ fn handle_b2bua_response(
         // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
         // Mirrors the offer processing done on the request side.
         if (200..300).contains(&status_code) && !message.body.is_empty() {
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
-                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
-            {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
+                &state.rtpengine_set,
+                &state.rtpengine_sessions,
+                &state.rtpengine_profiles,
+            ) {
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
@@ -16026,20 +17030,35 @@ fn handle_b2bua_response(
                         // In RTPEngine: from_tag = offerer, to_tag = answerer.
                         let (answer_from, answer_to) = if is_a2b {
                             // A→B re-INVITE: A offered (from_tag), B answers (to_tag)
-                            (session.from_tag.as_str(), session.to_tag.as_deref().unwrap_or(""))
+                            (
+                                session.from_tag.as_str(),
+                                session.to_tag.as_deref().unwrap_or(""),
+                            )
                         } else {
                             // B→A re-INVITE: B offered (to_tag), A answers (from_tag)
-                            (session.to_tag.as_deref().unwrap_or(session.from_tag.as_str()), session.from_tag.as_str())
+                            (
+                                session
+                                    .to_tag
+                                    .as_deref()
+                                    .unwrap_or(session.from_tag.as_str()),
+                                session.from_tag.as_str(),
+                            )
                         };
                         let answer_flags = profile.answer.clone();
                         match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.answer(session.rtpengine_id(), answer_from, answer_to, &message.body, &answer_flags)
-                            )
+                            tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
+                                session.rtpengine_id(),
+                                answer_from,
+                                answer_to,
+                                &message.body,
+                                &answer_flags,
+                            ))
                         }) {
                             Ok(rewritten_sdp) => {
                                 message.body = rewritten_sdp;
-                                message.headers.set("Content-Length", message.body.len().to_string());
+                                message
+                                    .headers
+                                    .set("Content-Length", message.body.len().to_string());
                                 debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE response SDP (answer)");
                             }
                             Err(error) => {
@@ -16088,7 +17107,9 @@ fn handle_b2bua_response(
                             ),
                             a_leg_advertised_port(
                                 a_leg.transport.local_addr,
-                                state.listen_addrs.get(&responder_transport)
+                                state
+                                    .listen_addrs
+                                    .get(&responder_transport)
                                     .map(|a| a.port())
                                     .unwrap_or(state.local_addr.port()),
                             ),
@@ -16102,26 +17123,32 @@ fn handle_b2bua_response(
                     // §12.2.1.1), captured above before sanitize rewrote it to
                     // siphon's address — reading `message` here addressed the ACK
                     // to ourselves. Falls back to the stored remote_contact.
-                    let ack_uri = responder_contact.as_deref()
+                    let ack_uri = responder_contact
+                        .as_deref()
                         .map(crate::b2bua::actor::extract_contact_uri)
                         .and_then(|u| parse_uri_standalone(&u).ok())
-                        .or_else(|| if is_a2b {
-                            b_leg_remote_contact.as_deref()
-                                .and_then(|u| parse_uri_standalone(u).ok())
-                        } else {
-                            a_leg.dialog.remote_contact.as_deref()
-                                .and_then(|u| parse_uri_standalone(u).ok())
+                        .or_else(|| {
+                            if is_a2b {
+                                b_leg_remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            } else {
+                                a_leg
+                                    .dialog
+                                    .remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            }
                         })
-                        .unwrap_or_else(|| SipUri::new(responder_dest.ip().to_string())
-                            .with_port(responder_dest.port()));
+                        .unwrap_or_else(|| {
+                            SipUri::new(responder_dest.ip().to_string())
+                                .with_port(responder_dest.port())
+                        });
                     let ack = match SipMessageBuilder::new()
                         .request(Method::Ack, ack_uri)
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
-                            transport_str,
-                            outbound_host,
-                            outbound_port,
-                            ack_branch,
+                            transport_str, outbound_host, outbound_port, ack_branch,
                         ))
                         .from(from.to_string())
                         .to(to.to_string())
@@ -16138,12 +17165,25 @@ fn handle_b2bua_response(
                         }
                     };
                     if is_a2b {
-                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, b_leg_local_addr, state);
+                        send_b2bua_to_bleg(
+                            ack,
+                            responder_transport,
+                            responder_dest,
+                            b_leg_local_addr,
+                            state,
+                        );
                     } else {
                         // ACK to the A-leg responder — source it from the A-leg's
                         // anchored socket (multi-homed source-port parity; Via above
                         // matches). No-op for single-listener hosts.
-                        send_message_from(ack, responder_transport, responder_dest, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
+                        send_message_from(
+                            ack,
+                            responder_transport,
+                            responder_dest,
+                            a_leg.transport.connection_id,
+                            a_leg.transport.local_addr,
+                            state,
+                        );
                     }
                 }
             }
@@ -16165,14 +17205,20 @@ fn handle_b2bua_response(
             // retransmitted 200 OKs can still be matched and re-ACKed.
             // The entry will be cleaned up when the call terminates.
             if let Some(idx) = b_leg_index {
-                state.call_actors.set_b_leg_target_uri(call_id, idx, format!("reinvite_done:{}", direction));
+                state.call_actors.set_b_leg_target_uri(
+                    call_id,
+                    idx,
+                    format!("reinvite_done:{}", direction),
+                );
             }
             // RFC 3261 §14.1: the re-INVITE toward the target leg has
             // completed — clear the pending flag so a subsequent re-INVITE
             // (from either side) is allowed to start. `is_a2b` means the
             // re-INVITE was forwarded TOWARD the B-leg, so the pending flag
             // was set on the B-leg.
-            state.call_actors.set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
+            state
+                .call_actors
+                .set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         } else if status_code >= 300 {
             // Non-2xx: ACK is hop-by-hop — reuse the SAME branch as the
             // forwarded re-INVITE (RFC 3261 §17.1.1.3).
@@ -16190,7 +17236,9 @@ fn handle_b2bua_response(
                 state.call_actors.remove_b_leg(call_id, idx);
             }
             // Clear pending-reinvite on the target leg (see comment above).
-            state.call_actors.set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
+            state
+                .call_actors
+                .set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         }
 
         // Forward the response to the originator — but ONLY for a bridged
@@ -16207,9 +17255,22 @@ fn handle_b2bua_response(
             );
         } else if is_a2b {
             // A→B re-INVITE: the response goes to the A-leg — pin its arrival socket.
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
+            send_message_from(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_conn_id,
+                resp_local_addr,
+                state,
+            );
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
+            send_b2bua_to_bleg(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_local_addr,
+                state,
+            );
         }
 
         debug!(
@@ -16226,7 +17287,9 @@ fn handle_b2bua_response(
     // §5.4: UPDATE is a non-INVITE transaction). Body-aware media handling
     // matches the request side: SDP rewrite via rtpengine.answer only when
     // the response carries SDP (session-timer refresh has empty body).
-    let update_direction = b_leg_target.as_deref().and_then(|t| t.strip_prefix("update:"));
+    let update_direction = b_leg_target
+        .as_deref()
+        .and_then(|t| t.strip_prefix("update:"));
 
     if let Some(direction) = update_direction {
         let is_a2b = direction == "a2b";
@@ -16234,13 +17297,23 @@ fn handle_b2bua_response(
         // 4th element: the responder leg's anchored egress socket (see the
         // re-INVITE response path above).
         let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
-            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id, a_leg_local_addr)
+            (
+                a_leg.transport.remote_addr,
+                a_leg.transport.transport,
+                a_leg.transport.connection_id,
+                a_leg_local_addr,
+            )
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
-                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr)
+                        (
+                            b.transport.remote_addr,
+                            b.transport.transport,
+                            ConnectionId::default(),
+                            b.transport.local_addr,
+                        )
                     } else {
                         warn!(call_id = %call_id, "B2BUA UPDATE response: no winning B-leg");
                         return;
@@ -16280,31 +17353,55 @@ fn handle_b2bua_response(
 
         // A-facing (is_a2b) response: anchor Contact to the A-leg's arrival socket;
         // B-facing: leave it to via_port (the B-side advertised address).
-        sanitize_b2bua_response(message, state, resp_transport, if is_a2b { a_leg_local_addr } else { None }, a_leg_supports_100rel, call_id);
+        sanitize_b2bua_response(
+            message,
+            state,
+            resp_transport,
+            if is_a2b { a_leg_local_addr } else { None },
+            a_leg_supports_100rel,
+            call_id,
+        );
 
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
         if (200..300).contains(&status_code) && !message.body.is_empty() {
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
-                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
-            {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
+                &state.rtpengine_set,
+                &state.rtpengine_sessions,
+                &state.rtpengine_profiles,
+            ) {
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
                         let (answer_from, answer_to) = if is_a2b {
-                            (session.from_tag.as_str(), session.to_tag.as_deref().unwrap_or(""))
+                            (
+                                session.from_tag.as_str(),
+                                session.to_tag.as_deref().unwrap_or(""),
+                            )
                         } else {
-                            (session.to_tag.as_deref().unwrap_or(session.from_tag.as_str()), session.from_tag.as_str())
+                            (
+                                session
+                                    .to_tag
+                                    .as_deref()
+                                    .unwrap_or(session.from_tag.as_str()),
+                                session.from_tag.as_str(),
+                            )
                         };
                         let answer_flags = profile.answer.clone();
                         match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.answer(session.rtpengine_id(), answer_from, answer_to, &message.body, &answer_flags)
-                            )
+                            tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
+                                session.rtpengine_id(),
+                                answer_from,
+                                answer_to,
+                                &message.body,
+                                &answer_flags,
+                            ))
                         }) {
                             Ok(rewritten_sdp) => {
                                 message.body = rewritten_sdp;
-                                message.headers.set("Content-Length", message.body.len().to_string());
+                                message
+                                    .headers
+                                    .set("Content-Length", message.body.len().to_string());
                                 debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
                             }
                             Err(error) => {
@@ -16335,7 +17432,11 @@ fn handle_b2bua_response(
 
             // Mark the UPDATE entry done so retransmitted 2xx can be absorbed.
             if let Some(idx) = b_leg_index {
-                state.call_actors.set_b_leg_target_uri(call_id, idx, format!("update_done:{}", direction));
+                state.call_actors.set_b_leg_target_uri(
+                    call_id,
+                    idx,
+                    format!("update_done:{}", direction),
+                );
             }
         } else if status_code >= 300 {
             // Non-2xx UPDATE — no ACK (UPDATE is non-INVITE), just remove the
@@ -16349,9 +17450,22 @@ fn handle_b2bua_response(
         // Forward response to the originator.
         if is_a2b {
             // A→B UPDATE: the response goes to the A-leg — pin its arrival socket.
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
+            send_message_from(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_conn_id,
+                resp_local_addr,
+                state,
+            );
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
+            send_b2bua_to_bleg(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_local_addr,
+                state,
+            );
         }
 
         debug!(
@@ -16370,7 +17484,10 @@ fn handle_b2bua_response(
     let transfer_response = b_leg_target.as_deref().and_then(|t| {
         t.strip_prefix("refer:")
             .map(|direction| ("refer", direction))
-            .or_else(|| t.strip_prefix("notify:").map(|direction| ("notify", direction)))
+            .or_else(|| {
+                t.strip_prefix("notify:")
+                    .map(|direction| ("notify", direction))
+            })
     });
     if let Some((marker, direction)) = transfer_response {
         let is_a2b = direction == "a2b";
@@ -16386,7 +17503,12 @@ fn handle_b2bua_response(
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => match call.winner.and_then(|i| call.b_legs.get(i)) {
-                    Some(b) => (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr),
+                    Some(b) => (
+                        b.transport.remote_addr,
+                        b.transport.transport,
+                        ConnectionId::default(),
+                        b.transport.local_addr,
+                    ),
                     None => {
                         warn!(call_id = %call_id, marker, "B2BUA transfer response: no winning B-leg");
                         return;
@@ -16452,7 +17574,10 @@ fn handle_b2bua_response(
                 } else if let Some(ref from_uri) = winner.dialog.remote_to_uri {
                     message.headers.set(
                         "From",
-                        crate::b2bua::actor::ensure_tag(from_uri, winner.dialog.remote_tag.as_deref()),
+                        crate::b2bua::actor::ensure_tag(
+                            from_uri,
+                            winner.dialog.remote_tag.as_deref(),
+                        ),
                     );
                 }
                 if let Some(ref to) = b_leg_stored_to {
@@ -16495,9 +17620,22 @@ fn handle_b2bua_response(
         }
 
         if is_a2b {
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
+            send_message_from(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_conn_id,
+                resp_local_addr,
+                state,
+            );
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
+            send_b2bua_to_bleg(
+                message.clone(),
+                resp_transport,
+                resp_dest,
+                resp_local_addr,
+                state,
+            );
         }
         debug!(call_id = %call_id, status = status_code, marker, direction, "B2BUA: forwarded transparent transfer response");
         return;
@@ -16514,17 +17652,19 @@ fn handle_b2bua_response(
     // still has to be consumed so the per-call channel drains. What comes back
     // is deliberately unused — see the classification note below.
     let _actor_event: Option<CallEvent> = if let Some(handle_tx) = &b_leg_handle_tx {
-        let leg_transport = b_leg_dest.map(|(addr, transport)| LegTransport {
-            remote_addr: addr,
-            connection_id: ConnectionId::default(),
-            transport,
-            local_addr: None,
-        }).unwrap_or_else(|| LegTransport {
-            remote_addr: state.local_addr,
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            local_addr: None,
-        });
+        let leg_transport = b_leg_dest
+            .map(|(addr, transport)| LegTransport {
+                remote_addr: addr,
+                connection_id: ConnectionId::default(),
+                transport,
+                local_addr: None,
+            })
+            .unwrap_or_else(|| LegTransport {
+                remote_addr: state.local_addr,
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            });
         match handle_tx.try_send(crate::b2bua::actor::LegMessage::SipInbound {
             message: message.clone(),
             source: leg_transport,
@@ -16580,12 +17720,13 @@ fn handle_b2bua_response(
                         b_leg.dialog.remote_tag = Some(to_tag);
                     }
                     // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
-                    if let Some(contact) = message.headers.get("Contact")
+                    if let Some(contact) = message
+                        .headers
+                        .get("Contact")
                         .or_else(|| message.headers.get("m"))
                     {
-                        b_leg.dialog.remote_contact = Some(
-                            crate::b2bua::actor::extract_contact_uri(contact),
-                        );
+                        b_leg.dialog.remote_contact =
+                            Some(crate::b2bua::actor::extract_contact_uri(contact));
                     }
                 }
             }
@@ -16656,1503 +17797,1693 @@ fn handle_b2bua_response(
         }
     }
 
-    match class { ResponseClass::Answered => {
-    // --- 2xx answer handling ---
-    if (200..300).contains(&status_code) {
-        // Atomically claim the answer. Under load, two B-leg 200s for the same
-        // call (the answer plus a retransmit, or a fork glare) can be processed
-        // concurrently; `call_state` is snapshotted at the top of this function
-        // and only flipped to Answered below, so both could pass a stale
-        // "not answered" check and both forward to the A-leg — delivering a
-        // duplicate 200 to a caller that already ACKed (the "Dead call
-        // (successful)" the UAC logs, and an occasional failed call when a
-        // forward lands after the A-leg freed its state). Claim under the
-        // per-call lock so exactly one 2xx wins and forwards; the rest are
-        // absorbed here. A FirstWin also sets the winner + Answered (replacing
-        // the set_winner below). `None` = no matched B-leg (defensive) — fall
-        // back to the pre-atomic snapshot check.
-        let already_answered: Option<bool> =
-            match b_leg_index.map(|idx| state.call_actors.try_win(call_id, idx)) {
-                Some(crate::b2bua::actor::WinOutcome::FirstWin) => None,
-                Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered { b_leg_acked }) => {
-                    Some(b_leg_acked)
-                }
-                None if call_state == CallState::Answered => Some(true),
-                None => {
-                    state.call_actors.set_state(call_id, CallState::Answered);
-                    None
-                }
-            };
-        if let Some(b_leg_acked) = already_answered {
-            // Retransmit of the winning B-leg's 200 (it hasn't received our ACK
-            // yet), or a losing fork branch. Re-ACK only once the B-leg ACK has
-            // gone out (late-ACK complete); while still awaiting the A-leg ACK,
-            // absorb silently.
-            if !b_leg_acked {
-                debug!(
-                    call_id = %call_id,
-                    "B2BUA: absorbing 200 OK retransmission (waiting for A-leg ACK)"
-                );
-                return;
-            }
-            debug!(
-                call_id = %call_id,
-                "B2BUA: absorbing 200 OK retransmission (already answered)"
-            );
-            // Re-send ACK to B-leg to stop retransmissions
-            if let Some((b_dest, b_transport)) = b_leg_dest {
-                if let Some((ref b_cid, _b_ftag)) = b_leg_dialog {
-                    // Build a clean ACK from scratch — do NOT clone the 200 OK
-                    // (cloning leaks response headers like User-Agent, Contact,
-                    // Allow, Supported, etc. from the remote UA).
-                    let request_uri = message.headers.get("Contact")
-                        .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
-                        .and_then(|u| parse_uri_standalone(&u).ok())
-                        .or_else(|| b_leg_remote_contact.as_deref()
-                            .and_then(|u| parse_uri_standalone(u).ok()))
-                        .or_else(|| b_leg_target.as_deref()
-                            .and_then(|u| parse_uri_standalone(u).ok()))
-                        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
-                    let transport_str = format!("{}", b_transport).to_uppercase();
-                    // Sent-by of the leg this ACK goes back on — the flow socket
-                    // when the leg was dialled over one.
-                    let (outbound_host, outbound_port) =
-                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                    let cseq_num = message.headers.cseq()
-                        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "1".to_string());
-                    let from = message.headers.from().cloned().unwrap_or_default();
-                    let to = message.headers.to().cloned().unwrap_or_default();
-                    let ack = match SipMessageBuilder::new()
-                        .request(Method::Ack, request_uri)
-                        .via(format!(
-                            "SIP/2.0/{} {}:{};branch={}",
-                            transport_str,
-                            outbound_host,
-                            outbound_port,
-                            TransactionKey::generate_branch(),
-                        ))
-                        .from(from.to_string())
-                        .to(to.to_string())
-                        .call_id(b_cid.clone())
-                        .cseq(format!("{} ACK", cseq_num))
-                        .header("Max-Forwards", "70".to_string())
-                        .content_length(0)
-                        .build()
-                    {
-                        Ok(ack) => ack,
-                        Err(error) => {
-                            error!("B2BUA ACK for 200 OK retransmission build failed: {error}");
-                            return;
+    match class {
+        ResponseClass::Answered => {
+            // --- 2xx answer handling ---
+            if (200..300).contains(&status_code) {
+                // Atomically claim the answer. Under load, two B-leg 200s for the same
+                // call (the answer plus a retransmit, or a fork glare) can be processed
+                // concurrently; `call_state` is snapshotted at the top of this function
+                // and only flipped to Answered below, so both could pass a stale
+                // "not answered" check and both forward to the A-leg — delivering a
+                // duplicate 200 to a caller that already ACKed (the "Dead call
+                // (successful)" the UAC logs, and an occasional failed call when a
+                // forward lands after the A-leg freed its state). Claim under the
+                // per-call lock so exactly one 2xx wins and forwards; the rest are
+                // absorbed here. A FirstWin also sets the winner + Answered (replacing
+                // the set_winner below). `None` = no matched B-leg (defensive) — fall
+                // back to the pre-atomic snapshot check.
+                let already_answered: Option<bool> =
+                    match b_leg_index.map(|idx| state.call_actors.try_win(call_id, idx)) {
+                        Some(crate::b2bua::actor::WinOutcome::FirstWin) => None,
+                        Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered { b_leg_acked }) => {
+                            Some(b_leg_acked)
+                        }
+                        None if call_state == CallState::Answered => Some(true),
+                        None => {
+                            state.call_actors.set_state(call_id, CallState::Answered);
+                            None
                         }
                     };
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                }
-            }
-            return;
-        }
-
-        // (siphon-terminated transfer-target responses are intercepted earlier,
-        // before the class match, so they never reach this normal-answer path.)
-
-        // 2xx — this is the winning answer; the winner + Answered state were
-        // claimed atomically above (try_win), so there is nothing to set here.
-
-        // Record the winning B-leg's own raw endpoint SDP (its 200 answer,
-        // captured before the @b2bua.on_answer script / rtpengine rewrite below)
-        // so a later siphon-terminated transfer where this leg is the survivor
-        // can offer its real media to the transfer target.
-        if !message.body.is_empty() {
-            state.call_actors.set_leg_last_sdp(call_id, false, &message.body);
-        }
-
-        // CDR: stamp the answer time (cdr.auto_emit).
-        cdr_mark_b2bua_answer(state, call_id, status_code);
-
-        // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR, and
-        // record it on the Ro session so every later CCR in that session names
-        // the carrier that actually carried the call. Under sequential failover
-        // that is not necessarily the one the CCR-INITIAL was built for, so it
-        // cannot be inferred from the initial request.
-        if let Some(route) = state.call_actors.active_route(call_id) {
-            cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
-            ro_stamp_winning_carrier(state, call_id, &route.carrier_id);
-        }
-
-        // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
-        // Fire-and-forget per TS 32.299 §6.5.
-        if let Some(invite_arc) = &a_leg_invite {
-            spawn_rf_b2bua_start(state, call_id, invite_arc);
-        }
-        // Ro is not *started* here — prepaid reserve-before-connect means the
-        // CCR-INITIAL already fired in `@b2bua.on_invite` via
-        // `call.ro_authorize()`, before the B-leg was dialed, and the re-auth
-        // loop it armed keeps running. But the answer is what starts the
-        // chargeable clock (TS 32.260 §5), so report it: a CCR-UPDATE carrying
-        // Time-Stamps tells the OCS when charging actually began, and under
-        // `ro.charge_from: answer` it is also what stops ring time being billed.
-        spawn_ro_b2bua_answer(state, call_id);
-
-        // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
-        let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
-
-        // Invoke @b2bua.on_answer handlers with (PyCall, PyReply)
-        let engine_state = state.engine.state();
-        let handlers = engine_state.handlers_for(&HandlerKind::B2buaAnswer);
-        if !handlers.is_empty() {
-            if let Some(invite_arc) = &a_leg_invite {
-                let mut py_call = PyCall::new(
-                    call_id.to_string(),
-                    Arc::clone(invite_arc),
-                    a_leg.transport.remote_addr.ip().to_string(),
-                    format!("{}", a_leg.transport.transport).to_lowercase(),
-                )
-                .with_flow(py_flow_from_leg(&a_leg.transport));
-                // LCR: surface the carrier that won as `call.active_route` so the
-                // script can stamp it onto a CDR / charging record.
-                if let Some(route) = state.call_actors.active_route(call_id) {
-                    py_call.set_active_route(route);
-                }
-                let py_reply = PyReply::new(Arc::clone(&response_arc))
-                    .with_a_leg(Arc::clone(invite_arc))
-                    .with_response_source(
-                        response_source.ip().to_string(),
-                        response_source.port(),
+                if let Some(b_leg_acked) = already_answered {
+                    // Retransmit of the winning B-leg's 200 (it hasn't received our ACK
+                    // yet), or a losing fork branch. Re-ACK only once the B-leg ACK has
+                    // gone out (late-ACK complete); while still awaiting the A-leg ACK,
+                    // absorb silently.
+                    if !b_leg_acked {
+                        debug!(
+                            call_id = %call_id,
+                            "B2BUA: absorbing 200 OK retransmission (waiting for A-leg ACK)"
+                        );
+                        return;
+                    }
+                    debug!(
+                        call_id = %call_id,
+                        "B2BUA: absorbing 200 OK retransmission (already answered)"
                     );
-
-                let answer_action = Python::attach(|python| -> Option<CallAction> {
-                    let call_obj = match Py::new(python, py_call) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyCall for on_answer: {error}");
-                            return None;
+                    // Re-send ACK to B-leg to stop retransmissions
+                    if let Some((b_dest, b_transport)) = b_leg_dest {
+                        if let Some((ref b_cid, _b_ftag)) = b_leg_dialog {
+                            // Build a clean ACK from scratch — do NOT clone the 200 OK
+                            // (cloning leaks response headers like User-Agent, Contact,
+                            // Allow, Supported, etc. from the remote UA).
+                            let request_uri = message
+                                .headers
+                                .get("Contact")
+                                .or_else(|| message.headers.get("m"))
+                                .map(|c| crate::b2bua::actor::extract_contact_uri(c))
+                                .and_then(|u| parse_uri_standalone(&u).ok())
+                                .or_else(|| {
+                                    b_leg_remote_contact
+                                        .as_deref()
+                                        .and_then(|u| parse_uri_standalone(u).ok())
+                                })
+                                .or_else(|| {
+                                    b_leg_target
+                                        .as_deref()
+                                        .and_then(|u| parse_uri_standalone(u).ok())
+                                })
+                                .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+                            let transport_str = format!("{}", b_transport).to_uppercase();
+                            // Sent-by of the leg this ACK goes back on — the flow socket
+                            // when the leg was dialled over one.
+                            let (outbound_host, outbound_port) =
+                                b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                            let cseq_num = message
+                                .headers
+                                .cseq()
+                                .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+                                .unwrap_or_else(|| "1".to_string());
+                            let from = message.headers.from().cloned().unwrap_or_default();
+                            let to = message.headers.to().cloned().unwrap_or_default();
+                            let ack = match SipMessageBuilder::new()
+                                .request(Method::Ack, request_uri)
+                                .via(format!(
+                                    "SIP/2.0/{} {}:{};branch={}",
+                                    transport_str,
+                                    outbound_host,
+                                    outbound_port,
+                                    TransactionKey::generate_branch(),
+                                ))
+                                .from(from.to_string())
+                                .to(to.to_string())
+                                .call_id(b_cid.clone())
+                                .cseq(format!("{} ACK", cseq_num))
+                                .header("Max-Forwards", "70".to_string())
+                                .content_length(0)
+                                .build()
+                            {
+                                Ok(ack) => ack,
+                                Err(error) => {
+                                    error!(
+                                        "B2BUA ACK for 200 OK retransmission build failed: {error}"
+                                    );
+                                    return;
+                                }
+                            };
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                         }
-                    };
-                    let reply_obj = match Py::new(python, py_reply) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyReply for on_answer: {error}");
-                            return None;
-                        }
-                    };
+                    }
+                    return;
+                }
 
-                    for handler in &handlers {
-                        let callable = handler.callable.bind(python);
-                        match callable.call1((call_obj.bind(python), reply_obj.bind(python))) {
-                            Ok(ret) => {
-                                if handler.is_async {
-                                    if let Err(error) = run_coroutine(python, &ret) {
-                                        error!("async B2BUA on_answer handler error: {error}");
+                // (siphon-terminated transfer-target responses are intercepted earlier,
+                // before the class match, so they never reach this normal-answer path.)
+
+                // 2xx — this is the winning answer; the winner + Answered state were
+                // claimed atomically above (try_win), so there is nothing to set here.
+
+                // Record the winning B-leg's own raw endpoint SDP (its 200 answer,
+                // captured before the @b2bua.on_answer script / rtpengine rewrite below)
+                // so a later siphon-terminated transfer where this leg is the survivor
+                // can offer its real media to the transfer target.
+                if !message.body.is_empty() {
+                    state
+                        .call_actors
+                        .set_leg_last_sdp(call_id, false, &message.body);
+                }
+
+                // CDR: stamp the answer time (cdr.auto_emit).
+                cdr_mark_b2bua_answer(state, call_id, status_code);
+
+                // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR, and
+                // record it on the Ro session so every later CCR in that session names
+                // the carrier that actually carried the call. Under sequential failover
+                // that is not necessarily the one the CCR-INITIAL was built for, so it
+                // cannot be inferred from the initial request.
+                if let Some(route) = state.call_actors.active_route(call_id) {
+                    cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
+                    ro_stamp_winning_carrier(state, call_id, &route.carrier_id);
+                }
+
+                // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
+                // Fire-and-forget per TS 32.299 §6.5.
+                if let Some(invite_arc) = &a_leg_invite {
+                    spawn_rf_b2bua_start(state, call_id, invite_arc);
+                }
+                // Ro is not *started* here — prepaid reserve-before-connect means the
+                // CCR-INITIAL already fired in `@b2bua.on_invite` via
+                // `call.ro_authorize()`, before the B-leg was dialed, and the re-auth
+                // loop it armed keeps running. But the answer is what starts the
+                // chargeable clock (TS 32.260 §5), so report it: a CCR-UPDATE carrying
+                // Time-Stamps tells the OCS when charging actually began, and under
+                // `ro.charge_from: answer` it is also what stops ring time being billed.
+                spawn_ro_b2bua_answer(state, call_id);
+
+                // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
+                let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
+
+                // Invoke @b2bua.on_answer handlers with (PyCall, PyReply)
+                let engine_state = state.engine.state();
+                let handlers = engine_state.handlers_for(&HandlerKind::B2buaAnswer);
+                if !handlers.is_empty() {
+                    if let Some(invite_arc) = &a_leg_invite {
+                        let mut py_call = PyCall::new(
+                            call_id.to_string(),
+                            Arc::clone(invite_arc),
+                            a_leg.transport.remote_addr.ip().to_string(),
+                            format!("{}", a_leg.transport.transport).to_lowercase(),
+                        )
+                        .with_flow(py_flow_from_leg(&a_leg.transport));
+                        // LCR: surface the carrier that won as `call.active_route` so the
+                        // script can stamp it onto a CDR / charging record.
+                        if let Some(route) = state.call_actors.active_route(call_id) {
+                            py_call.set_active_route(route);
+                        }
+                        let py_reply = PyReply::new(Arc::clone(&response_arc))
+                            .with_a_leg(Arc::clone(invite_arc))
+                            .with_response_source(
+                                response_source.ip().to_string(),
+                                response_source.port(),
+                            );
+
+                        let answer_action = Python::attach(|python| -> Option<CallAction> {
+                            let call_obj = match Py::new(python, py_call) {
+                                Ok(obj) => obj,
+                                Err(error) => {
+                                    error!("failed to create PyCall for on_answer: {error}");
+                                    return None;
+                                }
+                            };
+                            let reply_obj = match Py::new(python, py_reply) {
+                                Ok(obj) => obj,
+                                Err(error) => {
+                                    error!("failed to create PyReply for on_answer: {error}");
+                                    return None;
+                                }
+                            };
+
+                            for handler in &handlers {
+                                let callable = handler.callable.bind(python);
+                                match callable
+                                    .call1((call_obj.bind(python), reply_obj.bind(python)))
+                                {
+                                    Ok(ret) => {
+                                        if handler.is_async {
+                                            if let Err(error) = run_coroutine(python, &ret) {
+                                                error!(
+                                                    "async B2BUA on_answer handler error: {error}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("B2BUA on_answer handler error: {error}");
                                     }
                                 }
                             }
-                            Err(error) => {
-                                error!("B2BUA on_answer handler error: {error}");
-                            }
+                            let borrowed = call_obj.borrow(python);
+                            Some(borrowed.action().clone())
+                        });
+
+                        // Deferred call.refer() from @b2bua.on_answer: send an outbound
+                        // REFER to the A-leg (the connected caller). Other deferred
+                        // actions on on_answer are not applicable (the call is already
+                        // answered) and are ignored.
+                        if let Some(CallAction::SendRefer { refer_to }) = answer_action {
+                            b2bua_send_outbound_refer(
+                                state, call_id, /*on_a_leg=*/ true, &refer_to,
+                            );
                         }
-                    }
-                    let borrowed = call_obj.borrow(python);
-                    Some(borrowed.action().clone())
-                });
-
-                // Deferred call.refer() from @b2bua.on_answer: send an outbound
-                // REFER to the A-leg (the connected caller). Other deferred
-                // actions on on_answer are not applicable (the call is already
-                // answered) and are ignored.
-                if let Some(CallAction::SendRefer { refer_to }) = answer_action {
-                    b2bua_send_outbound_refer(state, call_id, /*on_a_leg=*/ true, &refer_to);
-                }
-            } else {
-                warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_answer");
-            }
-        }
-        // Resolve SRS URI from config when li.record() was called
-        let li_srs_uri = if li_record { state.li_siprec_srs_uri.as_deref() } else { None };
-
-        // RFC 4028: Activate session timer from negotiated 200 OK headers
-        if let Some(ref timer_config) = state.session_timer_config {
-            if timer_config.enabled {
-                // Parse Session-Expires from 200 OK (e.g. "1800;refresher=uas")
-                let Ok(response_lock) = response_arc.lock() else {
-                    error!("response_arc lock poisoned during session timer parsing");
-                    return;
-                };
-                let (negotiated_expires, negotiated_refresher) =
-                    if let Some(se_header) = response_lock.headers.get("Session-Expires") {
-                        let parts: Vec<&str> = se_header.split(';').collect();
-                        let expires = parts[0].trim().parse::<u32>()
-                            .unwrap_or(timer_config.session_expires);
-                        let refresher = parts.iter()
-                            .find(|p| p.trim().starts_with("refresher="))
-                            .map(|p| p.trim().trim_start_matches("refresher=").to_string())
-                            .unwrap_or_else(|| "b2bua".to_string());
-                        (expires, refresher)
                     } else {
-                        // Remote didn't include Session-Expires — use our config defaults
-                        (timer_config.session_expires, "b2bua".to_string())
-                    };
-                drop(response_lock);
-
-                let timer_state = crate::b2bua::actor::SessionTimerState {
-                    session_expires: negotiated_expires,
-                    refresher: negotiated_refresher.clone(),
-                    last_refresh: std::time::Instant::now(),
+                        warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_answer");
+                    }
+                }
+                // Resolve SRS URI from config when li.record() was called
+                let li_srs_uri = if li_record {
+                    state.li_siprec_srs_uri.as_deref()
+                } else {
+                    None
                 };
-                state.call_actors.set_session_timer(call_id, timer_state);
 
-                debug!(
-                    call_id = %call_id,
-                    session_expires = negotiated_expires,
-                    refresher = %negotiated_refresher,
-                    "B2BUA: session timer activated"
-                );
-            }
-        }
-
-        // Extract the (possibly SDP-modified) response and forward to A-leg
-        let mut response = match Arc::try_unwrap(response_arc) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_else(|error| error.into_inner()),
-            Err(arc) => arc.lock().unwrap_or_else(|error| error.into_inner()).clone(),
-        };
-
-        // Inject session timer headers into the response forwarded to the A-leg.
-        // RFC 4028 §7.4/§9: a UAS MUST NOT drive a session timer (least of all
-        // `refresher=uac`) toward a UAC that did not advertise `Supported: timer`
-        // (or `Require: timer`) — the refresh it would expect never comes and the
-        // call is torn down at expiry. So only inject when the A-leg INVITE
-        // advertised timer support; otherwise leave the response untouched.
-        if let Some(ref timer_config) = state.session_timer_config {
-            if timer_config.enabled {
-                let a_leg_supports_timer = a_leg_invite
-                    .as_ref()
-                    .and_then(|arc| arc.lock().ok())
-                    .map(|invite| {
-                        let has = |name: &str| {
-                            invite
-                                .headers
-                                .get_all(name)
-                                .map(|values| {
-                                    values
-                                        .iter()
-                                        .any(|v| v.to_ascii_lowercase().contains("timer"))
-                                })
-                                .unwrap_or(false)
+                // RFC 4028: Activate session timer from negotiated 200 OK headers
+                if let Some(ref timer_config) = state.session_timer_config {
+                    if timer_config.enabled {
+                        // Parse Session-Expires from 200 OK (e.g. "1800;refresher=uas")
+                        let Ok(response_lock) = response_arc.lock() else {
+                            error!("response_arc lock poisoned during session timer parsing");
+                            return;
                         };
-                        has("Supported") || has("Require")
-                    })
-                    .unwrap_or(false);
-                if a_leg_supports_timer {
-                    if response.headers.get("Supported").is_none() {
-                        response.headers.add("Supported", "timer".to_string());
-                    }
-                    if response.headers.get("Session-Expires").is_none() {
-                        response.headers.add(
-                            "Session-Expires",
-                            format!("{};refresher=uac", timer_config.session_expires),
-                        );
-                    }
-                }
-            }
-        }
+                        let (negotiated_expires, negotiated_refresher) =
+                            if let Some(se_header) = response_lock.headers.get("Session-Expires") {
+                                let parts: Vec<&str> = se_header.split(';').collect();
+                                let expires = parts[0]
+                                    .trim()
+                                    .parse::<u32>()
+                                    .unwrap_or(timer_config.session_expires);
+                                let refresher = parts
+                                    .iter()
+                                    .find(|p| p.trim().starts_with("refresher="))
+                                    .map(|p| p.trim().trim_start_matches("refresher=").to_string())
+                                    .unwrap_or_else(|| "b2bua".to_string());
+                                (expires, refresher)
+                            } else {
+                                // Remote didn't include Session-Expires — use our config defaults
+                                (timer_config.session_expires, "b2bua".to_string())
+                            };
+                        drop(response_lock);
 
-        // Rewrite B-leg dialog headers back to A-leg identifiers.
-        // The To-tag MUST be rewritten to A-leg's local_tag (RFC 3261 §12.2.1.1):
-        // B-leg 2xx carries the B-leg far end's tag in To, but the A-leg far
-        // end will store whatever it sees there as its dialog's remote-tag and
-        // match in-dialog requests against it. Without this rewrite, the BYE
-        // we later send toward A — built with a_leg.dialog.local_tag (the
-        // freshly generated sb-... tag) in its From — would mismatch the
-        // stored remote tag and get 481 Call/Transaction Does Not Exist.
-        if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::actor::Dialog::rewrite_headers(
-                &mut response,
-                &a_leg.dialog.call_id,
-                b_ftag,
-                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                Some(&a_leg.dialog.local_tag),
-            );
-            let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
-        }
+                        let timer_state = crate::b2bua::actor::SessionTimerState {
+                            session_expires: negotiated_expires,
+                            refresher: negotiated_refresher.clone(),
+                            last_refresh: std::time::Instant::now(),
+                        };
+                        state.call_actors.set_session_timer(call_id, timer_state);
 
-        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
-        // The B-leg response only carries our Via; the A-leg caller expects its own.
-        // Also restore the A-leg's original CSeq (RFC 3261 §8.2.6.2 — response
-        // CSeq MUST equal the request CSeq). The B-leg response carries the B-leg
-        // CSeq which is in an independent numbering space.
-        if let Some(invite_arc) = &a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(vias) = invite.headers.get_all("Via") {
-                    response.headers.set_all("Via", vias.clone());
-                }
-                if let Some(cseq) = invite.headers.cseq() {
-                    response.headers.set("CSeq", cseq.clone());
-                }
-                // RFC 3261 §8.2.6.2: the response From MUST equal the request
-                // From, and the response To MUST equal the request To plus the
-                // dialog tag. The cloned B-leg 2xx carries the B-leg dialog's
-                // From/To URIs (siphon's B-leg identity and the B-leg contact
-                // host) — restore the A-leg caller's own From verbatim and its
-                // To with siphon's A-leg tag (the rewrite_headers tag-swap above
-                // only fixed the tags, not the URIs).
-                if let Some(from) = invite.headers.from() {
-                    response.headers.set("From", from.clone());
-                }
-                if let Some(to) = invite.headers.to() {
-                    response.headers.set(
-                        "To",
-                        crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag)),
-                    );
-                }
-            }
-        }
-
-        // Extract B-leg Record-Route BEFORE sanitization — needed for B-leg ACK Route set.
-        // Per RFC 3261 §12.1.1, the ACK route set is the Record-Route from the 200 OK reversed.
-        let b_leg_record_routes = response.headers.get_all("Record-Route")
-            .cloned()
-            .unwrap_or_default();
-
-        // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(&mut response, state, a_leg.transport.transport, a_leg_local_addr, a_leg_supports_100rel, call_id);
-
-        // Own the o= identity toward the A-leg on the answer it receives (RFC
-        // 3264 §8): the first SDP siphon emits toward the caller fixes the leg's
-        // stable session-id; a later re-anchor (transfer, hold) then presents a
-        // strictly greater version under the same session-id.
-        if !response.body.is_empty() {
-            if let Some((sess_id, version)) =
-                state.call_actors.reserve_leg_sdp_version(call_id, true)
-            {
-                stamp_sdp_origin(&mut response.body, &state.sdp_name, sess_id, version, None);
-                response
-                    .headers
-                    .set("Content-Length", response.body.len().to_string());
-            }
-        }
-
-        // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
-        // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
-        // 200 OK must contain the A-leg Record-Route so the UAC can build its route set.
-        if let Some(ref invite_arc) = a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(rrs) = invite.headers.get_all("Record-Route") {
-                    response.headers.set_all("Record-Route", rrs.clone());
-                }
-            }
-        }
-
-        // Persist dialog route sets for in-dialog requests (BYE, re-INVITE).
-        // Must happen before we consume the Record-Routes for ACK building.
-        {
-            // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
-            // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
-            // header line stay in wire order until then.
-            let b_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
-            // A-leg route set from stored INVITE's Record-Route (in order for UAS)
-            let a_routes = a_leg_invite.as_ref()
-                .and_then(|arc| arc.lock().ok())
-                .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
-                .map(|rrs| flatten_record_route_headers(&rrs))
-                .unwrap_or_default();
-
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                if let Some(winner) = call.winner {
-                    if let Some(b_leg) = call.b_legs.get_mut(winner) {
                         debug!(
                             call_id = %call_id,
-                            b_routes_count = b_routes.len(),
-                            "B2BUA: stored B-leg dialog route set",
+                            session_expires = negotiated_expires,
+                            refresher = %negotiated_refresher,
+                            "B2BUA: session timer activated"
                         );
-                        b_leg.dialog.route_set = b_routes.clone();
                     }
                 }
-                debug!(
-                    call_id = %call_id,
-                    a_routes_count = a_routes.len(),
-                    "B2BUA: stored A-leg dialog route set",
-                );
-                call.a_leg.dialog.route_set = a_routes;
-            }
-        }
 
-        // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
-        // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
-        // ACK before ACKing B-leg. This keeps the B-leg INVITE transaction alive,
-        // preventing the B-leg from sending re-INVITEs before the A-leg has ACKed.
-        // The B-leg will retransmit 200 OK (Timer G) — we absorb those silently
-        // until A-leg ACKs and we send our ACK to B-leg.
-        if let Some((b_dest, b_transport)) = b_leg_dest {
-            if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
-                let ack_uri = message.headers.get("Contact")
-                    .or_else(|| message.headers.get("m"))
-                    .map(|c| crate::b2bua::actor::extract_contact_uri(c))
-                    .and_then(|u| parse_uri_standalone(&u).ok())
-                    .or_else(|| b_leg_remote_contact.as_deref()
-                        .and_then(|u| parse_uri_standalone(u).ok()))
-                    .or_else(|| b_leg_target.as_deref()
-                        .and_then(|u| parse_uri_standalone(u).ok()))
-                    .unwrap_or_else(|| SipUri::new("invalid".to_string()));
-                let transport_str = format!("{}", b_transport).to_uppercase();
-                let cseq_num = message.headers.cseq()
-                    .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "1".to_string());
-                let from = message.headers.from().cloned().unwrap_or_default();
-                let to = message.headers.to().cloned().unwrap_or_default();
+                // Extract the (possibly SDP-modified) response and forward to A-leg
+                let mut response = match Arc::try_unwrap(response_arc) {
+                    Ok(mutex) => mutex
+                        .into_inner()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    Err(arc) => arc
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                };
 
-                // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
-                // Flatten BEFORE reversing — see flatten_record_route_headers comment.
-                let b_leg_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
-
-                // Sent-by of the leg this ACK goes back on — the flow socket when
-                // the leg was dialled over one, so the ACK is consistent with the
-                // INVITE that drew this 2xx and leaves the same way (below).
-                let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                let mut ack_builder = SipMessageBuilder::new()
-                    .request(Method::Ack, ack_uri)
-                    .via(format!(
-                        "SIP/2.0/{} {}:{};branch={}",
-                        transport_str,
-                        ack_via_host,
-                        ack_via_port,
-                        TransactionKey::generate_branch(),
-                    ))
-                    .from(from.to_string())
-                    .to(to.to_string())
-                    .call_id(b_cid.clone())
-                    .cseq(format!("{} ACK", cseq_num))
-                    .header("Max-Forwards", "70".to_string());
-
-                // Add Route headers from reversed B-leg Record-Route
-                for route in &b_leg_routes {
-                    ack_builder = ack_builder.header("Route", route.clone());
+                // Inject session timer headers into the response forwarded to the A-leg.
+                // RFC 4028 §7.4/§9: a UAS MUST NOT drive a session timer (least of all
+                // `refresher=uac`) toward a UAC that did not advertise `Supported: timer`
+                // (or `Require: timer`) — the refresh it would expect never comes and the
+                // call is torn down at expiry. So only inject when the A-leg INVITE
+                // advertised timer support; otherwise leave the response untouched.
+                if let Some(ref timer_config) = state.session_timer_config {
+                    if timer_config.enabled {
+                        let a_leg_supports_timer = a_leg_invite
+                            .as_ref()
+                            .and_then(|arc| arc.lock().ok())
+                            .map(|invite| {
+                                let has = |name: &str| {
+                                    invite
+                                        .headers
+                                        .get_all(name)
+                                        .map(|values| {
+                                            values
+                                                .iter()
+                                                .any(|v| v.to_ascii_lowercase().contains("timer"))
+                                        })
+                                        .unwrap_or(false)
+                                };
+                                has("Supported") || has("Require")
+                            })
+                            .unwrap_or(false);
+                        if a_leg_supports_timer {
+                            if response.headers.get("Supported").is_none() {
+                                response.headers.add("Supported", "timer".to_string());
+                            }
+                            if response.headers.get("Session-Expires").is_none() {
+                                response.headers.add(
+                                    "Session-Expires",
+                                    format!("{};refresher=uac", timer_config.session_expires),
+                                );
+                            }
+                        }
+                    }
                 }
 
-                if let Ok(ack) = ack_builder
-                    .content_length(0)
-                    .build()
-                {
-                    // ACK to 2xx is end-to-end and follows the dialog route set
-                    // (RFC 3261 §13.2.2.4). Use the first Route URI as next hop
-                    // rather than the cached B-leg destination, which may be an
-                    // upstream that doesn't Record-Route (e.g. IMS I-CSCF).
-                    let (ack_dest, ack_transport) = resolve_in_dialog_destination(
-                        &b_leg_routes,
-                        state,
-                        b_dest,
-                        b_transport,
+                // Rewrite B-leg dialog headers back to A-leg identifiers.
+                // The To-tag MUST be rewritten to A-leg's local_tag (RFC 3261 §12.2.1.1):
+                // B-leg 2xx carries the B-leg far end's tag in To, but the A-leg far
+                // end will store whatever it sees there as its dialog's remote-tag and
+                // match in-dialog requests against it. Without this rewrite, the BYE
+                // we later send toward A — built with a_leg.dialog.local_tag (the
+                // freshly generated sb-... tag) in its From — would mismatch the
+                // stored remote tag and get 481 Call/Transaction Does Not Exist.
+                if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        &mut response,
+                        &a_leg.dialog.call_id,
+                        b_ftag,
+                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        Some(&a_leg.dialog.local_tag),
                     );
-                    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                        call.pending_b_leg_ack = Some((ack, ack_transport, ack_dest));
-                    }
-                    debug!(call_id = %call_id, destination = %ack_dest, "B2BUA: deferred B-leg ACK until A-leg ACKs");
-                }
-            }
-        }
-
-        // Extract SDP body before forwarding (needed for SIPREC)
-        let sdp_body = response.body.clone();
-
-        // Clone the sanitized 2xx before it is moved into send_message so the
-        // A-leg retransmit is byte-identical (RFC 3261 §13.3.1.4).
-        let retransmit_2xx = response.clone();
-
-        // Pin the reply egress socket to the listener the A-leg INVITE arrived on
-        // (`a_leg_local_addr`) so a multi-homed UDP host answers on the same port
-        // it received on — a peer doing symmetric signalling drops a 2xx sourced
-        // from a different local port. No-op for TCP/TLS/WS/WSS (routed by the
-        // accepted connection) and for a single-listener host (`udp_by_local` empty).
-        send_message_from(
-            response,
-            a_leg.transport.transport,
-            a_leg.transport.remote_addr,
-            a_leg.transport.connection_id,
-            a_leg_local_addr,
-            state,
-        );
-
-        // Arm A-leg 2xx retransmission — the B2BUA has no IST for the A-leg, so
-        // nothing else recovers a lost 200. Cancelled by the caller's ACK in the
-        // late-ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
-        // block below so its early returns can't skip it.
-        arm_b2bua_2xx_retransmit(
-            call_id,
-            retransmit_2xx,
-            a_leg.transport.transport,
-            a_leg.transport.remote_addr,
-            a_leg.transport.connection_id,
-            a_leg_local_addr,
-            state,
-        );
-
-        // SIPREC: start recording if configured for this call
-        if let Some(srs_uri) = li_srs_uri {
-            let sdp = &sdp_body;
-            if let Some(invite_arc) = &a_leg_invite {
-                let Ok(invite) = invite_arc.lock() else {
-                    error!(call_id = %call_id, "invite_arc lock poisoned during SIPREC start");
-                    return;
-                };
-                let caller_uri = invite.headers.get("From")
-                    .map(|from| from.to_string())
-                    .unwrap_or_default();
-                let callee_uri = invite.headers.get("To")
-                    .map(|to| to.to_string())
-                    .unwrap_or_default();
-                drop(invite);
-
-                // RTPEngine subscribe: fork media to the recording leg.
-                // Uses SIPREC-mode subscribe with from-tags containing both
-                // monologue tags so RTPEngine returns a combined SDP with
-                // 2 m= lines (one per call direction).
-                let a_sip_call_id = a_leg.dialog.call_id.clone();
-
-                // Look up the MediaSession to get both monologue tags that
-                // RTPEngine knows about (from_tag = A-leg, to_tag = B-leg).
-                let media_tags: Option<(String, String)> = state.rtpengine_sessions.as_ref()
-                    .and_then(|sessions| sessions.get(&a_sip_call_id))
-                    .and_then(|session| {
-                        session.to_tag.as_ref().map(|to_tag| {
-                            (session.from_tag.clone(), to_tag.clone())
-                        })
-                    });
-
-                // Look up the SIPREC SRC RTPEngine profile for additional subscribe flags.
-                let siprec_src_profile = state.li_siprec_rtpengine_profile.as_deref()
-                    .and_then(|name| {
-                        state.rtpengine_profiles.as_ref()
-                            .and_then(|registry| registry.get(name).cloned())
-                    });
-                let siprec_src_flags = siprec_src_profile.as_ref().map(|profile| &profile.offer);
-
-                let (mut caller_sdp, mut callee_sdp, subscriber_to_tag) = if let Some(ref rtpengine_set) = state.rtpengine_set {
-                    // Build from-tags list with both monologue tags.
-                    let from_tags: Vec<&str> = match &media_tags {
-                        Some((from_tag, to_tag)) => vec![from_tag.as_str(), to_tag.as_str()],
-                        None => {
-                            warn!(call_id = %call_id, "SIPREC: no MediaSession tags found, subscribe may return only 1 stream");
-                            vec![]
-                        }
-                    };
-
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            rtpengine_set.subscribe_request_siprec(&a_sip_call_id, &from_tags, siprec_src_flags)
-                        )
-                    });
-                    match result {
-                        Ok((sdp, to_tag)) => {
-                            debug!(call_id = %call_id, sdp_len = sdp.len(), subscriber_to_tag = %to_tag, "SIPREC: subscribe_request_siprec OK");
-                            // Fix direction (recvonly→sendonly) and add a=label per m= section.
-                            let processed = crate::siprec::fix_siprec_subscribe_sdp(&sdp);
-                            // Split the dual-m= SDP into per-direction parts so
-                            // start_recording builds a proper 2-stream INVITE.
-                            let (sdp1, sdp2) = crate::siprec::split_dual_sdp(&processed);
-                            let has_two = sdp1 != sdp2;
-                            if has_two {
-                                (Some(sdp1), Some(sdp2), Some(to_tag))
-                            } else {
-                                // Single m= line — split returned two identical copies.
-                                (Some(sdp1), None, Some(to_tag))
-                            }
-                        }
-                        Err(error) => {
-                            warn!(call_id = %call_id, %error, "SIPREC: subscribe_request_siprec failed");
-                            (None, None, None)
-                        }
-                    }
-                } else {
-                    (None, None, None)
-                };
-
-                // Sanitize the subscribe SDPs to hide the original call's identity
-                // (o=/s= lines may leak FreeSWITCH, Oracle, etc.).
-                let local_ip = state.local_addr.ip().to_string();
-                if let Some(ref mut sdp_bytes) = caller_sdp {
-                    sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
-                }
-                if let Some(ref mut sdp_bytes) = callee_sdp {
-                    sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
+                    let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
                 }
 
-                // For unsubscribe on BYE: SIPREC-mode uses empty from-tag and
-                // the subscriber to-tag returned by RTPEngine.
-                let tags_for_unsubscribe = subscriber_to_tag.as_ref().map(|tt| (String::new(), tt.clone()));
-                let tags_ref = tags_for_unsubscribe.as_ref().map(|(ft, tt)| (ft.as_str(), tt.as_str()));
-                if let Some((_session_id, rec_invite, destination, transport)) =
-                    state.recording_manager.start_recording(
-                        call_id, srs_uri, &caller_uri, &callee_uri, sdp, state.local_addr,
-                        caller_sdp.as_deref(), callee_sdp.as_deref(),
-                        Some(&a_sip_call_id), tags_ref,
-                        state.user_agent_header.as_deref(),
-                    )
-                {
-                    let data = Bytes::from(rec_invite.to_bytes());
-                    let target = RelayTarget {
-                        address: destination,
-                        transport: Some(transport),
-                        server_name: None,
-                    };
-                    send_to_target(data, &target, transport, ConnectionId::default(), None, state);
-                }
-            }
-        }
-    } // end 2xx guard
-
-    } ResponseClass::Provisional => {
-    // --- 1xx provisional handling ---
-    {
-        // Drop a stray provisional that arrives after the call is already
-        // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
-        // fork branch's late 18x. A B2BUA must not forward a provisional after
-        // the final response, nor downgrade the confirmed dialog back to Ringing
-        // (RFC 3261 §12.1). This MUST be an atomic check-and-set, not the
-        // `call_state` snapshot taken ~1600 lines earlier: under multi-worker
-        // dispatch a B-leg's 180 and 200 (received in order over one TCP/UDP
-        // flow) are processed on different workers concurrently, so a late 180
-        // that reads a stale "not answered" snapshot would be forwarded behind
-        // its 200 and abort the A-leg UAC (which already ACKed/BYE'd). Deciding
-        // under the per-call lock drops the provisional that lost the race.
-        if !state.call_actors.try_mark_ringing(call_id) {
-            debug!(call_id = %call_id, status = status_code,
-                "B2BUA: dropping provisional received after answer");
-            return;
-        }
-
-        // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
-        // This lets scripts process early media through RTPEngine before forwarding.
-        let has_sdp_body = !message.body.is_empty();
-        if has_sdp_body {
-            let engine_state = state.engine.state();
-            let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
-            if !handlers.is_empty() {
+                // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+                // The B-leg response only carries our Via; the A-leg caller expects its own.
+                // Also restore the A-leg's original CSeq (RFC 3261 §8.2.6.2 — response
+                // CSeq MUST equal the request CSeq). The B-leg response carries the B-leg
+                // CSeq which is in an independent numbering space.
                 if let Some(invite_arc) = &a_leg_invite {
-                    let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
-                    let py_call = PyCall::new(
-                        call_id.to_string(),
-                        Arc::clone(invite_arc),
-                        a_leg.transport.remote_addr.ip().to_string(),
-                        format!("{}", a_leg.transport.transport).to_lowercase(),
-                    )
-                    .with_flow(py_flow_from_leg(&a_leg.transport));
-                    let py_reply = PyReply::new(Arc::clone(&response_arc))
-                        .with_a_leg(Arc::clone(invite_arc))
-                        .with_response_source(
-                            response_source.ip().to_string(),
-                            response_source.port(),
+                    if let Ok(invite) = invite_arc.lock() {
+                        if let Some(vias) = invite.headers.get_all("Via") {
+                            response.headers.set_all("Via", vias.clone());
+                        }
+                        if let Some(cseq) = invite.headers.cseq() {
+                            response.headers.set("CSeq", cseq.clone());
+                        }
+                        // RFC 3261 §8.2.6.2: the response From MUST equal the request
+                        // From, and the response To MUST equal the request To plus the
+                        // dialog tag. The cloned B-leg 2xx carries the B-leg dialog's
+                        // From/To URIs (siphon's B-leg identity and the B-leg contact
+                        // host) — restore the A-leg caller's own From verbatim and its
+                        // To with siphon's A-leg tag (the rewrite_headers tag-swap above
+                        // only fixed the tags, not the URIs).
+                        if let Some(from) = invite.headers.from() {
+                            response.headers.set("From", from.clone());
+                        }
+                        if let Some(to) = invite.headers.to() {
+                            response.headers.set(
+                                "To",
+                                crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag)),
+                            );
+                        }
+                    }
+                }
+
+                // Extract B-leg Record-Route BEFORE sanitization — needed for B-leg ACK Route set.
+                // Per RFC 3261 §12.1.1, the ACK route set is the Record-Route from the 200 OK reversed.
+                let b_leg_record_routes = response
+                    .headers
+                    .get_all("Record-Route")
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Sanitize B-leg headers before forwarding to A-leg
+                sanitize_b2bua_response(
+                    &mut response,
+                    state,
+                    a_leg.transport.transport,
+                    a_leg_local_addr,
+                    a_leg_supports_100rel,
+                    call_id,
+                );
+
+                // Own the o= identity toward the A-leg on the answer it receives (RFC
+                // 3264 §8): the first SDP siphon emits toward the caller fixes the leg's
+                // stable session-id; a later re-anchor (transfer, hold) then presents a
+                // strictly greater version under the same session-id.
+                if !response.body.is_empty() {
+                    if let Some((sess_id, version)) =
+                        state.call_actors.reserve_leg_sdp_version(call_id, true)
+                    {
+                        stamp_sdp_origin(
+                            &mut response.body,
+                            &state.sdp_name,
+                            sess_id,
+                            version,
+                            None,
                         );
+                        response
+                            .headers
+                            .set("Content-Length", response.body.len().to_string());
+                    }
+                }
 
-                    Python::attach(|python| {
-                        let call_obj = match Py::new(python, py_call) {
-                            Ok(obj) => obj,
-                            Err(error) => {
-                                error!("failed to create PyCall for on_early_media: {error}");
-                                return;
-                            }
-                        };
-                        let reply_obj = match Py::new(python, py_reply) {
-                            Ok(obj) => obj,
-                            Err(error) => {
-                                error!("failed to create PyReply for on_early_media: {error}");
-                                return;
-                            }
-                        };
+                // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
+                // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
+                // 200 OK must contain the A-leg Record-Route so the UAC can build its route set.
+                if let Some(ref invite_arc) = a_leg_invite {
+                    if let Ok(invite) = invite_arc.lock() {
+                        if let Some(rrs) = invite.headers.get_all("Record-Route") {
+                            response.headers.set_all("Record-Route", rrs.clone());
+                        }
+                    }
+                }
 
-                        for handler in &handlers {
-                            let callable = handler.callable.bind(python);
-                            match callable.call1((call_obj.bind(python), reply_obj.bind(python))) {
-                                Ok(ret) => {
-                                    if handler.is_async {
-                                        if let Err(error) = run_coroutine(python, &ret) {
-                                            error!("async B2BUA on_early_media handler error: {error}");
-                                        }
+                // Persist dialog route sets for in-dialog requests (BYE, re-INVITE).
+                // Must happen before we consume the Record-Routes for ACK building.
+                {
+                    // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
+                    // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
+                    // header line stay in wire order until then.
+                    let b_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
+                    // A-leg route set from stored INVITE's Record-Route (in order for UAS)
+                    let a_routes = a_leg_invite
+                        .as_ref()
+                        .and_then(|arc| arc.lock().ok())
+                        .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
+                        .map(|rrs| flatten_record_route_headers(&rrs))
+                        .unwrap_or_default();
+
+                    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                        if let Some(winner) = call.winner {
+                            if let Some(b_leg) = call.b_legs.get_mut(winner) {
+                                debug!(
+                                    call_id = %call_id,
+                                    b_routes_count = b_routes.len(),
+                                    "B2BUA: stored B-leg dialog route set",
+                                );
+                                b_leg.dialog.route_set = b_routes.clone();
+                            }
+                        }
+                        debug!(
+                            call_id = %call_id,
+                            a_routes_count = a_routes.len(),
+                            "B2BUA: stored A-leg dialog route set",
+                        );
+                        call.a_leg.dialog.route_set = a_routes;
+                    }
+                }
+
+                // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
+                // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
+                // ACK before ACKing B-leg. This keeps the B-leg INVITE transaction alive,
+                // preventing the B-leg from sending re-INVITEs before the A-leg has ACKed.
+                // The B-leg will retransmit 200 OK (Timer G) — we absorb those silently
+                // until A-leg ACKs and we send our ACK to B-leg.
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
+                        let ack_uri = message
+                            .headers
+                            .get("Contact")
+                            .or_else(|| message.headers.get("m"))
+                            .map(|c| crate::b2bua::actor::extract_contact_uri(c))
+                            .and_then(|u| parse_uri_standalone(&u).ok())
+                            .or_else(|| {
+                                b_leg_remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            })
+                            .or_else(|| {
+                                b_leg_target
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            })
+                            .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+                        let transport_str = format!("{}", b_transport).to_uppercase();
+                        let cseq_num = message
+                            .headers
+                            .cseq()
+                            .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "1".to_string());
+                        let from = message.headers.from().cloned().unwrap_or_default();
+                        let to = message.headers.to().cloned().unwrap_or_default();
+
+                        // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
+                        // Flatten BEFORE reversing — see flatten_record_route_headers comment.
+                        let b_leg_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
+
+                        // Sent-by of the leg this ACK goes back on — the flow socket when
+                        // the leg was dialled over one, so the ACK is consistent with the
+                        // INVITE that drew this 2xx and leaves the same way (below).
+                        let (ack_via_host, ack_via_port) =
+                            b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                        let mut ack_builder = SipMessageBuilder::new()
+                            .request(Method::Ack, ack_uri)
+                            .via(format!(
+                                "SIP/2.0/{} {}:{};branch={}",
+                                transport_str,
+                                ack_via_host,
+                                ack_via_port,
+                                TransactionKey::generate_branch(),
+                            ))
+                            .from(from.to_string())
+                            .to(to.to_string())
+                            .call_id(b_cid.clone())
+                            .cseq(format!("{} ACK", cseq_num))
+                            .header("Max-Forwards", "70".to_string());
+
+                        // Add Route headers from reversed B-leg Record-Route
+                        for route in &b_leg_routes {
+                            ack_builder = ack_builder.header("Route", route.clone());
+                        }
+
+                        if let Ok(ack) = ack_builder.content_length(0).build() {
+                            // ACK to 2xx is end-to-end and follows the dialog route set
+                            // (RFC 3261 §13.2.2.4). Use the first Route URI as next hop
+                            // rather than the cached B-leg destination, which may be an
+                            // upstream that doesn't Record-Route (e.g. IMS I-CSCF).
+                            let (ack_dest, ack_transport) = resolve_in_dialog_destination(
+                                &b_leg_routes,
+                                state,
+                                b_dest,
+                                b_transport,
+                            );
+                            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                                call.pending_b_leg_ack = Some((ack, ack_transport, ack_dest));
+                            }
+                            debug!(call_id = %call_id, destination = %ack_dest, "B2BUA: deferred B-leg ACK until A-leg ACKs");
+                        }
+                    }
+                }
+
+                // Extract SDP body before forwarding (needed for SIPREC)
+                let sdp_body = response.body.clone();
+
+                // Clone the sanitized 2xx before it is moved into send_message so the
+                // A-leg retransmit is byte-identical (RFC 3261 §13.3.1.4).
+                let retransmit_2xx = response.clone();
+
+                // Pin the reply egress socket to the listener the A-leg INVITE arrived on
+                // (`a_leg_local_addr`) so a multi-homed UDP host answers on the same port
+                // it received on — a peer doing symmetric signalling drops a 2xx sourced
+                // from a different local port. No-op for TCP/TLS/WS/WSS (routed by the
+                // accepted connection) and for a single-listener host (`udp_by_local` empty).
+                send_message_from(
+                    response,
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
+
+                // Arm A-leg 2xx retransmission — the B2BUA has no IST for the A-leg, so
+                // nothing else recovers a lost 200. Cancelled by the caller's ACK in the
+                // late-ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
+                // block below so its early returns can't skip it.
+                arm_b2bua_2xx_retransmit(
+                    call_id,
+                    retransmit_2xx,
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
+
+                // SIPREC: start recording if configured for this call
+                if let Some(srs_uri) = li_srs_uri {
+                    let sdp = &sdp_body;
+                    if let Some(invite_arc) = &a_leg_invite {
+                        let Ok(invite) = invite_arc.lock() else {
+                            error!(call_id = %call_id, "invite_arc lock poisoned during SIPREC start");
+                            return;
+                        };
+                        let caller_uri = invite
+                            .headers
+                            .get("From")
+                            .map(|from| from.to_string())
+                            .unwrap_or_default();
+                        let callee_uri = invite
+                            .headers
+                            .get("To")
+                            .map(|to| to.to_string())
+                            .unwrap_or_default();
+                        drop(invite);
+
+                        // RTPEngine subscribe: fork media to the recording leg.
+                        // Uses SIPREC-mode subscribe with from-tags containing both
+                        // monologue tags so RTPEngine returns a combined SDP with
+                        // 2 m= lines (one per call direction).
+                        let a_sip_call_id = a_leg.dialog.call_id.clone();
+
+                        // Look up the MediaSession to get both monologue tags that
+                        // RTPEngine knows about (from_tag = A-leg, to_tag = B-leg).
+                        let media_tags: Option<(String, String)> = state
+                            .rtpengine_sessions
+                            .as_ref()
+                            .and_then(|sessions| sessions.get(&a_sip_call_id))
+                            .and_then(|session| {
+                                session
+                                    .to_tag
+                                    .as_ref()
+                                    .map(|to_tag| (session.from_tag.clone(), to_tag.clone()))
+                            });
+
+                        // Look up the SIPREC SRC RTPEngine profile for additional subscribe flags.
+                        let siprec_src_profile = state
+                            .li_siprec_rtpengine_profile
+                            .as_deref()
+                            .and_then(|name| {
+                                state
+                                    .rtpengine_profiles
+                                    .as_ref()
+                                    .and_then(|registry| registry.get(name).cloned())
+                            });
+                        let siprec_src_flags =
+                            siprec_src_profile.as_ref().map(|profile| &profile.offer);
+
+                        let (mut caller_sdp, mut callee_sdp, subscriber_to_tag) = if let Some(
+                            ref rtpengine_set,
+                        ) =
+                            state.rtpengine_set
+                        {
+                            // Build from-tags list with both monologue tags.
+                            let from_tags: Vec<&str> = match &media_tags {
+                                Some((from_tag, to_tag)) => {
+                                    vec![from_tag.as_str(), to_tag.as_str()]
+                                }
+                                None => {
+                                    warn!(call_id = %call_id, "SIPREC: no MediaSession tags found, subscribe may return only 1 stream");
+                                    vec![]
+                                }
+                            };
+
+                            let result = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(
+                                    rtpengine_set.subscribe_request_siprec(
+                                        &a_sip_call_id,
+                                        &from_tags,
+                                        siprec_src_flags,
+                                    ),
+                                )
+                            });
+                            match result {
+                                Ok((sdp, to_tag)) => {
+                                    debug!(call_id = %call_id, sdp_len = sdp.len(), subscriber_to_tag = %to_tag, "SIPREC: subscribe_request_siprec OK");
+                                    // Fix direction (recvonly→sendonly) and add a=label per m= section.
+                                    let processed = crate::siprec::fix_siprec_subscribe_sdp(&sdp);
+                                    // Split the dual-m= SDP into per-direction parts so
+                                    // start_recording builds a proper 2-stream INVITE.
+                                    let (sdp1, sdp2) = crate::siprec::split_dual_sdp(&processed);
+                                    let has_two = sdp1 != sdp2;
+                                    if has_two {
+                                        (Some(sdp1), Some(sdp2), Some(to_tag))
+                                    } else {
+                                        // Single m= line — split returned two identical copies.
+                                        (Some(sdp1), None, Some(to_tag))
                                     }
                                 }
                                 Err(error) => {
-                                    error!("B2BUA on_early_media handler error: {error}");
+                                    warn!(call_id = %call_id, %error, "SIPREC: subscribe_request_siprec failed");
+                                    (None, None, None)
                                 }
                             }
+                        } else {
+                            (None, None, None)
+                        };
+
+                        // Sanitize the subscribe SDPs to hide the original call's identity
+                        // (o=/s= lines may leak FreeSWITCH, Oracle, etc.).
+                        let local_ip = state.local_addr.ip().to_string();
+                        if let Some(ref mut sdp_bytes) = caller_sdp {
+                            sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
                         }
-                    });
-
-                    // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
-                    if let Ok(modified) = response_arc.lock() {
-                        *message = modified.clone();
-                    };
-                } else {
-                    warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_early_media");
-                }
-            }
-        }
-
-        // Rewrite B-leg dialog headers back to A-leg identifiers.
-        // For provisional responses that carry a To-tag (early dialogs —
-        // 180/183 with tag), the rewrite ensures A-leg's view of the early
-        // dialog matches its later view of the confirmed dialog (200 OK).
-        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::actor::Dialog::rewrite_headers(
-                message,
-                &a_leg.dialog.call_id,
-                b_ftag,
-                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                Some(&a_leg.dialog.local_tag),
-            );
-        }
-        // Replace B-leg Via(s) and CSeq with A-leg originals from stored INVITE
-        // (RFC 3261 §8.2.6.2 — response CSeq MUST equal request CSeq).
-        if let Some(invite_arc) = &a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(vias) = invite.headers.get_all("Via") {
-                    message.headers.set_all("Via", vias.clone());
-                }
-                if let Some(cseq) = invite.headers.cseq() {
-                    message.headers.set("CSeq", cseq.clone());
-                }
-                // RFC 3261 §8.2.6.2: response From/To URIs MUST echo the A-leg
-                // request's, not the cloned B-leg dialog's. Restore the A-leg
-                // From verbatim; restore the A-leg To URI while preserving
-                // whatever early-dialog To-tag the rewrite above established (a
-                // plain 180 has none, an early-dialog 18x carries siphon's tag).
-                if let Some(from) = invite.headers.from() {
-                    message.headers.set("From", from.clone());
-                }
-                if let Some(to) = invite.headers.to() {
-                    let existing_tag = message
-                        .headers
-                        .to()
-                        .and_then(|value| crate::sip::headers::nameaddr::NameAddr::parse(value).ok())
-                        .and_then(|name_addr| name_addr.tag);
-                    message.headers.set(
-                        "To",
-                        crate::b2bua::actor::ensure_tag(to, existing_tag.as_deref()),
-                    );
-                }
-            }
-        }
-        // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_local_addr, a_leg_supports_100rel, call_id);
-        // Pin the reply egress socket to the A-leg INVITE's arrival listener
-        // (`a_leg_local_addr`) so a multi-homed UDP host answers on the port it
-        // received on. No-op for stream transports and single-listener hosts.
-        send_message_from(
-            message.clone(),
-            a_leg.transport.transport,
-            a_leg.transport.remote_addr,
-            a_leg.transport.connection_id,
-            a_leg_local_addr,
-            state,
-        );
-    }
-
-    } ResponseClass::Failed => {
-    // --- 3xx+ error handling ---
-    {
-        // RFC 4028: 422 "Session Interval Too Small" — retry with higher Session-Expires
-        if status_code == 422 {
-            if let Some(ref timer_config) = state.session_timer_config {
-                if timer_config.enabled {
-                    let remote_min_se = message.headers.get("Min-SE")
-                        .and_then(|v| v.split(';').next())
-                        .and_then(|v| v.trim().parse::<u32>().ok());
-
-                    if let (Some(min_se), Some(target_uri), Some(invite_arc)) =
-                        (remote_min_se, &b_leg_target, &a_leg_invite)
-                    {
-                        if min_se > timer_config.session_expires {
-                            info!(
-                                call_id = %call_id,
-                                min_se = min_se,
-                                "B2BUA: 422 received, retrying with Session-Expires={min_se}"
-                            );
-
-                            // RFC 5923 connection reuse: keep the higher-
-                            // Session-Expires retry on the SAME trunk member the
-                            // 422'd INVITE traversed, instead of re-resolving the
-                            // trunk hostname and round-robining onto a sibling
-                            // member (see select_b2bua_retry_destination).
-                            {
-                                let (destination, transport, reuse_connection_id, relay_target) =
-                                    match select_b2bua_retry_destination(
-                                        b_leg_dest,
-                                        b_leg_connection_id,
-                                        target_uri,
-                                        &state.dns_resolver,
-                                    ) {
-                                        Some(resolved) => resolved,
-                                        None => return,
-                                    };
-
-                                // Build retry INVITE from stored A-leg INVITE
-                                let Ok(original) = invite_arc.lock() else {
-                                    error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
-                                    return;
-                                };
-                                let mut retry = original.clone();
-                                drop(original);
-
-                                // Replace Via with new branch. The retry continues
-                                // the same B-leg, so it keeps the leg's sent-by —
-                                // the flow socket when it was dialled over one.
-                                let new_branch = TransactionKey::generate_branch();
-                                let (retry_via_host, retry_via_port) =
-                                    b_leg_sent_by(b_leg_local_addr, state, &transport);
-                                let via_value = format!(
-                                    "SIP/2.0/{} {}:{};branch={}",
-                                    transport, retry_via_host, retry_via_port, new_branch,
-                                );
-                                retry.headers.set("Via", via_value);
-
-                                // Update Request-URI
-                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                    retry.start_line = StartLine::Request(
-                                        crate::sip::message::RequestLine {
-                                            method: crate::sip::message::Method::Invite,
-                                            request_uri: target_parsed,
-                                            version: crate::sip::message::Version::sip_2_0(),
-                                        },
-                                    );
-                                }
-
-                                // Set updated session timer headers
-                                retry.headers.remove("Session-Expires");
-                                retry.headers.remove("Min-SE");
-                                retry.headers.add(
-                                    "Session-Expires",
-                                    format!("{};refresher=uac", min_se),
-                                );
-                                retry.headers.add("Min-SE", min_se.to_string());
-
-                                // Reuse B-leg dialog identifiers from the failed attempt.
-                                // Retry source is the original A-leg INVITE — out-of-dialog,
-                                // To has no tag, so pass None for new_to_tag.
-                                let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
-                                    .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
-                                crate::b2bua::actor::Dialog::rewrite_headers(
-                                    &mut retry,
-                                    &retry_call_id,
-                                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                                    &retry_from_tag,
-                                    None,
-                                );
-
-                                let mut b_leg = Leg::new_b_leg(
-                                    retry_call_id,
-                                    retry_from_tag,
-                                    target_uri.clone(),
-                                    new_branch,
-                                    LegTransport {
-                                        remote_addr: destination,
-                                        connection_id: reuse_connection_id,
-                                        transport,
-                                        // The retry IS this B-leg continuing, so
-                                        // it keeps the leg's anchored socket.
-                                        local_addr: b_leg_local_addr,
-                                    },
-                                );
-                                // Stash the retry INVITE so a caller CANCEL during
-                                // alerting can rebuild the CANCEL from it (RFC 3261
-                                // §9.1 — same Via branch + CSeq). The original 422'd
-                                // leg's stash is discarded by the in-place supersede
-                                // below; without re-stashing here the live retry
-                                // transaction would be left un-cancellable.
-                                b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
-
-                                // RFC 4028: the 422'd INVITE transaction is complete,
-                                // so the higher-Session-Expires retry continues the
-                                // same logical B-leg — supersede in place rather than
-                                // append (see the 401/407 path for why appending
-                                // strands a dead leg that a later CANCEL hits).
-                                match b_leg_index {
-                                    Some(idx) => {
-                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
-                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
-                                    }
-                                    None => {
-                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                        spawn_b_leg_actor(call_id, &b_leg, state);
-                                    }
-                                }
-
-                                let data = Bytes::from(retry.to_bytes());
-                                // Egress from the leg's anchored socket (UDP only —
-                                // a stream leg is reached over its connection).
-                                let retry_source = match transport {
-                                    Transport::Udp => b_leg_local_addr,
-                                    _ => None,
-                                };
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, retry_source, state);
-                            }
-                            return; // don't forward 422 to A-leg or fire on_failure
+                        if let Some(ref mut sdp_bytes) = callee_sdp {
+                            sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));
                         }
-                    }
-                }
-            }
-        }
 
-        // 401/407 — auto-retry with digest credentials if available.
-        //
-        // The retry MUST be built from the B-leg's last-sent INVITE, NOT the
-        // raw A-leg INVITE. The first B-leg INVITE went through the full
-        // hygiene chain in `b2bua_send_b_leg_invite` (strip Record-Route /
-        // Route / Authorization, replace Via / Contact / User-Agent, rewrite
-        // From / To / P-Asserted-Identity host, regenerate Call-ID, set
-        // CSeq=1, decrement Max-Forwards, sanitize SDP origin), plus any
-        // script-side mutations applied before send. Cloning the A-leg INVITE
-        // and only patching Via / RURI / Authorization (the old behaviour)
-        // leaks every other A-leg header back to the B-leg.
-        if status_code == 401 || status_code == 407 {
-            // Cap credentialed retries per call. The per-leg dedup below stops a
-            // *retransmitted* challenge from spawning a duplicate INVITE, but a
-            // trunk that rejects every *fresh* credentialed attempt (wrong
-            // password, or a new nonce each time) would otherwise re-auth
-            // forever — each retry lands on a new branch, so there's no 482 to
-            // self-terminate the loop (that was the pre-dedup failure mode).
-            // Once MAX_B2BUA_AUTH_RETRIES credentialed INVITEs have gone out,
-            // treat a further challenge as a persistent auth failure: ACK it and
-            // surface the response upstream (fall through to @b2bua.on_failure +
-            // forward to the A-leg) instead of looping. The per-leg dedup makes
-            // this one-shot — retransmits of the surfaced challenge are absorbed.
-            if outbound_credentials.is_some()
-                && state.call_actors.auth_retry_count(call_id) >= MAX_B2BUA_AUTH_RETRIES
-            {
-                if let Some((b_dest, b_transport)) = b_leg_dest {
-                    // RFC 3261 §17.1.1.3 — this ACK belongs to the INVITE's own
-                    // client transaction, so its Via sent-by must be the one the
-                    // INVITE used: the leg's flow socket when it has one.
-                    let (ack_via_host, ack_via_port) =
-                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                    let ack = build_b2bua_ack_for_non2xx(
-                        message,
-                        branch,
-                        b_leg_target.as_deref(),
-                        b_transport,
-                        &ack_via_host,
-                        ack_via_port,
-                    );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                }
-                let first = b_leg_index
-                    .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
-                    .unwrap_or(true);
-                if !first {
-                    // Retransmit of an already-surfaced challenge — absorb.
-                    return;
-                }
-                warn!(
-                    call_id = %call_id,
-                    status = status_code,
-                    limit = MAX_B2BUA_AUTH_RETRIES,
-                    "B2BUA: outbound auth retry limit reached — surfacing {status_code} upstream instead of re-authing"
-                );
-                // fall through to the failure path (on_failure + forward to A-leg)
-            } else if let Some((username, password)) = &outbound_credentials {
-                let challenge_header = if status_code == 401 {
-                    message.headers.get("WWW-Authenticate")
-                } else {
-                    message.headers.get("Proxy-Authenticate")
-                };
-
-                if let Some(challenge_value) = challenge_header {
-                    if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
-                        if let (Some(target_uri), Some(stored_invite_arc)) = (&b_leg_target, &b_leg_stored_invite) {
-                            // RFC 3261 §17.1.1.3: the INVITE client transaction
-                            // MUST ACK every non-2xx final response on the branch
-                            // it arrived on — the first 401/407 AND every
-                            // retransmit. The trunk's server transaction keeps
-                            // retransmitting the challenge until this ACK lands;
-                            // skipping it (the old behaviour — this path returned
-                            // before the non-2xx ACK below) leaves the trunk
-                            // retransmitting until Timer B and feeds the re-retry
-                            // bug guarded against next.
-                            if let Some((b_dest, b_transport)) = b_leg_dest {
-                                // RFC 3261 §17.1.1.3 — same client transaction as
-                                // the INVITE, so the same sent-by (flow socket
-                                // when the leg is pinned).
-                                let (ack_via_host, ack_via_port) =
-                                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                                let ack = build_b2bua_ack_for_non2xx(
-                                    message,
-                                    branch,
-                                    b_leg_target.as_deref(),
-                                    b_transport,
-                                    &ack_via_host,
-                                    ack_via_port,
-                                );
-                                send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                            }
-
-                            // Only the FIRST challenge on this leg drives a retry.
-                            // A retransmitted 401/407 on the same branch is the
-                            // trunk re-sending its non-2xx (we just re-ACKed it),
-                            // NOT a fresh challenge. Re-challenging would emit a
-                            // second authenticated INVITE at the same CSeq on a
-                            // new branch; the trunk sees a merged request
-                            // (RFC 3261 §8.2.2.2) and replies 482, and we end up
-                            // with two outstanding UAC branches where the real
-                            // 2xx lands on the first while our state tracks the
-                            // second — the 2xx then never gets ACKed and the
-                            // trunk BYEs the call. A chained re-challenge (stale
-                            // nonce) lands on the *retry* leg's branch, a distinct
-                            // B-leg, so legitimate re-auth still proceeds.
-                            let first_challenge = b_leg_index
-                                .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
-                                .unwrap_or(true);
-                            if !first_challenge {
-                                debug!(
-                                    call_id = %call_id,
-                                    branch = %branch,
-                                    status = status_code,
-                                    "B2BUA: absorbing retransmitted challenge (auth retry already sent on this leg)"
-                                );
-                                return;
-                            }
-
-                            // Count this committed credentialed retry against the
-                            // per-call cap checked at the top of the 401/407
-                            // block. Placed after the per-leg dedup so retransmits
-                            // (which returned above) never inflate the count.
-                            state.call_actors.incr_auth_retry_count(call_id);
-
-                            // RFC 7616 §3.3: nc starts at 1 for a fresh server
-                            // nonce and increments on every reuse. The
-                                // per-call NonceCounter resets internally when
-                            // the nonce changes, so this is correct for both
-                            // first challenge and same-nonce re-challenge
-                            // (e.g. authenticated re-INVITE in the dialog).
-                            let nc = state
-                                .call_actors
-                                .get_call(call_id)
-                                .map(|call| call.digest_nc.next_for(&challenge.nonce))
-                                .unwrap_or(1);
-
-                            info!(
-                                call_id = %call_id,
-                                status = status_code,
-                                realm = %challenge.realm,
-                                nc = nc,
-                                "B2BUA: {status_code} received, retrying with credentials"
-                            );
-
-                            let credentials = crate::auth::DigestCredentials {
-                                username: username.clone(),
-                                password: password.clone(),
+                        // For unsubscribe on BYE: SIPREC-mode uses empty from-tag and
+                        // the subscriber to-tag returned by RTPEngine.
+                        let tags_for_unsubscribe = subscriber_to_tag
+                            .as_ref()
+                            .map(|tt| (String::new(), tt.clone()));
+                        let tags_ref = tags_for_unsubscribe
+                            .as_ref()
+                            .map(|(ft, tt)| (ft.as_str(), tt.as_str()));
+                        if let Some((_session_id, rec_invite, destination, transport)) =
+                            state.recording_manager.start_recording(
+                                call_id,
+                                srs_uri,
+                                &caller_uri,
+                                &callee_uri,
+                                sdp,
+                                state.local_addr,
+                                caller_sdp.as_deref(),
+                                callee_sdp.as_deref(),
+                                Some(&a_sip_call_id),
+                                tags_ref,
+                                state.user_agent_header.as_deref(),
+                            )
+                        {
+                            let data = Bytes::from(rec_invite.to_bytes());
+                            let target = RelayTarget {
+                                address: destination,
+                                transport: Some(transport),
+                                server_name: None,
                             };
-
-                            let auth_header_name = if status_code == 401 {
-                                "Authorization"
-                            } else {
-                                "Proxy-Authorization"
-                            };
-
-                            let auth_value = crate::auth::format_authorization_header(
-                                &challenge,
-                                &credentials,
-                                "INVITE",
-                                target_uri,
-                                Some(nc),
+                            send_to_target(
+                                data,
+                                &target,
+                                transport,
+                                ConnectionId::default(),
                                 None,
+                                state,
                             );
-
-                            // RFC 5923 connection reuse: keep the authenticated
-                            // retry on the SAME trunk member the CSeq-1 INVITE
-                            // (and its 401 + nonce) traversed, instead of
-                            // re-resolving the trunk hostname and round-robining
-                            // onto a sibling member that never issued the nonce.
-                            // See select_b2bua_retry_destination for the full
-                            // rationale; it falls back to a fresh DNS resolution
-                            // only when the leg has no recorded destination.
-                            {
-                                let (destination, transport, reuse_connection_id, relay_target) =
-                                    match select_b2bua_retry_destination(
-                                        b_leg_dest,
-                                        b_leg_connection_id,
-                                        target_uri,
-                                        &state.dns_resolver,
-                                    ) {
-                                        Some(resolved) => resolved,
-                                        None => return,
-                                    };
-
-                                // Build retry from the stored, hygiene-processed B-leg INVITE.
-                                // Call-ID, From-tag, From-host, To, RURI, Contact, User-Agent,
-                                // P-Asserted-Identity, Record-Route stripping, and the SDP body
-                                // (anchored by rtpengine if applicable) are all already correct.
-                                let new_branch = TransactionKey::generate_branch();
-                                // The credentialed retry continues the same B-leg,
-                                // so it keeps the leg's sent-by (flow socket when
-                                // it was dialled over one).
-                                let (retry_via_host, retry_via_port) =
-                                    b_leg_sent_by(b_leg_local_addr, state, &transport);
-                                let via_value = format!(
-                                    "SIP/2.0/{} {}:{};branch={}",
-                                    transport, retry_via_host, retry_via_port, new_branch,
-                                );
-                                let retry = {
-                                    let Ok(original) = stored_invite_arc.lock() else {
-                                        error!(call_id = %call_id, "b_leg_invite lock poisoned during 401/407 retry");
-                                        return;
-                                    };
-                                    // RFC 3261 §22.2: incremented CSeq for the retried request.
-                                    // local_cseq was bumped past the original after first send,
-                                    // so it now points at the next number to use.
-                                    build_digest_retry_invite(
-                                        &original,
-                                        via_value,
-                                        b_leg_local_cseq,
-                                        auth_header_name,
-                                        auth_value,
-                                    )
-                                };
-
-                                // Reuse the failed B-leg's dialog identity (Call-ID +
-                                // From-tag); the stored INVITE already carries them.
-                                let (retry_call_id, retry_from_tag) = b_leg_dialog.clone()
-                                    .unwrap_or_else(|| (a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()));
-
-                                let mut b_leg = Leg::new_b_leg(
-                                    retry_call_id,
-                                    retry_from_tag,
-                                    target_uri.clone(),
-                                    new_branch,
-                                    LegTransport {
-                                        remote_addr: destination,
-                                        connection_id: reuse_connection_id,
-                                        transport,
-                                        // The retry IS this B-leg continuing, so
-                                        // it keeps the leg's anchored socket.
-                                        local_addr: b_leg_local_addr,
-                                    },
-                                );
-                                // Preserve dialog state from the failed attempt:
-                                //  - local_cseq advances past the retry CSeq.
-                                //  - local_contact / from_uri / to_uri stay so mid-dialog
-                                //    requests on this leg work.
-                                b_leg.dialog.local_cseq = b_leg_local_cseq.saturating_add(1);
-                                b_leg.dialog.local_contact = retry.headers.get("Contact").cloned();
-                                b_leg.dialog.local_from_uri = retry.headers.from().cloned();
-                                b_leg.dialog.remote_to_uri = retry.headers.to().cloned();
-                                if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                    b_leg.dialog.remote_aor_host = Some(if let Some(port) = target_parsed.port {
-                                        format!("{}:{}", target_parsed.host, port)
-                                    } else {
-                                        target_parsed.host.clone()
-                                    });
-                                }
-                                // Persist the retry INVITE so a chained re-challenge
-                                // (e.g. nonce stale) rebuilds from the right snapshot.
-                                b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
-
-                                // RFC 3261 §9.1: the CSeq-1 INVITE transaction is
-                                // complete after its 401/407 + ACK, so the retry is
-                                // the *same* logical B-leg continuing with credentials
-                                // — supersede the failed leg in place rather than
-                                // appending. Appending leaves the dead leg in
-                                // `b_legs`, so a later CANCEL fans out to its
-                                // already-final-responded transaction too (→ a
-                                // spurious 481). `b_leg_index` is the slot the
-                                // challenged response matched; it is always Some here
-                                // (a B-leg response only reaches this path with a
-                                // matched leg), but fall back to append defensively.
-                                match b_leg_index {
-                                    Some(idx) => {
-                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
-                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
-                                    }
-                                    None => {
-                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                        spawn_b_leg_actor(call_id, &b_leg, state);
-                                    }
-                                }
-
-                                let data = Bytes::from(retry.to_bytes());
-                                // Egress from the leg's anchored socket (UDP only —
-                                // a stream leg is reached over its connection).
-                                let retry_source = match transport {
-                                    Transport::Udp => b_leg_local_addr,
-                                    _ => None,
-                                };
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, retry_source, state);
-                            }
-                            return; // don't forward 401/407 to A-leg or fire on_failure
                         }
                     }
                 }
-            }
+            } // end 2xx guard
         }
-
-        // auth_passthrough: a B-leg 401/407 with no siphon-side credentials is a
-        // NON-terminal challenge that we relay to the caller for end-to-end
-        // authentication (RFC 3261 §22.3). We still ACK the B-leg and forward the
-        // challenge to the A-leg below (unconditionally), but must NOT treat the
-        // call as failed: skip the CDR, @b2bua.on_failure, and the media teardown.
-        // The call actor is still removed (the caller re-INVITEs as a fresh call);
-        // the media session — keyed by SIP Call-ID, which the re-INVITE reuses —
-        // is deliberately left in place. The caller's ACK for the forwarded
-        // challenge matches no live call and is dropped by the unmatched-ACK guard
-        // (never answered with a 502).
-        let relay_challenge = (status_code == 401 || status_code == 407)
-            && outbound_credentials.is_none()
-            && state
-                .call_actors
-                .get_call(call_id)
-                .map(|call| call.auth_passthrough)
-                .unwrap_or(false);
-        if relay_challenge {
-            debug!(
-                call_id = %call_id,
-                status = status_code,
-                "B2BUA: relaying auth challenge to A-leg (auth_passthrough) — not a failure"
-            );
-        }
-
-        // LCR / sequential failover: this carrier produced a final failure. If
-        // it is a configured reroute cause and more carriers remain, advance to
-        // the next instead of failing the call — the A-leg sees an error only
-        // once the list is exhausted or the response is definitive.
-        let mut b_leg_acked_for_reroute = false;
-        if !relay_challenge && state.call_actors.is_route_sequence(call_id) {
-            // Absorb a straggler that must NEVER reach the A-leg: a leg we
-            // cancelled during a failover-advance (its `487 Request Terminated`),
-            // or ANY non-2xx arriving after another carrier already answered.
-            // Without this, a cancelled carrier's 487 tears down the bridged
-            // call. We still ACK it (RFC 3261 §17.1.1.3) so the carrier stops
-            // retransmitting, then drop it — no forward, no teardown, no advance.
-            let already_cancelled = b_leg_index
-                .and_then(|idx| {
-                    state
-                        .call_actors
-                        .get_call(call_id)
-                        .and_then(|call| call.b_leg_status.get(idx).cloned())
-                })
-                .is_some_and(|status| {
-                    matches!(status, crate::b2bua::actor::BLegStatus::Cancelled)
-                });
-            if already_cancelled || status_code == 487 || call_state == CallState::Answered {
-                if let Some((b_dest, b_transport)) = b_leg_dest {
-                    // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
-                    let (ack_via_host, ack_via_port) =
-                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                    let ack = build_b2bua_ack_for_non2xx(
-                        message,
-                        branch,
-                        b_leg_target.as_deref(),
-                        b_transport,
-                        &ack_via_host,
-                        ack_via_port,
-                    );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                }
-                debug!(call_id = %call_id, status = status_code,
-                    "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
-                return;
-            }
-            state.call_actors.record_route_failure(call_id, status_code);
-            // Fail over only on a configured reroute cause (per-route from the
-            // API > per-gateway override > global set). A definitive response
-            // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —
-            // trying another carrier won't help.
-            let reroute = b2bua_status_reroutes(call_id, status_code, state);
-            if reroute && state.call_actors.has_pending_routes(call_id) {
-                // ACK this carrier's non-2xx (RFC 3261 §17.1.1.3) before the
-                // next try. The failed carrier's media session is keyed by the
-                // A-leg Call-ID and reused by the next carrier's B-leg, so it is
-                // intentionally NOT torn down here.
-                if let Some((b_dest, b_transport)) = b_leg_dest {
-                    // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
-                    let (ack_via_host, ack_via_port) =
-                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                    let ack = build_b2bua_ack_for_non2xx(
-                        message,
-                        branch,
-                        b_leg_target.as_deref(),
-                        b_transport,
-                        &ack_via_host,
-                        ack_via_port,
-                    );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                    b_leg_acked_for_reroute = true;
-                }
-                let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
-                    Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
-                    _ => false,
-                };
-                if advanced {
+        ResponseClass::Provisional => {
+            // --- 1xx provisional handling ---
+            {
+                // Drop a stray provisional that arrives after the call is already
+                // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
+                // fork branch's late 18x. A B2BUA must not forward a provisional after
+                // the final response, nor downgrade the confirmed dialog back to Ringing
+                // (RFC 3261 §12.1). This MUST be an atomic check-and-set, not the
+                // `call_state` snapshot taken ~1600 lines earlier: under multi-worker
+                // dispatch a B-leg's 180 and 200 (received in order over one TCP/UDP
+                // flow) are processed on different workers concurrently, so a late 180
+                // that reads a stale "not answered" snapshot would be forwarded behind
+                // its 200 and abort the A-leg UAC (which already ACKed/BYE'd). Deciding
+                // under the per-call lock drops the provisional that lost the race.
+                if !state.call_actors.try_mark_ringing(call_id) {
                     debug!(call_id = %call_id, status = status_code,
-                        "LCR: carrier failed, advanced to next carrier");
+                "B2BUA: dropping provisional received after answer");
                     return;
                 }
+
+                // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
+                // This lets scripts process early media through RTPEngine before forwarding.
+                let has_sdp_body = !message.body.is_empty();
+                if has_sdp_body {
+                    let engine_state = state.engine.state();
+                    let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
+                    if !handlers.is_empty() {
+                        if let Some(invite_arc) = &a_leg_invite {
+                            let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
+                            let py_call = PyCall::new(
+                                call_id.to_string(),
+                                Arc::clone(invite_arc),
+                                a_leg.transport.remote_addr.ip().to_string(),
+                                format!("{}", a_leg.transport.transport).to_lowercase(),
+                            )
+                            .with_flow(py_flow_from_leg(&a_leg.transport));
+                            let py_reply = PyReply::new(Arc::clone(&response_arc))
+                                .with_a_leg(Arc::clone(invite_arc))
+                                .with_response_source(
+                                    response_source.ip().to_string(),
+                                    response_source.port(),
+                                );
+
+                            Python::attach(|python| {
+                                let call_obj = match Py::new(python, py_call) {
+                                    Ok(obj) => obj,
+                                    Err(error) => {
+                                        error!(
+                                            "failed to create PyCall for on_early_media: {error}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let reply_obj = match Py::new(python, py_reply) {
+                                    Ok(obj) => obj,
+                                    Err(error) => {
+                                        error!(
+                                            "failed to create PyReply for on_early_media: {error}"
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                for handler in &handlers {
+                                    let callable = handler.callable.bind(python);
+                                    match callable
+                                        .call1((call_obj.bind(python), reply_obj.bind(python)))
+                                    {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    error!("async B2BUA on_early_media handler error: {error}");
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error!("B2BUA on_early_media handler error: {error}");
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
+                            if let Ok(modified) = response_arc.lock() {
+                                *message = modified.clone();
+                            };
+                        } else {
+                            warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_early_media");
+                        }
+                    }
+                }
+
+                // Rewrite B-leg dialog headers back to A-leg identifiers.
+                // For provisional responses that carry a To-tag (early dialogs —
+                // 180/183 with tag), the rewrite ensures A-leg's view of the early
+                // dialog matches its later view of the confirmed dialog (200 OK).
+                if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        message,
+                        &a_leg.dialog.call_id,
+                        b_ftag,
+                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        Some(&a_leg.dialog.local_tag),
+                    );
+                }
+                // Replace B-leg Via(s) and CSeq with A-leg originals from stored INVITE
+                // (RFC 3261 §8.2.6.2 — response CSeq MUST equal request CSeq).
+                if let Some(invite_arc) = &a_leg_invite {
+                    if let Ok(invite) = invite_arc.lock() {
+                        if let Some(vias) = invite.headers.get_all("Via") {
+                            message.headers.set_all("Via", vias.clone());
+                        }
+                        if let Some(cseq) = invite.headers.cseq() {
+                            message.headers.set("CSeq", cseq.clone());
+                        }
+                        // RFC 3261 §8.2.6.2: response From/To URIs MUST echo the A-leg
+                        // request's, not the cloned B-leg dialog's. Restore the A-leg
+                        // From verbatim; restore the A-leg To URI while preserving
+                        // whatever early-dialog To-tag the rewrite above established (a
+                        // plain 180 has none, an early-dialog 18x carries siphon's tag).
+                        if let Some(from) = invite.headers.from() {
+                            message.headers.set("From", from.clone());
+                        }
+                        if let Some(to) = invite.headers.to() {
+                            let existing_tag = message
+                                .headers
+                                .to()
+                                .and_then(|value| {
+                                    crate::sip::headers::nameaddr::NameAddr::parse(value).ok()
+                                })
+                                .and_then(|name_addr| name_addr.tag);
+                            message.headers.set(
+                                "To",
+                                crate::b2bua::actor::ensure_tag(to, existing_tag.as_deref()),
+                            );
+                        }
+                    }
+                }
+                // Sanitize B-leg headers before forwarding to A-leg
+                sanitize_b2bua_response(
+                    message,
+                    state,
+                    a_leg.transport.transport,
+                    a_leg_local_addr,
+                    a_leg_supports_100rel,
+                    call_id,
+                );
+                // Pin the reply egress socket to the A-leg INVITE's arrival listener
+                // (`a_leg_local_addr`) so a multi-homed UDP host answers on the port it
+                // received on. No-op for stream transports and single-listener hosts.
+                send_message_from(
+                    message.clone(),
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
             }
-            debug!(call_id = %call_id, status = status_code, reroute,
-                "LCR: forwarding carrier response to A-leg (definitive or exhausted)");
         }
+        ResponseClass::Failed => {
+            // --- 3xx+ error handling ---
+            {
+                // RFC 4028: 422 "Session Interval Too Small" — retry with higher Session-Expires
+                if status_code == 422 {
+                    if let Some(ref timer_config) = state.session_timer_config {
+                        if timer_config.enabled {
+                            let remote_min_se = message
+                                .headers
+                                .get("Min-SE")
+                                .and_then(|v| v.split(';').next())
+                                .and_then(|v| v.trim().parse::<u32>().ok());
 
-        // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
-        // whether a @b2bua.on_failure handler is registered — the record must be
-        // written for the failed call either way. Skipped for a relayed challenge
-        // (the call has not failed).
-        if !relay_challenge {
-            cdr_finalize_b2bua_fail(state, call_id, status_code);
-        }
+                            if let (Some(min_se), Some(target_uri), Some(invite_arc)) =
+                                (remote_min_se, &b_leg_target, &a_leg_invite)
+                            {
+                                if min_se > timer_config.session_expires {
+                                    info!(
+                                        call_id = %call_id,
+                                        min_se = min_se,
+                                        "B2BUA: 422 received, retrying with Session-Expires={min_se}"
+                                    );
 
-        // Error response — invoke @b2bua.on_failure with (PyCall, code, reason).
-        // Skipped for a relayed challenge (not a failure — the caller authenticates).
-        let engine_state = state.engine.state();
-        let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
-        if !relay_challenge && !handlers.is_empty() {
-            let reason = match &message.start_line {
-                StartLine::Response(status_line) => status_line.reason_phrase.clone(),
-                _ => "Unknown".to_string(),
-            };
+                                    // RFC 5923 connection reuse: keep the higher-
+                                    // Session-Expires retry on the SAME trunk member the
+                                    // 422'd INVITE traversed, instead of re-resolving the
+                                    // trunk hostname and round-robining onto a sibling
+                                    // member (see select_b2bua_retry_destination).
+                                    {
+                                        let (
+                                            destination,
+                                            transport,
+                                            reuse_connection_id,
+                                            relay_target,
+                                        ) = match select_b2bua_retry_destination(
+                                            b_leg_dest,
+                                            b_leg_connection_id,
+                                            target_uri,
+                                            &state.dns_resolver,
+                                        ) {
+                                            Some(resolved) => resolved,
+                                            None => return,
+                                        };
 
-            if let Some(invite_arc) = &a_leg_invite {
-                let py_call = PyCall::new(
-                    call_id.to_string(),
-                    Arc::clone(invite_arc),
-                    a_leg.transport.remote_addr.ip().to_string(),
-                    format!("{}", a_leg.transport.transport).to_lowercase(),
-                )
-                .with_flow(py_flow_from_leg(&a_leg.transport));
+                                        // Build retry INVITE from stored A-leg INVITE
+                                        let Ok(original) = invite_arc.lock() else {
+                                            error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
+                                            return;
+                                        };
+                                        let mut retry = original.clone();
+                                        drop(original);
 
-                Python::attach(|python| {
-                    let call_obj = match Py::new(python, py_call) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyCall for on_failure: {error}");
+                                        // Replace Via with new branch. The retry continues
+                                        // the same B-leg, so it keeps the leg's sent-by —
+                                        // the flow socket when it was dialled over one.
+                                        let new_branch = TransactionKey::generate_branch();
+                                        let (retry_via_host, retry_via_port) =
+                                            b_leg_sent_by(b_leg_local_addr, state, &transport);
+                                        let via_value = format!(
+                                            "SIP/2.0/{} {}:{};branch={}",
+                                            transport, retry_via_host, retry_via_port, new_branch,
+                                        );
+                                        retry.headers.set("Via", via_value);
+
+                                        // Update Request-URI
+                                        if let Ok(target_parsed) = parse_uri_standalone(target_uri)
+                                        {
+                                            retry.start_line = StartLine::Request(
+                                                crate::sip::message::RequestLine {
+                                                    method: crate::sip::message::Method::Invite,
+                                                    request_uri: target_parsed,
+                                                    version: crate::sip::message::Version::sip_2_0(
+                                                    ),
+                                                },
+                                            );
+                                        }
+
+                                        // Set updated session timer headers
+                                        retry.headers.remove("Session-Expires");
+                                        retry.headers.remove("Min-SE");
+                                        retry.headers.add(
+                                            "Session-Expires",
+                                            format!("{};refresher=uac", min_se),
+                                        );
+                                        retry.headers.add("Min-SE", min_se.to_string());
+
+                                        // Reuse B-leg dialog identifiers from the failed attempt.
+                                        // Retry source is the original A-leg INVITE — out-of-dialog,
+                                        // To has no tag, so pass None for new_to_tag.
+                                        let (retry_call_id, retry_from_tag) =
+                                            b_leg_dialog.clone().unwrap_or_else(|| {
+                                                (
+                                                    a_leg.dialog.call_id.clone(),
+                                                    a_leg
+                                                        .dialog
+                                                        .remote_tag
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                )
+                                            });
+                                        crate::b2bua::actor::Dialog::rewrite_headers(
+                                            &mut retry,
+                                            &retry_call_id,
+                                            a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                                            &retry_from_tag,
+                                            None,
+                                        );
+
+                                        let mut b_leg = Leg::new_b_leg(
+                                            retry_call_id,
+                                            retry_from_tag,
+                                            target_uri.clone(),
+                                            new_branch,
+                                            LegTransport {
+                                                remote_addr: destination,
+                                                connection_id: reuse_connection_id,
+                                                transport,
+                                                // The retry IS this B-leg continuing, so
+                                                // it keeps the leg's anchored socket.
+                                                local_addr: b_leg_local_addr,
+                                            },
+                                        );
+                                        // Stash the retry INVITE so a caller CANCEL during
+                                        // alerting can rebuild the CANCEL from it (RFC 3261
+                                        // §9.1 — same Via branch + CSeq). The original 422'd
+                                        // leg's stash is discarded by the in-place supersede
+                                        // below; without re-stashing here the live retry
+                                        // transaction would be left un-cancellable.
+                                        b_leg.b_leg_invite =
+                                            Some(Arc::new(Mutex::new(retry.clone())));
+
+                                        // RFC 4028: the 422'd INVITE transaction is complete,
+                                        // so the higher-Session-Expires retry continues the
+                                        // same logical B-leg — supersede in place rather than
+                                        // append (see the 401/407 path for why appending
+                                        // strands a dead leg that a later CANCEL hits).
+                                        match b_leg_index {
+                                            Some(idx) => {
+                                                state.call_actors.replace_b_leg(
+                                                    call_id,
+                                                    idx,
+                                                    b_leg.clone(),
+                                                );
+                                                spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                            }
+                                            None => {
+                                                state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                            }
+                                        }
+
+                                        let data = Bytes::from(retry.to_bytes());
+                                        // Egress from the leg's anchored socket (UDP only —
+                                        // a stream leg is reached over its connection).
+                                        let retry_source = match transport {
+                                            Transport::Udp => b_leg_local_addr,
+                                            _ => None,
+                                        };
+                                        send_to_target(
+                                            data,
+                                            &relay_target,
+                                            transport,
+                                            reuse_connection_id,
+                                            retry_source,
+                                            state,
+                                        );
+                                    }
+                                    return; // don't forward 422 to A-leg or fire on_failure
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 401/407 — auto-retry with digest credentials if available.
+                //
+                // The retry MUST be built from the B-leg's last-sent INVITE, NOT the
+                // raw A-leg INVITE. The first B-leg INVITE went through the full
+                // hygiene chain in `b2bua_send_b_leg_invite` (strip Record-Route /
+                // Route / Authorization, replace Via / Contact / User-Agent, rewrite
+                // From / To / P-Asserted-Identity host, regenerate Call-ID, set
+                // CSeq=1, decrement Max-Forwards, sanitize SDP origin), plus any
+                // script-side mutations applied before send. Cloning the A-leg INVITE
+                // and only patching Via / RURI / Authorization (the old behaviour)
+                // leaks every other A-leg header back to the B-leg.
+                if status_code == 401 || status_code == 407 {
+                    // Cap credentialed retries per call. The per-leg dedup below stops a
+                    // *retransmitted* challenge from spawning a duplicate INVITE, but a
+                    // trunk that rejects every *fresh* credentialed attempt (wrong
+                    // password, or a new nonce each time) would otherwise re-auth
+                    // forever — each retry lands on a new branch, so there's no 482 to
+                    // self-terminate the loop (that was the pre-dedup failure mode).
+                    // Once MAX_B2BUA_AUTH_RETRIES credentialed INVITEs have gone out,
+                    // treat a further challenge as a persistent auth failure: ACK it and
+                    // surface the response upstream (fall through to @b2bua.on_failure +
+                    // forward to the A-leg) instead of looping. The per-leg dedup makes
+                    // this one-shot — retransmits of the surfaced challenge are absorbed.
+                    if outbound_credentials.is_some()
+                        && state.call_actors.auth_retry_count(call_id) >= MAX_B2BUA_AUTH_RETRIES
+                    {
+                        if let Some((b_dest, b_transport)) = b_leg_dest {
+                            // RFC 3261 §17.1.1.3 — this ACK belongs to the INVITE's own
+                            // client transaction, so its Via sent-by must be the one the
+                            // INVITE used: the leg's flow socket when it has one.
+                            let (ack_via_host, ack_via_port) =
+                                b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                            let ack = build_b2bua_ack_for_non2xx(
+                                message,
+                                branch,
+                                b_leg_target.as_deref(),
+                                b_transport,
+                                &ack_via_host,
+                                ack_via_port,
+                            );
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
+                        }
+                        let first = b_leg_index
+                            .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
+                            .unwrap_or(true);
+                        if !first {
+                            // Retransmit of an already-surfaced challenge — absorb.
                             return;
                         }
-                    };
+                        warn!(
+                            call_id = %call_id,
+                            status = status_code,
+                            limit = MAX_B2BUA_AUTH_RETRIES,
+                            "B2BUA: outbound auth retry limit reached — surfacing {status_code} upstream instead of re-authing"
+                        );
+                        // fall through to the failure path (on_failure + forward to A-leg)
+                    } else if let Some((username, password)) = &outbound_credentials {
+                        let challenge_header = if status_code == 401 {
+                            message.headers.get("WWW-Authenticate")
+                        } else {
+                            message.headers.get("Proxy-Authenticate")
+                        };
 
-                    for handler in &handlers {
-                        let callable = handler.callable.bind(python);
-                        match callable.call1((
-                            call_obj.bind(python),
-                            status_code,
-                            reason.as_str(),
-                        )) {
-                            Ok(ret) => {
-                                if handler.is_async {
-                                    if let Err(error) = run_coroutine(python, &ret) {
-                                        error!("async B2BUA on_failure handler error: {error}");
+                        if let Some(challenge_value) = challenge_header {
+                            if let Some(challenge) = crate::auth::parse_challenge(challenge_value) {
+                                if let (Some(target_uri), Some(stored_invite_arc)) =
+                                    (&b_leg_target, &b_leg_stored_invite)
+                                {
+                                    // RFC 3261 §17.1.1.3: the INVITE client transaction
+                                    // MUST ACK every non-2xx final response on the branch
+                                    // it arrived on — the first 401/407 AND every
+                                    // retransmit. The trunk's server transaction keeps
+                                    // retransmitting the challenge until this ACK lands;
+                                    // skipping it (the old behaviour — this path returned
+                                    // before the non-2xx ACK below) leaves the trunk
+                                    // retransmitting until Timer B and feeds the re-retry
+                                    // bug guarded against next.
+                                    if let Some((b_dest, b_transport)) = b_leg_dest {
+                                        // RFC 3261 §17.1.1.3 — same client transaction as
+                                        // the INVITE, so the same sent-by (flow socket
+                                        // when the leg is pinned).
+                                        let (ack_via_host, ack_via_port) =
+                                            b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                                        let ack = build_b2bua_ack_for_non2xx(
+                                            message,
+                                            branch,
+                                            b_leg_target.as_deref(),
+                                            b_transport,
+                                            &ack_via_host,
+                                            ack_via_port,
+                                        );
+                                        send_b2bua_to_bleg(
+                                            ack,
+                                            b_transport,
+                                            b_dest,
+                                            b_leg_local_addr,
+                                            state,
+                                        );
                                     }
+
+                                    // Only the FIRST challenge on this leg drives a retry.
+                                    // A retransmitted 401/407 on the same branch is the
+                                    // trunk re-sending its non-2xx (we just re-ACKed it),
+                                    // NOT a fresh challenge. Re-challenging would emit a
+                                    // second authenticated INVITE at the same CSeq on a
+                                    // new branch; the trunk sees a merged request
+                                    // (RFC 3261 §8.2.2.2) and replies 482, and we end up
+                                    // with two outstanding UAC branches where the real
+                                    // 2xx lands on the first while our state tracks the
+                                    // second — the 2xx then never gets ACKed and the
+                                    // trunk BYEs the call. A chained re-challenge (stale
+                                    // nonce) lands on the *retry* leg's branch, a distinct
+                                    // B-leg, so legitimate re-auth still proceeds.
+                                    let first_challenge = b_leg_index
+                                        .map(|idx| {
+                                            state.call_actors.try_mark_auth_challenged(call_id, idx)
+                                        })
+                                        .unwrap_or(true);
+                                    if !first_challenge {
+                                        debug!(
+                                            call_id = %call_id,
+                                            branch = %branch,
+                                            status = status_code,
+                                            "B2BUA: absorbing retransmitted challenge (auth retry already sent on this leg)"
+                                        );
+                                        return;
+                                    }
+
+                                    // Count this committed credentialed retry against the
+                                    // per-call cap checked at the top of the 401/407
+                                    // block. Placed after the per-leg dedup so retransmits
+                                    // (which returned above) never inflate the count.
+                                    state.call_actors.incr_auth_retry_count(call_id);
+
+                                    // RFC 7616 §3.3: nc starts at 1 for a fresh server
+                                    // nonce and increments on every reuse. The
+                                    // per-call NonceCounter resets internally when
+                                    // the nonce changes, so this is correct for both
+                                    // first challenge and same-nonce re-challenge
+                                    // (e.g. authenticated re-INVITE in the dialog).
+                                    let nc = state
+                                        .call_actors
+                                        .get_call(call_id)
+                                        .map(|call| call.digest_nc.next_for(&challenge.nonce))
+                                        .unwrap_or(1);
+
+                                    info!(
+                                        call_id = %call_id,
+                                        status = status_code,
+                                        realm = %challenge.realm,
+                                        nc = nc,
+                                        "B2BUA: {status_code} received, retrying with credentials"
+                                    );
+
+                                    let credentials = crate::auth::DigestCredentials {
+                                        username: username.clone(),
+                                        password: password.clone(),
+                                    };
+
+                                    let auth_header_name = if status_code == 401 {
+                                        "Authorization"
+                                    } else {
+                                        "Proxy-Authorization"
+                                    };
+
+                                    let auth_value = crate::auth::format_authorization_header(
+                                        &challenge,
+                                        &credentials,
+                                        "INVITE",
+                                        target_uri,
+                                        Some(nc),
+                                        None,
+                                    );
+
+                                    // RFC 5923 connection reuse: keep the authenticated
+                                    // retry on the SAME trunk member the CSeq-1 INVITE
+                                    // (and its 401 + nonce) traversed, instead of
+                                    // re-resolving the trunk hostname and round-robining
+                                    // onto a sibling member that never issued the nonce.
+                                    // See select_b2bua_retry_destination for the full
+                                    // rationale; it falls back to a fresh DNS resolution
+                                    // only when the leg has no recorded destination.
+                                    {
+                                        let (
+                                            destination,
+                                            transport,
+                                            reuse_connection_id,
+                                            relay_target,
+                                        ) = match select_b2bua_retry_destination(
+                                            b_leg_dest,
+                                            b_leg_connection_id,
+                                            target_uri,
+                                            &state.dns_resolver,
+                                        ) {
+                                            Some(resolved) => resolved,
+                                            None => return,
+                                        };
+
+                                        // Build retry from the stored, hygiene-processed B-leg INVITE.
+                                        // Call-ID, From-tag, From-host, To, RURI, Contact, User-Agent,
+                                        // P-Asserted-Identity, Record-Route stripping, and the SDP body
+                                        // (anchored by rtpengine if applicable) are all already correct.
+                                        let new_branch = TransactionKey::generate_branch();
+                                        // The credentialed retry continues the same B-leg,
+                                        // so it keeps the leg's sent-by (flow socket when
+                                        // it was dialled over one).
+                                        let (retry_via_host, retry_via_port) =
+                                            b_leg_sent_by(b_leg_local_addr, state, &transport);
+                                        let via_value = format!(
+                                            "SIP/2.0/{} {}:{};branch={}",
+                                            transport, retry_via_host, retry_via_port, new_branch,
+                                        );
+                                        let retry = {
+                                            let Ok(original) = stored_invite_arc.lock() else {
+                                                error!(call_id = %call_id, "b_leg_invite lock poisoned during 401/407 retry");
+                                                return;
+                                            };
+                                            // RFC 3261 §22.2: incremented CSeq for the retried request.
+                                            // local_cseq was bumped past the original after first send,
+                                            // so it now points at the next number to use.
+                                            build_digest_retry_invite(
+                                                &original,
+                                                via_value,
+                                                b_leg_local_cseq,
+                                                auth_header_name,
+                                                auth_value,
+                                            )
+                                        };
+
+                                        // Reuse the failed B-leg's dialog identity (Call-ID +
+                                        // From-tag); the stored INVITE already carries them.
+                                        let (retry_call_id, retry_from_tag) =
+                                            b_leg_dialog.clone().unwrap_or_else(|| {
+                                                (
+                                                    a_leg.dialog.call_id.clone(),
+                                                    a_leg
+                                                        .dialog
+                                                        .remote_tag
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                )
+                                            });
+
+                                        let mut b_leg = Leg::new_b_leg(
+                                            retry_call_id,
+                                            retry_from_tag,
+                                            target_uri.clone(),
+                                            new_branch,
+                                            LegTransport {
+                                                remote_addr: destination,
+                                                connection_id: reuse_connection_id,
+                                                transport,
+                                                // The retry IS this B-leg continuing, so
+                                                // it keeps the leg's anchored socket.
+                                                local_addr: b_leg_local_addr,
+                                            },
+                                        );
+                                        // Preserve dialog state from the failed attempt:
+                                        //  - local_cseq advances past the retry CSeq.
+                                        //  - local_contact / from_uri / to_uri stay so mid-dialog
+                                        //    requests on this leg work.
+                                        b_leg.dialog.local_cseq =
+                                            b_leg_local_cseq.saturating_add(1);
+                                        b_leg.dialog.local_contact =
+                                            retry.headers.get("Contact").cloned();
+                                        b_leg.dialog.local_from_uri = retry.headers.from().cloned();
+                                        b_leg.dialog.remote_to_uri = retry.headers.to().cloned();
+                                        if let Ok(target_parsed) = parse_uri_standalone(target_uri)
+                                        {
+                                            b_leg.dialog.remote_aor_host =
+                                                Some(if let Some(port) = target_parsed.port {
+                                                    format!("{}:{}", target_parsed.host, port)
+                                                } else {
+                                                    target_parsed.host.clone()
+                                                });
+                                        }
+                                        // Persist the retry INVITE so a chained re-challenge
+                                        // (e.g. nonce stale) rebuilds from the right snapshot.
+                                        b_leg.b_leg_invite =
+                                            Some(Arc::new(Mutex::new(retry.clone())));
+
+                                        // RFC 3261 §9.1: the CSeq-1 INVITE transaction is
+                                        // complete after its 401/407 + ACK, so the retry is
+                                        // the *same* logical B-leg continuing with credentials
+                                        // — supersede the failed leg in place rather than
+                                        // appending. Appending leaves the dead leg in
+                                        // `b_legs`, so a later CANCEL fans out to its
+                                        // already-final-responded transaction too (→ a
+                                        // spurious 481). `b_leg_index` is the slot the
+                                        // challenged response matched; it is always Some here
+                                        // (a B-leg response only reaches this path with a
+                                        // matched leg), but fall back to append defensively.
+                                        match b_leg_index {
+                                            Some(idx) => {
+                                                state.call_actors.replace_b_leg(
+                                                    call_id,
+                                                    idx,
+                                                    b_leg.clone(),
+                                                );
+                                                spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                            }
+                                            None => {
+                                                state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                            }
+                                        }
+
+                                        let data = Bytes::from(retry.to_bytes());
+                                        // Egress from the leg's anchored socket (UDP only —
+                                        // a stream leg is reached over its connection).
+                                        let retry_source = match transport {
+                                            Transport::Udp => b_leg_local_addr,
+                                            _ => None,
+                                        };
+                                        send_to_target(
+                                            data,
+                                            &relay_target,
+                                            transport,
+                                            reuse_connection_id,
+                                            retry_source,
+                                            state,
+                                        );
+                                    }
+                                    return; // don't forward 401/407 to A-leg or fire on_failure
                                 }
-                            }
-                            Err(error) => {
-                                error!("B2BUA on_failure handler error: {error}");
                             }
                         }
                     }
-                });
-            } else {
-                warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_failure");
-            }
-        }
-
-        // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
-        // The B2BUA must acknowledge non-2xx responses hop-by-hop.
-        // Use send_b2bua_to_bleg (not send_message) so TCP goes through the pool.
-        // Skipped when the LCR reroute path already ACKed this carrier before
-        // trying (and failing to route) the next one — no double ACK.
-        if let Some((b_dest, b_transport)) = b_leg_dest {
-            if !b_leg_acked_for_reroute {
-                // RFC 3261 §17.1.1.3 — same client transaction as the INVITE, so
-                // the same sent-by (the leg's flow socket when it has one).
-                let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
-                let ack = build_b2bua_ack_for_non2xx(
-                    message,
-                    branch,
-                    b_leg_target.as_deref(),
-                    b_transport,
-                    &ack_via_host,
-                    ack_via_port,
-                );
-                send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-            }
-        }
-
-        // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
-        if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
-            crate::b2bua::actor::Dialog::rewrite_headers(
-                message,
-                &a_leg.dialog.call_id,
-                b_ftag,
-                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                Some(&a_leg.dialog.local_tag),
-            );
-        }
-        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
-        if let Some(invite_arc) = &a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(vias) = invite.headers.get_all("Via") {
-                    message.headers.set_all("Via", vias.clone());
                 }
-                // Restore A-leg CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
-                // equal the request CSeq). B-leg has independent CSeq numbering.
-                if let Some(cseq) = invite.headers.cseq() {
-                    message.headers.set("CSeq", cseq.clone());
-                }
-            }
-        }
-        // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(message, state, a_leg.transport.transport, a_leg_local_addr, a_leg_supports_100rel, call_id);
-        // Pin the reply egress socket to the A-leg INVITE's arrival listener
-        // (`a_leg_local_addr`) so a multi-homed UDP host answers on the port it
-        // received on. No-op for stream transports and single-listener hosts.
-        send_message_from(
-            message.clone(),
-            a_leg.transport.transport,
-            a_leg.transport.remote_addr,
-            a_leg.transport.connection_id,
-            a_leg_local_addr,
-            state,
-        );
 
-        // Safety-net: if RTPEngine was offered but call failed, clean up the session.
-        // Only runs when the call is truly ending (script called reject, not retry).
-        // Skipped for a relayed auth challenge: the imminent authenticated
-        // re-INVITE reuses the media session (keyed by SIP Call-ID), so deleting
-        // it here would just force a needless re-offer (and could race that offer).
-        if !relay_challenge {
-            let a_sip_call_id = a_leg.dialog.call_id.clone();
-            if let (Some(rtpengine_set), Some(media_sessions)) =
-                (&state.rtpengine_set, &state.rtpengine_sessions)
-            {
-                if let Some(session) = media_sessions.remove(&a_sip_call_id) {
-                    let set = Arc::clone(rtpengine_set);
-                    tokio::spawn(async move {
-                        if let Err(error) = set.delete(session.rtpengine_id(), &session.from_tag).await {
-                            if error.is_call_not_found() {
-                                debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
-                            } else {
-                                warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
-                            }
+                // auth_passthrough: a B-leg 401/407 with no siphon-side credentials is a
+                // NON-terminal challenge that we relay to the caller for end-to-end
+                // authentication (RFC 3261 §22.3). We still ACK the B-leg and forward the
+                // challenge to the A-leg below (unconditionally), but must NOT treat the
+                // call as failed: skip the CDR, @b2bua.on_failure, and the media teardown.
+                // The call actor is still removed (the caller re-INVITEs as a fresh call);
+                // the media session — keyed by SIP Call-ID, which the re-INVITE reuses —
+                // is deliberately left in place. The caller's ACK for the forwarded
+                // challenge matches no live call and is dropped by the unmatched-ACK guard
+                // (never answered with a 502).
+                let relay_challenge = (status_code == 401 || status_code == 407)
+                    && outbound_credentials.is_none()
+                    && state
+                        .call_actors
+                        .get_call(call_id)
+                        .map(|call| call.auth_passthrough)
+                        .unwrap_or(false);
+                if relay_challenge {
+                    debug!(
+                        call_id = %call_id,
+                        status = status_code,
+                        "B2BUA: relaying auth challenge to A-leg (auth_passthrough) — not a failure"
+                    );
+                }
+
+                // LCR / sequential failover: this carrier produced a final failure. If
+                // it is a configured reroute cause and more carriers remain, advance to
+                // the next instead of failing the call — the A-leg sees an error only
+                // once the list is exhausted or the response is definitive.
+                let mut b_leg_acked_for_reroute = false;
+                if !relay_challenge && state.call_actors.is_route_sequence(call_id) {
+                    // Absorb a straggler that must NEVER reach the A-leg: a leg we
+                    // cancelled during a failover-advance (its `487 Request Terminated`),
+                    // or ANY non-2xx arriving after another carrier already answered.
+                    // Without this, a cancelled carrier's 487 tears down the bridged
+                    // call. We still ACK it (RFC 3261 §17.1.1.3) so the carrier stops
+                    // retransmitting, then drop it — no forward, no teardown, no advance.
+                    let already_cancelled = b_leg_index
+                        .and_then(|idx| {
+                            state
+                                .call_actors
+                                .get_call(call_id)
+                                .and_then(|call| call.b_leg_status.get(idx).cloned())
+                        })
+                        .is_some_and(|status| {
+                            matches!(status, crate::b2bua::actor::BLegStatus::Cancelled)
+                        });
+                    if already_cancelled || status_code == 487 || call_state == CallState::Answered
+                    {
+                        if let Some((b_dest, b_transport)) = b_leg_dest {
+                            // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
+                            let (ack_via_host, ack_via_port) =
+                                b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                            let ack = build_b2bua_ack_for_non2xx(
+                                message,
+                                branch,
+                                b_leg_target.as_deref(),
+                                b_transport,
+                                &ack_via_host,
+                                ack_via_port,
+                            );
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                         }
-                    });
+                        debug!(call_id = %call_id, status = status_code,
+                    "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
+                        return;
+                    }
+                    state.call_actors.record_route_failure(call_id, status_code);
+                    // Fail over only on a configured reroute cause (per-route from the
+                    // API > per-gateway override > global set). A definitive response
+                    // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —
+                    // trying another carrier won't help.
+                    let reroute = b2bua_status_reroutes(call_id, status_code, state);
+                    if reroute && state.call_actors.has_pending_routes(call_id) {
+                        // ACK this carrier's non-2xx (RFC 3261 §17.1.1.3) before the
+                        // next try. The failed carrier's media session is keyed by the
+                        // A-leg Call-ID and reused by the next carrier's B-leg, so it is
+                        // intentionally NOT torn down here.
+                        if let Some((b_dest, b_transport)) = b_leg_dest {
+                            // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
+                            let (ack_via_host, ack_via_port) =
+                                b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                            let ack = build_b2bua_ack_for_non2xx(
+                                message,
+                                branch,
+                                b_leg_target.as_deref(),
+                                b_transport,
+                                &ack_via_host,
+                                ack_via_port,
+                            );
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
+                            b_leg_acked_for_reroute = true;
+                        }
+                        let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
+                            Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
+                            _ => false,
+                        };
+                        if advanced {
+                            debug!(call_id = %call_id, status = status_code,
+                        "LCR: carrier failed, advanced to next carrier");
+                            return;
+                        }
+                    }
+                    debug!(call_id = %call_id, status = status_code, reroute,
+                "LCR: forwarding carrier response to A-leg (definitive or exhausted)");
                 }
+
+                // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
+                // whether a @b2bua.on_failure handler is registered — the record must be
+                // written for the failed call either way. Skipped for a relayed challenge
+                // (the call has not failed).
+                if !relay_challenge {
+                    cdr_finalize_b2bua_fail(state, call_id, status_code);
+                }
+
+                // Error response — invoke @b2bua.on_failure with (PyCall, code, reason).
+                // Skipped for a relayed challenge (not a failure — the caller authenticates).
+                let engine_state = state.engine.state();
+                let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
+                if !relay_challenge && !handlers.is_empty() {
+                    let reason = match &message.start_line {
+                        StartLine::Response(status_line) => status_line.reason_phrase.clone(),
+                        _ => "Unknown".to_string(),
+                    };
+
+                    if let Some(invite_arc) = &a_leg_invite {
+                        let py_call = PyCall::new(
+                            call_id.to_string(),
+                            Arc::clone(invite_arc),
+                            a_leg.transport.remote_addr.ip().to_string(),
+                            format!("{}", a_leg.transport.transport).to_lowercase(),
+                        )
+                        .with_flow(py_flow_from_leg(&a_leg.transport));
+
+                        Python::attach(|python| {
+                            let call_obj = match Py::new(python, py_call) {
+                                Ok(obj) => obj,
+                                Err(error) => {
+                                    error!("failed to create PyCall for on_failure: {error}");
+                                    return;
+                                }
+                            };
+
+                            for handler in &handlers {
+                                let callable = handler.callable.bind(python);
+                                match callable.call1((
+                                    call_obj.bind(python),
+                                    status_code,
+                                    reason.as_str(),
+                                )) {
+                                    Ok(ret) => {
+                                        if handler.is_async {
+                                            if let Err(error) = run_coroutine(python, &ret) {
+                                                error!(
+                                                    "async B2BUA on_failure handler error: {error}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("B2BUA on_failure handler error: {error}");
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_failure");
+                    }
+                }
+
+                // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
+                // The B2BUA must acknowledge non-2xx responses hop-by-hop.
+                // Use send_b2bua_to_bleg (not send_message) so TCP goes through the pool.
+                // Skipped when the LCR reroute path already ACKed this carrier before
+                // trying (and failing to route) the next one — no double ACK.
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    if !b_leg_acked_for_reroute {
+                        // RFC 3261 §17.1.1.3 — same client transaction as the INVITE, so
+                        // the same sent-by (the leg's flow socket when it has one).
+                        let (ack_via_host, ack_via_port) =
+                            b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                        let ack = build_b2bua_ack_for_non2xx(
+                            message,
+                            branch,
+                            b_leg_target.as_deref(),
+                            b_transport,
+                            &ack_via_host,
+                            ack_via_port,
+                        );
+                        send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
+                    }
+                }
+
+                // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
+                if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        message,
+                        &a_leg.dialog.call_id,
+                        b_ftag,
+                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        Some(&a_leg.dialog.local_tag),
+                    );
+                }
+                // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+                if let Some(invite_arc) = &a_leg_invite {
+                    if let Ok(invite) = invite_arc.lock() {
+                        if let Some(vias) = invite.headers.get_all("Via") {
+                            message.headers.set_all("Via", vias.clone());
+                        }
+                        // Restore A-leg CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
+                        // equal the request CSeq). B-leg has independent CSeq numbering.
+                        if let Some(cseq) = invite.headers.cseq() {
+                            message.headers.set("CSeq", cseq.clone());
+                        }
+                    }
+                }
+                // Sanitize B-leg headers before forwarding to A-leg
+                sanitize_b2bua_response(
+                    message,
+                    state,
+                    a_leg.transport.transport,
+                    a_leg_local_addr,
+                    a_leg_supports_100rel,
+                    call_id,
+                );
+                // Pin the reply egress socket to the A-leg INVITE's arrival listener
+                // (`a_leg_local_addr`) so a multi-homed UDP host answers on the port it
+                // received on. No-op for stream transports and single-listener hosts.
+                send_message_from(
+                    message.clone(),
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
+
+                // Safety-net: if RTPEngine was offered but call failed, clean up the session.
+                // Only runs when the call is truly ending (script called reject, not retry).
+                // Skipped for a relayed auth challenge: the imminent authenticated
+                // re-INVITE reuses the media session (keyed by SIP Call-ID), so deleting
+                // it here would just force a needless re-offer (and could race that offer).
+                if !relay_challenge {
+                    let a_sip_call_id = a_leg.dialog.call_id.clone();
+                    if let (Some(rtpengine_set), Some(media_sessions)) =
+                        (&state.rtpengine_set, &state.rtpengine_sessions)
+                    {
+                        if let Some(session) = media_sessions.remove(&a_sip_call_id) {
+                            let set = Arc::clone(rtpengine_set);
+                            tokio::spawn(async move {
+                                if let Err(error) =
+                                    set.delete(session.rtpengine_id(), &session.from_tag).await
+                                {
+                                    if error.is_call_not_found() {
+                                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
+                                    } else {
+                                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Release any Ro reservation made by `call.ro_authorize()` before the
+                // B-leg failed (reserve-before-connect leaves a live session pre-answer):
+                // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
+                // the call has not failed and the reservation must survive the re-INVITE.
+                if !relay_challenge {
+                    // The B-leg's own final status is the cause: a busy reports -486, a
+                    // ring timeout -408, and so on, which is what makes an unanswered
+                    // call distinguishable from a normal hangup on the OCS side.
+                    spawn_ro_b2bua_stop(
+                        state,
+                        call_id,
+                        crate::diameter::rf::sip_status_to_cause_code(status_code),
+                    );
+                }
+
+                state.call_actors.remove_call(call_id);
+                state.call_event_receivers.remove(call_id);
             }
-        }
-
-        // Release any Ro reservation made by `call.ro_authorize()` before the
-        // B-leg failed (reserve-before-connect leaves a live session pre-answer):
-        // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
-        // the call has not failed and the reservation must survive the re-INVITE.
-        if !relay_challenge {
-            // The B-leg's own final status is the cause: a busy reports -486, a
-            // ring timeout -408, and so on, which is what makes an unanswered
-            // call distinguishable from a normal hangup on the OCS side.
-            spawn_ro_b2bua_stop(
-                state,
-                call_id,
-                crate::diameter::rf::sip_status_to_cause_code(status_code),
-            );
-        }
-
-        state.call_actors.remove_call(call_id);
-        state.call_event_receivers.remove(call_id);
-    }
-
-    } // end ResponseClass::Failed
+        } // end ResponseClass::Failed
     } // end match class
 }
 
@@ -18166,9 +19497,7 @@ fn schedule_zombie_reinvite_cleanup(call_actors: &crate::b2bua::actor::CallActor
         return;
     }
     let zombie_map = call_actors.zombie_reinvites.clone();
-    let zombie_keys: Vec<String> = zombie_map.iter()
-        .map(|entry| entry.key().clone())
-        .collect();
+    let zombie_keys: Vec<String> = zombie_map.iter().map(|entry| entry.key().clone()).collect();
     if !zombie_keys.is_empty() {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(32)).await;
@@ -18217,17 +19546,25 @@ fn build_b2bua_ack_for_2xx(
     via_host: &str,
     via_port: u16,
 ) -> Option<SipMessage> {
-    let request_uri = response.headers.get("Contact")
+    let request_uri = response
+        .headers
+        .get("Contact")
         .map(|c| crate::b2bua::actor::extract_contact_uri(c))
         .and_then(|u| parse_uri_standalone(&u).ok())
         .unwrap_or_else(|| SipUri::new("invalid".to_string()));
     let transport_str = format!("{}", transport).to_uppercase();
-    let cseq_num = response.headers.cseq()
+    let cseq_num = response
+        .headers
+        .cseq()
         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
         .unwrap_or_else(|| "1".to_string());
     let from = response.headers.from().cloned().unwrap_or_default();
     let to = response.headers.to().cloned().unwrap_or_default();
-    let call_id = response.headers.call_id().map(|s| s.to_string()).unwrap_or_default();
+    let call_id = response
+        .headers
+        .call_id()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     match SipMessageBuilder::new()
         .request(Method::Ack, request_uri)
         .via(format!(
@@ -18290,7 +19627,9 @@ fn handle_zombie_cancelled_2xx(
         leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
     }
     // The BYE CSeq must exceed the INVITE's; derive it from the 2xx's CSeq.
-    let invite_cseq = response.headers.cseq()
+    let invite_cseq = response
+        .headers
+        .cseq()
         .and_then(|c| c.split_whitespace().next())
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(leg.dialog.local_cseq);
@@ -18384,12 +19723,10 @@ fn build_cancelled_leg_ack(
 }
 
 /// Handle a BYE for a B2BUA call — bridge to the other leg.
-fn handle_b2bua_bye(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
-    let sip_call_id = message.headers.get("Call-ID")
+fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
         .map(|s| s.to_string())
         .unwrap_or_default();
 
@@ -18401,12 +19738,19 @@ fn handle_b2bua_bye(
             // arm below: 481, never a silent drop (RFC 3261 §15.1.2).
             warn!(sip_call_id = %sip_call_id, "B2BUA BYE: no matching call — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -18429,12 +19773,19 @@ fn handle_b2bua_bye(
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA BYE: Call-ID matches no dialog leg — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -18455,9 +19806,11 @@ fn handle_b2bua_bye(
     // into its slot and the old anchor keyed on the A-leg Call-ID is what the
     // media re-anchor reads. Only the subscription is flagged, which is what
     // suppresses the NOTIFY + BYE aimed at a dialog that no longer exists.
-    if state.call_actors.mark_transfer_referrer_gone(&call_id, from_a_leg) {
-        let bye_response =
-            build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+    if state
+        .call_actors
+        .mark_transfer_referrer_gone(&call_id, from_a_leg)
+    {
+        let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
         send_message_from(
             bye_response,
             inbound.transport,
@@ -18500,7 +19853,11 @@ fn handle_b2bua_bye(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaBye);
     if !handlers.is_empty() {
-        let side = if from_a_leg { "a".to_string() } else { "b".to_string() };
+        let side = if from_a_leg {
+            "a".to_string()
+        } else {
+            "b".to_string()
+        };
 
         if let Some(invite_arc) = &a_leg_invite {
             let py_call = PyCall::new(
@@ -18603,7 +19960,13 @@ fn handle_b2bua_bye(
                         b_leg.transport.transport,
                     );
                     debug!(call_id = %call_id, %destination, "B2BUA: sending BYE to B-leg");
-                    send_b2bua_to_bleg(bye, transport, destination, b_leg.transport.local_addr, state);
+                    send_b2bua_to_bleg(
+                        bye,
+                        transport,
+                        destination,
+                        b_leg.transport.local_addr,
+                        state,
+                    );
                 } else {
                     warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
                 }
@@ -18720,14 +20083,24 @@ fn session_timer_sweep(state: &DispatcherState) {
 
 /// Send a B2BUA-initiated refresh re-INVITE to the B-leg.
 fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
-    let (a_leg_invite, a_leg_from_tag, winner_b_leg, session_expires) = match state.call_actors.get_call(call_id) {
-        Some(call) => {
-            let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
-            let se = call.session_timer.as_ref().map(|t| t.session_expires).unwrap_or(1800);
-            (call.a_leg_invite.clone(), call.a_leg.dialog.remote_tag.clone().unwrap_or_default(), b_leg, se)
-        }
-        None => return,
-    };
+    let (a_leg_invite, a_leg_from_tag, winner_b_leg, session_expires) =
+        match state.call_actors.get_call(call_id) {
+            Some(call) => {
+                let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
+                let se = call
+                    .session_timer
+                    .as_ref()
+                    .map(|t| t.session_expires)
+                    .unwrap_or(1800);
+                (
+                    call.a_leg_invite.clone(),
+                    call.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+                    b_leg,
+                    se,
+                )
+            }
+            None => return,
+        };
 
     let (invite_arc, b_leg) = match (a_leg_invite, winner_b_leg) {
         (Some(invite), Some(b_leg)) => (invite, b_leg),
@@ -18757,7 +20130,10 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     // Update Request-URI to B-leg's remote Contact (RFC 3261 §12.2.1.1),
     // falling back to the original dial target if Contact is not yet captured.
-    let reinvite_ruri = b_leg.dialog.remote_contact.as_deref()
+    let reinvite_ruri = b_leg
+        .dialog
+        .remote_contact
+        .as_deref()
         .or(b_leg.dialog.target_uri.as_deref())
         .unwrap_or_default();
     if !reinvite_ruri.is_empty() {
@@ -18784,12 +20160,21 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
 
     // Rewrite From URI host to our advertised address (topology hiding)
     let b2bua_host = state.via_host(&b_leg.transport.transport);
-    if let Some(from) = reinvite.headers.get("From").or_else(|| reinvite.headers.get("f")) {
-        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(from, &b2bua_host));
+    if let Some(from) = reinvite
+        .headers
+        .get("From")
+        .or_else(|| reinvite.headers.get("f"))
+    {
+        reinvite.headers.set(
+            "From",
+            crate::b2bua::actor::rewrite_uri_host(from, &b2bua_host),
+        );
     }
 
     // Regenerate CSeq for B-leg dialog
-    reinvite.headers.set("CSeq", format!("{} INVITE", b_leg.dialog.local_cseq));
+    reinvite
+        .headers
+        .set("CSeq", format!("{} INVITE", b_leg.dialog.local_cseq));
 
     // Decrement Max-Forwards (RFC 7332)
     let _ = crate::proxy::core::decrement_max_forwards(&mut reinvite.headers);
@@ -18807,7 +20192,9 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         format!("{};refresher=uac", session_expires),
     );
     if let Some(ref timer_config) = state.session_timer_config {
-        reinvite.headers.add("Min-SE", timer_config.min_se.to_string());
+        reinvite
+            .headers
+            .add("Min-SE", timer_config.min_se.to_string());
     }
     if reinvite.headers.get("Supported").is_none() {
         reinvite.headers.add("Supported", "timer".to_string());
@@ -18843,8 +20230,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // version rather than re-presenting the caller's forwarded o= (which would
     // read as a session change relative to the initial B-leg INVITE).
     if !reinvite.body.is_empty() {
-        if let Some((sess_id, version)) =
-            state.call_actors.reserve_leg_sdp_version(call_id, false)
+        if let Some((sess_id, version)) = state.call_actors.reserve_leg_sdp_version(call_id, false)
         {
             stamp_sdp_origin(
                 &mut reinvite.body,
@@ -18916,7 +20302,10 @@ fn b2bua_send_reinvite_on_leg(
     tracking_target: &str,
     state: &DispatcherState,
 ) -> bool {
-    let Some(cseq) = state.call_actors.reserve_leg_cseq(call_id, surviving_on_a_leg) else {
+    let Some(cseq) = state
+        .call_actors
+        .reserve_leg_cseq(call_id, surviving_on_a_leg)
+    else {
         return false;
     };
     let Some(surviving) = state.call_actors.clone_leg(call_id, surviving_on_a_leg) else {
@@ -18956,12 +20345,7 @@ fn b2bua_send_reinvite_on_leg(
         .headers
         .get("Via")
         .and_then(|via| via.split(";branch=").nth(1))
-        .map(|rest| {
-            rest.split([';', ',', ' '])
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
+        .map(|rest| rest.split([';', ',', ' ']).next().unwrap_or("").to_string())
         .unwrap_or_default();
     if branch.is_empty() {
         warn!(call_id = %call_id, "B2BUA: siphon-originated re-INVITE has no Via branch");
@@ -19013,7 +20397,9 @@ fn b2bua_send_reinvite_on_leg(
 /// teardown ([`b2bua_terminate_call_inner`]).
 fn b2bua_stop_siprec(internal_call_id: &str, state: &DispatcherState) {
     // Collect RTPEngine subscribe info before stop_recording cleans up sessions.
-    let siprec_infos = state.recording_manager.active_session_infos(internal_call_id);
+    let siprec_infos = state
+        .recording_manager
+        .active_session_infos(internal_call_id);
     let bye_messages = state
         .recording_manager
         .stop_recording(internal_call_id, state.local_addr);
@@ -19024,7 +20410,14 @@ fn b2bua_stop_siprec(internal_call_id: &str, state: &DispatcherState) {
             transport: Some(transport),
             server_name: None,
         };
-        send_to_target(data, &target, transport, ConnectionId::default(), None, state);
+        send_to_target(
+            data,
+            &target,
+            transport,
+            ConnectionId::default(),
+            None,
+            state,
+        );
     }
     // RTPEngine unsubscribe: stop media forking for each recording session.
     if let Some(ref rtpengine_set) = state.rtpengine_set {
@@ -19116,7 +20509,14 @@ fn b2bua_terminate_call_inner(
             a_leg.transport.transport,
         );
         // Source the framework BYE from the A-leg's anchored socket (Via matches).
-        send_message_from(bye_msg, transport, destination, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
+        send_message_from(
+            bye_msg,
+            transport,
+            destination,
+            a_leg.transport.connection_id,
+            a_leg.transport.local_addr,
+            state,
+        );
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_bye(b_leg) {
@@ -19127,7 +20527,13 @@ fn b2bua_terminate_call_inner(
                 b_leg.transport.transport,
             );
             // Source it from the B-leg's anchored socket (Via matches).
-            send_b2bua_to_bleg(bye_msg, transport, destination, b_leg.transport.local_addr, state);
+            send_b2bua_to_bleg(
+                bye_msg,
+                transport,
+                destination,
+                b_leg.transport.local_addr,
+                state,
+            );
         }
     }
 
@@ -19160,7 +20566,9 @@ fn b2bua_terminate_call_inner(
     // controlled (no-op otherwise).
     control_notify_terminated(&sip_call_id, reason_header.unwrap_or("terminated"));
 
-    state.call_actors.set_state(internal_call_id, CallState::Terminated);
+    state
+        .call_actors
+        .set_state(internal_call_id, CallState::Terminated);
     // remove_call sends Shutdown to any remaining actors, cleans up registry,
     // and moves re-INVITE tracking entries to the zombie map.
     state.call_actors.remove_call(internal_call_id);
@@ -19325,10 +20733,22 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
             ));
         }
     }
-    let response =
-        build_response(&invite, code, reason, state.server_header.as_deref(), &reply_headers);
+    let response = build_response(
+        &invite,
+        code,
+        reason,
+        state.server_header.as_deref(),
+        &reply_headers,
+    );
     drop(invite);
-    send_message_from(response, transport, remote_addr, connection_id, local_addr, state);
+    send_message_from(
+        response,
+        transport,
+        remote_addr,
+        connection_id,
+        local_addr,
+        state,
+    );
 
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, internal_call_id, code);
@@ -19632,14 +21052,9 @@ fn retry_originated_refer_with_credentials(
         ("Refer-To", pending.refer_to.to_string()),
         (auth_header_name, auth_value),
     ];
-    let Some(retry) = build_b2bua_in_dialog_request(
-        &leg,
-        state,
-        Method::Refer,
-        cseq,
-        &extra_headers,
-        None,
-    ) else {
+    let Some(retry) =
+        build_b2bua_in_dialog_request(&leg, state, Method::Refer, cseq, &extra_headers, None)
+    else {
         return false;
     };
 
@@ -19692,7 +21107,10 @@ fn b2bua_send_outbound_refer(
     on_a_leg: bool,
     refer_to: &crate::sip::headers::refer::ReferTo,
 ) -> bool {
-    let Some(cseq) = state.call_actors.reserve_leg_cseq(internal_call_id, on_a_leg) else {
+    let Some(cseq) = state
+        .call_actors
+        .reserve_leg_cseq(internal_call_id, on_a_leg)
+    else {
         warn!(call_id = %internal_call_id, "b2bua.refer: no such call/leg");
         return false;
     };
@@ -19702,14 +21120,9 @@ fn b2bua_send_outbound_refer(
     };
 
     let extra_headers = [("Refer-To", refer_to.to_string())];
-    let Some(refer) = build_b2bua_in_dialog_request(
-        &leg,
-        state,
-        Method::Refer,
-        cseq,
-        &extra_headers,
-        None,
-    ) else {
+    let Some(refer) =
+        build_b2bua_in_dialog_request(&leg, state, Method::Refer, cseq, &extra_headers, None)
+    else {
         return false;
     };
 
@@ -19784,10 +21197,7 @@ fn b2bua_send_outbound_refer(
 /// `@rtpengine.on_dtmf`, timers), keyed by SIP Call-ID. Refers the A-leg (the
 /// caller / IVR-connected party). Returns `false` if the Call-ID is unknown or
 /// the dispatcher is not running. Mirrors [`b2bua_terminate_call`].
-pub fn b2bua_refer_call(
-    sip_call_id: &str,
-    refer_to: crate::sip::headers::refer::ReferTo,
-) -> bool {
+pub fn b2bua_refer_call(sip_call_id: &str, refer_to: crate::sip::headers::refer::ReferTo) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
@@ -19795,7 +21205,12 @@ pub fn b2bua_refer_call(
         return false;
     };
     let _enter = control.runtime.enter();
-    b2bua_send_outbound_refer(&control.state, &internal_call_id, /*on_a_leg=*/ true, &refer_to)
+    b2bua_send_outbound_refer(
+        &control.state,
+        &internal_call_id,
+        /*on_a_leg=*/ true,
+        &refer_to,
+    )
 }
 
 /// Accept a *controlled* call's pending inbound REFER — the control-plane
@@ -20055,7 +21470,11 @@ pub fn b2bua_media_target(
 ) -> Option<(Arc<crate::rtpengine::MediaBackend>, String, String)> {
     let control = B2BUA_CONTROL.get()?;
     let backend = control.state.rtpengine_set.clone()?;
-    let session = control.state.rtpengine_sessions.as_ref()?.get(sip_call_id)?;
+    let session = control
+        .state
+        .rtpengine_sessions
+        .as_ref()?
+        .get(sip_call_id)?;
     Some((
         backend,
         session.rtpengine_id().to_string(),
@@ -20146,8 +21565,13 @@ fn b2bua_send_uas_response(
         }
     }
 
-    let mut response =
-        build_response(invite, code, reason, state.server_header.as_deref(), &reply_headers);
+    let mut response = build_response(
+        invite,
+        code,
+        reason,
+        state.server_header.as_deref(),
+        &reply_headers,
+    );
 
     // RFC 3261 §12.1.1 / §13.3.1.4: a UAS MUST put a Contact in a response that
     // establishes a dialog — the 2xx, and an 18x that opens an early one. It is
@@ -20181,7 +21605,9 @@ fn b2bua_send_uas_response(
         if let Some(ct) = content_type {
             response.headers.set("Content-Type", ct.to_string());
         }
-        response.headers.set("Content-Length", body_bytes.len().to_string());
+        response
+            .headers
+            .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
     // A locally-generated 2xx needs the same retransmission cover as a relayed
@@ -20194,7 +21620,14 @@ fn b2bua_send_uas_response(
     } else {
         None
     };
-    send_message_from(response, transport, remote_addr, connection_id, local_addr, state);
+    send_message_from(
+        response,
+        transport,
+        remote_addr,
+        connection_id,
+        local_addr,
+        state,
+    );
     if let Some(retransmit) = retransmit {
         arm_b2bua_2xx_retransmit(
             internal_call_id,
@@ -20210,7 +21643,9 @@ fn b2bua_send_uas_response(
     if final_response {
         // Confirm the A-leg dialog and mark the CDR answered (tracked at INVITE
         // by cdr_track_b2bua_start) so a later BYE/terminate CDR shows duration.
-        state.call_actors.set_state(internal_call_id, CallState::Answered);
+        state
+            .call_actors
+            .set_state(internal_call_id, CallState::Answered);
         if crate::cdr::auto_emit_enabled() {
             cdr_mark_answer(state, internal_call_id, code);
         }
@@ -20228,7 +21663,15 @@ pub fn b2bua_answer_call(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
 ) -> bool {
-    b2bua_send_uas_response(internal_call_id, invite, code, reason, body, content_type, true)
+    b2bua_send_uas_response(
+        internal_call_id,
+        invite,
+        code,
+        reason,
+        body,
+        content_type,
+        true,
+    )
 }
 
 /// Imperatively send a provisional (1xx) for a UAS-mode B2BUA call
@@ -20242,7 +21685,15 @@ pub fn b2bua_progress_call(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
 ) -> bool {
-    b2bua_send_uas_response(internal_call_id, invite, code, reason, body, content_type, false)
+    b2bua_send_uas_response(
+        internal_call_id,
+        invite,
+        code,
+        reason,
+        body,
+        content_type,
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -20379,12 +21830,11 @@ pub fn b2bua_originate_prepare(
     };
     let state = &control.state;
 
-    let target_uri = parse_uri_standalone(&params.to).map_err(|error| {
-        OriginateError::InvalidUri {
+    let target_uri =
+        parse_uri_standalone(&params.to).map_err(|error| OriginateError::InvalidUri {
             field: "to",
             detail: error.to_string(),
-        }
-    })?;
+        })?;
     for (field, value) in [
         ("from", params.from.as_deref()),
         ("next_hop", params.next_hop.as_deref()),
@@ -20462,7 +21912,9 @@ pub fn b2bua_originate_prepare(
     state
         .call_actors
         .set_a_leg_invite(&internal_call_id, Arc::new(Mutex::new(invite.clone())));
-    state.call_actors.mark_originated(&internal_call_id, &branch);
+    state
+        .call_actors
+        .mark_originated(&internal_call_id, &branch);
     if let OriginateMedia::Anchor { profile, ws_uri } = &params.media {
         state.call_actors.set_originate_anchor(
             &internal_call_id,
@@ -20617,10 +22069,7 @@ fn is_originate_reserved_header(name: &str) -> bool {
 /// profile registry. Pure enough to unit-test through
 /// [`originate_anchor_rejection`]; returns the typed refusal the caller
 /// surfaces verbatim.
-fn originate_validate_anchor(
-    profile: &str,
-    state: &DispatcherState,
-) -> Result<(), OriginateError> {
+fn originate_validate_anchor(profile: &str, state: &DispatcherState) -> Result<(), OriginateError> {
     let Some(backend) = state.rtpengine_set.as_ref() else {
         return Err(OriginateError::Unsupported(
             "originate media anchoring requires a media backend (media.backend), none configured"
@@ -20943,7 +22392,8 @@ fn handle_originated_call_response(
         StartLine::Response(status_line) => status_line.reason_phrase.clone(),
         StartLine::Request(_) => String::new(),
     };
-    let (via_host, via_port) = b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+    let (via_host, via_port) =
+        b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
     let ack = build_b2bua_ack_for_non2xx(
         message,
         &leg.branch,
@@ -21001,14 +22451,17 @@ fn originate_ack_2xx(
 ) {
     let (via_host, via_port) =
         b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
-    let Some(mut ack) = build_b2bua_ack_for_2xx(response, leg.transport.transport, &via_host, via_port)
+    let Some(mut ack) =
+        build_b2bua_ack_for_2xx(response, leg.transport.transport, &via_host, via_port)
     else {
         return;
     };
     if let Some(sdp) = answer_sdp {
-        ack.headers.set("Content-Type", "application/sdp".to_string());
+        ack.headers
+            .set("Content-Type", "application/sdp".to_string());
         ack.body = sdp.as_bytes().to_vec();
-        ack.headers.set("Content-Length", ack.body.len().to_string());
+        ack.headers
+            .set("Content-Length", ack.body.len().to_string());
     }
     send_b2bua_to_bleg(
         ack,
@@ -21113,7 +22566,10 @@ fn originate_delete_media(sip_call_id: &str, state: &DispatcherState) {
         if let Some(session) = sessions.remove(sip_call_id) {
             let backend = Arc::clone(backend);
             tokio::spawn(async move {
-                if let Err(error) = backend.delete(session.rtpengine_id(), &session.from_tag).await {
+                if let Err(error) = backend
+                    .delete(session.rtpengine_id(), &session.from_tag)
+                    .await
+                {
                     if !error.is_call_not_found() {
                         warn!(call_id = %session.call_id, "originate: media delete failed: {error}");
                     }
@@ -21299,7 +22755,10 @@ pub fn b2bua_cancel_originated_call(sip_call_id: &str, reason: Option<&str>) -> 
     );
     // Keep the leg alive as a zombie so a 2xx that raced our CANCEL is still
     // ACKed + BYEd (RFC 3261 §9.1 glare) rather than left ringing on the callee.
-    if state.call_actors.remove_call_after_cancel(&internal_call_id) {
+    if state
+        .call_actors
+        .remove_call_after_cancel(&internal_call_id)
+    {
         schedule_zombie_cancelled_cleanup(state.call_actors.clone());
     }
     state.call_event_receivers.remove(&internal_call_id);
@@ -21384,7 +22843,10 @@ fn bridge_leg_snapshot(
         .call_actors
         .find_by_sip_call_id(sip_call_id)
         .ok_or_else(unknown)?;
-    let call = state.call_actors.get_call(&internal_call_id).ok_or_else(unknown)?;
+    let call = state
+        .call_actors
+        .get_call(&internal_call_id)
+        .ok_or_else(unknown)?;
     let call_state = call.state.clone();
     let already_bridged = call.bridge.is_some();
     let originated = call.originated;
@@ -21429,9 +22891,7 @@ fn bridge_leg_snapshot(
 
 /// Refuse everything about one leg that would make the bridge a half-formed
 /// one. Runs after both legs have been resolved.
-fn bridge_leg_validate(
-    leg: &BridgeLegSnapshot,
-) -> Result<(), crate::b2bua::bridge::BridgeError> {
+fn bridge_leg_validate(leg: &BridgeLegSnapshot) -> Result<(), crate::b2bua::bridge::BridgeError> {
     use crate::b2bua::bridge::BridgeError;
 
     if leg.call_state != CallState::Answered {
@@ -21527,9 +22987,15 @@ async fn bridge_run_media_step(
             // live relaying one. The plan decides which — never both, and never
             // an `offer` over something live.
             if matches!(step, MediaStep::Offer { .. }) {
-                backend.offer(media_call_id, from_tag, sdp, &flags).await.map(Some)
+                backend
+                    .offer(media_call_id, from_tag, sdp, &flags)
+                    .await
+                    .map(Some)
             } else {
-                backend.reoffer(media_call_id, from_tag, sdp, &flags).await.map(Some)
+                backend
+                    .reoffer(media_call_id, from_tag, sdp, &flags)
+                    .await
+                    .map(Some)
             }
         }
     };
@@ -21537,9 +23003,16 @@ async fn bridge_run_media_step(
     match outcome {
         Ok(sdp) => Ok(sdp),
         Err(error) => {
-            let unsupported =
-                matches!(error, crate::rtpengine::error::RtpEngineError::Unsupported { .. });
-            match classify_media_failure(step, error.is_call_not_found(), unsupported, &error.to_string()) {
+            let unsupported = matches!(
+                error,
+                crate::rtpengine::error::RtpEngineError::Unsupported { .. }
+            );
+            match classify_media_failure(
+                step,
+                error.is_call_not_found(),
+                unsupported,
+                &error.to_string(),
+            ) {
                 Some(refusal) => Err(refusal),
                 None => {
                     debug!(?step, %error, "B2BUA bridge: tolerable media-step failure (nothing was attached)");
@@ -21812,12 +23285,13 @@ pub async fn b2bua_unbridge_call(
             which: "target",
             id: sip_call_id.to_string(),
         })?;
-    let context = state
-        .call_actors
-        .bridge(&internal_call_id)
-        .ok_or_else(|| BridgeError::NotBridged {
-            id: sip_call_id.to_string(),
-        })?;
+    let context =
+        state
+            .call_actors
+            .bridge(&internal_call_id)
+            .ok_or_else(|| BridgeError::NotBridged {
+                id: sip_call_id.to_string(),
+            })?;
     if context.stage.is_pending() {
         // The bridge is still forming — a re-INVITE is outstanding on both legs
         // and a hold offer now would collide with it (RFC 3261 §14.1).
@@ -21841,12 +23315,7 @@ pub async fn b2bua_unbridge_call(
 /// is on the wire". Without that a controller that re-bridges the moment it sees
 /// the event races its own outstanding re-INVITE into an RFC 3261 §14.1 glare
 /// refusal, with nothing on the rail to tell it when to try again.
-fn b2bua_bridge_release(
-    call_id: &str,
-    peer_call_id: &str,
-    reason: &str,
-    state: &DispatcherState,
-) {
+fn b2bua_bridge_release(call_id: &str, peer_call_id: &str, reason: &str, state: &DispatcherState) {
     use crate::b2bua::bridge::{set_media_direction, BridgeStage, MediaDirection};
 
     for leg_call_id in [call_id, peer_call_id] {
@@ -21866,13 +23335,7 @@ fn b2bua_bridge_release(
                     bridge.release_reason = Some(reason.to_string());
                 }
             }
-            if b2bua_send_reinvite_on_leg(
-                leg_call_id,
-                true,
-                held,
-                BRIDGE_TRACKING_RELEASE,
-                state,
-            ) {
+            if b2bua_send_reinvite_on_leg(leg_call_id, true, held, BRIDGE_TRACKING_RELEASE, state) {
                 continue;
             }
             state
@@ -22009,9 +23472,7 @@ fn handle_bridge_reinvite_response(
             state.call_actors.remove_b_leg(call_id, index);
         }
     }
-    state
-        .call_actors
-        .set_pending_reinvite(call_id, true, false);
+    state.call_actors.set_pending_reinvite(call_id, true, false);
     state.call_actors.reset_session_timer(call_id);
 
     match stage {
@@ -22088,10 +23549,11 @@ fn bridge_advance_to_anchor(peer_call_id: &str, response: &SipMessage, state: &D
                 bridge_fail(peer_call_id, "offering_peer", 500, state);
                 return;
             };
-            let flags = state
-                .rtpengine_profiles
-                .as_ref()
-                .and_then(|registry| registry.get(&session.profile).map(|entry| entry.answer.clone()));
+            let flags = state.rtpengine_profiles.as_ref().and_then(|registry| {
+                registry
+                    .get(&session.profile)
+                    .map(|entry| entry.answer.clone())
+            });
             let Some(flags) = flags else {
                 warn!(profile = %session.profile, "B2BUA bridge: unknown media profile on the anchor");
                 bridge_fail(peer_call_id, "offering_peer", 500, state);
@@ -22322,7 +23784,9 @@ fn arm_reliable_provisional_retransmit(
     state: &DispatcherState,
 ) {
     let call_id = request.headers.call_id().cloned().unwrap_or_default();
-    let cseq_num = request.headers.cseq()
+    let cseq_num = request
+        .headers
+        .cseq()
         .and_then(|c| c.split_whitespace().next())
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(1);
@@ -22330,7 +23794,9 @@ fn arm_reliable_provisional_retransmit(
         cancel: tokio::sync::Notify::new(),
         cseq_num,
     });
-    state.reliable_provisionals.insert((call_id.clone(), rseq), Arc::clone(&entry));
+    state
+        .reliable_provisionals
+        .insert((call_id.clone(), rseq), Arc::clone(&entry));
 
     let store = Arc::clone(&state.reliable_provisionals);
     let outbound = Arc::clone(&state.outbound);
@@ -22471,11 +23937,7 @@ fn arm_b2bua_2xx_retransmit(
 /// B-leg side is already PRACKed locally by the auto-PRACK path in the
 /// response handler, so all that's left is to terminate the A-leg PRACK
 /// transaction with 200 OK.
-fn handle_b2bua_prack(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
+fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
     debug!(
         call_id = %message.headers.get("Call-ID").map(|s| s.as_str()).unwrap_or(""),
@@ -22496,12 +23958,10 @@ fn handle_b2bua_prack(
 ///
 /// Re-INVITEs are used for session timer refreshes (RFC 4028), hold/resume,
 /// and codec renegotiation. They are forwarded to the other leg transparently.
-fn handle_b2bua_reinvite(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
-    let sip_call_id = message.headers.get("Call-ID")
+fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
         .map(|s| s.to_string())
         .unwrap_or_default();
 
@@ -22512,12 +23972,19 @@ fn handle_b2bua_reinvite(
             // 481 like the no-dialog-leg arm below, never a silent drop.
             warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: no matching call — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -22538,12 +24005,19 @@ fn handle_b2bua_reinvite(
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: Call-ID matches no dialog leg — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -22604,11 +24078,23 @@ fn handle_b2bua_reinvite(
     // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
     let (target_remote_contact, target_local_contact, _target_remote_aor_host) = if from_a_leg {
         // A→B: target is B-leg
-        winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone(), b.dialog.remote_aor_host.clone()))
+        winner_b_leg
+            .as_ref()
+            .map(|b| {
+                (
+                    b.dialog.remote_contact.clone(),
+                    b.dialog.local_contact.clone(),
+                    b.dialog.remote_aor_host.clone(),
+                )
+            })
             .unwrap_or((None, None, None))
     } else {
         // B→A: target is A-leg
-        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone(), a_leg.dialog.remote_aor_host.clone())
+        (
+            a_leg.dialog.remote_contact.clone(),
+            a_leg.dialog.local_contact.clone(),
+            a_leg.dialog.remote_aor_host.clone(),
+        )
     };
 
     // Glare prevention (RFC 3261 §14.1):
@@ -22621,7 +24107,10 @@ fn handle_b2bua_reinvite(
     // In either case we respond 491 Request Pending so the originator can
     // retry after a random delay per the RFC.
     let target_acked = if from_a_leg {
-        winner_b_leg.as_ref().map(|b| b.initial_acked).unwrap_or(false)
+        winner_b_leg
+            .as_ref()
+            .map(|b| b.initial_acked)
+            .unwrap_or(false)
     } else {
         a_leg.initial_acked
     };
@@ -22631,8 +24120,21 @@ fn handle_b2bua_reinvite(
             from_a_leg = from_a_leg,
             "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
         );
-        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            &message,
+            491,
+            "Request Pending",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -22640,17 +24142,31 @@ fn handle_b2bua_reinvite(
     // OPPOSITE side from where it arrived. A re-INVITE from the A-leg is
     // forwarded toward the B-leg (and vice versa). Take-and-set the pending
     // flag atomically so the glare check races against nothing.
-    let already_pending = state
-        .call_actors
-        .set_pending_reinvite(&call_id, /*on_a_leg=*/ !from_a_leg, true);
+    let already_pending =
+        state
+            .call_actors
+            .set_pending_reinvite(&call_id, /*on_a_leg=*/ !from_a_leg, true);
     if already_pending {
         debug!(
             call_id = %call_id,
             from_a_leg = from_a_leg,
             "B2BUA: rejecting re-INVITE with 491 — another re-INVITE already pending toward target"
         );
-        let response = build_response(&message, 491, "Request Pending", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        let response = build_response(
+            &message,
+            491,
+            "Request Pending",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -22689,7 +24205,14 @@ fn handle_b2bua_reinvite(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.transport.connection_id, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((
+                b_leg.transport.remote_addr,
+                b_leg.transport.transport,
+                b_leg.transport.local_addr,
+                b_leg.transport.connection_id,
+                b_leg.dialog.call_id.clone(),
+                b_leg.dialog.local_tag.clone(),
+            ))
         } else {
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
             return;
@@ -22705,10 +24228,25 @@ fn handle_b2bua_reinvite(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.transport.connection_id, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((
+            a_leg.transport.remote_addr,
+            a_leg.transport.transport,
+            a_leg.transport.local_addr,
+            a_leg.transport.connection_id,
+            a_leg.dialog.call_id.clone(),
+            a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+        ))
     };
 
-    if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = reinvite_target {
+    if let Some((
+        destination,
+        transport,
+        target_local_addr,
+        target_connection_id,
+        leg_call_id,
+        leg_from_tag,
+    )) = reinvite_target
+    {
         // Set Via with correct transport for the target leg.
         // Via host + port = the target leg's anchored socket: the A-leg's arrival
         // listener (family-correct, advertised identity) on a B→A forward, the
@@ -22754,7 +24292,10 @@ fn handle_b2bua_reinvite(
 
         // Add target leg's dialog route set as Route headers
         let target_route_set = if from_a_leg {
-            winner_b_leg.as_ref().map(|b| b.dialog.route_set.clone()).unwrap_or_default()
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.route_set.clone())
+                .unwrap_or_default()
         } else {
             a_leg.dialog.route_set.clone()
         };
@@ -22798,11 +24339,16 @@ fn handle_b2bua_reinvite(
 
         // Regenerate CSeq for the target leg's dialog (RFC 3261 — independent CSeq per dialog)
         let target_cseq = if from_a_leg {
-            winner_b_leg.as_ref().map(|b| b.dialog.local_cseq).unwrap_or(1)
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.local_cseq)
+                .unwrap_or(1)
         } else {
             a_leg.dialog.local_cseq
         };
-        forwarded.headers.set("CSeq", format!("{} INVITE", target_cseq));
+        forwarded
+            .headers
+            .set("CSeq", format!("{} INVITE", target_cseq));
 
         // Decrement Max-Forwards (RFC 7332 — B2BUAs MUST decrement)
         let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
@@ -22818,9 +24364,11 @@ fn handle_b2bua_reinvite(
         // Without this, re-INVITE SDP passes through unmodified — if the remote side
         // includes stale or cross-wired RTP ports, media breaks (one-way audio).
         if !forwarded.body.is_empty() {
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
-                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
-            {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
+                &state.rtpengine_set,
+                &state.rtpengine_sessions,
+                &state.rtpengine_profiles,
+            ) {
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
@@ -22828,13 +24376,19 @@ fn handle_b2bua_reinvite(
                         let offer_tag = if from_a_leg {
                             session.from_tag.as_str()
                         } else {
-                            session.to_tag.as_deref().unwrap_or(session.from_tag.as_str())
+                            session
+                                .to_tag
+                                .as_deref()
+                                .unwrap_or(session.from_tag.as_str())
                         };
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
-                            )
+                            tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
+                                session.rtpengine_id(),
+                                offer_tag,
+                                &forwarded.body,
+                                &offer_flags,
+                            ))
                         }) {
                             Ok(rewritten_sdp) => {
                                 forwarded.body = rewritten_sdp;
@@ -22864,7 +24418,9 @@ fn handle_b2bua_reinvite(
 
         // Update Content-Length after SDP rewrite (o=/s= and RTPEngine changes may alter body size)
         if !forwarded.body.is_empty() {
-            forwarded.headers.set("Content-Length", forwarded.body.len().to_string());
+            forwarded
+                .headers
+                .set("Content-Length", forwarded.body.len().to_string());
         }
 
         // Rewrite RURI to target leg's remote Contact (RFC 3261 §12.2.1.1).
@@ -22896,8 +24452,14 @@ fn handle_b2bua_reinvite(
         // Track the re-INVITE branch → call_id for response routing.
         // Encode the direction so the response handler knows where to relay.
         // Store the originator's Via(s) so we can restore them on the response.
-        let direction = if from_a_leg { "reinvite:a2b" } else { "reinvite:b2a" };
-        let originator_vias = message.headers.get_all("Via")
+        let direction = if from_a_leg {
+            "reinvite:a2b"
+        } else {
+            "reinvite:b2a"
+        };
+        let originator_vias = message
+            .headers
+            .get_all("Via")
             .map(|v| v.to_vec())
             .unwrap_or_default();
         let mut reinvite_leg = Leg::new_b_leg(
@@ -22931,22 +24493,44 @@ fn handle_b2bua_reinvite(
         // connection is dead, dial its remote-target Contact instead of the dead
         // cached socket (RFC 3261 §12.2.1.1).
         let contact_fallback = contact_fallback_target(
-            from_a_leg, send_dest, send_transport, target_connection_id,
-            target_route_set.is_empty(), target_remote_contact.as_deref(), state,
+            from_a_leg,
+            send_dest,
+            send_transport,
+            target_connection_id,
+            target_route_set.is_empty(),
+            target_remote_contact.as_deref(),
+            state,
         );
         if from_a_leg {
-            send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
+            send_b2bua_to_bleg(
+                forwarded,
+                send_transport,
+                send_dest,
+                target_local_addr,
+                state,
+            );
         } else if let Some(target) = contact_fallback {
             warn!(
                 call_id = %call_id, dest = %target.address,
                 "B2BUA re-INVITE B→A: stored TLS connection dead — dialing remote target Contact"
             );
             let data = Bytes::from(forwarded.to_bytes());
-            send_to_target(data, &target, send_transport, ConnectionId::default(), target_local_addr, state);
+            send_to_target(
+                data,
+                &target,
+                send_transport,
+                ConnectionId::default(),
+                target_local_addr,
+                state,
+            );
         } else {
             send_message_from(
-                forwarded, send_transport, send_dest,
-                target_connection_id, target_local_addr, state,
+                forwarded,
+                send_transport,
+                send_dest,
+                target_connection_id,
+                target_local_addr,
+                state,
             );
         }
 
@@ -22983,12 +24567,10 @@ fn handle_b2bua_reinvite(
 /// Tracking uses the `update:` / `update_done:` target_uri prefixes so that
 /// concurrent re-INVITE and UPDATE on the same dialog don't collide on a
 /// single B-leg slot.
-fn handle_b2bua_update(
-    inbound: InboundMessage,
-    message: SipMessage,
-    state: &DispatcherState,
-) {
-    let sip_call_id = message.headers.get("Call-ID")
+fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
         .map(|s| s.to_string())
         .unwrap_or_default();
 
@@ -22999,12 +24581,19 @@ fn handle_b2bua_update(
             // (RFC 3311 UPDATE, answered per RFC 3261 §12.2.2).
             warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: no matching call — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -23024,12 +24613,19 @@ fn handle_b2bua_update(
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: Call-ID matches no dialog leg — 481");
             let response = build_response(
-                &message, 481, "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(), &[],
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
             );
             send_message_from(
-                response, inbound.transport, inbound.remote_addr,
-                inbound.connection_id, Some(inbound.local_addr), state,
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
             );
             return;
         }
@@ -23085,11 +24681,20 @@ fn handle_b2bua_update(
     };
 
     let (target_remote_contact, target_local_contact) = if from_a_leg {
-        winner_b_leg.as_ref()
-            .map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone()))
+        winner_b_leg
+            .as_ref()
+            .map(|b| {
+                (
+                    b.dialog.remote_contact.clone(),
+                    b.dialog.local_contact.clone(),
+                )
+            })
             .unwrap_or((None, None))
     } else {
-        (a_leg.dialog.remote_contact.clone(), a_leg.dialog.local_contact.clone())
+        (
+            a_leg.dialog.remote_contact.clone(),
+            a_leg.dialog.local_contact.clone(),
+        )
     };
 
     debug!(
@@ -23127,7 +24732,14 @@ fn handle_b2bua_update(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.transport.connection_id, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((
+                b_leg.transport.remote_addr,
+                b_leg.transport.transport,
+                b_leg.transport.local_addr,
+                b_leg.transport.connection_id,
+                b_leg.dialog.call_id.clone(),
+                b_leg.dialog.local_tag.clone(),
+            ))
         } else {
             warn!(call_id = %call_id, "B2BUA UPDATE: no winning B-leg");
             return;
@@ -23142,10 +24754,25 @@ fn handle_b2bua_update(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.transport.connection_id, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((
+            a_leg.transport.remote_addr,
+            a_leg.transport.transport,
+            a_leg.transport.local_addr,
+            a_leg.transport.connection_id,
+            a_leg.dialog.call_id.clone(),
+            a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+        ))
     };
 
-    if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = update_target {
+    if let Some((
+        destination,
+        transport,
+        target_local_addr,
+        target_connection_id,
+        leg_call_id,
+        leg_from_tag,
+    )) = update_target
+    {
         // Via host + port = the target leg's anchored socket (see the re-INVITE
         // forward above for the A/B split).
         let transport_str = format!("{}", transport).to_uppercase();
@@ -23185,7 +24812,10 @@ fn handle_b2bua_update(
         forwarded.headers.remove("Route");
 
         let target_route_set = if from_a_leg {
-            winner_b_leg.as_ref().map(|b| b.dialog.route_set.clone()).unwrap_or_default()
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.route_set.clone())
+                .unwrap_or_default()
         } else {
             a_leg.dialog.route_set.clone()
         };
@@ -23232,11 +24862,16 @@ fn handle_b2bua_update(
         // CSeq: target leg's local sequence + UPDATE method. Per RFC 3311
         // §6, UPDATE shares the dialog's CSeq sequence with INVITE/BYE.
         let target_cseq = if from_a_leg {
-            winner_b_leg.as_ref().map(|b| b.dialog.local_cseq).unwrap_or(1)
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.local_cseq)
+                .unwrap_or(1)
         } else {
             a_leg.dialog.local_cseq
         };
-        forwarded.headers.set("CSeq", format!("{} UPDATE", target_cseq));
+        forwarded
+            .headers
+            .set("CSeq", format!("{} UPDATE", target_cseq));
 
         let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
 
@@ -23247,22 +24882,30 @@ fn handle_b2bua_update(
             let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
             sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
 
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
-                (&state.rtpengine_set, &state.rtpengine_sessions, &state.rtpengine_profiles)
-            {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
+                &state.rtpengine_set,
+                &state.rtpengine_sessions,
+                &state.rtpengine_profiles,
+            ) {
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
                         let offer_tag = if from_a_leg {
                             session.from_tag.as_str()
                         } else {
-                            session.to_tag.as_deref().unwrap_or(session.from_tag.as_str())
+                            session
+                                .to_tag
+                                .as_deref()
+                                .unwrap_or(session.from_tag.as_str())
                         };
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
-                            )
+                            tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
+                                session.rtpengine_id(),
+                                offer_tag,
+                                &forwarded.body,
+                                &offer_flags,
+                            ))
                         }) {
                             Ok(rewritten_sdp) => {
                                 forwarded.body = rewritten_sdp;
@@ -23277,12 +24920,15 @@ fn handle_b2bua_update(
             }
             // Own the o= identity toward the leg this UPDATE is sent to (RFC 3264
             // §8), after any rtpengine rewrite.
-            if let Some((sess_id, version)) =
-                state.call_actors.reserve_leg_sdp_version(&call_id, !from_a_leg)
+            if let Some((sess_id, version)) = state
+                .call_actors
+                .reserve_leg_sdp_version(&call_id, !from_a_leg)
             {
                 stamp_sdp_origin(&mut forwarded.body, &state.sdp_name, sess_id, version, None);
             }
-            forwarded.headers.set("Content-Length", forwarded.body.len().to_string());
+            forwarded
+                .headers
+                .set("Content-Length", forwarded.body.len().to_string());
         }
 
         // RURI = target leg's remote Contact (RFC 3261 §12.2.1.1).
@@ -23312,8 +24958,14 @@ fn handle_b2bua_update(
         // Track the UPDATE branch under "update:" so the response handler
         // routes the cross-leg response correctly without colliding with a
         // concurrent re-INVITE on the same dialog.
-        let direction = if from_a_leg { "update:a2b" } else { "update:b2a" };
-        let originator_vias = message.headers.get_all("Via")
+        let direction = if from_a_leg {
+            "update:a2b"
+        } else {
+            "update:b2a"
+        };
+        let originator_vias = message
+            .headers
+            .get_all("Via")
             .map(|v| v.to_vec())
             .unwrap_or_default();
         let mut update_leg = Leg::new_b_leg(
@@ -23347,22 +24999,44 @@ fn handle_b2bua_update(
         // connection is dead, dial its remote-target Contact instead of the dead
         // cached socket (RFC 3261 §12.2.1.1).
         let contact_fallback = contact_fallback_target(
-            from_a_leg, send_dest, send_transport, target_connection_id,
-            target_route_set.is_empty(), target_remote_contact.as_deref(), state,
+            from_a_leg,
+            send_dest,
+            send_transport,
+            target_connection_id,
+            target_route_set.is_empty(),
+            target_remote_contact.as_deref(),
+            state,
         );
         if from_a_leg {
-            send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
+            send_b2bua_to_bleg(
+                forwarded,
+                send_transport,
+                send_dest,
+                target_local_addr,
+                state,
+            );
         } else if let Some(target) = contact_fallback {
             warn!(
                 call_id = %call_id, dest = %target.address,
                 "B2BUA UPDATE B→A: stored TLS connection dead — dialing remote target Contact"
             );
             let data = Bytes::from(forwarded.to_bytes());
-            send_to_target(data, &target, send_transport, ConnectionId::default(), target_local_addr, state);
+            send_to_target(
+                data,
+                &target,
+                send_transport,
+                ConnectionId::default(),
+                target_local_addr,
+                state,
+            );
         } else {
             send_message_from(
-                forwarded, send_transport, send_dest,
-                target_connection_id, target_local_addr, state,
+                forwarded,
+                send_transport,
+                send_dest,
+                target_connection_id,
+                target_local_addr,
+                state,
             );
         }
 
@@ -23950,8 +25624,7 @@ fn b2bua_bridge_inbound_replaces(
             replaced_call = %replaced_call_id,
             "B2BUA Replaces: refusing takeover with {code} — {why}"
         );
-        let response =
-            build_response(invite, code, reason, state.server_header.as_deref(), &[]);
+        let response = build_response(invite, code, reason, state.server_header.as_deref(), &[]);
         send_message_from(
             response,
             inbound.transport,
@@ -23974,8 +25647,15 @@ fn b2bua_bridge_inbound_replaces(
 
     // The survivor is the peer of the dialog being replaced.
     let survivor_on_a_leg = !pending.replaced_on_a_leg;
-    let Some(survivor) = state.call_actors.clone_leg(&replaced_call_id, survivor_on_a_leg) else {
-        refuse(481, "Call/Transaction Does Not Exist", "the replaced call went away");
+    let Some(survivor) = state
+        .call_actors
+        .clone_leg(&replaced_call_id, survivor_on_a_leg)
+    else {
+        refuse(
+            481,
+            "Call/Transaction Does Not Exist",
+            "the replaced call went away",
+        );
         return;
     };
     let Some(survivor_tag) = survivor.dialog.remote_tag.clone() else {
@@ -23996,7 +25676,11 @@ fn b2bua_bridge_inbound_replaces(
     };
 
     let Some(new_leg) = state.call_actors.clone_leg(new_call_id, true) else {
-        refuse(481, "Call/Transaction Does Not Exist", "the new call went away");
+        refuse(
+            481,
+            "Call/Transaction Does Not Exist",
+            "the new call went away",
+        );
         return;
     };
     let new_tag = new_leg.dialog.local_tag.clone();
@@ -24075,7 +25759,11 @@ fn b2bua_bridge_inbound_replaces(
         None => (None, None),
     };
     let Some(new_leg_owned) = state.call_actors.detach_a_leg_for_adoption(new_call_id) else {
-        refuse(481, "Call/Transaction Does Not Exist", "the new call went away");
+        refuse(
+            481,
+            "Call/Transaction Does Not Exist",
+            "the new call went away",
+        );
         return;
     };
     state.call_event_receivers.remove(new_call_id);
@@ -24093,12 +25781,19 @@ fn b2bua_bridge_inbound_replaces(
             "B2BUA Replaces: the call being taken over disappeared mid-swap — 481"
         );
         let response = build_response(
-            invite, 481, "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(), &[],
+            invite,
+            481,
+            "Call/Transaction Does Not Exist",
+            state.server_header.as_deref(),
+            &[],
         );
         send_message_from(
-            response, inbound.transport, inbound.remote_addr,
-            inbound.connection_id, Some(inbound.local_addr), state,
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
         );
         return;
     };
@@ -24433,25 +26128,28 @@ fn b2bua_refer_accept(
                 .map(|name| name.to_string())
                 .or(inherited_profile);
             let fresh_cid = crate::b2bua::actor::generate_call_id();
-            let (target_offer_sdp, forced_cid) =
-                match (&anchored_profile, &survivor_sdp, &survivor_tag) {
-                    (Some(profile), Some(sdp), Some(tag)) => {
-                        // Anchored: rtpengine-offer the survivor's media on the
-                        // fresh call-id → the SDP to put in the target's INVITE.
-                        match b2bua_transfer_rtpengine_offer(state, &fresh_cid, tag, sdp, profile) {
-                            Some(anchored) => (Some(anchored), Some(fresh_cid.as_str())),
-                            None => {
-                                warn!(call_id = %call_id, "REFER terminate: rtpengine offer for transfer target failed — falling back to raw survivor SDP");
-                                (Some(sdp.clone()), None)
-                            }
+            let (target_offer_sdp, forced_cid) = match (
+                &anchored_profile,
+                &survivor_sdp,
+                &survivor_tag,
+            ) {
+                (Some(profile), Some(sdp), Some(tag)) => {
+                    // Anchored: rtpengine-offer the survivor's media on the
+                    // fresh call-id → the SDP to put in the target's INVITE.
+                    match b2bua_transfer_rtpengine_offer(state, &fresh_cid, tag, sdp, profile) {
+                        Some(anchored) => (Some(anchored), Some(fresh_cid.as_str())),
+                        None => {
+                            warn!(call_id = %call_id, "REFER terminate: rtpengine offer for transfer target failed — falling back to raw survivor SDP");
+                            (Some(sdp.clone()), None)
                         }
                     }
-                    // Not anchored, but we have the survivor's SDP: offer it raw.
-                    (None, Some(sdp), _) => (Some(sdp.clone()), None),
-                    // No survivor SDP captured (pre-existing call, or capture
-                    // missed): fall back to the referrer's INVITE body below.
-                    _ => (None, None),
-                };
+                }
+                // Not anchored, but we have the survivor's SDP: offer it raw.
+                (None, Some(sdp), _) => (Some(sdp.clone()), None),
+                // No survivor SDP captured (pre-existing call, or capture
+                // missed): fall back to the referrer's INVITE body below.
+                _ => (None, None),
+            };
 
             // Clone the A-leg INVITE as the dial template, but point its To at
             // the Refer-To target (not the original callee). The generic B-leg
@@ -24562,27 +26260,25 @@ fn b2bua_complete_terminated_transfer(
     // `referrer_gone` is set when the referrer already BYE'd this call while the
     // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
     // still completes, but there is no dialog left to NOTIFY or BYE.
-    let (referrer_on_a_leg, referrer_gone, transfer_profile, target_leg) = match state
-        .call_actors
-        .get_call(call_id)
-    {
-        Some(call) => {
-            let Some(subscription) = call
-                .refer_subscriptions
-                .iter()
-                .find(|subscription| subscription.siphon_notifies)
-            else {
-                return;
-            };
-            (
-                subscription.on_a_leg,
-                subscription.referrer_gone,
-                subscription.media_profile.clone(),
-                call.b_legs.get(target_idx).cloned(),
-            )
-        }
-        None => return,
-    };
+    let (referrer_on_a_leg, referrer_gone, transfer_profile, target_leg) =
+        match state.call_actors.get_call(call_id) {
+            Some(call) => {
+                let Some(subscription) = call
+                    .refer_subscriptions
+                    .iter()
+                    .find(|subscription| subscription.siphon_notifies)
+                else {
+                    return;
+                };
+                (
+                    subscription.on_a_leg,
+                    subscription.referrer_gone,
+                    subscription.media_profile.clone(),
+                    call.b_legs.get(target_idx).cloned(),
+                )
+            }
+            None => return,
+        };
     let Some(target_leg) = target_leg else {
         return;
     };
@@ -24665,7 +26361,9 @@ fn b2bua_complete_terminated_transfer(
     let notify_cseq = if referrer_gone {
         None
     } else {
-        state.call_actors.reserve_leg_cseq(call_id, referrer_on_a_leg)
+        state
+            .call_actors
+            .reserve_leg_cseq(call_id, referrer_on_a_leg)
     };
     if let Some(cseq) = notify_cseq {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
@@ -24914,7 +26612,10 @@ fn b2bua_fail_terminated_transfer(
         crate::b2bua::transfer::TransferState::Failed { code, reason } => (*code, reason.clone()),
         _ => (status_code, "Failure".to_string()),
     };
-    if let Some(cseq) = state.call_actors.reserve_leg_cseq(call_id, referrer_on_a_leg) {
+    if let Some(cseq) = state
+        .call_actors
+        .reserve_leg_cseq(call_id, referrer_on_a_leg)
+    {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
                 ("Event", "refer".to_string()),
@@ -25025,7 +26726,12 @@ fn b2bua_forward_indialog_request(
     let (target_remote_contact, target_local_contact) = if from_a_leg {
         winner_b_leg
             .as_ref()
-            .map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone()))
+            .map(|b| {
+                (
+                    b.dialog.remote_contact.clone(),
+                    b.dialog.local_contact.clone(),
+                )
+            })
             .unwrap_or((None, None))
     } else {
         (
@@ -25079,8 +26785,14 @@ fn b2bua_forward_indialog_request(
         ))
     };
 
-    let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) =
-        target
+    let Some((
+        destination,
+        transport,
+        target_local_addr,
+        target_connection_id,
+        leg_call_id,
+        leg_from_tag,
+    )) = target
     else {
         return;
     };
@@ -25165,11 +26877,16 @@ fn b2bua_forward_indialog_request(
     }
 
     let target_cseq = if from_a_leg {
-        winner_b_leg.as_ref().map(|b| b.dialog.local_cseq).unwrap_or(1)
+        winner_b_leg
+            .as_ref()
+            .map(|b| b.dialog.local_cseq)
+            .unwrap_or(1)
     } else {
         a_leg.dialog.local_cseq
     };
-    forwarded.headers.set("CSeq", format!("{target_cseq} {method_str}"));
+    forwarded
+        .headers
+        .set("CSeq", format!("{target_cseq} {method_str}"));
 
     let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
 
@@ -25235,7 +26952,13 @@ fn b2bua_forward_indialog_request(
         state,
     );
     if from_a_leg {
-        send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
+        send_b2bua_to_bleg(
+            forwarded,
+            send_transport,
+            send_dest,
+            target_local_addr,
+            state,
+        );
     } else if let Some(fallback) = contact_fallback {
         let data = Bytes::from(forwarded.to_bytes());
         send_to_target(
@@ -25423,7 +27146,10 @@ fn is_siprec_invite(message: &SipMessage) -> bool {
         None => return false,
     };
 
-    if !content_type.to_ascii_lowercase().contains("multipart/mixed") {
+    if !content_type
+        .to_ascii_lowercase()
+        .contains("multipart/mixed")
+    {
         return false;
     }
 
@@ -25448,10 +27174,14 @@ fn handle_srs_invite(
 ) {
     let state = Arc::clone(state);
     tokio::spawn(async move {
-        let call_id = message.headers.get("Call-ID")
+        let call_id = message
+            .headers
+            .get("Call-ID")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let from_tag = message.headers.get("From")
+        let from_tag = message
+            .headers
+            .get("From")
             .and_then(|from| from.split("tag=").nth(1))
             .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string())
             .unwrap_or_default();
@@ -25467,16 +27197,42 @@ fn handle_srs_invite(
             Some(content_type) => content_type.clone(),
             None => {
                 warn!(call_id = %call_id, "SRS: SIPREC INVITE missing Content-Type");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                let response = build_response(
+                    &message,
+                    400,
+                    "Bad Request",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    &state,
+                );
                 return;
             }
         };
 
         if message.body.is_empty() {
             warn!(call_id = %call_id, "SRS: SIPREC INVITE has no body");
-            let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+            let response = build_response(
+                &message,
+                400,
+                "Bad Request",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                &state,
+            );
             return;
         }
         let body = message.body.clone();
@@ -25485,8 +27241,21 @@ fn handle_srs_invite(
             Ok(parts) => parts,
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse multipart body");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                let response = build_response(
+                    &message,
+                    400,
+                    "Bad Request",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    &state,
+                );
                 return;
             }
         };
@@ -25499,8 +27268,21 @@ fn handle_srs_invite(
             Some(part) => String::from_utf8_lossy(&part.body).to_string(),
             None => {
                 warn!(call_id = %call_id, "SRS: no rs-metadata+xml part in SIPREC INVITE");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                let response = build_response(
+                    &message,
+                    400,
+                    "Bad Request",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    &state,
+                );
                 return;
             }
         };
@@ -25510,8 +27292,21 @@ fn handle_srs_invite(
             Ok(metadata) => metadata,
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "SRS: failed to parse recording metadata");
-                let response = build_response(&message, 400, "Bad Request", state.server_header.as_deref(), &[]);
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                let response = build_response(
+                    &message,
+                    400,
+                    "Bad Request",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    &state,
+                );
                 return;
             }
         };
@@ -25529,7 +27324,8 @@ fn handle_srs_invite(
             let engine_state = state.engine.state();
             let srs_handlers = engine_state.handlers_for(&HandlerKind::SrsOnInvite);
             if !srs_handlers.is_empty() {
-                let py_metadata = crate::script::api::srs::PyRecordingMetadata::from_metadata(&metadata);
+                let py_metadata =
+                    crate::script::api::srs::PyRecordingMetadata::from_metadata(&metadata);
                 let result = pyo3::Python::attach(|python| {
                     let py_meta = match pyo3::Py::new(python, py_metadata) {
                         Ok(meta) => meta,
@@ -25564,8 +27360,21 @@ fn handle_srs_invite(
 
         if !should_accept {
             info!(call_id = %call_id, "SRS: recording rejected by script");
-            let response = build_response(&message, 403, "Forbidden", state.server_header.as_deref(), &[]);
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+            let response = build_response(
+                &message,
+                403,
+                "Forbidden",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                &state,
+            );
             return;
         }
 
@@ -25576,14 +27385,28 @@ fn handle_srs_invite(
             // Re-INVITE: update existing session metadata, reuse to-tag.
             match srs_manager.update_session(&call_id, metadata) {
                 Some(to_tag) => {
-                    let session_id = srs_manager.session_for_call_id(&call_id)
+                    let session_id = srs_manager
+                        .session_for_call_id(&call_id)
                         .unwrap_or_default();
                     (session_id, to_tag)
                 }
                 None => {
                     warn!(call_id = %call_id, "SRS: re-INVITE but session not found");
-                    let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
-                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                    let response = build_response(
+                        &message,
+                        481,
+                        "Call/Transaction Does Not Exist",
+                        state.server_header.as_deref(),
+                        &[],
+                    );
+                    send_message_from(
+                        response,
+                        inbound.transport,
+                        inbound.remote_addr,
+                        inbound.connection_id,
+                        Some(inbound.local_addr),
+                        &state,
+                    );
                     return;
                 }
             }
@@ -25593,15 +27416,30 @@ fn handle_srs_invite(
                 Some(result) => result,
                 None => {
                     warn!(call_id = %call_id, "SRS: session creation failed (max sessions?)");
-                    let response = build_response(&message, 503, "Service Unavailable", state.server_header.as_deref(), &[]);
-                    send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                    let response = build_response(
+                        &message,
+                        503,
+                        "Service Unavailable",
+                        state.server_header.as_deref(),
+                        &[],
+                    );
+                    send_message_from(
+                        response,
+                        inbound.transport,
+                        inbound.remote_addr,
+                        inbound.connection_id,
+                        Some(inbound.local_addr),
+                        &state,
+                    );
                     return;
                 }
             }
         };
 
         // Set up RTPEngine recording if available.
-        let answer_sdp = if let (Some(ref rtpengine_set), Some(sdp_part)) = (&state.rtpengine_set, sdp_part) {
+        let answer_sdp = if let (Some(ref rtpengine_set), Some(sdp_part)) =
+            (&state.rtpengine_set, sdp_part)
+        {
             let profile_name = srs_manager.rtpengine_profile();
             let profile_registry = crate::rtpengine::profile::ProfileRegistry::new();
             let profile = profile_registry.get(profile_name);
@@ -25627,17 +27465,17 @@ fn handle_srs_invite(
                     answer_flags.record_path = Some(recording_dir_str);
 
                     // Step 1: offer() with first m= line (caller stream).
-                    let offer_result = rtpengine_set.offer(
-                        &call_id, &from_tag, &sdp1, &offer_flags,
-                    ).await;
+                    let offer_result = rtpengine_set
+                        .offer(&call_id, &from_tag, &sdp1, &offer_flags)
+                        .await;
 
                     match offer_result {
                         Ok(offer_response_sdp) => {
                             // Step 2: answer() with second m= line (callee stream).
                             let srs_to_tag = format!("srs-{}", uuid::Uuid::new_v4().as_simple());
-                            let answer_result = rtpengine_set.answer(
-                                &call_id, &from_tag, &srs_to_tag, &sdp2, &answer_flags,
-                            ).await;
+                            let answer_result = rtpengine_set
+                                .answer(&call_id, &from_tag, &srs_to_tag, &sdp2, &answer_flags)
+                                .await;
 
                             match answer_result {
                                 Ok(answer_response_sdp) => {
@@ -25691,8 +27529,7 @@ fn handle_srs_invite(
         };
 
         // Build 200 OK response.
-        let mut response_builder = SipMessageBuilder::new()
-            .response(200, "OK".to_string());
+        let mut response_builder = SipMessageBuilder::new().response(200, "OK".to_string());
 
         // Copy Via, From headers.
         if let Some(vias) = message.headers.get_all("Via") {
@@ -25722,10 +27559,8 @@ fn handle_srs_invite(
         }
 
         // Add Contact header.
-        response_builder = response_builder.header(
-            "Contact",
-            format!("<sip:srs@{}>", state.local_addr),
-        );
+        response_builder =
+            response_builder.header("Contact", format!("<sip:srs@{}>", state.local_addr));
 
         // Add SDP body (from RTPEngine or echo back original).
         // Sanitize o=/s= lines to hide the SRC's identity (e.g. "FreeSWITCH").
@@ -25763,7 +27598,14 @@ fn handle_srs_invite(
                     session_id = %session_id,
                     "SRS: sending 200 OK to SRC"
                 );
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    &state,
+                );
             }
             Err(error) => {
                 error!(call_id = %call_id, error = %error, "SRS: failed to build 200 OK");
@@ -25788,7 +27630,9 @@ fn handle_srs_bye(
 
         // Stop recording via RTPEngine.
         if let Some(ref rtpengine_set) = state.rtpengine_set {
-            let from_tag = message.headers.get("From")
+            let from_tag = message
+                .headers
+                .get("From")
                 .and_then(|from| from.split("tag=").nth(1))
                 .map(|tag| tag.split(';').next().unwrap_or(tag).trim().to_string())
                 .unwrap_or_default();
@@ -25807,7 +27651,14 @@ fn handle_srs_bye(
 
         // Send 200 OK for the BYE.
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), &state);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            &state,
+        );
 
         // Store recording metadata via configured backend.
         if let Some(record) = record {
@@ -25820,7 +27671,9 @@ fn handle_srs_bye(
                     pyo3::Python::attach(|python| {
                         if let Ok(py_sess) = pyo3::Py::new(python, py_session) {
                             for handler in &end_handlers {
-                                if let Err(error) = handler.callable.call1(python, (py_sess.clone_ref(python),)) {
+                                if let Err(error) =
+                                    handler.callable.call1(python, (py_sess.clone_ref(python),))
+                                {
                                     warn!(call_id = %call_id, error = %error, "SRS: on_session_end handler error");
                                 }
                             }
@@ -25841,10 +27694,10 @@ fn handle_srs_bye(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
-    use crate::sip::builder::SipMessageBuilder;
 
     /// `Supported` is a list header: the option tag goes *inside* the value the
     /// caller already advertised, never on a second line.
@@ -25908,9 +27761,16 @@ mod tests {
             classify_b_leg_response(183),
             Some(ResponseClass::Provisional)
         );
-        assert_eq!(classify_b_leg_response(199), Some(ResponseClass::Provisional));
+        assert_eq!(
+            classify_b_leg_response(199),
+            Some(ResponseClass::Provisional)
+        );
         assert_eq!(classify_b_leg_response(100), None, "100 Trying is absorbed");
-        assert_eq!(classify_b_leg_response(179), None, "a 1xx below 180 is absorbed");
+        assert_eq!(
+            classify_b_leg_response(179),
+            None,
+            "a 1xx below 180 is absorbed"
+        );
         // Everything final and non-2xx fails the leg.
         for code in [300, 401, 404, 486, 500, 603] {
             assert_eq!(
@@ -25936,7 +27796,6 @@ mod tests {
             ..Default::default()
         }
     }
-
 
     // -----------------------------------------------------------------------
     // LCR destination retarget (RFC 3261 §16.5)
@@ -25970,7 +27829,8 @@ mod tests {
         // The bug this closes: an unfiltered `From` overwrote the B-leg From
         // including its tag, which doesn't fail at INVITE time — it surfaces
         // later as ACKs and BYEs that no longer match the dialog.
-        let route = route_with_headers(&[("From", "<sip:spoofed@example.net>"), ("X-Account", "42")]);
+        let route =
+            route_with_headers(&[("From", "<sip:spoofed@example.net>"), ("X-Account", "42")]);
         assert_eq!(injected_names(&route), vec!["X-Account"]);
     }
 
@@ -26065,9 +27925,8 @@ mod tests {
     fn an_unauthenticated_proxy_call_leaves_the_cdr_username_empty() {
         // `None` must stay absent rather than becoming an empty string that
         // reads as "authenticated as nobody".
-        let (_, session) =
-            cdr_session_from_invite(&invite_for_cdr(), "10.0.0.1", "udp", None)
-                .expect("session builds");
+        let (_, session) = cdr_session_from_invite(&invite_for_cdr(), "10.0.0.1", "udp", None)
+            .expect("session builds");
 
         assert!(session.finalize("caller", None, None).auth_user.is_none());
     }
@@ -26113,14 +27972,21 @@ mod tests {
         // The shape this exists for: an inbound call addressed to a local
         // access number is retargeted at the real destination, and still goes
         // out through the gateway-group member siphon selected.
-        let target = b2bua_carrier_ruri(&route_to(Some("+12025550199")), ACCESS_NUMBER, Some(CARRIER));
+        let target = b2bua_carrier_ruri(
+            &route_to(Some("+12025550199")),
+            ACCESS_NUMBER,
+            Some(CARRIER),
+        );
 
         assert!(target.contains("+12025550199"), "{target}");
         assert!(
             !target.contains("+12025550100"),
             "the access number must not be on the wire: {target}",
         );
-        assert!(target.contains("10.0.0.1"), "host still comes from the carrier: {target}");
+        assert!(
+            target.contains("10.0.0.1"),
+            "host still comes from the carrier: {target}"
+        );
     }
 
     #[test]
@@ -26168,7 +28034,10 @@ mod tests {
         let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER));
 
         assert!(target.contains("+12025550199"), "{target}");
-        assert!(target.contains("carrier-a.net"), "an explicit ruri keeps its host: {target}");
+        assert!(
+            target.contains("carrier-a.net"),
+            "an explicit ruri keeps its host: {target}"
+        );
     }
 
     #[test]
@@ -26201,7 +28070,10 @@ mod tests {
 
         assert!(rewritten.contains("+12025550199"), "{rewritten}");
         assert!(!rewritten.contains("+12025550100"), "{rewritten}");
-        assert!(rewritten.contains("siphon.example.com"), "host is untouched: {rewritten}");
+        assert!(
+            rewritten.contains("siphon.example.com"),
+            "host is untouched: {rewritten}"
+        );
     }
 
     #[test]
@@ -26212,12 +28084,18 @@ mod tests {
         assert!(rewritten.contains("Support"), "{rewritten}");
         assert!(rewritten.contains("+12025550199"), "{rewritten}");
         assert!(rewritten.contains("5070"), "port survives: {rewritten}");
-        assert!(rewritten.contains("transport=tcp"), "uri params survive: {rewritten}");
+        assert!(
+            rewritten.contains("transport=tcp"),
+            "uri params survive: {rewritten}"
+        );
     }
 
     #[test]
     fn an_unparseable_header_is_left_alone_rather_than_corrupted() {
-        assert_eq!(rewrite_uri_userpart("not a name-addr", "+12025550199"), "not a name-addr");
+        assert_eq!(
+            rewrite_uri_userpart("not a name-addr", "+12025550199"),
+            "not a name-addr"
+        );
     }
 
     #[test]
@@ -26302,7 +28180,12 @@ mod tests {
 
     #[test]
     fn other_status_codes_are_forwarded_untouched() {
-        for (code, reason) in [(404, "Not Found"), (408, "Request Timeout"), (200, "OK"), (500, "Server Internal Error")] {
+        for (code, reason) in [
+            (404, "Not Found"),
+            (408, "Request Timeout"),
+            (200, "OK"),
+            (500, "Server Internal Error"),
+        ] {
             let mut response = response_for_downgrade(code, reason);
             let forwarded = downgrade_503_for_upstream(&mut response, code, &downgrade_key());
             assert_eq!(forwarded, code, "{code} must be forwarded unchanged");
@@ -26379,23 +28262,62 @@ mod tests {
         assert_eq!(cdr.response_code, 0);
         // Media lifetime surfaces both as the standard duration and precisely.
         assert!((cdr.duration_secs - 42.5).abs() < 1e-9);
-        assert_eq!(cdr.extra.get("media_duration_ms").map(String::as_str), Some("42500"));
-        assert_eq!(cdr.extra.get("media_reason").map(String::as_str), Some("delete"));
+        assert_eq!(
+            cdr.extra.get("media_duration_ms").map(String::as_str),
+            Some("42500")
+        );
+        assert_eq!(
+            cdr.extra.get("media_reason").map(String::as_str),
+            Some("delete")
+        );
 
         // Near (measured) leg — counters + quality present under `near_`.
-        assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("near-tag"));
-        assert_eq!(cdr.extra.get("near_codec").map(String::as_str), Some("AMR-WB"));
-        assert_eq!(cdr.extra.get("near_packets_in").map(String::as_str), Some("2100"));
-        assert_eq!(cdr.extra.get("near_bytes_out").map(String::as_str), Some("335680"));
-        assert_eq!(cdr.extra.get("near_packets_dropped").map(String::as_str), Some("2"));
-        assert_eq!(cdr.extra.get("near_packets_lost").map(String::as_str), Some("6"));
-        assert_eq!(cdr.extra.get("near_loss_percent").map(String::as_str), Some("0.3"));
-        assert_eq!(cdr.extra.get("near_mos_average").map(String::as_str), Some("4.11"));
-        assert_eq!(cdr.extra.get("near_mos_basis").map(String::as_str), Some("full"));
+        assert_eq!(
+            cdr.extra.get("near_tag").map(String::as_str),
+            Some("near-tag")
+        );
+        assert_eq!(
+            cdr.extra.get("near_codec").map(String::as_str),
+            Some("AMR-WB")
+        );
+        assert_eq!(
+            cdr.extra.get("near_packets_in").map(String::as_str),
+            Some("2100")
+        );
+        assert_eq!(
+            cdr.extra.get("near_bytes_out").map(String::as_str),
+            Some("335680")
+        );
+        assert_eq!(
+            cdr.extra.get("near_packets_dropped").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            cdr.extra.get("near_packets_lost").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(
+            cdr.extra.get("near_loss_percent").map(String::as_str),
+            Some("0.3")
+        );
+        assert_eq!(
+            cdr.extra.get("near_mos_average").map(String::as_str),
+            Some("4.11")
+        );
+        assert_eq!(
+            cdr.extra.get("near_mos_basis").map(String::as_str),
+            Some("full")
+        );
 
         // Far (counters-only) leg — quality fields omitted entirely.
-        assert_eq!(cdr.extra.get("far_tag").map(String::as_str), Some("far-tag"));
-        assert_eq!(cdr.extra.get("far_packets_in").map(String::as_str), Some("2099"));
+        assert_eq!(
+            cdr.extra.get("far_tag").map(String::as_str),
+            Some("far-tag")
+        );
+        assert_eq!(
+            cdr.extra.get("far_packets_in").map(String::as_str),
+            Some("2099")
+        );
         assert!(!cdr.extra.contains_key("far_codec"));
         assert!(!cdr.extra.contains_key("far_ssrc"));
         assert!(!cdr.extra.contains_key("far_mos_average"));
@@ -26439,7 +28361,10 @@ mod tests {
         assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("a"));
         assert_eq!(cdr.extra.get("far_tag").map(String::as_str), Some("b"));
         assert_eq!(cdr.extra.get("leg2_tag").map(String::as_str), Some("c"));
-        assert_eq!(cdr.extra.get("media_reason").map(String::as_str), Some("media_timeout"));
+        assert_eq!(
+            cdr.extra.get("media_reason").map(String::as_str),
+            Some("media_timeout")
+        );
     }
 
     #[test]
@@ -26479,12 +28404,27 @@ mod tests {
         };
 
         let cdr = media_summary_to_cdr(&summary);
-        assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("caller"));
-        assert_eq!(cdr.extra.get("near_packets_in").map(String::as_str), Some("60"));
-        assert_eq!(cdr.extra.get("near_packets_out").map(String::as_str), Some("64"));
-        assert_eq!(cdr.extra.get("near_codec").map(String::as_str), Some("PCMU"));
+        assert_eq!(
+            cdr.extra.get("near_tag").map(String::as_str),
+            Some("caller")
+        );
+        assert_eq!(
+            cdr.extra.get("near_packets_in").map(String::as_str),
+            Some("60")
+        );
+        assert_eq!(
+            cdr.extra.get("near_packets_out").map(String::as_str),
+            Some("64")
+        );
+        assert_eq!(
+            cdr.extra.get("near_codec").map(String::as_str),
+            Some("PCMU")
+        );
         // Quality belongs to the same leg as the counters, not a separate one.
-        assert_eq!(cdr.extra.get("near_jitter_ms").map(String::as_str), Some("19.25"));
+        assert_eq!(
+            cdr.extra.get("near_jitter_ms").map(String::as_str),
+            Some("19.25")
+        );
         // No second party.
         assert!(
             !cdr.extra.keys().any(|key| key.starts_with("far_")),
@@ -26568,9 +28508,7 @@ mod tests {
     #[test]
     fn b_leg_invite_sent_by_prefers_the_flow_over_the_default_listener() {
         let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-        let sent_by = b_leg_invite_sent_by(Some(flow), None, || {
-            ("192.0.2.10".to_string(), 5060)
-        });
+        let sent_by = b_leg_invite_sent_by(Some(flow), None, || ("192.0.2.10".to_string(), 5060));
         assert_eq!(
             sent_by,
             ("192.0.2.10".to_string(), 6100),
@@ -26595,11 +28533,10 @@ mod tests {
     /// pin wins over the default, and with neither, the default stands.
     #[test]
     fn b_leg_invite_sent_by_without_a_flow_is_unchanged() {
-        let pinned = b_leg_invite_sent_by(
-            None,
-            Some(("sip.example.com".to_string(), 5080)),
-            || ("192.0.2.10".to_string(), 5060),
-        );
+        let pinned =
+            b_leg_invite_sent_by(None, Some(("sip.example.com".to_string(), 5080)), || {
+                ("192.0.2.10".to_string(), 5060)
+            });
         assert_eq!(pinned, ("sip.example.com".to_string(), 5080));
 
         let plain = b_leg_invite_sent_by(None, None, || ("192.0.2.10".to_string(), 5060));
@@ -26610,11 +28547,9 @@ mod tests {
     /// the flow path — the sent-by is a URI host, not a bare address.
     #[test]
     fn b_leg_invite_sent_by_brackets_an_ipv6_send_socket_host() {
-        let sent_by = b_leg_invite_sent_by(
-            None,
-            Some(("2001:db8::20".to_string(), 5080)),
-            || ("192.0.2.10".to_string(), 5060),
-        );
+        let sent_by = b_leg_invite_sent_by(None, Some(("2001:db8::20".to_string(), 5080)), || {
+            ("192.0.2.10".to_string(), 5060)
+        });
         assert_eq!(sent_by, ("[2001:db8::20]".to_string(), 5080));
     }
 
@@ -26624,8 +28559,16 @@ mod tests {
 
     fn dualstack_registry() -> crate::transport::ListenerRegistry {
         crate::transport::ListenerRegistry::from_entries(vec![
-            (Transport::Udp, "192.0.2.10:5060".parse().unwrap(), None::<String>),
-            (Transport::Udp, "[2001:db8::10]:5060".parse().unwrap(), None::<String>),
+            (
+                Transport::Udp,
+                "192.0.2.10:5060".parse().unwrap(),
+                None::<String>,
+            ),
+            (
+                Transport::Udp,
+                "[2001:db8::10]:5060".parse().unwrap(),
+                None::<String>,
+            ),
         ])
     }
 
@@ -26633,8 +28576,16 @@ mod tests {
     fn resolve_advertised_host_uses_exact_listener_advertise() {
         // Per-listener advertise is the most specific source, per family.
         let registry = crate::transport::ListenerRegistry::from_entries(vec![
-            (Transport::Udp, "192.0.2.10:5060".parse().unwrap(), Some("pcscf-v4.example".to_string())),
-            (Transport::Udp, "[2001:db8::10]:5060".parse().unwrap(), Some("pcscf-v6.example".to_string())),
+            (
+                Transport::Udp,
+                "192.0.2.10:5060".parse().unwrap(),
+                Some("pcscf-v4.example".to_string()),
+            ),
+            (
+                Transport::Udp,
+                "[2001:db8::10]:5060".parse().unwrap(),
+                Some("pcscf-v6.example".to_string()),
+            ),
         ]);
         let advertised = std::collections::HashMap::new();
         let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
@@ -26657,12 +28608,24 @@ mod tests {
         let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
         assert_eq!(
-            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            resolve_advertised_host(
+                &registry,
+                &advertised,
+                default_ip,
+                Some(v6),
+                &Transport::Udp
+            ),
             "[2001:db8::10]"
         );
         let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
         assert_eq!(
-            resolve_advertised_host(&registry, &advertised, default_ip, Some(v4), &Transport::Udp),
+            resolve_advertised_host(
+                &registry,
+                &advertised,
+                default_ip,
+                Some(v4),
+                &Transport::Udp
+            ),
             "192.0.2.10"
         );
     }
@@ -26678,12 +28641,24 @@ mod tests {
         let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
         assert_eq!(
-            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            resolve_advertised_host(
+                &registry,
+                &advertised,
+                default_ip,
+                Some(v6),
+                &Transport::Udp
+            ),
             "[2001:db8::10]"
         );
         let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
         assert_eq!(
-            resolve_advertised_host(&registry, &advertised, default_ip, Some(v4), &Transport::Udp),
+            resolve_advertised_host(
+                &registry,
+                &advertised,
+                default_ip,
+                Some(v4),
+                &Transport::Udp
+            ),
             "198.51.100.1"
         );
     }
@@ -26698,7 +28673,13 @@ mod tests {
         let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
         assert_eq!(
-            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            resolve_advertised_host(
+                &registry,
+                &advertised,
+                default_ip,
+                Some(v6),
+                &Transport::Udp
+            ),
             "pcscf.ims.example"
         );
     }
@@ -26801,7 +28782,14 @@ mod tests {
         );
         let invite = parse_sip_message(raw).expect("test fixture must parse").1;
         assert!(!b2bua_answer_call("nope", &invite, 200, "OK", None, None));
-        assert!(!b2bua_progress_call("nope", &invite, 183, "Session Progress", None, None));
+        assert!(!b2bua_progress_call(
+            "nope",
+            &invite,
+            183,
+            "Session Progress",
+            None,
+            None
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -26824,7 +28812,9 @@ mod tests {
             "Content-Length: 0\r\n",
             "\r\n",
         );
-        let mut invite = parse_sip_message(raw).expect("answer-first fixture must parse").1;
+        let mut invite = parse_sip_message(raw)
+            .expect("answer-first fixture must parse")
+            .1;
         invite.body = body.to_vec();
         invite
     }
@@ -26833,7 +28823,8 @@ mod tests {
         // A native-backend handle over a dead address — `answer_first_prepare`
         // never does I/O (only `kind()` / `unsupported_flags()`), so no server
         // is needed. Construction spawns a connection task, hence #[tokio::test].
-        let (event_tx, _rx) = tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(16);
+        let (event_tx, _rx) =
+            tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(16);
         let set = crate::rtpengine::siphon_rtp::SiphonRtpClientSet::new(
             vec![("127.0.0.1:1".parse().unwrap(), 200, 1)],
             None,
@@ -26896,7 +28887,10 @@ mod tests {
             Some("wss://ai/{call_id}"),
         )
         .unwrap_err();
-        assert!(error.contains("siphon-rtp"), "expected a backend-gate error, got: {error}");
+        assert!(
+            error.contains("siphon-rtp"),
+            "expected a backend-gate error, got: {error}"
+        );
     }
 
     #[tokio::test]
@@ -26987,7 +28981,13 @@ mod tests {
         // SA is still warm, so the binding must be retained (deferred to the
         // SA-idle sweep) rather than network-deregistered on the FIN.
         let registrar = crate::registrar::Registrar::default();
-        save_stream_binding(&registrar, "sip:alice@ims.example.com", "alice", "100.65.0.2", 7);
+        save_stream_binding(
+            &registrar,
+            "sip:alice@ims.example.com",
+            "alice",
+            "100.65.0.2",
+            7,
+        );
         let bindings = registrar.bindings_for_connection(7);
         assert_eq!(bindings.len(), 1);
 
@@ -27101,7 +29101,10 @@ mod tests {
         liveness_note_alive(&last_seen, &misses, ip("100.65.0.2"), aor, 12_345);
 
         assert_eq!(last_seen.get(&ip("100.65.0.2")).map(|v| *v), Some(12_345));
-        assert!(!misses.contains_key(aor), "answer must clear the miss strike");
+        assert!(
+            !misses.contains_key(aor),
+            "answer must clear the miss strike"
+        );
     }
 
     #[test]
@@ -27253,8 +29256,13 @@ mod tests {
     #[test]
     fn b_leg_contact_user_override_keeps_host_port() {
         // set_contact_user() injects a userpart, siphon's host:port unchanged.
-        let contact =
-            build_b_leg_contact("proxy.example.com", 5060, Transport::Tcp, Some("1001"), None);
+        let contact = build_b_leg_contact(
+            "proxy.example.com",
+            5060,
+            Transport::Tcp,
+            Some("1001"),
+            None,
+        );
         assert_eq!(contact, "<sip:1001@proxy.example.com:5060;transport=tcp>");
     }
 
@@ -27334,7 +29342,10 @@ mod tests {
             wire.starts_with("REGISTER sip:example.com SIP/2.0\r\n"),
             "request line wrong:\n{wire}"
         );
-        assert!(wire.contains("Expires: 0\r\n"), "missing Expires: 0:\n{wire}");
+        assert!(
+            wire.contains("Expires: 0\r\n"),
+            "missing Expires: 0:\n{wire}"
+        );
         assert!(
             wire.contains("Contact: <sip:alice@10.0.0.1:5060>;expires=0"),
             "missing deregistering Contact:\n{wire}"
@@ -27343,7 +29354,10 @@ mod tests {
             wire.contains("Route: <sip:scscf.example.com:6060;lr>"),
             "missing Service-Route:\n{wire}"
         );
-        assert!(wire.contains("To: <sip:alice@example.com>"), "missing To:\n{wire}");
+        assert!(
+            wire.contains("To: <sip:alice@example.com>"),
+            "missing To:\n{wire}"
+        );
         assert!(
             wire.contains("From: <sip:alice@example.com>;tag=liveness-"),
             "missing From with liveness tag:\n{wire}"
@@ -27366,7 +29380,10 @@ mod tests {
     fn transport_from_name_maps_known_transports_else_udp() {
         assert!(matches!(transport_from_name(Some("tcp")), Transport::Tcp));
         assert!(matches!(transport_from_name(Some("TLS")), Transport::Tls));
-        assert!(matches!(transport_from_name(Some("ws")), Transport::WebSocket));
+        assert!(matches!(
+            transport_from_name(Some("ws")),
+            Transport::WebSocket
+        ));
         assert!(matches!(
             transport_from_name(Some("WSS")),
             Transport::WebSocketSecure
@@ -27399,7 +29416,9 @@ mod tests {
     #[test]
     fn drain_state_reports_counts_after_register() {
         let drain = DrainState::new();
-        let tm = Arc::new(TransactionManager::new(crate::transaction::timer::TimerConfig::default()));
+        let tm = Arc::new(TransactionManager::new(
+            crate::transaction::timer::TimerConfig::default(),
+        ));
         let ca = Arc::new(CallActorStore::new());
         drain.transaction_manager.set(Arc::clone(&tm)).ok();
         drain.call_actors.set(Arc::clone(&ca)).ok();
@@ -27431,7 +29450,10 @@ mod tests {
             "<sip:pcscf.example.com:5060;lr;transport=tcp>".to_string(),
         ];
         let uri = first_route_uri(&route_set);
-        assert_eq!(uri.as_deref(), Some("sip:scscf.example.com:6060;lr;transport=udp"));
+        assert_eq!(
+            uri.as_deref(),
+            Some("sip:scscf.example.com:6060;lr;transport=udp")
+        );
     }
 
     #[test]
@@ -27573,10 +29595,7 @@ mod tests {
                 assert_eq!(request_line.method, Method::Prack);
                 assert_eq!(request_line.request_uri.host, "203.0.113.14");
                 assert_eq!(request_line.request_uri.port, Some(42685));
-                assert_eq!(
-                    request_line.request_uri.user.as_deref(),
-                    Some("ue"),
-                );
+                assert_eq!(request_line.request_uri.user.as_deref(), Some("ue"),);
                 assert_ne!(
                     request_line.request_uri.host, "ims.example.com",
                     "R-URI must be the remote target Contact, never the To AoR",
@@ -27587,7 +29606,10 @@ mod tests {
         // To carries the remote tag from the 183 (early-dialog identity).
         assert!(prack.headers.to().unwrap().contains("tag=uas-early-1"));
         // RAck = "<RSeq> <CSeq-num> <method>" (RFC 3262 §7.2).
-        assert_eq!(prack.headers.get("RAck").map(String::as_str), Some("1 1 INVITE"));
+        assert_eq!(
+            prack.headers.get("RAck").map(String::as_str),
+            Some("1 1 INVITE")
+        );
         // Route set follows the reversed Record-Route to the S-CSCF first hop.
         let routes = prack.headers.get_all("Route").cloned().unwrap_or_default();
         assert_eq!(
@@ -27661,7 +29683,11 @@ mod tests {
                 _ => panic!("expected a PRACK request line"),
             }
             assert!(
-                prack.headers.to().unwrap().contains(&format!("tag={to_tag}")),
+                prack
+                    .headers
+                    .to()
+                    .unwrap()
+                    .contains(&format!("tag={to_tag}")),
                 "each fork branch PRACK carries its own To-tag",
             );
         }
@@ -27886,7 +29912,9 @@ mod tests {
         for (transport, addr, advertise) in &entries {
             listen_addrs.entry(*transport).or_insert(*addr);
             if let Some(advertise) = advertise {
-                advertised.entry(*transport).or_insert_with(|| advertise.clone());
+                advertised
+                    .entry(*transport)
+                    .or_insert_with(|| advertise.clone());
             }
         }
 
@@ -28020,11 +30048,10 @@ mod tests {
         // RFC 3261 §7.3.1 allows multiple comma-separated URIs on a single header line.
         // B2BUA must split them so the route-set has one URI per entry — a precondition
         // for reversal to produce the RFC §12.1.1 UAC route order.
-        let headers = vec![
-            "<sip:p1.example.com:5060;lr;transport=tcp>, \
+        let headers = vec!["<sip:p1.example.com:5060;lr;transport=tcp>, \
              <sip:p2.example.com:5060;lr;transport=udp>, \
-             <sip:p3.example.com:6060;lr;transport=udp>".to_string(),
-        ];
+             <sip:p3.example.com:6060;lr;transport=udp>"
+            .to_string()];
         let routes = flatten_record_route_headers(&headers);
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0], "<sip:p1.example.com:5060;lr;transport=tcp>");
@@ -28040,11 +30067,14 @@ mod tests {
             "<sip:p3.example.com;lr>".to_string(),
         ];
         let routes = flatten_record_route_headers(&headers);
-        assert_eq!(routes, vec![
-            "<sip:p1.example.com;lr>".to_string(),
-            "<sip:p2.example.com;lr>".to_string(),
-            "<sip:p3.example.com;lr>".to_string(),
-        ]);
+        assert_eq!(
+            routes,
+            vec![
+                "<sip:p1.example.com;lr>".to_string(),
+                "<sip:p2.example.com;lr>".to_string(),
+                "<sip:p3.example.com;lr>".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -28055,13 +30085,16 @@ mod tests {
             "<sip:d;lr>, <sip:e;lr>".to_string(),
         ];
         let routes = flatten_record_route_headers(&headers);
-        assert_eq!(routes, vec![
-            "<sip:a;lr>".to_string(),
-            "<sip:b;lr>".to_string(),
-            "<sip:c;lr>".to_string(),
-            "<sip:d;lr>".to_string(),
-            "<sip:e;lr>".to_string(),
-        ]);
+        assert_eq!(
+            routes,
+            vec![
+                "<sip:a;lr>".to_string(),
+                "<sip:b;lr>".to_string(),
+                "<sip:c;lr>".to_string(),
+                "<sip:d;lr>".to_string(),
+                "<sip:e;lr>".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -28072,7 +30105,8 @@ mod tests {
         // instead of reversed — sending in-dialog BYE through P-CSCF instead of I-CSCF.
         let single_line = vec![
             "<sip:pcscf;lr;transport=tcp>, <sip:pcscf;lr;transport=udp>, \
-             <sip:scscf;lr;transport=udp>".to_string(),
+             <sip:scscf;lr;transport=udp>"
+                .to_string(),
         ];
         let mut routes = flatten_record_route_headers(&single_line);
         routes.reverse();
@@ -28105,7 +30139,11 @@ mod tests {
         assert!(vias[0].contains("pc33.atlanta.com"));
 
         // From/To/Call-ID/CSeq must be copied
-        assert!(response.headers.from().unwrap().contains("alice@atlanta.com"));
+        assert!(response
+            .headers
+            .from()
+            .unwrap()
+            .contains("alice@atlanta.com"));
         assert!(response.headers.to().unwrap().contains("bob@biloxi.com"));
         assert_eq!(
             response.headers.call_id().unwrap(),
@@ -28208,13 +30246,7 @@ mod tests {
             );
         }
 
-        let response = build_response(
-            &request,
-            407,
-            "Proxy Authentication Required",
-            None,
-            &[],
-        );
+        let response = build_response(&request, 407, "Proxy Authentication Required", None, &[]);
 
         for name in ["Proxy-Authenticate", "WWW-Authenticate"] {
             let values = response.headers.get_all(name).unwrap();
@@ -28244,13 +30276,8 @@ mod tests {
         // UAS tag has to be added (RFC 3261 §8.2.6.2). A 407 challenge without
         // it leaves the caller unable to key our response to its dialog.
         let request = sample_invite();
-        let mut response = build_response(
-            &request,
-            407,
-            "Proxy Authentication Required",
-            None,
-            &[],
-        );
+        let mut response =
+            build_response(&request, 407, "Proxy Authentication Required", None, &[]);
         assert!(!response.headers.to().unwrap().contains(";tag="));
 
         stamp_uas_to_tag(&mut response, "a-leg-uas-tag");
@@ -28269,7 +30296,8 @@ mod tests {
         request
             .headers
             .set("To", "<sip:bob@example.com>;tag=already-here".to_string());
-        let mut response = build_response(&request, 481, "Call/Transaction Does Not Exist", None, &[]);
+        let mut response =
+            build_response(&request, 481, "Call/Transaction Does Not Exist", None, &[]);
 
         stamp_uas_to_tag(&mut response, "a-different-tag");
         assert_eq!(
@@ -28289,10 +30317,7 @@ mod tests {
     fn build_response_replace_op_overwrites_copied_to_header() {
         use crate::script::api::request::ReplyHeaderOp;
         let request = sample_invite();
-        let to_with_tag = format!(
-            "{};tag=scscf-abc123",
-            request.headers.to().unwrap()
-        );
+        let to_with_tag = format!("{};tag=scscf-abc123", request.headers.to().unwrap());
         let reply_headers = vec![(
             ReplyHeaderOp::Replace,
             "To".to_string(),
@@ -28314,7 +30339,10 @@ mod tests {
         let bytes = response.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         let to_line_count = text.lines().filter(|line| line.starts_with("To:")).count();
-        assert_eq!(to_line_count, 1, "wire output must carry exactly one To header");
+        assert_eq!(
+            to_line_count, 1,
+            "wire output must carry exactly one To header"
+        );
     }
 
     #[test]
@@ -28322,9 +30350,21 @@ mod tests {
         use crate::script::api::request::ReplyHeaderOp;
         let request = sample_invite();
         let reply_headers = vec![
-            (ReplyHeaderOp::Add, "Service-Route".to_string(), "<sip:orig@scscf:6060;lr>".to_string()),
-            (ReplyHeaderOp::Add, "Service-Route".to_string(), "<sip:term@scscf:6060;lr>".to_string()),
-            (ReplyHeaderOp::Add, "P-Associated-URI".to_string(), "<sip:alice@ims.example.com>".to_string()),
+            (
+                ReplyHeaderOp::Add,
+                "Service-Route".to_string(),
+                "<sip:orig@scscf:6060;lr>".to_string(),
+            ),
+            (
+                ReplyHeaderOp::Add,
+                "Service-Route".to_string(),
+                "<sip:term@scscf:6060;lr>".to_string(),
+            ),
+            (
+                ReplyHeaderOp::Add,
+                "P-Associated-URI".to_string(),
+                "<sip:alice@ims.example.com>".to_string(),
+            ),
         ];
         let response = build_response(&request, 200, "OK", None, &reply_headers);
 
@@ -28361,8 +30401,16 @@ mod tests {
         // Pathological but well-defined: replace clears prior values,
         // subsequent add accumulates on top.
         let reply_headers = vec![
-            (ReplyHeaderOp::Replace, "Warning".to_string(), "399 siphon \"first\"".to_string()),
-            (ReplyHeaderOp::Add, "Warning".to_string(), "399 siphon \"second\"".to_string()),
+            (
+                ReplyHeaderOp::Replace,
+                "Warning".to_string(),
+                "399 siphon \"first\"".to_string(),
+            ),
+            (
+                ReplyHeaderOp::Add,
+                "Warning".to_string(),
+                "399 siphon \"second\"".to_string(),
+            ),
         ];
         let response = build_response(&request, 200, "OK", None, &reply_headers);
         let warns = response.headers.get_all("Warning").unwrap();
@@ -28403,7 +30451,10 @@ mod tests {
         assert_eq!(ack.headers.to().unwrap(), response.headers.to().unwrap());
 
         // Call-ID: same as original
-        assert_eq!(ack.headers.call_id().unwrap(), request.headers.call_id().unwrap());
+        assert_eq!(
+            ack.headers.call_id().unwrap(),
+            request.headers.call_id().unwrap()
+        );
 
         // CSeq: same number, ACK method
         let cseq = ack.headers.cseq().unwrap();
@@ -28445,7 +30496,8 @@ a=rtpmap:8 PCMA/8000\r\n";
             .content_length(sdp.len())
             .build()
             .unwrap();
-        msg.headers.set("Contact", "<sip:192.0.2.10:5060;transport=udp>".to_string());
+        msg.headers
+            .set("Contact", "<sip:192.0.2.10:5060;transport=udp>".to_string());
         msg.headers.set("User-Agent", "SIPhon/test".to_string());
         msg.headers.set(
             "P-Asserted-Identity",
@@ -28504,7 +30556,9 @@ a=rtpmap:8 PCMA/8000\r\n";
         // helper must drop both Authorization and Proxy-Authorization before
         // adding the fresh challenge response.
         let mut original = hygiene_processed_b_leg_invite();
-        original.headers.add("Authorization", "Digest stale".to_string());
+        original
+            .headers
+            .add("Authorization", "Digest stale".to_string());
         original
             .headers
             .add("Proxy-Authorization", "Digest also-stale".to_string());
@@ -28517,7 +30571,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             "Digest fresh".to_string(),
         );
 
-        let auths = retry.headers.get_all("Authorization").expect("Authorization present");
+        let auths = retry
+            .headers
+            .get_all("Authorization")
+            .expect("Authorization present");
         assert_eq!(auths.len(), 1);
         assert_eq!(auths[0], "Digest fresh");
         assert!(retry.headers.get("Proxy-Authorization").is_none());
@@ -28556,7 +30613,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         );
 
         // Max-Forwards must NOT silently increment back up.
-        assert_eq!(retry.headers.get("Max-Forwards").map(|s| s.as_str()), Some("69"));
+        assert_eq!(
+            retry.headers.get("Max-Forwards").map(|s| s.as_str()),
+            Some("69")
+        );
 
         // Record-Route and Route must remain absent (they were stripped by
         // hygiene; the retry must not bring them back).
@@ -28788,11 +30848,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         // The channel now holds [Terminated (stale), Answered]. The classifier
         // must skip Terminated and return Answered; the pre-fix code returned
         // Terminated, which the dispatcher misreads as a non-answer.
-        let event = tokio::task::spawn_blocking(move || {
-            recv_b_leg_classification_event(&mut event_rx)
-        })
-        .await
-        .unwrap();
+        let event =
+            tokio::task::spawn_blocking(move || recv_b_leg_classification_event(&mut event_rx))
+                .await
+                .unwrap();
 
         assert!(
             matches!(event, Some(CallEvent::Answered { .. })),
@@ -28812,14 +30871,20 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_ip_with_port() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@192.168.1.100:5080", &resolver).unwrap();
-        assert_eq!(result.address, "192.168.1.100:5080".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result.address,
+            "192.168.1.100:5080".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_ip_default_port() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@10.0.0.1", &resolver).unwrap();
-        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result.address,
+            "10.0.0.1:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -28834,7 +30899,10 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_bare_socketaddr() {
         let resolver = test_resolver();
         let result = resolve_target("10.0.0.1:5060", &resolver).unwrap();
-        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result.address,
+            "10.0.0.1:5060".parse::<SocketAddr>().unwrap()
+        );
         assert!(result.transport.is_none());
     }
 
@@ -28843,8 +30911,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         let resolver = test_resolver();
         // A SIP URI with a hostname → every candidate carries the host so a new
         // outbound TLS connection presents it as SNI / certificate hostname.
-        let hosted = resolve_target("sip:alice@localhost:5090", &resolver)
-            .expect("localhost must resolve");
+        let hosted =
+            resolve_target("sip:alice@localhost:5090", &resolver).expect("localhost must resolve");
         assert_eq!(hosted.server_name.as_deref(), Some("localhost"));
 
         // A bare IP:port short-circuits → no SNI (RFC 6066 emits none for an IP).
@@ -28856,14 +30924,21 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_transport_tcp() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@10.0.0.1:5060;transport=tcp", &resolver).unwrap();
-        assert_eq!(result.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result.address,
+            "10.0.0.1:5060".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(result.transport, Some(Transport::Tcp));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_unresolvable_domain() {
         let resolver = test_resolver();
-        assert!(resolve_target("sip:alice@this-domain-should-not-exist-xyzzy.invalid", &resolver).is_none());
+        assert!(resolve_target(
+            "sip:alice@this-domain-should-not-exist-xyzzy.invalid",
+            &resolver
+        )
+        .is_none());
     }
 
     // -- RFC 3261 §18.1.1 over-MTU UDP → TCP fallback ------------------------
@@ -28886,17 +30961,26 @@ a=rtpmap:8 PCMA/8000\r\n";
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dest = listener.local_addr().unwrap();
         let uri = dest.to_string(); // numeric "127.0.0.1:PORT" next hop
-        // Over threshold + reachable TCP → switch to TCP at the same address.
+                                    // Over threshold + reachable TCP → switch to TCP at the same address.
         assert_eq!(
             mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &uri, dest, &resolver),
             Some((Transport::Tcp, dest)),
         );
         // Under threshold → keep UDP (no probe).
-        assert_eq!(mtu_tcp_upgrade(Some(1280), Transport::Udp, 900, &uri, dest, &resolver), None);
+        assert_eq!(
+            mtu_tcp_upgrade(Some(1280), Transport::Udp, 900, &uri, dest, &resolver),
+            None
+        );
         // MTU off → never switch.
-        assert_eq!(mtu_tcp_upgrade(None, Transport::Udp, 1300, &uri, dest, &resolver), None);
+        assert_eq!(
+            mtu_tcp_upgrade(None, Transport::Udp, 1300, &uri, dest, &resolver),
+            None
+        );
         // Already non-UDP → never switch.
-        assert_eq!(mtu_tcp_upgrade(Some(1280), Transport::Tcp, 1300, &uri, dest, &resolver), None);
+        assert_eq!(
+            mtu_tcp_upgrade(Some(1280), Transport::Tcp, 1300, &uri, dest, &resolver),
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -28909,7 +30993,14 @@ a=rtpmap:8 PCMA/8000\r\n";
         };
         let resolver = test_resolver();
         assert_eq!(
-            mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &dest.to_string(), dest, &resolver),
+            mtu_tcp_upgrade(
+                Some(1280),
+                Transport::Udp,
+                1300,
+                &dest.to_string(),
+                dest,
+                &resolver
+            ),
             None,
         );
     }
@@ -28947,7 +31038,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         let next_hop = "sip:192.0.2.178:4060";
 
         // An explicit next_hop= overrides everything (BGCF / I-CSCF pin).
-        assert_eq!(b_leg_routing_uri(Some(next_hop), Some(route), target), next_hop);
+        assert_eq!(
+            b_leg_routing_uri(Some(next_hop), Some(route), target),
+            next_hop
+        );
         assert_eq!(b_leg_routing_uri(Some(next_hop), None, target), next_hop);
         // RFC 3261 §16.6 step 6 — a route set with no next_hop routes via the
         // topmost Route, i.e. the binding's RFC 3327 Path, NOT the Contact.
@@ -29015,8 +31109,14 @@ a=rtpmap:8 PCMA/8000\r\n";
         let dest = listener.local_addr().unwrap();
         // Bare IP:port and a sip: URI with a numeric host both resolve to the
         // same address, and the live listener makes the probe succeed.
-        assert_eq!(resolve_tcp_path(&dest.to_string(), dest, &resolver), Some(dest));
-        assert_eq!(resolve_tcp_path(&format!("sip:{dest}"), dest, &resolver), Some(dest));
+        assert_eq!(
+            resolve_tcp_path(&dest.to_string(), dest, &resolver),
+            Some(dest)
+        );
+        assert_eq!(
+            resolve_tcp_path(&format!("sip:{dest}"), dest, &resolver),
+            Some(dest)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -29050,7 +31150,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].address, resolved);
         // Hostname preserved for TLS SNI to the FQDN peer.
-        assert_eq!(candidates[0].server_name.as_deref(), Some("gw.test.invalid"));
+        assert_eq!(
+            candidates[0].server_name.as_deref(),
+            Some("gw.test.invalid")
+        );
         assert_eq!(candidates[0].transport, Some(Transport::Tls));
     }
 
@@ -29096,14 +31199,21 @@ a=rtpmap:8 PCMA/8000\r\n";
     // --- In-dialog connection reuse (RFC 5923) ---
 
     fn candidate(addr: &str) -> RelayTarget {
-        RelayTarget { address: addr.parse().unwrap(), transport: None, server_name: None }
+        RelayTarget {
+            address: addr.parse().unwrap(),
+            transport: None,
+            server_name: None,
+        }
     }
 
     #[test]
     fn established_peer_in_candidates_ip_match() {
         // Load-balanced trunk: the established peer's IP is one of the members
         // the route-set domain resolves to → reuse the established connection.
-        let candidates = [candidate("198.51.100.26:5061"), candidate("198.51.100.34:5061")];
+        let candidates = [
+            candidate("198.51.100.26:5061"),
+            candidate("198.51.100.34:5061"),
+        ];
         let cached = "198.51.100.26:5061".parse::<SocketAddr>().unwrap();
         assert!(established_peer_in_candidates(cached.ip(), &candidates));
     }
@@ -29165,9 +31275,15 @@ a=rtpmap:8 PCMA/8000\r\n";
             Transport::Tls,
             connection_id,
         );
-        assert_eq!(destination, cached, "must keep the established peer's connection address");
+        assert_eq!(
+            destination, cached,
+            "must keep the established peer's connection address"
+        );
         assert_eq!(transport, Transport::Tls);
-        assert_eq!(out_connection_id, connection_id, "must reuse the established connection_id");
+        assert_eq!(
+            out_connection_id, connection_id,
+            "must reuse the established connection_id"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -29186,7 +31302,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             Transport::Udp,
             connection_id,
         );
-        assert_eq!(destination, "203.0.113.20:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            destination,
+            "203.0.113.20:5060".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(
             out_connection_id,
             ConnectionId::default(),
@@ -29228,7 +31347,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             .unwrap()
     }
 
-    fn rescue_in_dialog_message(method: Method, call_id: &str, cseq: u32, to_tag: bool) -> SipMessage {
+    fn rescue_in_dialog_message(
+        method: Method,
+        call_id: &str,
+        cseq: u32,
+        to_tag: bool,
+    ) -> SipMessage {
         let to = if to_tag {
             "<sip:bob@192.0.2.1>;tag=bob-tag".to_string()
         } else {
@@ -29240,7 +31364,9 @@ a=rtpmap:8 PCMA/8000\r\n";
                 method,
                 SipUri::new("192.0.2.1".to_string()).with_user("bob".to_string()),
             )
-            .via(format!("SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK-cseq{cseq}"))
+            .via(format!(
+                "SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK-cseq{cseq}"
+            ))
             .to(to)
             .from("<sip:alice@203.0.113.9>;tag=alice-tag".to_string())
             .call_id(call_id.to_string())
@@ -29461,7 +31587,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             Transport::Udp,
             ConnectionId(4),
         );
-        assert_eq!(ack_forward_hop(resolved, established, &rescue_is_self), None);
+        assert_eq!(
+            ack_forward_hop(resolved, established, &rescue_is_self),
+            None
+        );
     }
 
     // --- B2BUA 401/407/422 retry connection reuse (RFC 5923) ---
@@ -29478,14 +31607,13 @@ a=rtpmap:8 PCMA/8000\r\n";
         let member_b_uri = "sip:trunk@198.51.100.20:5061;transport=tls";
         let leg_connection_id = ConnectionId(99);
 
-        let (destination, transport, connection_id, relay_target) =
-            select_b2bua_retry_destination(
-                Some((member_a, Transport::Tls)),
-                leg_connection_id,
-                member_b_uri,
-                &resolver,
-            )
-            .expect("established leg destination is always selectable");
+        let (destination, transport, connection_id, relay_target) = select_b2bua_retry_destination(
+            Some((member_a, Transport::Tls)),
+            leg_connection_id,
+            member_b_uri,
+            &resolver,
+        )
+        .expect("established leg destination is always selectable");
 
         assert_eq!(
             destination, member_a,
@@ -29506,16 +31634,18 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Defensive fallback: with no recorded leg destination, resolve the
         // target afresh and open/pool a new connection (default connection_id).
         let resolver = test_resolver();
-        let (destination, transport, connection_id, relay_target) =
-            select_b2bua_retry_destination(
-                None,
-                ConnectionId(99),
-                "sip:bob@192.0.2.50:5061;transport=tls",
-                &resolver,
-            )
-            .expect("a resolvable literal-IP target yields a destination");
+        let (destination, transport, connection_id, relay_target) = select_b2bua_retry_destination(
+            None,
+            ConnectionId(99),
+            "sip:bob@192.0.2.50:5061;transport=tls",
+            &resolver,
+        )
+        .expect("a resolvable literal-IP target yields a destination");
 
-        assert_eq!(destination, "192.0.2.50:5061".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            destination,
+            "192.0.2.50:5061".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(transport, Transport::Tls);
         assert_eq!(relay_target.address, destination);
         assert_eq!(
@@ -29590,17 +31720,21 @@ a=rtpmap:8 PCMA/8000\r\n";
         SipMessageBuilder::new()
             .request(
                 Method::Invite,
-                SipUri::new("ims.example.com".to_string())
-                    .with_user("5111".to_string()),
+                SipUri::new("ims.example.com".to_string()).with_user("5111".to_string()),
             )
-            .via("SIP/2.0/UDP siphon.example.com:6060;branch=z9hG4bK-bleg-INVITE-BRANCH".to_string())
+            .via(
+                "SIP/2.0/UDP siphon.example.com:6060;branch=z9hG4bK-bleg-INVITE-BRANCH".to_string(),
+            )
             .to("<sip:5111@ims.example.com>".to_string())
             .from("<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
             .call_id("b2b-call-id-bleg".to_string())
             .cseq("1 INVITE".to_string())
             .max_forwards(70)
             .header("Route", "<sip:icscf.example.com:5060;lr>".to_string())
-            .header("Contact", "<sip:siphon@siphon.example.com:6060>".to_string())
+            .header(
+                "Contact",
+                "<sip:siphon@siphon.example.com:6060>".to_string(),
+            )
             .header("Allow", "INVITE,ACK,BYE,CANCEL".to_string())
             .header("Supported", "timer,100rel".to_string())
             .header("Session-Expires", "1800".to_string())
@@ -29640,10 +31774,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             cancel.headers.from().unwrap(),
             "<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ",
         );
-        assert_eq!(
-            cancel.headers.to().unwrap(),
-            "<sip:5111@ims.example.com>",
-        );
+        assert_eq!(cancel.headers.to().unwrap(), "<sip:5111@ims.example.com>",);
         assert_eq!(cancel.headers.call_id().unwrap(), "b2b-call-id-bleg");
     }
 
@@ -29675,10 +31806,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             !cancel.headers.has("Contact"),
             "CANCEL is hop-by-hop — Contact must be stripped"
         );
-        assert!(
-            !cancel.headers.has("Allow"),
-            "CANCEL must not carry Allow"
-        );
+        assert!(!cancel.headers.has("Allow"), "CANCEL must not carry Allow");
         assert!(
             !cancel.headers.has("Supported"),
             "CANCEL must not carry Supported"
@@ -29746,9 +31874,18 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Same CSeq number as the INVITE, method ACK (RFC 3261 §13.2.2.4).
         assert!(wire.contains("CSeq: 5 ACK\r\n"), "CSeq wrong:\n{wire}");
         // Dialog identifiers echoed from the 2xx, including the remote To-tag.
-        assert!(wire.contains("Call-ID: glare-call@10.0.0.50\r\n"), "Call-ID:\n{wire}");
-        assert!(wire.contains(";tag=their-tag"), "To-tag must survive:\n{wire}");
-        assert!(wire.contains(";tag=our-tag"), "From-tag must survive:\n{wire}");
+        assert!(
+            wire.contains("Call-ID: glare-call@10.0.0.50\r\n"),
+            "Call-ID:\n{wire}"
+        );
+        assert!(
+            wire.contains(";tag=their-tag"),
+            "To-tag must survive:\n{wire}"
+        );
+        assert!(
+            wire.contains(";tag=our-tag"),
+            "From-tag must survive:\n{wire}"
+        );
         // Fresh Via on the supplied local host:port.
         assert!(
             wire.contains("Via: SIP/2.0/UDP 10.0.0.9:5060;branch="),
@@ -29838,7 +31975,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         );
         let via = cancel_via_for_client_branch(&client_key, Transport::Tls);
         assert_eq!(
-            via, "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
+            via,
+            "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
         );
     }
 
@@ -29849,13 +31987,19 @@ a=rtpmap:8 PCMA/8000\r\n";
         let manager = TransactionManager::default();
         let invite = sample_invite();
         let txn_transport = crate::transaction::state::Transport::Udp;
-        let (key, actions) = manager.new_client_transaction(invite, txn_transport).unwrap();
+        let (key, actions) = manager
+            .new_client_transaction(invite, txn_transport)
+            .unwrap();
         assert_eq!(key.method, Method::Invite);
         assert_eq!(manager.count(), 1);
         // Should have SendMessage + StartTimer(B) + StartTimer(A) for UDP
         assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
-        assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::B, _))));
-        assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::StartTimer(TimerName::B, _))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::StartTimer(TimerName::A, _))));
     }
 
     /// Regression for the spurious-INVITE-retransmit bug: a forwarded INVITE
@@ -29892,7 +32036,9 @@ a=rtpmap:8 PCMA/8000\r\n";
             .new_client_transaction(invite, crate::transaction::state::Transport::Udp)
             .unwrap();
         assert!(
-            start_actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::A, _))),
+            start_actions
+                .iter()
+                .any(|a| matches!(a, Action::StartTimer(TimerName::A, _))),
             "UDP INVITE client transaction must arm Timer A"
         );
 
@@ -29916,10 +32062,15 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // (2) Feeding the 100 as a provisional cancels Timer A.
         let actions = manager
-            .process_client_event(&response_key, ClientEvent::Ict(IctEvent::Provisional(trying)))
+            .process_client_event(
+                &response_key,
+                ClientEvent::Ict(IctEvent::Provisional(trying)),
+            )
             .unwrap();
         assert!(
-            actions.iter().any(|a| matches!(a, Action::CancelTimer(TimerName::A))),
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CancelTimer(TimerName::A))),
             "100 Trying must cancel the INVITE retransmit Timer A"
         );
     }
@@ -29929,7 +32080,9 @@ a=rtpmap:8 PCMA/8000\r\n";
         let manager = TransactionManager::default();
         let invite = sample_invite();
         let txn_transport = crate::transaction::state::Transport::Udp;
-        let crate::transaction::ServerTransactionOutcome { key, actions, .. } = manager.new_server_transaction(&invite, txn_transport).unwrap();
+        let crate::transaction::ServerTransactionOutcome { key, actions, .. } = manager
+            .new_server_transaction(&invite, txn_transport)
+            .unwrap();
         assert_eq!(key.method, Method::Invite);
         assert_eq!(manager.count(), 1);
         assert!(actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
@@ -29937,7 +32090,11 @@ a=rtpmap:8 PCMA/8000\r\n";
 
     #[test]
     fn timer_entry_created_with_correct_fields() {
-        let key = TransactionKey::new("z9hG4bK-test".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
+        let key = TransactionKey::new(
+            "z9hG4bK-test".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
         let entry = TimerEntry {
             key: key.clone(),
             name: TimerName::A,
@@ -30026,7 +32183,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         manager.add_b_leg(&call_id, b_leg);
 
         // Can route response via B-leg branch
-        assert_eq!(manager.call_id_for_branch("z9hG4bK-b1"), Some(call_id.clone()));
+        assert_eq!(
+            manager.call_id_for_branch("z9hG4bK-b1"),
+            Some(call_id.clone())
+        );
 
         // Set winner and verify answered state
         manager.set_winner(&call_id, 0);
@@ -30048,7 +32208,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             StartLine::Request(rl) => rl.request_uri.to_string(),
             _ => panic!("expected request"),
         };
-        assert!(original_ruri.contains("bob@"), "original R-URI should have user part: {original_ruri}");
+        assert!(
+            original_ruri.contains("bob@"),
+            "original R-URI should have user part: {original_ruri}"
+        );
 
         // Simulate what relay_request does: clone, add Via/RR, but do NOT overwrite R-URI
         let relayed = invite.clone();
@@ -30056,8 +32219,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             StartLine::Request(rl) => rl.request_uri.to_string(),
             _ => panic!("expected request"),
         };
-        assert_eq!(original_ruri, ruri_after,
-            "R-URI must be preserved when next_hop is used for routing only");
+        assert_eq!(
+            original_ruri, ruri_after,
+            "R-URI must be preserved when next_hop is used for routing only"
+        );
     }
 
     // --- Bug fix regression tests ---
@@ -30081,7 +32246,9 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // Second INVITE with same SIP Call-ID (retransmission) should be detected
         assert!(
-            manager.find_by_sip_call_id("retransmit-test@host").is_some(),
+            manager
+                .find_by_sip_call_id("retransmit-test@host")
+                .is_some(),
             "retransmission guard must detect existing call by SIP Call-ID"
         );
         // Different Call-ID should not match
@@ -30191,7 +32358,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         let winner = &call.b_legs[call.winner.unwrap()];
         assert_eq!(winner.dialog.call_id, "b-cid-1");
         assert_eq!(winner.dialog.local_tag, "b-ftag-1");
-        assert_eq!(winner.transport.remote_addr, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            winner.transport.remote_addr,
+            "10.0.0.3:5060".parse::<SocketAddr>().unwrap()
+        );
 
         // ACK bridging would use find_by_sip_call_id to locate the call
         assert_eq!(
@@ -30223,7 +32393,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut body = sdp.as_bytes().to_vec();
         sanitize_sdp_identity(&mut body, "SIPhon", Some("203.0.113.1"));
         let result = std::str::from_utf8(&body).unwrap();
-        assert!(result.contains("o=SIPhon 123 456 IN IP4 203.0.113.1\r\n"), "o= line should have rewritten address, got: {result}");
+        assert!(
+            result.contains("o=SIPhon 123 456 IN IP4 203.0.113.1\r\n"),
+            "o= line should have rewritten address, got: {result}"
+        );
         assert!(result.contains("s=SIPhon\r\n"));
         assert!(!result.contains("10.0.0.1"));
         assert!(!result.contains("FreeSWITCH"));
@@ -30241,8 +32414,14 @@ a=rtpmap:8 PCMA/8000\r\n";
             result.contains("o=SIPhon 123 456 IN IP6 2001:db8::1\r\n"),
             "o= line should carry IN IP6 + an unbracketed v6 address, got: {result}"
         );
-        assert!(!result.contains("IN IP4 2001"), "addrtype must not stay IP4: {result}");
-        assert!(!result.contains('['), "SDP address must not be bracketed: {result}");
+        assert!(
+            !result.contains("IN IP4 2001"),
+            "addrtype must not stay IP4: {result}"
+        );
+        assert!(
+            !result.contains('['),
+            "SDP address must not be bracketed: {result}"
+        );
     }
 
     #[test]
@@ -30254,21 +32433,45 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut body = sdp.as_bytes().to_vec();
         sanitize_sdp_identity(&mut body, "SIPhon", Some("203.0.113.7"));
         let result = std::str::from_utf8(&body).unwrap();
-        assert!(!result.contains("198.51.100.9"), "peer address must be masked: {result}");
-        assert!(result.contains("203.0.113.7"), "substitute address must be present: {result}");
-        assert!(!result.contains("carol"), "username must be replaced: {result}");
+        assert!(
+            !result.contains("198.51.100.9"),
+            "peer address must be masked: {result}"
+        );
+        assert!(
+            result.contains("203.0.113.7"),
+            "substitute address must be present: {result}"
+        );
+        assert!(
+            !result.contains("carol"),
+            "username must be replaced: {result}"
+        );
     }
 
     #[test]
     fn sdp_origin_address_classifies_and_strips() {
-        assert_eq!(sdp_origin_address("10.0.0.1"), ("10.0.0.1".to_string(), Some("IP4")));
-        assert_eq!(sdp_origin_address("[2001:db8::1]"), ("2001:db8::1".to_string(), Some("IP6")));
-        assert_eq!(sdp_origin_address("2001:db8::1"), ("2001:db8::1".to_string(), Some("IP6")));
+        assert_eq!(
+            sdp_origin_address("10.0.0.1"),
+            ("10.0.0.1".to_string(), Some("IP4"))
+        );
+        assert_eq!(
+            sdp_origin_address("[2001:db8::1]"),
+            ("2001:db8::1".to_string(), Some("IP6"))
+        );
+        assert_eq!(
+            sdp_origin_address("2001:db8::1"),
+            ("2001:db8::1".to_string(), Some("IP6"))
+        );
         // FQDN — emitted verbatim, addrtype left to the caller.
-        assert_eq!(sdp_origin_address("pcscf.example"), ("pcscf.example".to_string(), None));
+        assert_eq!(
+            sdp_origin_address("pcscf.example"),
+            ("pcscf.example".to_string(), None)
+        );
         // Bracketed but unparseable (zoned link-local): brackets stripped, never
         // leaked into SDP.
-        assert_eq!(sdp_origin_address("[fe80::1%eth0]"), ("fe80::1%eth0".to_string(), None));
+        assert_eq!(
+            sdp_origin_address("[fe80::1%eth0]"),
+            ("fe80::1%eth0".to_string(), None)
+        );
     }
 
     #[test]
@@ -30358,8 +32561,14 @@ a=rtpmap:8 PCMA/8000\r\n";
             result.contains("o=SIPhon 42 1 IN IP6 2001:db8::7\r\n"),
             "got: {result}",
         );
-        assert!(!result.contains("IN IP4 2001"), "addrtype must flip to IP6: {result}");
-        assert!(!result.contains('['), "SDP address must be unbracketed: {result}");
+        assert!(
+            !result.contains("IN IP4 2001"),
+            "addrtype must flip to IP6: {result}"
+        );
+        assert!(
+            !result.contains('['),
+            "SDP address must be unbracketed: {result}"
+        );
     }
 
     /// The whole point of siphon-owned o=: a re-emit toward the same peer keeps
@@ -30379,8 +32588,14 @@ a=rtpmap:8 PCMA/8000\r\n";
         stamp_sdp_origin(&mut b, "SIPhon", 5000, 1, None);
         let ra = std::str::from_utf8(&a).unwrap();
         let rb = std::str::from_utf8(&b).unwrap();
-        assert!(ra.contains("o=SIPhon 5000 0 IN IP4 10.0.0.2\r\n"), "got: {ra}");
-        assert!(rb.contains("o=SIPhon 5000 1 IN IP4 10.0.0.9\r\n"), "got: {rb}");
+        assert!(
+            ra.contains("o=SIPhon 5000 0 IN IP4 10.0.0.2\r\n"),
+            "got: {ra}"
+        );
+        assert!(
+            rb.contains("o=SIPhon 5000 1 IN IP4 10.0.0.9\r\n"),
+            "got: {rb}"
+        );
     }
 
     #[test]
@@ -30418,8 +32633,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             StartLine::Request(rl) => rl.request_uri.to_string(),
             _ => panic!("expected request"),
         };
-        assert!(ruri.contains("bob@192.168.1.50"),
-            "fork branch R-URI should be updated to target contact: {ruri}");
+        assert!(
+            ruri.contains("bob@192.168.1.50"),
+            "fork branch R-URI should be updated to target contact: {ruri}"
+        );
     }
 
     #[test]
@@ -30496,12 +32713,18 @@ a=rtpmap:8 PCMA/8000\r\n";
 
     #[test]
     fn contact_expires_bare_param() {
-        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=3600"), Some(3600));
+        assert_eq!(
+            parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=3600"),
+            Some(3600)
+        );
     }
 
     #[test]
     fn contact_expires_quoted_value() {
-        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=\"1800\""), Some(1800));
+        assert_eq!(
+            parse_contact_expires("<sip:trunk@10.0.0.1:5060>;expires=\"1800\""),
+            Some(1800)
+        );
     }
 
     #[test]
@@ -30516,12 +32739,18 @@ a=rtpmap:8 PCMA/8000\r\n";
     #[test]
     fn contact_expires_uri_param_only_ignored() {
         // Only URI-level expires=, no Contact-level — should return None
-        assert_eq!(parse_contact_expires("<sip:trunk@10.0.0.1:5060;expires=0>"), None);
+        assert_eq!(
+            parse_contact_expires("<sip:trunk@10.0.0.1:5060;expires=0>"),
+            None
+        );
     }
 
     #[test]
     fn contact_expires_no_angle_brackets() {
-        assert_eq!(parse_contact_expires("sip:trunk@10.0.0.1:5060;expires=600"), Some(600));
+        assert_eq!(
+            parse_contact_expires("sip:trunk@10.0.0.1:5060;expires=600"),
+            Some(600)
+        );
     }
 
     #[test]
@@ -30532,7 +32761,9 @@ a=rtpmap:8 PCMA/8000\r\n";
     #[test]
     fn contact_expires_with_other_params() {
         assert_eq!(
-            parse_contact_expires("<sip:trunk@10.0.0.1:5060>;q=0.8;expires=900;+sip.instance=\"<urn:uuid:abc>\""),
+            parse_contact_expires(
+                "<sip:trunk@10.0.0.1:5060>;q=0.8;expires=900;+sip.instance=\"<urn:uuid:abc>\""
+            ),
             Some(900),
         );
     }
@@ -30581,7 +32812,10 @@ a=rtpmap:8 PCMA/8000\r\n";
     fn clear_media_session_on_timeout_no_record_is_noop() {
         let store = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
         // Unknown call_id → nothing to clear, returns false, does not panic.
-        assert!(!clear_media_session_on_timeout(Some(&store), "no-such-call@host"));
+        assert!(!clear_media_session_on_timeout(
+            Some(&store),
+            "no-such-call@host"
+        ));
         assert!(store.is_empty());
     }
 
@@ -30799,7 +33033,11 @@ a=rtpmap:8 PCMA/8000\r\n";
         // dialogs it never tracked (topmost Route belongs to another proxy), so
         // "not a call of ours" must NOT become a 481.
         let store = store_after_teardown("ue-call-id@10.0.0.1");
-        let bye = in_dialog_request(Method::Bye, "someone-elses-dialog@10.0.0.9", Some("bob-tag"));
+        let bye = in_dialog_request(
+            Method::Bye,
+            "someone-elses-dialog@10.0.0.9",
+            Some("bob-tag"),
+        );
         assert!(!terminated_dialog_needs_481("BYE", &bye, &store));
     }
 
@@ -31340,7 +33578,10 @@ a=rtpmap:8 PCMA/8000\r\n";
         // b2bua_refer_accept: the Refer-To target + the resolved leg direction.
         let store = PendingInboundReferStore::default();
         let now = std::time::Instant::now();
-        store.insert("cid@host", sample_pending_refer(now + std::time::Duration::from_secs(30)));
+        store.insert(
+            "cid@host",
+            sample_pending_refer(now + std::time::Duration::from_secs(30)),
+        );
 
         let pending = store.take("cid@host").expect("entry present");
         assert_eq!(pending.refer_to.uri, "sip:carol@example.com");
@@ -31420,7 +33661,10 @@ mod originate_tests {
         match &invite.start_line {
             StartLine::Request(line) => {
                 assert_eq!(line.method, Method::Invite);
-                assert_eq!(line.request_uri.to_string(), "sip:+14035551212@carrier.example");
+                assert_eq!(
+                    line.request_uri.to_string(),
+                    "sip:+14035551212@carrier.example"
+                );
             }
             other => panic!("expected a request line, got {other:?}"),
         }
@@ -31469,9 +33713,16 @@ mod originate_tests {
         let invite = build(&params);
 
         let from = invite.headers.from().unwrap();
-        assert!(from.starts_with("\"Reminders\" <sip:+14035550100@siphon.example>"), "from was {from}");
+        assert!(
+            from.starts_with("\"Reminders\" <sip:+14035550100@siphon.example>"),
+            "from was {from}"
+        );
         assert!(from.contains(";tag=sft-1"));
-        assert!(invite.headers.to().unwrap().starts_with("\"Callee\" <sip:+14035551212@carrier.example>"));
+        assert!(invite
+            .headers
+            .to()
+            .unwrap()
+            .starts_with("\"Callee\" <sip:+14035551212@carrier.example>"));
         // RFC 3325 §9.1: PAI is a name-addr for the trusted next hop.
         assert_eq!(
             invite.headers.get("P-Asserted-Identity").unwrap(),
@@ -31493,8 +33744,14 @@ mod originate_tests {
         let invite = build(&params);
 
         let from = invite.headers.from().unwrap();
-        assert!(!from.contains("+14035550100"), "CLIR must not leak the CLI in From: {from}");
-        assert!(from.contains(";tag=sft-1"), "the dialog tag must survive CLIR: {from}");
+        assert!(
+            !from.contains("+14035550100"),
+            "CLIR must not leak the CLI in From: {from}"
+        );
+        assert!(
+            from.contains(";tag=sft-1"),
+            "the dialog tag must survive CLIR: {from}"
+        );
         assert!(invite
             .headers
             .get("Privacy")
@@ -31548,7 +33805,11 @@ mod originate_tests {
         assert_eq!(invite.headers.get("X-Campaign").unwrap(), "reminder");
         assert_eq!(invite.headers.call_id().unwrap(), "b2b-originate-1");
         assert!(invite.headers.from().unwrap().contains(";tag=sft-1"));
-        assert!(invite.headers.get("Via").unwrap().contains("z9hG4bK-orig-1"));
+        assert!(invite
+            .headers
+            .get("Via")
+            .unwrap()
+            .contains("z9hG4bK-orig-1"));
         assert_eq!(invite.headers.cseq().unwrap(), "1 INVITE");
         assert_eq!(
             invite.headers.get("Contact").unwrap(),
@@ -31560,13 +33821,35 @@ mod originate_tests {
     #[test]
     fn originate_reserved_header_set_is_case_insensitive() {
         for name in [
-            "Via", "via", "FROM", "To", "Call-ID", "call-id", "CSeq", "Contact", "Max-Forwards",
-            "Content-Length", "Route", "Record-Route",
+            "Via",
+            "via",
+            "FROM",
+            "To",
+            "Call-ID",
+            "call-id",
+            "CSeq",
+            "Contact",
+            "Max-Forwards",
+            "Content-Length",
+            "Route",
+            "Record-Route",
         ] {
-            assert!(is_originate_reserved_header(name), "{name} must be reserved");
+            assert!(
+                is_originate_reserved_header(name),
+                "{name} must be reserved"
+            );
         }
-        for name in ["X-Campaign", "P-Asserted-Identity", "Subject", "Privacy", "Allow"] {
-            assert!(!is_originate_reserved_header(name), "{name} must be settable");
+        for name in [
+            "X-Campaign",
+            "P-Asserted-Identity",
+            "Subject",
+            "Privacy",
+            "Allow",
+        ] {
+            assert!(
+                !is_originate_reserved_header(name),
+                "{name} must be settable"
+            );
         }
     }
 
@@ -31575,7 +33858,10 @@ mod originate_tests {
         let sdp = "v=0\r\no=- 1 1 IN IP4 198.51.100.10\r\ns=-\r\nc=IN IP4 198.51.100.10\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n";
         let invite = build(&params(OriginateMedia::Offer(sdp.to_string())));
         assert_eq!(invite.body, sdp.as_bytes());
-        assert_eq!(invite.headers.get("Content-Type").unwrap(), "application/sdp");
+        assert_eq!(
+            invite.headers.get("Content-Type").unwrap(),
+            "application/sdp"
+        );
         assert_eq!(
             invite.headers.get("Content-Length").unwrap(),
             &sdp.len().to_string()

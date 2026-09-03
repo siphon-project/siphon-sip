@@ -91,10 +91,11 @@ async fn connect(
         HeaderValue::from_static(SUBPROTOCOL),
     );
 
-    let (socket, _response) = tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(request))
-        .await
-        .map_err(|_| "dial timed out".to_string())?
-        .map_err(|error| format!("dial error: {error}"))?;
+    let (socket, _response) =
+        tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| "dial timed out".to_string())?
+            .map_err(|error| format!("dial error: {error}"))?;
     Ok(socket)
 }
 
@@ -107,7 +108,8 @@ async fn drive_outbound_socket(
     pending: PendingOwn,
 ) {
     let conn = bus.register_connection(&app);
-    crate::metrics::try_metrics().inspect(|m| m.control_connections.with_label_values(&[&app]).inc());
+    crate::metrics::try_metrics()
+        .inspect(|m| m.control_connections.with_label_values(&[&app]).inc());
 
     // The accepting socket owns the call. Register + push StasisStart before
     // reading commands so the very first thing the controller sees is its call.
@@ -160,7 +162,8 @@ async fn drive_outbound_socket(
 
     conn.events.close();
     bus.unregister_connection(&conn);
-    crate::metrics::try_metrics().inspect(|m| m.control_connections.with_label_values(&[&app]).dec());
+    crate::metrics::try_metrics()
+        .inspect(|m| m.control_connections.with_label_values(&[&app]).dec());
     let _ = writer.await;
     debug!(conn_id = conn.id, %app, "control plane: outbound connection closed");
 }

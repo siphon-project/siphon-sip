@@ -39,10 +39,10 @@
 //! pyo3-async-bridged tokio futures (the wake-up
 //! `loop.call_soon_threadsafe(set_result, ...)` always lands on a live loop).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -426,8 +426,7 @@ pub(crate) fn run_coroutine_via_pool(
     // py_executor pool / `spawn_blocking` threads that already reach this path
     // it is the same passthrough those callers use elsewhere (blocking.rs,
     // engine.rs, diameter.rs).
-    let outcome =
-        python.detach(|| tokio::task::block_in_place(|| runtime.block_on(receiver)));
+    let outcome = python.detach(|| tokio::task::block_in_place(|| runtime.block_on(receiver)));
 
     match outcome {
         Ok(Ok(value)) => Ok(Some(value)),
@@ -443,8 +442,8 @@ mod tests {
     use super::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
     use std::ffi::CString;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Bridge a tokio sleep into Python via `future_into_py` — the same
@@ -500,8 +499,7 @@ mod tests {
     /// subsequent tests panic with "context was found, but it is being
     /// shutdown".  A single process-wide runtime survives all tests.
     fn test_runtime() -> &'static tokio::runtime::Runtime {
-        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
-            std::sync::OnceLock::new();
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RUNTIME.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
@@ -524,7 +522,9 @@ mod tests {
     static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        POOL_SERIAL.lock().unwrap_or_else(|poison| poison.into_inner())
+        POOL_SERIAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn ensure_pool() -> Arc<AsyncPool> {
@@ -569,8 +569,7 @@ mod tests {
                 ))
             });
             let value = dispatch(factory).await;
-            let extracted: i64 =
-                Python::attach(|python| value.bind(python).extract().unwrap());
+            let extracted: i64 = Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 3);
         });
     }
@@ -589,7 +588,10 @@ mod tests {
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
-                Arc::new(build_factory(python, "async def factory():\n    return 5\n"))
+                Arc::new(build_factory(
+                    python,
+                    "async def factory():\n    return 5\n",
+                ))
             });
             let value = tokio::spawn(async move {
                 Python::attach(|python| {
@@ -601,8 +603,7 @@ mod tests {
             })
             .await
             .expect("worker-thread dispatch must not panic");
-            let extracted: i64 =
-                Python::attach(|python| value.bind(python).extract().unwrap());
+            let extracted: i64 = Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 5);
         });
     }
@@ -699,8 +700,7 @@ mod tests {
                         .unwrap(),
                     "child task awaiting future_into_py future must complete"
                 );
-                let value: i64 =
-                    task.call_method0("result").unwrap().extract().unwrap();
+                let value: i64 = task.call_method0("result").unwrap().extract().unwrap();
                 assert_eq!(value, 7);
             });
         });
@@ -765,8 +765,7 @@ mod tests {
                 ))
             });
             let value = dispatch(factory).await;
-            let extracted: i64 =
-                Python::attach(|python| value.bind(python).extract().unwrap());
+            let extracted: i64 = Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 42);
         });
     }
@@ -843,8 +842,7 @@ mod tests {
         for _ in 0..pool.size() {
             let factory = Arc::clone(&factory);
             let value = dispatch(factory).await;
-            let count: usize =
-                Python::attach(|python| value.bind(python).extract().unwrap());
+            let count: usize = Python::attach(|python| value.bind(python).extract().unwrap());
             counts.push(count);
         }
         counts
@@ -855,11 +853,7 @@ mod tests {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmRSS:") {
-                let kb: u64 = rest
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()?;
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
                 return Some(kb);
             }
         }

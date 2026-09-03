@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 
+use super::sip_uri::PySipUri;
+use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::{SipMessage, StartLine};
 use crate::sip::uri::SipUri;
-use crate::sip::headers::nameaddr::NameAddr;
-use super::sip_uri::PySipUri;
 
 /// Python-visible SIP reply object.
 ///
@@ -133,9 +133,9 @@ impl PyReply {
         let message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
-        message.status_code().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("not a response message")
-        })
+        message
+            .status_code()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not a response message"))
     }
 
     /// Reason phrase (e.g. "OK", "Not Found").
@@ -157,9 +157,10 @@ impl PyReply {
         let message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
-        Ok(message.headers.from().and_then(|value| {
-            extract_uri_from_header(value).map(PySipUri::new)
-        }))
+        Ok(message
+            .headers
+            .from()
+            .and_then(|value| extract_uri_from_header(value).map(PySipUri::new)))
     }
 
     /// To URI parsed from the To header.
@@ -168,9 +169,10 @@ impl PyReply {
         let message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
-        Ok(message.headers.to().and_then(|value| {
-            extract_uri_from_header(value).map(PySipUri::new)
-        }))
+        Ok(message
+            .headers
+            .to()
+            .and_then(|value| extract_uri_from_header(value).map(PySipUri::new)))
     }
 
     /// Call-ID header value.
@@ -299,7 +301,9 @@ impl PyReply {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         let prefix_lower = prefix.to_lowercase();
-        let names_to_remove: Vec<String> = message.headers.names()
+        let names_to_remove: Vec<String> = message
+            .headers
+            .names()
             .iter()
             .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
             .map(|name| name.to_string())
@@ -318,7 +322,9 @@ impl PyReply {
         if message.body.is_empty() {
             return Ok(false);
         }
-        Ok(message.headers.content_type()
+        Ok(message
+            .headers
+            .content_type()
             .map(|ct| ct.starts_with(content_type))
             .unwrap_or(false))
     }
@@ -336,12 +342,19 @@ impl PyReply {
     ///
     /// Idempotent: after the AV has been stripped, a second call returns
     /// ``None`` because no header still carries ``ck``/``ik``.
-    fn take_av(&self, python: Python<'_>) -> PyResult<Option<Py<super::ipsec::PyAuthVectorHandle>>> {
+    fn take_av(
+        &self,
+        python: Python<'_>,
+    ) -> PyResult<Option<Py<super::ipsec::PyAuthVectorHandle>>> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
 
-        for header_name in ["WWW-Authenticate", "Proxy-Authenticate", "Authentication-Info"] {
+        for header_name in [
+            "WWW-Authenticate",
+            "Proxy-Authenticate",
+            "Authentication-Info",
+        ] {
             let original = match message.headers.get(header_name).cloned() {
                 Some(value) => value,
                 None => continue,
@@ -459,7 +472,7 @@ impl PyReply {
             (Some(ip), Some(port)) => (ip.clone(), port),
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "response source address not available for fix_nated_contact"
+                    "response source address not available for fix_nated_contact",
                 ));
             }
         };
@@ -571,7 +584,7 @@ fn extract_uri_from_header(header_value: &str) -> Option<SipUri> {
 mod tests {
     use super::*;
     use crate::sip::headers::SipHeaders;
-    use crate::sip::message::{Version, StatusLine, StartLine};
+    use crate::sip::message::{StartLine, StatusLine, Version};
 
     fn make_response(status_code: u16, reason: &str) -> SipMessage {
         let mut headers = SipHeaders::new();
@@ -579,7 +592,10 @@ mod tests {
         headers.add("To", "<sip:bob@example.com>;tag=def456".to_string());
         headers.add("Call-ID", "call-42@host".to_string());
         headers.add("CSeq", "1 INVITE".to_string());
-        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776".to_string(),
+        );
 
         SipMessage {
             start_line: StartLine::Response(StatusLine {
@@ -633,7 +649,10 @@ mod tests {
 
         reply.set_header("X-Custom", "value").unwrap();
         assert!(reply.has_header("X-Custom").unwrap());
-        assert_eq!(reply.get_header("X-Custom").unwrap(), Some("value".to_string()));
+        assert_eq!(
+            reply.get_header("X-Custom").unwrap(),
+            Some("value".to_string())
+        );
         assert_eq!(reply.header("X-Custom").unwrap(), Some("value".to_string()));
 
         reply.remove_header("X-Custom").unwrap();
@@ -643,7 +662,9 @@ mod tests {
     #[test]
     fn has_body_checks_content_type() {
         let mut response = make_response(200, "OK");
-        response.headers.set("Content-Type", "application/sdp".to_string());
+        response
+            .headers
+            .set("Content-Type", "application/sdp".to_string());
         response.body = b"v=0\r\n".to_vec();
 
         let message = Arc::new(Mutex::new(response));
@@ -664,7 +685,9 @@ mod tests {
     #[test]
     fn body_returns_bytes_when_present() {
         let mut response = make_response(200, "OK");
-        response.headers.set("Content-Type", "application/sdp".to_string());
+        response
+            .headers
+            .set("Content-Type", "application/sdp".to_string());
         response.body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec();
 
         let message = Arc::new(Mutex::new(response));
@@ -687,12 +710,17 @@ mod tests {
     #[test]
     fn content_type_getter() {
         let mut response = make_response(200, "OK");
-        response.headers.set("Content-Type", "application/sdp".to_string());
+        response
+            .headers
+            .set("Content-Type", "application/sdp".to_string());
 
         let message = Arc::new(Mutex::new(response));
         let reply = PyReply::new(message);
 
-        assert_eq!(reply.content_type().unwrap(), Some("application/sdp".to_string()));
+        assert_eq!(
+            reply.content_type().unwrap(),
+            Some("application/sdp".to_string())
+        );
     }
 
     #[test]
@@ -728,7 +756,9 @@ mod tests {
         let mut reply = PyReply::new(message);
 
         assert_eq!(reply.reject_action(), None);
-        let took = reply.reject(503, Some("Media Authorization Failed")).unwrap();
+        let took = reply
+            .reject(503, Some("Media Authorization Failed"))
+            .unwrap();
         assert!(took, "reject on a provisional must take");
         assert_eq!(
             reply.reject_action(),
@@ -811,12 +841,17 @@ mod tests {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
         let reply = PyReply::new(Arc::clone(&message));
 
-        reply.set_header("P-Asserted-Identity", "sip:alice@example.com").unwrap();
+        reply
+            .set_header("P-Asserted-Identity", "sip:alice@example.com")
+            .unwrap();
 
         // Verify mutation is visible through the original Arc.
         let locked = message.lock().unwrap();
         assert_eq!(
-            locked.headers.get("P-Asserted-Identity").map(|s| s.as_str()),
+            locked
+                .headers
+                .get("P-Asserted-Identity")
+                .map(|s| s.as_str()),
             Some("sip:alice@example.com")
         );
     }
@@ -824,7 +859,9 @@ mod tests {
     #[test]
     fn fix_nated_contact_rewrites_uri() {
         let mut response = make_response(200, "OK");
-        response.headers.set("Contact", "<sip:alice@192.168.1.100:6000>".to_string());
+        response
+            .headers
+            .set("Contact", "<sip:alice@192.168.1.100:6000>".to_string());
 
         let message = Arc::new(Mutex::new(response));
         let reply = PyReply::new(Arc::clone(&message))
@@ -834,8 +871,14 @@ mod tests {
 
         let locked = message.lock().unwrap();
         let contact = locked.headers.get("Contact").unwrap();
-        assert!(contact.contains("203.0.113.50"), "Contact should contain NATed IP: {contact}");
-        assert!(contact.contains("54321"), "Contact should contain NATed port: {contact}");
+        assert!(
+            contact.contains("203.0.113.50"),
+            "Contact should contain NATed IP: {contact}"
+        );
+        assert!(
+            contact.contains("54321"),
+            "Contact should contain NATed port: {contact}"
+        );
     }
 
     #[test]
@@ -849,8 +892,7 @@ mod tests {
     #[test]
     fn fix_nated_contact_no_contact_header_is_noop() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("10.0.0.1".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("10.0.0.1".to_string(), 5060);
 
         // Should not error even without Contact header
         reply.fix_nated_contact().unwrap();
@@ -882,8 +924,7 @@ mod tests {
     #[test]
     fn source_ip_and_port_exposed_when_set() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("10.0.0.1".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("10.0.0.1".to_string(), 5060);
         assert_eq!(reply.source_ip(), Some("10.0.0.1".to_string()));
         assert_eq!(reply.source_port(), Some(5060));
     }
@@ -899,8 +940,7 @@ mod tests {
     #[test]
     fn from_gateway_true_for_member_source() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("10.0.0.1".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("10.0.0.1".to_string(), 5060);
         let manager = gateway_manager_with_group();
         assert!(reply.from_gateway_impl("carriers", Some(&manager)));
     }
@@ -909,8 +949,7 @@ mod tests {
     fn from_gateway_false_for_non_member_source() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
         // RFC 5737 TEST-NET-1 — not a member of the group.
-        let reply = PyReply::new(message)
-            .with_response_source("192.0.2.7".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("192.0.2.7".to_string(), 5060);
         let manager = gateway_manager_with_group();
         assert!(!reply.from_gateway_impl("carriers", Some(&manager)));
     }
@@ -918,8 +957,7 @@ mod tests {
     #[test]
     fn from_gateway_false_for_unknown_group() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("10.0.0.1".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("10.0.0.1".to_string(), 5060);
         let manager = gateway_manager_with_group();
         assert!(!reply.from_gateway_impl("nonexistent", Some(&manager)));
     }
@@ -935,16 +973,14 @@ mod tests {
     #[test]
     fn from_gateway_false_when_no_manager() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("10.0.0.1".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("10.0.0.1".to_string(), 5060);
         assert!(!reply.from_gateway_impl("carriers", None));
     }
 
     #[test]
     fn from_gateway_false_for_unparseable_source_ip() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message)
-            .with_response_source("not-an-ip".to_string(), 5060);
+        let reply = PyReply::new(message).with_response_source("not-an-ip".to_string(), 5060);
         let manager = gateway_manager_with_group();
         assert!(!reply.from_gateway_impl("carriers", Some(&manager)));
     }

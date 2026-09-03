@@ -81,11 +81,7 @@ impl SiprecManager {
     /// 3. Handle the SRS response
     ///
     /// For now, registers the session in the store.
-    pub fn start_recording(
-        &self,
-        original_call_id: &str,
-        liid: Option<&str>,
-    ) -> RecordingSession {
+    pub fn start_recording(&self, original_call_id: &str, liid: Option<&str>) -> RecordingSession {
         let recording_call_id = format!("siprec-{}", uuid::Uuid::new_v4());
 
         let session = RecordingSession {
@@ -104,7 +100,8 @@ impl SiprecManager {
             "SIPREC: recording session initiated"
         );
 
-        self.sessions.insert(original_call_id.to_string(), session.clone());
+        self.sessions
+            .insert(original_call_id.to_string(), session.clone());
         session
     }
 
@@ -131,7 +128,9 @@ impl SiprecManager {
             );
         }
 
-        self.sessions.remove(original_call_id).map(|(_, session)| session)
+        self.sessions
+            .remove(original_call_id)
+            .map(|(_, session)| session)
     }
 
     /// Check if a call is being recorded.
@@ -141,7 +140,9 @@ impl SiprecManager {
 
     /// Get session info for a call.
     pub fn get_session(&self, original_call_id: &str) -> Option<RecordingSession> {
-        self.sessions.get(original_call_id).map(|entry| entry.clone())
+        self.sessions
+            .get(original_call_id)
+            .map(|entry| entry.clone())
     }
 
     /// Number of active recording sessions.
@@ -194,7 +195,8 @@ impl SiprecManager {
 
 impl std::fmt::Debug for SiprecManager {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SiprecManager")
+        formatter
+            .debug_struct("SiprecManager")
             .field("srs_uri", &self.srs_uri)
             .field("session_copies", &self.session_copies)
             .field("active_sessions", &self.sessions.len())

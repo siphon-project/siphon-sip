@@ -43,12 +43,7 @@ impl PyMetricsNamespace {
     /// Returns:
     ///     A Counter handle for incrementing.
     #[pyo3(signature = (name, help, labels=None))]
-    fn counter(
-        &self,
-        name: &str,
-        help: &str,
-        labels: Option<Vec<String>>,
-    ) -> PyResult<PyCounter> {
+    fn counter(&self, name: &str, help: &str, labels: Option<Vec<String>>) -> PyResult<PyCounter> {
         let label_names = labels.unwrap_or_default();
         let label_refs: Vec<&str> = label_names.iter().map(|s| s.as_str()).collect();
         self.custom
@@ -72,12 +67,7 @@ impl PyMetricsNamespace {
     /// Returns:
     ///     A Gauge handle.
     #[pyo3(signature = (name, help, labels=None))]
-    fn gauge(
-        &self,
-        name: &str,
-        help: &str,
-        labels: Option<Vec<String>>,
-    ) -> PyResult<PyGauge> {
+    fn gauge(&self, name: &str, help: &str, labels: Option<Vec<String>>) -> PyResult<PyGauge> {
         let label_names = labels.unwrap_or_default();
         let label_refs: Vec<&str> = label_names.iter().map(|s| s.as_str()).collect();
         self.custom
@@ -377,9 +367,7 @@ fn resolve_kwargs(
     let mut pairs = Vec::with_capacity(label_names.len());
     for name in label_names {
         let value = kwargs.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "missing label '{name}'"
-            ))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("missing label '{name}'"))
         })?;
         pairs.push((name.clone(), value.clone()));
     }

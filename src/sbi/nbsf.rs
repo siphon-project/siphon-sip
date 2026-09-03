@@ -527,7 +527,10 @@ mod tests {
         let query = &queries[0];
         assert!(query.starts_with("ipv6Prefix="), "got: {query}");
         // The `/` of the /64 prefix MUST be percent-encoded (TS 29.521 wire).
-        assert!(query.contains("%2F64"), "slash must be %2F encoded: {query}");
+        assert!(
+            query.contains("%2F64"),
+            "slash must be %2F encoded: {query}"
+        );
     }
 
     /// Captured `(target-nf-type, service-names, requester-nf-type)` discovery
@@ -564,8 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn indirect_discover_emits_delegated_discovery_headers() {
-        let captured: CapturedDiscoveryHeaders =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: CapturedDiscoveryHeaders = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         let client = BsfClient::new(&scp, reqwest::Client::new())
             .with_communication(crate::sbi::Communication::Indirect);
@@ -574,7 +576,10 @@ mod tests {
             .discover_binding(&BindingQuery::Ipv4("10.45.0.7".into()))
             .await
             .unwrap();
-        assert!(result.is_none(), "404 still maps to Ok(None) in indirect mode");
+        assert!(
+            result.is_none(),
+            "404 still maps to Ok(None) in indirect mode"
+        );
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -586,8 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_discover_emits_no_discovery_headers() {
-        let captured: CapturedDiscoveryHeaders =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: CapturedDiscoveryHeaders = Arc::new(Mutex::new(Vec::new()));
         let bsf = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         // Direct by default.
         let client = BsfClient::new(&bsf, reqwest::Client::new());
@@ -599,13 +603,16 @@ mod tests {
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0], (None, None, None), "direct mode emits no discovery headers");
+        assert_eq!(
+            captured[0],
+            (None, None, None),
+            "direct mode emits no discovery headers"
+        );
     }
 
     #[tokio::test]
     async fn indirect_requester_nf_type_override() {
-        let captured: CapturedDiscoveryHeaders =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: CapturedDiscoveryHeaders = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_discovery_router(Arc::clone(&captured))).await;
         let client = BsfClient::new(&scp, reqwest::Client::new())
             .with_communication(crate::sbi::Communication::Indirect)
@@ -634,7 +641,10 @@ mod tests {
         let router = axum::Router::new().fallback(move |request: Request| {
             let captured = Arc::clone(&captured_handler);
             async move {
-                captured.lock().unwrap().push(request.uri().path().to_string());
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(request.uri().path().to_string());
                 axum::http::StatusCode::NOT_FOUND
             }
         });

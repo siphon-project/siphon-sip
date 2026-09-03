@@ -312,12 +312,22 @@ pub fn encode_avp_u32(code: u32, value: u32) -> Vec<u8> {
 
 /// Encode a UTF8String/DiameterIdentity AVP with 3GPP vendor.
 pub fn encode_avp_utf8_3gpp(code: u32, value: &str) -> Vec<u8> {
-    encode_avp_vendor(code, AVP_FLAG_MANDATORY, dictionary::VENDOR_3GPP, value.as_bytes())
+    encode_avp_vendor(
+        code,
+        AVP_FLAG_MANDATORY,
+        dictionary::VENDOR_3GPP,
+        value.as_bytes(),
+    )
 }
 
 /// Encode a Unsigned32 AVP with 3GPP vendor.
 pub fn encode_avp_u32_3gpp(code: u32, value: u32) -> Vec<u8> {
-    encode_avp_vendor(code, AVP_FLAG_MANDATORY, dictionary::VENDOR_3GPP, &value.to_be_bytes())
+    encode_avp_vendor(
+        code,
+        AVP_FLAG_MANDATORY,
+        dictionary::VENDOR_3GPP,
+        &value.to_be_bytes(),
+    )
 }
 
 /// Encode an OctetString AVP with 3GPP vendor.
@@ -347,7 +357,12 @@ pub fn encode_avp_u64(code: u32, value: u64) -> Vec<u8> {
 
 /// Encode a signed Integer32 AVP with 3GPP vendor.
 pub fn encode_avp_i32_3gpp(code: u32, value: i32) -> Vec<u8> {
-    encode_avp_vendor(code, AVP_FLAG_MANDATORY, dictionary::VENDOR_3GPP, &value.to_be_bytes())
+    encode_avp_vendor(
+        code,
+        AVP_FLAG_MANDATORY,
+        dictionary::VENDOR_3GPP,
+        &value.to_be_bytes(),
+    )
 }
 
 /// Offset between the NTP epoch (1900-01-01 00:00:00 UTC) and the Unix
@@ -412,8 +427,15 @@ pub fn encode_avp_address_3gpp(code: u32, ip: std::net::IpAddr) -> Vec<u8> {
 pub fn encode_vendor_specific_app_id(vendor_id: u32, auth_app_id: u32) -> Vec<u8> {
     let mut children = Vec::new();
     children.extend_from_slice(&encode_avp_u32(dictionary::avp::VENDOR_ID, vendor_id));
-    children.extend_from_slice(&encode_avp_u32(dictionary::avp::AUTH_APPLICATION_ID, auth_app_id));
-    encode_avp(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, AVP_FLAG_MANDATORY, &children)
+    children.extend_from_slice(&encode_avp_u32(
+        dictionary::avp::AUTH_APPLICATION_ID,
+        auth_app_id,
+    ));
+    encode_avp(
+        dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
+        AVP_FLAG_MANDATORY,
+        &children,
+    )
 }
 
 // ── Full message encoding ──────────────────────────────────────────────────
@@ -440,7 +462,10 @@ pub fn encode_generic_answer(
     let mut avp_buf = Vec::with_capacity(160);
     avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, session_id));
     avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, origin_host));
-    avp_buf.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_REALM, origin_realm));
+    avp_buf.extend_from_slice(&encode_avp_utf8(
+        dictionary::avp::ORIGIN_REALM,
+        origin_realm,
+    ));
     avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1));
     // Apps with a 3GPP-vendor application-id (Cx, Sh, Rx, S6c, SGd) need
     // Vendor-Specific-Application-Id; base apps (Ro, Rf) don't. Match
@@ -448,8 +473,7 @@ pub fn encode_generic_answer(
     if let Some(name) = dictionary::app_name_by_id(application_id) {
         if let Some((vendor, _)) = dictionary::app_id_by_name(name) {
             if vendor != 0 {
-                avp_buf
-                    .extend_from_slice(&encode_vendor_specific_app_id(vendor, application_id));
+                avp_buf.extend_from_slice(&encode_vendor_specific_app_id(vendor, application_id));
             }
         }
     }
@@ -821,43 +845,72 @@ impl DiameterMsg {
 pub fn command_name(code: u32, is_request: bool) -> &'static str {
     match (code, is_request) {
         // Base
-        (257, true) => "CER", (257, false) => "CEA",
-        (258, true) => "RAR", (258, false) => "RAA",
-        (265, true) => "AAR", (265, false) => "AAA",
-        (271, true) => "ACR", (271, false) => "ACA",
-        (272, true) => "CCR", (272, false) => "CCA",
-        (274, true) => "ASR", (274, false) => "ASA",
-        (275, true) => "STR", (275, false) => "STA",
-        (280, true) => "DWR", (280, false) => "DWA",
-        (282, true) => "DPR", (282, false) => "DPA",
+        (257, true) => "CER",
+        (257, false) => "CEA",
+        (258, true) => "RAR",
+        (258, false) => "RAA",
+        (265, true) => "AAR",
+        (265, false) => "AAA",
+        (271, true) => "ACR",
+        (271, false) => "ACA",
+        (272, true) => "CCR",
+        (272, false) => "CCA",
+        (274, true) => "ASR",
+        (274, false) => "ASA",
+        (275, true) => "STR",
+        (275, false) => "STA",
+        (280, true) => "DWR",
+        (280, false) => "DWA",
+        (282, true) => "DPR",
+        (282, false) => "DPA",
         // Cx
-        (300, true) => "UAR", (300, false) => "UAA",
-        (301, true) => "SAR", (301, false) => "SAA",
-        (302, true) => "LIR", (302, false) => "LIA",
-        (303, true) => "MAR", (303, false) => "MAA",
-        (304, true) => "RTR", (304, false) => "RTA",
-        (305, true) => "PPR", (305, false) => "PPA",
+        (300, true) => "UAR",
+        (300, false) => "UAA",
+        (301, true) => "SAR",
+        (301, false) => "SAA",
+        (302, true) => "LIR",
+        (302, false) => "LIA",
+        (303, true) => "MAR",
+        (303, false) => "MAA",
+        (304, true) => "RTR",
+        (304, false) => "RTA",
+        (305, true) => "PPR",
+        (305, false) => "PPA",
         // Sh
-        (306, true) => "UDR", (306, false) => "UDA",
-        (307, true) => "PUR", (307, false) => "PUA",
-        (308, true) => "SNR", (308, false) => "SNA",
-        (309, true) => "PNR", (309, false) => "PNA",
+        (306, true) => "UDR",
+        (306, false) => "UDA",
+        (307, true) => "PUR",
+        (307, false) => "PUA",
+        (308, true) => "SNR",
+        (308, false) => "SNA",
+        (309, true) => "PNR",
+        (309, false) => "PNA",
         // S6a
-        (316, true) => "ULR", (316, false) => "ULA",
-        (317, true) => "CLR", (317, false) => "CLA",
-        (318, true) => "AIR", (318, false) => "AIA",
-        (319, true) => "IDR", (319, false) => "IDA",
-        (320, true) => "DSR", (320, false) => "DSA",
-        (321, true) => "PUR-S6a", (321, false) => "PUA-S6a",
-        (323, true) => "NOR", (323, false) => "NOA",
-        (324, true) => "ECR", (324, false) => "ECA",
+        (316, true) => "ULR",
+        (316, false) => "ULA",
+        (317, true) => "CLR",
+        (317, false) => "CLA",
+        (318, true) => "AIR",
+        (318, false) => "AIA",
+        (319, true) => "IDR",
+        (319, false) => "IDA",
+        (320, true) => "DSR",
+        (320, false) => "DSA",
+        (321, true) => "PUR-S6a",
+        (321, false) => "PUA-S6a",
+        (323, true) => "NOR",
+        (323, false) => "NOA",
+        (324, true) => "ECR",
+        (324, false) => "ECA",
         _ => "Unknown",
     }
 }
 
 /// Extract IMSI from decoded AVPs.
 pub fn extract_imsi(avps: &Value) -> Option<String> {
-    avps.get("User-Name").and_then(|v| v.as_str()).map(|s| s.to_string())
+    avps.get("User-Name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract a u32 AVP value by name from decoded AVPs.
@@ -932,7 +985,13 @@ pub const TON_NPI_INTERNATIONAL_E164: u8 = 0x91;
 pub fn encode_tbcd_digits(digits: &str) -> Vec<u8> {
     let parsed: Vec<u8> = digits
         .bytes()
-        .filter_map(|b| if b.is_ascii_digit() { Some(b - b'0') } else { None })
+        .filter_map(|b| {
+            if b.is_ascii_digit() {
+                Some(b - b'0')
+            } else {
+                None
+            }
+        })
         .collect();
 
     let mut result = Vec::with_capacity(parsed.len().div_ceil(2));
@@ -1029,10 +1088,19 @@ mod tests {
     #[test]
     fn encode_decode_full_message() {
         let mut avps = Vec::new();
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "test;session;1"));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::SESSION_ID,
+            "test;session;1",
+        ));
         avps.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, 2001));
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "hss.example.com"));
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_REALM, "example.com"));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::ORIGIN_HOST,
+            "hss.example.com",
+        ));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::ORIGIN_REALM,
+            "example.com",
+        ));
 
         let msg = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
@@ -1049,7 +1117,10 @@ mod tests {
         assert_eq!(decoded.application_id, dictionary::CX_APP_ID);
         assert_eq!(decoded.hop_by_hop, 0x12345678);
         assert_eq!(decoded.end_to_end, 0xAABBCCDD);
-        assert_eq!(command_name(decoded.command_code, decoded.is_request), "MAR");
+        assert_eq!(
+            command_name(decoded.command_code, decoded.is_request),
+            "MAR"
+        );
 
         assert_eq!(
             decoded.avps.get("Session-Id").and_then(|v| v.as_str()),
@@ -1265,7 +1336,11 @@ mod avp_tree_tests {
             flags: AVP_FLAG_MANDATORY,
             value: AvpData::Grouped(vec![
                 Avp::u32(dictionary::avp::VENDOR_ID, 0, dictionary::VENDOR_3GPP),
-                Avp::u32(dictionary::avp::AUTH_APPLICATION_ID, 0, dictionary::CX_APP_ID),
+                Avp::u32(
+                    dictionary::avp::AUTH_APPLICATION_ID,
+                    0,
+                    dictionary::CX_APP_ID,
+                ),
             ]),
         };
         let wire = encode_avps(std::slice::from_ref(&inner));
@@ -1304,7 +1379,10 @@ mod avp_tree_tests {
     fn full_message_from_wire_to_wire() {
         let mut avps = Vec::new();
         avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "diam;1;1"));
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "mme.example.org"));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::ORIGIN_HOST,
+            "mme.example.org",
+        ));
         avps.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, 2001));
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
@@ -1320,7 +1398,10 @@ mod avp_tree_tests {
         assert!(msg.is_proxiable());
         assert_eq!(msg.hop_by_hop, 0x1122_3344);
         assert_eq!(msg.end_to_end, 0x5566_7788);
-        assert_eq!(msg.get_str(dictionary::avp::SESSION_ID).as_deref(), Some("diam;1;1"));
+        assert_eq!(
+            msg.get_str(dictionary::avp::SESSION_ID).as_deref(),
+            Some("diam;1;1")
+        );
 
         // Byte-exact round-trip for this well-formed (zero-padded) message.
         assert_eq!(msg.to_wire(), wire);
@@ -1366,13 +1447,22 @@ mod avp_tree_tests {
         // from_wire → to_wire → from_wire and assert structural stability.
         let mut avps = Vec::new();
         avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "scscf;42;7"));
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "scscf.ims.example.org"));
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_REALM, "ims.example.org"));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::ORIGIN_HOST,
+            "scscf.ims.example.org",
+        ));
+        avps.extend_from_slice(&encode_avp_utf8(
+            dictionary::avp::ORIGIN_REALM,
+            "ims.example.org",
+        ));
         avps.extend_from_slice(&encode_vendor_specific_app_id(
             dictionary::VENDOR_3GPP,
             dictionary::CX_APP_ID,
         ));
-        avps.extend_from_slice(&encode_avp_utf8_3gpp(dictionary::avp::PUBLIC_IDENTITY, "sip:alice@ims.example.org"));
+        avps.extend_from_slice(&encode_avp_utf8_3gpp(
+            dictionary::avp::PUBLIC_IDENTITY,
+            "sip:alice@ims.example.org",
+        ));
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_MULTIMEDIA_AUTH,

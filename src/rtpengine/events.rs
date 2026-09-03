@@ -32,10 +32,7 @@ pub enum RtpEngineEvent {
     /// A call's media went silent past the timeout and the engine tore it down
     /// (dead-path detection).  Emitted by the `siphon-rtp` native backend; the
     /// rtpengine NG backend does not currently surface this.
-    MediaTimeout {
-        call_id: String,
-        from_tag: String,
-    },
+    MediaTimeout { call_id: String, from_tag: String },
     /// End-of-call media summary (the structured twin of the `siphon_rtp::cdr`
     /// log block), emitted once when the engine tears a call down.  Carries the
     /// per-leg byte/packet counters and, when a userspace media actor measured
@@ -503,9 +500,8 @@ fn dict_i32(dict: &BencodeValue, key: &str) -> Option<i32> {
 /// Unrecognised events are returned as [`RtpEngineEvent::Unknown`] so callers
 /// can log them rather than silently dropping.
 pub fn classify_event(dict: &BencodeValue) -> Result<RtpEngineEvent, RtpEngineError> {
-    let event_name = dict_str(dict, "event").ok_or_else(|| {
-        RtpEngineError::Decode("event dict missing 'event' key".to_string())
-    })?;
+    let event_name = dict_str(dict, "event")
+        .ok_or_else(|| RtpEngineError::Decode("event dict missing 'event' key".to_string()))?;
 
     // rtpengine's current build emits "DTMF" (daemon/dtmf.c); older or
     // alternative builds emit "DTMF-receive", "DTMF-end".  Accept the set.
@@ -515,12 +511,10 @@ pub fn classify_event(dict: &BencodeValue) -> Result<RtpEngineEvent, RtpEngineEr
     );
 
     if is_dtmf {
-        let call_id = dict_str(dict, "call-id").ok_or_else(|| {
-            RtpEngineError::Decode("DTMF event missing 'call-id'".to_string())
-        })?;
-        let from_tag = dict_str(dict, "from-tag").ok_or_else(|| {
-            RtpEngineError::Decode("DTMF event missing 'from-tag'".to_string())
-        })?;
+        let call_id = dict_str(dict, "call-id")
+            .ok_or_else(|| RtpEngineError::Decode("DTMF event missing 'call-id'".to_string()))?;
+        let from_tag = dict_str(dict, "from-tag")
+            .ok_or_else(|| RtpEngineError::Decode("DTMF event missing 'from-tag'".to_string()))?;
         // rtpengine uses "code" on some builds, "digit" on others.
         let digit = dict_str(dict, "code")
             .or_else(|| dict_str(dict, "digit"))
@@ -557,7 +551,9 @@ pub async fn spawn_event_listener(
     listen_addr: SocketAddr,
     event_tx: mpsc::Sender<RtpEngineEvent>,
 ) -> Result<(), RtpEngineError> {
-    let listener = TcpListener::bind(listen_addr).await.map_err(RtpEngineError::from)?;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(RtpEngineError::from)?;
 
     info!(%listen_addr, "rtpengine event listener bound");
 
@@ -735,7 +731,9 @@ mod tests {
     #[test]
     fn classify_event_accepts_digit_key() {
         // "digit" instead of "code"
-        let bytes = b"d5:event4:DTMF7:call-id3:abc8:from-tag3:xyz5:digit1:78:durationi50e6:volumei0ee".to_vec();
+        let bytes =
+            b"d5:event4:DTMF7:call-id3:abc8:from-tag3:xyz5:digit1:78:durationi50e6:volumei0ee"
+                .to_vec();
         let dict = bencode::decode_full_dict(&bytes).unwrap();
         let event = classify_event(&dict).unwrap();
         match event {

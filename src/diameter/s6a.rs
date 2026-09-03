@@ -81,7 +81,10 @@ pub fn build_authentication_information_request(
         &requested,
     ));
 
-    avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::VISITED_PLMN_ID, visited_plmn_id));
+    avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::VISITED_PLMN_ID,
+        visited_plmn_id,
+    ));
 
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -185,7 +188,10 @@ pub fn build_update_location_request(
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, imsi));
     avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::RAT_TYPE, rat_type));
     avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::ULR_FLAGS, ulr_flags));
-    avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::VISITED_PLMN_ID, visited_plmn_id));
+    avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::VISITED_PLMN_ID,
+        visited_plmn_id,
+    ));
 
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -226,7 +232,10 @@ pub fn parse_ula(message: &codec::DiameterMessage) -> Option<UpdateLocationAnswe
     Some(UpdateLocationAnswer {
         result_code,
         experimental_result_code,
-        ula_flags: avps.get("ULA-Flags").and_then(|v| v.as_u64()).map(|n| n as u32),
+        ula_flags: avps
+            .get("ULA-Flags")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
         has_subscription_data: avps.get("Subscription-Data").is_some(),
     })
 }
@@ -299,7 +308,10 @@ mod tests {
         );
         let decoded = codec::decode_diameter(&air).unwrap();
         assert!(decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_AUTHENTICATION_INFORMATION);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_AUTHENTICATION_INFORMATION
+        );
         assert_eq!(decoded.application_id, dictionary::S6A_APP_ID);
         assert_eq!(
             decoded.avps.get("User-Name").and_then(|v| v.as_str()),
@@ -353,7 +365,10 @@ mod tests {
         );
         let decoded = codec::decode_diameter(&ulr).unwrap();
         assert_eq!(decoded.command_code, dictionary::CMD_UPDATE_LOCATION);
-        assert_eq!(decoded.avps.get("RAT-Type").and_then(|v| v.as_u64()), Some(1004));
+        assert_eq!(
+            decoded.avps.get("RAT-Type").and_then(|v| v.as_u64()),
+            Some(1004)
+        );
         assert_eq!(
             decoded.avps.get("ULR-Flags").and_then(|v| v.as_u64()),
             Some(ULR_FLAG_S6A_S6D_INDICATOR as u64)
@@ -381,7 +396,10 @@ mod tests {
 
         let mut avps = Vec::new();
         avps.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "mme;1;1"));
-        avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, dictionary::DIAMETER_SUCCESS));
+        avps.extend_from_slice(&encode_avp_u32(
+            avp::RESULT_CODE,
+            dictionary::DIAMETER_SUCCESS,
+        ));
         avps.extend_from_slice(&auth_info);
         let aia = encode_diameter_message(
             FLAG_PROXIABLE,
@@ -405,7 +423,10 @@ mod tests {
         let subscription = encode_avp_grouped_3gpp(avp::SUBSCRIPTION_DATA, &[]);
         let mut avps = Vec::new();
         avps.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "mme;2;2"));
-        avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, dictionary::DIAMETER_SUCCESS));
+        avps.extend_from_slice(&encode_avp_u32(
+            avp::RESULT_CODE,
+            dictionary::DIAMETER_SUCCESS,
+        ));
         avps.extend_from_slice(&encode_avp_u32_3gpp(avp::ULA_FLAGS, 1));
         avps.extend_from_slice(&subscription);
         let ula = encode_diameter_message(

@@ -83,7 +83,12 @@ impl IdentityHeader {
     /// Accepts `request-uri` / `ruri` / `r-uri`, the header names (any case),
     /// and the `pai` / `ppi` shorthands.
     pub fn from_token(token: &str) -> Option<IdentityHeader> {
-        match token.trim().to_ascii_lowercase().replace([' ', '_'], "-").as_str() {
+        match token
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '_'], "-")
+            .as_str()
+        {
             "request-uri" | "ruri" | "r-uri" | "uri" => Some(IdentityHeader::RequestUri),
             "to" => Some(IdentityHeader::To),
             "from" => Some(IdentityHeader::From),
@@ -183,11 +188,7 @@ impl NumberPolicy {
     /// Build a simple policy that applies one format to a set of headers.
     ///
     /// Used for the inline (`request.rewrite_identities(format=…)`) case.
-    pub fn uniform(
-        locale: Locale,
-        format: NumberFormat,
-        headers: Vec<IdentityHeader>,
-    ) -> Self {
+    pub fn uniform(locale: Locale, format: NumberFormat, headers: Vec<IdentityHeader>) -> Self {
         Self {
             name: "(inline)".to_string(),
             locale,
@@ -960,7 +961,10 @@ mod tests {
         let pai = message.headers.get("P-Asserted-Identity").unwrap();
         // Both entries rewritten, tel scheme preserved.
         assert!(pai.contains("tel:+31612345678"), "pai was {pai}");
-        assert!(pai.contains("sip:+31612345678@example.com"), "pai was {pai}");
+        assert!(
+            pai.contains("sip:+31612345678@example.com"),
+            "pai was {pai}"
+        );
     }
 
     // ---- Diversion family --------------------------------------------------
@@ -997,8 +1001,14 @@ mod tests {
         let policy = diversion_policy(NumberFormat::E164);
         apply(&mut message, &policy);
         let diversion = message.headers.get("Diversion").unwrap();
-        assert!(diversion.contains("+31201234567"), "diversion was {diversion}");
-        assert!(diversion.contains("reason=unconditional"), "was {diversion}");
+        assert!(
+            diversion.contains("+31201234567"),
+            "diversion was {diversion}"
+        );
+        assert!(
+            diversion.contains("reason=unconditional"),
+            "was {diversion}"
+        );
         assert!(diversion.contains("counter=1"), "was {diversion}");
     }
 
@@ -1154,7 +1164,11 @@ country_code: "44"
     fn reformat_target_normalizes_dial_uri() {
         let policy = e164_policy(vec![IdentityHeader::RequestUri]);
         assert_eq!(
-            reformat_target("sip:0201234567@ims.example.com", NumberFormat::E164, &policy),
+            reformat_target(
+                "sip:0201234567@ims.example.com",
+                NumberFormat::E164,
+                &policy
+            ),
             "sip:+31201234567@ims.example.com"
         );
         // Non-number target returned verbatim.
@@ -1192,8 +1206,7 @@ country_code: "44"
             ..Default::default()
         };
         let mut policies = HashMap::new();
-        let config: NumberPolicyConfig =
-            serde_yaml_ng::from_str("default: e164\n").unwrap();
+        let config: NumberPolicyConfig = serde_yaml_ng::from_str("default: e164\n").unwrap();
         policies.insert("teams-outbound@2026".to_string(), config);
         let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
         assert!(warnings.is_empty());

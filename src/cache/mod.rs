@@ -77,7 +77,8 @@ impl LocalLru {
         // Evict expired entries if at capacity
         if self.entries.len() >= self.max_entries {
             let ttl = self.ttl;
-            self.entries.retain(|_, entry| entry.inserted_at.elapsed() < ttl);
+            self.entries
+                .retain(|_, entry| entry.inserted_at.elapsed() < ttl);
         }
         // If still at capacity after eviction, remove oldest entry
         if self.entries.len() >= self.max_entries {
@@ -446,7 +447,10 @@ impl NamedCache {
         #[cfg(not(feature = "redis-backend"))]
         {
             let _ = prefix;
-            debug!(prefix = prefix, "list_len_sum: no Redis backend; returning None");
+            debug!(
+                prefix = prefix,
+                "list_len_sum: no Redis backend; returning None"
+            );
             None
         }
     }
@@ -597,7 +601,11 @@ impl CacheManager {
 mod tests {
     use super::*;
 
-    fn make_config(name: &str, ttl_secs: Option<u64>, max_entries: Option<usize>) -> NamedCacheConfig {
+    fn make_config(
+        name: &str,
+        ttl_secs: Option<u64>,
+        max_entries: Option<usize>,
+    ) -> NamedCacheConfig {
         NamedCacheConfig {
             name: name.to_string(),
             // Use a bogus URL so tests never hit a real Redis instance
@@ -702,7 +710,10 @@ mod tests {
     async fn list_push_returns_none_when_redis_unreachable() {
         let manager = CacheManager::new(&[make_config("queue", None, None)]);
         // Bogus Redis URL — backend is unreachable, op degrades.
-        assert!(manager.list_push("queue", "ims_queue_abc", "msg-1").await.is_none());
+        assert!(manager
+            .list_push("queue", "ims_queue_abc", "msg-1")
+            .await
+            .is_none());
     }
 
     #[tokio::test]

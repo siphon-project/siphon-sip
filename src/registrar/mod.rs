@@ -395,7 +395,11 @@ impl Registrar {
     /// accepted by this process from bindings restored from a peer or a
     /// previous boot.
     pub fn is_local_contact(&self, contact: &Contact) -> bool {
-        match (self.instance_identity.get(), contact.instance_id.as_deref(), contact.instance_epoch.as_deref()) {
+        match (
+            self.instance_identity.get(),
+            contact.instance_id.as_deref(),
+            contact.instance_epoch.as_deref(),
+        ) {
             (Some(identity), Some(id), Some(epoch)) => identity.id == id && identity.epoch == epoch,
             _ => false,
         }
@@ -510,7 +514,8 @@ impl Registrar {
     /// auxiliary maps.  Used by `restore_from_backend`.
     pub(crate) fn apply_aor_state(&self, aor: &str, state: backend::StoredAorState) {
         if !state.service_routes.is_empty() {
-            self.service_routes.insert(aor.to_string(), state.service_routes);
+            self.service_routes
+                .insert(aor.to_string(), state.service_routes);
         }
         if let Some(identity) = state.asserted_identity {
             self.asserted_identities.insert(aor.to_string(), identity);
@@ -519,7 +524,8 @@ impl Registrar {
             // Rebuild the derived alias index from the persisted AU list so
             // `lookup(alias)` works immediately after a restart.
             self.install_aliases(aor, &state.associated_uris);
-            self.associated_uris.insert(aor.to_string(), state.associated_uris);
+            self.associated_uris
+                .insert(aor.to_string(), state.associated_uris);
         }
     }
 
@@ -556,7 +562,21 @@ impl Registrar {
         source_addr: Option<SocketAddr>,
         source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![], FlowCapture::default(), Vec::new())
+        self.save_full(
+            aor,
+            uri,
+            expires_secs,
+            q,
+            call_id,
+            cseq,
+            source_addr,
+            source_transport,
+            None,
+            None,
+            vec![],
+            FlowCapture::default(),
+            Vec::new(),
+        )
     }
 
     /// Core save with all fields including +sip.instance and reg-id.
@@ -587,8 +607,19 @@ impl Registrar {
     ) -> Result<(), RegistrarError> {
         let capped = std::cmp::min(expires_secs, self.config.max_expires);
         self.save_full_uncapped(
-            aor, uri, capped, q, call_id, cseq, source_addr, source_transport,
-            sip_instance, reg_id, path, flow, params,
+            aor,
+            uri,
+            capped,
+            q,
+            call_id,
+            cseq,
+            source_addr,
+            source_transport,
+            sip_instance,
+            reg_id,
+            path,
+            flow,
+            params,
         )
     }
 
@@ -760,7 +791,9 @@ impl Registrar {
                     metrics.registrations_active.dec();
                 }
             }
-            self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
+            self.emit_event(RegistrationEvent::Deregistered {
+                aor: aor.to_string(),
+            });
             return Ok(());
         }
 
@@ -768,11 +801,13 @@ impl Registrar {
         // When a UE re-registers with a different port (e.g. IPsec port rotation),
         // the URI changes but the +sip.instance stays the same — match on instance first.
         let instance_match = contact.sip_instance.as_ref().and_then(|inst| {
-            contacts.iter().position(|c| {
-                c.sip_instance.as_ref().is_some_and(|ci| ci == inst)
-            })
+            contacts
+                .iter()
+                .position(|c| c.sip_instance.as_ref().is_some_and(|ci| ci == inst))
         });
-        let uri_match = contacts.iter().position(|c| c.uri.to_string() == uri_string);
+        let uri_match = contacts
+            .iter()
+            .position(|c| c.uri.to_string() == uri_string);
         let replace_idx = instance_match.or(uri_match);
 
         let is_refresh = replace_idx.is_some();
@@ -877,7 +912,9 @@ impl Registrar {
                 metrics.registrations_active.dec();
             }
         }
-        self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
+        self.emit_event(RegistrationEvent::Deregistered {
+            aor: aor.to_string(),
+        });
     }
 
     /// Remove all contacts for an AoR **without** emitting a change event.
@@ -1211,7 +1248,9 @@ impl Registrar {
                         metrics.registrations_active.dec();
                     }
                 }
-                self.emit_event(RegistrationEvent::Deregistered { aor: aor.to_string() });
+                self.emit_event(RegistrationEvent::Deregistered {
+                    aor: aor.to_string(),
+                });
             }
         }
     }
@@ -1276,9 +1315,7 @@ impl Registrar {
         if expires_secs == 0 {
             // Targeted AS-contact removal — same URI, AS-kind only.
             let before = contacts.len();
-            contacts.retain(|c| {
-                !(c.kind == ContactKind::As && c.uri.to_string() == uri_string)
-            });
+            contacts.retain(|c| !(c.kind == ContactKind::As && c.uri.to_string() == uri_string));
             if contacts.len() == before {
                 drop(entry);
                 return Ok(false);
@@ -1335,9 +1372,9 @@ impl Registrar {
 
         // Replace existing AS contact with the same URI; never collide
         // with a UE contact even if URIs happen to match.
-        let replace_idx = contacts.iter().position(|c| {
-            c.kind == ContactKind::As && c.uri.to_string() == uri_string
-        });
+        let replace_idx = contacts
+            .iter()
+            .position(|c| c.kind == ContactKind::As && c.uri.to_string() == uri_string);
         if let Some(idx) = replace_idx {
             contacts[idx] = contact;
         } else {
@@ -1369,7 +1406,21 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![], FlowCapture::default(), Vec::new())
+        self.save_full(
+            aor,
+            uri,
+            expires_secs,
+            q,
+            call_id,
+            cseq,
+            source_addr,
+            None,
+            sip_instance,
+            reg_id,
+            vec![],
+            FlowCapture::default(),
+            Vec::new(),
+        )
     }
 
     /// Generate a public GRUU for a contact with a `+sip.instance`.
@@ -1380,17 +1431,23 @@ impl Registrar {
         // Strip angle brackets from sip.instance ("urn:uuid:..." or "<urn:uuid:...>")
         let instance = sip_instance
             .trim()
-            .strip_prefix('"').unwrap_or(sip_instance.trim())
-            .strip_suffix('"').unwrap_or(sip_instance.trim())
-            .strip_prefix('<').unwrap_or(sip_instance.trim())
-            .strip_suffix('>').unwrap_or(sip_instance.trim());
+            .strip_prefix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_prefix('<')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('>')
+            .unwrap_or(sip_instance.trim());
 
         if instance.is_empty() {
             return None;
         }
 
         // Extract user@host from AoR (strip sip: prefix)
-        let aor_part = aor.strip_prefix("sip:").or_else(|| aor.strip_prefix("sips:"))?;
+        let aor_part = aor
+            .strip_prefix("sip:")
+            .or_else(|| aor.strip_prefix("sips:"))?;
         Some(format!("sip:{aor_part};gr={instance}"))
     }
 
@@ -1401,16 +1458,22 @@ impl Registrar {
     pub fn temp_gruu(aor: &str, sip_instance: &str, call_id: &str) -> Option<String> {
         let instance = sip_instance
             .trim()
-            .strip_prefix('"').unwrap_or(sip_instance.trim())
-            .strip_suffix('"').unwrap_or(sip_instance.trim())
-            .strip_prefix('<').unwrap_or(sip_instance.trim())
-            .strip_suffix('>').unwrap_or(sip_instance.trim());
+            .strip_prefix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_prefix('<')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('>')
+            .unwrap_or(sip_instance.trim());
 
         if instance.is_empty() {
             return None;
         }
 
-        let aor_part = aor.strip_prefix("sip:").or_else(|| aor.strip_prefix("sips:"))?;
+        let aor_part = aor
+            .strip_prefix("sip:")
+            .or_else(|| aor.strip_prefix("sips:"))?;
 
         // Extract domain from AoR
         let domain = aor_part.split('@').nth(1).unwrap_or(aor_part);
@@ -1702,10 +1765,14 @@ impl Registrar {
     pub fn lookup_by_instance(&self, aor: &str, sip_instance: &str) -> Vec<Contact> {
         let instance = sip_instance
             .trim()
-            .strip_prefix('"').unwrap_or(sip_instance.trim())
-            .strip_suffix('"').unwrap_or(sip_instance.trim())
-            .strip_prefix('<').unwrap_or(sip_instance.trim())
-            .strip_suffix('>').unwrap_or(sip_instance.trim());
+            .strip_prefix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('"')
+            .unwrap_or(sip_instance.trim())
+            .strip_prefix('<')
+            .unwrap_or(sip_instance.trim())
+            .strip_suffix('>')
+            .unwrap_or(sip_instance.trim());
 
         let primary = self.resolve_alias(aor);
         match self.bindings.get(primary.as_str()) {
@@ -1819,7 +1886,10 @@ impl Registrar {
         let uri_string = uri.to_string();
 
         // Replace existing contact with same URI, or append
-        if let Some(existing) = contacts.iter_mut().find(|c| c.uri.to_string() == uri_string) {
+        if let Some(existing) = contacts
+            .iter_mut()
+            .find(|c| c.uri.to_string() == uri_string)
+        {
             *existing = contact;
         } else {
             contacts.push(contact);
@@ -1887,10 +1957,7 @@ impl Registrar {
             // Cascade-clear AS contacts whose UE has expired out from
             // under them.  Keeps reginfo NOTIFY honest after the GC
             // pass.
-            let any_ue_left = entry
-                .value()
-                .iter()
-                .any(|c| c.kind == ContactKind::Ue);
+            let any_ue_left = entry.value().iter().any(|c| c.kind == ContactKind::Ue);
             if !any_ue_left {
                 entry.value_mut().clear();
             }
@@ -2031,9 +2098,33 @@ mod tests {
         let registrar = Registrar::default();
         // Two AoRs share inbound connection 7 (e.g. a PBX trunk multiplexing
         // registrations over one TCP socket); a third is on connection 8.
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
-        save_flow(&registrar, "sip:b@example.com", "b", "10.0.0.2", "tcp", Some(7), "c-b");
-        save_flow(&registrar, "sip:c@example.com", "c", "10.0.0.3", "tcp", Some(8), "c-c");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
+        save_flow(
+            &registrar,
+            "sip:b@example.com",
+            "b",
+            "10.0.0.2",
+            "tcp",
+            Some(7),
+            "c-b",
+        );
+        save_flow(
+            &registrar,
+            "sip:c@example.com",
+            "c",
+            "10.0.0.3",
+            "tcp",
+            Some(8),
+            "c-c",
+        );
 
         let removed = registrar.unregister_flow(7);
         assert_eq!(removed, 2);
@@ -2051,8 +2142,24 @@ mod tests {
         // A UDP binding whose deterministic ConnectionId happens to equal a
         // stream connection id must never be torn down by flow failure — UDP
         // has no closable socket.
-        save_flow(&registrar, "sip:stream@example.com", "s", "10.0.0.1", "tcp", Some(7), "c-s");
-        save_flow(&registrar, "sip:udp@example.com", "u", "10.0.0.2", "udp", Some(7), "c-u");
+        save_flow(
+            &registrar,
+            "sip:stream@example.com",
+            "s",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-s",
+        );
+        save_flow(
+            &registrar,
+            "sip:udp@example.com",
+            "u",
+            "10.0.0.2",
+            "udp",
+            Some(7),
+            "c-u",
+        );
 
         let removed = registrar.unregister_flow(7);
         assert_eq!(removed, 1);
@@ -2354,7 +2461,15 @@ mod tests {
     #[test]
     fn unregister_flow_unknown_id_is_noop() {
         let registrar = Registrar::default();
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
         assert_eq!(registrar.unregister_flow(999), 0);
         assert!(registrar.is_registered("sip:a@example.com"));
     }
@@ -2362,7 +2477,15 @@ mod tests {
     #[test]
     fn unregister_flow_emits_deregistered_event() {
         let registrar = Registrar::default();
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tls", Some(42), "c-a");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tls",
+            Some(42),
+            "c-a",
+        );
         // Subscribe after the save so we only observe the deregistration.
         let mut events = registrar.subscribe_events();
         assert_eq!(registrar.unregister_flow(42), 1);
@@ -2378,8 +2501,24 @@ mod tests {
     fn unregister_flow_removes_one_contact_keeps_siblings() {
         let registrar = Registrar::default();
         // Same AoR, two devices on two different connections.
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-1");
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.2", "tcp", Some(8), "c-2");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-1",
+        );
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.2",
+            "tcp",
+            Some(8),
+            "c-2",
+        );
 
         assert_eq!(registrar.unregister_flow(7), 1);
         let contacts = registrar.lookup("sip:a@example.com");
@@ -2393,7 +2532,15 @@ mod tests {
     #[test]
     fn connection_index_pruned_by_remove_all() {
         let registrar = Registrar::default();
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
         registrar.remove_all("sip:a@example.com");
         // Index pruned: a later flow failure for the same id finds nothing.
         assert_eq!(registrar.unregister_flow(7), 0);
@@ -2402,15 +2549,34 @@ mod tests {
     #[test]
     fn connection_index_pruned_by_remove_contact() {
         let registrar = Registrar::default();
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
-        registrar.remove_contact("sip:a@example.com", &contact_uri("a", "10.0.0.1").to_string());
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
+        registrar.remove_contact(
+            "sip:a@example.com",
+            &contact_uri("a", "10.0.0.1").to_string(),
+        );
         assert_eq!(registrar.unregister_flow(7), 0);
     }
 
     #[test]
     fn connection_index_pruned_by_expire_stale() {
         let registrar = Registrar::default();
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
         // Age the binding out without sleeping.
         if let Some(mut entry) = registrar.bindings.get_mut("sip:a@example.com") {
             for contact in entry.value_mut().iter_mut() {
@@ -2425,8 +2591,24 @@ mod tests {
     fn connection_index_follows_refresh_to_new_connection() {
         let registrar = Registrar::default();
         // Same +sip.instance re-registers over a new connection (id 7 → 8).
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(7), "c-a");
-        save_flow(&registrar, "sip:a@example.com", "a", "10.0.0.1", "tcp", Some(8), "c-a");
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(7),
+            "c-a",
+        );
+        save_flow(
+            &registrar,
+            "sip:a@example.com",
+            "a",
+            "10.0.0.1",
+            "tcp",
+            Some(8),
+            "c-a",
+        );
         // The old connection's failure no longer deregisters the refreshed binding.
         assert_eq!(registrar.unregister_flow(7), 0);
         assert!(registrar.is_registered("sip:a@example.com"));
@@ -2439,7 +2621,14 @@ mod tests {
     fn save_and_lookup() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "call-1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2452,13 +2641,34 @@ mod tests {
     fn lookup_returns_sorted_by_q() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:bob@example.com", contact_uri("bob", "10.0.0.1"), 3600, 0.5, "call-1".into(), 1)
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "10.0.0.1"),
+                3600,
+                0.5,
+                "call-1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:bob@example.com", contact_uri("bob", "10.0.0.2"), 3600, 1.0, "call-2".into(), 2)
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "10.0.0.2"),
+                3600,
+                1.0,
+                "call-2".into(),
+                2,
+            )
             .unwrap();
         registrar
-            .save("sip:bob@example.com", contact_uri("bob", "10.0.0.3"), 3600, 0.8, "call-3".into(), 3)
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "10.0.0.3"),
+                3600,
+                0.8,
+                "call-3".into(),
+                3,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:bob@example.com");
@@ -2483,7 +2693,10 @@ mod tests {
             .save(
                 "sip:1001@pbx.example",
                 contact,
-                3600, 1.0, "call-1".into(), 1,
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
             )
             .unwrap();
 
@@ -2545,7 +2758,14 @@ mod tests {
         // expired binding must not surface. Use a 0-expiry deregister path via
         // a short save then manual expiry is awkward; assert the empty case.
         registrar
-            .save("sip:1001@pbx.example", contact.clone(), 3600, 1.0, "c".into(), 1)
+            .save(
+                "sip:1001@pbx.example",
+                contact.clone(),
+                3600,
+                1.0,
+                "c".into(),
+                1,
+            )
             .unwrap();
         assert!(registrar.is_registered_contact("sip:1001@203.0.113.7:17514"));
 
@@ -2554,13 +2774,17 @@ mod tests {
             .save("sip:1001@pbx.example", contact, 0, 1.0, "c".into(), 2)
             .unwrap();
         assert!(!registrar.is_registered_contact("sip:1001@203.0.113.7:17514"));
-        assert!(registrar.lookup_contact("sip:1001@203.0.113.7:17514").is_empty());
+        assert!(registrar
+            .lookup_contact("sip:1001@203.0.113.7:17514")
+            .is_empty());
     }
 
     #[test]
     fn lookup_contact_unknown_returns_empty() {
         let registrar = Registrar::default();
-        assert!(registrar.lookup_contact("sip:nobody@203.0.113.7:17514").is_empty());
+        assert!(registrar
+            .lookup_contact("sip:nobody@203.0.113.7:17514")
+            .is_empty());
         assert!(!registrar.is_registered_contact("sip:nobody@203.0.113.7:17514"));
     }
 
@@ -2575,27 +2799,44 @@ mod tests {
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 as_uri,
-                3600, 1.0,
+                3600,
+                1.0,
                 vec![("+g.3gpp.smsip".to_string(), None)],
             )
             .unwrap());
 
         // The UE contact matches; the AS contact does not.
         assert!(registrar.is_registered_contact("sip:alice@10.0.0.1"));
-        assert!(registrar.lookup_contact("sip:mmtel@ims.example.com").is_empty());
+        assert!(registrar
+            .lookup_contact("sip:mmtel@ims.example.com")
+            .is_empty());
     }
 
     #[test]
     fn deregister_with_expires_zero() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "call-1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
             .unwrap();
         assert!(registrar.is_registered("sip:alice@example.com"));
 
         // Expires=0 removes the specific contact
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 0, 1.0, "call-1".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                0,
+                1.0,
+                "call-1".into(),
+                2,
+            )
             .unwrap();
         assert!(!registrar.is_registered("sip:alice@example.com"));
     }
@@ -2604,10 +2845,24 @@ mod tests {
     fn wildcard_deregister() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "call-1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.2"), 3600, 0.5, "call-2".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.2"),
+                3600,
+                0.5,
+                "call-2".into(),
+                2,
+            )
             .unwrap();
 
         registrar.remove_all("sip:alice@example.com");
@@ -2619,11 +2874,25 @@ mod tests {
     fn replace_existing_contact() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 0.5, "call-1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                0.5,
+                "call-1".into(),
+                1,
+            )
             .unwrap();
         // Re-register same URI with different q
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "call-1".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                2,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2640,21 +2909,35 @@ mod tests {
         let registrar = Registrar::new(config);
 
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.2"), 3600, 0.8, "c2".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.2"),
+                3600,
+                0.8,
+                "c2".into(),
+                2,
+            )
             .unwrap();
 
         let result = registrar.save(
             "sip:alice@example.com",
             contact_uri("alice", "10.0.0.3"),
-            3600, 0.5, "c3".into(), 3,
+            3600,
+            0.5,
+            "c3".into(),
+            3,
         );
-        assert_eq!(
-            result,
-            Err(RegistrarError::TooManyContacts { max: 2 })
-        );
+        assert_eq!(result, Err(RegistrarError::TooManyContacts { max: 2 }));
     }
 
     #[test]
@@ -2668,7 +2951,10 @@ mod tests {
         let result = registrar.save(
             "sip:alice@example.com",
             contact_uri("alice", "10.0.0.1"),
-            30, 1.0, "c1".into(), 1,
+            30,
+            1.0,
+            "c1".into(),
+            1,
         );
         assert_eq!(
             result,
@@ -2684,7 +2970,14 @@ mod tests {
         };
         let registrar = Registrar::new(config);
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 99999, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                99999,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2703,10 +2996,24 @@ mod tests {
         assert_eq!(registrar.aor_count(), 0);
 
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:bob@example.com", contact_uri("bob", "10.0.0.2"), 3600, 1.0, "c2".into(), 2)
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "10.0.0.2"),
+                3600,
+                1.0,
+                "c2".into(),
+                2,
+            )
             .unwrap();
         assert_eq!(registrar.aor_count(), 2);
     }
@@ -2719,7 +3026,14 @@ mod tests {
             epoch: "boot-1".to_string(),
         });
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2732,7 +3046,14 @@ mod tests {
     fn save_without_identity_leaves_fields_none() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -2847,7 +3168,11 @@ mod tests {
                 params: Vec::new(),
                 kind: ContactKind::Ue,
             };
-            registrar.bindings.entry("sip:alice@example.com".to_string()).or_default().push(contact);
+            registrar
+                .bindings
+                .entry("sip:alice@example.com".to_string())
+                .or_default()
+                .push(contact);
         }
         assert_eq!(registrar.aor_count(), 0); // expired contacts don't count
         registrar.expire_stale();
@@ -2868,8 +3193,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 path.clone(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -2892,8 +3223,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "old-handset".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "old-handset".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 Vec::new(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -2903,8 +3240,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.2"),
-                3600, 1.0, "new-handset".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "new-handset".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 Vec::new(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -2935,8 +3278,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "preferred-but-old".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "preferred-but-old".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 Vec::new(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -2946,8 +3295,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.2"),
-                3600, 0.3, "recent-but-deprioritised".into(), 1,
-                None, None, None, None,
+                3600,
+                0.3,
+                "recent-but-deprioritised".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 Vec::new(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -2972,8 +3327,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 Vec::new(),
                 FlowCapture::default(),
                 Vec::new(),
@@ -3000,8 +3361,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
                 vec!["<sip:old-pcscf.example.com;lr>".to_string()],
                 FlowCapture::default(),
                 Vec::new(),
@@ -3013,8 +3380,14 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c2".into(), 2,
-                None, None, None, None,
+                3600,
+                1.0,
+                "c2".into(),
+                2,
+                None,
+                None,
+                None,
+                None,
                 vec!["<sip:new-pcscf.example.com;lr>".to_string()],
                 FlowCapture::default(),
                 Vec::new(),
@@ -3030,7 +3403,14 @@ mod tests {
     fn path_empty_when_not_provided() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
@@ -3042,10 +3422,24 @@ mod tests {
     fn all_contacts_returns_across_aors() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:bob@example.com", contact_uri("bob", "10.0.0.2"), 3600, 1.0, "c2".into(), 2)
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "10.0.0.2"),
+                3600,
+                1.0,
+                "c2".into(),
+                2,
+            )
             .unwrap();
 
         let all = registrar.all_contacts();
@@ -3059,10 +3453,24 @@ mod tests {
     fn remove_contact_removes_specific_uri() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.2"), 3600, 0.8, "c2".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.2"),
+                3600,
+                0.8,
+                "c2".into(),
+                2,
+            )
             .unwrap();
         assert_eq!(registrar.lookup("sip:alice@example.com").len(), 2);
 
@@ -3076,7 +3484,14 @@ mod tests {
     fn remove_contact_cleans_up_empty_aor() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         registrar.remove_contact("sip:alice@example.com", "sip:alice@10.0.0.1");
@@ -3088,14 +3503,23 @@ mod tests {
     fn remove_contact_emits_deregistered_event() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let mut receiver = registrar.subscribe_events();
         registrar.remove_contact("sip:alice@example.com", "sip:alice@10.0.0.1");
 
         let event = receiver.try_recv().unwrap();
-        assert!(matches!(event, RegistrationEvent::Deregistered { ref aor } if aor == "sip:alice@example.com"));
+        assert!(
+            matches!(event, RegistrationEvent::Deregistered { ref aor } if aor == "sip:alice@example.com")
+        );
     }
 
     #[test]
@@ -3122,7 +3546,9 @@ mod tests {
     #[test]
     fn service_route_empty_returns_empty() {
         let registrar = Registrar::default();
-        assert!(registrar.service_routes("sip:nobody@example.com").is_empty());
+        assert!(registrar
+            .service_routes("sip:nobody@example.com")
+            .is_empty());
     }
 
     #[test]
@@ -3137,7 +3563,14 @@ mod tests {
     fn service_route_cleared_on_remove_all() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar.set_service_routes("sip:alice@example.com", vec!["<sip:scscf@x;lr>".into()]);
 
@@ -3150,8 +3583,12 @@ mod tests {
         let gruu = Registrar::public_gruu(
             "sip:alice@example.com",
             "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>",
-        ).unwrap();
-        assert_eq!(gruu, "sip:alice@example.com;gr=urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6");
+        )
+        .unwrap();
+        assert_eq!(
+            gruu,
+            "sip:alice@example.com;gr=urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+        );
     }
 
     #[test]
@@ -3160,7 +3597,8 @@ mod tests {
             "sip:alice@example.com",
             "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>",
             "call-1@host",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(gruu.starts_with("sip:tgruu."));
         assert!(gruu.contains("@example.com;gr"));
     }
@@ -3180,7 +3618,10 @@ mod tests {
             .save_with_gruu(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
                 None,
                 Some(instance.to_string()),
                 Some(1),
@@ -3205,7 +3646,10 @@ mod tests {
             .save_with_gruu(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
                 None,
                 Some(instance.to_string()),
                 Some(1),
@@ -3220,7 +3664,10 @@ mod tests {
             .save_with_gruu(
                 "sip:alice@example.com",
                 uri2.clone(),
-                3600, 1.0, "c2".into(), 2,
+                3600,
+                1.0,
+                "c2".into(),
+                2,
                 None,
                 Some(instance.to_string()),
                 Some(1),
@@ -3238,7 +3685,14 @@ mod tests {
     fn lookup_by_instance_no_match() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         let contacts = registrar.lookup_by_instance("sip:alice@example.com", "<urn:uuid:none>");
         assert!(contacts.is_empty());
@@ -3252,8 +3706,12 @@ mod tests {
             .save_with_source(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                Some(addr), Some("tls".to_string()),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                Some(addr),
+                Some("tls".to_string()),
             )
             .unwrap();
 
@@ -3268,7 +3726,10 @@ mod tests {
         registrar.save_pending(
             "sip:alice@example.com",
             contact_uri("alice", "10.0.0.1"),
-            3600, 1.0, "c1".into(), 1,
+            3600,
+            1.0,
+            "c1".into(),
+            1,
         );
 
         // Contact exists but is pending
@@ -3288,7 +3749,10 @@ mod tests {
         let registrar = Registrar::default();
         assert_eq!(registrar.asserted_identity("sip:alice@example.com"), None);
 
-        registrar.set_asserted_identity("sip:alice@example.com", "sip:+15551234@ims.example.com".to_string());
+        registrar.set_asserted_identity(
+            "sip:alice@example.com",
+            "sip:+15551234@ims.example.com".to_string(),
+        );
         assert_eq!(
             registrar.asserted_identity("sip:alice@example.com"),
             Some("sip:+15551234@ims.example.com".to_string()),
@@ -3301,7 +3765,14 @@ mod tests {
 
         // UDP contact — should survive
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         // TLS contact — should be evicted
@@ -3336,7 +3807,14 @@ mod tests {
 
         // Same AoR, two contacts: one UDP, one TLS
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         let tls_uri = SipUri::new("10.0.0.2".to_string())
             .with_user("alice".to_string())
@@ -3361,7 +3839,14 @@ mod tests {
         let registrar = Registrar::default();
         let mut rx = registrar.subscribe_events();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         // Drain the Registered event
         let _ = rx.try_recv();
@@ -3377,7 +3862,14 @@ mod tests {
     fn force_save_then_deregister_emits_single_event() {
         let registrar = Registrar::default();
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let mut rx = registrar.subscribe_events();
@@ -3385,7 +3877,14 @@ mod tests {
         // Simulate force=True + Expires: 0 (what PyRegistrar::save does)
         registrar.clear_bindings("sip:alice@example.com");
         registrar
-            .save("sip:alice@example.com", contact_uri("alice", "10.0.0.1"), 0, 1.0, "c1".into(), 2)
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                0,
+                1.0,
+                "c1".into(),
+                2,
+            )
             .unwrap();
 
         // Should get exactly one Deregistered event (from save with expires=0)
@@ -3418,7 +3917,14 @@ mod tests {
         // Re-store and clear via remove_all
         registrar.set_associated_uris(aor, uris.clone());
         registrar
-            .save(aor, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                aor,
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar.remove_all(aor);
         assert!(registrar.associated_uris(aor).is_empty());
@@ -3431,7 +3937,14 @@ mod tests {
         let registrar = Registrar::default();
         let primary = "sip:alice@ims.example.com";
         registrar
-            .save(primary, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                primary,
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
         registrar.set_associated_uris(
             primary,
@@ -3460,10 +3973,7 @@ mod tests {
         let primary = "sip:alice@ims.example.com";
         registrar.set_associated_uris(
             primary,
-            vec![
-                primary.to_string(),
-                "tel:+15551234".to_string(),
-            ],
+            vec![primary.to_string(), "tel:+15551234".to_string()],
         );
 
         // The primary URI in the AU list must not become an alias of itself
@@ -3483,17 +3993,11 @@ mod tests {
     fn alias_index_replaces_on_resave() {
         let registrar = Registrar::default();
         let primary = "sip:alice@ims.example.com";
-        registrar.set_associated_uris(
-            primary,
-            vec!["tel:+15550000".to_string()],
-        );
+        registrar.set_associated_uris(primary, vec!["tel:+15550000".to_string()]);
         assert!(registrar.aliases.contains_key("sip:tel:+15550000"));
 
         // Replace the implicit set with a different list.
-        registrar.set_associated_uris(
-            primary,
-            vec!["tel:+15551111".to_string()],
-        );
+        registrar.set_associated_uris(primary, vec!["tel:+15551111".to_string()]);
         assert!(!registrar.aliases.contains_key("sip:tel:+15550000"));
         assert!(registrar.aliases.contains_key("sip:tel:+15551111"));
     }
@@ -3502,14 +4006,18 @@ mod tests {
     fn alias_index_resolved_on_save() {
         let registrar = Registrar::default();
         let primary = "sip:alice@ims.example.com";
-        registrar.set_associated_uris(
-            primary,
-            vec!["tel:+15551234".to_string()],
-        );
+        registrar.set_associated_uris(primary, vec!["tel:+15551234".to_string()]);
 
         // REGISTER arrives with To = alias; bindings should still land on primary.
         registrar
-            .save("sip:tel:+15551234", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                "sip:tel:+15551234",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
 
         let by_primary = registrar.lookup(primary);
@@ -3526,12 +4034,16 @@ mod tests {
         let registrar = Registrar::default();
         let primary = "sip:alice@ims.example.com";
         registrar
-            .save(primary, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .save(
+                primary,
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+            )
             .unwrap();
-        registrar.set_associated_uris(
-            primary,
-            vec!["tel:+15551234".to_string()],
-        );
+        registrar.set_associated_uris(primary, vec!["tel:+15551234".to_string()]);
         assert!(registrar.aliases.contains_key("sip:tel:+15551234"));
 
         registrar.remove_all(primary);
@@ -3551,10 +4063,7 @@ mod tests {
 
         // Same caller now claims a different IMPU as the implicit set —
         // calling via the alias should land on the primary.
-        registrar.set_associated_uris(
-            "sip:tel:+15550000",
-            vec!["tel:+15551111".to_string()],
-        );
+        registrar.set_associated_uris("sip:tel:+15550000", vec!["tel:+15551111".to_string()]);
 
         assert_eq!(
             registrar.associated_uris(primary),
@@ -3584,15 +4093,23 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                Some("10.0.0.1:5066".parse().unwrap()), Some("udp".into()),
-                None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                Some("10.0.0.1:5066".parse().unwrap()),
+                Some("udp".into()),
+                None,
+                None,
+                vec![],
                 flow_capture("token-abc", 5066, 5066),
                 Vec::new(),
             )
             .unwrap();
 
-        let resolved = registrar.lookup_by_token("token-abc").expect("token resolves");
+        let resolved = registrar
+            .lookup_by_token("token-abc")
+            .expect("token resolves");
         assert_eq!(resolved.0, "sip:alice@ims.example.com");
         assert_eq!(resolved.1.flow_token.as_deref(), Some("token-abc"));
         assert_eq!(resolved.1.inbound_local_addr.unwrap().port(), 5066);
@@ -3615,9 +4132,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, Some("udp".into()),
-                Some(instance.clone()), None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                Some("udp".into()),
+                Some(instance.clone()),
+                None,
+                vec![],
                 flow_capture("token-old", 5066, 5066),
                 Vec::new(),
             )
@@ -3626,9 +4149,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c2".into(), 2,
-                None, Some("udp".into()),
-                Some(instance), None, vec![],
+                3600,
+                1.0,
+                "c2".into(),
+                2,
+                None,
+                Some("udp".into()),
+                Some(instance),
+                None,
+                vec![],
                 flow_capture("token-new", 5066, 5066),
                 Vec::new(),
             )
@@ -3657,9 +4186,15 @@ mod tests {
                 .save_full(
                     "sip:alice@ims.example.com",
                     contact_uri("alice", "10.0.0.1"),
-                    3600, 1.0, format!("c{cseq}"), cseq,
-                    None, Some("udp".into()),
-                    Some(instance.clone()), None, vec![],
+                    3600,
+                    1.0,
+                    format!("c{cseq}"),
+                    cseq,
+                    None,
+                    Some("udp".into()),
+                    Some(instance.clone()),
+                    None,
+                    vec![],
                     flow_capture("token-stable", 5066, 5066),
                     Vec::new(),
                 )
@@ -3678,9 +4213,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, Some("udp".into()),
-                None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                Some("udp".into()),
+                None,
+                None,
+                vec![],
                 flow_capture("token-x", 5066, 5066),
                 Vec::new(),
             )
@@ -3691,10 +4232,16 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                0, 1.0, "c2".into(), 2,                 // Expires: 0
-                None, Some("udp".into()),
-                None, None, vec![],
-                FlowCapture::default(),                  // de-REGISTER carries no token
+                0,
+                1.0,
+                "c2".into(),
+                2, // Expires: 0
+                None,
+                Some("udp".into()),
+                None,
+                None,
+                vec![],
+                FlowCapture::default(), // de-REGISTER carries no token
                 Vec::new(),
             )
             .unwrap();
@@ -3711,9 +4258,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, Some("udp".into()),
-                None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                Some("udp".into()),
+                None,
+                None,
+                vec![],
                 flow_capture("tok-1", 5066, 5066),
                 Vec::new(),
             )
@@ -3752,7 +4305,11 @@ mod tests {
             params: vec![],
             kind: ContactKind::Ue,
         };
-        registrar.bindings.entry(aor.clone()).or_default().push(stale);
+        registrar
+            .bindings
+            .entry(aor.clone())
+            .or_default()
+            .push(stale);
         registrar.tokens.insert("tok-gc".into(), aor);
 
         registrar.expire_stale();
@@ -3787,13 +4344,19 @@ mod tests {
             params: vec![],
             kind: ContactKind::Ue,
         };
-        registrar.bindings.entry(aor.clone()).or_default().push(live);
+        registrar
+            .bindings
+            .entry(aor.clone())
+            .or_default()
+            .push(live);
 
         // Index empty before rebuild — lookup misses.
         assert!(registrar.lookup_by_token("tok-restored").is_none());
 
         registrar.rebuild_token_index();
-        let resolved = registrar.lookup_by_token("tok-restored").expect("token now resolves");
+        let resolved = registrar
+            .lookup_by_token("tok-restored")
+            .expect("token now resolves");
         assert_eq!(resolved.0, aor);
     }
 
@@ -3837,9 +4400,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, Some("udp".into()),
-                None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                Some("udp".into()),
+                None,
+                None,
+                vec![],
                 flow_capture("tok-udp", 5066, 5066),
                 Vec::new(),
             )
@@ -3853,7 +4422,9 @@ mod tests {
             let template = entry.value()[0].clone();
             drop(entry);
             let mut tcp = template.clone();
-            tcp.uri.params.push(("transport".into(), Some("tcp".into())));
+            tcp.uri
+                .params
+                .push(("transport".into(), Some("tcp".into())));
             tcp.flow_token = Some("tok-tcp".into());
             tcp.inbound_connection_id = Some(99);
             tcp
@@ -3863,7 +4434,9 @@ mod tests {
             .entry("sip:alice@ims.example.com".to_string())
             .or_default()
             .push(tcp_contact);
-        registrar.tokens.insert("tok-tcp".into(), "sip:alice@ims.example.com".into());
+        registrar
+            .tokens
+            .insert("tok-tcp".into(), "sip:alice@ims.example.com".into());
 
         let evicted = registrar.evict_connection_oriented();
         assert_eq!(evicted, 1, "exactly one TCP binding must be evicted");
@@ -3906,7 +4479,11 @@ mod tests {
             params: vec![],
             kind: ContactKind::Ue,
         };
-        registrar.bindings.entry(aor.clone()).or_default().push(stale);
+        registrar
+            .bindings
+            .entry(aor.clone())
+            .or_default()
+            .push(stale);
         registrar.tokens.insert("tok".into(), aor);
 
         assert!(
@@ -3934,16 +4511,23 @@ mod tests {
                     r.save_full(
                         &aor,
                         SipUri::new("10.0.0.1".to_string()).with_user(format!("u{thread_id}_{i}")),
-                        3600, 1.0, format!("c{thread_id}-{i}"), 1,
-                        None, Some("udp".into()),
-                        None, None, vec![],
+                        3600,
+                        1.0,
+                        format!("c{thread_id}-{i}"),
+                        1,
+                        None,
+                        Some("udp".into()),
+                        None,
+                        None,
+                        vec![],
                         FlowCapture {
                             flow_token: Some(token),
                             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
                             inbound_connection_id: Some(thread_id * 1000 + i),
                         },
                         Vec::new(),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             }));
         }
@@ -3972,8 +4556,15 @@ mod tests {
             .save_full(
                 "sip:alice@example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
+                vec![],
                 FlowCapture::default(),
                 Vec::new(),
             )
@@ -4008,8 +4599,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
+                vec![],
                 FlowCapture::default(),
                 params.clone(),
             )
@@ -4030,8 +4628,15 @@ mod tests {
             .save_full(
                 "sip:bob@ims.example.com",
                 contact_uri("bob", "10.0.0.2"),
-                3600, 1.0, "c1".into(), 1,
-                None, None, None, None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                None,
+                None,
+                vec![],
                 FlowCapture::default(),
                 Vec::new(),
             )
@@ -4048,15 +4653,20 @@ mod tests {
         // see the old tag stick around (RFC 3261 §10.3 step 7: refresh
         // == replace).
         let registrar = Registrar::default();
-        let instance =
-            "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>".to_string();
+        let instance = "<urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>".to_string();
         registrar
             .save_full(
                 "sip:carol@ims.example.com",
                 contact_uri("carol", "10.0.0.3"),
-                3600, 1.0, "c1".into(), 1,
-                None, None,
-                Some(instance.clone()), None, vec![],
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                None,
+                None,
+                Some(instance.clone()),
+                None,
+                vec![],
                 FlowCapture::default(),
                 vec![("+g.3gpp.smsip".to_string(), None)],
             )
@@ -4065,9 +4675,15 @@ mod tests {
             .save_full(
                 "sip:carol@ims.example.com",
                 contact_uri("carol", "10.0.0.3"),
-                3600, 1.0, "c2".into(), 2,
-                None, None,
-                Some(instance), None, vec![],
+                3600,
+                1.0,
+                "c2".into(),
+                2,
+                None,
+                None,
+                Some(instance),
+                None,
+                vec![],
                 FlowCapture::default(),
                 vec![("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string()))],
             )
@@ -4088,8 +4704,15 @@ mod tests {
             .save_full(
                 aor,
                 contact_uri(user, host),
-                3600, 1.0, format!("c-{user}"), 1,
-                None, None, None, None, vec![],
+                3600,
+                1.0,
+                format!("c-{user}"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                vec![],
                 FlowCapture::default(),
                 Vec::new(),
             )
@@ -4102,8 +4725,7 @@ mod tests {
         // to the registration.  Without a UE binding, refusing to write
         // the AS contact keeps reginfo emission honest.
         let registrar = Registrar::default();
-        let as_uri = SipUri::new("ims.example.com".to_string())
-            .with_user("mmtel".into());
+        let as_uri = SipUri::new("ims.example.com".to_string()).with_user("mmtel".into());
         let saved = registrar
             .save_as_contact(
                 "sip:alice@ims.example.com",
@@ -4122,23 +4744,17 @@ mod tests {
         let registrar = Registrar::default();
         save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
 
-        let as_uri = SipUri::new("ims.example.com".to_string())
-            .with_user("mmtel".into());
+        let as_uri = SipUri::new("ims.example.com".to_string()).with_user("mmtel".into());
         let saved = registrar
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 as_uri,
                 3600,
                 1.0,
-                vec![
-                    (
-                        "+g.3gpp.icsi-ref".to_string(),
-                        Some(
-                            "\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
-                                .to_string(),
-                        ),
-                    ),
-                ],
+                vec![(
+                    "+g.3gpp.icsi-ref".to_string(),
+                    Some("\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"".to_string()),
+                )],
             )
             .unwrap();
         assert!(saved);
@@ -4162,7 +4778,8 @@ mod tests {
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
-                3600, 1.0,
+                3600,
+                1.0,
                 vec![("+g.3gpp.smsip".to_string(), None)],
             )
             .unwrap();
@@ -4177,14 +4794,14 @@ mod tests {
         let registrar = Registrar::default();
         save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
 
-        let as_uri = SipUri::new("ims.example.com".to_string())
-            .with_user("mmtel".into());
+        let as_uri = SipUri::new("ims.example.com".to_string()).with_user("mmtel".into());
 
         registrar
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 as_uri.clone(),
-                3600, 1.0,
+                3600,
+                1.0,
                 vec![("+g.3gpp.smsip".to_string(), None)],
             )
             .unwrap();
@@ -4193,7 +4810,8 @@ mod tests {
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 as_uri,
-                3600, 1.0,
+                3600,
+                1.0,
                 vec![("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string()))],
             )
             .unwrap();
@@ -4216,12 +4834,22 @@ mod tests {
         let ipsmgw = SipUri::new("ims.example.com".to_string()).with_user("ipsmgw".into());
 
         registrar
-            .save_as_contact("sip:alice@ims.example.com", mmtel.clone(), 3600, 1.0,
-                vec![("+g.3gpp.smsip".to_string(), None)])
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                mmtel.clone(),
+                3600,
+                1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
             .unwrap();
         registrar
-            .save_as_contact("sip:alice@ims.example.com", ipsmgw, 3600, 1.0,
-                vec![("+g.3gpp.smsip".to_string(), None)])
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                ipsmgw,
+                3600,
+                1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
             .unwrap();
 
         // Targeted removal of just the mmtel AS contact.
@@ -4249,7 +4877,8 @@ mod tests {
             .save_as_contact(
                 "sip:alice@ims.example.com",
                 SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
-                3600, 1.0,
+                3600,
+                1.0,
                 vec![("+g.3gpp.smsip".to_string(), None)],
             )
             .unwrap();
@@ -4259,8 +4888,15 @@ mod tests {
             .save_full(
                 "sip:alice@ims.example.com",
                 contact_uri("alice", "10.0.0.1"),
-                0, 1.0, "c-dereg".into(), 2,
-                None, None, None, None, vec![],
+                0,
+                1.0,
+                "c-dereg".into(),
+                2,
+                None,
+                None,
+                None,
+                None,
+                vec![],
                 FlowCapture::default(),
                 Vec::new(),
             )

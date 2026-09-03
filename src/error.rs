@@ -68,7 +68,10 @@ mod tests {
     #[test]
     fn rtpengine_error_display() {
         let error = SiphonError::RtpEngine("timeout talking to RTPEngine".to_string());
-        assert_eq!(error.to_string(), "RTPEngine error: timeout talking to RTPEngine");
+        assert_eq!(
+            error.to_string(),
+            "RTPEngine error: timeout talking to RTPEngine"
+        );
     }
 
     #[test]

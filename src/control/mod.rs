@@ -176,7 +176,11 @@ pub fn spawn_control_plane(config: &ControlConfig, extra_adapters: Vec<Arc<dyn C
 
     // Command consumer: routes each command to its adapter (or handles a
     // substrate verb) as a plain async task — zero blocking-pool slots.
-    tokio::spawn(run_consumer(Arc::clone(&bus), Arc::clone(&adapters), command_rx));
+    tokio::spawn(run_consumer(
+        Arc::clone(&bus),
+        Arc::clone(&adapters),
+        command_rx,
+    ));
 
     if let Some(listen) = config.listen.as_deref() {
         match listen.parse::<SocketAddr>() {
@@ -219,7 +223,17 @@ async fn run_consumer(
                 response_tx,
                 ..
             } = command;
-            let result = dispatch(&bus, &adapters, &app, conn_id, module.as_deref(), &verb, target, args).await;
+            let result = dispatch(
+                &bus,
+                &adapters,
+                &app,
+                conn_id,
+                module.as_deref(),
+                &verb,
+                target,
+                args,
+            )
+            .await;
             let _ = response_tx.send(result);
         });
     }
@@ -304,7 +318,9 @@ async fn dispatch(
                     }
                 };
                 let value = bus.get_var(&channel_id, key);
-                return ControlResult::Ok(serde_json::json!({ "channel": channel_id, "key": key, "value": value }));
+                return ControlResult::Ok(
+                    serde_json::json!({ "channel": channel_id, "key": key, "value": value }),
+                );
             }
         }
         _ => {}
@@ -368,7 +384,11 @@ async fn dispatch(
 /// Build a resync channel snapshot (ids + current state + vars).
 fn channel_snapshot(bus: &Arc<ControlBus>, channel: &ChannelRef) -> serde_json::Value {
     let state = crate::b2bua::actor::global_call_store()
-        .and_then(|store| store.get_call(&channel.call_actor_id).map(|call| call_state_str(&call.state)))
+        .and_then(|store| {
+            store
+                .get_call(&channel.call_actor_id)
+                .map(|call| call_state_str(&call.state))
+        })
         .unwrap_or("gone");
     serde_json::json!({
         "channel": channel.channel_id,
@@ -406,7 +426,10 @@ mod tests {
 
     fn sip_only() -> HashMap<String, Arc<dyn ControlAdapter>> {
         let mut adapters: HashMap<String, Arc<dyn ControlAdapter>> = HashMap::new();
-        adapters.insert("sip".to_string(), Arc::new(sip_adapter::SipControlAdapter::new()));
+        adapters.insert(
+            "sip".to_string(),
+            Arc::new(sip_adapter::SipControlAdapter::new()),
+        );
         adapters
     }
 
@@ -421,7 +444,14 @@ mod tests {
             3000,
         );
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("ch1", &conn, "call-uuid", "sipcid@h", "hangup", Default::default());
+        bus.register_channel(
+            "ch1",
+            &conn,
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            Default::default(),
+        );
         (bus, conn)
     }
 
@@ -498,7 +528,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::Forbidden, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::Forbidden,
+                ..
+            }
         ));
     }
 
@@ -518,7 +551,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -538,7 +574,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 

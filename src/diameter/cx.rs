@@ -41,13 +41,11 @@ fn required_u32(avps: &serde_json::Value, name: &str) -> Option<u32> {
 
 /// Decode an OctetString AVP that is actually UTF-8 text (hex-encoded by the codec).
 pub(crate) fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> {
-    avps.get(name)
-        .and_then(|v| v.as_str())
-        .map(|hex_str| {
-            codec::hex::decode(hex_str)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| hex_str.to_string())
-        })
+    avps.get(name).and_then(|v| v.as_str()).map(|hex_str| {
+        codec::hex::decode(hex_str)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| hex_str.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +98,8 @@ impl CxAnswerBuilder {
             FLAG_PROXIABLE,
             command_code,
             dictionary::CX_APP_ID,
-            0, 0, // hbh/e2e filled by caller
+            0,
+            0, // hbh/e2e filled by caller
             &self.avp_buf,
         )
     }
@@ -204,7 +203,10 @@ pub fn parse_sar(incoming: &IncomingRequest) -> Option<ServerAssignmentRequest> 
         session_id: required_str(a, "Session-Id")?,
         origin_host: required_str(a, "Origin-Host")?,
         origin_realm: required_str(a, "Origin-Realm")?,
-        public_identity: a.get("Public-Identity").and_then(|v| v.as_str()).map(String::from),
+        public_identity: a
+            .get("Public-Identity")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         server_name: required_str(a, "Server-Name")?,
         assignment_type: required_u32(a, "Server-Assignment-Type")?,
         user_data_already_available: optional_u32(a, "User-Data-Already-Available"),
@@ -333,10 +335,22 @@ pub fn build_maa_success(
         avp::SIP_AUTHENTICATION_SCHEME,
         "Digest-AKAv1-MD5",
     ));
-    auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHENTICATE, vector.sip_authenticate));
-    auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHORIZATION, vector.sip_authorization));
-    auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::CONFIDENTIALITY_KEY, vector.confidentiality_key));
-    auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::INTEGRITY_KEY, vector.integrity_key));
+    auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::SIP_AUTHENTICATE,
+        vector.sip_authenticate,
+    ));
+    auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::SIP_AUTHORIZATION,
+        vector.sip_authorization,
+    ));
+    auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::CONFIDENTIALITY_KEY,
+        vector.confidentiality_key,
+    ));
+    auth_children.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::INTEGRITY_KEY,
+        vector.integrity_key,
+    ));
     let auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
 
     // Extra AVPs beyond the standard answer scaffold
@@ -412,7 +426,11 @@ pub fn build_rta(
 ) -> Vec<u8> {
     CxAnswerBuilder::new(origin_host, origin_realm, session_id)
         .experimental_result(dictionary::DIAMETER_SUCCESS)
-        .build_with_ids(dictionary::CMD_REGISTRATION_TERMINATION, hop_by_hop, end_to_end)
+        .build_with_ids(
+            dictionary::CMD_REGISTRATION_TERMINATION,
+            hop_by_hop,
+            end_to_end,
+        )
 }
 
 /// Encode an RTR (Registration-Termination-Request) — HSS-initiated push.
@@ -493,10 +511,22 @@ mod tests {
     fn parse_and_verify_uar() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "cx;uar;1"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "icscf.ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:+15551234@ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_octet_3gpp(avp::VISITED_NETWORK_IDENTIFIER, b"ims.mnc001.mcc001.3gppnetwork.org"));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "icscf.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:+15551234@ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::VISITED_NETWORK_IDENTIFIER,
+            b"ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_AUTHORIZATION_TYPE, 0));
 
         let incoming = synthesize_request(dictionary::CMD_USER_AUTHORIZATION, &raw);
@@ -504,7 +534,10 @@ mod tests {
 
         assert_eq!(uar.session_id, "cx;uar;1");
         assert_eq!(uar.origin_host, "icscf.ims.mnc001.mcc001.3gppnetwork.org");
-        assert_eq!(uar.public_identity, "sip:+15551234@ims.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(
+            uar.public_identity,
+            "sip:+15551234@ims.mnc001.mcc001.3gppnetwork.org"
+        );
         assert_eq!(uar.visited_network_id, "ims.mnc001.mcc001.3gppnetwork.org");
         assert_eq!(uar.user_authorization_type, Some(0));
     }
@@ -515,8 +548,14 @@ mod tests {
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "cx;sar;1"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.ims.example.com"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.example.com"));
-        raw.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:alice@ims.example.com"));
-        raw.extend_from_slice(&encode_avp_utf8_3gpp(avp::SERVER_NAME, "sip:scscf1.ims.example.com:6060"));
+        raw.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:alice@ims.example.com",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::SERVER_NAME,
+            "sip:scscf1.ims.example.com:6060",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(avp::SERVER_ASSIGNMENT_TYPE, 1));
         raw.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
 
@@ -524,7 +563,10 @@ mod tests {
         let sar = parse_sar(&incoming).expect("SAR parsing failed");
 
         assert_eq!(sar.session_id, "cx;sar;1");
-        assert_eq!(sar.public_identity.as_deref(), Some("sip:alice@ims.example.com"));
+        assert_eq!(
+            sar.public_identity.as_deref(),
+            Some("sip:alice@ims.example.com")
+        );
         assert_eq!(sar.server_name, "sip:scscf1.ims.example.com:6060");
         assert_eq!(sar.assignment_type, 1);
         assert_eq!(sar.user_data_already_available, Some(0));
@@ -536,7 +578,10 @@ mod tests {
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "cx;lir;1"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "icscf.ims.example.com"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.example.com"));
-        raw.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:bob@ims.example.com"));
+        raw.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:bob@ims.example.com",
+        ));
 
         let incoming = synthesize_request(dictionary::CMD_LOCATION_INFO, &raw);
         let lir = parse_lir(&incoming).expect("LIR parsing failed");
@@ -558,7 +603,10 @@ mod tests {
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "cx;mar;1"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.ims.example.com"));
         raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.example.com"));
-        raw.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:carol@ims.example.com"));
+        raw.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:carol@ims.example.com",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(avp::SIP_NUMBER_AUTH_ITEMS, 1));
         raw.extend_from_slice(&auth_data);
 
@@ -586,7 +634,8 @@ mod tests {
             "cx;mar;2",
             "sip:dave@ims.example.com",
             &vector,
-            42, 99,
+            42,
+            99,
         );
 
         let decoded = decode_diameter(&maa).unwrap();
@@ -595,13 +644,21 @@ mod tests {
         assert_eq!(decoded.application_id, dictionary::CX_APP_ID);
 
         // Verify standard fields
-        assert_eq!(decoded.avps.get("Session-Id").and_then(|v| v.as_str()), Some("cx;mar;2"));
-        assert_eq!(decoded.avps.get("Origin-Host").and_then(|v| v.as_str()), Some("hss.ims.example.com"));
+        assert_eq!(
+            decoded.avps.get("Session-Id").and_then(|v| v.as_str()),
+            Some("cx;mar;2")
+        );
+        assert_eq!(
+            decoded.avps.get("Origin-Host").and_then(|v| v.as_str()),
+            Some("hss.ims.example.com")
+        );
 
         // Verify auth vector
         let auth_item = decoded.avps.get("SIP-Auth-Data-Item").unwrap();
         assert_eq!(
-            auth_item.get("SIP-Authentication-Scheme").and_then(|v| v.as_str()),
+            auth_item
+                .get("SIP-Authentication-Scheme")
+                .and_then(|v| v.as_str()),
             Some("Digest-AKAv1-MD5")
         );
         assert!(auth_item.get("SIP-Authenticate").is_some());
@@ -617,7 +674,8 @@ mod tests {
             "cx;uar;2",
             Some("sip:scscf2.ims.example.com:6060"),
             dictionary::DIAMETER_FIRST_REGISTRATION,
-            10, 20,
+            10,
+            20,
         );
 
         let decoded = decode_diameter(&uaa).unwrap();
@@ -636,7 +694,8 @@ mod tests {
             "ims.example.com",
             "cx;lir;2",
             "sip:scscf3.ims.example.com:6060",
-            30, 40,
+            30,
+            40,
         );
 
         let decoded = decode_diameter(&lia).unwrap();
@@ -659,18 +718,34 @@ mod tests {
             "sip:eve@ims.example.com",
             deregistration_reason::PERMANENT_TERMINATION,
             Some("Admin-initiated removal"),
-            50, 60,
+            50,
+            60,
         );
 
         let decoded = decode_diameter(&rtr).unwrap();
         assert!(decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_REGISTRATION_TERMINATION);
-        assert_eq!(decoded.avps.get("Destination-Host").and_then(|v| v.as_str()), Some("scscf.ims.example.com"));
-        assert_eq!(decoded.avps.get("Public-Identity").and_then(|v| v.as_str()), Some("sip:eve@ims.example.com"));
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_REGISTRATION_TERMINATION
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Host")
+                .and_then(|v| v.as_str()),
+            Some("scscf.ims.example.com")
+        );
+        assert_eq!(
+            decoded.avps.get("Public-Identity").and_then(|v| v.as_str()),
+            Some("sip:eve@ims.example.com")
+        );
 
         let dr = decoded.avps.get("Deregistration-Reason").unwrap();
         assert_eq!(dr.get("Reason-Code").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(dr.get("Reason-Info").and_then(|v| v.as_str()), Some("Admin-initiated removal"));
+        assert_eq!(
+            dr.get("Reason-Info").and_then(|v| v.as_str()),
+            Some("Admin-initiated removal")
+        );
     }
 
     #[test]
@@ -685,7 +760,8 @@ mod tests {
             "sip:alice@ims.example.com",
             deregistration_reason::NEW_SERVER_ASSIGNED,
             Some("HSS migration"),
-            70, 80,
+            70,
+            80,
         );
 
         let decoded = decode_diameter(&rtr_bytes).unwrap();
@@ -718,7 +794,8 @@ mod tests {
             "sip:bob@ims.example.com",
             deregistration_reason::PERMANENT_TERMINATION,
             None,
-            90, 100,
+            90,
+            100,
         );
 
         let decoded = decode_diameter(&rtr_bytes).unwrap();
@@ -733,7 +810,10 @@ mod tests {
 
         let rtr = parse_rtr(&incoming).expect("parse_rtr failed");
         assert_eq!(rtr.public_identity, "sip:bob@ims.example.com");
-        assert_eq!(rtr.reason_code, deregistration_reason::PERMANENT_TERMINATION);
+        assert_eq!(
+            rtr.reason_code,
+            deregistration_reason::PERMANENT_TERMINATION
+        );
         assert!(rtr.reason_info.is_none());
     }
 
@@ -743,18 +823,23 @@ mod tests {
             "scscf.ims.example.com",
             "ims.example.com",
             "cx;rtr;42",
-            70, 80,
+            70,
+            80,
         );
 
         let decoded = decode_diameter(&rta).unwrap();
         assert!(!decoded.is_request, "RTA should not have request flag");
-        assert_eq!(decoded.command_code, dictionary::CMD_REGISTRATION_TERMINATION);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_REGISTRATION_TERMINATION
+        );
         assert_eq!(decoded.hop_by_hop, 70);
         assert_eq!(decoded.end_to_end, 80);
 
         // Verify Experimental-Result contains success code
         let er = decoded.avps.get("Experimental-Result").unwrap();
-        let rc = er.get("Experimental-Result-Code")
+        let rc = er
+            .get("Experimental-Result-Code")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
         assert_eq!(rc, Some(dictionary::DIAMETER_SUCCESS));

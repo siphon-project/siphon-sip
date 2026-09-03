@@ -231,8 +231,7 @@ impl SaRole {
 /// `XfrmInStateMismatch`.  When `Any` is selected, the XFRM selector
 /// stamps `proto = 0` (kernel-side "match any inner protocol"), so the
 /// same SPI pair covers both transports without doubling kernel state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaProtocol {
     /// IPPROTO_UDP (17).
     Udp,
@@ -272,7 +271,6 @@ impl SaProtocol {
         }
     }
 }
-
 
 impl std::fmt::Display for SaProtocol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -642,14 +640,12 @@ impl std::error::Error for IpsecError {}
 /// XFRM backend — either direct netlink (fast, requires CAP_NET_ADMIN
 /// on the netlink socket) or `/sbin/ip xfrm` shell-out (slower but
 /// works in any environment where ``ip`` itself works).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XfrmBackend {
     #[default]
     Netlink,
     IpCommand,
 }
-
 
 /// Manages active IPsec SAs for UE registrations.
 ///
@@ -700,7 +696,11 @@ impl IpsecManager {
     ///
     /// `spi_range_count` is clamped to at least 2 (we always need to
     /// allocate pairs).  Wraparound is handled inside `allocate_spi_pair`.
-    pub fn with_partition(backend: XfrmBackend, spi_range_start: u32, spi_range_count: u32) -> Self {
+    pub fn with_partition(
+        backend: XfrmBackend,
+        spi_range_start: u32,
+        spi_range_count: u32,
+    ) -> Self {
         let count = spi_range_count.max(2);
         let end = spi_range_start.saturating_add(count);
         Self {
@@ -749,10 +749,7 @@ impl IpsecManager {
     /// 2. PCSCF:port_ps → UE:port_uc, SPI=spi_uc (outbound replies)
     /// 3. PCSCF:port_pc → UE:port_us, SPI=spi_us (outbound requests)
     /// 4. UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound replies)
-    pub async fn create_sa_pair(
-        &self,
-        mut sa: SecurityAssociationPair,
-    ) -> Result<(), IpsecError> {
+    pub async fn create_sa_pair(&self, mut sa: SecurityAssociationPair) -> Result<(), IpsecError> {
         let key = Self::contact_key(&sa.ue_addr, sa.ue_port_c);
 
         // Stamp the authoritative sweep deadline from the SA's own hard
@@ -821,39 +818,67 @@ impl IpsecManager {
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
         self.add_sa(
-            &sa.ue_addr, sa.ue_port_c,
-            &sa.pcscf_addr, sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
             sa.spi_ps,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, sa.hard_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            sa.hard_lifetime_secs,
+        )
+        .await?;
 
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc (outbound from P-CSCF server)
         self.add_sa(
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            &sa.ue_addr, sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
             sa.spi_uc,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, sa.hard_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            sa.hard_lifetime_secs,
+        )
+        .await?;
 
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us (outbound from P-CSCF client)
         self.add_sa(
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            &sa.ue_addr, sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
             sa.spi_us,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, sa.hard_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            sa.hard_lifetime_secs,
+        )
+        .await?;
 
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound to P-CSCF client)
         self.add_sa(
-            &sa.ue_addr, sa.ue_port_s,
-            &sa.pcscf_addr, sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
             sa.spi_pc,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, sa.hard_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            sa.hard_lifetime_secs,
+        )
+        .await?;
 
         // Policies get the SAME hard lifetime as the states so they self-reap
         // on the same deadline (3GPP TS 33.203 §7.4); `None` = permanent.
@@ -864,31 +889,55 @@ impl IpsecManager {
 
         // Policy 1: UE:port_uc → PCSCF:port_ps (UE-sourced)
         self.add_policy(
-            &sa.ue_addr, sa.ue_port_c,
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            role.policy_dir(true), sa.spi_ps, proto, policy_lifetime,
-        ).await?;
+            &sa.ue_addr,
+            sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            role.policy_dir(true),
+            sa.spi_ps,
+            proto,
+            policy_lifetime,
+        )
+        .await?;
 
         // Policy 2: PCSCF:port_ps → UE:port_uc (P-CSCF-sourced)
         self.add_policy(
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            &sa.ue_addr, sa.ue_port_c,
-            role.policy_dir(false), sa.spi_uc, proto, policy_lifetime,
-        ).await?;
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
+            role.policy_dir(false),
+            sa.spi_uc,
+            proto,
+            policy_lifetime,
+        )
+        .await?;
 
         // Policy 3: PCSCF:port_pc → UE:port_us (P-CSCF-sourced)
         self.add_policy(
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            &sa.ue_addr, sa.ue_port_s,
-            role.policy_dir(false), sa.spi_us, proto, policy_lifetime,
-        ).await?;
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
+            role.policy_dir(false),
+            sa.spi_us,
+            proto,
+            policy_lifetime,
+        )
+        .await?;
 
         // Policy 4: UE:port_us → PCSCF:port_pc (UE-sourced)
         self.add_policy(
-            &sa.ue_addr, sa.ue_port_s,
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            role.policy_dir(true), sa.spi_pc, proto, policy_lifetime,
-        ).await?;
+            &sa.ue_addr,
+            sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            role.policy_dir(true),
+            sa.spi_pc,
+            proto,
+            policy_lifetime,
+        )
+        .await?;
 
         Ok(())
     }
@@ -905,33 +954,61 @@ impl IpsecManager {
         let role = sa.role;
 
         // States — keyed on (dst, spi); src is ignored by the kernel del.
-        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps).await.ok();
-        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc).await.ok();
-        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us).await.ok();
-        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await.ok();
+        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps)
+            .await
+            .ok();
+        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc)
+            .await
+            .ok();
+        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us)
+            .await
+            .ok();
+        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc)
+            .await
+            .ok();
 
         // Policies — the colliding objects; same four selectors + dirs as the
         // install, so this clears exactly what install_sa_kernel would add.
         self.del_policy(
-            &sa.ue_addr, sa.ue_port_c,
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            role.policy_dir(true), proto,
-        ).await.ok();
+            &sa.ue_addr,
+            sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            role.policy_dir(true),
+            proto,
+        )
+        .await
+        .ok();
         self.del_policy(
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            &sa.ue_addr, sa.ue_port_c,
-            role.policy_dir(false), proto,
-        ).await.ok();
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
+            role.policy_dir(false),
+            proto,
+        )
+        .await
+        .ok();
         self.del_policy(
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            &sa.ue_addr, sa.ue_port_s,
-            role.policy_dir(false), proto,
-        ).await.ok();
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
+            role.policy_dir(false),
+            proto,
+        )
+        .await
+        .ok();
         self.del_policy(
-            &sa.ue_addr, sa.ue_port_s,
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            role.policy_dir(true), proto,
-        ).await.ok();
+            &sa.ue_addr,
+            sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            role.policy_dir(true),
+            proto,
+        )
+        .await
+        .ok();
     }
 
     /// Create the UE-side IPsec SAs for an outbound IMS registration.
@@ -955,11 +1032,7 @@ impl IpsecManager {
     }
 
     /// Delete IPsec SAs and SPs for a UE.
-    pub async fn delete_sa_pair(
-        &self,
-        ue_addr: &IpAddr,
-        ue_port_c: u16,
-    ) -> Result<(), IpsecError> {
+    pub async fn delete_sa_pair(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
             // Best-effort teardown — every delete is independent, so a single
@@ -1001,11 +1074,7 @@ impl IpsecManager {
     /// Walks `associations` once (O(N) in active SA count); the inner
     /// `delete_sa_pair` call deletes four SAs + four policies per
     /// victim.
-    pub async fn cleanup_other_pairs_for_ue(
-        &self,
-        ue_addr: &IpAddr,
-        keep_port_c: u16,
-    ) {
+    pub async fn cleanup_other_pairs_for_ue(&self, ue_addr: &IpAddr, keep_port_c: u16) {
         let victim_ports: Vec<u16> = self
             .associations
             .iter()
@@ -1114,42 +1183,72 @@ impl IpsecManager {
         // leaving it pinned to the original install.  `None` (permanent SA)
         // carries through untouched.
         let kernel_lifetime_secs = hard_lifetime_secs.map(|requested| {
-            let elapsed = Instant::now().saturating_duration_since(sa.created_at).as_secs();
+            let elapsed = Instant::now()
+                .saturating_duration_since(sa.created_at)
+                .as_secs();
             requested.saturating_add(elapsed)
         });
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps
         self.update_sa_only(
-            &sa.ue_addr, sa.ue_port_c,
-            &sa.pcscf_addr, sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
             sa.spi_ps,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, kernel_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            kernel_lifetime_secs,
+        )
+        .await?;
         // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc
         self.update_sa_only(
-            &sa.pcscf_addr, sa.pcscf_port_s,
-            &sa.ue_addr, sa.ue_port_c,
+            &sa.pcscf_addr,
+            sa.pcscf_port_s,
+            &sa.ue_addr,
+            sa.ue_port_c,
             sa.spi_uc,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, kernel_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            kernel_lifetime_secs,
+        )
+        .await?;
         // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us
         self.update_sa_only(
-            &sa.pcscf_addr, sa.pcscf_port_c,
-            &sa.ue_addr, sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
             sa.spi_us,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, kernel_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            kernel_lifetime_secs,
+        )
+        .await?;
         // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc
         self.update_sa_only(
-            &sa.ue_addr, sa.ue_port_s,
-            &sa.pcscf_addr, sa.pcscf_port_c,
+            &sa.ue_addr,
+            sa.ue_port_s,
+            &sa.pcscf_addr,
+            sa.pcscf_port_c,
             sa.spi_pc,
-            &sa.ealg, &sa.aalg, &sa.encryption_key, &sa.integrity_key,
-            proto, kernel_lifetime_secs,
-        ).await?;
+            &sa.ealg,
+            &sa.aalg,
+            &sa.encryption_key,
+            &sa.integrity_key,
+            proto,
+            kernel_lifetime_secs,
+        )
+        .await?;
 
         info!(
             ue = %sa.ue_addr,
@@ -1312,11 +1411,7 @@ impl IpsecManager {
     }
 
     /// Get the SA pair for a UE (for inspection/logging).
-    pub fn get_sa(
-        &self,
-        ue_addr: &IpAddr,
-        ue_port_c: u16,
-    ) -> Option<SecurityAssociationPair> {
+    pub fn get_sa(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Option<SecurityAssociationPair> {
         self.associations
             .get(&Self::contact_key(ue_addr, ue_port_c))
             .map(|entry| entry.value().clone())
@@ -1327,11 +1422,7 @@ impl IpsecManager {
     /// inbound request's `(source_addr, source_port)` to the SA that
     /// just decrypted it.  Walks the DashMap — O(N) in number of
     /// currently active SAs.
-    pub fn find_sa_by_ue(
-        &self,
-        ue_addr: &IpAddr,
-        ue_port: u16,
-    ) -> Option<SecurityAssociationPair> {
+    pub fn find_sa_by_ue(&self, ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociationPair> {
         for entry in self.associations.iter() {
             let sa = entry.value();
             if sa.ue_addr == *ue_addr && (sa.ue_port_c == ue_port || sa.ue_port_s == ue_port) {
@@ -1688,18 +1779,30 @@ impl IpsecManager {
         // protocol token.  Putting them out of order makes iproute2 fail
         // with `argument "udp" is wrong: PROTO value is invalid`.
         let mut args = vec![
-            "xfrm", "state", "add",
-            "src", &source_str,
-            "dst", &destination_str,
-            "proto", "esp",
-            "spi", &spi_str,
-            "mode", "transport",
+            "xfrm",
+            "state",
+            "add",
+            "src",
+            &source_str,
+            "dst",
+            &destination_str,
+            "proto",
+            "esp",
+            "spi",
+            &spi_str,
+            "mode",
+            "transport",
             "sel",
-            "src", &sel_src,
-            "dst", &sel_dst,
-            "proto", proto_str,
-            "sport", &sel_sport,
-            "dport", &sel_dport,
+            "src",
+            &sel_src,
+            "dst",
+            &sel_dst,
+            "proto",
+            proto_str,
+            "sport",
+            &sel_sport,
+            "dport",
+            &sel_dport,
         ];
 
         let enc_key_hex = format!("0x{}", encryption_key);
@@ -1758,18 +1861,30 @@ impl IpsecManager {
         let lifetime_secs_str;
 
         let mut args = vec![
-            "xfrm", "state", "update",
-            "src", &source_str,
-            "dst", &destination_str,
-            "proto", "esp",
-            "spi", &spi_str,
-            "mode", "transport",
+            "xfrm",
+            "state",
+            "update",
+            "src",
+            &source_str,
+            "dst",
+            &destination_str,
+            "proto",
+            "esp",
+            "spi",
+            &spi_str,
+            "mode",
+            "transport",
             "sel",
-            "src", &sel_src,
-            "dst", &sel_dst,
-            "proto", proto_str,
-            "sport", &sel_sport,
-            "dport", &sel_dport,
+            "src",
+            &sel_src,
+            "dst",
+            &sel_dst,
+            "proto",
+            proto_str,
+            "sport",
+            &sel_sport,
+            "dport",
+            &sel_dport,
         ];
 
         let enc_key_hex = format!("0x{}", encryption_key);
@@ -1806,11 +1921,17 @@ impl IpsecManager {
         let spi_str = format!("0x{:x}", spi);
 
         let args = vec![
-            "xfrm", "state", "delete",
-            "src", &source_str,
-            "dst", &destination_str,
-            "proto", "esp",
-            "spi", &spi_str,
+            "xfrm",
+            "state",
+            "delete",
+            "src",
+            &source_str,
+            "dst",
+            &destination_str,
+            "proto",
+            "esp",
+            "spi",
+            &spi_str,
         ];
         Self::run_ip_command(&args).await
     }
@@ -1838,19 +1959,32 @@ impl IpsecManager {
         // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
         // grammar — see xfrm_sa_add for the same ordering constraint.
         let mut args = vec![
-            "xfrm", "policy", "add",
-            "src", &source_cidr,
-            "dst", &destination_cidr,
-            "proto", proto_str,
-            "sport", &source_port_str,
-            "dport", &destination_port_str,
-            "dir", direction,
+            "xfrm",
+            "policy",
+            "add",
+            "src",
+            &source_cidr,
+            "dst",
+            &destination_cidr,
+            "proto",
+            proto_str,
+            "sport",
+            &source_port_str,
+            "dport",
+            &destination_port_str,
+            "dir",
+            direction,
             "tmpl",
-            "src", &source_str,
-            "dst", &destination_str,
-            "proto", "esp",
-            "spi", &spi_str,
-            "mode", "transport",
+            "src",
+            &source_str,
+            "dst",
+            &destination_str,
+            "proto",
+            "esp",
+            "spi",
+            &spi_str,
+            "mode",
+            "transport",
         ];
 
         // Optional hard lifetime — mirrors xfrm_sa_add so a policy reaps
@@ -1882,13 +2016,21 @@ impl IpsecManager {
 
         // Same UPSPEC ordering as xfrm_policy_add — `proto X` first.
         let args = vec![
-            "xfrm", "policy", "delete",
-            "src", &source_cidr,
-            "dst", &destination_cidr,
-            "proto", proto_str,
-            "sport", &source_port_str,
-            "dport", &destination_port_str,
-            "dir", direction,
+            "xfrm",
+            "policy",
+            "delete",
+            "src",
+            &source_cidr,
+            "dst",
+            &destination_cidr,
+            "proto",
+            proto_str,
+            "sport",
+            &source_port_str,
+            "dport",
+            &destination_port_str,
+            "dir",
+            direction,
         ];
         Self::run_ip_command(&args).await
     }
@@ -1904,10 +2046,7 @@ impl IpsecManager {
     /// `ik` must be 16 bytes (128-bit IK from Milenage).  Returns the
     /// derived integrity key as raw bytes.  Returns `None` if the
     /// requested length cannot be derived.
-    pub fn derive_integrity_key(
-        aalg: IntegrityAlgorithm,
-        ik: &[u8],
-    ) -> Option<Vec<u8>> {
+    pub fn derive_integrity_key(aalg: IntegrityAlgorithm, ik: &[u8]) -> Option<Vec<u8>> {
         if ik.len() != 16 {
             return None;
         }
@@ -1936,9 +2075,7 @@ impl IpsecManager {
             .args(args)
             .output()
             .await
-            .map_err(|error| {
-                IpsecError::Command(format!("failed to run ip: {}", error))
-            })?;
+            .map_err(|error| IpsecError::Command(format!("failed to run ip: {}", error)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2219,10 +2356,7 @@ mod tests {
     #[test]
     fn integrity_algorithm_display() {
         assert_eq!(format!("{}", IntegrityAlgorithm::HmacMd5), "HMAC-MD5-96");
-        assert_eq!(
-            format!("{}", IntegrityAlgorithm::HmacSha1),
-            "HMAC-SHA-1-96"
-        );
+        assert_eq!(format!("{}", IntegrityAlgorithm::HmacSha1), "HMAC-SHA-1-96");
     }
 
     #[test]
@@ -2234,10 +2368,7 @@ mod tests {
         );
 
         let key_error = IpsecError::InvalidKey("bad hex".to_string());
-        assert_eq!(
-            format!("{}", key_error),
-            "IPsec invalid key: bad hex"
-        );
+        assert_eq!(format!("{}", key_error), "IPsec invalid key: bad hex");
     }
 
     #[test]
@@ -2380,7 +2511,9 @@ mod tests {
             .create_sa_pair(sa)
             .await
             .expect("create_sa_pair should succeed against the mock kernel");
-        let installed = manager.get_sa(&ue, 50000).expect("SA pair present after create");
+        let installed = manager
+            .get_sa(&ue, 50000)
+            .expect("SA pair present after create");
         assert!(
             installed.created_at <= Instant::now() + Duration::from_secs(60),
             "created_at must be re-stamped to install time, not the far-future placeholder"
@@ -2412,8 +2545,7 @@ mod tests {
             .expect("re-pin should succeed");
 
         // Four UPDSA messages, each carrying requested(100) + elapsed(1) = 101.
-        let first: Vec<Option<u64>> =
-            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        let first: Vec<Option<u64>> = manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
         assert_eq!(first.len(), 4, "one UPDSA per SA of the pair");
         assert!(
             first.iter().all(|lft| *lft == Some(101)),
@@ -2425,7 +2557,10 @@ mod tests {
         let cached = manager.get_sa(&ue, 50000).expect("SA still present");
         assert_eq!(cached.hard_lifetime_secs, Some(100));
         assert!(cached.expires_at > Instant::now() + Duration::from_secs(100));
-        assert_eq!(cached.created_at, anchor, "install anchor must not move on re-pin");
+        assert_eq!(
+            cached.created_at, anchor,
+            "install anchor must not move on re-pin"
+        );
 
         // A second re-pin still measures elapsed from the ORIGINAL install
         // (≈1 s), not from the first re-pin — if the anchor had been reset to
@@ -2435,8 +2570,7 @@ mod tests {
             .update_sa_pair_lifetime(&ue, 50000, Some(100))
             .await
             .expect("second re-pin should succeed");
-        let second: Vec<Option<u64>> =
-            manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
+        let second: Vec<Option<u64>> = manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
         assert!(
             second.iter().all(|lft| *lft == Some(101)),
             "re-pin must stay anchored to original install, got {second:?}"
@@ -2461,7 +2595,10 @@ mod tests {
         let updates: Vec<Option<u64>> =
             manager.mock().updates.iter().map(|(_, lft)| *lft).collect();
         assert_eq!(updates.len(), 4);
-        assert!(updates.iter().all(|lft| lft.is_none()), "None must not inflate");
+        assert!(
+            updates.iter().all(|lft| lft.is_none()),
+            "None must not inflate"
+        );
     }
 
     #[test]
@@ -2648,7 +2785,11 @@ mod tests {
             "all four SAs installed"
         );
         assert_eq!(
-            state.live.iter().filter(|k| k.starts_with("policy:")).count(),
+            state
+                .live
+                .iter()
+                .filter(|k| k.starts_with("policy:"))
+                .count(),
             4,
             "all four policies installed exactly once"
         );
@@ -2704,28 +2845,48 @@ mod tests {
         {
             let mut state = manager.mock();
             state.reject_existing = true;
-            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_ps));
-            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_uc));
-            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_us));
-            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_pc));
+            state
+                .live
+                .insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_ps));
+            state
+                .live
+                .insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_uc));
+            state
+                .live
+                .insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_us));
+            state
+                .live
+                .insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_pc));
             state.live.insert(format!(
                 "policy:{}:{}->{}:{}:{}",
-                sa.ue_addr, sa.ue_port_c, sa.pcscf_addr, sa.pcscf_port_s,
+                sa.ue_addr,
+                sa.ue_port_c,
+                sa.pcscf_addr,
+                sa.pcscf_port_s,
                 policy_dir_str(sa.role.policy_dir(true))
             ));
             state.live.insert(format!(
                 "policy:{}:{}->{}:{}:{}",
-                sa.pcscf_addr, sa.pcscf_port_s, sa.ue_addr, sa.ue_port_c,
+                sa.pcscf_addr,
+                sa.pcscf_port_s,
+                sa.ue_addr,
+                sa.ue_port_c,
                 policy_dir_str(sa.role.policy_dir(false))
             ));
             state.live.insert(format!(
                 "policy:{}:{}->{}:{}:{}",
-                sa.pcscf_addr, sa.pcscf_port_c, sa.ue_addr, sa.ue_port_s,
+                sa.pcscf_addr,
+                sa.pcscf_port_c,
+                sa.ue_addr,
+                sa.ue_port_s,
                 policy_dir_str(sa.role.policy_dir(false))
             ));
             state.live.insert(format!(
                 "policy:{}:{}->{}:{}:{}",
-                sa.ue_addr, sa.ue_port_s, sa.pcscf_addr, sa.pcscf_port_c,
+                sa.ue_addr,
+                sa.ue_port_s,
+                sa.pcscf_addr,
+                sa.pcscf_port_c,
                 policy_dir_str(sa.role.policy_dir(true))
             ));
         }
@@ -2743,9 +2904,16 @@ mod tests {
         assert_eq!(manager.active_count(), 1);
 
         let state = manager.mock();
-        assert_eq!(state.live.iter().filter(|k| k.starts_with("sa:")).count(), 4);
         assert_eq!(
-            state.live.iter().filter(|k| k.starts_with("policy:")).count(),
+            state.live.iter().filter(|k| k.starts_with("sa:")).count(),
+            4
+        );
+        assert_eq!(
+            state
+                .live
+                .iter()
+                .filter(|k| k.starts_with("policy:"))
+                .count(),
             4
         );
     }

@@ -34,7 +34,6 @@ fn optional_u32(avps: &serde_json::Value, name: &str) -> Option<u32> {
     avps.get(name).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
 
-
 // ---------------------------------------------------------------------------
 // S6c answer builder — shared scaffolding for ALA / SRA / RSA answers
 // ---------------------------------------------------------------------------
@@ -289,7 +288,10 @@ pub fn build_report_sm_delivery_status_request(
     // outcome leaf. We emit only the MME-side leaf (most common in MT
     // delivery completion); HSS implementations accept either MME or
     // SGSN outcomes here as the dispositive value.
-    let outcome_children = encode_avp_u32_3gpp(avp::SM_RP_MTI /* placeholder leaf code */, delivery_outcome);
+    let outcome_children = encode_avp_u32_3gpp(
+        avp::SM_RP_MTI, /* placeholder leaf code */
+        delivery_outcome,
+    );
     avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(
         avp::SM_DELIVERY_OUTCOME,
         &outcome_children,
@@ -375,7 +377,10 @@ mod tests {
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
         assert!(decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_SEND_ROUTING_INFO_FOR_SM);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_SEND_ROUTING_INFO_FOR_SM
+        );
         assert_eq!(decoded.application_id, dictionary::S6C_APP_ID);
 
         // MSISDN and SC-Address are ISDN-AddressString — ToN/NPI 0x91 +
@@ -389,11 +394,15 @@ mod tests {
         // → 0x13 0x16 0x32 0x54 0x76 0xF8, with 0x91 ToN/NPI prefix.
         let msisdn_isdn = vec![0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8];
         assert!(
-            wire.windows(msisdn_isdn.len()).any(|w| w == msisdn_isdn.as_slice()),
+            wire.windows(msisdn_isdn.len())
+                .any(|w| w == msisdn_isdn.as_slice()),
             "MSISDN must be 0x91 ToN/NPI + TBCD(31612345678) — 7 octets on \
              the wire, not 11 ASCII octets"
         );
-        assert_eq!(codec::decode_isdn_address_string(&msisdn_isdn), "31612345678");
+        assert_eq!(
+            codec::decode_isdn_address_string(&msisdn_isdn),
+            "31612345678"
+        );
 
         // "31611111111": (31)(61)(11)(11)(11)(1F) → 0x13 0x16 0x11
         // 0x11 0x11 0xF1, with 0x91 prefix.
@@ -405,8 +414,14 @@ mod tests {
         assert_eq!(codec::decode_isdn_address_string(&sc_isdn), "31611111111");
 
         let avps = &decoded.avps;
-        assert_eq!(avps.get("MSISDN").and_then(|v| v.as_str()), Some("31612345678"));
-        assert_eq!(avps.get("SC-Address").and_then(|v| v.as_str()), Some("31611111111"));
+        assert_eq!(
+            avps.get("MSISDN").and_then(|v| v.as_str()),
+            Some("31612345678")
+        );
+        assert_eq!(
+            avps.get("SC-Address").and_then(|v| v.as_str()),
+            Some("31611111111")
+        );
     }
 
     /// Regression test for the bug trace's MSISDN "3197010267609" — siphon
@@ -426,11 +441,15 @@ mod tests {
         let decoded = codec::decode_diameter(&wire).unwrap();
         let msisdn_isdn = vec![0x91, 0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9];
         assert!(
-            wire.windows(msisdn_isdn.len()).any(|w| w == msisdn_isdn.as_slice()),
+            wire.windows(msisdn_isdn.len())
+                .any(|w| w == msisdn_isdn.as_slice()),
             "MSISDN 3197010267609 must be the exact 8-byte ISDN-AddressString \
              on the wire, not the 13-byte ASCII the pre-fix encoder shipped"
         );
-        assert_eq!(codec::decode_isdn_address_string(&msisdn_isdn), "3197010267609");
+        assert_eq!(
+            codec::decode_isdn_address_string(&msisdn_isdn),
+            "3197010267609"
+        );
         assert_eq!(
             decoded.avps.get("MSISDN").and_then(|v| v.as_str()),
             Some("3197010267609"),
@@ -529,13 +548,7 @@ mod tests {
 
     #[test]
     fn ala_success_carries_result_code_2001() {
-        let wire = build_ala_success(
-            "smsc.example.com",
-            "example.com",
-            "test;1;1",
-            10,
-            20,
-        );
+        let wire = build_ala_success("smsc.example.com", "example.com", "test;1;1", 10, 20);
         let decoded = codec::decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_ALERT_SERVICE_CENTRE);
@@ -547,14 +560,7 @@ mod tests {
 
     #[test]
     fn ala_error_carries_supplied_result_code() {
-        let wire = build_ala_error(
-            "smsc.example.com",
-            "example.com",
-            "test;1;1",
-            5012,
-            10,
-            20,
-        );
+        let wire = build_ala_error("smsc.example.com", "example.com", "test;1;1", 5012, 10, 20);
         let decoded = codec::decode_diameter(&wire).unwrap();
         assert_eq!(
             decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),

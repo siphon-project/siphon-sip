@@ -230,11 +230,7 @@ impl X1Server {
                 envelope,
                 kind,
                 error,
-            } => (
-                None,
-                Some((*envelope, kind)),
-                Some(error),
-            ),
+            } => (None, Some((*envelope, kind)), Some(error)),
         };
 
         if let (Some((envelope, kind)), Some(error)) = (kind_hint, decode_error) {
@@ -540,10 +536,7 @@ impl X1Server {
     /// The container-level failure answer.
     fn top_level_error(&self) -> String {
         let response = TopLevelErrorResponse {
-            admf_identifier: self
-                .expected_admf
-                .clone()
-                .unwrap_or_else(Token::unknown),
+            admf_identifier: self.expected_admf.clone().unwrap_or_else(Token::unknown),
             ne_identifier: self.ne_identifier.clone(),
             message_timestamp: Timestamp::now(),
             version: self.version.clone(),
@@ -676,10 +669,7 @@ fn build_tls_config(
 /// Returns once the listener is bound; the accept loop runs on a spawned task.
 /// A bind failure is returned to the caller so startup can fail rather than
 /// continue with an interface that silently is not listening.
-pub async fn serve(
-    config: Arc<LiX1Config>,
-    server: Arc<X1Server>,
-) -> io::Result<SocketAddr> {
+pub async fn serve(config: Arc<LiX1Config>, server: Arc<X1Server>) -> io::Result<SocketAddr> {
     let tls_config = build_tls_config(&config.tls)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -744,12 +734,15 @@ async fn serve_connection(
             .unwrap_or_default()
     };
 
-    let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-        let server = Arc::clone(&server);
-        let config = Arc::clone(&config);
-        let peer = peer.clone();
-        async move { Ok::<_, std::convert::Infallible>(handle_http(request, server, config, peer).await) }
-    });
+    let service =
+        hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+            let server = Arc::clone(&server);
+            let config = Arc::clone(&config);
+            let peer = peer.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(handle_http(request, server, config, peer).await)
+            }
+        });
 
     hyper::server::conn::http1::Builder::new()
         .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), service)
@@ -822,11 +815,7 @@ mod tests {
             let log = Arc::clone(self);
             Arc::new(move |operation, subject, detail| {
                 if let Ok(mut entries) = log.entries.lock() {
-                    entries.push((
-                        operation.to_string(),
-                        subject.map(str::to_string),
-                        detail,
-                    ));
+                    entries.push((operation.to_string(), subject.map(str::to_string), detail));
                 }
             })
         }
@@ -989,7 +978,10 @@ mod tests {
             &request(&[("DeactivateTaskRequest", format!("<xId>{x_id}</xId>"))]),
             &peer(),
         );
-        assert!(deactivate.contains("DeactivateTaskResponse"), "{deactivate}");
+        assert!(
+            deactivate.contains("DeactivateTaskResponse"),
+            "{deactivate}"
+        );
         assert!(server.tasks().is_empty());
 
         let operations = audit.operations();
@@ -1048,7 +1040,10 @@ mod tests {
             )]),
             &peer(),
         );
-        assert!(response.contains("<errorCode>2020</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>2020</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
@@ -1066,9 +1061,14 @@ mod tests {
         }
         assert_eq!(server.tasks().len(), 3);
 
-        let response =
-            server.handle_container(&request(&[("DeactivateAllTasksRequest", String::new())]), &peer());
-        assert!(response.contains("DeactivateAllTasksResponse"), "{response}");
+        let response = server.handle_container(
+            &request(&[("DeactivateAllTasksRequest", String::new())]),
+            &peer(),
+        );
+        assert!(
+            response.contains("DeactivateAllTasksResponse"),
+            "{response}"
+        );
         assert!(server.tasks().is_empty());
     }
 
@@ -1110,7 +1110,10 @@ mod tests {
             &request(&[("RemoveDestinationRequest", format!("<dId>{d_id}</dId>"))]),
             &peer(),
         );
-        assert!(response.contains("<errorCode>7010</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>7010</errorCode>"),
+            "{response}"
+        );
         assert!(
             response.contains(&x_id.to_string()),
             "the refusal should name the referencing task: {response}"
@@ -1133,9 +1136,14 @@ mod tests {
             &peer(),
         );
 
-        let response = server
-            .handle_container(&request(&[("RemoveAllDestinationsRequest", String::new())]), &peer());
-        assert!(response.contains("<errorCode>8010</errorCode>"), "{response}");
+        let response = server.handle_container(
+            &request(&[("RemoveAllDestinationsRequest", String::new())]),
+            &peer(),
+        );
+        assert!(
+            response.contains("<errorCode>8010</errorCode>"),
+            "{response}"
+        );
         assert_eq!(server.destinations().len(), 1);
     }
 
@@ -1145,9 +1153,14 @@ mod tests {
         provision_destination(&server, DeliveryType::X2Only);
         provision_destination(&server, DeliveryType::X2Only);
 
-        let response = server
-            .handle_container(&request(&[("RemoveAllDestinationsRequest", String::new())]), &peer());
-        assert!(response.contains("RemoveAllDestinationsResponse"), "{response}");
+        let response = server.handle_container(
+            &request(&[("RemoveAllDestinationsRequest", String::new())]),
+            &peer(),
+        );
+        assert!(
+            response.contains("RemoveAllDestinationsResponse"),
+            "{response}"
+        );
         assert!(server.destinations().is_empty());
     }
 
@@ -1161,7 +1174,10 @@ mod tests {
             )]),
             &peer(),
         );
-        assert!(response.contains("<errorCode>2040</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>2040</errorCode>"),
+            "{response}"
+        );
         assert!(server.tasks().is_empty());
     }
 
@@ -1198,8 +1214,10 @@ mod tests {
             &peer(),
         );
 
-        let response =
-            server.handle_container(&request(&[("GetAllDetailsRequest", String::new())]), &peer());
+        let response = server.handle_container(
+            &request(&[("GetAllDetailsRequest", String::new())]),
+            &peer(),
+        );
         assert!(response.contains("GetAllDetailsResponse"), "{response}");
         assert!(response.contains(&x_id.to_string()));
         assert!(response.contains(&d_id.to_string()));
@@ -1219,8 +1237,10 @@ mod tests {
             &peer(),
         );
 
-        let response =
-            server.handle_container(&request(&[("ListAllDetailsRequest", String::new())]), &peer());
+        let response = server.handle_container(
+            &request(&[("ListAllDetailsRequest", String::new())]),
+            &peer(),
+        );
         assert!(response.contains("ListAllDetailsResponse"), "{response}");
         assert!(response.contains(&x_id.to_string()));
         assert!(response.contains(&d_id.to_string()));
@@ -1239,7 +1259,8 @@ mod tests {
     fn ping_and_keepalive_are_acknowledged() {
         let (server, _) = server();
         for type_name in ["PingRequest", "KeepaliveRequest"] {
-            let response = server.handle_container(&request(&[(type_name, String::new())]), &peer());
+            let response =
+                server.handle_container(&request(&[(type_name, String::new())]), &peer());
             assert!(
                 response.contains(&type_name.replace("Request", "Response")),
                 "{type_name}: {response}"
@@ -1259,9 +1280,16 @@ mod tests {
         let response = server.handle_container(&body, &peer());
 
         let ping = response.find("PingResponse").expect("ping answered");
-        let status = response.find("GetNEStatusResponse").expect("status answered");
-        let keepalive = response.find("KeepaliveResponse").expect("keepalive answered");
-        assert!(ping < status && status < keepalive, "responses out of order:\n{response}");
+        let status = response
+            .find("GetNEStatusResponse")
+            .expect("status answered");
+        let keepalive = response
+            .find("KeepaliveResponse")
+            .expect("keepalive answered");
+        assert!(
+            ping < status && status < keepalive,
+            "responses out of order:\n{response}"
+        );
         assert_eq!(response.matches("x1ResponseMessage").count(), 6); // 3 open + 3 close
     }
 
@@ -1338,7 +1366,10 @@ mod tests {
         ]);
         let response = server.handle_container(&body, &peer());
         assert!(response.contains("PingResponse"), "{response}");
-        assert!(response.contains("<errorCode>1080</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1080</errorCode>"),
+            "{response}"
+        );
         assert!(!response.contains("X1TopLevelErrorResponse"));
     }
 
@@ -1354,25 +1385,38 @@ mod tests {
             )]),
             &peer(),
         );
-        assert!(response.contains("<errorCode>1080</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1080</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
     fn an_unexpected_admf_identifier_returns_1040() {
         let (server, _) = server();
-        let body = request(&[("PingRequest", String::new())])
-            .replace(&format!("<admfIdentifier>{ADMF}</admfIdentifier>"), "<admfIdentifier>other-admf</admfIdentifier>");
+        let body = request(&[("PingRequest", String::new())]).replace(
+            &format!("<admfIdentifier>{ADMF}</admfIdentifier>"),
+            "<admfIdentifier>other-admf</admfIdentifier>",
+        );
         let response = server.handle_container(&body, &peer());
-        assert!(response.contains("<errorCode>1040</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1040</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
     fn an_unexpected_ne_identifier_returns_1060() {
         let (server, _) = server();
-        let body = request(&[("PingRequest", String::new())])
-            .replace(&format!("<neIdentifier>{NE}</neIdentifier>"), "<neIdentifier>some-other-ne</neIdentifier>");
+        let body = request(&[("PingRequest", String::new())]).replace(
+            &format!("<neIdentifier>{NE}</neIdentifier>"),
+            "<neIdentifier>some-other-ne</neIdentifier>",
+        );
         let response = server.handle_container(&body, &peer());
-        assert!(response.contains("<errorCode>1060</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1060</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
@@ -1389,7 +1433,10 @@ mod tests {
         };
         let response =
             server.handle_container(&request(&[("PingRequest", String::new())]), &wrong_peer);
-        assert!(response.contains("<errorCode>1030</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1030</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
@@ -1405,7 +1452,10 @@ mod tests {
             &request(&[("PingRequest", String::new())]),
             &PeerIdentity::default(),
         );
-        assert!(response.contains("<errorCode>1030</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1030</errorCode>"),
+            "{response}"
+        );
     }
 
     #[test]
@@ -1417,7 +1467,8 @@ mod tests {
         let tasks = TaskStore::new(destinations.clone(), ContentCapability::Available);
         let server = X1Server::new(&settings, tasks, destinations, audit.hook()).unwrap();
 
-        let response = server.handle_container(&request(&[("PingRequest", String::new())]), &peer());
+        let response =
+            server.handle_container(&request(&[("PingRequest", String::new())]), &peer());
         assert!(response.contains("PingResponse"), "{response}");
     }
 
@@ -1484,7 +1535,10 @@ mod tests {
         );
         let response =
             server.handle_container(&request(&[("ActivateTaskRequest", payload)]), &peer());
-        assert!(response.contains("<errorCode>3010</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>3010</errorCode>"),
+            "{response}"
+        );
         assert!(response.contains("gtpuTunnelId"), "{response}");
     }
 
@@ -1516,7 +1570,10 @@ mod tests {
             !response.contains("X1TopLevelErrorResponse"),
             "the container itself was readable, so this is a per-message failure: {response}"
         );
-        assert!(response.contains("<errorCode>1010</errorCode>"), "{response}");
+        assert!(
+            response.contains("<errorCode>1010</errorCode>"),
+            "{response}"
+        );
         assert!(server.destinations().is_empty());
     }
 

@@ -18,7 +18,6 @@ pub mod event_sink;
 pub mod forward;
 pub mod peer;
 pub mod pool;
-pub mod server;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
@@ -26,6 +25,7 @@ pub mod ro_service;
 pub mod rx;
 pub mod s6a;
 pub mod s6c;
+pub mod server;
 pub mod sgd;
 pub mod sh;
 pub mod transport;
@@ -71,7 +71,10 @@ impl DiameterClient {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            &config.destination_realm,
+        ));
         if let Some(dest_host) = &config.destination_host {
             avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
         }
@@ -86,7 +89,10 @@ impl DiameterClient {
             visited_network_id.as_bytes(),
         ));
         if let Some(auth_type) = user_auth_type {
-            avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_AUTHORIZATION_TYPE, auth_type));
+            avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(
+                avp::USER_AUTHORIZATION_TYPE,
+                auth_type,
+            ));
         }
 
         let msg = encode_diameter_message(
@@ -117,7 +123,10 @@ impl DiameterClient {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            &config.destination_realm,
+        ));
         if let Some(dest_host) = &config.destination_host {
             avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
         }
@@ -128,7 +137,10 @@ impl DiameterClient {
         ));
         avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity));
         avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::SERVER_NAME, server_name));
-        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SERVER_ASSIGNMENT_TYPE, server_assignment_type));
+        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::SERVER_ASSIGNMENT_TYPE,
+            server_assignment_type,
+        ));
         avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
 
         let msg = encode_diameter_message(
@@ -144,10 +156,7 @@ impl DiameterClient {
     }
 
     /// Send a LIR (Location-Info-Request) and return the LIA.
-    pub async fn send_lir(
-        &self,
-        public_identity: &str,
-    ) -> Result<codec::DiameterMessage, String> {
+    pub async fn send_lir(&self, public_identity: &str) -> Result<codec::DiameterMessage, String> {
         let config = self.peer.config();
         let hbh = self.peer.next_hbh();
         let e2e = self.peer.next_e2e();
@@ -157,7 +166,10 @@ impl DiameterClient {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            &config.destination_realm,
+        ));
         if let Some(dest_host) = &config.destination_host {
             avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
         }
@@ -202,10 +214,8 @@ impl DiameterClient {
         // Include SIP-Authorization AVP for AUTS resynchronization (TS 29.228 §6.3.18).
         // Contains RAND(16) || AUTS(14) = 30 bytes when UE SQN is out of sync.
         if let Some(auth_data) = sip_authorization {
-            auth_children.extend_from_slice(&encode_avp_octet_3gpp(
-                avp::SIP_AUTHORIZATION,
-                auth_data,
-            ));
+            auth_children
+                .extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHORIZATION, auth_data));
         }
         let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
 
@@ -213,7 +223,10 @@ impl DiameterClient {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            &config.destination_realm,
+        ));
         if let Some(dest_host) = &config.destination_host {
             avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
         }
@@ -223,7 +236,10 @@ impl DiameterClient {
             dictionary::CX_APP_ID,
         ));
         avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity));
-        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SIP_NUMBER_AUTH_ITEMS, sip_num_auth_items));
+        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::SIP_NUMBER_AUTH_ITEMS,
+            sip_num_auth_items,
+        ));
         avp_bytes.extend_from_slice(&sip_auth_data_item);
 
         let msg = encode_diameter_message(
@@ -485,7 +501,9 @@ impl DiameterManager {
 
     /// Get a client by peer name.
     pub fn client(&self, name: &str) -> Option<Arc<DiameterClient>> {
-        self.clients.get(name).map(|entry| Arc::clone(entry.value()))
+        self.clients
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Get a client by peer name only if its connection is `Open`.
@@ -538,7 +556,10 @@ impl DiameterManager {
 
     /// Get the first available client (for single-peer setups).
     pub fn any_client(&self) -> Option<Arc<DiameterClient>> {
-        self.clients.iter().next().map(|entry| Arc::clone(entry.value()))
+        self.clients
+            .iter()
+            .next()
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Number of registered peers.
@@ -664,10 +685,8 @@ mod tests {
             avp::SIP_AUTHENTICATION_SCHEME,
             "Digest-AKAv1-MD5",
         ));
-        auth_children.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::SIP_AUTHORIZATION,
-            &resync_data,
-        ));
+        auth_children
+            .extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHORIZATION, &resync_data));
         let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
 
         let mut avp_bytes = Vec::new();
@@ -691,7 +710,8 @@ mod tests {
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_MULTIMEDIA_AUTH,
             dictionary::CX_APP_ID,
-            100, 200,
+            100,
+            200,
             &avp_bytes,
         );
 
@@ -704,7 +724,10 @@ mod tests {
         assert!(auth_data.is_some(), "SIP-Auth-Data-Item AVP missing");
 
         let sip_auth = auth_data.unwrap().get("SIP-Authorization");
-        assert!(sip_auth.is_some(), "SIP-Authorization AVP missing in SIP-Auth-Data-Item");
+        assert!(
+            sip_auth.is_some(),
+            "SIP-Authorization AVP missing in SIP-Auth-Data-Item"
+        );
 
         // The codec hex-encodes OctetString AVPs, verify the decoded length
         let hex_value = sip_auth.unwrap().as_str().unwrap();

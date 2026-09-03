@@ -22,7 +22,7 @@ use arc_swap::ArcSwap;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use crate::script::engine::{HandlerEntry, HandlerKind, ScriptState, run_coroutine_value};
+use crate::script::engine::{run_coroutine_value, HandlerEntry, HandlerKind, ScriptState};
 
 /// Owned, opaque reference to a script-registered handler. Returned by
 /// [`ScriptHandle::handlers_for`].
@@ -99,10 +99,7 @@ impl ScriptHandle {
     /// handle. Server bootstrap calls this once after the runtime is
     /// built and the script engine is initialised; extensions never
     /// construct a `ScriptHandle` directly.
-    pub(crate) fn new(
-        state: Arc<ArcSwap<ScriptState>>,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
+    pub(crate) fn new(state: Arc<ArcSwap<ScriptState>>, runtime: tokio::runtime::Handle) -> Self {
         Self { state, runtime }
     }
 
@@ -354,11 +351,7 @@ _r.register("ext.boom", None, boom, False, None)
         );
         let handle = ScriptHandle::new(engine.state_arc(), tokio::runtime::Handle::current());
 
-        let handler = handle
-            .handlers_for("ext.boom")
-            .into_iter()
-            .next()
-            .unwrap();
+        let handler = handle.handlers_for("ext.boom").into_iter().next().unwrap();
 
         let result = handle.call_handler(&handler, vec![]).await;
         let error = result.expect_err("ValueError must propagate");

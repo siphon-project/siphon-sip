@@ -470,7 +470,9 @@ impl RoChargingService {
 
         if answer.result_code == DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE {
             // Free of charge — no session, call proceeds unmonitored.
-            info!("ro: CCR-INITIAL returned CREDIT_CONTROL_NOT_APPLICABLE, call proceeds uncharged");
+            info!(
+                "ro: CCR-INITIAL returned CREDIT_CONTROL_NOT_APPLICABLE, call proceeds uncharged"
+            );
             return ChargeDecision::AllowUncharged;
         }
         if !answer.is_success() {
@@ -515,7 +517,8 @@ impl RoChargingService {
         // TERMINATE — the low-balance case where the whole balance fits in one
         // grant — consume it, then cut, without ever sending a CCR-UPDATE.
         let initial_final = answer.final_unit_action == Some(FINAL_UNIT_ACTION_TERMINATE);
-        self.spawn_reauth_timer(&session, grant_secs, initial_final).await;
+        self.spawn_reauth_timer(&session, grant_secs, initial_final)
+            .await;
 
         info!(
             session_id = %session.inner.session_id,
@@ -565,7 +568,10 @@ impl RoChargingService {
                 ChargeDecision::Granted(None)
             }
             Ok(answer) => {
-                info!(result_code = answer.result_code, "ro: CCR-EVENT (IEC) denied");
+                info!(
+                    result_code = answer.result_code,
+                    "ro: CCR-EVENT (IEC) denied"
+                );
                 ChargeDecision::Denied(answer.result_code)
             }
             Err(error) => {
@@ -736,7 +742,9 @@ impl RoChargingService {
         let service = Arc::clone(self);
         let task_session = session.clone();
         let handle = tokio::spawn(async move {
-            service.reauth_loop(task_session, initial_grant, initial_final).await;
+            service
+                .reauth_loop(task_session, initial_grant, initial_final)
+                .await;
         });
         *session.inner.reauth_handle.lock().await = Some(handle);
     }
@@ -764,7 +772,8 @@ impl RoChargingService {
             if is_final {
                 // The grant just consumed was the final one — cut now. Its
                 // seconds are unreported, so the CCR-T's USU covers them once.
-                self.enforce(&session, "credit exhausted (final unit)").await;
+                self.enforce(&session, "credit exhausted (final unit)")
+                    .await;
                 return;
             }
             if session.inner.started_at.elapsed().as_secs() >= MAX_RO_SESSION_LIFETIME_SECS {
@@ -836,9 +845,7 @@ impl RoChargingService {
                         is_final = true;
                     }
                 }
-                Ok(answer)
-                    if answer.result_code == DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE =>
-                {
+                Ok(answer) if answer.result_code == DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE => {
                     // Free of charge from here on — stop charging, leave the call up.
                     info!(session_id = %session.inner.session_id,
                         "ro: CCR-UPDATE returned CREDIT_CONTROL_NOT_APPLICABLE, call continues uncharged");
@@ -974,7 +981,11 @@ mod tests {
                 if let Ok(mut guard) = cap_task.lock() {
                     guard.push(msg.avps.clone());
                 }
-                let req_type = msg.avps.get("CC-Request-Type").and_then(|v| v.as_u64()).unwrap_or(0);
+                let req_type = msg
+                    .avps
+                    .get("CC-Request-Type")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 // Answer per CC-Request-Type: UPDATE (2) gets update_result;
                 // TERMINATION (3) is always acknowledged; INITIAL (1) / EVENT (4)
                 // get initial_result. A grant is included only on success.
@@ -997,7 +1008,10 @@ mod tests {
                     let mut mscc = Vec::new();
                     if let Some(secs) = grant_secs {
                         let gsu = encode_avp_u32(avp::CC_TIME, secs);
-                        mscc.extend_from_slice(&encode_avp_grouped(avp::GRANTED_SERVICE_UNIT, &gsu));
+                        mscc.extend_from_slice(&encode_avp_grouped(
+                            avp::GRANTED_SERVICE_UNIT,
+                            &gsu,
+                        ));
                     }
                     if let Some(action) = fua {
                         let fui = encode_avp_u32(avp::FINAL_UNIT_ACTION, action);
@@ -1171,8 +1185,13 @@ mod tests {
         // Grant at INITIAL, then the mock denies the first UPDATE → the re-auth
         // loop must fire the teardown hook exactly once and drain the session.
         // Paused clock so the grant sleep resolves without a real wait.
-        let (manager, _rx, _cap) =
-            mock_ocs_manager(2001, Some(MIN_REAUTH_SECS), DIAMETER_CREDIT_LIMIT_REACHED, None).await;
+        let (manager, _rx, _cap) = mock_ocs_manager(
+            2001,
+            Some(MIN_REAUTH_SECS),
+            DIAMETER_CREDIT_LIMIT_REACHED,
+            None,
+        )
+        .await;
         let service = RoChargingService::new(manager, enabled_config());
 
         let torn_down = Arc::new(AtomicUsize::new(0));
@@ -1200,7 +1219,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(service.active_session_count(), 0, "denied session must drain");
+        assert_eq!(
+            service.active_session_count(),
+            0,
+            "denied session must drain"
+        );
         assert_eq!(
             torn_down.load(Ordering::Relaxed),
             1,
@@ -1250,16 +1273,30 @@ mod tests {
         assert_eq!(sessions.len(), 40, "all 40 should be granted");
 
         // Every session-id is distinct (in the handles and on the wire).
-        let ids: std::collections::HashSet<_> =
-            sessions.iter().map(|s| s.session_id().to_string()).collect();
-        assert_eq!(ids.len(), 40, "session-ids must be unique across concurrent calls");
+        let ids: std::collections::HashSet<_> = sessions
+            .iter()
+            .map(|s| s.session_id().to_string())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            40,
+            "session-ids must be unique across concurrent calls"
+        );
         let wire_ids: std::collections::HashSet<_> = captured
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|c| c.get("Session-Id").and_then(|v| v.as_str()).map(String::from))
+            .filter_map(|c| {
+                c.get("Session-Id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect();
-        assert_eq!(wire_ids.len(), 40, "on-the-wire CCR Session-Ids must be unique too");
+        assert_eq!(
+            wire_ids.len(),
+            40,
+            "on-the-wire CCR Session-Ids must be unique too"
+        );
 
         for s in &sessions {
             service.terminate_call(s, Some(0)).await;
@@ -1285,7 +1322,10 @@ mod tests {
             let ChargeDecision::Granted(Some(session)) = decision else {
                 panic!("cycle {i} not granted");
             };
-            assert!(seen.insert(session.session_id().to_string()), "Session-Id reused at cycle {i}");
+            assert!(
+                seen.insert(session.session_id().to_string()),
+                "Session-Id reused at cycle {i}"
+            );
             service.terminate_call(&session, Some(0)).await;
             assert_eq!(service.active_session_count(), 0, "must drain each cycle");
         }
@@ -1422,7 +1462,9 @@ mod tests {
         // The INITIAL went out before any carrier was chosen.
         let initial = ccr_of_type(&captured.lock().unwrap().clone(), 1);
         assert!(
-            ims_information(&initial).and_then(|i| i.get("Trunk-Group-Id")).is_none(),
+            ims_information(&initial)
+                .and_then(|i| i.get("Trunk-Group-Id"))
+                .is_none(),
             "no carrier is known yet at CCR-INITIAL",
         );
 
@@ -1525,7 +1567,11 @@ mod tests {
 
         let all = [normal, busy, no_answer, exhausted];
         let distinct: std::collections::HashSet<_> = all.iter().collect();
-        assert_eq!(distinct.len(), all.len(), "all four must be distinguishable");
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "all four must be distinguishable"
+        );
     }
 
     #[tokio::test]
@@ -1545,9 +1591,7 @@ mod tests {
         }
     }
 
-    async fn granted_session(
-        service: &Arc<RoChargingService>,
-    ) -> CcCreditSession {
+    async fn granted_session(service: &Arc<RoChargingService>) -> CcCreditSession {
         match service
             .authorize_call(
                 SubscriberId::msisdn("+310000000001"),
@@ -1631,7 +1675,10 @@ mod tests {
             .and_then(|u| u.get("CC-Time"))
             .and_then(|v| v.as_u64())
             .expect("CCR-T reports a CC-Time");
-        assert!(reported <= 1, "reported {reported}s, expected only the talk time");
+        assert!(
+            reported <= 1,
+            "reported {reported}s, expected only the talk time"
+        );
     }
 
     #[tokio::test]

@@ -66,12 +66,14 @@ pub const DEFAULT_VERSION: &str = "v1.23.1";
 /// response and rejected by the ADMF's own validator.
 fn parse_dictionary_uuid(value: &str, field: &str) -> Result<Uuid, X1Error> {
     let shaped = value.len() == 36
-        && value.as_bytes().iter().enumerate().all(|(index, byte)| {
-            match index {
+        && value
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
                 8 | 13 | 18 | 23 => *byte == b'-',
                 _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
-            }
-        });
+            });
     if !shaped {
         return Err(X1Error::syntax(format!(
             "{field} {value:?} is not a TS 103 280 UUID \
@@ -386,7 +388,11 @@ pub(crate) fn normalise_fractional_seconds(value: &str) -> Option<String> {
     if !digits_at(&[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]) {
         return None;
     }
-    if !(bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T' && bytes[13] == b':' && bytes[16] == b':')
+    if !(bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':')
     {
         return None;
     }
@@ -433,7 +439,9 @@ fn matches_qualified_microsecond(value: &str) -> bool {
     let digits_at = |positions: &[usize]| positions.iter().all(|i| bytes[*i].is_ascii_digit());
     let literal_at = |position: usize, expected: u8| bytes[position] == expected;
 
-    if !digits_at(&[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22, 23, 24, 25]) {
+    if !digits_at(&[
+        0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22, 23, 24, 25,
+    ]) {
         return false;
     }
     if !(literal_at(4, b'-')
@@ -947,7 +955,8 @@ mod tests {
     fn generated_xid_round_trips_through_its_own_parser() {
         for _ in 0..64 {
             let id = XId::generate();
-            let parsed = XId::parse(&id.to_string()).expect("generated XID must be dictionary-valid");
+            let parsed =
+                XId::parse(&id.to_string()).expect("generated XID must be dictionary-valid");
             assert_eq!(id, parsed);
         }
     }
@@ -996,9 +1005,9 @@ mod tests {
         assert!(Liid::parse("LI-2026-0001").is_ok()); // printable ASCII
         assert!(Liid::parse(&"a".repeat(25)).is_ok()); // 25 printable
         assert!(Liid::parse(&"0123456789abcdef".repeat(2)).is_ok()); // 32 hex
-        // 26 'a's is over the printable form's 25-char limit but 'a' is a hex
-        // digit, so it matches the second alternative. The two branches of the
-        // pattern genuinely overlap like this.
+                                                                     // 26 'a's is over the printable form's 25-char limit but 'a' is a hex
+                                                                     // digit, so it matches the second alternative. The two branches of the
+                                                                     // pattern genuinely overlap like this.
         assert!(Liid::parse(&"a".repeat(26)).is_ok());
         assert!(Liid::parse(&"0123456789abcdef".repeat(3)).is_ok()); // 48 hex
         assert!(Liid::parse("").is_err());
@@ -1015,7 +1024,7 @@ mod tests {
         // Over 50 hex digits is over both.
         assert!(Liid::parse(&"a".repeat(51)).is_err());
         assert!(Liid::parse(&"0123456789abcdef".repeat(4)).is_err()); // 64 hex
-        // Uppercase hex is not in [0-9a-f], so a 26-char uppercase run fails.
+                                                                      // Uppercase hex is not in [0-9a-f], so a 26-char uppercase run fails.
         assert!(Liid::parse(&"A".repeat(26)).is_err());
     }
 
@@ -1054,9 +1063,18 @@ mod tests {
         for (input, want) in [
             ("2026-08-31T09:00:00.1Z", "2026-08-31T09:00:00.100000Z"),
             ("2026-08-31T09:00:00.12Z", "2026-08-31T09:00:00.120000Z"),
-            ("2026-08-31T09:00:00.1234567Z", "2026-08-31T09:00:00.123456Z"),
-            ("2026-08-31T09:00:00.123456789Z", "2026-08-31T09:00:00.123456Z"),
-            ("2026-08-31T09:00:00.632+02:00", "2026-08-31T09:00:00.632000+02:00"),
+            (
+                "2026-08-31T09:00:00.1234567Z",
+                "2026-08-31T09:00:00.123456Z",
+            ),
+            (
+                "2026-08-31T09:00:00.123456789Z",
+                "2026-08-31T09:00:00.123456Z",
+            ),
+            (
+                "2026-08-31T09:00:00.632+02:00",
+                "2026-08-31T09:00:00.632000+02:00",
+            ),
         ] {
             let stamp = Timestamp::parse(input)
                 .unwrap_or_else(|error| panic!("{input} should normalise: {error}"));
@@ -1144,7 +1162,9 @@ mod tests {
             Ipv6Addr::UNSPECIFIED,
             Ipv6Addr::LOCALHOST,
             "2001:db8::1".parse().unwrap(),
-            "fe80::1%0".parse::<Ipv6Addr>().unwrap_or(Ipv6Addr::LOCALHOST),
+            "fe80::1%0"
+                .parse::<Ipv6Addr>()
+                .unwrap_or(Ipv6Addr::LOCALHOST),
             "::ffff:192.0.2.1".parse().unwrap(),
             "2001:db8:1c18:6b8c::1".parse().unwrap(),
         ];
@@ -1217,7 +1237,10 @@ mod tests {
         assert_eq!(DeliveryType::X2Only.as_str(), "X2Only");
         assert_eq!(DeliveryType::X3Only.as_str(), "X3Only");
         assert_eq!(DeliveryType::X2AndX3.as_str(), "X2andX3");
-        assert_eq!(DeliveryType::parse("X2andX3").unwrap(), DeliveryType::X2AndX3);
+        assert_eq!(
+            DeliveryType::parse("X2andX3").unwrap(),
+            DeliveryType::X2AndX3
+        );
         assert!(DeliveryType::parse("X2AndX3").is_err());
         assert!(DeliveryType::parse("iri_only").is_err());
     }
@@ -1304,7 +1327,8 @@ mod tests {
         assert!(TargetIdentifier::from_element("e164Number", "+15551234567").is_err());
         assert!(TargetIdentifier::from_element("e164Number", "1234567890123456").is_err());
         assert!(TargetIdentifier::from_element("imsi", "12345").is_err()); // too short
-        assert!(TargetIdentifier::from_element("imei", "0123456789012").is_err()); // 13 digits
+        assert!(TargetIdentifier::from_element("imei", "0123456789012").is_err());
+        // 13 digits
     }
 
     #[test]

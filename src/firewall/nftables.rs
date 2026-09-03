@@ -360,7 +360,12 @@ fn build_flush_chain(table: &str, chain: &str, seq: u32) -> Vec<u8> {
     let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
     push_nla_str(&mut body, NFTA_RULE_TABLE, table);
     push_nla_str(&mut body, NFTA_RULE_CHAIN, chain);
-    nlmsg(nft_type(NFT_MSG_DELRULE), NLM_F_REQUEST | NLM_F_ACK, seq, &body)
+    nlmsg(
+        nft_type(NFT_MSG_DELRULE),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        &body,
+    )
 }
 
 /// Append one expression: `NFTA_LIST_ELEM { NFTA_EXPR_NAME, NFTA_EXPR_DATA }`.
@@ -420,7 +425,12 @@ fn build_drop_rule(table: &str, chain: &str, set: &str, family: SetFamily, seq: 
     push_nla_str(&mut body, NFTA_RULE_TABLE, table);
     push_nla_str(&mut body, NFTA_RULE_CHAIN, chain);
     push_nla_nested(&mut body, NFTA_RULE_EXPRESSIONS, &expressions);
-    nlmsg(nft_type(NFT_MSG_NEWRULE), OBJECT_FLAGS | NLM_F_APPEND, seq, &body)
+    nlmsg(
+        nft_type(NFT_MSG_NEWRULE),
+        OBJECT_FLAGS | NLM_F_APPEND,
+        seq,
+        &body,
+    )
 }
 
 // --- batch framing + transport ---------------------------------------------
@@ -616,7 +626,13 @@ pub async fn ensure_firewall(
 /// (`ttl_ms == 0` = permanent, e.g. an apiban entry). `EEXIST` (element already
 /// present, e.g. an apiban re-push after restart) is idempotent success;
 /// `ENOENT` (set/table gone) is a real error and surfaces.
-pub async fn add_banned(table: &str, set_v4: &str, set_v6: &str, address: IpAddr, ttl_ms: u64) -> io::Result<()> {
+pub async fn add_banned(
+    table: &str,
+    set_v4: &str,
+    set_v6: &str,
+    address: IpAddr,
+    ttl_ms: u64,
+) -> io::Result<()> {
     let set = match SetFamily::of(&address) {
         SetFamily::V4 => set_v4,
         SetFamily::V6 => set_v6,
@@ -627,7 +643,12 @@ pub async fn add_banned(table: &str, set_v4: &str, set_v6: &str, address: IpAddr
 
 /// Remove a banned source (optional — the kernel auto-expires timed elements).
 /// `ENOENT` (the kernel already expired the element) is idempotent success.
-pub async fn remove_banned(table: &str, set_v4: &str, set_v6: &str, address: IpAddr) -> io::Result<()> {
+pub async fn remove_banned(
+    table: &str,
+    set_v4: &str,
+    set_v6: &str,
+    address: IpAddr,
+) -> io::Result<()> {
     let set = match SetFamily::of(&address) {
         SetFamily::V4 => set_v4,
         SetFamily::V6 => set_v6,
@@ -645,7 +666,12 @@ mod tests {
         u16::from_ne_bytes([buffer[offset], buffer[offset + 1]])
     }
     fn u32_at(buffer: &[u8], offset: usize) -> u32 {
-        u32::from_ne_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]])
+        u32::from_ne_bytes([
+            buffer[offset],
+            buffer[offset + 1],
+            buffer[offset + 2],
+            buffer[offset + 3],
+        ])
     }
     fn be32(payload: &[u8]) -> u32 {
         u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
@@ -724,12 +750,20 @@ mod tests {
     #[test]
     fn nfgenmsg_layout() {
         assert_eq!(nfgenmsg(NFPROTO_INET, 0), [1, 0, 0, 0]);
-        assert_eq!(nfgenmsg(NFPROTO_UNSPEC, NFNL_SUBSYS_NFTABLES), [0, 0, 0, 10]);
+        assert_eq!(
+            nfgenmsg(NFPROTO_UNSPEC, NFNL_SUBSYS_NFTABLES),
+            [0, 0, 0, 10]
+        );
     }
 
     #[test]
     fn nlmsg_header_and_wire_type() {
-        let message = nlmsg(nft_type(NFT_MSG_NEWSET), NLM_F_REQUEST | NLM_F_ACK, 3, &[0xde, 0xad]);
+        let message = nlmsg(
+            nft_type(NFT_MSG_NEWSET),
+            NLM_F_REQUEST | NLM_F_ACK,
+            3,
+            &[0xde, 0xad],
+        );
         assert_eq!(u32_at(&message, 0), 18); // 16 hdr + 2 body
         assert_eq!(u16_at(&message, 4), (10 << 8) | 9); // (NFTABLES<<8)|NEWSET
         assert_eq!(u16_at(&message, 6), NLM_F_REQUEST | NLM_F_ACK);
@@ -744,7 +778,10 @@ mod tests {
         assert_eq!(attr(&attrs, NFTA_SET_TABLE, "table"), b"siphon\0");
         assert_eq!(attr(&attrs, NFTA_SET_NAME, "name"), b"banned4\0");
         assert_eq!(be32(attr(&attrs, NFTA_SET_FLAGS, "flags")), NFT_SET_TIMEOUT);
-        assert_eq!(be32(attr(&attrs, NFTA_SET_KEY_TYPE, "key type")), NFT_TYPE_IPADDR);
+        assert_eq!(
+            be32(attr(&attrs, NFTA_SET_KEY_TYPE, "key type")),
+            NFT_TYPE_IPADDR
+        );
         assert_eq!(be32(attr(&attrs, NFTA_SET_KEY_LEN, "key len")), 4);
         // NFTA_SET_ID is REQUIRED by the kernel for NEWSET (nf_tables_newset
         // returns EINVAL without it) — it identifies the set within a batch.
@@ -769,7 +806,10 @@ mod tests {
     fn ipv6_set_family() {
         assert_eq!(SetFamily::V6.key_len(), 16);
         assert_eq!(SetFamily::V6.key_type(), NFT_TYPE_IP6ADDR);
-        assert_eq!(SetFamily::of(&IpAddr::V6(Ipv6Addr::LOCALHOST)), SetFamily::V6);
+        assert_eq!(
+            SetFamily::of(&IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            SetFamily::V6
+        );
         let octets: [u8; 16] = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
         let element = encode_element(&IpAddr::V6("2001:db8::1".parse().unwrap()), Some(0));
         assert!(element.windows(16).any(|w| w == octets));
@@ -794,7 +834,10 @@ mod tests {
         let elem = walk_attrs(attr(&elements, NFTA_LIST_ELEM, "list elem"));
         let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
         assert_eq!(attr(&key, NFTA_DATA_VALUE, "key value"), &[203, 0, 113, 5]);
-        assert_eq!(attr(&elem, NFTA_SET_ELEM_TIMEOUT, "timeout"), &60_000u64.to_be_bytes());
+        assert_eq!(
+            attr(&elem, NFTA_SET_ELEM_TIMEOUT, "timeout"),
+            &60_000u64.to_be_bytes()
+        );
     }
 
     #[test]
@@ -824,7 +867,10 @@ mod tests {
         // A base chain: type "filter", hook = input, priority 0 (NF_IP_PRI_FILTER).
         assert_eq!(attr(&attrs, NFTA_CHAIN_TYPE, "type"), b"filter\0");
         let hook = walk_attrs(attr(&attrs, NFTA_CHAIN_HOOK, "hook"));
-        assert_eq!(be32(attr(&hook, NFTA_HOOK_HOOKNUM, "hooknum")), NF_INET_LOCAL_IN);
+        assert_eq!(
+            be32(attr(&hook, NFTA_HOOK_HOOKNUM, "hooknum")),
+            NF_INET_LOCAL_IN
+        );
         assert_eq!(be32(attr(&hook, NFTA_HOOK_PRIORITY, "priority")), 0);
     }
 
@@ -856,7 +902,10 @@ mod tests {
 
         // meta loads nfproto into reg1.
         let meta = walk_attrs(expr_data(exprs[0].1));
-        assert_eq!(be32(attr(&meta, NFTA_META_KEY, "meta key")), NFT_META_NFPROTO);
+        assert_eq!(
+            be32(attr(&meta, NFTA_META_KEY, "meta key")),
+            NFT_META_NFPROTO
+        );
         assert_eq!(be32(attr(&meta, NFTA_META_DREG, "meta dreg")), NFT_REG_1);
 
         // cmp reg1 == NFPROTO_IPV4 (a single byte) — the guard that keeps a v6
@@ -866,7 +915,10 @@ mod tests {
         assert_eq!(be32(attr(&cmp, NFTA_CMP_SREG, "cmp sreg")), NFT_REG_1);
         assert_eq!(be32(attr(&cmp, NFTA_CMP_OP, "cmp op")), NFT_CMP_EQ);
         let cmp_value = walk_attrs(attr(&cmp, NFTA_CMP_DATA, "cmp data"));
-        assert_eq!(attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"), &[NFPROTO_IPV4]);
+        assert_eq!(
+            attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"),
+            &[NFPROTO_IPV4]
+        );
 
         // payload loads the v4 source address: network base, offset 12, len 4.
         let payload = walk_attrs(expr_data(exprs[2].1));
@@ -880,7 +932,10 @@ mod tests {
 
         // lookup references the set by name.
         let lookup = walk_attrs(expr_data(exprs[3].1));
-        assert_eq!(be32(attr(&lookup, NFTA_LOOKUP_SREG, "lookup sreg")), NFT_REG_1);
+        assert_eq!(
+            be32(attr(&lookup, NFTA_LOOKUP_SREG, "lookup sreg")),
+            NFT_REG_1
+        );
         assert_eq!(attr(&lookup, NFTA_LOOKUP_SET, "lookup set"), b"banned4\0");
 
         // immediate verdict = drop, into the verdict register.
@@ -891,7 +946,10 @@ mod tests {
         );
         let imm_data = walk_attrs(attr(&immediate, NFTA_IMMEDIATE_DATA, "imm data"));
         let verdict = walk_attrs(attr(&imm_data, NFTA_DATA_VERDICT, "verdict container"));
-        assert_eq!(be32(attr(&verdict, NFTA_VERDICT_CODE, "verdict code")), NF_DROP);
+        assert_eq!(
+            be32(attr(&verdict, NFTA_VERDICT_CODE, "verdict code")),
+            NF_DROP
+        );
     }
 
     #[test]
@@ -903,7 +961,10 @@ mod tests {
 
         let cmp = walk_attrs(expr_data(exprs[1].1));
         let cmp_value = walk_attrs(attr(&cmp, NFTA_CMP_DATA, "cmp data"));
-        assert_eq!(attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"), &[NFPROTO_IPV6]);
+        assert_eq!(
+            attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"),
+            &[NFPROTO_IPV6]
+        );
 
         let payload = walk_attrs(expr_data(exprs[2].1));
         assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_OFFSET, "offset")), 8);
@@ -985,35 +1046,75 @@ mod tests {
             ensure_firewall("siphon", "input", "banned4", "banned6", true)
                 .await
                 .expect("ensure_firewall restart");
-            add_banned("siphon", "banned4", "banned6", "203.0.113.5".parse().unwrap(), 3_600_000)
-                .await
-                .expect("add v4");
+            add_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "203.0.113.5".parse().unwrap(),
+                3_600_000,
+            )
+            .await
+            .expect("add v4");
             // Timed element that STAYS, so `nft list` shows its timeout below.
-            add_banned("siphon", "banned4", "banned6", "198.51.100.7".parse().unwrap(), 3_600_000)
-                .await
-                .expect("add v4 timed");
-            add_banned("siphon", "banned4", "banned6", "2001:db8::1".parse().unwrap(), 0)
-                .await
-                .expect("add v6 permanent");
+            add_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "198.51.100.7".parse().unwrap(),
+                3_600_000,
+            )
+            .await
+            .expect("add v4 timed");
+            add_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "2001:db8::1".parse().unwrap(),
+                0,
+            )
+            .await
+            .expect("add v6 permanent");
             // Re-adding an existing element (apiban re-push after restart) is
             // idempotent success, not an error.
-            add_banned("siphon", "banned4", "banned6", "2001:db8::1".parse().unwrap(), 0)
-                .await
-                .expect("re-add v6 must be idempotent");
-            remove_banned("siphon", "banned4", "banned6", "203.0.113.5".parse().unwrap())
-                .await
-                .expect("remove v4");
+            add_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "2001:db8::1".parse().unwrap(),
+                0,
+            )
+            .await
+            .expect("re-add v6 must be idempotent");
+            remove_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "203.0.113.5".parse().unwrap(),
+            )
+            .await
+            .expect("remove v4");
             // Removing an element the kernel already expired/never had is
             // idempotent success.
-            remove_banned("siphon", "banned4", "banned6", "203.0.113.99".parse().unwrap())
-                .await
-                .expect("remove of a missing element must be idempotent");
+            remove_banned(
+                "siphon",
+                "banned4",
+                "banned6",
+                "203.0.113.99".parse().unwrap(),
+            )
+            .await
+            .expect("remove of a missing element must be idempotent");
             // But an add into a missing set is a REAL failure and must surface
             // (a swallowed ENOENT here would silently disable kernel
             // enforcement while siphon believes bans are being dropped).
-            add_banned("siphon", "no_such_set", "no_such_set6", "203.0.113.5".parse().unwrap(), 0)
-                .await
-                .expect_err("add into a missing set must error, not silently succeed");
+            add_banned(
+                "siphon",
+                "no_such_set",
+                "no_such_set6",
+                "203.0.113.5".parse().unwrap(),
+                0,
+            )
+            .await
+            .expect_err("add into a missing set must error, not silently succeed");
             // manage_rule=false owns only table + sets — no chain, no rules.
             ensure_firewall("siphon_sets", "input", "banned4", "banned6", false)
                 .await
@@ -1026,20 +1127,49 @@ mod tests {
             .expect("run nft");
         let text = String::from_utf8_lossy(&output.stdout);
         // Sets + elements.
-        assert!(text.contains("banned4") && text.contains("banned6"), "sets missing:\n{text}");
-        assert!(text.contains("2001:db8::1"), "v6 permanent element missing:\n{text}");
-        assert!(text.contains("flags timeout"), "timeout flag missing:\n{text}");
-        assert!(!text.contains("203.0.113.5"), "removed v4 element still present:\n{text}");
+        assert!(
+            text.contains("banned4") && text.contains("banned6"),
+            "sets missing:\n{text}"
+        );
+        assert!(
+            text.contains("2001:db8::1"),
+            "v6 permanent element missing:\n{text}"
+        );
+        assert!(
+            text.contains("flags timeout"),
+            "timeout flag missing:\n{text}"
+        );
+        assert!(
+            !text.contains("203.0.113.5"),
+            "removed v4 element still present:\n{text}"
+        );
         // The timed element must carry a kernel-side expiry.
-        assert!(text.contains("198.51.100.7"), "timed v4 element missing:\n{text}");
-        assert!(text.contains("expires"), "per-element timeout not armed:\n{text}");
+        assert!(
+            text.contains("198.51.100.7"),
+            "timed v4 element missing:\n{text}"
+        );
+        assert!(
+            text.contains("expires"),
+            "per-element timeout not armed:\n{text}"
+        );
         // Self-contained chain + drop rules.
         assert!(text.contains("chain input"), "base chain missing:\n{text}");
-        assert!(text.contains("@banned4") && text.contains("@banned6"), "drop rules missing:\n{text}");
+        assert!(
+            text.contains("@banned4") && text.contains("@banned6"),
+            "drop rules missing:\n{text}"
+        );
         assert!(text.contains("drop"), "drop verdict missing:\n{text}");
         // The double ensure_firewall must NOT have duplicated the rules.
-        assert_eq!(text.matches("@banned4 drop").count(), 1, "duplicate v4 drop rule:\n{text}");
-        assert_eq!(text.matches("@banned6 drop").count(), 1, "duplicate v6 drop rule:\n{text}");
+        assert_eq!(
+            text.matches("@banned4 drop").count(),
+            1,
+            "duplicate v4 drop rule:\n{text}"
+        );
+        assert_eq!(
+            text.matches("@banned6 drop").count(),
+            1,
+            "duplicate v6 drop rule:\n{text}"
+        );
 
         // The sets-only table: sets exist, but no chain and no rules.
         let output = std::process::Command::new("nft")
@@ -1047,7 +1177,10 @@ mod tests {
             .output()
             .expect("run nft");
         let sets_only = String::from_utf8_lossy(&output.stdout);
-        assert!(sets_only.contains("banned4"), "sets-only table missing sets:\n{sets_only}");
+        assert!(
+            sets_only.contains("banned4"),
+            "sets-only table missing sets:\n{sets_only}"
+        );
         assert!(
             !sets_only.contains("chain"),
             "manage_rule=false must not create a chain:\n{sets_only}"

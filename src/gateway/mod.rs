@@ -119,12 +119,18 @@ impl Destination {
 
     /// Get the current resolved address.
     pub fn address(&self) -> SocketAddr {
-        *self.address.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        *self
+            .address
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Update the resolved address (after DNS re-resolution).
     pub fn set_address(&self, address: SocketAddr) {
-        *self.address.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = address;
+        *self
+            .address
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = address;
     }
 
     pub fn with_address_str(mut self, address_str: String) -> Self {
@@ -220,7 +226,6 @@ impl Destination {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Probe config (per-group)
 // ---------------------------------------------------------------------------
@@ -286,8 +291,7 @@ pub struct DispatcherGroup {
 
 impl DispatcherGroup {
     pub fn new(name: String, algorithm: Algorithm, destinations: Vec<Destination>) -> Self {
-        let destinations: Vec<Arc<Destination>> =
-            destinations.into_iter().map(Arc::new).collect();
+        let destinations: Vec<Arc<Destination>> = destinations.into_iter().map(Arc::new).collect();
         let group = Self {
             name,
             algorithm,
@@ -347,8 +351,7 @@ impl DispatcherGroup {
                 .filter(|d| {
                     d.priority == priority
                         && d.is_healthy()
-                        && attr_filter
-                            .map_or(true, |f| d.matches_attrs(f))
+                        && attr_filter.map_or(true, |f| d.matches_attrs(f))
                 })
                 .collect();
 
@@ -381,11 +384,7 @@ impl DispatcherGroup {
     }
 
     /// Weighted round-robin.
-    fn select_weighted(
-        &self,
-        candidates: &[&Arc<Destination>],
-        priority: u32,
-    ) -> Arc<Destination> {
+    fn select_weighted(&self, candidates: &[&Arc<Destination>], priority: u32) -> Arc<Destination> {
         let total_weight: u32 = candidates.iter().map(|d| d.weight).sum();
         if total_weight == 0 {
             return Arc::clone(candidates[0]);
@@ -409,11 +408,7 @@ impl DispatcherGroup {
     }
 
     /// Hash-based selection for sticky sessions.
-    fn select_hash(
-        &self,
-        candidates: &[&Arc<Destination>],
-        key: Option<&str>,
-    ) -> Arc<Destination> {
+    fn select_hash(&self, candidates: &[&Arc<Destination>], key: Option<&str>) -> Arc<Destination> {
         let hash_value = match key {
             Some(k) => {
                 let mut hasher = DefaultHasher::new();
@@ -506,7 +501,10 @@ impl DispatcherGroup {
     /// never resolves DNS.
     pub fn contains_source(&self, ip: IpAddr) -> bool {
         self.member_ips.load().contains(&ip)
-            || self.source_networks.iter().any(|network| network.contains(&ip))
+            || self
+                .source_networks
+                .iter()
+                .any(|network| network.contains(&ip))
     }
 }
 
@@ -524,7 +522,6 @@ pub fn parse_source_network(spec: &str) -> Option<IpNet> {
     let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
     IpNet::new(ip, host_prefix).ok()
 }
-
 
 // ---------------------------------------------------------------------------
 // DispatcherManager
@@ -636,10 +633,7 @@ impl Default for DispatcherManager {
 /// Spawn background health probers for all groups that have probing enabled.
 ///
 /// Each group gets its own probe task with its own interval and threshold.
-pub fn spawn_health_probers(
-    manager: Arc<DispatcherManager>,
-    uac_sender: Arc<UacSender>,
-) {
+pub fn spawn_health_probers(manager: Arc<DispatcherManager>, uac_sender: Arc<UacSender>) {
     for entry in manager.groups.iter() {
         let group = Arc::clone(entry.value());
         if !group.probe_config.enabled {
@@ -663,7 +657,14 @@ pub fn spawn_health_probers(
             let mut tick = tokio::time::interval(interval);
             loop {
                 tick.tick().await;
-                probe_group(&group, &uac, threshold, from_user.as_deref(), from_domain.as_deref()).await;
+                probe_group(
+                    &group,
+                    &uac,
+                    threshold,
+                    from_user.as_deref(),
+                    from_domain.as_deref(),
+                )
+                .await;
             }
         });
     }
@@ -701,13 +702,17 @@ async fn probe_destination(
     from_domain: Option<&str>,
 ) {
     // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
-    let host_part = dest.uri
+    let host_part = dest
+        .uri
         .strip_prefix("sip:")
         .or_else(|| dest.uri.strip_prefix("sips:"))
         .unwrap_or(&dest.uri);
     let current_addr = dest.address();
     let (host, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
-        (h.to_string(), p.parse::<u16>().unwrap_or(current_addr.port()))
+        (
+            h.to_string(),
+            p.parse::<u16>().unwrap_or(current_addr.port()),
+        )
     } else {
         (host_part.to_string(), current_addr.port())
     };
@@ -910,7 +915,7 @@ pub fn resolve_address(address: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{OutboundRouter};
+    use crate::transport::OutboundRouter;
 
     fn make_dest(uri: &str, port: u16, weight: u32, priority: u32) -> Destination {
         Destination::new(
@@ -1027,7 +1032,10 @@ mod tests {
             }
         }
 
-        assert!(heavy_count > light_count, "heavy={heavy_count} light={light_count}");
+        assert!(
+            heavy_count > light_count,
+            "heavy={heavy_count} light={light_count}"
+        );
         assert!(heavy_count >= 60, "heavy={heavy_count} should be >= 60");
     }
 
@@ -1308,7 +1316,10 @@ mod tests {
         assert_eq!(group.probe_config.interval, Duration::from_secs(10));
         assert_eq!(group.probe_config.failure_threshold, 5);
         assert_eq!(group.probe_config.from_user.as_deref(), Some("bgcf"));
-        assert_eq!(group.probe_config.from_domain.as_deref(), Some("example.com"));
+        assert_eq!(
+            group.probe_config.from_domain.as_deref(),
+            Some("example.com")
+        );
     }
 
     #[test]
@@ -1380,7 +1391,15 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let uac_sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None, None));
+        let uac_sender = Arc::new(UacSender::new(
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+        ));
         let manager = Arc::new(DispatcherManager::new());
 
         manager.add_group(DispatcherGroup::new(
@@ -1401,7 +1420,10 @@ mod tests {
 
     #[test]
     fn algorithm_from_str() {
-        assert_eq!(Algorithm::from_str("round_robin"), Some(Algorithm::RoundRobin));
+        assert_eq!(
+            Algorithm::from_str("round_robin"),
+            Some(Algorithm::RoundRobin)
+        );
         assert_eq!(Algorithm::from_str("weighted"), Some(Algorithm::Weighted));
         assert_eq!(Algorithm::from_str("hash"), Some(Algorithm::Hash));
         assert_eq!(Algorithm::from_str("call_id_hash"), Some(Algorithm::Hash));
@@ -1527,7 +1549,9 @@ mod tests {
         }
 
         for handle in handles {
-            handle.join().expect("thread panicked during concurrent test");
+            handle
+                .join()
+                .expect("thread panicked during concurrent test");
         }
 
         // Verify system is still functional after contention
@@ -1553,7 +1577,12 @@ mod tests {
             ],
         );
 
-        let keys = ["call-id-alpha", "call-id-beta", "call-id-gamma", "call-id-delta"];
+        let keys = [
+            "call-id-alpha",
+            "call-id-beta",
+            "call-id-gamma",
+            "call-id-delta",
+        ];
         let expected: Vec<String> = keys
             .iter()
             .map(|key| group.select(Some(key), None).unwrap().uri.clone())
@@ -1835,10 +1864,7 @@ mod tests {
 
     #[test]
     fn extract_address_bare_ip_port() {
-        assert_eq!(
-            extract_address_from_uri("10.0.0.1:5060"),
-            "10.0.0.1:5060"
-        );
+        assert_eq!(extract_address_from_uri("10.0.0.1:5060"), "10.0.0.1:5060");
     }
 
     // --- resolve_address ---
@@ -1898,7 +1924,9 @@ mod tests {
         let manager = DispatcherManager::new();
         manager.add_group(group);
 
-        assert!(manager.cached_address_for("other.host.invalid:5061").is_none());
+        assert!(manager
+            .cached_address_for("other.host.invalid:5061")
+            .is_none());
         // Same host, different port → not the same destination.
         assert!(manager.cached_address_for("gw.test.invalid:5060").is_none());
     }
@@ -1953,8 +1981,7 @@ mod tests {
             1,
         )
         .with_address_str("localhost:5060".to_string());
-        let group =
-            DispatcherGroup::new("local".to_string(), Algorithm::Weighted, vec![dest]);
+        let group = DispatcherGroup::new("local".to_string(), Algorithm::Weighted, vec![dest]);
 
         assert!(
             group.contains_source("127.0.0.1".parse().unwrap()),
@@ -2022,8 +2049,14 @@ mod tests {
         assert!(parse_source_network("203.0.113.0/24").is_some());
         assert!(parse_source_network("2001:db8::/32").is_some());
         // Bare IP → host route (/32 for v4, /128 for v6).
-        assert_eq!(parse_source_network("203.0.113.7").unwrap().prefix_len(), 32);
-        assert_eq!(parse_source_network("2001:db8::1").unwrap().prefix_len(), 128);
+        assert_eq!(
+            parse_source_network("203.0.113.7").unwrap().prefix_len(),
+            32
+        );
+        assert_eq!(
+            parse_source_network("2001:db8::1").unwrap().prefix_len(),
+            128
+        );
         // Neither a CIDR nor an IP → None (caller warns and skips).
         assert!(parse_source_network("not-an-ip").is_none());
         assert!(parse_source_network("203.0.113.0/99").is_none());
@@ -2126,7 +2159,10 @@ mod tests {
         let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
         // A single 503 + Retry-After marks down at once, without the threshold.
         apply_probe_response(&dest, Some(&make_response(503, Some("30"))), 3);
-        assert!(!dest.is_healthy(), "503+Retry-After must mark down immediately");
+        assert!(
+            !dest.is_healthy(),
+            "503+Retry-After must mark down immediately"
+        );
         assert!(dest.in_cooldown(), "cooldown must be armed");
 
         // A healthy probe DURING the cooldown does not recover it.

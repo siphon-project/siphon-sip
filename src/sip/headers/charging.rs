@@ -186,7 +186,10 @@ mod tests {
              icid-generated-at=192.0.6.8;\
              orig-ioi=home1.net;term-ioi=home2.net",
         );
-        assert_eq!(cv.icid.as_deref(), Some("AyretyU0dm+6O2IrT5tAFrbHLso=023551024"));
+        assert_eq!(
+            cv.icid.as_deref(),
+            Some("AyretyU0dm+6O2IrT5tAFrbHLso=023551024")
+        );
         assert_eq!(cv.icid_generated_at.as_deref(), Some("192.0.6.8"));
         assert_eq!(cv.orig_ioi.as_deref(), Some("home1.net"));
         assert_eq!(cv.term_ioi.as_deref(), Some("home2.net"));
@@ -198,7 +201,10 @@ mod tests {
         let cv = ChargingVector::parse(
             "icid-value=\"AyretyU0dm+6O2IrT5tAFrbHLso=023551024\";orig-ioi=home1.net",
         );
-        assert_eq!(cv.icid.as_deref(), Some("AyretyU0dm+6O2IrT5tAFrbHLso=023551024"));
+        assert_eq!(
+            cv.icid.as_deref(),
+            Some("AyretyU0dm+6O2IrT5tAFrbHLso=023551024")
+        );
         assert_eq!(cv.orig_ioi.as_deref(), Some("home1.net"));
         assert!(cv.term_ioi.is_none());
     }
@@ -214,9 +220,7 @@ mod tests {
 
     #[test]
     fn charging_vector_unknown_params_ignored() {
-        let cv = ChargingVector::parse(
-            "icid-value=icid-1;ggsn=gw.example.com;auth-token=opaque",
-        );
+        let cv = ChargingVector::parse("icid-value=icid-1;ggsn=gw.example.com;auth-token=opaque");
         assert_eq!(cv.icid.as_deref(), Some("icid-1"));
         assert!(cv.icid_generated_at.is_none());
     }
@@ -253,8 +257,7 @@ mod tests {
 
     #[test]
     fn served_user_term_unreg() {
-        let su =
-            ServedUser::parse("<sip:user2@example.com>;sescase=term;regstate=unreg").unwrap();
+        let su = ServedUser::parse("<sip:user2@example.com>;sescase=term;regstate=unreg").unwrap();
         assert_eq!(su.sescase.as_deref(), Some("term"));
         assert_eq!(su.regstate.as_deref(), Some("unreg"));
     }
@@ -293,7 +296,10 @@ mod tests {
 
     #[test]
     fn visited_network_unquoted() {
-        assert_eq!(parse_visited_network_id("other.net"), Some("other.net".into()));
+        assert_eq!(
+            parse_visited_network_id("other.net"),
+            Some("other.net".into())
+        );
     }
 
     #[test]

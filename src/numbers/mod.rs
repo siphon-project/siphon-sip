@@ -233,7 +233,10 @@ impl Number {
         let (international, form) = if had_plus {
             (digits, InputForm::International)
         } else if !intl_prefix.is_empty() && digits.starts_with(intl_prefix.as_str()) {
-            (digits[intl_prefix.len()..].to_string(), InputForm::International)
+            (
+                digits[intl_prefix.len()..].to_string(),
+                InputForm::International,
+            )
         } else if !trunk_prefix.is_empty() && digits.starts_with(trunk_prefix.as_str()) {
             (
                 format!("{}{}", locale.country_code, &digits[trunk_prefix.len()..]),
@@ -262,19 +265,20 @@ impl Number {
         // arrived explicitly international (`+` / access prefix) are trusted as
         // given and skip the guard.
         if matches!(form, InputForm::National | InputForm::Bare) {
-            let significant = international.len().saturating_sub(locale.country_code.len());
+            let significant = international
+                .len()
+                .saturating_sub(locale.country_code.len());
             if significant < locale.min_national_digits {
                 return Err(NumberError::NotANumber(raw.to_string()));
             }
         }
 
-        let country_code = if !locale.country_code.is_empty()
-            && international.starts_with(&locale.country_code)
-        {
-            Some(locale.country_code.clone())
-        } else {
-            None
-        };
+        let country_code =
+            if !locale.country_code.is_empty() && international.starts_with(&locale.country_code) {
+                Some(locale.country_code.clone())
+            } else {
+                None
+            };
 
         Ok(Number {
             international,
@@ -430,8 +434,16 @@ mod tests {
             }
             let number = Number::parse(kav.input, &locale)
                 .unwrap_or_else(|e| panic!("row {row} {:?}: {e}", kav.input));
-            assert_eq!(number.format(NumberFormat::E164), kav.e164, "e164 row {row}");
-            assert_eq!(number.format(NumberFormat::Plain), kav.plain, "plain row {row}");
+            assert_eq!(
+                number.format(NumberFormat::E164),
+                kav.e164,
+                "e164 row {row}"
+            );
+            assert_eq!(
+                number.format(NumberFormat::Plain),
+                kav.plain,
+                "plain row {row}"
+            );
             assert_eq!(
                 number.format(NumberFormat::International),
                 kav.international,
@@ -547,7 +559,10 @@ mod tests {
     fn format_token_parsing() {
         use std::str::FromStr;
         assert_eq!(NumberFormat::from_str("e164").unwrap(), NumberFormat::E164);
-        assert_eq!(NumberFormat::from_str("PLAIN").unwrap(), NumberFormat::Plain);
+        assert_eq!(
+            NumberFormat::from_str("PLAIN").unwrap(),
+            NumberFormat::Plain
+        );
         assert_eq!(
             NumberFormat::from_str("intl").unwrap(),
             NumberFormat::International

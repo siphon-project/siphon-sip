@@ -59,9 +59,7 @@ pub fn enable_deferred_sends() {
 /// Drain and return all deferred messages, disabling deferred mode.
 /// Call after the reply has been sent to wire.
 pub fn drain_deferred_sends() -> Vec<DeferredMessage> {
-    DEFERRED_SENDS.with(|cell| {
-        cell.borrow_mut().take().unwrap_or_default()
-    })
+    DEFERRED_SENDS.with(|cell| cell.borrow_mut().take().unwrap_or_default())
 }
 
 /// Drain only the deferred messages addressed to `(destination, transport)`,
@@ -99,11 +97,19 @@ pub fn drain_deferred_sends_for(
 /// Try to queue a message for deferred sending.  Returns `true` if deferred
 /// mode is active and the message was queued; `false` if no request handler
 /// is active (caller should send immediately).
-pub(crate) fn try_defer_send(message: SipMessage, destination: std::net::SocketAddr, transport: Transport) -> bool {
+pub(crate) fn try_defer_send(
+    message: SipMessage,
+    destination: std::net::SocketAddr,
+    transport: Transport,
+) -> bool {
     DEFERRED_SENDS.with(|cell| {
         let mut guard = cell.borrow_mut();
         if let Some(ref mut queue) = *guard {
-            queue.push(DeferredMessage { message, destination, transport });
+            queue.push(DeferredMessage {
+                message,
+                destination,
+                transport,
+            });
             true
         } else {
             false
@@ -336,7 +342,9 @@ impl PyProxyUtils {
 
         // Parse the request URI (used in the Request-Line)
         let uri = parse_uri_standalone(ruri).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid request URI '{ruri}': {error}"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid request URI '{ruri}': {error}"
+            ))
         })?;
 
         // Resolve the transport destination per RFC 3261 §8.1.2 (a UAC's
@@ -356,7 +364,9 @@ impl PyProxyUtils {
         //   3. Otherwise, resolve the R-URI (RFC 3263).
         let resolve_uri = resolve_send_target(&uri, next_hop, headers)?;
 
-        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+        let transport_hint = resolve_uri
+            .get_param("transport")
+            .map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
@@ -381,11 +391,7 @@ impl PyProxyUtils {
         })?;
 
         // Determine transport
-        let transport = match target
-            .transport
-            .as_deref()
-            .or(transport_hint.as_deref())
-        {
+        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
             Some(hint) => match hint.to_lowercase().as_str() {
                 "tcp" => Transport::Tcp,
                 "tls" => Transport::Tls,
@@ -394,7 +400,13 @@ impl PyProxyUtils {
                 "sctp" => Transport::Sctp,
                 _ => Transport::Udp,
             },
-            None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+            None => {
+                if scheme == "sips" {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                }
+            }
         };
 
         // Via sent-by = our advertised host (FQDN-aware) + listen port, so the
@@ -404,24 +416,14 @@ impl PyProxyUtils {
             uac_sender.via_host_for(&transport),
             uac_sender.addr_for(&transport).port(),
         );
-        let (message, branch) = build_send_request_message(
-            method,
-            uri,
-            transport,
-            &local_sent_by,
-            headers,
-            body,
-        )?;
+        let (message, branch) =
+            build_send_request_message(method, uri, transport, &local_sent_by, headers, body)?;
 
         // Always register a pending entry. For fire-and-forget the entry
         // exists only so the dispatcher's `UacSender::match_response` silently
         // consumes the matching response — without it, every legitimate
         // response logs "response for unknown branch (not ours)".
-        let receiver = uac_sender.send_request_with_response(
-            message,
-            target.address,
-            transport,
-        );
+        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
 
         if !wait_for_response {
             // Fire-and-forget: clean up the pending entry after RFC 3261
@@ -432,12 +434,9 @@ impl PyProxyUtils {
             let uac_for_cleanup = Arc::clone(uac_sender);
             let branch_for_cleanup = branch;
             tokio::spawn(async move {
-                if tokio::time::timeout(
-                    std::time::Duration::from_secs(32),
-                    receiver,
-                )
-                .await
-                .is_err()
+                if tokio::time::timeout(std::time::Duration::from_secs(32), receiver)
+                    .await
+                    .is_err()
                 {
                     uac_for_cleanup.expire_branch(&branch_for_cleanup);
                 }
@@ -452,12 +451,10 @@ impl PyProxyUtils {
         let timeout = std::time::Duration::from_millis(timeout_ms);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             match tokio::time::timeout(timeout, receiver).await {
-                Ok(Ok(crate::uac::UacResult::Response(message))) => {
-                    Python::attach(|py| {
-                        let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
-                        Py::new(py, py_reply).map(Some)
-                    })
-                }
+                Ok(Ok(crate::uac::UacResult::Response(message))) => Python::attach(|py| {
+                    let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
+                    Py::new(py, py_reply).map(Some)
+                }),
                 // Timeout, channel closed, or explicit UacResult::Timeout
                 _ => Ok(None),
             }
@@ -631,14 +628,10 @@ fn build_send_request_message(
     if let Some(header_dict) = headers {
         for (key, value) in header_dict.iter() {
             let name: String = key.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "header name must be str: {error}"
-                ))
+                pyo3::exceptions::PyTypeError::new_err(format!("header name must be str: {error}"))
             })?;
             let val: String = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "header value must be str: {error}"
-                ))
+                pyo3::exceptions::PyTypeError::new_err(format!("header value must be str: {error}"))
             })?;
             // Case-insensitive match — RFC 3261 §7.3 makes header names
             // case-insensitive, and Call-ID has the compact form "i".
@@ -674,7 +667,10 @@ fn build_send_request_message(
         // Auto Via sent-by is *our* advertised host:port (FQDN-aware, RFC 3261
         // §20.42) so the peer routes the response back to us — not the
         // destination address, which was a latent bug.
-        None => format!("SIP/2.0/{} {};branch={}", transport, local_sent_by, auto_branch),
+        None => format!(
+            "SIP/2.0/{} {};branch={}",
+            transport, local_sent_by, auto_branch
+        ),
     };
     let branch = crate::sip::headers::via::Via::parse(&via_value)
         .ok()
@@ -734,9 +730,7 @@ fn build_send_request_message(
     }
 
     let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to build SIP message: {error}"
-        ))
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SIP message: {error}"))
     })?;
     Ok((message, branch))
 }
@@ -879,17 +873,33 @@ mod deferred_send_tests {
         let other = addr("10.0.0.2:5060");
 
         enable_deferred_sends();
-        assert!(try_defer_send(notify_to("alice"), subscriber, Transport::Udp));
+        assert!(try_defer_send(
+            notify_to("alice"),
+            subscriber,
+            Transport::Udp
+        ));
         assert!(try_defer_send(notify_to("bob"), other, Transport::Udp));
-        assert!(try_defer_send(notify_to("carol"), subscriber, Transport::Udp));
+        assert!(try_defer_send(
+            notify_to("carol"),
+            subscriber,
+            Transport::Udp
+        ));
 
         let matched = drain_deferred_sends_for(subscriber, Transport::Udp);
         assert_eq!(matched.len(), 2, "both messages for the reply's peer");
         // Relative order preserved — they are sent as ordered followups.
         assert_eq!(matched[0].destination, subscriber);
         assert_eq!(matched[1].destination, subscriber);
-        assert!(matched[0].message.to_bytes().windows(5).any(|w| w == b"alice"));
-        assert!(matched[1].message.to_bytes().windows(5).any(|w| w == b"carol"));
+        assert!(matched[0]
+            .message
+            .to_bytes()
+            .windows(5)
+            .any(|w| w == b"alice"));
+        assert!(matched[1]
+            .message
+            .to_bytes()
+            .windows(5)
+            .any(|w| w == b"carol"));
 
         // The other peer's message MUST survive for the end-of-request flush.
         // Draining used to disable deferred mode outright, which silently
@@ -1099,7 +1109,8 @@ mod tests {
                 "branch must use the UAC-py prefix, got {branch}"
             );
             assert_eq!(
-                message.body, body.as_bytes(),
+                message.body,
+                body.as_bytes(),
                 "body must round-trip through the builder"
             );
             assert_eq!(
@@ -1214,7 +1225,9 @@ mod tests {
         pyo3::Python::initialize();
         Python::attach(|py| {
             let headers = PyDict::new(py);
-            headers.set_item("Call-ID", "ussd-original-call-id").unwrap();
+            headers
+                .set_item("Call-ID", "ussd-original-call-id")
+                .unwrap();
 
             let (message, _branch) = build_send_request_message(
                 "MESSAGE",
@@ -1265,7 +1278,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
-            let cseqs = message.headers.get_all("CSeq").expect("CSeq must be present");
+            let cseqs = message
+                .headers
+                .get_all("CSeq")
+                .expect("CSeq must be present");
             assert_eq!(cseqs.len(), 1, "CSeq must be unique, got {cseqs:?}");
             assert_eq!(cseqs[0], "42 MESSAGE");
         });
@@ -1390,7 +1406,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
-            let froms = message.headers.get_all("From").expect("From must be present");
+            let froms = message
+                .headers
+                .get_all("From")
+                .expect("From must be present");
             assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
             // Matches ^<sip:a@b>;tag=.+$
             assert!(
@@ -1423,7 +1442,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
-            let froms = message.headers.get_all("From").expect("From must be present");
+            let froms = message
+                .headers
+                .get_all("From")
+                .expect("From must be present");
             assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
             assert_eq!(
                 froms[0], "<sip:a@b>;tag=fixed",
@@ -1453,7 +1475,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
-            let froms = message.headers.get_all("From").expect("From must be present");
+            let froms = message
+                .headers
+                .get_all("From")
+                .expect("From must be present");
             assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
             assert!(
                 froms[0].starts_with("\"Alice\" <sip:alice@atlanta.com>;tag="),
@@ -1485,7 +1510,10 @@ mod tests {
             // The store expands compact forms (§7.3.3), so both names resolve
             // to the one canonical From — a single value proves there is no
             // duplicate From/`f` pair on the wire.
-            let froms = message.headers.get_all("From").expect("From must be present");
+            let froms = message
+                .headers
+                .get_all("From")
+                .expect("From must be present");
             assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
             assert!(
                 froms[0].starts_with("<sip:a@b>;tag="),
@@ -1512,7 +1540,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
-            let froms = message.headers.get_all("From").expect("From must be present");
+            let froms = message
+                .headers
+                .get_all("From")
+                .expect("From must be present");
             assert_eq!(froms.len(), 1, "one From expected, got {froms:?}");
             // Built from our advertised identity, and tagged.
             assert!(
@@ -1549,8 +1580,8 @@ mod tests {
     async fn send_request_python_kwargs_preserve_body_and_content_type() {
         use crate::transport::OutboundRouter;
         use crate::uac::UacSender;
-        use std::collections::HashMap;
         use pyo3::types::PyTuple;
+        use std::collections::HashMap;
 
         pyo3::Python::initialize();
 
@@ -1596,13 +1627,11 @@ mod tests {
         // 9 headers (incl. Content-Type), 1809-byte str body.
         // ---------------------------------------------------------------
         let mut body_1 = String::with_capacity(1809);
-        body_1.push_str(
-            "REGISTER sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n",
-        );
-        body_1.push_str(
-            "Via: SIP/2.0/UDP 172.30.0.50:5060;branch=z9hG4bK-ue-1\r\n",
-        );
-        body_1.push_str("From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue-1\r\n");
+        body_1
+            .push_str("REGISTER sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n");
+        body_1.push_str("Via: SIP/2.0/UDP 172.30.0.50:5060;branch=z9hG4bK-ue-1\r\n");
+        body_1
+            .push_str("From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue-1\r\n");
         body_1.push_str("To: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>\r\n");
         body_1.push_str("Call-ID: orig-call-id\r\n");
         body_1.push_str("CSeq: 2 REGISTER\r\n");
@@ -1623,15 +1652,42 @@ mod tests {
             let bound = utils_py.bind(py);
 
             let headers = PyDict::new(py);
-            headers.set_item("Contact", "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>").unwrap();
+            headers
+                .set_item(
+                    "Contact",
+                    "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>",
+                )
+                .unwrap();
             headers.set_item("Content-Type", "message/sip").unwrap();
             headers.set_item("Event", "registration").unwrap();
             headers.set_item("Expires", "0").unwrap();
-            headers.set_item("From", "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>;tag=scscf-3preg").unwrap();
-            headers.set_item("P-Associated-URI", "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>").unwrap();
-            headers.set_item("P-Visited-Network-ID", "ims.mnc001.mcc001.3gppnetwork.org").unwrap();
-            headers.set_item("Path", "<sip:term@pcscf.ims.mnc001.mcc001.3gppnetwork.org:5060;lr>").unwrap();
-            headers.set_item("To", "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>").unwrap();
+            headers
+                .set_item(
+                    "From",
+                    "<sip:scscf-0.ims.mnc001.mcc001.3gppnetwork.org:6060>;tag=scscf-3preg",
+                )
+                .unwrap();
+            headers
+                .set_item(
+                    "P-Associated-URI",
+                    "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>",
+                )
+                .unwrap();
+            headers
+                .set_item("P-Visited-Network-ID", "ims.mnc001.mcc001.3gppnetwork.org")
+                .unwrap();
+            headers
+                .set_item(
+                    "Path",
+                    "<sip:term@pcscf.ims.mnc001.mcc001.3gppnetwork.org:5060;lr>",
+                )
+                .unwrap();
+            headers
+                .set_item(
+                    "To",
+                    "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>",
+                )
+                .unwrap();
 
             let kwargs = PyDict::new(py);
             kwargs.set_item("headers", headers).unwrap();
@@ -1783,7 +1839,10 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("Via:"))
             .and_then(|via| via.split(";branch=").nth(1))
-            .and_then(|rest| rest.split(|c: char| c == ';' || c.is_ascii_whitespace()).next())
+            .and_then(|rest| {
+                rest.split(|c: char| c == ';' || c.is_ascii_whitespace())
+                    .next()
+            })
             .expect("scenario 4: outbound Via must carry branch");
         assert!(
             branch.starts_with("z9hG4bK-uac-py-"),
@@ -1937,7 +1996,9 @@ mod tests {
         Python::attach(|py| {
             let headers = PyDict::new(py);
             headers.set_item("To", "<sip:bob@example.org>").unwrap();
-            headers.set_item("Route", "<sip:scscf-0.example.org:6060;lr>").unwrap();
+            headers
+                .set_item("Route", "<sip:scscf-0.example.org:6060;lr>")
+                .unwrap();
 
             let uri = route_next_hop(Some(&headers)).expect("Route must produce a next hop");
             assert_eq!(uri.host, "scscf-0.example.org");
@@ -1950,7 +2011,9 @@ mod tests {
         pyo3::Python::initialize();
         Python::attach(|py| {
             let headers = PyDict::new(py);
-            headers.set_item("rOuTe", "<sip:scscf-0.example.org:6060;lr>").unwrap();
+            headers
+                .set_item("rOuTe", "<sip:scscf-0.example.org:6060;lr>")
+                .unwrap();
 
             let uri = route_next_hop(Some(&headers)).expect("Route is case-insensitive");
             assert_eq!(uri.host, "scscf-0.example.org");
@@ -1980,7 +2043,9 @@ mod tests {
         Python::attach(|py| {
             let ruri = SipUri::new("host-b.example.org".to_string());
             let headers = PyDict::new(py);
-            headers.set_item("Route", "<sip:host-a.example.org;lr>").unwrap();
+            headers
+                .set_item("Route", "<sip:host-a.example.org;lr>")
+                .unwrap();
 
             // next_hop (host-c) outranks both the Route (host-a) and R-URI (host-b).
             let target = resolve_send_target(&ruri, Some("sip:host-c.example.org"), Some(&headers))
@@ -1995,7 +2060,9 @@ mod tests {
         Python::attach(|py| {
             let ruri = SipUri::new("host-b.example.org".to_string());
             let headers = PyDict::new(py);
-            headers.set_item("Route", "<sip:host-a.example.org;lr>").unwrap();
+            headers
+                .set_item("Route", "<sip:host-a.example.org;lr>")
+                .unwrap();
 
             let target = resolve_send_target(&ruri, None, Some(&headers))
                 .expect("route must produce a target");

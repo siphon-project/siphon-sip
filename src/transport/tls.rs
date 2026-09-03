@@ -21,11 +21,17 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{TlsMethod, TlsServerConfig};
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
-use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor, StreamContext};
+use crate::transport::stream::{
+    bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
+    StreamContext,
+};
+use crate::transport::{
+    configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
+    StreamConnections, Transport,
+};
 
 /// Live-swappable TLS acceptor — read by every accept loop, replaced
 /// atomically by the file watcher when the cert or key on disk changes.
@@ -68,15 +74,14 @@ fn load_certified_key(
             format!("failed to open certificate file '{certificate_path}': {error}"),
         )
     })?;
-    let certificates: Vec<_> =
-        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("failed to parse certificate PEM '{certificate_path}': {error}"),
-                )
-            })?;
+    let certificates: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse certificate PEM '{certificate_path}': {error}"),
+            )
+        })?;
 
     if certificates.is_empty() {
         return Err(io::Error::new(
@@ -258,7 +263,11 @@ fn build_cert_resolver(tls_config: &TlsServerConfig) -> io::Result<SniCertResolv
         );
     }
 
-    Ok(SniCertResolver { exact, wildcard, default })
+    Ok(SniCertResolver {
+        exact,
+        wildcard,
+        default,
+    })
 }
 
 /// The rustls protocol-version list for a configured `tls.method` floor.
@@ -300,9 +309,8 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
     // bare `builder()` (rustls default = TLS 1.2 + 1.3) and the config value was
     // parsed but never read, so `method: TLSv1_3` claimed a floor nothing
     // enforced — a TLS 1.2 peer still handshook fine.
-    let builder = rustls::ServerConfig::builder_with_protocol_versions(protocol_versions(
-        tls_config.method,
-    ));
+    let builder =
+        rustls::ServerConfig::builder_with_protocol_versions(protocol_versions(tls_config.method));
     info!(
         min_version = %tls_config.method,
         "TLS listener minimum protocol version"
@@ -376,9 +384,7 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
 /// new handshakes pick up the new cert. That matches the standard cert-renewal
 /// model: ACME/cert-manager writes the new pair, siphon picks it up, sessions
 /// transition naturally over the renewal window.
-pub fn build_hot_reload_acceptor(
-    tls_config: &TlsServerConfig,
-) -> io::Result<SharedTlsAcceptor> {
+pub fn build_hot_reload_acceptor(tls_config: &TlsServerConfig) -> io::Result<SharedTlsAcceptor> {
     let initial = build_tls_acceptor(tls_config)?;
     let shared: SharedTlsAcceptor = Arc::new(ArcSwap::from(Arc::new(initial)));
 
@@ -448,7 +454,9 @@ pub fn build_hot_reload_acceptor(
             let event = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
                 Ok(event) => event,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if weak.upgrade().is_none() { break; }
+                    if weak.upgrade().is_none() {
+                        break;
+                    }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -458,7 +466,11 @@ pub fn build_hot_reload_acceptor(
                 None => break,
             };
             match event {
-                Ok(Event { kind: EventKind::Modify(_) | EventKind::Create(_), paths, .. }) => {
+                Ok(Event {
+                    kind: EventKind::Modify(_) | EventKind::Create(_),
+                    paths,
+                    ..
+                }) => {
                     let touched = paths.iter().any(|path| {
                         path.file_name()
                             .is_some_and(|name| watched_names.iter().any(|watched| watched == name))
@@ -614,8 +626,8 @@ pub async fn listen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
 
     fn test_acl() -> Arc<TransportAcl> {
         Arc::new(TransportAcl::new(vec![], vec![]))
@@ -629,7 +641,9 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate().expect("keygen");
         let certificate_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create cert params");
-        let certificate = certificate_params.self_signed(&key_pair).expect("self-sign");
+        let certificate = certificate_params
+            .self_signed(&key_pair)
+            .expect("self-sign");
         let cert_pem = certificate.pem();
         let key_pem = key_pair.serialize_pem();
         (cert_pem, key_pem)
@@ -659,7 +673,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tls_config = write_test_cert(&directory);
         let result = build_tls_acceptor(&tls_config);
-        assert!(result.is_ok(), "build_tls_acceptor failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build_tls_acceptor failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -678,7 +696,11 @@ mod tests {
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
         let error = result.as_ref().err().unwrap().to_string();
-        assert!(error.contains("cert"), "error should mention cert: {}", error);
+        assert!(
+            error.contains("cert"),
+            "error should mention cert: {}",
+            error
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -698,8 +720,10 @@ mod tests {
         shared.store(Arc::new(replacement));
 
         let after = Arc::clone(&shared.load());
-        assert!(!Arc::ptr_eq(&initial, &after),
-            "SharedTlsAcceptor did not swap the inner Arc after store()");
+        assert!(
+            !Arc::ptr_eq(&initial, &after),
+            "SharedTlsAcceptor did not swap the inner Arc after store()"
+        );
     }
 
     #[test]
@@ -906,10 +930,9 @@ mod tests {
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
         use rustls_pki_types::pem::PemObject;
-        let certs: Vec<_> =
-            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
@@ -973,19 +996,21 @@ mod tests {
         tls_stream.write_all(sip_message.as_bytes()).await.unwrap();
 
         // Receive the inbound message
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("timed out waiting for inbound message")
-        .expect("inbound channel closed");
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("timed out waiting for inbound message")
+                .expect("inbound channel closed");
 
         assert_eq!(message.transport, Transport::Tls);
         assert_eq!(message.local_addr, bound_addr);
         assert!(!message.data.is_empty());
         let data_str = String::from_utf8_lossy(&message.data);
-        assert!(data_str.contains("REGISTER"), "expected REGISTER in data: {}", data_str);
+        assert!(
+            data_str.contains("REGISTER"),
+            "expected REGISTER in data: {}",
+            data_str
+        );
 
         // Verify connection is tracked
         assert!(connection_map.contains_key(&message.connection_id));
@@ -1032,10 +1057,9 @@ mod tests {
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
         let mut cursor = std::io::Cursor::new(cert_pem);
         use rustls_pki_types::pem::PemObject;
-        let certs: Vec<_> =
-            rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let mut root_store = rustls::RootCertStore::empty();
         for cert in &certs {
             root_store.add(cert.clone()).unwrap();
@@ -1050,14 +1074,15 @@ mod tests {
         let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
 
         // Send data so the connection gets an ID
-        tls_stream.write_all(b"REGISTER sip:test SIP/2.0\r\n\r\n").await.unwrap();
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        tls_stream
+            .write_all(b"REGISTER sip:test SIP/2.0\r\n\r\n")
+            .await
+            .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         let connection_id = message.connection_id;
         let remote_addr = message.remote_addr;
@@ -1098,16 +1123,14 @@ mod tests {
         let certificate_params =
             rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
                 .expect("failed to create cert params");
-        let certificate = certificate_params.self_signed(&key_pair).expect("self-sign");
+        let certificate = certificate_params
+            .self_signed(&key_pair)
+            .expect("self-sign");
         (certificate.pem(), key_pair.serialize_pem())
     }
 
     /// Write a cert/key pair into `directory` under `stem`, returning the paths.
-    fn write_pair(
-        directory: &tempfile::TempDir,
-        stem: &str,
-        names: &[&str],
-    ) -> (String, String) {
+    fn write_pair(directory: &tempfile::TempDir, stem: &str, names: &[&str]) -> (String, String) {
         let (cert_pem, key_pem) = generate_cert_for(names);
         let cert_path = directory.path().join(format!("{stem}-cert.pem"));
         let key_path = directory.path().join(format!("{stem}-key.pem"));
@@ -1225,7 +1248,11 @@ mod tests {
 
         let resolver = build_cert_resolver(&tls_config).expect("resolver");
 
-        for probe in ["sip.tenant-b.test", "SIP.TENANT-B.TEST", "Sip.Tenant-b.Test"] {
+        for probe in [
+            "sip.tenant-b.test",
+            "SIP.TENANT-B.TEST",
+            "Sip.Tenant-b.Test",
+        ] {
             assert_eq!(
                 resolved_der(&resolver, Some(probe)),
                 tenant_der,
@@ -1290,7 +1317,10 @@ mod tests {
         let error = build_cert_resolver(&tls_config)
             .expect_err("duplicate server name must fail closed")
             .to_string();
-        assert!(error.contains("dup.test"), "error should name the duplicate: {error}");
+        assert!(
+            error.contains("dup.test"),
+            "error should name the duplicate: {error}"
+        );
     }
 
     #[test]
@@ -1433,9 +1463,10 @@ mod tests {
 
         let tcp_stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
         let name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
-        let tls_stream = connector.connect(name, tcp_stream).await.unwrap_or_else(|error| {
-            panic!("client handshake for '{server_name}' failed: {error}")
-        });
+        let tls_stream = connector
+            .connect(name, tcp_stream)
+            .await
+            .unwrap_or_else(|error| panic!("client handshake for '{server_name}' failed: {error}"));
         let peer = tls_stream
             .get_ref()
             .1

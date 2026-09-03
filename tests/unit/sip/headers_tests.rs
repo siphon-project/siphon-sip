@@ -4,15 +4,18 @@ use siphon::sip::headers::SipHeaders;
 fn test_header_add() {
     let mut headers = SipHeaders::new();
     headers.add("Via", "SIP/2.0/UDP host.example.com:5060".to_string());
-    
-    assert_eq!(headers.get("Via").unwrap(), "SIP/2.0/UDP host.example.com:5060");
+
+    assert_eq!(
+        headers.get("Via").unwrap(),
+        "SIP/2.0/UDP host.example.com:5060"
+    );
 }
 
 #[test]
 fn test_header_case_insensitive() {
     let mut headers = SipHeaders::new();
     headers.add("Via", "test".to_string());
-    
+
     assert_eq!(headers.get("via").unwrap(), "test");
     assert_eq!(headers.get("VIA").unwrap(), "test");
     assert_eq!(headers.get("ViA").unwrap(), "test");
@@ -23,7 +26,7 @@ fn test_multiple_values() {
     let mut headers = SipHeaders::new();
     headers.add("Via", "first".to_string());
     headers.add("Via", "second".to_string());
-    
+
     let values = headers.get_all("Via").unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!(values[0], "first");
@@ -35,7 +38,7 @@ fn test_header_set() {
     let mut headers = SipHeaders::new();
     headers.add("Via", "first".to_string());
     headers.set("Via", "second".to_string());
-    
+
     let values = headers.get_all("Via").unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(values[0], "second");
@@ -46,7 +49,7 @@ fn test_header_remove() {
     let mut headers = SipHeaders::new();
     headers.add("Via", "test".to_string());
     headers.remove("Via");
-    
+
     assert!(headers.get("Via").is_none());
 }
 
@@ -60,7 +63,7 @@ fn test_convenience_methods() {
     headers.add("CSeq", "1 INVITE".to_string());
     headers.add("Max-Forwards", "70".to_string());
     headers.add("Content-Length", "100".to_string());
-    
+
     assert!(headers.via().is_some());
     assert!(headers.to().is_some());
     assert!(headers.from().is_some());
@@ -94,10 +97,13 @@ fn set_all_preserves_header_position() {
     headers.add("To", "<sip:bob@example.com>".to_string());
 
     // set_all() should replace Via values in-place, keeping position
-    headers.set_all("Via", vec![
-        "SIP/2.0/TCP new1:5061".to_string(),
-        "SIP/2.0/UDP new2:5060".to_string(),
-    ]);
+    headers.set_all(
+        "Via",
+        vec![
+            "SIP/2.0/TCP new1:5061".to_string(),
+            "SIP/2.0/UDP new2:5060".to_string(),
+        ],
+    );
 
     let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
     assert_eq!(names, vec!["Via", "From", "To"]);
@@ -135,4 +141,3 @@ fn remove_and_add_moves_header_to_end() {
     let names: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
     assert_eq!(names, vec!["From", "To", "Via"]); // Via moved to end!
 }
-

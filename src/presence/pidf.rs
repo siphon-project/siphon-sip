@@ -104,10 +104,7 @@ impl PresenceBody {
                 tuple.status.as_str(),
             ));
             if let Some(ref contact) = tuple.contact {
-                output.push_str(&format!(
-                    "    <contact>{}</contact>\n",
-                    xml_escape(contact),
-                ));
+                output.push_str(&format!("    <contact>{}</contact>\n", xml_escape(contact),));
             }
             if let Some(ref note) = tuple.note {
                 output.push_str(&format!("    <note>{}</note>\n", xml_escape(note)));
@@ -142,8 +139,7 @@ impl PresenceBody {
             };
             let tuple_fragment = &xml[absolute_start..tuple_end];
 
-            let id = extract_attribute(tuple_fragment, "tuple", "id")
-                .unwrap_or_default();
+            let id = extract_attribute(tuple_fragment, "tuple", "id").unwrap_or_default();
 
             let status = extract_tag_content(tuple_fragment, "basic")
                 .and_then(|value| BasicStatus::from_str_value(&value))
@@ -291,7 +287,10 @@ mod tests {
 
     #[test]
     fn basic_status_from_trimmed() {
-        assert_eq!(BasicStatus::from_str_value("  open  "), Some(BasicStatus::Open));
+        assert_eq!(
+            BasicStatus::from_str_value("  open  "),
+            Some(BasicStatus::Open)
+        );
     }
 
     // -- Tuple creation ----------------------------------------------------

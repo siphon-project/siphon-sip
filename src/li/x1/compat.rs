@@ -179,7 +179,13 @@ mod tests {
     fn malformed_input_is_returned_rather_than_lost() {
         // The rewriter is not a parser; anything it cannot make sense of is
         // passed through for the real validator to reject.
-        for input in ["", "<", "not xml", "<messageTimestamp>", "<messageTimestamp>x"] {
+        for input in [
+            "",
+            "<",
+            "not xml",
+            "<messageTimestamp>",
+            "<messageTimestamp>x",
+        ] {
             let (out, _) = normalise_inbound_timestamps(input);
             assert!(
                 out.contains(input.trim_start_matches('<').trim())
@@ -219,7 +225,10 @@ mod tests {
         );
 
         let (out, changed) = normalise_inbound_timestamps(input);
-        assert!(changed, "the millisecond timestamp should have been widened");
+        assert!(
+            changed,
+            "the millisecond timestamp should have been widened"
+        );
 
         // The only difference must be the timestamp's width.
         assert_eq!(

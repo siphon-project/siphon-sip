@@ -91,22 +91,31 @@ impl SrsSession {
             session_id: self.session_id.clone(),
             recording_call_id: self.recording_call_id.clone(),
             original_call_id: self.original_call_id.clone(),
-            participants: self.metadata.participants.iter().map(|participant| {
-                ParticipantRecord {
+            participants: self
+                .metadata
+                .participants
+                .iter()
+                .map(|participant| ParticipantRecord {
                     participant_id: participant.participant_id.clone(),
                     aor: participant.aor.clone(),
                     name: participant.name.clone(),
-                }
-            }).collect(),
-            streams: self.metadata.streams.iter().map(|stream| {
-                StreamRecord {
+                })
+                .collect(),
+            streams: self
+                .metadata
+                .streams
+                .iter()
+                .map(|stream| StreamRecord {
                     stream_id: stream.stream_id.clone(),
                     label: stream.label.clone(),
-                }
-            }).collect(),
+                })
+                .collect(),
             state: self.state.to_string(),
             duration_secs: self.duration_secs(),
-            recording_dir: self.recording_dir.as_ref().map(|path| path.display().to_string()),
+            recording_dir: self
+                .recording_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
         }
     }
 }
@@ -214,7 +223,8 @@ impl SrsManager {
         );
 
         self.sessions.insert(session_id.clone(), session);
-        self.call_id_to_session.insert(recording_call_id.to_string(), session_id.clone());
+        self.call_id_to_session
+            .insert(recording_call_id.to_string(), session_id.clone());
 
         Some((session_id, to_tag))
     }
@@ -228,8 +238,7 @@ impl SrsManager {
         recording_call_id: &str,
         metadata: RecordingMetadata,
     ) -> Option<String> {
-        let session_id = self.call_id_to_session.get(recording_call_id)?
-            .clone();
+        let session_id = self.call_id_to_session.get(recording_call_id)?.clone();
 
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             let to_tag = session.to_tag.clone();
@@ -268,8 +277,7 @@ impl SrsManager {
     ///
     /// Returns the recording record for storage, or `None` if not found.
     pub fn stop_session(&self, recording_call_id: &str) -> Option<RecordingRecord> {
-        let session_id = self.call_id_to_session.get(recording_call_id)?
-            .clone();
+        let session_id = self.call_id_to_session.get(recording_call_id)?.clone();
 
         let record = if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.state = SrsSessionState::Completed;
@@ -294,7 +302,9 @@ impl SrsManager {
 
     /// Look up a session by the SIPREC INVITE's Call-ID.
     pub fn session_for_call_id(&self, recording_call_id: &str) -> Option<String> {
-        self.call_id_to_session.get(recording_call_id).map(|value| value.clone())
+        self.call_id_to_session
+            .get(recording_call_id)
+            .map(|value| value.clone())
     }
 
     /// Check if a Call-ID belongs to an active SRS session.
@@ -313,13 +323,17 @@ impl SrsManager {
     }
 
     /// Get session details by session ID.
-    pub fn get_session(&self, session_id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, SrsSession>> {
+    pub fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, SrsSession>> {
         self.sessions.get(session_id)
     }
 
     /// Get the recording directory for a session.
     pub fn recording_dir(&self, session_id: &str) -> Option<PathBuf> {
-        self.sessions.get(session_id)
+        self.sessions
+            .get(session_id)
             .and_then(|session| session.recording_dir.clone())
     }
 
@@ -366,13 +380,11 @@ mod tests {
                     name: None,
                 },
             ],
-            streams: vec![
-                StreamInfo {
-                    stream_id: "s1".to_string(),
-                    session_id: "test-session-001".to_string(),
-                    label: "caller-audio".to_string(),
-                },
-            ],
+            streams: vec![StreamInfo {
+                stream_id: "s1".to_string(),
+                session_id: "test-session-001".to_string(),
+                label: "caller-audio".to_string(),
+            }],
         }
     }
 
@@ -398,7 +410,9 @@ mod tests {
         let manager = SrsManager::new(test_config());
         let metadata = test_metadata();
 
-        let (session_id, _) = manager.create_session("call-1", "from-tag-1", metadata).unwrap();
+        let (session_id, _) = manager
+            .create_session("call-1", "from-tag-1", metadata)
+            .unwrap();
 
         // Initially pending.
         let session = manager.get_session(&session_id).unwrap();
@@ -416,7 +430,9 @@ mod tests {
         let manager = SrsManager::new(test_config());
         let metadata = test_metadata();
 
-        let (session_id, _) = manager.create_session("call-1", "from-tag-1", metadata).unwrap();
+        let (session_id, _) = manager
+            .create_session("call-1", "from-tag-1", metadata)
+            .unwrap();
         manager.activate_session(&session_id);
 
         let record = manager.stop_session("call-1");
@@ -437,11 +453,15 @@ mod tests {
         let manager = SrsManager::new(test_config());
         let metadata = test_metadata();
 
-        let (session_id, _) = manager.create_session("call-1", "from-tag-1", metadata).unwrap();
+        let (session_id, _) = manager
+            .create_session("call-1", "from-tag-1", metadata)
+            .unwrap();
         manager.fail_session(&session_id, "RTPEngine unreachable");
 
         let session = manager.get_session(&session_id).unwrap();
-        assert!(matches!(&session.state, SrsSessionState::Failed(reason) if reason == "RTPEngine unreachable"));
+        assert!(
+            matches!(&session.state, SrsSessionState::Failed(reason) if reason == "RTPEngine unreachable")
+        );
     }
 
     #[test]
@@ -457,7 +477,9 @@ mod tests {
             participants: vec![],
             streams: vec![],
         };
-        assert!(manager.create_session("call-1", "tag-1", metadata1).is_some());
+        assert!(manager
+            .create_session("call-1", "tag-1", metadata1)
+            .is_some());
 
         // Create session 2.
         let metadata2 = RecordingMetadata {
@@ -466,7 +488,9 @@ mod tests {
             participants: vec![],
             streams: vec![],
         };
-        assert!(manager.create_session("call-2", "tag-2", metadata2).is_some());
+        assert!(manager
+            .create_session("call-2", "tag-2", metadata2)
+            .is_some());
 
         // Session 3 should be rejected.
         let metadata3 = RecordingMetadata {
@@ -475,7 +499,9 @@ mod tests {
             participants: vec![],
             streams: vec![],
         };
-        assert!(manager.create_session("call-3", "tag-3", metadata3).is_none());
+        assert!(manager
+            .create_session("call-3", "tag-3", metadata3)
+            .is_none());
     }
 
     #[test]
@@ -520,7 +546,10 @@ mod tests {
 
         let (session_id, _) = manager.create_session("call-1", "tag-1", metadata).unwrap();
         let dir = manager.recording_dir(&session_id).unwrap();
-        assert_eq!(dir, PathBuf::from("/tmp/siphon-test-recordings/test-session-001"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/siphon-test-recordings/test-session-001")
+        );
     }
 
     #[test]
@@ -528,7 +557,9 @@ mod tests {
         let manager = SrsManager::new(test_config());
         let metadata = test_metadata();
 
-        let (_, original_to_tag) = manager.create_session("call-1", "from-tag-1", metadata).unwrap();
+        let (_, original_to_tag) = manager
+            .create_session("call-1", "from-tag-1", metadata)
+            .unwrap();
         manager.activate_session("test-session-001");
 
         // Simulate re-INVITE with updated metadata (e.g. new stream).

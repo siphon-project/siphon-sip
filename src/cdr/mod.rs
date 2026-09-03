@@ -245,14 +245,9 @@ struct CdrAutoFlags {
 #[derive(Debug, Clone)]
 pub enum CdrBackendType {
     /// JSON-lines file with optional rotation.
-    File {
-        path: String,
-        rotate_size_mb: u64,
-    },
+    File { path: String, rotate_size_mb: u64 },
     /// UDP syslog to remote collector.
-    Syslog {
-        target: String,
-    },
+    Syslog { target: String },
     /// HTTP POST webhook — sends JSON body to the configured URL.
     Http {
         url: String,
@@ -625,10 +620,16 @@ impl HttpState {
                 let port_str = &host_port[idx + 1..];
                 match port_str.parse::<u16>() {
                     Ok(port) => (host_port[..idx].to_string(), port),
-                    Err(_) => (host_port.to_string(), if scheme == "https" { 443 } else { 80 }),
+                    Err(_) => (
+                        host_port.to_string(),
+                        if scheme == "https" { 443 } else { 80 },
+                    ),
                 }
             }
-            None => (host_port.to_string(), if scheme == "https" { 443 } else { 80 }),
+            None => (
+                host_port.to_string(),
+                if scheme == "https" { 443 } else { 80 },
+            ),
         };
 
         Self {
@@ -746,7 +747,11 @@ async fn connect_tls(
 fn check_http_response(response: &[u8], call_id: &str) {
     let response_str = String::from_utf8_lossy(response);
     if let Some(status_line) = response_str.lines().next() {
-        if status_line.contains("200") || status_line.contains("201") || status_line.contains("202") || status_line.contains("204") {
+        if status_line.contains("200")
+            || status_line.contains("201")
+            || status_line.contains("202")
+            || status_line.contains("204")
+        {
             debug!("CDR HTTP POST ok: call_id={call_id}");
         } else {
             warn!("CDR HTTP POST non-2xx response: {status_line} (call_id={call_id})");
@@ -799,9 +804,7 @@ fn format_timestamp(time: SystemTime) -> String {
     }
     let day = remaining_days + 1;
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -859,22 +862,23 @@ mod tests {
 
     #[test]
     fn cdr_with_end_computes_duration() {
-        let cdr = sample_cdr()
-            .with_answer();
+        let cdr = sample_cdr().with_answer();
 
         // Small sleep to get a non-zero duration
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let cdr = cdr.with_end();
         assert!(cdr.timestamp_end.is_some());
-        assert!(cdr.duration_secs >= 0.01, "duration should be >= 10ms, got {}", cdr.duration_secs);
+        assert!(
+            cdr.duration_secs >= 0.01,
+            "duration should be >= 10ms, got {}",
+            cdr.duration_secs
+        );
     }
 
     #[test]
     fn cdr_with_end_without_answer_has_zero_duration() {
-        let cdr = sample_cdr()
-            .with_start()
-            .with_end();
+        let cdr = sample_cdr().with_start().with_end();
 
         assert_eq!(cdr.duration_secs, 0.0);
     }
@@ -952,7 +956,11 @@ mod tests {
             None,
             None,
         );
-        assert!(session.clone().finalize("caller", None, None).auth_user.is_none());
+        assert!(session
+            .clone()
+            .finalize("caller", None, None)
+            .auth_user
+            .is_none());
 
         session.set_auth_user("alice".to_string());
         session.mark_answered(200);

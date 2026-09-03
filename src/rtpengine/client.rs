@@ -89,8 +89,7 @@ impl RtpEngineClient {
         // Bind to an ephemeral port (0 = OS-assigned).
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let socket = Arc::new(socket);
-        let pending: Arc<DashMap<String, oneshot::Sender<BencodeValue>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, oneshot::Sender<BencodeValue>>> = Arc::new(DashMap::new());
 
         // Spawn background receiver.
         {
@@ -157,11 +156,7 @@ impl RtpEngineClient {
     }
 
     /// Send a `delete` command to tear down a media session.
-    pub async fn delete(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let pairs: Vec<(&str, BencodeValue)> = vec![
             ("command", BencodeValue::string("delete")),
             ("call-id", BencodeValue::string(call_id)),
@@ -265,11 +260,7 @@ impl RtpEngineClient {
 
     /// Send a `stop media` command — stop any prompt currently playing on the
     /// monologue selected by `from-tag`.
-    pub async fn stop_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn stop_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let pairs: Vec<(&str, BencodeValue)> = vec![
             ("command", BencodeValue::string("stop media")),
             ("call-id", BencodeValue::string(call_id)),
@@ -320,12 +311,9 @@ impl RtpEngineClient {
 
     /// Send a `silence media` command — replace the selected monologue's
     /// outgoing audio with silence. Use for hold-music gating and LI warnings.
-    pub async fn silence_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
-        self.simple_tag_command("silence media", call_id, from_tag).await
+    pub async fn silence_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("silence media", call_id, from_tag)
+            .await
     }
 
     /// Send an `unsilence media` command — stop replacing outgoing audio with
@@ -335,27 +323,22 @@ impl RtpEngineClient {
         call_id: &str,
         from_tag: &str,
     ) -> Result<(), RtpEngineError> {
-        self.simple_tag_command("unsilence media", call_id, from_tag).await
+        self.simple_tag_command("unsilence media", call_id, from_tag)
+            .await
     }
 
     /// Send a `block media` command — drop the selected monologue's outgoing
     /// packets entirely (peer hears nothing, not even comfort silence).
-    pub async fn block_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
-        self.simple_tag_command("block media", call_id, from_tag).await
+    pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("block media", call_id, from_tag)
+            .await
     }
 
     /// Send an `unblock media` command — resume forwarding the selected
     /// monologue's packets after a prior `block media`.
-    pub async fn unblock_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
-        self.simple_tag_command("unblock media", call_id, from_tag).await
+    pub async fn unblock_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        self.simple_tag_command("unblock media", call_id, from_tag)
+            .await
     }
 
     /// Shared shape for `silence`/`unsilence`/`block`/`unblock media`:
@@ -457,9 +440,7 @@ impl RtpEngineClient {
         let sdp = response
             .dict_get_bytes("sdp")
             .map(|bytes| bytes.to_vec())
-            .ok_or_else(|| {
-                RtpEngineError::Protocol("response missing 'sdp' field".to_string())
-            })?;
+            .ok_or_else(|| RtpEngineError::Protocol("response missing 'sdp' field".to_string()))?;
 
         let to_tag = response
             .dict_get_str("to-tag")
@@ -522,14 +503,12 @@ impl RtpEngineClient {
 
     /// Send a `ping` command — health check.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
-        let pairs: Vec<(&str, BencodeValue)> = vec![
-            ("command", BencodeValue::string("ping")),
-        ];
+        let pairs: Vec<(&str, BencodeValue)> = vec![("command", BencodeValue::string("ping"))];
 
         let response = self.send_command(BencodeValue::dict(pairs)).await?;
-        let result = response
-            .dict_get_str("result")
-            .ok_or_else(|| RtpEngineError::Protocol("ping response missing 'result'".to_string()))?;
+        let result = response.dict_get_str("result").ok_or_else(|| {
+            RtpEngineError::Protocol("ping response missing 'result'".to_string())
+        })?;
 
         if result == "pong" {
             Ok(())
@@ -541,10 +520,7 @@ impl RtpEngineClient {
     }
 
     /// Send a bencode command and wait for the response.
-    async fn send_command(
-        &self,
-        command: BencodeValue,
-    ) -> Result<BencodeValue, RtpEngineError> {
+    async fn send_command(&self, command: BencodeValue) -> Result<BencodeValue, RtpEngineError> {
         let cookie = generate_cookie();
         let encoded = bencode::encode(&command);
 
@@ -593,25 +569,19 @@ impl RtpEngineClient {
         response
             .dict_get_bytes("sdp")
             .map(|bytes| bytes.to_vec())
-            .ok_or_else(|| {
-                RtpEngineError::Protocol("response missing 'sdp' field".to_string())
-            })
+            .ok_or_else(|| RtpEngineError::Protocol("response missing 'sdp' field".to_string()))
     }
 
     /// Check the `result` field of a response for errors.
     fn check_result(&self, response: &BencodeValue) -> Result<(), RtpEngineError> {
-        let result = response
-            .dict_get_str("result")
-            .ok_or_else(|| {
-                RtpEngineError::Protocol("response missing 'result' field".to_string())
-            })?;
+        let result = response.dict_get_str("result").ok_or_else(|| {
+            RtpEngineError::Protocol("response missing 'result' field".to_string())
+        })?;
 
         if result == "ok" {
             Ok(())
         } else {
-            let reason = response
-                .dict_get_str("error-reason")
-                .unwrap_or(result);
+            let reason = response.dict_get_str("error-reason").unwrap_or(result);
             Err(RtpEngineError::EngineError(reason.to_string()))
         }
     }
@@ -698,9 +668,7 @@ pub struct RtpEngineSet {
 
 impl RtpEngineSet {
     /// Create a set from multiple address/timeout/weight triples.
-    pub async fn new(
-        instances: Vec<(SocketAddr, u64, u32)>,
-    ) -> Result<Self, RtpEngineError> {
+    pub async fn new(instances: Vec<(SocketAddr, u64, u32)>) -> Result<Self, RtpEngineError> {
         if instances.is_empty() {
             return Err(RtpEngineError::Protocol(
                 "at least one RTPEngine instance is required".to_string(),
@@ -805,11 +773,7 @@ impl RtpEngineSet {
     }
 
     /// Send a `delete` command and remove affinity.
-    pub async fn delete(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         let result = client.delete(call_id, from_tag).await;
         self.affinity.remove(call_id);
@@ -839,16 +803,20 @@ impl RtpEngineSet {
     ) -> Result<Option<u64>, RtpEngineError> {
         let client = self.select(call_id);
         client
-            .play_media(call_id, from_tag, source, repeat_times, start_pos_ms, duration_ms, to_tag)
+            .play_media(
+                call_id,
+                from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+                duration_ms,
+                to_tag,
+            )
             .await
     }
 
     /// Send a `stop media` command to the affinity-bound instance.
-    pub async fn stop_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn stop_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         client.stop_media(call_id, from_tag).await
     }
@@ -866,16 +834,20 @@ impl RtpEngineSet {
     ) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         client
-            .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+            .play_dtmf(
+                call_id,
+                from_tag,
+                code,
+                duration_ms,
+                volume_dbm0,
+                pause_ms,
+                to_tag,
+            )
             .await
     }
 
     /// Send a `silence media` command to the affinity-bound instance.
-    pub async fn silence_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn silence_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         client.silence_media(call_id, from_tag).await
     }
@@ -891,21 +863,13 @@ impl RtpEngineSet {
     }
 
     /// Send a `block media` command to the affinity-bound instance.
-    pub async fn block_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         client.block_media(call_id, from_tag).await
     }
 
     /// Send an `unblock media` command to the affinity-bound instance.
-    pub async fn unblock_media(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn unblock_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let client = self.select(call_id);
         client.unblock_media(call_id, from_tag).await
     }
@@ -920,7 +884,9 @@ impl RtpEngineSet {
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
         let client = self.select(call_id);
-        client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+        client
+            .subscribe_request(call_id, from_tag, to_tag, sdp, flags)
+            .await
     }
 
     /// Send a SIPREC-mode `subscribe request` to the affinity-bound instance.
@@ -931,7 +897,9 @@ impl RtpEngineSet {
         profile_flags: Option<&NgFlags>,
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
         let client = self.select(call_id);
-        client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
+        client
+            .subscribe_request_siprec(call_id, from_tags, profile_flags)
+            .await
     }
 
     /// Send a `subscribe answer` command to the affinity-bound instance.
@@ -944,7 +912,9 @@ impl RtpEngineSet {
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
         let client = self.select(call_id);
-        client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+        client
+            .subscribe_answer(call_id, from_tag, to_tag, sdp, flags)
+            .await
     }
 
     /// Send an `unsubscribe` command to the affinity-bound instance.
@@ -985,7 +955,9 @@ impl RtpEngineSet {
         if let Some(client) = self.clients.first() {
             client.ping().await
         } else {
-            Err(RtpEngineError::Protocol("no RTPEngine instances".to_string()))
+            Err(RtpEngineError::Protocol(
+                "no RTPEngine instances".to_string(),
+            ))
         }
     }
 
@@ -1043,9 +1015,7 @@ mod tests {
                 let cookie = std::str::from_utf8(&data[..space]).unwrap();
 
                 // Build pong response.
-                let response = BencodeValue::dict(vec![
-                    ("result", BencodeValue::string("pong")),
-                ]);
+                let response = BencodeValue::dict(vec![("result", BencodeValue::string("pong"))]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
                 reply.extend_from_slice(cookie.as_bytes());
@@ -1145,7 +1115,10 @@ mod tests {
 
                 let response = BencodeValue::dict(vec![
                     ("result", BencodeValue::string("ok")),
-                    ("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n")),
+                    (
+                        "sdp",
+                        BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n"),
+                    ),
                 ]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
@@ -1159,10 +1132,18 @@ mod tests {
         let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
         let flags = NgFlags::default();
         let result = client
-            .answer("call-1", "tag-a", "tag-b", b"v=0\r\nc=IN IP4 10.0.0.1\r\n", &flags)
+            .answer(
+                "call-1",
+                "tag-a",
+                "tag-b",
+                b"v=0\r\nc=IN IP4 10.0.0.1\r\n",
+                &flags,
+            )
             .await
             .unwrap();
-        assert!(std::str::from_utf8(&result).unwrap().contains("203.0.113.1"));
+        assert!(std::str::from_utf8(&result)
+            .unwrap()
+            .contains("203.0.113.1"));
     }
 
     #[tokio::test]
@@ -1181,9 +1162,7 @@ mod tests {
                 let command = bencode::decode_full_dict(payload).unwrap();
                 assert_eq!(command.dict_get_str("command"), Some("delete"));
 
-                let response = BencodeValue::dict(vec![
-                    ("result", BencodeValue::string("ok")),
-                ]);
+                let response = BencodeValue::dict(vec![("result", BencodeValue::string("ok"))]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
                 reply.extend_from_slice(cookie.as_bytes());
@@ -1239,7 +1218,10 @@ mod tests {
         let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
         let result = client.delete("call-1", "tag-a").await;
         assert!(matches!(result, Err(RtpEngineError::EngineError(_))));
-        assert!(result.unwrap_err().to_string().contains("session not found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("session not found"));
     }
 
     // -- RtpEngineSet tests --
@@ -1261,15 +1243,18 @@ mod tests {
                 let cmd_name = command.dict_get_str("command").unwrap_or("unknown");
 
                 let response = if cmd_name == "ping" {
-                    BencodeValue::dict(vec![
-                        ("result", BencodeValue::string("pong")),
-                    ])
+                    BencodeValue::dict(vec![("result", BencodeValue::string("pong"))])
                 } else {
-                    let mut pairs = vec![
-                        ("result", BencodeValue::string("ok")),
-                    ];
-                    if cmd_name == "offer" || cmd_name == "answer" || cmd_name == "subscribe request" || cmd_name == "subscribe answer" {
-                        pairs.push(("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n")));
+                    let mut pairs = vec![("result", BencodeValue::string("ok"))];
+                    if cmd_name == "offer"
+                        || cmd_name == "answer"
+                        || cmd_name == "subscribe request"
+                        || cmd_name == "subscribe answer"
+                    {
+                        pairs.push((
+                            "sdp",
+                            BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n"),
+                        ));
                     }
                     BencodeValue::dict(pairs)
                 };
@@ -1361,10 +1346,9 @@ mod tests {
     async fn set_multiple_instances_ping_all() {
         let addr1 = spawn_mock_rtpengine().await;
         let addr2 = spawn_mock_rtpengine().await;
-        let set = RtpEngineSet::new(vec![
-            (addr1, 2000, 1),
-            (addr2, 2000, 1),
-        ]).await.unwrap();
+        let set = RtpEngineSet::new(vec![(addr1, 2000, 1), (addr2, 2000, 1)])
+            .await
+            .unwrap();
         assert_eq!(set.instance_count(), 2);
         set.ping_all().await.unwrap();
     }
@@ -1373,19 +1357,22 @@ mod tests {
     async fn set_call_id_affinity() {
         let addr1 = spawn_mock_rtpengine().await;
         let addr2 = spawn_mock_rtpengine().await;
-        let set = RtpEngineSet::new(vec![
-            (addr1, 2000, 1),
-            (addr2, 2000, 1),
-        ]).await.unwrap();
+        let set = RtpEngineSet::new(vec![(addr1, 2000, 1), (addr2, 2000, 1)])
+            .await
+            .unwrap();
 
         let flags = NgFlags::default();
 
         // First offer binds affinity.
-        set.offer("call-abc", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+        set.offer("call-abc", "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
         assert_eq!(set.active_sessions(), 1);
 
         // Answer goes to the same instance (affinity).
-        set.answer("call-abc", "tag-a", "tag-b", b"v=0\r\n", &flags).await.unwrap();
+        set.answer("call-abc", "tag-a", "tag-b", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
         assert_eq!(set.active_sessions(), 1);
 
         // Delete removes affinity.
@@ -1420,7 +1407,12 @@ mod tests {
 
                 let response = BencodeValue::dict(vec![
                     ("result", BencodeValue::string("ok")),
-                    ("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\nm=audio 40000 RTP/AVP 0\r\n")),
+                    (
+                        "sdp",
+                        BencodeValue::string(
+                            "v=0\r\nc=IN IP4 203.0.113.1\r\nm=audio 40000 RTP/AVP 0\r\n",
+                        ),
+                    ),
                 ]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
@@ -1458,9 +1450,7 @@ mod tests {
                 let command = bencode::decode_full_dict(payload).unwrap();
                 assert_eq!(command.dict_get_str("command"), Some("unsubscribe"));
 
-                let response = BencodeValue::dict(vec![
-                    ("result", BencodeValue::string("ok")),
-                ]);
+                let response = BencodeValue::dict(vec![("result", BencodeValue::string("ok"))]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
                 reply.extend_from_slice(cookie.as_bytes());
@@ -1471,7 +1461,10 @@ mod tests {
         });
 
         let client = RtpEngineClient::new(mock_addr, 2000).await.unwrap();
-        client.unsubscribe("call-1", "tag-a", "tag-b").await.unwrap();
+        client
+            .unsubscribe("call-1", "tag-a", "tag-b")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1481,7 +1474,9 @@ mod tests {
         let flags = NgFlags::default();
 
         // First offer to bind affinity.
-        set.offer("call-sub", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+        set.offer("call-sub", "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
 
         // subscribe_request uses the same instance via affinity.
         let result = set
@@ -1520,9 +1515,7 @@ mod tests {
                         ("duration", BencodeValue::from_integer(12345)),
                     ])
                 } else {
-                    BencodeValue::dict(vec![
-                        ("result", BencodeValue::string("ok")),
-                    ])
+                    BencodeValue::dict(vec![("result", BencodeValue::string("ok"))])
                 };
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
@@ -1567,9 +1560,20 @@ mod tests {
             command.dict_get_str("file"),
             Some("/var/lib/siphon/prompts/announcement.wav")
         );
-        assert_eq!(command.dict_get("repeat-times").and_then(|v| v.as_integer()), Some(2));
-        assert_eq!(command.dict_get("start-pos").and_then(|v| v.as_integer()), Some(500));
-        assert_eq!(command.dict_get("duration").and_then(|v| v.as_integer()), Some(10_000));
+        assert_eq!(
+            command
+                .dict_get("repeat-times")
+                .and_then(|v| v.as_integer()),
+            Some(2)
+        );
+        assert_eq!(
+            command.dict_get("start-pos").and_then(|v| v.as_integer()),
+            Some(500)
+        );
+        assert_eq!(
+            command.dict_get("duration").and_then(|v| v.as_integer()),
+            Some(10_000)
+        );
     }
 
     #[tokio::test]
@@ -1607,13 +1611,24 @@ mod tests {
         let client = RtpEngineClient::new(addr, 2000).await.unwrap();
 
         client
-            .play_media("call-db", "tag-a", &PlayMediaSource::DbId(42), None, None, None, None)
+            .play_media(
+                "call-db",
+                "tag-a",
+                &PlayMediaSource::DbId(42),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
         let captured = captured.lock().await;
         let command = &captured[0];
-        assert_eq!(command.dict_get("db-id").and_then(|v| v.as_integer()), Some(42));
+        assert_eq!(
+            command.dict_get("db-id").and_then(|v| v.as_integer()),
+            Some(42)
+        );
         assert!(command.dict_get("file").is_none());
         assert!(command.dict_get("blob").is_none());
     }
@@ -1627,7 +1642,10 @@ mod tests {
                 "call-min",
                 "tag-a",
                 &PlayMediaSource::File("/tmp/x.wav".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1656,16 +1674,33 @@ mod tests {
         let (addr, captured) = spawn_capturing_mock().await;
         let client = RtpEngineClient::new(addr, 2000).await.unwrap();
         client
-            .play_dtmf("call-dtmf", "tag-a", "123#", Some(100), Some(-8), Some(60), None)
+            .play_dtmf(
+                "call-dtmf",
+                "tag-a",
+                "123#",
+                Some(100),
+                Some(-8),
+                Some(60),
+                None,
+            )
             .await
             .unwrap();
         let captured = captured.lock().await;
         let command = &captured[0];
         assert_eq!(command.dict_get_str("command"), Some("play DTMF"));
         assert_eq!(command.dict_get_str("code"), Some("123#"));
-        assert_eq!(command.dict_get("duration").and_then(|v| v.as_integer()), Some(100));
-        assert_eq!(command.dict_get("volume").and_then(|v| v.as_integer()), Some(-8));
-        assert_eq!(command.dict_get("pause").and_then(|v| v.as_integer()), Some(60));
+        assert_eq!(
+            command.dict_get("duration").and_then(|v| v.as_integer()),
+            Some(100)
+        );
+        assert_eq!(
+            command.dict_get("volume").and_then(|v| v.as_integer()),
+            Some(-8)
+        );
+        assert_eq!(
+            command.dict_get("pause").and_then(|v| v.as_integer()),
+            Some(60)
+        );
     }
 
     #[tokio::test]
@@ -1721,7 +1756,10 @@ mod tests {
                 let cookie = std::str::from_utf8(&data[..space]).unwrap();
                 let response = BencodeValue::dict(vec![
                     ("result", BencodeValue::string("error")),
-                    ("error-reason", BencodeValue::string("audio player not enabled")),
+                    (
+                        "error-reason",
+                        BencodeValue::string("audio player not enabled"),
+                    ),
                 ]);
                 let encoded = bencode::encode(&response);
                 let mut reply = Vec::new();
@@ -1738,7 +1776,10 @@ mod tests {
                 "call-err",
                 "tag-a",
                 &PlayMediaSource::File("/nope.wav".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(matches!(result, Err(RtpEngineError::EngineError(_))));
@@ -1757,12 +1798,9 @@ mod tests {
         let dead_addr = dead_socket.local_addr().unwrap();
         drop(dead_socket);
 
-        let set = RtpEngineSet::new(vec![
-            (live_addr, 2000, 1),
-            (dead_addr, 100, 1),
-        ])
-        .await
-        .unwrap();
+        let set = RtpEngineSet::new(vec![(live_addr, 2000, 1), (dead_addr, 100, 1)])
+            .await
+            .unwrap();
 
         let results = set.health_check().await;
         assert_eq!(results.len(), 2);
@@ -1779,13 +1817,9 @@ mod tests {
         let addr1 = spawn_mock_rtpengine().await;
         let addr2 = spawn_mock_rtpengine().await;
         let addr3 = spawn_mock_rtpengine().await;
-        let set = RtpEngineSet::new(vec![
-            (addr1, 2000, 1),
-            (addr2, 2000, 1),
-            (addr3, 2000, 1),
-        ])
-        .await
-        .unwrap();
+        let set = RtpEngineSet::new(vec![(addr1, 2000, 1), (addr2, 2000, 1), (addr3, 2000, 1)])
+            .await
+            .unwrap();
 
         let addresses = set.instance_addresses();
         assert_eq!(addresses, vec![addr1, addr2, addr3]);
@@ -1803,7 +1837,9 @@ mod tests {
         let addr = spawn_mock_rtpengine().await;
         let set = RtpEngineSet::new(vec![(addr, 2000, 1)]).await.unwrap();
         let flags = NgFlags::default();
-        set.offer("call-play-aff", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+        set.offer("call-play-aff", "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
         // `spawn_mock_rtpengine` returns `result: ok` for unknown commands,
         // so play_media succeeds with no duration. Success alone proves the
         // set routed to the affinity-bound instance without timing out.
@@ -1812,7 +1848,10 @@ mod tests {
                 "call-play-aff",
                 "tag-a",
                 &PlayMediaSource::File("/a.wav".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();

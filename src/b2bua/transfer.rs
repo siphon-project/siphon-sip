@@ -188,9 +188,7 @@ pub fn replaces_matches(
     local_tag: &str,
     remote_tag: &str,
 ) -> bool {
-    replaces.call_id == call_id
-        && replaces.from_tag == remote_tag
-        && replaces.to_tag == local_tag
+    replaces.call_id == call_id && replaces.from_tag == remote_tag && replaces.to_tag == local_tag
 }
 
 #[cfg(test)]
@@ -263,15 +261,22 @@ Contact: <sip:carol@example.com>
     #[test]
     fn parse_sipfrag_accepts_missing_reason_phrase() {
         // RFC 3261 §25.1 allows an empty Reason-Phrase.
-        assert_eq!(parse_sipfrag_status(b"SIP/2.0 200
-"), Some((200, String::new())));
+        assert_eq!(
+            parse_sipfrag_status(
+                b"SIP/2.0 200
+"
+            ),
+            Some((200, String::new()))
+        );
     }
 
     #[test]
     fn parse_sipfrag_multi_word_reason_is_kept_whole() {
         assert_eq!(
-            parse_sipfrag_status(b"SIP/2.0 480 Temporarily Unavailable
-"),
+            parse_sipfrag_status(
+                b"SIP/2.0 480 Temporarily Unavailable
+"
+            ),
             Some((480, "Temporarily Unavailable".to_string()))
         );
     }
@@ -279,21 +284,51 @@ Contact: <sip:carol@example.com>
     #[test]
     fn parse_sipfrag_without_status_line_is_none() {
         // RFC 3420 §2: a header-only fragment carries no outcome at all.
-        assert_eq!(parse_sipfrag_status(b"Contact: <sip:carol@example.com>
-"), None);
+        assert_eq!(
+            parse_sipfrag_status(
+                b"Contact: <sip:carol@example.com>
+"
+            ),
+            None
+        );
         assert_eq!(parse_sipfrag_status(b""), None);
-        assert_eq!(parse_sipfrag_status(b"
+        assert_eq!(
+            parse_sipfrag_status(
+                b"
 
-"), None);
-        assert_eq!(parse_sipfrag_status(b"SIP/2.0 not-a-code
-"), None);
-        assert_eq!(parse_sipfrag_status(b"HTTP/1.1 200 OK
-"), None);
+"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_sipfrag_status(
+                b"SIP/2.0 not-a-code
+"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_sipfrag_status(
+                b"HTTP/1.1 200 OK
+"
+            ),
+            None
+        );
         // Out of the 100..699 status range (RFC 3261 §21).
-        assert_eq!(parse_sipfrag_status(b"SIP/2.0 99 Nope
-"), None);
-        assert_eq!(parse_sipfrag_status(b"SIP/2.0 700 Nope
-"), None);
+        assert_eq!(
+            parse_sipfrag_status(
+                b"SIP/2.0 99 Nope
+"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_sipfrag_status(
+                b"SIP/2.0 700 Nope
+"
+            ),
+            None
+        );
         // Not UTF-8 at all.
         assert_eq!(parse_sipfrag_status(&[0xff, 0xfe, 0x00]), None);
     }
@@ -301,23 +336,19 @@ Contact: <sip:carol@example.com>
     #[test]
     fn parse_sipfrag_tolerates_leading_blank_lines() {
         assert_eq!(
-            parse_sipfrag_status(b"
+            parse_sipfrag_status(
+                b"
 SIP/2.0 200 OK
-"),
+"
+            ),
             Some((200, "OK".to_string()))
         );
     }
 
     #[test]
     fn transfer_result_2xx() {
-        assert_eq!(
-            transfer_result_from_response(200),
-            TransferState::Succeeded
-        );
-        assert_eq!(
-            transfer_result_from_response(202),
-            TransferState::Succeeded
-        );
+        assert_eq!(transfer_result_from_response(200), TransferState::Succeeded);
+        assert_eq!(transfer_result_from_response(202), TransferState::Succeeded);
     }
 
     #[test]
@@ -374,14 +405,8 @@ SIP/2.0 200 OK
 
     #[test]
     fn transfer_result_1xx_still_trying() {
-        assert_eq!(
-            transfer_result_from_response(180),
-            TransferState::Trying
-        );
-        assert_eq!(
-            transfer_result_from_response(183),
-            TransferState::Trying
-        );
+        assert_eq!(transfer_result_from_response(180), TransferState::Trying);
+        assert_eq!(transfer_result_from_response(183), TransferState::Trying);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use super::message::{
 use super::types::{
     parse_expanded_ipv6, parse_ipv4, DId, DeliveryAddress, DeliveryType, IpAddressPort, Liid,
     MediationDeliveryType, Port, ServiceType, TargetIdentifier, TaskReportType, Timestamp, Token,
-    TypeOfNeIssueMessage, Version, XId, X1TransactionId, NS_COMMON, NS_X1, NS_XSI,
+    TypeOfNeIssueMessage, Version, X1TransactionId, XId, NS_COMMON, NS_X1, NS_XSI,
 };
 
 /// Prefix used for the TS 103 280 dictionary namespace on the wire.
@@ -84,10 +84,9 @@ fn optional_integer(
 ) -> Result<Option<i64>, X1Error> {
     match child_text(document, node, name) {
         None => Ok(None),
-        Some(text) => text
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|error| X1Error::syntax(format!("<{name}> {text:?} is not an integer: {error}"))),
+        Some(text) => text.parse::<i64>().map(Some).map_err(|error| {
+            X1Error::syntax(format!("<{name}> {text:?} is not an integer: {error}"))
+        }),
     }
 }
 
@@ -172,9 +171,7 @@ pub fn single_message_document(document: &Document<'_>, node: NodeId) -> String 
             let prefix = prefix.to_string();
             if seen.insert(prefix.clone()) {
                 declarations.push((prefix, uri.to_string()));
-            } else if let Some(entry) =
-                declarations.iter_mut().find(|(name, _)| *name == prefix)
-            {
+            } else if let Some(entry) = declarations.iter_mut().find(|(name, _)| *name == prefix) {
                 entry.1 = uri.to_string();
             }
         }
@@ -212,15 +209,12 @@ pub fn single_message_document(document: &Document<'_>, node: NodeId) -> String 
 ///
 /// Individual messages that fail to decode are returned as
 /// [`DecodedMessage::Failed`] so their siblings still get answered.
-pub fn decode_request_container(
-    document: &Document<'_>,
-) -> Result<Vec<DecodedMessage>, X1Error> {
+pub fn decode_request_container(document: &Document<'_>) -> Result<Vec<DecodedMessage>, X1Error> {
     Ok(request_message_nodes(document)?
         .into_iter()
         .map(|id| decode_request_message(document, id))
         .collect())
 }
-
 
 /// Decode one `x1RequestMessage`.
 ///
@@ -359,10 +353,16 @@ fn decode_request_body(
             document, node, "xId",
         )?)?)),
         MessageKind::CreateDestination => Ok(RequestBody::CreateDestination(Box::new(
-            decode_destination_details(document, require_child(document, node, "destinationDetails")?)?,
+            decode_destination_details(
+                document,
+                require_child(document, node, "destinationDetails")?,
+            )?,
         ))),
         MessageKind::ModifyDestination => Ok(RequestBody::ModifyDestination(Box::new(
-            decode_destination_details(document, require_child(document, node, "destinationDetails")?)?,
+            decode_destination_details(
+                document,
+                require_child(document, node, "destinationDetails")?,
+            )?,
         ))),
         MessageKind::RemoveDestination => Ok(RequestBody::RemoveDestination(DId::parse(
             &require_text(document, node, "dId")?,
@@ -407,10 +407,7 @@ fn decode_request_body(
 }
 
 /// Decode a `TaskDetails`.
-pub fn decode_task_details(
-    document: &Document<'_>,
-    node: NodeId,
-) -> Result<TaskDetails, X1Error> {
+pub fn decode_task_details(document: &Document<'_>, node: NodeId) -> Result<TaskDetails, X1Error> {
     let identifiers_node = require_child(document, node, "targetIdentifiers")?;
     let mut target_identifiers = Vec::new();
     for (local, id) in child_elements(document, identifiers_node) {
@@ -544,13 +541,13 @@ pub fn decode_destination_details(
         "ipAddressAndPort" => {
             DeliveryAddress::IpAddressAndPort(decode_ip_address_port(document, choice_id)?)
         }
-        "e164Number" => DeliveryAddress::E164Number(
-            document.text_content_deep(choice_id).trim().to_string(),
-        ),
+        "e164Number" => {
+            DeliveryAddress::E164Number(document.text_content_deep(choice_id).trim().to_string())
+        }
         "uri" => DeliveryAddress::Uri(document.text_content_deep(choice_id).trim().to_string()),
-        "emailAddress" => DeliveryAddress::EmailAddress(
-            document.text_content_deep(choice_id).trim().to_string(),
-        ),
+        "emailAddress" => {
+            DeliveryAddress::EmailAddress(document.text_content_deep(choice_id).trim().to_string())
+        }
         other => {
             return Err(X1Error::new(
                 ErrorCode::UnsupportedDeliveryAddressType,
@@ -568,10 +565,7 @@ pub fn decode_destination_details(
 }
 
 /// Decode a TS 103 280 `IPAddressPort`.
-fn decode_ip_address_port(
-    document: &Document<'_>,
-    node: NodeId,
-) -> Result<IpAddressPort, X1Error> {
+fn decode_ip_address_port(document: &Document<'_>, node: NodeId) -> Result<IpAddressPort, X1Error> {
     let address_node = require_child(document, node, "address")?;
     let Some((kind, value_id)) = child_elements(document, address_node).into_iter().next() else {
         return Err(X1Error::syntax("<address> contains no address element"));
@@ -611,9 +605,7 @@ fn decode_ip_address_port(
 
 /// Decode an `X1Response` container — used by the NE-to-ADMF client direction
 /// to read the ADMF's answers.
-pub fn decode_response_container(
-    document: &Document<'_>,
-) -> Result<ResponseContainer, X1Error> {
+pub fn decode_response_container(document: &Document<'_>) -> Result<ResponseContainer, X1Error> {
     let root = document.root();
     let container = child_elements(document, root)
         .into_iter()
@@ -631,9 +623,7 @@ pub fn decode_response_container(
             .element(node)
             .and_then(|element| element.get_attribute_ns(NS_XSI, "type"))
             .map(|value| value.rsplit(':').next().unwrap_or(value).to_string())
-            .ok_or_else(|| {
-                X1Error::syntax("<x1ResponseMessage> carries no xsi:type attribute")
-            })?;
+            .ok_or_else(|| X1Error::syntax("<x1ResponseMessage> carries no xsi:type attribute"))?;
 
         if type_name == "ErrorResponse" {
             let error_node = require_child(document, node, "errorInformation")?;
@@ -693,7 +683,6 @@ pub fn decode_response_container(
 
     Ok(ResponseContainer { messages })
 }
-
 
 /// Decode a `NeStatusDetails` from a response message.
 fn decode_ne_status(document: &Document<'_>, node: NodeId) -> Result<NeStatusDetails, X1Error> {
@@ -1048,7 +1037,10 @@ fn encode_task_details(builder: &mut XmlBuilder, task: &TaskDetails) -> Result<(
         builder.text_element("correlationID", &correlation.to_string())?;
     }
     if let Some(allowed) = task.implicit_deactivation_allowed {
-        builder.text_element("implicitDeactivationAllowed", if allowed { "true" } else { "false" })?;
+        builder.text_element(
+            "implicitDeactivationAllowed",
+            if allowed { "true" } else { "false" },
+        )?;
     }
     if let Some(product) = &task.product_id {
         builder.text_element("productID", &product.to_string())?;
@@ -1149,7 +1141,10 @@ fn encode_destination_response_details(
     builder.open("destinationStatus")?;
     builder.text_element(
         "destinationDeliveryStatus",
-        details.destination_status.destination_delivery_status.as_str(),
+        details
+            .destination_status
+            .destination_delivery_status
+            .as_str(),
     )?;
     encode_faults(builder, &details.destination_status.list_of_faults)?;
     builder.close("destinationStatus")
@@ -1578,18 +1573,16 @@ mod tests {
         ))));
         match decode_one(&xml) {
             DecodedMessage::Message(message) => match message.body {
-                RequestBody::CreateDestination(destination) => {
-                    match destination.delivery_address {
-                        DeliveryAddress::IpAddressAndPort(endpoint) => {
-                            assert_eq!(endpoint.address, compressed);
-                            assert_eq!(
-                                endpoint.address_text(),
-                                "2001:0db8:0000:0000:0000:0000:0000:0001"
-                            );
-                        }
-                        other => panic!("expected ipAddressAndPort, got {other:?}"),
+                RequestBody::CreateDestination(destination) => match destination.delivery_address {
+                    DeliveryAddress::IpAddressAndPort(endpoint) => {
+                        assert_eq!(endpoint.address, compressed);
+                        assert_eq!(
+                            endpoint.address_text(),
+                            "2001:0db8:0000:0000:0000:0000:0000:0001"
+                        );
                     }
-                }
+                    other => panic!("expected ipAddressAndPort, got {other:?}"),
+                },
                 other => panic!("expected CreateDestination, got {other:?}"),
             },
             DecodedMessage::Failed { error, .. } => panic!("decode failed: {error}"),
@@ -1743,22 +1736,21 @@ mod tests {
             isolated.contains("ns2"),
             "the peer's prefix should be carried into the wrapper:\n{isolated}"
         );
-        uppsala::parse(&isolated)
-            .unwrap_or_else(|error| panic!("isolated document does not parse: {error:?}\n{isolated}"));
+        uppsala::parse(&isolated).unwrap_or_else(|error| {
+            panic!("isolated document does not parse: {error:?}\n{isolated}")
+        });
         assert_schema_valid(&isolated);
 
         // And it decodes to the destination the peer described.
         match decode_request_message(&document, nodes[0]) {
             DecodedMessage::Message(message) => match message.body {
-                RequestBody::CreateDestination(destination) => {
-                    match destination.delivery_address {
-                        DeliveryAddress::IpAddressAndPort(endpoint) => {
-                            assert_eq!(endpoint.address_text(), "192.0.2.62");
-                            assert_eq!(endpoint.port.number(), 42069);
-                        }
-                        other => panic!("expected ipAddressAndPort, got {other:?}"),
+                RequestBody::CreateDestination(destination) => match destination.delivery_address {
+                    DeliveryAddress::IpAddressAndPort(endpoint) => {
+                        assert_eq!(endpoint.address_text(), "192.0.2.62");
+                        assert_eq!(endpoint.port.number(), 42069);
                     }
-                }
+                    other => panic!("expected ipAddressAndPort, got {other:?}"),
+                },
                 other => panic!("expected CreateDestination, got {other:?}"),
             },
             DecodedMessage::Failed { error, .. } => panic!("decode failed: {error}"),
@@ -1838,7 +1830,8 @@ mod tests {
 
     #[test]
     fn a_container_with_no_messages_is_a_container_level_failure() {
-        let xml = "<?xml version=\"1.0\"?>\n<X1Request xmlns=\"http://uri.etsi.org/03221/X1/2017/10\"/>";
+        let xml =
+            "<?xml version=\"1.0\"?>\n<X1Request xmlns=\"http://uri.etsi.org/03221/X1/2017/10\"/>";
         let document = uppsala::parse(xml).unwrap();
         assert!(decode_request_container(&document).is_err());
     }
@@ -1882,9 +1875,14 @@ mod tests {
     fn text_is_escaped_on_the_way_out() {
         let mut destination = ip_destination(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)));
         destination.friendly_name = Some("mdf <one> & \"two\"".to_string());
-        let xml = request_xml(RequestBody::CreateDestination(Box::new(destination.clone())));
+        let xml = request_xml(RequestBody::CreateDestination(Box::new(
+            destination.clone(),
+        )));
         assert_schema_valid(&xml);
-        assert!(!xml.contains("<one>"), "raw markup leaked into the document");
+        assert!(
+            !xml.contains("<one>"),
+            "raw markup leaked into the document"
+        );
         match decode_one(&xml) {
             DecodedMessage::Message(message) => match message.body {
                 RequestBody::CreateDestination(decoded) => {

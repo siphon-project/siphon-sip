@@ -10,13 +10,13 @@
 //! test realm (`ims.example.com`), never real identities.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use std::hint::black_box;
 use siphon::diameter::codec::{
     decode_diameter, encode_avp_grouped_3gpp, encode_avp_octet_3gpp, encode_avp_u32,
     encode_avp_u32_3gpp, encode_avp_utf8, encode_avp_utf8_3gpp, encode_diameter_message,
     encode_vendor_specific_app_id, FLAG_PROXIABLE, FLAG_REQUEST,
 };
 use siphon::diameter::dictionary::{avp, CMD_MULTIMEDIA_AUTH, CX_APP_ID, VENDOR_3GPP};
+use std::hint::black_box;
 
 /// Build the AVP block of a Cx MAR (with a SIP-Auth-Data-Item carrying a
 /// resync token) — the per-request encode work an S-CSCF does on registration.
@@ -31,20 +31,27 @@ fn build_mar_avps() -> Vec<u8> {
     };
 
     let mut auth_children = Vec::new();
-    auth_children
-        .extend_from_slice(&encode_avp_utf8_3gpp(avp::SIP_AUTHENTICATION_SCHEME, "Digest-AKAv1-MD5"));
+    auth_children.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::SIP_AUTHENTICATION_SCHEME,
+        "Digest-AKAv1-MD5",
+    ));
     auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHORIZATION, &resync_data));
     let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
 
     let mut avp_bytes = Vec::new();
-    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "scscf.ims.example.com;1;1"));
+    avp_bytes.extend_from_slice(&encode_avp_utf8(
+        avp::SESSION_ID,
+        "scscf.ims.example.com;1;1",
+    ));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.ims.example.com"));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.example.com"));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "ims.example.com"));
     avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
     avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(VENDOR_3GPP, CX_APP_ID));
-    avp_bytes
-        .extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:alice@ims.example.com"));
+    avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::PUBLIC_IDENTITY,
+        "sip:alice@ims.example.com",
+    ));
     avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SIP_NUMBER_AUTH_ITEMS, 1));
     avp_bytes.extend_from_slice(&sip_auth_data_item);
     avp_bytes

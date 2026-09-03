@@ -216,7 +216,10 @@ mod tests {
         assert_eq!(answer.application_id, request.application_id);
         assert_eq!(answer.hop_by_hop, request.hop_by_hop);
         assert_eq!(answer.end_to_end, request.end_to_end);
-        assert_eq!(answer.get_str(avp::SESSION_ID).as_deref(), Some("client;1;1"));
+        assert_eq!(
+            answer.get_str(avp::SESSION_ID).as_deref(),
+            Some("client;1;1")
+        );
         assert_eq!(
             answer.find(avp::RESULT_CODE, 0).and_then(|a| a.as_u32()),
             Some(dictionary::DIAMETER_LOOP_DETECTED)
@@ -225,7 +228,10 @@ mod tests {
             answer.get_str(avp::ORIGIN_HOST).as_deref(),
             Some("diam.example.org")
         );
-        assert_eq!(answer.get_str(avp::ERROR_MESSAGE).as_deref(), Some("loop detected"));
+        assert_eq!(
+            answer.get_str(avp::ERROR_MESSAGE).as_deref(),
+            Some("loop detected")
+        );
     }
 
     #[test]

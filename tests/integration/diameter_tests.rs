@@ -6,7 +6,7 @@
 //! through the dictionary.
 
 use siphon::diameter::codec::*;
-use siphon::diameter::cx::{build_uaa_success, build_saa_success, build_lia_success};
+use siphon::diameter::cx::{build_lia_success, build_saa_success, build_uaa_success};
 use siphon::diameter::dictionary::{self, avp, lookup_avp};
 use siphon::diameter::rf::AccountingRecordType;
 use siphon::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole};
@@ -46,7 +46,10 @@ fn build_mar_wire(public_identity: &str, auth_scheme: &str) -> Vec<u8> {
         avp::SIP_AUTHENTICATION_SCHEME,
         auth_scheme,
     ));
-    payload.extend_from_slice(&encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children));
+    payload.extend_from_slice(&encode_avp_grouped_3gpp(
+        avp::SIP_AUTH_DATA_ITEM,
+        &auth_children,
+    ));
 
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -59,13 +62,13 @@ fn build_mar_wire(public_identity: &str, auth_scheme: &str) -> Vec<u8> {
 }
 
 /// Build an Ro CCR on the wire using raw AVP encoding (no private methods).
-fn build_ccr_wire(
-    request_type: u32,
-    ims_data: Option<&ImsChargingData>,
-) -> Vec<u8> {
+fn build_ccr_wire(request_type: u32, ims_data: Option<&ImsChargingData>) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "ocs;ccr;sess;1"));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RO_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RO_APP_ID,
+    ));
     payload.extend_from_slice(&encode_avp_utf8(
         avp::ORIGIN_HOST,
         "scscf.ims.mnc001.mcc001.3gppnetwork.org",
@@ -120,12 +123,18 @@ fn build_acr_wire(
         avp::DESTINATION_REALM,
         "ims.mnc001.mcc001.3gppnetwork.org",
     ));
-    payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::ACCT_APPLICATION_ID,
+        dictionary::RF_APP_ID,
+    ));
     payload.extend_from_slice(&encode_avp_u32(
         avp::ACCOUNTING_RECORD_TYPE,
         record_type as u32,
     ));
-    payload.extend_from_slice(&encode_avp_u32(avp::ACCOUNTING_RECORD_NUMBER, record_number));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::ACCOUNTING_RECORD_NUMBER,
+        record_number,
+    ));
     if let Some(ims) = ims_data {
         payload.extend_from_slice(&ims.encode_service_information());
     }
@@ -155,7 +164,10 @@ fn build_aar_wire() -> Vec<u8> {
         avp::DESTINATION_REALM,
         "ims.mnc001.mcc001.3gppnetwork.org",
     ));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RX_APP_ID,
+    ));
 
     // Media-Component-Description (grouped, 3GPP)
     let mut mcd_inner = Vec::new();
@@ -169,7 +181,10 @@ fn build_aar_wire() -> Vec<u8> {
         avp::FLOW_DESCRIPTION,
         b"permit in 17 from any to 10.0.0.1 49170",
     ));
-    mcd_inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::MEDIA_SUB_COMPONENT, &msc_inner));
+    mcd_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+        avp::MEDIA_SUB_COMPONENT,
+        &msc_inner,
+    ));
 
     payload.extend_from_slice(&encode_avp_grouped_3gpp(
         avp::MEDIA_COMPONENT_DESCRIPTION,
@@ -190,10 +205,7 @@ fn build_aar_wire() -> Vec<u8> {
 
 #[test]
 fn cx_mar_encode_decode_roundtrip() {
-    let wire = build_mar_wire(
-        "sip:alice@ims.mnc001.mcc001.3gppnetwork.org",
-        "SIP Digest",
-    );
+    let wire = build_mar_wire("sip:alice@ims.mnc001.mcc001.3gppnetwork.org", "SIP Digest");
     let decoded = decode_diameter(&wire).unwrap();
 
     assert!(decoded.is_request);
@@ -201,15 +213,15 @@ fn cx_mar_encode_decode_roundtrip() {
     assert_eq!(decoded.application_id, dictionary::CX_APP_ID);
     assert_eq!(decoded.hop_by_hop, 100);
     assert_eq!(decoded.end_to_end, 200);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "MAR");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "MAR"
+    );
 }
 
 #[test]
 fn cx_mar_avps_resolve_through_dictionary() {
-    let wire = build_mar_wire(
-        "sip:alice@ims.mnc001.mcc001.3gppnetwork.org",
-        "SIP Digest",
-    );
+    let wire = build_mar_wire("sip:alice@ims.mnc001.mcc001.3gppnetwork.org", "SIP Digest");
     let decoded = decode_diameter(&wire).unwrap();
 
     // Standard AVPs resolve by name
@@ -247,7 +259,10 @@ fn ro_ccr_with_ims_data_encode_decode() {
     assert!(decoded.is_request);
     assert_eq!(decoded.command_code, dictionary::CMD_CREDIT_CONTROL);
     assert_eq!(decoded.application_id, dictionary::RO_APP_ID);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "CCR");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "CCR"
+    );
 
     // Subscription-Id grouped AVP with children
     let sub_id = decoded.avps.get("Subscription-Id").unwrap();
@@ -294,7 +309,10 @@ fn rf_acr_shares_ims_data_with_ro() {
 
     assert_eq!(decoded.command_code, dictionary::CMD_ACCOUNTING);
     assert_eq!(decoded.application_id, dictionary::RF_APP_ID);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "ACR");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "ACR"
+    );
 
     let svc_info = decoded.avps.get("Service-Information").unwrap();
     let ims_info = svc_info.get("IMS-Information").unwrap();
@@ -400,7 +418,10 @@ fn build_aar_wire_structured() -> Vec<u8> {
         avp::DESTINATION_REALM,
         "ims.mnc001.mcc001.3gppnetwork.org",
     ));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RX_APP_ID,
+    ));
     payload.extend_from_slice(&component.encode());
 
     encode_diameter_message(
@@ -456,7 +477,10 @@ fn rx_aar_encode_decode_roundtrip() {
     assert!(decoded.is_request);
     assert_eq!(decoded.command_code, dictionary::CMD_AA);
     assert_eq!(decoded.application_id, dictionary::RX_APP_ID);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "AAR");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "AAR"
+    );
 
     // Nested Media-Component-Description
     let mcd = decoded.avps.get("Media-Component-Description").unwrap();
@@ -471,10 +495,7 @@ fn rx_aar_encode_decode_roundtrip() {
 
     // Nested Media-Sub-Component inside MCD
     let msc = mcd.get("Media-Sub-Component").unwrap();
-    assert_eq!(
-        msc.get("Flow-Number").and_then(|v| v.as_u64()),
-        Some(1)
-    );
+    assert_eq!(msc.get("Flow-Number").and_then(|v| v.as_u64()), Some(1));
 }
 
 // ── Dictionary lookup integration ──────────────────────────────────────
@@ -590,8 +611,14 @@ fn full_ims_call_flow_cx_ro_rf() {
         .unwrap()
         .get("IMS-Information")
         .unwrap();
-    assert_eq!(ccr_ims.get("Calling-Party-Address"), acr_ims.get("Calling-Party-Address"));
-    assert_eq!(ccr_ims.get("Called-Party-Address"), acr_ims.get("Called-Party-Address"));
+    assert_eq!(
+        ccr_ims.get("Calling-Party-Address"),
+        acr_ims.get("Calling-Party-Address")
+    );
+    assert_eq!(
+        ccr_ims.get("Called-Party-Address"),
+        acr_ims.get("Called-Party-Address")
+    );
 }
 
 // ── Full IMS call flow: Cx + Rx + Ro + Rf ──────────────────────────────
@@ -703,16 +730,19 @@ fn cx_uaa_encode_decode_roundtrip() {
     assert_eq!(decoded.command_code, dictionary::CMD_USER_AUTHORIZATION);
     assert_eq!(decoded.hop_by_hop, 500);
     assert_eq!(decoded.end_to_end, 600);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "UAA");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "UAA"
+    );
 
     // Server-Name AVP present
-    let server_name = decoded.avps.get("Server-Name")
-        .and_then(|v| v.as_str());
+    let server_name = decoded.avps.get("Server-Name").and_then(|v| v.as_str());
     assert_eq!(server_name, Some("sip:scscf.ims.example.com:6060"));
 
     // Experimental-Result grouped AVP with result code
     let exp_result = decoded.avps.get("Experimental-Result").unwrap();
-    let exp_code = exp_result.get("Experimental-Result-Code")
+    let exp_code = exp_result
+        .get("Experimental-Result-Code")
         .and_then(|v| v.as_u64());
     assert_eq!(exp_code, Some(2001));
 }
@@ -732,10 +762,15 @@ fn cx_saa_encode_decode_roundtrip() {
 
     assert!(!decoded.is_request);
     assert_eq!(decoded.command_code, dictionary::CMD_SERVER_ASSIGNMENT);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "SAA");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "SAA"
+    );
 
     // User-Data AVP (code 606) contains the iFC XML as hex-encoded OctetString
-    let user_data_hex = decoded.avps.get("User-Data")
+    let user_data_hex = decoded
+        .avps
+        .get("User-Data")
         .and_then(|v| v.as_str())
         .unwrap();
     let user_data_bytes = hex::decode(user_data_hex).unwrap();
@@ -743,9 +778,13 @@ fn cx_saa_encode_decode_roundtrip() {
 
     // Experimental-Result
     let exp_result = decoded.avps.get("Experimental-Result").unwrap();
-    let exp_code = exp_result.get("Experimental-Result-Code")
+    let exp_code = exp_result
+        .get("Experimental-Result-Code")
         .and_then(|v| v.as_u64());
-    assert_eq!(exp_code, Some(dictionary::DIAMETER_FIRST_REGISTRATION as u64));
+    assert_eq!(
+        exp_code,
+        Some(dictionary::DIAMETER_FIRST_REGISTRATION as u64)
+    );
 }
 
 #[test]
@@ -779,9 +818,11 @@ fn cx_lia_encode_decode_roundtrip() {
 
     assert!(!decoded.is_request);
     assert_eq!(decoded.command_code, dictionary::CMD_LOCATION_INFO);
-    assert_eq!(command_name(decoded.command_code, decoded.is_request), "LIA");
+    assert_eq!(
+        command_name(decoded.command_code, decoded.is_request),
+        "LIA"
+    );
 
-    let server_name = decoded.avps.get("Server-Name")
-        .and_then(|v| v.as_str());
+    let server_name = decoded.avps.get("Server-Name").and_then(|v| v.as_str());
     assert_eq!(server_name, Some("sip:scscf.ims.example.com:6060"));
 }

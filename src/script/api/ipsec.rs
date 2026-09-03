@@ -90,7 +90,9 @@ pub fn is_protected_local_port(local_port: u16) -> bool {
 /// not running as P-CSCF, or the deployment hasn't set the per-replica
 /// path host); callers should error rather than guess.
 pub fn pcscf_path_host() -> Option<String> {
-    IPSEC_CONFIG_REF.get().and_then(|config| config.path_host.clone())
+    IPSEC_CONFIG_REF
+        .get()
+        .and_then(|config| config.path_host.clone())
 }
 
 /// Pick the local egress address that should be used to send a packet
@@ -460,8 +462,7 @@ impl PyTransform {
         let offer_ealg = offer.ealg.to_lowercase();
         let want_ealg = self.ealg_str();
         offer_alg == self.alg_str()
-            && (offer_ealg == want_ealg
-                || (offer_ealg.is_empty() && want_ealg == "null"))
+            && (offer_ealg == want_ealg || (offer_ealg.is_empty() && want_ealg == "null"))
     }
 
     fn __repr__(&self) -> String {
@@ -471,9 +472,7 @@ impl PyTransform {
             PyTransform::HmacSha256_128Null => "Transform.HmacSha256_128Null".to_string(),
             PyTransform::HmacSha1_96AesCbc128 => "Transform.HmacSha1_96AesCbc128".to_string(),
             PyTransform::HmacMd5_96AesCbc128 => "Transform.HmacMd5_96AesCbc128".to_string(),
-            PyTransform::HmacSha256_128AesCbc128 => {
-                "Transform.HmacSha256_128AesCbc128".to_string()
-            }
+            PyTransform::HmacSha256_128AesCbc128 => "Transform.HmacSha256_128AesCbc128".to_string(),
         }
     }
 }
@@ -740,9 +739,7 @@ impl PyPendingSA {
     /// header you set on the relayed 401.
     fn security_server_params(&self) -> PyResult<PySecurityServerParams> {
         let guard = self.inner.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "PendingSA lock poisoned: {error}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("PendingSA lock poisoned: {error}"))
         })?;
         Ok(guard.params.clone())
     }
@@ -849,7 +846,9 @@ impl PyPendingSA {
         // cleanup degrades to "kernel policy table grows by 4 until the
         // next successful activate", which the next round will catch.
         tokio::spawn(async move {
-            manager.cleanup_other_pairs_for_ue(&ue_addr, ue_port_c).await;
+            manager
+                .cleanup_other_pairs_for_ue(&ue_addr, ue_port_c)
+                .await;
         });
 
         Ok(())
@@ -859,9 +858,7 @@ impl PyPendingSA {
     #[getter]
     fn is_active(&self) -> PyResult<bool> {
         let guard = self.inner.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "PendingSA lock poisoned: {error}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("PendingSA lock poisoned: {error}"))
         })?;
         Ok(guard.state == PendingState::Active)
     }
@@ -870,9 +867,7 @@ impl PyPendingSA {
     #[getter]
     fn is_cleaned(&self) -> PyResult<bool> {
         let guard = self.inner.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "PendingSA lock poisoned: {error}"
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("PendingSA lock poisoned: {error}"))
         })?;
         Ok(guard.state == PendingState::Cleaned)
     }
@@ -944,7 +939,10 @@ impl PyPendingSA {
             }
             // Tear down the old SAs first; ignore errors (xfrm may have
             // already lost them — we still want the new ones to land).
-            if let Err(error) = manager.delete_sa_pair(&sa_new.ue_addr, sa_new.ue_port_c).await {
+            if let Err(error) = manager
+                .delete_sa_pair(&sa_new.ue_addr, sa_new.ue_port_c)
+                .await
+            {
                 debug!(
                     %error,
                     "ipsec.PendingSA.refresh: prior delete_sa_pair returned error (ignored)"
@@ -1169,9 +1167,8 @@ impl PyIpsec {
                 transform, offer.alg, offer.ealg
             )));
         }
-        let sa_protocol = parse_allocate_protocol(protocol).map_err(|message| {
-            pyo3::exceptions::PyValueError::new_err(message)
-        })?;
+        let sa_protocol =
+            parse_allocate_protocol(protocol).map_err(pyo3::exceptions::PyValueError::new_err)?;
         let keys = av.borrow().take().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
         })?;
@@ -1266,7 +1263,10 @@ impl PyIpsec {
     /// fires after the configured TTL (default 30 s).
     fn stash(&self, call_id: String, pending: Py<PyPendingSA>) {
         let expires_at = Instant::now() + self.stash_ttl;
-        let entry = StashEntry { pending, expires_at };
+        let entry = StashEntry {
+            pending,
+            expires_at,
+        };
         if let Some(prior) = self.stash.insert(call_id.clone(), entry) {
             spawn_pending_cleanup(prior.pending);
         }
@@ -1296,7 +1296,10 @@ impl PyIpsec {
     }
 
     fn __repr__(&self) -> String {
-        let fmt = |addr: Option<IpAddr>| addr.map(|a| a.to_string()).unwrap_or_else(|| "-".to_string());
+        let fmt = |addr: Option<IpAddr>| {
+            addr.map(|a| a.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        };
         format!(
             "Ipsec(pcscf_addr_v4={}, pcscf_addr_v6={}, pcscf_port_c={}, pcscf_port_s={}, active={}, stashed={})",
             fmt(self.pcscf_addr_v4),
@@ -1544,7 +1547,12 @@ mod tests {
         let v6: IpAddr = "2001:db8::10".parse().unwrap();
 
         // Dual-stack: each UE family selects its own P-CSCF local address.
-        let dual = PyIpsec::new(Arc::clone(&manager), Arc::clone(&config), Some(v4), Some(v6));
+        let dual = PyIpsec::new(
+            Arc::clone(&manager),
+            Arc::clone(&config),
+            Some(v4),
+            Some(v6),
+        );
         assert_eq!(dual.pcscf_addr_for(false), Some(v4));
         assert_eq!(dual.pcscf_addr_for(true), Some(v6));
 
@@ -1623,7 +1631,8 @@ mod tests {
 
     #[test]
     fn parse_security_client_multi_single_offer() {
-        let header = "ipsec-3gpp; alg=hmac-sha-1-96; spi-c=11111; spi-s=22222; port-c=5060; port-s=5062";
+        let header =
+            "ipsec-3gpp; alg=hmac-sha-1-96; spi-c=11111; spi-s=22222; port-c=5060; port-s=5062";
         let offers = parse_security_client_multi(header, "10.0.0.1");
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].mechanism, "ipsec-3gpp");
@@ -1756,13 +1765,31 @@ mod tests {
 
     #[test]
     fn parse_allocate_protocol_accepts_explicit_pins() {
-        assert_eq!(parse_allocate_protocol(Some("udp")).unwrap(), SaProtocol::Udp);
-        assert_eq!(parse_allocate_protocol(Some("tcp")).unwrap(), SaProtocol::Tcp);
-        assert_eq!(parse_allocate_protocol(Some("any")).unwrap(), SaProtocol::Any);
+        assert_eq!(
+            parse_allocate_protocol(Some("udp")).unwrap(),
+            SaProtocol::Udp
+        );
+        assert_eq!(
+            parse_allocate_protocol(Some("tcp")).unwrap(),
+            SaProtocol::Tcp
+        );
+        assert_eq!(
+            parse_allocate_protocol(Some("any")).unwrap(),
+            SaProtocol::Any
+        );
         // Case-insensitive — UE-supplied transport strings vary.
-        assert_eq!(parse_allocate_protocol(Some("UDP")).unwrap(), SaProtocol::Udp);
-        assert_eq!(parse_allocate_protocol(Some("TCP")).unwrap(), SaProtocol::Tcp);
-        assert_eq!(parse_allocate_protocol(Some("Any")).unwrap(), SaProtocol::Any);
+        assert_eq!(
+            parse_allocate_protocol(Some("UDP")).unwrap(),
+            SaProtocol::Udp
+        );
+        assert_eq!(
+            parse_allocate_protocol(Some("TCP")).unwrap(),
+            SaProtocol::Tcp
+        );
+        assert_eq!(
+            parse_allocate_protocol(Some("Any")).unwrap(),
+            SaProtocol::Any
+        );
     }
 
     #[test]
@@ -2061,7 +2088,10 @@ mod tests {
             crate::transport::Transport::Tcp, // caller hint — overridden
         )
         .unwrap();
-        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        assert_eq!(
+            source,
+            std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c)
+        );
         assert_eq!(transport, crate::transport::Transport::Udp);
     }
 
@@ -2076,13 +2106,12 @@ mod tests {
         let mut sa = ipsec_test_sa();
         sa.protocol = SaProtocol::Tcp;
 
-        let (source, transport) = outbound_for_sa(
-            &sa,
-            sa.ue_port_s,
-            crate::transport::Transport::Udp,
-        )
-        .unwrap();
-        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        let (source, transport) =
+            outbound_for_sa(&sa, sa.ue_port_s, crate::transport::Transport::Udp).unwrap();
+        assert_eq!(
+            source,
+            std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c)
+        );
         assert_eq!(transport, crate::transport::Transport::Tcp);
     }
 
@@ -2095,13 +2124,12 @@ mod tests {
         let mut sa = ipsec_test_sa();
         sa.protocol = SaProtocol::Tcp;
 
-        let (source, transport) = outbound_for_sa(
-            &sa,
-            sa.ue_port_c,
-            crate::transport::Transport::Udp,
-        )
-        .unwrap();
-        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s));
+        let (source, transport) =
+            outbound_for_sa(&sa, sa.ue_port_c, crate::transport::Transport::Udp).unwrap();
+        assert_eq!(
+            source,
+            std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s)
+        );
         assert_eq!(transport, crate::transport::Transport::Tcp);
     }
 
@@ -2118,22 +2146,17 @@ mod tests {
         sa.protocol = SaProtocol::Any;
 
         // Caller wants UDP — Any SA preserves it.
-        let (source, transport) = outbound_for_sa(
-            &sa,
-            sa.ue_port_s,
-            crate::transport::Transport::Udp,
-        )
-        .unwrap();
-        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        let (source, transport) =
+            outbound_for_sa(&sa, sa.ue_port_s, crate::transport::Transport::Udp).unwrap();
+        assert_eq!(
+            source,
+            std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c)
+        );
         assert_eq!(transport, crate::transport::Transport::Udp);
 
         // Caller wants TCP — same Any SA preserves that too.
-        let (_, transport_tcp) = outbound_for_sa(
-            &sa,
-            sa.ue_port_s,
-            crate::transport::Transport::Tcp,
-        )
-        .unwrap();
+        let (_, transport_tcp) =
+            outbound_for_sa(&sa, sa.ue_port_s, crate::transport::Transport::Tcp).unwrap();
         assert_eq!(transport_tcp, crate::transport::Transport::Tcp);
     }
 

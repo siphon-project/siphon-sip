@@ -125,7 +125,10 @@ async fn media_backend_siphon_rtp_offer_rewrites_sdp() {
         .await
         .unwrap();
     let rewritten = String::from_utf8_lossy(&rewritten);
-    assert!(rewritten.contains("203.0.113.1"), "SDP not rewritten: {rewritten}");
+    assert!(
+        rewritten.contains("203.0.113.1"),
+        "SDP not rewritten: {rewritten}"
+    );
     assert!(rewritten.contains("30000"));
 
     backend.delete(call_id, "alice-tag").await.unwrap();
@@ -165,9 +168,8 @@ async fn spawn_recording_siphon_rtp() -> (std::net::SocketAddr, mpsc::UnboundedR
                         frame::decode::<Request>(&buffer).expect("decode request")
                     {
                         // The raw JSON exactly as siphon serialised it.
-                        let body =
-                            String::from_utf8(buffer[frame::HEADER_LEN..consumed].to_vec())
-                                .expect("request body is utf-8");
+                        let body = String::from_utf8(buffer[frame::HEADER_LEN..consumed].to_vec())
+                            .expect("request body is utf-8");
                         buffer.drain(..consumed);
                         let _ = record_tx.send(body);
 
@@ -263,8 +265,7 @@ async fn detach_ws_tee_emits_the_documented_wire_shape() {
     backend.detach_ws_tee("c", "f").await.unwrap();
     let body = records.recv().await.expect("detach recorded");
     assert_eq!(
-        body,
-        r#"{"id":2,"command":"detach_ws_tee","call_id":"c","from_tag":"f"}"#,
+        body, r#"{"id":2,"command":"detach_ws_tee","call_id":"c","from_tag":"f"}"#,
         "detach_ws_tee wire shape drifted"
     );
 }
@@ -306,7 +307,10 @@ async fn offer_with_ws_tee_profile_carries_it_to_the_engine() {
         ws_tee_channels: Some(1),
         ..NgFlags::default()
     };
-    backend.offer("call-2", "tag-a", SMOKE_SDP, &flags).await.unwrap();
+    backend
+        .offer("call-2", "tag-a", SMOKE_SDP, &flags)
+        .await
+        .unwrap();
     let body = records.recv().await.expect("offer recorded");
     assert!(
         body.contains(r#""ws_tee":"wss://asr.example/stream""#),
@@ -335,8 +339,14 @@ async fn ws_tee_is_rejected_by_backends_that_cannot_stream() {
         .await
         .expect_err("rtpengine cannot stream a websocket tee");
     let text = error.to_string();
-    assert!(text.contains("attach_ws_tee"), "error must name the operation: {text}");
-    assert!(text.contains("rtpengine"), "error must name the backend: {text}");
+    assert!(
+        text.contains("attach_ws_tee"),
+        "error must name the operation: {text}"
+    );
+    assert!(
+        text.contains("rtpengine"),
+        "error must name the backend: {text}"
+    );
     // Never mistaken for "the call is already gone".
     assert!(!error.is_call_not_found());
 
@@ -423,7 +433,10 @@ async fn smoke_test_against_real_siphon_rtp() {
         wait_until(|| async { set.ping().await.is_ok() }).await,
         "siphon-rtp NG listener did not become ready"
     );
-    let offered = set.offer("smoke-ng", "tag-a", SMOKE_SDP, &flags).await.unwrap();
+    let offered = set
+        .offer("smoke-ng", "tag-a", SMOKE_SDP, &flags)
+        .await
+        .unwrap();
     assert!(!offered.is_empty());
     let answered = set
         .answer("smoke-ng", "tag-a", "tag-b", SMOKE_SDP, &flags)

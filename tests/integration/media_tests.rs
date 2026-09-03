@@ -4,7 +4,7 @@
 //! and removal, parse-serialize-reparse roundtrips, edge cases (empty SDP, no
 //! media lines), and session-level attribute preservation.
 
-use siphon::media::sdp::{SdpBody, rewrite_sdp_body};
+use siphon::media::sdp::{rewrite_sdp_body, SdpBody};
 
 // ---------------------------------------------------------------------------
 // Sample SDP bodies
@@ -103,7 +103,10 @@ fn filter_codecs_keep_pcmu_only() {
     assert_eq!(media.formats, vec![0]);
     assert_eq!(media.rtpmap.len(), 1);
     assert_eq!(media.rtpmap[0].1, "PCMU/8000");
-    assert!(media.fmtp.is_empty(), "opus and telephone-event fmtp should be removed");
+    assert!(
+        media.fmtp.is_empty(),
+        "opus and telephone-event fmtp should be removed"
+    );
 }
 
 #[test]
@@ -137,7 +140,10 @@ fn remove_codecs_telephone_event() {
 
     let media = &sdp.media_sections[0];
     assert_eq!(media.formats, vec![0, 8, 97]);
-    assert!(!media.rtpmap.iter().any(|(_, codec)| codec.contains("telephone-event")));
+    assert!(!media
+        .rtpmap
+        .iter()
+        .any(|(_, codec)| codec.contains("telephone-event")));
     assert!(!media.fmtp.iter().any(|(pt, _)| *pt == 101));
 }
 
@@ -300,15 +306,24 @@ fn media_level_other_attrs_preserved_after_filtering() {
 
     // The c= and a=sendrecv lines should be in other_attrs.
     let media = &sdp.media_sections[0];
-    assert!(media.other_attrs.iter().any(|attr| attr.contains("sendrecv")));
-    assert!(media.other_attrs.iter().any(|attr| attr.contains("c=IN IP4")));
+    assert!(media
+        .other_attrs
+        .iter()
+        .any(|attr| attr.contains("sendrecv")));
+    assert!(media
+        .other_attrs
+        .iter()
+        .any(|attr| attr.contains("c=IN IP4")));
 
     // Filter to PCMU only.
     sdp.filter_codecs(&["PCMU"]);
 
     // other_attrs should still be there.
     let media = &sdp.media_sections[0];
-    assert!(media.other_attrs.iter().any(|attr| attr.contains("sendrecv")));
+    assert!(media
+        .other_attrs
+        .iter()
+        .any(|attr| attr.contains("sendrecv")));
 
     // Verify in serialized output.
     let output = sdp.to_string();

@@ -34,15 +34,12 @@ fn optional_u32(avps: &serde_json::Value, name: &str) -> Option<u32> {
 }
 
 fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> {
-    avps.get(name)
-        .and_then(|v| v.as_str())
-        .map(|hex_str| {
-            codec::hex::decode(hex_str)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| hex_str.to_string())
-        })
+    avps.get(name).and_then(|v| v.as_str()).map(|hex_str| {
+        codec::hex::decode(hex_str)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| hex_str.to_string())
+    })
 }
-
 
 /// Decode an OctetString AVP into raw bytes (no UTF-8 assumption — for
 /// SM-RP-UI which carries TPDUs).
@@ -374,9 +371,10 @@ mod tests {
             1,
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
-        let correlation = decoded.avps.get("SMSMI-Correlation-ID").expect(
-            "SMSMI-Correlation-ID must be present when a correlation ref was supplied",
-        );
+        let correlation = decoded
+            .avps
+            .get("SMSMI-Correlation-ID")
+            .expect("SMSMI-Correlation-ID must be present when a correlation ref was supplied");
         assert!(correlation.get("User-Name").is_some());
     }
 
@@ -445,7 +443,10 @@ mod tests {
         let wire = build_ofa_success("smsc.example.com", "example.com", "test;1;1", 5, 6);
         let decoded = codec::decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_MO_FORWARD_SHORT_MESSAGE);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_MO_FORWARD_SHORT_MESSAGE
+        );
         assert_eq!(
             decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
             Some(2001)

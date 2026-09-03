@@ -366,21 +366,16 @@ mod tests {
             ("command", BencodeValue::string("offer")),
             ("call-id", BencodeValue::string("abc-1234")),
         ]);
-        assert_eq!(
-            encode(&value),
-            b"d7:command5:offer7:call-id8:abc-1234e"
-        );
+        assert_eq!(encode(&value), b"d7:command5:offer7:call-id8:abc-1234e");
     }
 
     #[test]
     fn encode_nested_dict_with_list() {
-        let value = BencodeValue::dict(vec![
-            ("flags", BencodeValue::string_list(&["trust-address", "symmetric"])),
-        ]);
-        assert_eq!(
-            encode(&value),
-            b"d5:flagsl13:trust-address9:symmetricee"
-        );
+        let value = BencodeValue::dict(vec![(
+            "flags",
+            BencodeValue::string_list(&["trust-address", "symmetric"]),
+        )]);
+        assert_eq!(encode(&value), b"d5:flagsl13:trust-address9:symmetricee");
     }
 
     // -- Decoding --
@@ -506,14 +501,8 @@ mod tests {
                     "m=audio 8000 RTP/AVP 0\r\n",
                 )),
             ),
-            (
-                "replace",
-                BencodeValue::string_list(&["origin"]),
-            ),
-            (
-                "flags",
-                BencodeValue::string_list(&["trust-address"]),
-            ),
+            ("replace", BencodeValue::string_list(&["origin"])),
+            ("flags", BencodeValue::string_list(&["trust-address"])),
         ]);
         let encoded = encode(&original);
         let (decoded, remaining) = decode(&encoded).unwrap();
@@ -524,9 +513,7 @@ mod tests {
     #[test]
     fn roundtrip_binary_sdp() {
         let sdp_bytes = vec![0x76, 0x3d, 0x30, 0x0d, 0x0a, 0x00, 0xff];
-        let original = BencodeValue::dict(vec![
-            ("sdp", BencodeValue::String(sdp_bytes)),
-        ]);
+        let original = BencodeValue::dict(vec![("sdp", BencodeValue::String(sdp_bytes))]);
         let encoded = encode(&original);
         let (decoded, _) = decode(&encoded).unwrap();
         assert_eq!(original, decoded);
@@ -554,7 +541,10 @@ mod tests {
         let input = b"5:hello";
         let result = decode_full_dict(input);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected dictionary"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected dictionary"));
     }
 
     // -- Error cases --
@@ -612,12 +602,12 @@ mod tests {
             ("command", BencodeValue::string("offer")),
             ("call-id", BencodeValue::string("abc-1234")),
             ("from-tag", BencodeValue::string("foo")),
-            ("sdp", BencodeValue::string("v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n")),
-            ("ICE", BencodeValue::string("remove")),
             (
-                "replace",
-                BencodeValue::string_list(&["origin"]),
+                "sdp",
+                BencodeValue::string("v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n"),
             ),
+            ("ICE", BencodeValue::string("remove")),
+            ("replace", BencodeValue::string_list(&["origin"])),
         ]);
         let encoded = encode(&request);
         // Verify it starts with 'd' and ends with 'e'.
@@ -690,9 +680,7 @@ mod tests {
 
     #[test]
     fn dict_get_bytes_on_binary() {
-        let value = BencodeValue::dict(vec![
-            ("data", BencodeValue::String(vec![0x00, 0xff])),
-        ]);
+        let value = BencodeValue::dict(vec![("data", BencodeValue::String(vec![0x00, 0xff]))]);
         assert_eq!(value.dict_get_bytes("data"), Some(&[0x00, 0xff][..]));
     }
 }

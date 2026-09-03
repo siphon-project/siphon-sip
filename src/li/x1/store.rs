@@ -24,7 +24,7 @@ use super::message::{
     TaskResponseDetails, TaskStatus,
 };
 use super::types::{
-    DId, DestinationDeliveryStatus, DeliveryType, ProvisioningStatus, Timestamp, XId,
+    DId, DeliveryType, DestinationDeliveryStatus, ProvisioningStatus, Timestamp, XId,
 };
 use crate::li::target::{MatchedParty, TargetStore};
 
@@ -455,8 +455,7 @@ impl TaskStore {
             .map(|destination| destination.details.delivery_type)
             .collect();
 
-        if details.delivery_type.includes_iri()
-            && !accepted.iter().any(|kind| kind.includes_iri())
+        if details.delivery_type.includes_iri() && !accepted.iter().any(|kind| kind.includes_iri())
         {
             return Err(X1Error::new(
                 ErrorCode::InvalidCombinationOfDeliveryTypeAndDestinations,
@@ -709,8 +708,8 @@ pub fn content_delivery_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::li::x1::types::{IpAddressPort, Port, TargetIdentifier};
     use crate::li::x1::types::DeliveryAddress;
+    use crate::li::x1::types::{IpAddressPort, Port, TargetIdentifier};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn destination(delivery_type: DeliveryType) -> DestinationDetails {
@@ -775,7 +774,9 @@ mod tests {
     #[test]
     fn modifying_an_unknown_did_is_refused() {
         let (destinations, _) = stores_with_content();
-        let error = destinations.modify(destination(DeliveryType::X2Only)).unwrap_err();
+        let error = destinations
+            .modify(destination(DeliveryType::X2Only))
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::DidDoesNotExist);
     }
 
@@ -787,7 +788,11 @@ mod tests {
         details.friendly_name = Some("renamed".to_string());
         destinations.modify(details.clone()).unwrap();
         assert_eq!(
-            destinations.get(details.d_id).unwrap().details.friendly_name,
+            destinations
+                .get(details.d_id)
+                .unwrap()
+                .details
+                .friendly_name,
             Some("renamed".to_string())
         );
     }
@@ -853,7 +858,9 @@ mod tests {
     #[test]
     fn a_task_naming_no_destination_is_refused() {
         let (_, tasks) = stores_with_content();
-        let error = tasks.activate(task(DeliveryType::X2Only, vec![])).unwrap_err();
+        let error = tasks
+            .activate(task(DeliveryType::X2Only, vec![]))
+            .unwrap_err();
         assert_eq!(
             error.code,
             ErrorCode::InvalidCombinationOfDeliveryTypeAndDestinations
@@ -954,7 +961,9 @@ mod tests {
         bad.list_of_dids = vec![DId::generate()]; // unknown destination
         assert!(tasks.modify(bad).is_err());
 
-        let stored = tasks.get(x_id).expect("the task must survive a rejected modify");
+        let stored = tasks
+            .get(x_id)
+            .expect("the task must survive a rejected modify");
         assert_eq!(stored.details.list_of_dids, vec![d_id]);
         assert_eq!(stored.modification_count, 0);
     }
@@ -962,7 +971,9 @@ mod tests {
     #[test]
     fn modifying_an_unknown_xid_is_refused() {
         let (_, tasks) = stores_with_content();
-        let error = tasks.modify(task(DeliveryType::X2Only, vec![])).unwrap_err();
+        let error = tasks
+            .modify(task(DeliveryType::X2Only, vec![]))
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::XidDoesNotExist);
     }
 
@@ -983,7 +994,11 @@ mod tests {
         tasks.activate(details).unwrap();
 
         let resolved = tasks.destinations_for(x_id);
-        assert_eq!(resolved.len(), 1, "must not fan out to unnamed destinations");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "must not fan out to unnamed destinations"
+        );
         assert_eq!(resolved[0].details.d_id, named_id);
     }
 
@@ -1107,9 +1122,7 @@ mod tests {
             let d_id = dest.d_id;
             destinations.create(dest).unwrap();
 
-            let error = tasks
-                .activate(task(delivery_type, vec![d_id]))
-                .unwrap_err();
+            let error = tasks.activate(task(delivery_type, vec![d_id])).unwrap_err();
             assert_eq!(
                 error.code,
                 ErrorCode::InvalidCombinationOfDeliveryTypeAndDestinations,
@@ -1215,9 +1228,18 @@ mod tests {
         let unavailable = ContentCapability::WrongBackend {
             backend: "rtpengine",
         };
-        assert!(content_delivery_supported(DeliveryType::X2Only, unavailable));
-        assert!(!content_delivery_supported(DeliveryType::X3Only, unavailable));
-        assert!(!content_delivery_supported(DeliveryType::X2AndX3, unavailable));
+        assert!(content_delivery_supported(
+            DeliveryType::X2Only,
+            unavailable
+        ));
+        assert!(!content_delivery_supported(
+            DeliveryType::X3Only,
+            unavailable
+        ));
+        assert!(!content_delivery_supported(
+            DeliveryType::X2AndX3,
+            unavailable
+        ));
         assert!(content_delivery_supported(DeliveryType::X2Only, available));
         assert!(content_delivery_supported(DeliveryType::X3Only, available));
         assert!(content_delivery_supported(DeliveryType::X2AndX3, available));
@@ -1285,7 +1307,9 @@ mod tests {
         let dest = destination(DeliveryType::X2Only);
         let d_id = dest.d_id;
         destinations.create(dest).unwrap();
-        tasks.activate(task(DeliveryType::X2Only, vec![d_id])).unwrap();
+        tasks
+            .activate(task(DeliveryType::X2Only, vec![d_id]))
+            .unwrap();
 
         let replacement = task(DeliveryType::X2Only, vec![d_id]);
         let new_id = replacement.x_id;
@@ -1302,7 +1326,9 @@ mod tests {
         let d_id = dest.d_id;
         destinations.create(dest).unwrap();
         for _ in 0..5 {
-            tasks.activate(task(DeliveryType::X2Only, vec![d_id])).unwrap();
+            tasks
+                .activate(task(DeliveryType::X2Only, vec![d_id]))
+                .unwrap();
         }
         assert_eq!(tasks.deactivate_all(), 5);
         assert!(tasks.is_empty());

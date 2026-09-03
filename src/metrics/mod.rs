@@ -10,8 +10,8 @@ pub mod glibc;
 use std::sync::{Arc, OnceLock};
 
 use prometheus::{
-    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tracing::error;
 
@@ -358,10 +358,8 @@ impl SiphonMetrics {
             "Number of active registrations (AoR bindings)",
         )?;
 
-        let dialogs_active = IntGauge::new(
-            "siphon_dialogs_active",
-            "Number of active SIP dialogs",
-        )?;
+        let dialogs_active =
+            IntGauge::new("siphon_dialogs_active", "Number of active SIP dialogs")?;
 
         let connections_active = GaugeVec::new(
             Opts::new("siphon_connections_active", "Active transport connections"),
@@ -373,7 +371,9 @@ impl SiphonMetrics {
                 "siphon_request_duration_seconds",
                 "Request processing duration in seconds",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+            ]),
             &["method"],
         )?;
 
@@ -386,10 +386,8 @@ impl SiphonMetrics {
             &["method", "type"],
         )?;
 
-        let uptime_seconds = Gauge::new(
-            "siphon_uptime_seconds",
-            "Time since SIPhon process started",
-        )?;
+        let uptime_seconds =
+            Gauge::new("siphon_uptime_seconds", "Time since SIPhon process started")?;
 
         let memory_allocated_bytes = IntGauge::new(
             "siphon_memory_allocated_bytes",
@@ -417,7 +415,10 @@ impl SiphonMetrics {
         )?;
 
         let script_executions_total = IntCounterVec::new(
-            Opts::new("siphon_script_executions_total", "Total Python script handler executions"),
+            Opts::new(
+                "siphon_script_executions_total",
+                "Total Python script handler executions",
+            ),
             &["handler"],
         )?;
 
@@ -517,7 +518,10 @@ impl SiphonMetrics {
         )?;
 
         let diameter_requests_total = IntCounterVec::new(
-            Opts::new("siphon_diameter_requests_total", "Total Diameter requests sent"),
+            Opts::new(
+                "siphon_diameter_requests_total",
+                "Total Diameter requests sent",
+            ),
             &["command"],
         )?;
 
@@ -534,7 +538,9 @@ impl SiphonMetrics {
                 "siphon_diameter_request_duration_seconds",
                 "Diameter request round-trip duration in seconds",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0,
+            ]),
             &["command"],
         )?;
 
@@ -588,7 +594,10 @@ impl SiphonMetrics {
         )?;
 
         let control_connections = IntGaugeVec::new(
-            Opts::new("siphon_control_connections", "Live control-plane connections per app"),
+            Opts::new(
+                "siphon_control_connections",
+                "Live control-plane connections per app",
+            ),
             &["app"],
         )?;
         let control_controlled_calls = IntGaugeVec::new(
@@ -599,7 +608,10 @@ impl SiphonMetrics {
             &["app"],
         )?;
         let control_commands_total = IntCounterVec::new(
-            Opts::new("siphon_control_commands_total", "Control-plane commands applied"),
+            Opts::new(
+                "siphon_control_commands_total",
+                "Control-plane commands applied",
+            ),
             &["app", "verb"],
         )?;
         let control_events_dropped_total = IntCounterVec::new(
@@ -926,7 +938,10 @@ pub fn update_python_stats() {
     };
     use pyo3::prelude::*;
     let result = pyo3::Python::attach(|python| -> PyResult<i64> {
-        python.import("sys")?.call_method0("getallocatedblocks")?.extract()
+        python
+            .import("sys")?
+            .call_method0("getallocatedblocks")?
+            .extract()
     });
     if let Ok(blocks) = result {
         metrics.python_allocated_blocks.set(blocks);
@@ -989,7 +1004,10 @@ mod tests {
 
         // Increment a counter
         metrics.requests_total.with_label_values(&["INVITE"]).inc();
-        metrics.requests_total.with_label_values(&["REGISTER"]).inc();
+        metrics
+            .requests_total
+            .with_label_values(&["REGISTER"])
+            .inc();
         metrics.requests_total.with_label_values(&["INVITE"]).inc();
 
         assert_eq!(
@@ -997,7 +1015,10 @@ mod tests {
             2
         );
         assert_eq!(
-            metrics.requests_total.with_label_values(&["REGISTER"]).get(),
+            metrics
+                .requests_total
+                .with_label_values(&["REGISTER"])
+                .get(),
             1
         );
     }
@@ -1006,10 +1027,18 @@ mod tests {
     fn metrics_encode_produces_text() {
         init().unwrap();
         // Ensure at least one label is observed so the counter appears in output
-        metrics().unwrap().requests_total.with_label_values(&["OPTIONS"]).inc();
+        metrics()
+            .unwrap()
+            .requests_total
+            .with_label_values(&["OPTIONS"])
+            .inc();
         let output = encode_metrics();
         // Gauges always appear (even at zero), counters appear after first observation
-        assert!(output.contains("siphon_transactions_active"), "output: {}", &output[..output.len().min(500)]);
+        assert!(
+            output.contains("siphon_transactions_active"),
+            "output: {}",
+            &output[..output.len().min(500)]
+        );
         assert!(output.contains("siphon_registrations_active"));
     }
 
@@ -1033,9 +1062,18 @@ mod tests {
         init().unwrap();
         let metrics = metrics().unwrap();
 
-        metrics.connections_active.with_label_values(&["TCP"]).set(10.0);
-        metrics.connections_active.with_label_values(&["UDP"]).set(0.0);
-        metrics.connections_active.with_label_values(&["TLS"]).set(3.0);
+        metrics
+            .connections_active
+            .with_label_values(&["TCP"])
+            .set(10.0);
+        metrics
+            .connections_active
+            .with_label_values(&["UDP"])
+            .set(0.0);
+        metrics
+            .connections_active
+            .with_label_values(&["TLS"])
+            .set(3.0);
 
         assert_eq!(
             metrics.connections_active.with_label_values(&["TCP"]).get(),
@@ -1047,8 +1085,7 @@ mod tests {
     fn sum_int_counter_vec_totals_all_series() {
         // Built on a local, isolated vector so the shared global registry can't
         // perturb the total.
-        let vector =
-            IntCounterVec::new(Opts::new("test_reqs_total", "test"), &["method"]).unwrap();
+        let vector = IntCounterVec::new(Opts::new("test_reqs_total", "test"), &["method"]).unwrap();
         vector.with_label_values(&["INVITE"]).inc_by(3);
         vector.with_label_values(&["REGISTER"]).inc_by(5);
         assert_eq!(sum_int_counter_vec(&vector), 8);
@@ -1056,8 +1093,7 @@ mod tests {
 
     #[test]
     fn gauge_vec_by_label_groups_by_key() {
-        let vector =
-            GaugeVec::new(Opts::new("test_conns_active", "test"), &["transport"]).unwrap();
+        let vector = GaugeVec::new(Opts::new("test_conns_active", "test"), &["transport"]).unwrap();
         vector.with_label_values(&["udp"]).set(6.0);
         vector.with_label_values(&["tcp"]).set(2.0);
         let map = gauge_vec_by_label(&vector, "transport");
@@ -1109,16 +1145,31 @@ mod tests {
         init().unwrap();
         let metrics = metrics().unwrap();
 
-        metrics.diameter_requests_total.with_label_values(&["UAR"]).inc();
-        metrics.diameter_requests_total.with_label_values(&["UAR"]).inc();
-        metrics.diameter_requests_total.with_label_values(&["SAR"]).inc();
+        metrics
+            .diameter_requests_total
+            .with_label_values(&["UAR"])
+            .inc();
+        metrics
+            .diameter_requests_total
+            .with_label_values(&["UAR"])
+            .inc();
+        metrics
+            .diameter_requests_total
+            .with_label_values(&["SAR"])
+            .inc();
 
         assert_eq!(
-            metrics.diameter_requests_total.with_label_values(&["UAR"]).get(),
+            metrics
+                .diameter_requests_total
+                .with_label_values(&["UAR"])
+                .get(),
             2
         );
         assert_eq!(
-            metrics.diameter_requests_total.with_label_values(&["SAR"]).get(),
+            metrics
+                .diameter_requests_total
+                .with_label_values(&["SAR"])
+                .get(),
             1
         );
     }
@@ -1137,15 +1188,27 @@ mod tests {
             .get();
         let base_watchdog = metrics.diameter_watchdog_failures_total.get();
 
-        metrics.diameter_request_errors_total.with_label_values(&["timeout"]).inc();
-        metrics.diameter_request_errors_total.with_label_values(&["channel_dropped"]).inc();
+        metrics
+            .diameter_request_errors_total
+            .with_label_values(&["timeout"])
+            .inc();
+        metrics
+            .diameter_request_errors_total
+            .with_label_values(&["channel_dropped"])
+            .inc();
         metrics.diameter_watchdog_failures_total.inc();
 
         assert_eq!(
-            metrics.diameter_request_errors_total.with_label_values(&["timeout"]).get(),
+            metrics
+                .diameter_request_errors_total
+                .with_label_values(&["timeout"])
+                .get(),
             base_timeout + 1
         );
-        assert_eq!(metrics.diameter_watchdog_failures_total.get(), base_watchdog + 1);
+        assert_eq!(
+            metrics.diameter_watchdog_failures_total.get(),
+            base_watchdog + 1
+        );
 
         let output = encode_metrics();
         assert!(output.contains("siphon_diameter_request_errors_total"));
@@ -1157,7 +1220,8 @@ mod tests {
         init().unwrap();
         let metrics = metrics().unwrap();
 
-        metrics.diameter_request_duration_seconds
+        metrics
+            .diameter_request_duration_seconds
             .with_label_values(&["MAR"])
             .observe(0.015);
 

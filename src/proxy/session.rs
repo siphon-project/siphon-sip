@@ -321,7 +321,9 @@ impl ProxySessionStore {
         if let Ok(mut session) = session_arc.write() {
             session.add_client_key(client_key.clone());
             session.set_client_branch(client_key.clone(), branch);
-            session.branch_index_map.insert(client_key.clone(), branch_index);
+            session
+                .branch_index_map
+                .insert(client_key.clone(), branch_index);
         }
         self.by_client_key
             .insert(client_key.clone(), Arc::clone(session_arc));
@@ -353,11 +355,7 @@ impl ProxySessionStore {
     }
 
     /// Add a client key to an existing session (for fork branches added after initial insert).
-    pub fn add_client_key(
-        &self,
-        server_key: &TransactionKey,
-        client_key: TransactionKey,
-    ) -> bool {
+    pub fn add_client_key(&self, server_key: &TransactionKey, client_key: TransactionKey) -> bool {
         // Find the session via any existing client key for this server
         let session_arc = match self.server_to_clients.get(server_key) {
             Some(keys) => {
@@ -381,8 +379,7 @@ impl ProxySessionStore {
         }
 
         // Update indices
-        self.by_client_key
-            .insert(client_key.clone(), session_arc);
+        self.by_client_key.insert(client_key.clone(), session_arc);
         self.server_to_clients
             .entry(server_key.clone())
             .and_modify(|keys| {
@@ -502,7 +499,9 @@ impl ProxySessionStore {
             let session = match session_arc.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
-                    tracing::error!("proxy session RwLock poisoned in remove_client_key, recovering");
+                    tracing::error!(
+                        "proxy session RwLock poisoned in remove_client_key, recovering"
+                    );
                     poisoned.into_inner()
                 }
             };
@@ -511,12 +510,14 @@ impl ProxySessionStore {
 
         // Update reverse index
         let mut should_remove_server = false;
-        self.server_to_clients.entry(server_key.clone()).and_modify(|keys| {
-            keys.retain(|key| key != client_key);
-            if keys.is_empty() {
-                should_remove_server = true;
-            }
-        });
+        self.server_to_clients
+            .entry(server_key.clone())
+            .and_modify(|keys| {
+                keys.retain(|key| key != client_key);
+                if keys.is_empty() {
+                    should_remove_server = true;
+                }
+            });
 
         if should_remove_server {
             self.server_to_clients.remove(&server_key);
@@ -600,11 +601,7 @@ impl ProxySessionStore {
     /// Returns `None` if Call-ID or From tag is missing.
     fn dialog_key_from_message(msg: &SipMessage) -> Option<String> {
         let call_id = msg.headers.get("Call-ID")?;
-        let from_tag = msg
-            .typed_from()
-            .ok()
-            .flatten()
-            .and_then(|na| na.tag)?;
+        let from_tag = msg.typed_from().ok().flatten().and_then(|na| na.tag)?;
         Some(format!("{}\0{}", call_id, from_tag))
     }
 
@@ -661,11 +658,19 @@ mod tests {
     }
 
     fn server_key() -> TransactionKey {
-        TransactionKey::new("z9hG4bK-srv".to_string(), Method::Options, "10.0.0.1:5060".to_string())
+        TransactionKey::new(
+            "z9hG4bK-srv".to_string(),
+            Method::Options,
+            "10.0.0.1:5060".to_string(),
+        )
     }
 
     fn client_key(suffix: &str) -> TransactionKey {
-        TransactionKey::new(format!("z9hG4bK-cli-{suffix}"), Method::Options, "10.0.0.1:5060".to_string())
+        TransactionKey::new(
+            format!("z9hG4bK-cli-{suffix}"),
+            Method::Options,
+            "10.0.0.1:5060".to_string(),
+        )
     }
 
     fn source_addr() -> SocketAddr {
@@ -772,7 +777,10 @@ mod tests {
             .expect("clone_relay_callbacks panicked on an unattached worker thread");
 
         assert!(has_reply, "on_reply callback lost in cross-thread clone");
-        assert!(has_failure, "on_failure callback lost in cross-thread clone");
+        assert!(
+            has_failure,
+            "on_failure callback lost in cross-thread clone"
+        );
         // `clone_ref` must alias the same Python object, not substitute a new one.
         assert_eq!(
             cloned_reply_ptr,
@@ -852,7 +860,11 @@ mod tests {
     #[test]
     fn store_add_client_key_unknown_server_returns_false() {
         let store = ProxySessionStore::new();
-        let unknown = TransactionKey::new("z9hG4bK-nope".to_string(), Method::Options, "10.0.0.1:5060".to_string());
+        let unknown = TransactionKey::new(
+            "z9hG4bK-nope".to_string(),
+            Method::Options,
+            "10.0.0.1:5060".to_string(),
+        );
         assert!(!store.add_client_key(&unknown, client_key("x")));
     }
 
@@ -1134,7 +1146,11 @@ mod tests {
     #[test]
     fn store_get_by_server_key_unknown_returns_none() {
         let store = ProxySessionStore::new();
-        let unknown = TransactionKey::new("z9hG4bK-nope".to_string(), Method::Options, "10.0.0.1:5060".to_string());
+        let unknown = TransactionKey::new(
+            "z9hG4bK-nope".to_string(),
+            Method::Options,
+            "10.0.0.1:5060".to_string(),
+        );
         assert!(store.get_by_server_key(&unknown).is_none());
     }
 
@@ -1144,15 +1160,21 @@ mod tests {
     fn session_client_branch_set_and_get() {
         let mut session = make_session();
         let key = client_key("1");
-        session.set_client_branch(key.clone(), ClientBranch {
-            destination: "10.0.0.2:5060".parse().unwrap(),
-            transport: Transport::Udp,
-            connection_id: ConnectionId::default(),
-        });
+        session.set_client_branch(
+            key.clone(),
+            ClientBranch {
+                destination: "10.0.0.2:5060".parse().unwrap(),
+                transport: Transport::Udp,
+                connection_id: ConnectionId::default(),
+            },
+        );
 
         let branch = session.get_client_branch(&key);
         assert!(branch.is_some());
-        assert_eq!(branch.unwrap().destination, "10.0.0.2:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            branch.unwrap().destination,
+            "10.0.0.2:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -1182,9 +1204,10 @@ mod tests {
             SipUri::new("target1.example.com".to_string()),
             SipUri::new("target2.example.com".to_string()),
         ];
-        let aggregator = Arc::new(Mutex::new(
-            ForkAggregator::new(targets, ForkStrategy::Parallel),
-        ));
+        let aggregator = Arc::new(Mutex::new(ForkAggregator::new(
+            targets,
+            ForkStrategy::Parallel,
+        )));
         session.fork_aggregator = Some(Arc::clone(&aggregator));
 
         // Add two client branches with index mapping
@@ -1243,8 +1266,16 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        let leg1_server = TransactionKey::new("z9hG4bK-leg1".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
-        let leg1_client = TransactionKey::new("z9hG4bK-leg1-c".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
+        let leg1_server = TransactionKey::new(
+            "z9hG4bK-leg1".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
+        let leg1_client = TransactionKey::new(
+            "z9hG4bK-leg1-c".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
         let mut session1 = ProxySession::new(
             leg1_server.clone(),
             "10.0.0.1:5060".parse().unwrap(),
@@ -1255,11 +1286,14 @@ mod tests {
             false,
         );
         session1.add_client_key(leg1_client.clone());
-        session1.set_client_branch(leg1_client.clone(), ClientBranch {
-            destination: "10.0.0.2:5060".parse().unwrap(), // FreeSWITCH
-            transport: Transport::Tcp,
-            connection_id: ConnectionId::default(),
-        });
+        session1.set_client_branch(
+            leg1_client.clone(),
+            ClientBranch {
+                destination: "10.0.0.2:5060".parse().unwrap(), // FreeSWITCH
+                transport: Transport::Tcp,
+                connection_id: ConnectionId::default(),
+            },
+        );
         store.insert(session1);
 
         // Leg 2: FS → proxy → callee (same Call-ID, different From-tag = "fs-tag")
@@ -1273,8 +1307,16 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        let leg2_server = TransactionKey::new("z9hG4bK-leg2".to_string(), Method::Invite, "10.0.0.2:5060".to_string());
-        let leg2_client = TransactionKey::new("z9hG4bK-leg2-c".to_string(), Method::Invite, "10.0.0.2:5060".to_string());
+        let leg2_server = TransactionKey::new(
+            "z9hG4bK-leg2".to_string(),
+            Method::Invite,
+            "10.0.0.2:5060".to_string(),
+        );
+        let leg2_client = TransactionKey::new(
+            "z9hG4bK-leg2-c".to_string(),
+            Method::Invite,
+            "10.0.0.2:5060".to_string(),
+        );
         let mut session2 = ProxySession::new(
             leg2_server.clone(),
             "10.0.0.2:5060".parse().unwrap(),
@@ -1285,24 +1327,35 @@ mod tests {
             false,
         );
         session2.add_client_key(leg2_client.clone());
-        session2.set_client_branch(leg2_client.clone(), ClientBranch {
-            destination: "10.0.0.3:5060".parse().unwrap(), // callee
-            transport: Transport::Tls,
-            connection_id: ConnectionId::default(),
-        });
+        session2.set_client_branch(
+            leg2_client.clone(),
+            ClientBranch {
+                destination: "10.0.0.3:5060".parse().unwrap(), // callee
+                transport: Transport::Tls,
+                connection_id: ConnectionId::default(),
+            },
+        );
         store.insert(session2);
 
         // ACK from caller (From-tag = "caller-tag") should find Leg 1 → FS
-        let found1 = store.get_by_dialog_key("shared-call-id", "caller-tag").unwrap();
+        let found1 = store
+            .get_by_dialog_key("shared-call-id", "caller-tag")
+            .unwrap();
         let s1 = found1.read().unwrap();
         let branch1 = s1.get_client_branch(&leg1_client).unwrap();
-        assert_eq!(branch1.destination, "10.0.0.2:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            branch1.destination,
+            "10.0.0.2:5060".parse::<SocketAddr>().unwrap()
+        );
 
         // ACK from FS (From-tag = "fs-tag") should find Leg 2 → callee
         let found2 = store.get_by_dialog_key("shared-call-id", "fs-tag").unwrap();
         let s2 = found2.read().unwrap();
         let branch2 = s2.get_client_branch(&leg2_client).unwrap();
-        assert_eq!(branch2.destination, "10.0.0.3:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            branch2.destination,
+            "10.0.0.3:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]

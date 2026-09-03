@@ -246,7 +246,10 @@ mod tests {
     #[test]
     fn credentials_reject_invalid_hex() {
         let result = AkaCredentials::from_hex("zz", None, Some(OPC_HEX), AMF_HEX);
-        assert_eq!(result.unwrap_err(), AkaConfigError::InvalidHex { field: "k" });
+        assert_eq!(
+            result.unwrap_err(),
+            AkaConfigError::InvalidHex { field: "k" }
+        );
     }
 
     #[test]
@@ -304,7 +307,12 @@ mod tests {
         // Stored SQN_MS well below the challenge SQN → fresh.
         let outcome = aka_challenge(&creds, &vector.rand, &vector.autn, &[0u8; 6]);
         match outcome {
-            AkaOutcome::Success { res, ck, ik, sqn: accepted } => {
+            AkaOutcome::Success {
+                res,
+                ck,
+                ik,
+                sqn: accepted,
+            } => {
                 assert_eq!(res, vector.xres);
                 assert_eq!(ck, vector.ck);
                 assert_eq!(ik, vector.ik);

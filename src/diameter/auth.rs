@@ -158,7 +158,9 @@ mod tests {
         let mut acl = SourceIpAcl::new();
         acl.add_str("2001:db8::/32", "v6tenant", "v6peer").unwrap();
         assert_eq!(
-            acl.lookup("2001:db8:1234::1".parse().unwrap()).unwrap().tenant,
+            acl.lookup("2001:db8:1234::1".parse().unwrap())
+                .unwrap()
+                .tenant,
             "v6tenant"
         );
         assert!(acl.lookup("2001:dead::1".parse().unwrap()).is_none());
@@ -170,7 +172,10 @@ mod tests {
         acl.add_str("10.0.0.0/8", "broad", "broad-peer").unwrap();
         acl.add_str("10.1.0.0/16", "narrow", "narrow-peer").unwrap();
         // 10.1.0.5 falls in both; first entry wins.
-        assert_eq!(acl.lookup("10.1.0.5".parse().unwrap()).unwrap().peer, "broad-peer");
+        assert_eq!(
+            acl.lookup("10.1.0.5".parse().unwrap()).unwrap().peer,
+            "broad-peer"
+        );
     }
 
     #[test]

@@ -186,9 +186,7 @@ pub fn parse_challenge(header_value: &str) -> Option<DigestChallenge> {
                         "SHA-256" | "SHA256" => DigestAlgorithm::Sha256,
                         "SHA-256-SESS" | "SHA256-SESS" => DigestAlgorithm::Sha256Sess,
                         "SHA-512-256" | "SHA512-256" => DigestAlgorithm::Sha512_256,
-                        "SHA-512-256-SESS" | "SHA512-256-SESS" => {
-                            DigestAlgorithm::Sha512_256Sess
-                        }
+                        "SHA-512-256-SESS" | "SHA512-256-SESS" => DigestAlgorithm::Sha512_256Sess,
                         "AKAV1-MD5" => DigestAlgorithm::AkaV1Md5,
                         _ => return None, // unsupported algorithm
                     };
@@ -816,7 +814,10 @@ mod tests {
 
         assert_ne!(c1, "0a1b2c3d", "must not fall back to a hardcoded cnonce");
         assert_ne!(c2, "0a1b2c3d", "must not fall back to a hardcoded cnonce");
-        assert_ne!(c1, c2, "two consecutive calls must produce different cnonces");
+        assert_ne!(
+            c1, c2,
+            "two consecutive calls must produce different cnonces"
+        );
         assert_eq!(c1.len(), 16, "cnonce is 16 hex chars (64 bits of entropy)");
         assert!(c1.chars().all(|character| character.is_ascii_hexdigit()));
     }
@@ -837,7 +838,14 @@ mod tests {
             username: "u".to_string(),
             password: "p".to_string(),
         };
-        let header = format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), Some("explicitcnonce"));
+        let header = format_authorization_header(
+            &challenge,
+            &creds,
+            "INVITE",
+            "sip:x",
+            Some(1),
+            Some("explicitcnonce"),
+        );
         assert!(header.contains("cnonce=\"explicitcnonce\""));
     }
 
@@ -863,14 +871,17 @@ mod tests {
             username: "u".to_string(),
             password: "p".to_string(),
         };
-        let header = format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), Some("c"));
+        let header =
+            format_authorization_header(&challenge, &creds, "INVITE", "sip:x", Some(1), Some("c"));
         assert!(header.contains("algorithm=SHA-256"));
         // Response field must be 64 hex chars for SHA-256.
         let response_start = header.find("response=\"").unwrap() + 10;
         let response_end = header[response_start..].find('"').unwrap() + response_start;
         let response = &header[response_start..response_end];
         assert_eq!(response.len(), 64, "SHA-256 digest is 64 hex chars");
-        assert!(response.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(response
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -900,12 +911,16 @@ mod tests {
 
         let ha1 = md5_hex("Mufasa:testrealm@host.com:Circle Of Life");
         let ha2 = md5_hex("GET:/dir/index.html");
-        let expected = md5_hex(&format!(
-            "{ha1}:dcd98b7102dd2f0e8b11d0f600bfb0c093:{ha2}"
-        ));
+        let expected = md5_hex(&format!("{ha1}:dcd98b7102dd2f0e8b11d0f600bfb0c093:{ha2}"));
 
-        let response =
-            compute_digest_response(&challenge, &credentials, "GET", "/dir/index.html", None, None);
+        let response = compute_digest_response(
+            &challenge,
+            &credentials,
+            "GET",
+            "/dir/index.html",
+            None,
+            None,
+        );
         assert_eq!(response, expected);
     }
 
@@ -1036,7 +1051,9 @@ mod tests {
         let response_end = header[response_start..].find('"').unwrap() + response_start;
         let response = &header[response_start..response_end];
         assert_eq!(response.len(), 32);
-        assert!(response.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(response
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1113,7 +1130,9 @@ mod tests {
 
         // Verify it's a valid 32-char hex MD5 hash
         assert_eq!(response.len(), 32);
-        assert!(response.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(response
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
 
         // Verify it's deterministic
         let response2 = compute_digest_response(
@@ -1129,8 +1148,7 @@ mod tests {
 
     #[test]
     fn parse_challenge_with_extra_whitespace() {
-        let header =
-            r#"Digest  realm = "example.com" , nonce = "abc123" , algorithm = MD5"#;
+        let header = r#"Digest  realm = "example.com" , nonce = "abc123" , algorithm = MD5"#;
         let challenge = parse_challenge(header).unwrap();
         assert_eq!(challenge.realm, "example.com");
         assert_eq!(challenge.nonce, "abc123");
@@ -1256,8 +1274,15 @@ mod tests {
             md5::compute(format!("{ha1}:{nonce}:00000001:abcd:auth:{ha2}").as_bytes())
         );
 
-        let response =
-            compute_aka_response(&challenge, username, &res, "REGISTER", uri, Some(1), Some("abcd"));
+        let response = compute_aka_response(
+            &challenge,
+            username,
+            &res,
+            "REGISTER",
+            uri,
+            Some(1),
+            Some("abcd"),
+        );
         assert_eq!(response, expected);
     }
 
@@ -1280,13 +1305,22 @@ mod tests {
             stale: false,
         };
 
-        let binary = compute_aka_response(&challenge, username, &res, "REGISTER", uri, Some(1), Some("c"));
+        let binary = compute_aka_response(
+            &challenge,
+            username,
+            &res,
+            "REGISTER",
+            uri,
+            Some(1),
+            Some("c"),
+        );
 
         let hex_creds = DigestCredentials {
             username: username.to_string(),
             password: "a54211d5e3ba50bf".to_string(),
         };
-        let as_hex = compute_digest_response(&challenge, &hex_creds, "REGISTER", uri, Some(1), Some("c"));
+        let as_hex =
+            compute_digest_response(&challenge, &hex_creds, "REGISTER", uri, Some(1), Some("c"));
 
         assert_ne!(binary, as_hex);
     }

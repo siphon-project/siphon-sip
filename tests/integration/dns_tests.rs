@@ -88,7 +88,9 @@ async fn transport_hint_preserved_in_result() {
 #[tokio::test]
 async fn transport_hint_none_when_not_provided() {
     let resolver = SipResolver::from_system().unwrap();
-    let results = resolver.resolve("192.168.1.1", Some(5060), "sip", None).await;
+    let results = resolver
+        .resolve("192.168.1.1", Some(5060), "sip", None)
+        .await;
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -132,7 +134,10 @@ async fn localhost_resolves_to_loopback() {
     let resolver = SipResolver::from_system().unwrap();
     let results = resolver.resolve("localhost", Some(5090), "sip", None).await;
 
-    assert!(!results.is_empty(), "localhost should resolve to at least one address");
+    assert!(
+        !results.is_empty(),
+        "localhost should resolve to at least one address"
+    );
     assert_eq!(results[0].address.port(), 5090);
     assert!(
         results[0].address.ip().is_loopback(),
@@ -169,12 +174,21 @@ async fn multiple_resolves_same_resolver() {
     let results3 = resolver.resolve("3.3.3.3", None, "sip", Some("tcp")).await;
 
     assert_eq!(results1.len(), 1);
-    assert_eq!(results1[0].address, "1.1.1.1:5060".parse::<SocketAddr>().unwrap());
+    assert_eq!(
+        results1[0].address,
+        "1.1.1.1:5060".parse::<SocketAddr>().unwrap()
+    );
 
     assert_eq!(results2.len(), 1);
-    assert_eq!(results2[0].address, "2.2.2.2:5061".parse::<SocketAddr>().unwrap());
+    assert_eq!(
+        results2[0].address,
+        "2.2.2.2:5061".parse::<SocketAddr>().unwrap()
+    );
 
     assert_eq!(results3.len(), 1);
-    assert_eq!(results3[0].address, "3.3.3.3:5060".parse::<SocketAddr>().unwrap());
+    assert_eq!(
+        results3[0].address,
+        "3.3.3.3:5060".parse::<SocketAddr>().unwrap()
+    );
     assert_eq!(results3[0].transport.as_deref(), Some("tcp"));
 }

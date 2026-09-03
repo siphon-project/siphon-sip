@@ -1,5 +1,5 @@
-use siphon::sip::uri::SipUri;
 use siphon::sip::parse_sip_message;
+use siphon::sip::uri::SipUri;
 
 /// Test basic SIP URI parsing
 #[test]
@@ -14,16 +14,14 @@ fn test_basic_uri() {
 /// Test URI with user
 #[test]
 fn test_uri_with_user() {
-    let uri = SipUri::new("example.com".to_string())
-        .with_user("user".to_string());
+    let uri = SipUri::new("example.com".to_string()).with_user("user".to_string());
     assert_eq!(uri.user.as_ref().unwrap(), "user");
 }
 
 /// Test URI with port
 #[test]
 fn test_uri_with_port() {
-    let uri = SipUri::new("example.com".to_string())
-        .with_port(5060);
+    let uri = SipUri::new("example.com".to_string()).with_port(5060);
     assert_eq!(uri.port, Some(5060));
 }
 
@@ -33,7 +31,7 @@ fn test_uri_with_params() {
     let uri = SipUri::new("example.com".to_string())
         .with_param("transport".to_string(), Some("udp".to_string()))
         .with_param("lr".to_string(), None);
-    
+
     assert_eq!(uri.get_param("transport"), Some("udp"));
     assert_eq!(uri.get_param("lr"), Some(""));
 }
@@ -49,7 +47,7 @@ fn test_parse_uri_from_message() {
 
     let result = parse_sip_message(message);
     assert!(result.is_ok());
-    
+
     let (_, msg) = result.unwrap();
     let uri = msg.request_uri().unwrap();
     assert_eq!(uri.user.as_ref().unwrap(), "user");

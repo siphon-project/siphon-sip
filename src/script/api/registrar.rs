@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use crate::registrar::{Contact, Registrar, RegistrarError, normalize_aor, reginfo};
-use crate::sip::headers::nameaddr::NameAddr;
-use crate::sip::message::SipMessage;
 use super::reply::PyReply;
 use super::request::PyRequest;
+use crate::registrar::{normalize_aor, reginfo, Contact, Registrar, RegistrarError};
+use crate::sip::headers::nameaddr::NameAddr;
+use crate::sip::message::SipMessage;
 
 /// Grace seconds added to the registrar's granted Expires when caching a
 /// binding on a proxy. Sized to one SIP non-INVITE transaction timeout
@@ -433,21 +433,23 @@ impl PyContact {
                         source_addr.hash(&mut hasher);
                         hasher.finish()
                     }
-                    None => return Self {
-                        uri_string: contact.uri.to_string(),
-                        q_value: contact.q,
-                        expires_remaining: contact.remaining_seconds(),
-                        age_seconds: contact.age_seconds(),
-                        received_string,
-                        path_headers: contact.path.clone(),
-                        instance_id_value: contact.instance_id.clone(),
-                        instance_epoch_value: contact.instance_epoch.clone(),
-                        is_local_value,
-                        flow_token_value: contact.flow_token.clone(),
-                        flow_value: None,
-                        params_value: contact.params.clone(),
-                        kind_value: contact.kind,
-                    },
+                    None => {
+                        return Self {
+                            uri_string: contact.uri.to_string(),
+                            q_value: contact.q,
+                            expires_remaining: contact.remaining_seconds(),
+                            age_seconds: contact.age_seconds(),
+                            received_string,
+                            path_headers: contact.path.clone(),
+                            instance_id_value: contact.instance_id.clone(),
+                            instance_epoch_value: contact.instance_epoch.clone(),
+                            is_local_value,
+                            flow_token_value: contact.flow_token.clone(),
+                            flow_value: None,
+                            params_value: contact.params.clone(),
+                            kind_value: contact.kind,
+                        }
+                    }
                 };
                 Some(PyFlow {
                     transport,
@@ -648,19 +650,11 @@ impl PyRegistrar {
             })
             .unwrap_or(1);
 
-        let call_id = message
-            .headers
-            .call_id()
-            .cloned()
-            .unwrap_or_default();
+        let call_id = message.headers.call_id().cloned().unwrap_or_default();
 
         // Extract Path headers (RFC 3327) — stored per-contact binding so
         // terminating requests can be routed through the proxy chain.
-        let path: Vec<String> = message
-            .headers
-            .get_all("Path")
-            .cloned()
-            .unwrap_or_default();
+        let path: Vec<String> = message.headers.get_all("Path").cloned().unwrap_or_default();
 
         // Parse Contact headers
         let contact_values = message
@@ -679,9 +673,7 @@ impl PyRegistrar {
             };
 
             for nameaddr in nameaddrs {
-                let expires = nameaddr
-                    .expires
-                    .unwrap_or(default_expires);
+                let expires = nameaddr.expires.unwrap_or(default_expires);
                 let q = nameaddr.q.unwrap_or(1.0);
 
                 // The registrar caps expires at max_expires internally.
@@ -690,10 +682,14 @@ impl PyRegistrar {
 
                 // Extract +sip.instance and reg-id from Contact header params
                 // (RFC 5627 §3) for GRUU support and contact replacement.
-                let sip_instance = nameaddr.other_params.iter()
+                let sip_instance = nameaddr
+                    .other_params
+                    .iter()
                     .find(|(name, _)| name == "+sip.instance")
                     .and_then(|(_, value)| value.clone());
-                let reg_id = nameaddr.other_params.iter()
+                let reg_id = nameaddr
+                    .other_params
+                    .iter()
                     .find(|(name, _)| name == "reg-id")
                     .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
 
@@ -735,11 +731,9 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
-                        RegistrarError::InvalidAor => {
-                            pyo3::exceptions::PyValueError::new_err(
-                                "invalid AoR (unsafe storage key)".to_string(),
-                            )
-                        }
+                        RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
+                            "invalid AoR (unsafe storage key)".to_string(),
+                        ),
                     })?;
             }
         }
@@ -893,11 +887,7 @@ impl PyRegistrar {
             })
             .unwrap_or(1);
 
-        let call_id = request_msg
-            .headers
-            .call_id()
-            .cloned()
-            .unwrap_or_default();
+        let call_id = request_msg.headers.call_id().cloned().unwrap_or_default();
 
         let path: Vec<String> = request_msg
             .headers
@@ -929,10 +919,14 @@ impl PyRegistrar {
                     .saturating_add(PROXY_BINDING_GRACE_SECS);
                 let q = nameaddr.q.unwrap_or(1.0);
 
-                let sip_instance = nameaddr.other_params.iter()
+                let sip_instance = nameaddr
+                    .other_params
+                    .iter()
                     .find(|(name, _)| name == "+sip.instance")
                     .and_then(|(_, value)| value.clone());
-                let reg_id = nameaddr.other_params.iter()
+                let reg_id = nameaddr
+                    .other_params
+                    .iter()
                     .find(|(name, _)| name == "reg-id")
                     .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
 
@@ -972,11 +966,9 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
-                        RegistrarError::InvalidAor => {
-                            pyo3::exceptions::PyValueError::new_err(
-                                "invalid AoR (unsafe storage key)".to_string(),
-                            )
-                        }
+                        RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
+                            "invalid AoR (unsafe storage key)".to_string(),
+                        ),
                     })?;
             }
         }
@@ -1085,8 +1077,7 @@ impl PyRegistrar {
                 // NameAddr) is a capability/feature tag for our purposes.
                 // We do NOT special-case `+sip.instance` or `reg-id` for
                 // AS contacts — those are meaningful only on the UE side.
-                let params: Vec<(String, Option<String>)> = nameaddr
-                    .other_params.to_vec();
+                let params: Vec<(String, Option<String>)> = nameaddr.other_params.to_vec();
 
                 let saved = self
                     .inner
@@ -1102,11 +1093,9 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
-                        RegistrarError::InvalidAor => {
-                            pyo3::exceptions::PyValueError::new_err(
-                                "invalid AoR (unsafe storage key)".to_string(),
-                            )
-                        }
+                        RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
+                            "invalid AoR (unsafe storage key)".to_string(),
+                        ),
                     })?;
                 wrote = wrote || saved;
             }
@@ -1145,7 +1134,10 @@ impl PyRegistrar {
     fn lookup_by_token(&self, token: &str) -> Option<PyContact> {
         let inner = &self.inner;
         let (_aor, contact) = inner.lookup_by_token(token)?;
-        Some(PyContact::from_rust_contact_with_registrar(&contact, Some(inner)))
+        Some(PyContact::from_rust_contact_with_registrar(
+            &contact,
+            Some(inner),
+        ))
     }
 
     /// Force-expire (remove) all contacts for a URI.
@@ -1276,11 +1268,7 @@ impl PyRegistrar {
             })
             .unwrap_or(1);
 
-        let call_id = message
-            .headers
-            .call_id()
-            .cloned()
-            .unwrap_or_default();
+        let call_id = message.headers.call_id().cloned().unwrap_or_default();
 
         let contact_values = message
             .headers
@@ -1296,14 +1284,8 @@ impl PyRegistrar {
             for nameaddr in nameaddrs {
                 let expires = nameaddr.expires.unwrap_or(default_expires);
                 let q = nameaddr.q.unwrap_or(1.0);
-                self.inner.save_pending(
-                    &aor,
-                    nameaddr.uri,
-                    expires,
-                    q,
-                    call_id.clone(),
-                    cseq_seq,
-                );
+                self.inner
+                    .save_pending(&aor, nameaddr.uri, expires, q, call_id.clone(), cseq_seq);
             }
         }
         Ok(())
@@ -1364,7 +1346,12 @@ impl PyRegistrar {
         let registry = python.import("_siphon_registry")?;
         registry.call_method1(
             "register",
-            ("registrar.on_change", python.None(), func.bind(python), is_async),
+            (
+                "registrar.on_change",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
         )?;
         Ok(func)
     }
@@ -1427,9 +1414,10 @@ impl PyRegistrar {
 
 /// Extract the AoR (Address of Record) from the To header of a SIP message.
 fn extract_aor(message: &SipMessage) -> PyResult<String> {
-    let to_raw = message.headers.to().ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("missing To header in REGISTER")
-    })?;
+    let to_raw = message
+        .headers
+        .to()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing To header in REGISTER"))?;
 
     let nameaddr = NameAddr::parse(to_raw).map_err(|error| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid To header: {error}"))
@@ -1464,9 +1452,9 @@ mod tests {
     use super::*;
     use crate::registrar::RegistrarConfig;
     use crate::script::api::request::RequestAction;
-    use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
+    use crate::sip::uri::SipUri;
     use std::sync::Mutex;
 
     fn make_registrar() -> Arc<Registrar> {
@@ -1510,8 +1498,11 @@ mod tests {
     #[test]
     fn save_and_lookup() {
         let registrar = make_registrar();
-        let (mut request, py_reg) =
-            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1:5060>", &registrar);
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1:5060>",
+            &registrar,
+        );
 
         py_reg.save(&mut request, false, vec![], None).unwrap();
 
@@ -1566,7 +1557,10 @@ mod tests {
             .from("<sip:alice@example.com>;tag=reg-tag".to_string())
             .call_id("reg-call@host".to_string())
             .cseq("1 REGISTER".to_string())
-            .header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>".to_string())
+            .header(
+                "Contact",
+                "<sip:alice@10.0.0.1:5060;transport=tcp>".to_string(),
+            )
             .content_length(0)
             .build()
             .unwrap();
@@ -1605,7 +1599,10 @@ mod tests {
             .from("<sip:bob@example.com>;tag=reg-tag".to_string())
             .call_id("reg-call@host".to_string())
             .cseq("1 REGISTER".to_string())
-            .header("Contact", "<sip:bob@df7jal23ls0d.invalid;transport=wss>".to_string())
+            .header(
+                "Contact",
+                "<sip:bob@df7jal23ls0d.invalid;transport=wss>".to_string(),
+            )
             .content_length(0)
             .build()
             .unwrap();
@@ -1653,8 +1650,14 @@ mod tests {
             .find(|(_, name, _)| name == "Contact")
             .map(|(_, _, value)| value)
             .expect("REGISTER 200 OK must carry a Contact binding (RFC 3261 §10.3 step 8)");
-        assert!(contact.contains("alice@10.0.0.1"), "contact value: {contact}");
-        assert!(contact.contains("expires="), "contact must carry an expires param: {contact}");
+        assert!(
+            contact.contains("alice@10.0.0.1"),
+            "contact value: {contact}"
+        );
+        assert!(
+            contact.contains("expires="),
+            "contact must carry an expires param: {contact}"
+        );
     }
 
     #[test]
@@ -1682,11 +1685,15 @@ mod tests {
         // The flag tag survives as `(name, None)` and the valued tag
         // as `(name, Some(value))`.
         assert!(
-            params.iter().any(|(n, v)| n == "+g.3gpp.smsip" && v.is_none()),
+            params
+                .iter()
+                .any(|(n, v)| n == "+g.3gpp.smsip" && v.is_none()),
             "expected flag tag +g.3gpp.smsip; got params={params:?}"
         );
         assert!(
-            params.iter().any(|(n, v)| n == "+g.3gpp.icsi-ref" && v.is_some()),
+            params
+                .iter()
+                .any(|(n, v)| n == "+g.3gpp.icsi-ref" && v.is_some()),
             "expected valued tag +g.3gpp.icsi-ref; got params={params:?}"
         );
     }
@@ -1750,7 +1757,9 @@ mod tests {
         );
 
         // Opt in and the capability surface is unchanged.
-        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0, true).unwrap();
+        let xml = py_reg
+            .reginfo_xml("sip:alice@ims.example.com", "full", 0, true)
+            .unwrap();
         assert!(
             xml.contains("mmtel.ims.example.com:8060"),
             "AS contact URI missing from opted-in reginfo XML:\n{xml}"
@@ -1765,10 +1774,7 @@ mod tests {
     fn save_as_contact_refuses_without_ue_binding() {
         let registrar = make_registrar();
         let py_reg = PyRegistrar::new(registrar);
-        let reply = make_as_reply(
-            "<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip",
-            3600,
-        );
+        let reply = make_as_reply("<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip", 3600);
         let saved = py_reg
             .save_as_contact("sip:alice@ims.example.com", &reply, None)
             .unwrap();
@@ -1786,16 +1792,15 @@ mod tests {
         );
         py_reg.save(&mut request, false, vec![], None).unwrap();
 
-        let reply = make_as_reply(
-            "<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip",
-            1800,
-        );
+        let reply = make_as_reply("<sip:mmtel.ims.example.com:8060>;+g.3gpp.smsip", 1800);
         assert!(py_reg
             .save_as_contact("sip:alice@ims.example.com", &reply, None)
             .unwrap());
 
         // Find the AS contact and check its expiry was honored.
-        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0, true).unwrap();
+        let xml = py_reg
+            .reginfo_xml("sip:alice@ims.example.com", "full", 0, true)
+            .unwrap();
         // The exact Expires value lands in the reginfo XML for the AS
         // contact (with the grace cap left to the registrar layer).
         // Looser check: presence + non-zero.
@@ -1841,8 +1846,11 @@ mod tests {
     #[test]
     fn wildcard_deregister() {
         let registrar = make_registrar();
-        let (mut request, py_reg) =
-            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
 
         py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
@@ -1868,19 +1876,27 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         );
-        py_reg.save(&mut dereg_request, false, vec![], None).unwrap();
+        py_reg
+            .save(&mut dereg_request, false, vec![], None)
+            .unwrap();
         assert!(!py_reg.is_registered_str("sip:alice@example.com"));
     }
 
     #[test]
     fn force_save_clears_existing() {
         let registrar = make_registrar();
-        let (mut request1, py_reg) =
-            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
+        let (mut request1, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
         py_reg.save(&mut request1, false, vec![], None).unwrap();
 
-        let (mut request2, _) =
-            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.2>", &registrar);
+        let (mut request2, _) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.2>",
+            &registrar,
+        );
         py_reg.save(&mut request2, true, vec![], None).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
@@ -1910,11 +1926,8 @@ mod tests {
         );
         py_reg.save(&mut alice, false, vec![], None).unwrap();
 
-        let (mut bob, _) = make_register_request(
-            "<sip:bob@example.com>",
-            "<sip:bob@10.0.0.2>",
-            &registrar,
-        );
+        let (mut bob, _) =
+            make_register_request("<sip:bob@example.com>", "<sip:bob@10.0.0.2>", &registrar);
         py_reg.save(&mut bob, false, vec![], None).unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
@@ -1924,7 +1937,9 @@ mod tests {
             "<sip:alice@10.0.0.1>",
             &registrar,
         );
-        py_reg.save(&mut alice_refresh, false, vec![], None).unwrap();
+        py_reg
+            .save(&mut alice_refresh, false, vec![], None)
+            .unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
         registrar.remove_all("sip:alice@example.com");
@@ -1934,15 +1949,24 @@ mod tests {
 
     #[test]
     fn normalize_aor_adds_sip_prefix() {
-        assert_eq!(normalize_aor("sip:alice@example.com"), "sip:alice@example.com");
-        assert_eq!(normalize_aor("sips:alice@example.com"), "sips:alice@example.com");
+        assert_eq!(
+            normalize_aor("sip:alice@example.com"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(
+            normalize_aor("sips:alice@example.com"),
+            "sips:alice@example.com"
+        );
         assert_eq!(normalize_aor("alice@example.com"), "sip:alice@example.com");
     }
 
     #[test]
     fn normalize_aor_strips_default_port() {
         assert_eq!(normalize_aor("sip:bob@127.0.0.1:5060"), "sip:bob@127.0.0.1");
-        assert_eq!(normalize_aor("sip:bob@127.0.0.1:5080"), "sip:bob@127.0.0.1:5080");
+        assert_eq!(
+            normalize_aor("sip:bob@127.0.0.1:5080"),
+            "sip:bob@127.0.0.1:5080"
+        );
         assert_eq!(normalize_aor("sips:bob@host:5061"), "sips:bob@host");
         assert_eq!(normalize_aor("sips:bob@host:5060"), "sips:bob@host:5060");
     }
@@ -2025,8 +2049,11 @@ mod tests {
     #[test]
     fn expire_removes_all_contacts() {
         let registrar = make_registrar();
-        let (mut request, py_reg) =
-            make_register_request("<sip:carol@example.com>", "<sip:carol@10.0.0.3>", &registrar);
+        let (mut request, py_reg) = make_register_request(
+            "<sip:carol@example.com>",
+            "<sip:carol@10.0.0.3>",
+            &registrar,
+        );
 
         py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:carol@example.com"));
@@ -2056,7 +2083,10 @@ mod tests {
             .from("<sip:trunk@carrier.com>;tag=reg-tag".to_string())
             .call_id("reg-trunk@host".to_string())
             .cseq("1 REGISTER".to_string())
-            .header("Contact", "<sip:trunk@10.0.0.1:5061;transport=tls>".to_string())
+            .header(
+                "Contact",
+                "<sip:trunk@10.0.0.1:5061;transport=tls>".to_string(),
+            )
             .header("Expires", "3600".to_string())
             .content_length(0)
             .build()
@@ -2107,8 +2137,11 @@ mod tests {
     #[test]
     fn save_sends_reply_for_wildcard_deregister() {
         let registrar = make_registrar();
-        let (mut request, py_reg) =
-            make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
 
         py_reg.save(&mut request, false, vec![], None).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
@@ -2134,7 +2167,9 @@ mod tests {
             5060,
         );
 
-        let result = py_reg.save(&mut dereg_request, false, vec![], None).unwrap();
+        let result = py_reg
+            .save(&mut dereg_request, false, vec![], None)
+            .unwrap();
         assert!(result);
 
         // save() should have sent 200 OK for wildcard deregister
@@ -2168,7 +2203,10 @@ mod tests {
             .save(
                 &mut request,
                 false,
-                vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+                vec![
+                    "tel:+15551234".to_string(),
+                    "sip:wildcard@ims.example.com".to_string(),
+                ],
                 None,
             )
             .unwrap();
@@ -2189,7 +2227,10 @@ mod tests {
         // becomes "sip:tel:+15551234" via `normalize_aor`.
         assert_eq!(
             registrar.associated_uris("sip:tel:+15551234"),
-            vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+            vec![
+                "tel:+15551234".to_string(),
+                "sip:wildcard@ims.example.com".to_string()
+            ],
         );
     }
 
@@ -2380,13 +2421,19 @@ mod tests {
         // and the victim's keyspace is left empty (no binding, no force-clear).
         let mut spoof = build_register("victim");
         spoof.set_auth_user("attacker".to_string());
-        assert!(matches!(py_reg.save(&mut spoof, true, vec![], None), Ok(false)));
+        assert!(matches!(
+            py_reg.save(&mut spoof, true, vec![], None),
+            Ok(false)
+        ));
         assert!(py_reg.lookup_str("sip:victim@example.com").is_empty());
 
         // Authenticated as "victim" binding own AoR → allowed.
         let mut legit = build_register("victim");
         legit.set_auth_user("victim".to_string());
-        assert!(matches!(py_reg.save(&mut legit, true, vec![], None), Ok(true)));
+        assert!(matches!(
+            py_reg.save(&mut legit, true, vec![], None),
+            Ok(true)
+        ));
         assert!(!py_reg.lookup_str("sip:victim@example.com").is_empty());
     }
 
@@ -2439,7 +2486,10 @@ mod tests {
         let mut reduced = build_register("alice");
         reduced.set_auth_user("qualifier:alice".to_string());
         reduced.py_set_auth_user(Some("alice".to_string()));
-        assert!(matches!(py_reg.save(&mut reduced, true, vec![], None), Ok(true)));
+        assert!(matches!(
+            py_reg.save(&mut reduced, true, vec![], None),
+            Ok(true)
+        ));
         assert!(!py_reg.lookup_str("sip:alice@example.com").is_empty());
 
         // Reducing to somebody *else's* identity is still refused — the setter
@@ -2545,7 +2595,10 @@ mod tests {
         // Non-local → flow withheld, URI carried for DNS routing.
         py.is_local_value = false;
         let (uri, flow, _path) = py.fork_target();
-        assert!(flow.is_none(), "non-local binding must not surface its flow");
+        assert!(
+            flow.is_none(),
+            "non-local binding must not surface its flow"
+        );
         assert!(uri.contains("bob@df7jal23ls0d.invalid"));
 
         // Local → flow surfaced for connection reuse.

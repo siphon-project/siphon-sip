@@ -33,11 +33,7 @@ pub struct PySbi {
 }
 
 impl PySbi {
-    pub fn new(
-        client: Arc<NpcfClient>,
-        bsf: Option<Arc<BsfClient>>,
-        pcf_scheme: Scheme,
-    ) -> Self {
+    pub fn new(client: Arc<NpcfClient>, bsf: Option<Arc<BsfClient>>, pcf_scheme: Scheme) -> Self {
         Self {
             client,
             bsf,
@@ -115,12 +111,11 @@ impl PySbi {
             }
         };
 
-        let result = crate::script::detach_block_on(async move { bsf.discover_binding(&query).await });
+        let result =
+            crate::script::detach_block_on(async move { bsf.discover_binding(&query).await });
 
         match result {
-            Ok(Some(binding)) => {
-                Ok(Some(binding_to_pydict(python, &binding, self.pcf_scheme)?))
-            }
+            Ok(Some(binding)) => Ok(Some(binding_to_pydict(python, &binding, self.pcf_scheme)?)),
             Ok(None) => Ok(None),
             Err(error) => Err(BsfError::new_err(format!(
                 "sbi.discover_pcf_binding failed: {error}"
@@ -423,9 +418,7 @@ fn flow_usage_to_sbi(s: &str) -> PyResult<String> {
 /// Collect parsed media components into the `medComponents` map keyed by each
 /// component's `medCompN` (TS 29.514 §5.6.2.3). Returns `None` for an empty
 /// list so the field is omitted from the request body entirely.
-fn components_to_map(
-    components: Vec<MediaComponent>,
-) -> Option<IndexMap<String, MediaComponent>> {
+fn components_to_map(components: Vec<MediaComponent>) -> Option<IndexMap<String, MediaComponent>> {
     if components.is_empty() {
         return None;
     }
@@ -667,9 +660,15 @@ mod tests {
             );
             // medCompN / fNum are the keys the PCF parses — a camelCase of the
             // Rust field names would be ignored.
-            assert!(json.contains("medCompN"), "medCompN must be present: {json}");
+            assert!(
+                json.contains("medCompN"),
+                "medCompN must be present: {json}"
+            );
             assert!(json.contains("fNum"), "fNum must be present: {json}");
-            assert!(json.contains("RTCP"), "Flow-Usage RTCP must survive: {json}");
+            assert!(
+                json.contains("RTCP"),
+                "Flow-Usage RTCP must survive: {json}"
+            );
             assert!(
                 json.contains("permit out 17 from 10.0.0.1 50001"),
                 "5-tuple Flow-Description must survive: {json}"
@@ -770,7 +769,12 @@ mod tests {
 
             // pcf_uri derived from pcfFqdn — the field the script hands straight
             // to create_session(pcf_uri=...).
-            let pcf_uri: String = dict.get_item("pcf_uri").unwrap().unwrap().extract().unwrap();
+            let pcf_uri: String = dict
+                .get_item("pcf_uri")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
             assert_eq!(pcf_uri, "http://pcf01.5gc.example.org");
 
             // Nested snssai dict.

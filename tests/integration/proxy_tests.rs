@@ -3,10 +3,10 @@
 //! These test cross-module interactions: parsing → building → transaction keying,
 //! config → registrar wiring, and end-to-end message flows through the proxy pipeline.
 
-use siphon::sip::{SipMessageBuilder, SipUri, Method, parse_sip_message};
-use siphon::transaction::key::TransactionKey;
+use siphon::dialog::{Dialog, DialogState, DialogStore};
 use siphon::registrar::{Registrar, RegistrarConfig};
-use siphon::dialog::{Dialog, DialogStore, DialogState};
+use siphon::sip::{parse_sip_message, Method, SipMessageBuilder, SipUri};
+use siphon::transaction::key::TransactionKey;
 
 // ---------------------------------------------------------------------------
 // Parser → Builder roundtrip
@@ -34,7 +34,10 @@ fn parse_and_rebuild_invite() {
 
     // Rebuild using builder and verify it produces a valid message
     let rebuilt = SipMessageBuilder::new()
-        .request(Method::Invite, SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()))
+        .request(
+            Method::Invite,
+            SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+        )
         .via("SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds".to_string())
         .to("Bob <sip:bob@biloxi.com>".to_string())
         .from("Alice <sip:alice@atlanta.com>;tag=1928301774".to_string())
@@ -47,7 +50,10 @@ fn parse_and_rebuild_invite() {
 
     assert!(rebuilt.is_request());
     assert_eq!(rebuilt.method(), Some(&Method::Invite));
-    assert_eq!(rebuilt.headers.call_id().unwrap(), "a84b4c76e66710@pc33.atlanta.com");
+    assert_eq!(
+        rebuilt.headers.call_id().unwrap(),
+        "a84b4c76e66710@pc33.atlanta.com"
+    );
 }
 
 #[test]
@@ -98,9 +104,19 @@ fn parsed_message_yields_correct_transaction_key() {
 
     // Extract branch from Via header (simplified — in production the Via parser does this)
     let via = message.headers.via().unwrap();
-    let branch = via.split("branch=").nth(1).unwrap().split(';').next().unwrap();
+    let branch = via
+        .split("branch=")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
 
-    let key = TransactionKey::new(branch.to_string(), message.method().unwrap().clone(), "10.0.0.1:5060".to_string());
+    let key = TransactionKey::new(
+        branch.to_string(),
+        message.method().unwrap().clone(),
+        "10.0.0.1:5060".to_string(),
+    );
     assert_eq!(key.branch, "z9hG4bK-reg-001");
     assert_eq!(key.method, Method::Register);
     assert!(TransactionKey::is_rfc3261_branch(&key.branch));
@@ -208,7 +224,9 @@ fn multi_contact_registration_with_forking_lookup() {
     registrar
         .save(
             "sip:bob@example.com",
-            SipUri::new("10.0.0.1".to_string()).with_user("bob".to_string()).with_port(5060),
+            SipUri::new("10.0.0.1".to_string())
+                .with_user("bob".to_string())
+                .with_port(5060),
             3600,
             1.0,
             "reg-1".into(),
@@ -218,7 +236,9 @@ fn multi_contact_registration_with_forking_lookup() {
     registrar
         .save(
             "sip:bob@example.com",
-            SipUri::new("10.0.0.2".to_string()).with_user("bob".to_string()).with_port(5060),
+            SipUri::new("10.0.0.2".to_string())
+                .with_user("bob".to_string())
+                .with_port(5060),
             3600,
             0.5,
             "reg-2".into(),
@@ -228,7 +248,9 @@ fn multi_contact_registration_with_forking_lookup() {
     registrar
         .save(
             "sip:bob@example.com",
-            SipUri::new("10.0.0.3".to_string()).with_user("bob".to_string()).with_port(5060),
+            SipUri::new("10.0.0.3".to_string())
+                .with_user("bob".to_string())
+                .with_port(5060),
             3600,
             0.8,
             "reg-3".into(),
@@ -349,13 +371,26 @@ fn parse_and_rebuild_subscribe() {
 
     // Transaction key uses SUBSCRIBE method (NIST)
     let via = message.headers.via().unwrap();
-    let branch = via.split("branch=").nth(1).unwrap().split(';').next().unwrap();
-    let key = TransactionKey::new(branch.to_string(), message.method().unwrap().clone(), "10.0.0.1:5060".to_string());
+    let branch = via
+        .split("branch=")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let key = TransactionKey::new(
+        branch.to_string(),
+        message.method().unwrap().clone(),
+        "10.0.0.1:5060".to_string(),
+    );
     assert_eq!(key.method, Method::Subscribe);
 
     // Builder roundtrip
     let rebuilt = SipMessageBuilder::new()
-        .request(Method::Subscribe, SipUri::new("example.com".to_string()).with_user("presentity".to_string()))
+        .request(
+            Method::Subscribe,
+            SipUri::new("example.com".to_string()).with_user("presentity".to_string()),
+        )
         .via("SIP/2.0/UDP watcher.example.com:5060;branch=z9hG4bK-sub-001".to_string())
         .to("<sip:presentity@example.com>".to_string())
         .from("<sip:watcher@example.com>;tag=sub001".to_string())
@@ -409,7 +444,10 @@ fn parse_and_rebuild_notify_with_pidf_body() {
     let (_, message) = parse_sip_message(&raw).expect("should parse NOTIFY");
     assert_eq!(message.method(), Some(&Method::Notify));
     assert_eq!(message.headers.get("Event").unwrap(), "presence");
-    assert_eq!(message.headers.get("Subscription-State").unwrap(), "active;expires=3599");
+    assert_eq!(
+        message.headers.get("Subscription-State").unwrap(),
+        "active;expires=3599"
+    );
     assert_eq!(message.body.len(), pidf.len());
     assert_eq!(String::from_utf8_lossy(&message.body), pidf);
 }
@@ -438,8 +476,18 @@ fn parse_and_rebuild_publish() {
 
     // Transaction key: PUBLISH is NIST
     let via = message.headers.via().unwrap();
-    let branch = via.split("branch=").nth(1).unwrap().split(';').next().unwrap();
-    let key = TransactionKey::new(branch.to_string(), message.method().unwrap().clone(), "10.0.0.1:5060".to_string());
+    let branch = via
+        .split("branch=")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let key = TransactionKey::new(
+        branch.to_string(),
+        message.method().unwrap().clone(),
+        "10.0.0.1:5060".to_string(),
+    );
     assert_eq!(key.method, Method::Publish);
 }
 
@@ -472,7 +520,10 @@ fn parse_and_rebuild_message_with_text_body() {
 
     // Build → serialize → reparse
     let rebuilt = SipMessageBuilder::new()
-        .request(Method::Message, SipUri::new("example.com".to_string()).with_user("user".to_string()))
+        .request(
+            Method::Message,
+            SipUri::new("example.com".to_string()).with_user("user".to_string()),
+        )
         .via("SIP/2.0/UDP sender.example.com:5060;branch=z9hG4bK-msg-001".to_string())
         .to("<sip:user@example.com>".to_string())
         .from("<sip:sender@example.com>;tag=msg001".to_string())
@@ -553,7 +604,10 @@ fn builder_to_bytes_parse_roundtrip() {
     let (_, reparsed) = parse_sip_message(&wire_str).expect("should reparse built message");
     assert!(reparsed.is_request());
     assert_eq!(reparsed.method(), Some(&Method::Options));
-    assert_eq!(reparsed.request_uri().unwrap().user.as_deref(), Some("carol"));
+    assert_eq!(
+        reparsed.request_uri().unwrap().user.as_deref(),
+        Some("carol")
+    );
     assert_eq!(reparsed.headers.call_id().unwrap(), "options-roundtrip-001");
     assert_eq!(reparsed.headers.max_forwards(), Some(70));
 }
@@ -715,7 +769,9 @@ fn concurrent_registrar_access() {
 }
 fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contact {
     siphon::registrar::Contact {
-        uri: SipUri::new(host.to_string()).with_user("alice".to_string()).with_port(5060),
+        uri: SipUri::new(host.to_string())
+            .with_user("alice".to_string())
+            .with_port(5060),
         q: 1.0,
         registered_at: std::time::Instant::now(),
         expires: std::time::Duration::from_secs(3600),
@@ -742,8 +798,14 @@ fn two_bindings_of_one_aor_get_independent_route_sets() {
     use siphon::proxy::core::branch_routing;
     use siphon::script::api::registrar::PyContact;
 
-    let binding_a = binding_with_path("10.0.0.1", vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]);
-    let binding_b = binding_with_path("10.0.0.2", vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]);
+    let binding_a = binding_with_path(
+        "10.0.0.1",
+        vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()],
+    );
+    let binding_b = binding_with_path(
+        "10.0.0.2",
+        vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()],
+    );
 
     let (uri_a, _flow_a, path_a) = PyContact::from_rust_contact(&binding_a).fork_target();
     let (uri_b, _flow_b, path_b) = PyContact::from_rust_contact(&binding_b).fork_target();
@@ -751,8 +813,14 @@ fn two_bindings_of_one_aor_get_independent_route_sets() {
     let branch_a = branch_routing(&path_a, &uri_a).expect("binding A must be routable");
     let branch_b = branch_routing(&path_b, &uri_b).expect("binding B must be routable");
 
-    assert_eq!(branch_a.route_set.as_deref(), Some("<sip:TOKEN-A@edge.example.com;lr>"));
-    assert_eq!(branch_b.route_set.as_deref(), Some("<sip:TOKEN-B@edge.example.com;lr>"));
+    assert_eq!(
+        branch_a.route_set.as_deref(),
+        Some("<sip:TOKEN-A@edge.example.com;lr>")
+    );
+    assert_eq!(
+        branch_b.route_set.as_deref(),
+        Some("<sip:TOKEN-B@edge.example.com;lr>")
+    );
     assert!(branch_a.next_hop.contains("TOKEN-A"));
     assert!(branch_b.next_hop.contains("TOKEN-B"));
 
@@ -801,7 +869,9 @@ fn registrar_lookup_orders_bindings_newest_first() {
     registrar
         .save_with_source(
             "sip:alice@example.com",
-            SipUri::new("10.0.0.1".to_string()).with_user("alice".to_string()).with_port(5060),
+            SipUri::new("10.0.0.1".to_string())
+                .with_user("alice".to_string())
+                .with_port(5060),
             3600,
             1.0,
             "old-handset".to_string(),
@@ -814,7 +884,9 @@ fn registrar_lookup_orders_bindings_newest_first() {
     registrar
         .save_with_source(
             "sip:alice@example.com",
-            SipUri::new("10.0.0.2".to_string()).with_user("alice".to_string()).with_port(5060),
+            SipUri::new("10.0.0.2".to_string())
+                .with_user("alice".to_string())
+                .with_port(5060),
             3600,
             1.0,
             "new-handset".to_string(),

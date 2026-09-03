@@ -1,17 +1,17 @@
 //! RFC 3261 SIP message parser built with nom.
 
-use nom::{
-    IResult, Parser,
-    bytes::complete::{tag, take_until, take_while, take_while1},
-    character::complete::{char, space1, digit1},
-    sequence::{preceded, delimited},
-    multi::many0,
-    combinator::{opt, map_res},
-    branch::alt,
-};
+use crate::sip::headers::SipHeaders;
 use crate::sip::message::*;
 use crate::sip::uri::SipUri;
-use crate::sip::headers::SipHeaders;
+use nom::{
+    branch::alt,
+    bytes::complete::{tag, take_until, take_while, take_while1},
+    character::complete::{char, digit1, space1},
+    combinator::{map_res, opt},
+    multi::many0,
+    sequence::{delimited, preceded},
+    IResult, Parser,
+};
 
 /// Parse a SIP message (request or response)
 ///
@@ -24,11 +24,14 @@ pub fn parse_sip_message(input: &str) -> IResult<&str, SipMessage> {
     let (input, headers) = parse_headers(input)?;
     let (input, body) = parse_body(input, &headers)?;
 
-    Ok((input, SipMessage {
-        start_line,
-        headers,
-        body: body.as_bytes().to_vec(),
-    }))
+    Ok((
+        input,
+        SipMessage {
+            start_line,
+            headers,
+            body: body.as_bytes().to_vec(),
+        },
+    ))
 }
 
 /// Reject a header block whose lines are not all CRLF-terminated.
@@ -118,14 +121,15 @@ fn parse_header_block(input: &[u8]) -> Result<(StartLine, SipHeaders, usize), St
     // We feed it the header portion only; it will see no body (Content-Length
     // references bytes beyond what we pass, so parse_body returns "").
     let trimmed = header_str;
-    let (_, start_line) = parse_start_line(trimmed)
-        .map_err(|error| format!("start line parse error: {error}"))?;
+    let (_, start_line) =
+        parse_start_line(trimmed).map_err(|error| format!("start line parse error: {error}"))?;
     // Skip past start line to parse headers
-    let after_start_line = trimmed.find("\r\n")
+    let after_start_line = trimmed
+        .find("\r\n")
         .map(|pos| &trimmed[pos + 2..])
         .unwrap_or("");
-    let (_, headers) = parse_headers(after_start_line)
-        .map_err(|error| format!("header parse error: {error}"))?;
+    let (_, headers) =
+        parse_headers(after_start_line).map_err(|error| format!("header parse error: {error}"))?;
 
     Ok((start_line, headers, boundary))
 }
@@ -141,7 +145,11 @@ fn parse_header_block(input: &[u8]) -> Result<(StartLine, SipHeaders, usize), St
 /// back at the sender.
 pub fn parse_sip_headers_only(input: &[u8]) -> Result<SipMessage, String> {
     let (start_line, headers, _) = parse_header_block(input)?;
-    Ok(SipMessage { start_line, headers, body: Vec::new() })
+    Ok(SipMessage {
+        start_line,
+        headers,
+        body: Vec::new(),
+    })
 }
 
 /// Parse a SIP message from raw bytes, supporting binary bodies.
@@ -204,7 +212,8 @@ fn parse_start_line(input: &str) -> IResult<&str, StartLine> {
     alt((
         parse_request_line.map(StartLine::Request),
         parse_status_line.map(StartLine::Response),
-    )).parse(input)
+    ))
+    .parse(input)
 }
 
 /// Parse request line: METHOD SP Request-URI SP SIP-Version CRLF
@@ -218,7 +227,11 @@ fn parse_request_line(input: &str) -> IResult<&str, RequestLine> {
     // method name is a literal token character, not an escape (RFC 4475
     // §3.1.1.5: "RE%47IST%45R" is an unknown method, NOT a REGISTER).
     let (input, method_str) = take_while1(|c: char| {
-        c.is_alphanumeric() || matches!(c, '-' | '.' | '!' | '%' | '*' | '_' | '+' | '`' | '\'' | '~')
+        c.is_alphanumeric()
+            || matches!(
+                c,
+                '-' | '.' | '!' | '%' | '*' | '_' | '+' | '`' | '\'' | '~'
+            )
     })(input)?;
     let method = Method::from_str(method_str);
 
@@ -232,11 +245,14 @@ fn parse_request_line(input: &str) -> IResult<&str, RequestLine> {
     let (input, version) = parse_version(input)?;
     let (input, _) = parse_crlf(input)?;
 
-    Ok((input, RequestLine {
-        method,
-        request_uri: uri,
-        version,
-    }))
+    Ok((
+        input,
+        RequestLine {
+            method,
+            request_uri: uri,
+            version,
+        },
+    ))
 }
 
 /// Parse status line: SIP-Version SP Status-Code SP Reason-Phrase CRLF
@@ -248,11 +264,14 @@ fn parse_status_line(input: &str) -> IResult<&str, StatusLine> {
     let (input, reason_phrase) = take_until("\r\n")(input)?;
     let (input, _) = parse_crlf(input)?;
 
-    Ok((input, StatusLine {
-        version,
-        status_code,
-        reason_phrase: reason_phrase.to_string(),
-    }))
+    Ok((
+        input,
+        StatusLine {
+            version,
+            status_code,
+            reason_phrase: reason_phrase.to_string(),
+        },
+    ))
 }
 
 /// Parse SIP version: SIP/2.0
@@ -306,7 +325,7 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     let (input, user, user_params) = if let Some(at_pos) = uri_portion.rfind('@') {
         let user_part = &input[..at_pos];
         let rest = &input[at_pos + 1..]; // skip @
-        // Split user from user-params at first ';' (RFC 3966 phone-context etc.)
+                                         // Split user from user-params at first ';' (RFC 3966 phone-context etc.)
         if let Some(semi_pos) = user_part.find(';') {
             let bare_user = &user_part[..semi_pos];
             let params_str = &user_part[semi_pos..]; // ";phone-context=..."
@@ -330,46 +349,45 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     // Host can be domain name, IPv4, or IPv6 in brackets
     let (input, host_str) = if input.starts_with('[') {
         // IPv6 address in brackets
-        let (input, ipv6) = delimited(
-            char('['),
-            take_while1(|c: char| c != ']'),
-            char(']')
-        ).parse(input)?;
+        let (input, ipv6) =
+            delimited(char('['), take_while1(|c: char| c != ']'), char(']')).parse(input)?;
         (input, format!("[{}]", ipv6))
     } else {
         // Domain name or IPv4 - take until : or ; or ? or space
-        let (input, host) = take_while1(|c: char| {
-            c.is_alphanumeric() || matches!(c, '.' | '-')
-        })(input)?;
+        let (input, host) =
+            take_while1(|c: char| c.is_alphanumeric() || matches!(c, '.' | '-'))(input)?;
         (input, host.to_string())
     };
 
     // Parse port (optional)
     let (input, port) = opt(preceded(
         char(':'),
-        map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<u16>())
-    )).parse(input)?;
+        map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| {
+            s.parse::<u16>()
+        }),
+    ))
+    .parse(input)?;
 
     // Parse URI parameters (optional)
     let (input, params) = opt(parse_uri_params).parse(input)?;
     let params = params.unwrap_or_default();
 
     // Parse URI headers (optional, after ?)
-    let (input, headers) = opt(preceded(
-        char('?'),
-        parse_uri_headers
-    )).parse(input)?;
+    let (input, headers) = opt(preceded(char('?'), parse_uri_headers)).parse(input)?;
     let headers = headers.unwrap_or_default();
 
-    Ok((input, SipUri {
-        scheme,
-        user: user.map(|s| s.to_string()),
-        host: host_str.to_string(),
-        port,
-        params,
-        headers,
-        user_params,
-    }))
+    Ok((
+        input,
+        SipUri {
+            scheme,
+            user: user.map(|s| s.to_string()),
+            host: host_str.to_string(),
+            port,
+            params,
+            headers,
+            user_params,
+        },
+    ))
 }
 
 /// Parse tel: URI (RFC 3966): tel:+1234567890;phone-context=example.com
@@ -378,9 +396,10 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
 /// domain (or empty if global number), no port.
 fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
     // Subscriber number: digits, +, -, . (visual separators)
-    let (input, subscriber) = take_while1(|c: char| {
-        c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '(' | ')')
-    })(input)?;
+    let (input, subscriber) =
+        take_while1(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '(' | ')'))(
+            input,
+        )?;
 
     // Parse parameters (;phone-context=..., ;isub=..., etc.)
     let (input, params) = opt(parse_uri_params).parse(input)?;
@@ -393,15 +412,18 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
         .and_then(|(_, value)| value.clone())
         .unwrap_or_default();
 
-    Ok((input, SipUri {
-        scheme: "tel".to_string(),
-        user: Some(subscriber.to_string()),
-        host,
-        port: None,
-        params,
-        headers: Vec::new(),
-        user_params: Vec::new(),
-    }))
+    Ok((
+        input,
+        SipUri {
+            scheme: "tel".to_string(),
+            user: Some(subscriber.to_string()),
+            host,
+            port: None,
+            params,
+            headers: Vec::new(),
+            user_params: Vec::new(),
+        },
+    ))
 }
 
 /// Parse a non-SIP `absoluteURI` — a scheme and an opaque remainder.
@@ -472,10 +494,11 @@ fn parse_uri_params(input: &str) -> IResult<&str, Vec<(String, Option<String>)>>
             take_while1(|c: char| !matches!(c, '=' | ';' | '?' | ' ' | '\r' | '\n')),
             opt(preceded(
                 char('='),
-                take_while(|c: char| !matches!(c, ';' | '?' | ' ' | '\r' | '\n'))
+                take_while(|c: char| !matches!(c, ';' | '?' | ' ' | '\r' | '\n')),
             )),
-        )
-    )).parse(input)
+        ),
+    ))
+    .parse(input)
     .map(|(input, params)| {
         let params: Vec<(String, Option<String>)> = params
             .into_iter()
@@ -493,10 +516,11 @@ fn parse_uri_headers(input: &str) -> IResult<&str, Vec<(String, Option<String>)>
             take_while1(|c: char| !matches!(c, '=' | '&' | ' ' | '\r' | '\n')),
             opt(preceded(
                 char('='),
-                take_while(|c: char| !matches!(c, '&' | ' ' | '\r' | '\n'))
+                take_while(|c: char| !matches!(c, '&' | ' ' | '\r' | '\n')),
             )),
-        )
-    )).parse(input)
+        ),
+    ))
+    .parse(input)
     .map(|(input, headers)| {
         let headers: Vec<(String, Option<String>)> = headers
             .into_iter()
@@ -585,12 +609,18 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
         let (input, _) = parse_crlf(input)?;
 
         if input.is_empty() {
-            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
+            return Ok((
+                input,
+                (name.trim_ascii().to_string(), value.trim().to_string()),
+            ));
         }
 
         let trimmed = input.trim_start_matches([' ', '\t']);
         if trimmed.is_empty() {
-            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
+            return Ok((
+                input,
+                (name.trim_ascii().to_string(), value.trim().to_string()),
+            ));
         }
 
         if input.starts_with([' ', '\t']) {
@@ -598,7 +628,10 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
             value.push(' ');
             remaining = input;
         } else {
-            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
+            return Ok((
+                input,
+                (name.trim_ascii().to_string(), value.trim().to_string()),
+            ));
         }
     }
 }
@@ -630,10 +663,7 @@ fn parse_body<'a>(input: &'a str, headers: &SipHeaders) -> IResult<&'a str, &'a 
 
 /// Parse CRLF
 fn parse_crlf(input: &str) -> IResult<&str, &str> {
-    alt((
-        tag("\r\n"),
-        tag("\n"),
-    )).parse(input)
+    alt((tag("\r\n"), tag("\n"))).parse(input)
 }
 
 #[cfg(test)]
@@ -864,9 +894,8 @@ mod tests {
 
     #[test]
     fn tel_uri_with_phone_context() {
-        let uri = parse_uri_standalone(
-            "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org"
-        ).unwrap();
+        let uri = parse_uri_standalone("tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org")
+            .unwrap();
         assert_eq!(uri.scheme, "tel");
         assert_eq!(uri.user.as_deref(), Some("8367"));
         assert_eq!(uri.host, "ims.mnc001.mcc001.3gppnetwork.org");
@@ -994,9 +1023,15 @@ mod tests {
         assert_eq!(uri.host, "ims.mnc090.mcc208.3gppnetwork.org");
         assert_eq!(
             uri.user_params,
-            vec![("phone-context".to_string(), Some("ims.mnc001.mcc206.3gppnetwork.org".to_string()))],
+            vec![(
+                "phone-context".to_string(),
+                Some("ims.mnc001.mcc206.3gppnetwork.org".to_string())
+            )],
         );
-        assert!(uri.params.iter().any(|(n, _)| n == "user"), "URI params should contain user=phone");
+        assert!(
+            uri.params.iter().any(|(n, _)| n == "user"),
+            "URI params should contain user=phone"
+        );
     }
 
     #[test]
@@ -1082,8 +1117,14 @@ mod tests {
             Some("hcolon.ws@example.com".to_string()).as_ref()
         );
         assert!(message.headers.get("To").is_some(), "`To :` should parse");
-        assert!(message.headers.get("From").is_some(), "`From\\t:` should parse");
-        assert!(message.headers.get("Via").is_some(), "`Via  :` should parse");
+        assert!(
+            message.headers.get("From").is_some(),
+            "`From\\t:` should parse"
+        );
+        assert!(
+            message.headers.get("Via").is_some(),
+            "`Via  :` should parse"
+        );
     }
 
     /// RFC 3261 §25.1: `extension-method = token`, and `token` admits
@@ -1157,7 +1198,12 @@ mod tests {
     /// to look like one (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`).
     #[test]
     fn absolute_uri_fallback_rejects_a_malformed_scheme() {
-        for bad in ["1nvalid:content", ":noscheme", "has space:content", "nocolon"] {
+        for bad in [
+            "1nvalid:content",
+            ":noscheme",
+            "has space:content",
+            "nocolon",
+        ] {
             assert!(
                 parse_uri_standalone(bad).is_err(),
                 "`{bad}` is not a valid absoluteURI and must not parse"

@@ -3,30 +3,22 @@
 //! Stateless header manipulation: Via insertion/stripping, Max-Forwards,
 //! Record-Route insertion, and Route processing (loose routing).
 
-use crate::sip::headers::via::Via;
 use crate::sip::headers::route::RouteEntry;
+use crate::sip::headers::via::Via;
 use crate::sip::headers::SipHeaders;
 use crate::transaction::key::TransactionKey;
 
 /// Insert a Via header at the top of the message (for outgoing requests).
 ///
 /// The branch is auto-generated with the RFC 3261 magic cookie.
-pub fn add_via(
-    headers: &mut SipHeaders,
-    transport: &str,
-    host: &str,
-    port: Option<u16>,
-) -> String {
+pub fn add_via(headers: &mut SipHeaders, transport: &str, host: &str, port: Option<u16>) -> String {
     let branch = TransactionKey::generate_branch();
     let via_value = match port {
         Some(port) => format!("SIP/2.0/{transport} {host}:{port};branch={branch}"),
         None => format!("SIP/2.0/{transport} {host};branch={branch}"),
     };
     // Prepend our Via before existing ones, preserving header position
-    let existing = headers
-        .get_all("Via")
-        .cloned()
-        .unwrap_or_default();
+    let existing = headers.get_all("Via").cloned().unwrap_or_default();
     let mut all_vias = vec![via_value];
     all_vias.extend(existing);
     headers.set_all("Via", all_vias);
@@ -37,10 +29,7 @@ pub fn add_via(
 ///
 /// Returns the removed Via, or `None` if no Via headers exist.
 pub fn strip_top_via(headers: &mut SipHeaders) -> Option<Via> {
-    let existing = headers
-        .get_all("Via")
-        .cloned()
-        .unwrap_or_default();
+    let existing = headers.get_all("Via").cloned().unwrap_or_default();
 
     if existing.is_empty() {
         return None;
@@ -91,9 +80,7 @@ pub fn strip_top_via(headers: &mut SipHeaders) -> Option<Via> {
 /// Returns the new value. If already 0, returns `Err(())` (caller should send 483).
 #[allow(clippy::result_unit_err)]
 pub fn decrement_max_forwards(headers: &mut SipHeaders) -> Result<u8, ()> {
-    let current = headers
-        .max_forwards()
-        .unwrap_or(70); // RFC 3261 default
+    let current = headers.max_forwards().unwrap_or(70); // RFC 3261 default
 
     if current == 0 {
         return Err(());
@@ -108,10 +95,7 @@ pub fn decrement_max_forwards(headers: &mut SipHeaders) -> Result<u8, ()> {
 pub fn add_record_route(headers: &mut SipHeaders, uri: &str) {
     let rr_value = format!("<{uri};lr>");
     // Prepend: Record-Route order matters (topmost = closest proxy)
-    let existing = headers
-        .get_all("Record-Route")
-        .cloned()
-        .unwrap_or_default();
+    let existing = headers.get_all("Record-Route").cloned().unwrap_or_default();
     headers.remove("Record-Route");
     headers.add("Record-Route", rr_value);
     for rr in existing {
@@ -145,10 +129,7 @@ pub fn check_loose_route(headers: &SipHeaders) -> bool {
 ///
 /// Returns the removed entry, or `None` if no Route headers exist.
 pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
-    let existing = headers
-        .get_all("Route")
-        .cloned()
-        .unwrap_or_default();
+    let existing = headers.get_all("Route").cloned().unwrap_or_default();
 
     if existing.is_empty() {
         return None;
@@ -213,7 +194,9 @@ pub struct SelfIdentity {
 
 impl SelfIdentity {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     fn normalise(host: &str) -> String {
@@ -318,10 +301,7 @@ pub fn top_route_is_local(headers: &SipHeaders, identity: &SelfIdentity) -> bool
 /// Returns the popped entries in the order they were removed (top first) so
 /// callers can expose pre-pop metadata (e.g. an `orig`/`term` user-part the
 /// P-CSCF preloaded on the IMS service-route) to scripts.
-pub fn pop_local_routes(
-    headers: &mut SipHeaders,
-    identity: &SelfIdentity,
-) -> Vec<RouteEntry> {
+pub fn pop_local_routes(headers: &mut SipHeaders, identity: &SelfIdentity) -> Vec<RouteEntry> {
     let mut popped = Vec::new();
     while let Some(route_raw) = headers.get("Route").cloned() {
         let entries = match RouteEntry::parse_multi(&route_raw) {
@@ -456,12 +436,17 @@ pub fn branch_routing(branch_path: &[String], target: &str) -> Option<BranchRout
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn make_headers() -> SipHeaders {
         let mut headers = SipHeaders::new();
-        headers.add("Via", "SIP/2.0/UDP proxy1.example.com:5060;branch=z9hG4bK-p1".to_string());
-        headers.add("Via", "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-c1".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP proxy1.example.com:5060;branch=z9hG4bK-p1".to_string(),
+        );
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-c1".to_string(),
+        );
         headers.add("Max-Forwards", "70".to_string());
         headers
     }
@@ -585,8 +570,12 @@ mod tests {
         // Same host registered twice; the match must not stop at the first
         // entry whose port set misses.
         let mut identity = SelfIdentity::new();
-        identity.entries.push(("192.0.2.40".to_string(), vec![5060]));
-        identity.entries.push(("192.0.2.40".to_string(), vec![6060]));
+        identity
+            .entries
+            .push(("192.0.2.40".to_string(), vec![5060]));
+        identity
+            .entries
+            .push(("192.0.2.40".to_string(), vec![6060]));
         assert!(identity.matches("192.0.2.40", Some(6060)));
     }
 
@@ -643,9 +632,8 @@ mod tests {
 
     #[test]
     fn pop_local_routes_consumes_our_route_and_keeps_the_next_hop() {
-        let mut headers = route_headers(
-            "<sip:192.0.2.40:5060;transport=udp;lr>, <sip:scscf.example.net;lr>",
-        );
+        let mut headers =
+            route_headers("<sip:192.0.2.40:5060;transport=udp;lr>, <sip:scscf.example.net;lr>");
         let popped = pop_local_routes(&mut headers, &identity());
         assert_eq!(popped.len(), 1);
         assert_eq!(popped[0].uri.host, "192.0.2.40");
@@ -824,7 +812,10 @@ mod tests {
     #[test]
     fn pop_top_route_removes_first() {
         let mut headers = SipHeaders::new();
-        headers.add("Route", "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string());
+        headers.add(
+            "Route",
+            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>".to_string(),
+        );
 
         let removed = super::pop_top_route(&mut headers).unwrap();
         assert_eq!(removed.uri.host, "p1.example.com");
@@ -852,7 +843,10 @@ mod tests {
     #[test]
     fn next_hop_from_route_returns_top_uri() {
         let mut headers = SipHeaders::new();
-        headers.add("Route", "<sip:scscf.example.com;lr>, <sip:pcscf.example.com;lr>".to_string());
+        headers.add(
+            "Route",
+            "<sip:scscf.example.com;lr>, <sip:pcscf.example.com;lr>".to_string(),
+        );
         let hop = super::next_hop_from_route(&headers).unwrap();
         assert!(hop.contains("scscf.example.com"));
     }
@@ -1010,7 +1004,10 @@ mod tests {
     #[test]
     fn next_hop_from_route_after_pop() {
         let mut headers = SipHeaders::new();
-        headers.add("Route", "<sip:us.example.com;lr>, <sip:next.example.com;lr>".to_string());
+        headers.add(
+            "Route",
+            "<sip:us.example.com;lr>, <sip:next.example.com;lr>".to_string(),
+        );
         // Pop our own Route (simulates loose_route())
         super::pop_top_route(&mut headers);
         // Next hop should now be the next proxy
@@ -1051,7 +1048,10 @@ mod tests {
         let mut headers = SipHeaders::new();
         let branch = add_via(&mut headers, "UDP", "[2001:db8::1]", Some(5060));
         let via_raw = headers.get("Via").unwrap();
-        assert!(via_raw.contains("[2001:db8::1]:5060"), "Via should contain bracketed IPv6: {via_raw}");
+        assert!(
+            via_raw.contains("[2001:db8::1]:5060"),
+            "Via should contain bracketed IPv6: {via_raw}"
+        );
         assert!(via_raw.contains(&branch));
     }
 
@@ -1060,7 +1060,10 @@ mod tests {
         let mut headers = SipHeaders::new();
         add_via(&mut headers, "TCP", "[::1]", Some(5060));
         let via_raw = headers.get("Via").unwrap();
-        assert!(via_raw.contains("[::1]:5060"), "Via should contain [::1]:5060: {via_raw}");
+        assert!(
+            via_raw.contains("[::1]:5060"),
+            "Via should contain [::1]:5060: {via_raw}"
+        );
     }
 
     #[test]
@@ -1074,8 +1077,14 @@ mod tests {
     #[test]
     fn strip_top_via_ipv6() {
         let mut headers = SipHeaders::new();
-        headers.add("Via", "SIP/2.0/UDP [::1]:5060;branch=z9hG4bK-v6".to_string());
-        headers.add("Via", "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-c1".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP [::1]:5060;branch=z9hG4bK-v6".to_string(),
+        );
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-c1".to_string(),
+        );
         let removed = strip_top_via(&mut headers).unwrap();
         assert_eq!(removed.host, "[::1]");
         assert_eq!(removed.port, Some(5060));
@@ -1099,11 +1108,17 @@ mod tests {
         let all_rr = headers.get_all("Record-Route").unwrap();
         assert_eq!(all_rr.len(), 2, "should have two Record-Route headers");
         // Outbound (topmost) should be first — the AS sees this as the next hop
-        assert!(all_rr[0].contains("transport=tcp"),
-            "topmost RR should be outbound transport: {}", all_rr[0]);
+        assert!(
+            all_rr[0].contains("transport=tcp"),
+            "topmost RR should be outbound transport: {}",
+            all_rr[0]
+        );
         // Inbound should be second — the subscriber sees this as the next hop
-        assert!(all_rr[1].contains("transport=tls"),
-            "second RR should be inbound transport: {}", all_rr[1]);
+        assert!(
+            all_rr[1].contains("transport=tls"),
+            "second RR should be inbound transport: {}",
+            all_rr[1]
+        );
     }
 
     #[test]
@@ -1113,7 +1128,8 @@ mod tests {
         let mut headers = SipHeaders::new();
         headers.add(
             "Route",
-            "<sip:proxy.example.com:5060;transport=tcp;lr>, <sip:external.example.com;lr>".to_string(),
+            "<sip:proxy.example.com:5060;transport=tcp;lr>, <sip:external.example.com;lr>"
+                .to_string(),
         );
 
         let domains = aliases(&["proxy.example.com", "10.0.0.1"]);
@@ -1132,7 +1148,8 @@ mod tests {
         let mut headers = SipHeaders::new();
         headers.add(
             "Route",
-            "<sip:10.0.0.1:5060;transport=tcp;lr>, <sip:proxy.example.com:5061;transport=tls;lr>".to_string(),
+            "<sip:10.0.0.1:5060;transport=tcp;lr>, <sip:proxy.example.com:5061;transport=tls;lr>"
+                .to_string(),
         );
 
         let domains = aliases(&["proxy.example.com", "10.0.0.1"]);
@@ -1185,7 +1202,10 @@ mod tests {
 
         // Should still be there
         assert!(headers.has("Route"));
-        assert!(headers.get("Route").unwrap().contains("external.example.com"));
+        assert!(headers
+            .get("Route")
+            .unwrap()
+            .contains("external.example.com"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ use siphon::li::x1::store::{ContentCapability, DestinationStore, TaskStore};
 use siphon::li::x1::types::{
     DId, DeliveryAddress, DeliveryType, DestinationDeliveryStatus, IpAddressPort, NeStatus,
     OkValue, Port, ProvisioningStatus, TargetIdentifier, TaskReportType, Timestamp, Token,
-    TypeOfNeIssueMessage, Version, XId, X1TransactionId, DEFAULT_VERSION,
+    TypeOfNeIssueMessage, Version, X1TransactionId, XId, DEFAULT_VERSION,
 };
 use siphon::li::x1::X1Schema;
 
@@ -81,33 +81,35 @@ async fn start_mock_admf() -> (SocketAddr, AdmfState) {
             };
             let state = served.clone();
             tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                    let state = state.clone();
-                    async move {
-                        let body = request
-                            .into_body()
-                            .collect()
-                            .await
-                            .map(|collected| collected.to_bytes())
-                            .unwrap_or_default();
-                        let text = String::from_utf8_lossy(&body).into_owned();
-                        if let Ok(mut received) = state.received.lock() {
-                            received.push(text);
-                        }
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let state = state.clone();
+                        async move {
+                            let body = request
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|collected| collected.to_bytes())
+                                .unwrap_or_default();
+                            let text = String::from_utf8_lossy(&body).into_owned();
+                            if let Ok(mut received) = state.received.lock() {
+                                received.push(text);
+                            }
 
-                        let canned = state.response.lock().ok().and_then(|body| body.clone());
-                        let response = match canned {
-                            Some(body) => hyper::Response::builder()
-                                .status(200)
-                                .header("content-type", "application/xml")
-                                .body(body),
-                            None => hyper::Response::builder().status(500).body(String::new()),
-                        };
-                        Ok::<_, std::convert::Infallible>(
-                            response.unwrap_or_else(|_| hyper::Response::new(String::new())),
-                        )
-                    }
-                });
+                            let canned = state.response.lock().ok().and_then(|body| body.clone());
+                            let response = match canned {
+                                Some(body) => hyper::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/xml")
+                                    .body(body),
+                                None => hyper::Response::builder().status(500).body(String::new()),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                response.unwrap_or_else(|_| hyper::Response::new(String::new())),
+                            )
+                        }
+                    },
+                );
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
                     .await;
@@ -297,12 +299,25 @@ async fn a_keepalive_reaches_the_admf_with_the_right_envelope() {
     client.keepalive().await.expect("keepalive must succeed");
 
     let requests = admf.requests();
-    assert_eq!(requests.len(), 1, "exactly one request should have been sent");
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one request should have been sent"
+    );
     let sent = &requests[0];
     assert!(sent.contains(r#"xsi:type="KeepaliveRequest""#), "{sent}");
-    assert!(sent.contains(&format!("<admfIdentifier>{ADMF}</admfIdentifier>")), "{sent}");
-    assert!(sent.contains(&format!("<neIdentifier>{NE}</neIdentifier>")), "{sent}");
-    assert!(sent.contains(&format!("<version>{DEFAULT_VERSION}</version>")), "{sent}");
+    assert!(
+        sent.contains(&format!("<admfIdentifier>{ADMF}</admfIdentifier>")),
+        "{sent}"
+    );
+    assert!(
+        sent.contains(&format!("<neIdentifier>{NE}</neIdentifier>")),
+        "{sent}"
+    );
+    assert!(
+        sent.contains(&format!("<version>{DEFAULT_VERSION}</version>")),
+        "{sent}"
+    );
     assert!(sent.contains("<x1TransactionId>"), "{sent}");
 }
 
@@ -323,9 +338,18 @@ async fn a_ne_issue_report_carries_its_type_and_description() {
         .expect("report must succeed");
 
     let sent = &admf.requests()[0];
-    assert!(sent.contains(r#"xsi:type="ReportNEIssueRequest""#), "{sent}");
-    assert!(sent.contains("<typeOfNeIssueMessage>FaultReport</typeOfNeIssueMessage>"), "{sent}");
-    assert!(sent.contains("<description>media backend unavailable</description>"), "{sent}");
+    assert!(
+        sent.contains(r#"xsi:type="ReportNEIssueRequest""#),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("<typeOfNeIssueMessage>FaultReport</typeOfNeIssueMessage>"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("<description>media backend unavailable</description>"),
+        "{sent}"
+    );
     assert!(sent.contains("<issueCode>9020</issueCode>"), "{sent}");
 }
 
@@ -348,7 +372,10 @@ async fn a_task_issue_report_names_the_task() {
         .expect("report must succeed");
 
     let sent = &admf.requests()[0];
-    assert!(sent.contains(r#"xsi:type="ReportTaskIssueRequest""#), "{sent}");
+    assert!(
+        sent.contains(r#"xsi:type="ReportTaskIssueRequest""#),
+        "{sent}"
+    );
     assert!(sent.contains(&format!("<xId>{x_id}</xId>")), "{sent}");
     assert!(
         sent.contains("<taskReportType>FullyActionedAndSuccessful</taskReportType>"),
@@ -377,14 +404,19 @@ async fn a_destination_issue_report_names_the_destination() {
         .expect("report must succeed");
 
     let sent = &admf.requests()[0];
-    assert!(sent.contains(r#"xsi:type="ReportDestinationIssueRequest""#), "{sent}");
+    assert!(
+        sent.contains(r#"xsi:type="ReportDestinationIssueRequest""#),
+        "{sent}"
+    );
     assert!(sent.contains(&format!("<dId>{d_id}</dId>")), "{sent}");
     assert!(
         sent.contains("<destinationReportType>TerminatingFault</destinationReportType>"),
         "{sent}"
     );
     assert!(
-        sent.contains("<destinationIssueDetails>delivery connection lost</destinationIssueDetails>"),
+        sent.contains(
+            "<destinationIssueDetails>delivery connection lost</destinationIssueDetails>"
+        ),
         "{sent}"
     );
 }
@@ -404,7 +436,10 @@ async fn get_all_details_sends_the_query_and_parses_the_answer() {
         .expect("reconciliation query must succeed");
 
     let sent = &admf.requests()[0];
-    assert!(sent.contains(r#"xsi:type="GetAllDetailsRequest""#), "{sent}");
+    assert!(
+        sent.contains(r#"xsi:type="GetAllDetailsRequest""#),
+        "{sent}"
+    );
     assert_eq!(state.tasks.len(), 1);
     assert_eq!(state.tasks[0].x_id, x_id);
     assert_eq!(state.destinations.len(), 1);
@@ -467,7 +502,10 @@ async fn spawn_reconciles_provisioned_state_from_the_admf() {
     let client = build_client(address, &directory);
     let config = admf_config(address, &directory);
     let (tasks, destinations) = stores();
-    assert!(tasks.is_empty(), "the stores start empty, as after a restart");
+    assert!(
+        tasks.is_empty(),
+        "the stores start empty, as after a restart"
+    );
 
     siphon::li::x1::client::spawn(client, &config, tasks.clone(), destinations.clone());
 
@@ -607,9 +645,9 @@ async fn reconciliation_reports_a_warrant_it_cannot_honour() {
     // back naming it.
     wait_for("the destination to land", || destinations.len() == 1).await;
     wait_for("the rejection report", || {
-        admf.requests().iter().any(|body| {
-            body.contains("ReportNEIssueRequest") && body.contains(&x_id.to_string())
-        })
+        admf.requests()
+            .iter()
+            .any(|body| body.contains("ReportNEIssueRequest") && body.contains(&x_id.to_string()))
     })
     .await;
     assert!(

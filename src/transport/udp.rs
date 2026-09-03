@@ -18,8 +18,8 @@ use socket2::SockAddr;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport};
 use crate::transport::acl::TransportAcl;
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport};
 
 /// Spawn `num_cpus::get()` UDP listener workers, all sharing the same port
 /// via SO_REUSEPORT. Each worker sends inbound messages to `inbound_tx` and
@@ -44,7 +44,10 @@ pub async fn listen(
             let socket = match create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes) {
                 Ok(socket) => Arc::new(socket),
                 Err(error) => {
-                    error!("[udp-worker-{}] failed to create socket: {}", worker_index, error);
+                    error!(
+                        "[udp-worker-{}] failed to create socket: {}",
+                        worker_index, error
+                    );
                     return;
                 }
             };
@@ -217,7 +220,10 @@ fn apply_recv_buffer(socket: &socket2::Socket, local_addr: SocketAddr, requested
             local_addr, granted, requested
         ),
         Ok(granted) => debug!("[udp {}] SO_RCVBUF granted {} bytes", local_addr, granted),
-        Err(error) => debug!("[udp {}] could not read back SO_RCVBUF: {}", local_addr, error),
+        Err(error) => debug!(
+            "[udp {}] could not read back SO_RCVBUF: {}",
+            local_addr, error
+        ),
     }
 }
 
@@ -235,8 +241,8 @@ mod tests {
         const REQUESTED: usize = 256 * 1024;
 
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-        let socket = create_reusable_udp_socket(addr, None, REQUESTED)
-            .expect("listener socket binds");
+        let socket =
+            create_reusable_udp_socket(addr, None, REQUESTED).expect("listener socket binds");
 
         let granted = socket2::SockRef::from(&socket)
             .recv_buffer_size()
@@ -288,7 +294,10 @@ mod tests {
         let local: SocketAddr = "127.0.0.1:5060".parse().unwrap();
         let remote1: SocketAddr = "192.168.1.100:50123".parse().unwrap();
         let remote2: SocketAddr = "192.168.1.101:50123".parse().unwrap();
-        assert_ne!(udp_connection_id(local, remote1), udp_connection_id(local, remote2));
+        assert_ne!(
+            udp_connection_id(local, remote1),
+            udp_connection_id(local, remote2)
+        );
     }
 
     #[test]
@@ -296,7 +305,10 @@ mod tests {
         let local: SocketAddr = "127.0.0.1:5060".parse().unwrap();
         let remote1: SocketAddr = "192.168.1.100:50123".parse().unwrap();
         let remote2: SocketAddr = "192.168.1.100:50124".parse().unwrap();
-        assert_ne!(udp_connection_id(local, remote1), udp_connection_id(local, remote2));
+        assert_ne!(
+            udp_connection_id(local, remote1),
+            udp_connection_id(local, remote2)
+        );
     }
 
     /// Frames of one `OutboundMessage` must reach the peer in the order they
@@ -329,8 +341,10 @@ mod tests {
         .unwrap();
         peer.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
         peer.set_nonblocking(true).unwrap();
-        peer.bind(&SockAddr::from("127.0.0.1:0".parse::<SocketAddr>().unwrap()))
-            .unwrap();
+        peer.bind(&SockAddr::from(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        ))
+        .unwrap();
         let peer = tokio::net::UdpSocket::from_std(peer.into()).unwrap();
         let peer_addr = peer.local_addr().unwrap();
 

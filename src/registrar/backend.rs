@@ -252,19 +252,34 @@ impl StoredAorState {
 /// Futures must be `Send` so the backend can be used from `tokio::spawn`.
 pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     /// Store contacts for an AoR, replacing any existing bindings.
-    fn save(&self, aor: &str, contacts: &[StoredContact]) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
+    fn save(
+        &self,
+        aor: &str,
+        contacts: &[StoredContact],
+    ) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
 
     /// Load contacts for an AoR.
-    fn load(&self, aor: &str) -> impl std::future::Future<Output = Result<Vec<StoredContact>, BackendError>> + Send;
+    fn load(
+        &self,
+        aor: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<StoredContact>, BackendError>> + Send;
 
     /// Remove all contacts for an AoR.
-    fn remove(&self, aor: &str) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
+    fn remove(
+        &self,
+        aor: &str,
+    ) -> impl std::future::Future<Output = Result<(), BackendError>> + Send;
 
     /// Check if an AoR exists in the backend.
-    fn exists(&self, aor: &str) -> impl std::future::Future<Output = Result<bool, BackendError>> + Send;
+    fn exists(
+        &self,
+        aor: &str,
+    ) -> impl std::future::Future<Output = Result<bool, BackendError>> + Send;
 
     /// List all AoRs with stored contacts.
-    fn all_aors(&self) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
+    fn all_aors(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
 
     /// Persist the auxiliary per-AoR state (service-routes, asserted identity,
     /// associated URIs).  Implementations must overwrite any prior state.
@@ -382,11 +397,7 @@ impl RegistrarBackend for MemoryBackend {
         Ok(self.data.iter().map(|entry| entry.key().clone()).collect())
     }
 
-    async fn save_aor_state(
-        &self,
-        aor: &str,
-        state: &StoredAorState,
-    ) -> Result<(), BackendError> {
+    async fn save_aor_state(&self, aor: &str, state: &StoredAorState) -> Result<(), BackendError> {
         if state.is_empty() {
             self.aor_state.remove(aor);
         } else {
@@ -395,10 +406,7 @@ impl RegistrarBackend for MemoryBackend {
         Ok(())
     }
 
-    async fn load_aor_state(
-        &self,
-        aor: &str,
-    ) -> Result<Option<StoredAorState>, BackendError> {
+    async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
         Ok(self.aor_state.get(aor).map(|entry| entry.value().clone()))
     }
 
@@ -408,7 +416,11 @@ impl RegistrarBackend for MemoryBackend {
     }
 
     async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
-        Ok(self.aor_state.iter().map(|entry| entry.key().clone()).collect())
+        Ok(self
+            .aor_state
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect())
     }
 }
 
@@ -695,10 +707,7 @@ mod redis_real {
             Ok(())
         }
 
-        async fn load_aor_state(
-            &self,
-            aor: &str,
-        ) -> Result<Option<StoredAorState>, BackendError> {
+        async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
             let key = self.state_key(aor);
             let mut connection = self.connection_for(aor);
             let value: Option<String> = connection
@@ -820,10 +829,7 @@ impl RegistrarBackend for RedisBackend {
         Ok(())
     }
 
-    async fn load_aor_state(
-        &self,
-        _aor: &str,
-    ) -> Result<Option<StoredAorState>, BackendError> {
+    async fn load_aor_state(&self, _aor: &str) -> Result<Option<StoredAorState>, BackendError> {
         Ok(None)
     }
 
@@ -920,10 +926,9 @@ mod postgres_real {
             url: &str,
             table: &str,
         ) -> Result<Arc<tokio_postgres::Client>, BackendError> {
-            let (client, connection) =
-                tokio_postgres::connect(url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|error| BackendError::Connection(error.to_string()))?;
+            let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| BackendError::Connection(error.to_string()))?;
 
             // Spawn the connection task so it runs in the background.
             tokio::spawn(async move {
@@ -1136,10 +1141,7 @@ mod postgres_real {
             Ok(())
         }
 
-        async fn load_aor_state(
-            &self,
-            aor: &str,
-        ) -> Result<Option<StoredAorState>, BackendError> {
+        async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
             let client = self.client_for(aor);
             let table = self.state_table();
             let query = format!("SELECT state FROM {table} WHERE aor = $1");
@@ -1245,10 +1247,7 @@ impl RegistrarBackend for PostgresBackend {
         Ok(())
     }
 
-    async fn load_aor_state(
-        &self,
-        _aor: &str,
-    ) -> Result<Option<StoredAorState>, BackendError> {
+    async fn load_aor_state(&self, _aor: &str) -> Result<Option<StoredAorState>, BackendError> {
         Ok(None)
     }
 
@@ -1267,10 +1266,20 @@ impl RegistrarBackend for PostgresBackend {
 
 /// Commands sent to the backend writer task.
 enum BackendCommand {
-    Save { aor: String, contacts: Vec<StoredContact> },
-    Remove { aor: String },
-    SaveAorState { aor: String, state: StoredAorState },
-    RemoveAorState { aor: String },
+    Save {
+        aor: String,
+        contacts: Vec<StoredContact>,
+    },
+    Remove {
+        aor: String,
+    },
+    SaveAorState {
+        aor: String,
+        state: StoredAorState,
+    },
+    RemoveAorState {
+        aor: String,
+    },
     CountAors {
         reply: tokio::sync::oneshot::Sender<Result<usize, BackendError>>,
     },
@@ -1409,9 +1418,8 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
         }
         if !contacts_for_aor.is_empty() {
             // Sort by q-value descending (same as Registrar::save)
-            contacts_for_aor.sort_by(|a, b| {
-                b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            contacts_for_aor
+                .sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
             contact_count += contacts_for_aor.len();
             aor_count += 1;
             registrar.bindings.insert(aor.clone(), contacts_for_aor);
@@ -1595,9 +1603,7 @@ mod tests {
         // Contact → StoredContact direction: write-through to the
         // backend must include params, not silently drop them.
         let mut contact = sample_stored_contact().to_contact().expect("non-expired");
-        contact.params = vec![
-            ("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string())),
-        ];
+        contact.params = vec![("+g.3gpp.iari-ref".to_string(), Some("\"x\"".to_string()))];
         let stored = StoredContact::from_contact(&contact);
         assert_eq!(stored.params, contact.params);
     }
@@ -1765,7 +1771,10 @@ mod tests {
             ..sample_stored_contact()
         };
         assert!(stored.is_expired());
-        assert!(stored.to_contact().is_none(), "expired contact should return None");
+        assert!(
+            stored.to_contact().is_none(),
+            "expired contact should return None"
+        );
     }
 
     #[test]
@@ -1866,38 +1875,15 @@ mod tests {
 
         // Store two AoRs with contacts
         backend
-            .save("sip:alice@example.com", &[StoredContact {
-                uri: "sip:alice@10.0.0.1".to_string(),
-                q: 1.0,
-                expires_secs: 3600,
-                expires_at: Some(now_epoch + 3600),
-                registered_at_epoch: None,
-                call_id: "c1".to_string(),
-                cseq: 1,
-                source_addr: None,
-                source_transport: None,
-                sip_instance: None,
-                reg_id: None,
-                path: vec![],
-                instance_id: None,
-                instance_epoch: None,
-                flow_token: None,
-                inbound_local_addr: None,
-                inbound_connection_id: None,
-                params: vec![],
-                kind: "ue".to_string(),
-            }])
-            .await
-            .unwrap();
-        backend
-            .save("sip:bob@example.com", &[
-                StoredContact {
-                    uri: "sip:bob@10.0.0.2".to_string(),
+            .save(
+                "sip:alice@example.com",
+                &[StoredContact {
+                    uri: "sip:alice@10.0.0.1".to_string(),
                     q: 1.0,
                     expires_secs: 3600,
                     expires_at: Some(now_epoch + 3600),
                     registered_at_epoch: None,
-                    call_id: "c2".to_string(),
+                    call_id: "c1".to_string(),
                     cseq: 1,
                     source_addr: None,
                     source_transport: None,
@@ -1911,29 +1897,58 @@ mod tests {
                     inbound_connection_id: None,
                     params: vec![],
                     kind: "ue".to_string(),
-                },
-                StoredContact {
-                    uri: "sip:bob@10.0.0.3".to_string(),
-                    q: 0.5,
-                    expires_secs: 1800,
-                    expires_at: Some(now_epoch + 1800),
-                    registered_at_epoch: None,
-                    call_id: "c3".to_string(),
-                    cseq: 2,
-                    source_addr: None,
-                    source_transport: None,
-                    sip_instance: None,
-                    reg_id: None,
-                    path: vec![],
-                    instance_id: None,
-                    instance_epoch: None,
-                    flow_token: None,
-                    inbound_local_addr: None,
-                    inbound_connection_id: None,
-                    params: vec![],
-                    kind: "ue".to_string(),
-                },
-            ])
+                }],
+            )
+            .await
+            .unwrap();
+        backend
+            .save(
+                "sip:bob@example.com",
+                &[
+                    StoredContact {
+                        uri: "sip:bob@10.0.0.2".to_string(),
+                        q: 1.0,
+                        expires_secs: 3600,
+                        expires_at: Some(now_epoch + 3600),
+                        registered_at_epoch: None,
+                        call_id: "c2".to_string(),
+                        cseq: 1,
+                        source_addr: None,
+                        source_transport: None,
+                        sip_instance: None,
+                        reg_id: None,
+                        path: vec![],
+                        instance_id: None,
+                        instance_epoch: None,
+                        flow_token: None,
+                        inbound_local_addr: None,
+                        inbound_connection_id: None,
+                        params: vec![],
+                        kind: "ue".to_string(),
+                    },
+                    StoredContact {
+                        uri: "sip:bob@10.0.0.3".to_string(),
+                        q: 0.5,
+                        expires_secs: 1800,
+                        expires_at: Some(now_epoch + 1800),
+                        registered_at_epoch: None,
+                        call_id: "c3".to_string(),
+                        cseq: 2,
+                        source_addr: None,
+                        source_transport: None,
+                        sip_instance: None,
+                        reg_id: None,
+                        path: vec![],
+                        instance_id: None,
+                        instance_epoch: None,
+                        flow_token: None,
+                        inbound_local_addr: None,
+                        inbound_connection_id: None,
+                        params: vec![],
+                        kind: "ue".to_string(),
+                    },
+                ],
+            )
             .await
             .unwrap();
 
@@ -1953,27 +1968,30 @@ mod tests {
 
         // Store an already-expired contact
         backend
-            .save("sip:old@example.com", &[StoredContact {
-                uri: "sip:old@10.0.0.1".to_string(),
-                q: 1.0,
-                expires_secs: 0,
-                expires_at: Some(1), // long expired
-                registered_at_epoch: None,
-                call_id: "c1".to_string(),
-                cseq: 1,
-                source_addr: None,
-                source_transport: None,
-                sip_instance: None,
-                reg_id: None,
-                path: vec![],
-                instance_id: None,
-                instance_epoch: None,
-                flow_token: None,
-                inbound_local_addr: None,
-                inbound_connection_id: None,
-                params: vec![],
-                kind: "ue".to_string(),
-            }])
+            .save(
+                "sip:old@example.com",
+                &[StoredContact {
+                    uri: "sip:old@10.0.0.1".to_string(),
+                    q: 1.0,
+                    expires_secs: 0,
+                    expires_at: Some(1), // long expired
+                    registered_at_epoch: None,
+                    call_id: "c1".to_string(),
+                    cseq: 1,
+                    source_addr: None,
+                    source_transport: None,
+                    sip_instance: None,
+                    reg_id: None,
+                    path: vec![],
+                    instance_id: None,
+                    instance_epoch: None,
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: None,
+                    params: vec![],
+                    kind: "ue".to_string(),
+                }],
+            )
             .await
             .unwrap();
 
@@ -1995,27 +2013,30 @@ mod tests {
             .as_secs();
 
         backend
-            .save("sip:alice@example.com", &[StoredContact {
-                uri: "sip:alice@10.0.0.1".to_string(),
-                q: 1.0,
-                expires_secs: 3600,
-                expires_at: Some(now_epoch + 3600),
-                registered_at_epoch: None,
-                call_id: "c1".to_string(),
-                cseq: 1,
-                source_addr: None,
-                source_transport: None,
-                sip_instance: None,
-                reg_id: None,
-                path: vec![],
-                instance_id: None,
-                instance_epoch: None,
-                flow_token: None,
-                inbound_local_addr: None,
-                inbound_connection_id: None,
-                params: vec![],
-                kind: "ue".to_string(),
-            }])
+            .save(
+                "sip:alice@example.com",
+                &[StoredContact {
+                    uri: "sip:alice@10.0.0.1".to_string(),
+                    q: 1.0,
+                    expires_secs: 3600,
+                    expires_at: Some(now_epoch + 3600),
+                    registered_at_epoch: None,
+                    call_id: "c1".to_string(),
+                    cseq: 1,
+                    source_addr: None,
+                    source_transport: None,
+                    sip_instance: None,
+                    reg_id: None,
+                    path: vec![],
+                    instance_id: None,
+                    instance_epoch: None,
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: None,
+                    params: vec![],
+                    kind: "ue".to_string(),
+                }],
+            )
             .await
             .unwrap();
 
@@ -2036,8 +2057,14 @@ mod tests {
     async fn count_aors_through_writer() {
         let backend = MemoryBackend::new();
         let stored = sample_stored_contact();
-        backend.save("sip:a@x.com", std::slice::from_ref(&stored)).await.unwrap();
-        backend.save("sip:b@x.com", std::slice::from_ref(&stored)).await.unwrap();
+        backend
+            .save("sip:a@x.com", std::slice::from_ref(&stored))
+            .await
+            .unwrap();
+        backend
+            .save("sip:b@x.com", std::slice::from_ref(&stored))
+            .await
+            .unwrap();
 
         let writer = spawn_backend_writer(backend);
         assert_eq!(writer.count_aors().await.unwrap(), 2);
@@ -2049,9 +2076,18 @@ mod tests {
         let stored = sample_stored_contact();
         // Pre-load three AoRs into the backend — none of them are in the
         // registrar's in-memory map.  aor_count_distributed() must see 3.
-        backend.save("sip:a@x.com", std::slice::from_ref(&stored)).await.unwrap();
-        backend.save("sip:b@x.com", std::slice::from_ref(&stored)).await.unwrap();
-        backend.save("sip:c@x.com", std::slice::from_ref(&stored)).await.unwrap();
+        backend
+            .save("sip:a@x.com", std::slice::from_ref(&stored))
+            .await
+            .unwrap();
+        backend
+            .save("sip:b@x.com", std::slice::from_ref(&stored))
+            .await
+            .unwrap();
+        backend
+            .save("sip:c@x.com", std::slice::from_ref(&stored))
+            .await
+            .unwrap();
 
         let registrar = Registrar::default();
         let writer = spawn_backend_writer(backend);
@@ -2091,10 +2127,16 @@ mod tests {
 
         let loaded = backend.load_aor_state(aor).await.unwrap().unwrap();
         assert_eq!(loaded, state);
-        assert_eq!(backend.all_aor_state_aors().await.unwrap(), vec![aor.to_string()]);
+        assert_eq!(
+            backend.all_aor_state_aors().await.unwrap(),
+            vec![aor.to_string()]
+        );
 
         // Saving an empty state acts as a remove.
-        backend.save_aor_state(aor, &StoredAorState::default()).await.unwrap();
+        backend
+            .save_aor_state(aor, &StoredAorState::default())
+            .await
+            .unwrap();
         assert!(backend.load_aor_state(aor).await.unwrap().is_none());
         assert!(backend.all_aor_state_aors().await.unwrap().is_empty());
     }
@@ -2110,14 +2152,8 @@ mod tests {
         {
             let registrar = Registrar::default();
             registrar.set_backend_writer(writer.clone());
-            registrar.set_service_routes(
-                aor,
-                vec!["<sip:scscf.ims.example.com;lr>".to_string()],
-            );
-            registrar.set_asserted_identity(
-                aor,
-                "sip:+15551234@ims.example.com".to_string(),
-            );
+            registrar.set_service_routes(aor, vec!["<sip:scscf.ims.example.com;lr>".to_string()]);
+            registrar.set_asserted_identity(aor, "sip:+15551234@ims.example.com".to_string());
             registrar.set_associated_uris(
                 aor,
                 vec![
@@ -2152,7 +2188,9 @@ mod tests {
             .unwrap();
 
         let restored = Registrar::default();
-        restore_from_backend(&backend_for_restore, &restored).await.unwrap();
+        restore_from_backend(&backend_for_restore, &restored)
+            .await
+            .unwrap();
 
         assert_eq!(
             restored.service_routes(aor),
@@ -2211,7 +2249,9 @@ mod tests {
         );
         // Sanity: in-memory view sees what was applied.
         assert_eq!(
-            registrar.asserted_identity("sip:alice@ims.example.com").as_deref(),
+            registrar
+                .asserted_identity("sip:alice@ims.example.com")
+                .as_deref(),
             Some("sip:+15551234@ims.example.com"),
         );
 
@@ -2219,9 +2259,14 @@ mod tests {
         registrar.remove_all("sip:alice@ims.example.com");
 
         // Local maps cleared.
-        assert!(registrar.asserted_identity("sip:alice@ims.example.com").is_none());
-        assert!(registrar.service_routes("sip:alice@ims.example.com").is_empty());
-        assert!(registrar.associated_uris("sip:alice@ims.example.com").is_empty());
+        assert!(registrar
+            .asserted_identity("sip:alice@ims.example.com")
+            .is_none());
+        assert!(registrar
+            .service_routes("sip:alice@ims.example.com")
+            .is_empty());
+        assert!(registrar
+            .associated_uris("sip:alice@ims.example.com")
+            .is_empty());
     }
-
 }

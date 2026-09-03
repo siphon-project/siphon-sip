@@ -160,8 +160,22 @@ impl PyQosNamespace {
             rtp_flow.set_item(
                 "descriptions",
                 vec![
-                    ipfilter_rule("out", proto_num, &ue_ip, ue_rtp_port, &remote_ip, remote_rtp_port),
-                    ipfilter_rule("in", proto_num, &remote_ip, remote_rtp_port, &ue_ip, ue_rtp_port),
+                    ipfilter_rule(
+                        "out",
+                        proto_num,
+                        &ue_ip,
+                        ue_rtp_port,
+                        &remote_ip,
+                        remote_rtp_port,
+                    ),
+                    ipfilter_rule(
+                        "in",
+                        proto_num,
+                        &remote_ip,
+                        remote_rtp_port,
+                        &ue_ip,
+                        ue_rtp_port,
+                    ),
                 ],
             )?;
             flows.append(rtp_flow)?;
@@ -242,8 +256,7 @@ fn sdp_connection_ip(value: Option<&str>) -> Option<String> {
 }
 
 fn media_or_session_ip(media: &MediaLine, session_ip: Option<&str>) -> Option<String> {
-    sdp_connection_ip(media.connection())
-        .or_else(|| session_ip.map(|s| s.to_string()))
+    sdp_connection_ip(media.connection()).or_else(|| session_ip.map(|s| s.to_string()))
 }
 
 /// Pick a transport-layer protocol number for an IPFilterRule.  RFC 6733
@@ -304,9 +317,7 @@ fn ipfilter_rule(
     dst_ip: &str,
     dst_port: u16,
 ) -> String {
-    format!(
-        "permit {direction} {proto} from {src_ip} {src_port} to {dst_ip} {dst_port}"
-    )
+    format!("permit {direction} {proto} from {src_ip} {src_port} to {dst_ip} {dst_port}")
 }
 
 /// Turn a `Bound<PyAny>` (str / bytes / Request / Reply / Call) into a parsed [`SdpBody`].
@@ -316,16 +327,12 @@ fn parse_to_sdp(obj: &Bound<'_, PyAny>) -> PyResult<SdpBody> {
     }
     if let Ok(raw) = obj.extract::<Vec<u8>>() {
         let text = String::from_utf8(raw).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "SDP body is not valid UTF-8: {error}"
-            ))
+            pyo3::exceptions::PyValueError::new_err(format!("SDP body is not valid UTF-8: {error}"))
         })?;
         return Ok(SdpBody::parse(&text));
     }
     let message_arc = extract_message(obj).map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err(
-            "expected a Request, Reply, Call, str, or bytes",
-        )
+        pyo3::exceptions::PyTypeError::new_err("expected a Request, Reply, Call, str, or bytes")
     })?;
     let message = message_arc.lock().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("message lock poisoned: {error}"))
@@ -333,9 +340,7 @@ fn parse_to_sdp(obj: &Bound<'_, PyAny>) -> PyResult<SdpBody> {
     let sdp_bytes = extract_sdp_body(&message)?;
     drop(message);
     let text = String::from_utf8(sdp_bytes).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "SDP body is not valid UTF-8: {error}"
-        ))
+        pyo3::exceptions::PyValueError::new_err(format!("SDP body is not valid UTF-8: {error}"))
     })?;
     Ok(SdpBody::parse(&text))
 }
@@ -379,7 +384,12 @@ mod tests {
             assert_eq!(result.len(), 1);
             let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             assert_eq!(
-                component.get_item("media_type").unwrap().unwrap().extract::<String>().unwrap(),
+                component
+                    .get_item("media_type")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
                 "audio"
             );
             let flows: Bound<'_, PyList> = component
@@ -409,7 +419,11 @@ mod tests {
 
             let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().cast_into().unwrap();
             assert_eq!(
-                rtcp.get_item("usage").unwrap().unwrap().extract::<String>().unwrap(),
+                rtcp.get_item("usage")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
                 "rtcp"
             );
             let rtcp_descs: Vec<String> = rtcp
@@ -490,8 +504,7 @@ mod tests {
             let result = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
-            let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().cast_into().unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             let flows: Bound<'_, PyList> = component
                 .get_item("flows")
                 .unwrap()
@@ -521,8 +534,7 @@ mod tests {
             let result = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
-            let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().cast_into().unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             let flows: Bound<'_, PyList> = component
                 .get_item("flows")
                 .unwrap()
@@ -591,8 +603,7 @@ mod tests {
             let result = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
-            let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().cast_into().unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             let status: String = component
                 .get_item("flow_status")
                 .unwrap()

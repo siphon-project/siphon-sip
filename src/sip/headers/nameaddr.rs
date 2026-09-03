@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use crate::sip::uri::SipUri;
 use crate::sip::parser::parse_uri_standalone;
+use crate::sip::uri::SipUri;
 
 /// A parsed From, To, or Contact header value.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,14 +85,10 @@ impl NameAddr {
                 match name.to_lowercase().as_str() {
                     "tag" => tag = value.clone(),
                     "q" => {
-                        q = value
-                            .as_ref()
-                            .and_then(|v| v.parse::<f32>().ok());
+                        q = value.as_ref().and_then(|v| v.parse::<f32>().ok());
                     }
                     "expires" => {
-                        expires = value
-                            .as_ref()
-                            .and_then(|v| v.parse::<u32>().ok());
+                        expires = value.as_ref().and_then(|v| v.parse::<u32>().ok());
                     }
                     _ => kept_params.push((name.clone(), value.clone())),
                 }
@@ -275,8 +271,7 @@ mod tests {
 
     #[test]
     fn parse_multi_contacts() {
-        let input =
-            "\"Alice\" <sip:alice@a.com>;q=0.9, <sip:bob@b.com>;q=0.5;expires=600";
+        let input = "\"Alice\" <sip:alice@a.com>;q=0.9, <sip:bob@b.com>;q=0.5;expires=600";
         let contacts = NameAddr::parse_multi(input).unwrap();
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].display_name.as_deref(), Some("Alice"));
@@ -326,8 +321,9 @@ mod tests {
     #[test]
     fn tel_uri_with_tag() {
         let na = NameAddr::parse(
-            "<tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org>;tag=0TleWIZ"
-        ).unwrap();
+            "<tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org>;tag=0TleWIZ",
+        )
+        .unwrap();
         assert_eq!(na.uri.scheme, "tel");
         assert_eq!(na.uri.user.as_deref(), Some("8367"));
         assert_eq!(na.tag.as_deref(), Some("0TleWIZ"));

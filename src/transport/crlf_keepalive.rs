@@ -357,7 +357,10 @@ mod tests {
         let drained = drain_leading_crlf_keepalives(&mut buf, id, &tx, None);
 
         assert_eq!(drained, 1);
-        assert!(rx.try_recv().is_ok(), "pong should be sent regardless of tracker");
+        assert!(
+            rx.try_recv().is_ok(),
+            "pong should be sent regardless of tracker"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
+use crate::sip::headers::SipHeaders;
 use crate::sip::message::*;
 use crate::sip::uri::SipUri;
-use crate::sip::headers::SipHeaders;
 
 /// Builder for constructing SIP messages
 pub struct SipMessageBuilder {
@@ -115,14 +115,15 @@ impl SipMessageBuilder {
     pub fn body_str(mut self, body: &str) -> Self {
         let body_bytes = body.as_bytes().to_vec();
         self.body = body_bytes.clone();
-        self.headers.set("Content-Length", body_bytes.len().to_string());
+        self.headers
+            .set("Content-Length", body_bytes.len().to_string());
         self
     }
 
     /// Build the SIP message
     pub fn build(self) -> Result<SipMessage, String> {
         let start_line = self.start_line.ok_or("Start line not set")?;
-        
+
         Ok(SipMessage {
             start_line,
             headers: self.headers,
@@ -178,7 +179,7 @@ impl SipMessage {
     /// Convert SIP message to wire format
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::new();
-        
+
         // Start line
         match &self.start_line {
             StartLine::Request(req) => {
@@ -198,7 +199,7 @@ impl SipMessage {
                 result.extend_from_slice(b"\r\n");
             }
         }
-        
+
         // Headers — one pass over the map, original-cased name + values
         // together (no per-header re-lowercase + re-lookup).
         for (name, values) in self.headers.iter_original() {
@@ -209,13 +210,13 @@ impl SipMessage {
                 result.extend_from_slice(b"\r\n");
             }
         }
-        
+
         // Empty line
         result.extend_from_slice(b"\r\n");
-        
+
         // Body
         result.extend_from_slice(&self.body);
-        
+
         result
     }
 }
@@ -225,4 +226,3 @@ impl std::fmt::Display for SipMessage {
         write!(f, "{}", String::from_utf8_lossy(&self.to_bytes()))
     }
 }
-

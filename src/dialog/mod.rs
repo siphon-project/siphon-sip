@@ -45,11 +45,7 @@ impl DialogId {
 
 impl std::fmt::Display for DialogId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}:{}",
-            self.call_id, self.local_tag, self.remote_tag
-        )
+        write!(f, "{}:{}:{}", self.call_id, self.local_tag, self.remote_tag)
     }
 }
 
@@ -452,7 +448,9 @@ mod tests {
             "tag-b".to_string(),
             1,
             vec![],
-            None, None, None,
+            None,
+            None,
+            None,
         ));
         assert_eq!(store.count(), 2);
     }
@@ -470,7 +468,9 @@ mod tests {
             "tag-b".to_string(),
             1,
             vec![],
-            None, None, None,
+            None,
+            None,
+            None,
         ));
 
         assert_eq!(store.confirmed_count(), 0);
@@ -492,7 +492,9 @@ mod tests {
             "b".to_string(),
             1,
             vec![],
-            None, None, None,
+            None,
+            None,
+            None,
         ));
 
         // Terminate dialog1 but don't remove it through terminate()
@@ -505,7 +507,9 @@ mod tests {
             "y".to_string(),
             1,
             vec![],
-            None, None, None,
+            None,
+            None,
+            None,
         );
         terminated_dialog.state = DialogState::Terminated;
         store.insert(terminated_dialog);

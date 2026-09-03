@@ -51,10 +51,14 @@ impl HepSender {
                 spawn_tcp_sender(endpoint, receiver);
             }
             HepTransport::Tls => {
-                let server_name = config
-                    .tls_server_name
-                    .clone()
-                    .unwrap_or_else(|| config.endpoint.split(':').next().unwrap_or("localhost").to_string());
+                let server_name = config.tls_server_name.clone().unwrap_or_else(|| {
+                    config
+                        .endpoint
+                        .split(':')
+                        .next()
+                        .unwrap_or("localhost")
+                        .to_string()
+                });
                 let ca_cert = config.ca_cert.clone();
                 spawn_tls_sender(endpoint, receiver, server_name, ca_cert);
             }
@@ -71,16 +75,34 @@ impl HepSender {
     }
 
     /// Capture an inbound SIP message (received from the network).
-    pub fn capture_inbound(&self, source: SocketAddr, local_addr: SocketAddr, transport: Transport, raw: &[u8]) {
+    pub fn capture_inbound(
+        &self,
+        source: SocketAddr,
+        local_addr: SocketAddr,
+        transport: Transport,
+        raw: &[u8],
+    ) {
         self.capture(source, local_addr, transport, raw);
     }
 
     /// Capture an outbound SIP message (sent to the network).
-    pub fn capture_outbound(&self, local_addr: SocketAddr, destination: SocketAddr, transport: Transport, raw: &[u8]) {
+    pub fn capture_outbound(
+        &self,
+        local_addr: SocketAddr,
+        destination: SocketAddr,
+        transport: Transport,
+        raw: &[u8],
+    ) {
         self.capture(local_addr, destination, transport, raw);
     }
 
-    fn capture(&self, source: SocketAddr, destination: SocketAddr, transport: Transport, raw: &[u8]) {
+    fn capture(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        transport: Transport,
+        raw: &[u8],
+    ) {
         let (timestamp_secs, timestamp_usecs) = now_timestamp();
         let call_id = extract_call_id(raw);
 
@@ -132,7 +154,11 @@ fn now_timestamp() -> (u32, u32) {
 // Background sender tasks
 // ---------------------------------------------------------------------------
 
-fn spawn_udp_sender(endpoint: SocketAddr, receiver: flume::Receiver<Bytes>, error_log_interval: u64) {
+fn spawn_udp_sender(
+    endpoint: SocketAddr,
+    receiver: flume::Receiver<Bytes>,
+    error_log_interval: u64,
+) {
     tokio::spawn(async move {
         // Bind to any available port
         let bind_addr = if endpoint.is_ipv6() {
@@ -286,7 +312,9 @@ async fn tls_sender_loop(
 }
 
 /// Build a rustls `ClientConfig` for HEP TLS connections.
-fn build_tls_client_config(ca_cert: Option<&str>) -> io::Result<tokio_rustls::rustls::ClientConfig> {
+fn build_tls_client_config(
+    ca_cert: Option<&str>,
+) -> io::Result<tokio_rustls::rustls::ClientConfig> {
     use tokio_rustls::rustls;
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -446,28 +474,29 @@ mod tests {
         sender.capture_outbound(source, destination, Transport::Tcp, sip_payload.as_bytes());
 
         // Accept connection and read data
-        let timeout = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0u8; 4096];
-                let mut total = 0;
-                // Read until we get a complete HEP packet
-                loop {
-                    use tokio::io::AsyncReadExt;
-                    let n = stream.read(&mut buffer[total..]).await.unwrap();
-                    if n == 0 { break; }
-                    total += n;
-                    // Check if we have a complete packet (HEP3 magic + length)
-                    if total >= 6 {
-                        let expected = u16::from_be_bytes([buffer[4], buffer[5]]) as usize;
-                        if total >= expected { break; }
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 4096];
+            let mut total = 0;
+            // Read until we get a complete HEP packet
+            loop {
+                use tokio::io::AsyncReadExt;
+                let n = stream.read(&mut buffer[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                // Check if we have a complete packet (HEP3 magic + length)
+                if total >= 6 {
+                    let expected = u16::from_be_bytes([buffer[4], buffer[5]]) as usize;
+                    if total >= expected {
+                        break;
                     }
                 }
-                buffer.truncate(total);
-                buffer
-            },
-        )
+            }
+            buffer.truncate(total);
+            buffer
+        })
         .await
         .expect("timeout waiting for HEP TCP packet");
 

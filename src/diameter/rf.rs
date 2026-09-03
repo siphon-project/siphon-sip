@@ -199,16 +199,16 @@ pub fn encode_acr_payload(
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, origin_host));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, origin_realm));
-    payload.extend_from_slice(&encode_avp_utf8(
-        avp::DESTINATION_REALM,
-        destination_realm,
-    ));
+    payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, destination_realm));
     if let Some(host) = destination_host {
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
 
     // Acct-Application-Id = 3 (Rf uses base accounting, not Vendor-Specific-Application-Id).
-    payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::ACCT_APPLICATION_ID,
+        dictionary::RF_APP_ID,
+    ));
 
     // Service-Context-Id (TS 32.299 §7.2.91) — mandatory for IMS Rf.
     let service_context = params.service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS);
@@ -822,7 +822,8 @@ mod tests {
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
@@ -836,18 +837,27 @@ mod tests {
     fn acr_encodes_service_context_id_default_ims() {
         let params = AccountingParams::new(AccountingRecordType::StartRecord);
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(
-            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            decoded
+                .avps
+                .get("Service-Context-Id")
+                .and_then(|v| v.as_str()),
             Some("32260@3gpp.org")
         );
     }
@@ -857,18 +867,27 @@ mod tests {
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.service_context_id = Some("32274@3gpp.org"); // MMTel SC
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(
-            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            decoded
+                .avps
+                .get("Service-Context-Id")
+                .and_then(|v| v.as_str()),
             Some("32274@3gpp.org")
         );
     }
@@ -878,13 +897,19 @@ mod tests {
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.user_name = Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org");
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
@@ -898,13 +923,19 @@ mod tests {
     fn acr_omits_user_name_when_none() {
         let params = AccountingParams::new(AccountingRecordType::StartRecord);
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
@@ -920,18 +951,27 @@ mod tests {
         params.record_number = 1;
         params.termination_cause = Some(termination_cause::DIAMETER_LOGOUT);
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(
-            decoded.avps.get("Termination-Cause").and_then(|v| v.as_u64()),
+            decoded
+                .avps
+                .get("Termination-Cause")
+                .and_then(|v| v.as_u64()),
             Some(1) // DIAMETER_LOGOUT
         );
     }
@@ -943,18 +983,27 @@ mod tests {
         params.record_number = 5;
         params.termination_cause = Some(termination_cause::DIAMETER_SESSION_TIMEOUT);
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(
-            decoded.avps.get("Termination-Cause").and_then(|v| v.as_u64()),
+            decoded
+                .avps
+                .get("Termination-Cause")
+                .and_then(|v| v.as_u64()),
             Some(8) // DIAMETER_SESSION_TIMEOUT
         );
     }
@@ -963,13 +1012,19 @@ mod tests {
     fn acr_start_omits_termination_cause() {
         let params = AccountingParams::new(AccountingRecordType::StartRecord);
         let payload = encode_acr_payload(
-            "scscf.example.com", "example.com", "example.com", None, "sess;1", &params,
+            "scscf.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "sess;1",
+            &params,
         );
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_ACCOUNTING,
             dictionary::RF_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         );
         let decoded = decode_diameter(&wire).unwrap();
@@ -1257,7 +1312,9 @@ mod tests {
     }
 
     fn unix_secs(time: SystemTime) -> u64 {
-        time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        time.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     fn encode_for_test(params: &AccountingParams<'_>) -> Vec<u8> {
@@ -1289,10 +1346,11 @@ mod tests {
         params.ims_data = Some(&ims);
         let payload = encode_for_test(&params);
 
-        let addresses: Vec<String> = avps_with_code(ims_information(&payload), avp::CALLING_PARTY_ADDRESS)
-            .into_iter()
-            .map(utf8)
-            .collect();
+        let addresses: Vec<String> =
+            avps_with_code(ims_information(&payload), avp::CALLING_PARTY_ADDRESS)
+                .into_iter()
+                .map(utf8)
+                .collect();
         assert_eq!(
             addresses,
             vec![
@@ -1342,8 +1400,8 @@ mod tests {
             decoded,
             vec![
                 (2, "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string()), // END_USER_SIP_URI
-                (0, "+31612345678".to_string()),                              // END_USER_E164
-                (1, "001010000000001".to_string()),                           // END_USER_IMSI
+                (0, "+31612345678".to_string()),                               // END_USER_E164
+                (1, "001010000000001".to_string()),                            // END_USER_IMSI
             ]
         );
     }
@@ -1388,7 +1446,11 @@ mod tests {
 
         assert_eq!(request, unix_secs(invite_at));
         assert_eq!(response, unix_secs(answer_at));
-        assert_eq!(event, unix_secs(answer_at), "START is stamped at the answer");
+        assert_eq!(
+            event,
+            unix_secs(answer_at),
+            "START is stamped at the answer"
+        );
         assert_eq!(
             response - request,
             6,

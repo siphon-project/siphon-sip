@@ -1,19 +1,19 @@
+pub mod acl;
+pub mod crlf_keepalive;
+pub mod flow;
+pub mod mux;
+pub mod pool;
+pub mod rate_limit;
+#[cfg(feature = "sctp")]
+pub mod sctp;
+pub mod stream;
+pub mod tcp;
+pub mod tls;
 /// Transport layer — UDP, TCP, TLS, WebSocket, WSS, SCTP.
 /// Each transport sends inbound SIP messages to the core via a channel
 /// and receives outbound messages via a per-connection sender.
 pub mod udp;
-pub mod tcp;
-pub mod tls;
 pub mod ws;
-pub mod stream;
-pub mod mux;
-#[cfg(feature = "sctp")]
-pub mod sctp;
-pub mod pool;
-pub mod rate_limit;
-pub mod acl;
-pub mod flow;
-pub mod crlf_keepalive;
 
 /// Test-only helpers shared by this module's unit tests.
 #[cfg(test)]
@@ -61,7 +61,6 @@ pub(crate) mod testutil {
         panic!("no free loopback port in the reserved test range");
     }
 }
-
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -348,7 +347,9 @@ impl ListenerRegistry {
             .into_iter()
             .map(|(transport, addr, advertise)| ((transport, addr), advertise))
             .collect();
-        Self { entries: Arc::new(map) }
+        Self {
+            entries: Arc::new(map),
+        }
     }
 
     /// Resolve a parsed `(transport, addr)` to a [`SendSocket`] iff a listener
@@ -358,7 +359,11 @@ impl ListenerRegistry {
     pub fn resolve(&self, transport: Transport, addr: SocketAddr) -> Option<SendSocket> {
         self.entries
             .get(&(transport, addr))
-            .map(|advertise| SendSocket { transport, addr, advertise: advertise.clone() })
+            .map(|advertise| SendSocket {
+                transport,
+                addr,
+                advertise: advertise.clone(),
+            })
     }
 
     /// Resolve the listener of `transport` matching the given address family
@@ -463,8 +468,7 @@ impl OutboundMessage {
     /// The frames to write, in the order they must leave: `data`, then any
     /// [`followups`](Self::followups).
     pub fn frames(&self) -> impl Iterator<Item = &Bytes> {
-        std::iter::once(&self.data)
-            .chain(self.followups.iter().flat_map(|extra| extra.iter()))
+        std::iter::once(&self.data).chain(self.followups.iter().flat_map(|extra| extra.iter()))
     }
 
     /// Owned form of [`frames`](Self::frames), for senders that move each frame
@@ -554,7 +558,9 @@ pub struct StreamConnections {
 
 impl StreamConnections {
     pub fn new() -> Self {
-        Self { map: Arc::new(DashMap::new()) }
+        Self {
+            map: Arc::new(DashMap::new()),
+        }
     }
 
     /// Register (or overwrite) the live connection for `peer`.  Called by the
@@ -613,7 +619,12 @@ impl StreamConnections {
     /// still registered — backs [`crate::script::api::registrar::PyFlow`]'s
     /// `is_alive` for stream transports.  A peer that re-registered with a new
     /// connection makes the old flow report dead.
-    pub fn is_alive(&self, peer: SocketAddr, transport: Transport, connection_id: ConnectionId) -> bool {
+    pub fn is_alive(
+        &self,
+        peer: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+    ) -> bool {
         self.map
             .get(&peer)
             .map(|entry| *entry.value() == (transport, connection_id))
@@ -652,12 +663,18 @@ mod tests {
         // replaced. Guarded on Some() so a CI host without a default route passes.
         if let Some(ip) = detect_routable_local_ip(false) {
             assert!(!ip.is_loopback(), "IPv4 detect returned loopback: {ip}");
-            assert!(!ip.is_unspecified(), "IPv4 detect returned unspecified: {ip}");
+            assert!(
+                !ip.is_unspecified(),
+                "IPv4 detect returned unspecified: {ip}"
+            );
             assert!(ip.is_ipv4(), "requested IPv4, got {ip}");
         }
         if let Some(ip) = detect_routable_local_ip(true) {
             assert!(!ip.is_loopback(), "IPv6 detect returned loopback: {ip}");
-            assert!(!ip.is_unspecified(), "IPv6 detect returned unspecified: {ip}");
+            assert!(
+                !ip.is_unspecified(),
+                "IPv6 detect returned unspecified: {ip}"
+            );
         }
     }
 
@@ -666,9 +683,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let connect_task = tokio::spawn(async move {
-            tokio::net::TcpStream::connect(addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
 
         let (server_socket, _) = listener.accept().await.unwrap();
         let client_socket = connect_task.await.unwrap();
@@ -678,12 +694,21 @@ mod tests {
         configure_tcp_socket(&client_socket, None);
 
         // Verify TCP_NODELAY is set
-        assert!(server_socket.nodelay().unwrap(), "server TCP_NODELAY should be true");
-        assert!(client_socket.nodelay().unwrap(), "client TCP_NODELAY should be true");
+        assert!(
+            server_socket.nodelay().unwrap(),
+            "server TCP_NODELAY should be true"
+        );
+        assert!(
+            client_socket.nodelay().unwrap(),
+            "client TCP_NODELAY should be true"
+        );
 
         // Verify SO_KEEPALIVE is set via socket2
         let server_ref = SockRef::from(&server_socket);
-        assert!(server_ref.keepalive().unwrap(), "server SO_KEEPALIVE should be true");
+        assert!(
+            server_ref.keepalive().unwrap(),
+            "server SO_KEEPALIVE should be true"
+        );
     }
 
     #[test]
@@ -748,16 +773,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let connect_task = tokio::spawn(async move {
-            tokio::net::TcpStream::connect(addr).await.unwrap()
-        });
+        let connect_task =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
 
         let (server_socket, _) = listener.accept().await.unwrap();
         let _client_socket = connect_task.await.unwrap();
 
         configure_tcp_socket(&server_socket, Some(96));
         let sock_ref = SockRef::from(&server_socket);
-        assert_eq!(sock_ref.tos_v4().unwrap(), 96, "TOS should be set by configure_tcp_socket");
+        assert_eq!(
+            sock_ref.tos_v4().unwrap(),
+            96,
+            "TOS should be set by configure_tcp_socket"
+        );
     }
 
     #[test]
@@ -916,7 +944,10 @@ mod tests {
         let peer = addr("10.0.0.1:50000");
         registry.register(peer, Transport::WebSocketSecure, ConnectionId(7));
         assert_eq!(registry.len(), 1);
-        assert_eq!(registry.get(&peer), Some((Transport::WebSocketSecure, ConnectionId(7))));
+        assert_eq!(
+            registry.get(&peer),
+            Some((Transport::WebSocketSecure, ConnectionId(7)))
+        );
         assert_eq!(registry.get(&addr("10.0.0.2:50000")), None);
     }
 
@@ -925,7 +956,10 @@ mod tests {
         let registry = StreamConnections::new();
         let peer = addr("10.0.0.1:50000");
         registry.register(peer, Transport::WebSocket, ConnectionId(3));
-        assert_eq!(registry.reuse(peer, Transport::WebSocket), Some(ConnectionId(3)));
+        assert_eq!(
+            registry.reuse(peer, Transport::WebSocket),
+            Some(ConnectionId(3))
+        );
     }
 
     #[test]
@@ -934,7 +968,10 @@ mod tests {
         let registry = StreamConnections::new();
         registry.register(addr("10.0.0.1:50000"), Transport::Tls, ConnectionId(9));
         // Exact match on :5060 misses, IP-only fallback finds the :50000 conn.
-        assert_eq!(registry.reuse(addr("10.0.0.1:5060"), Transport::Tls), Some(ConnectionId(9)));
+        assert_eq!(
+            registry.reuse(addr("10.0.0.1:5060"), Transport::Tls),
+            Some(ConnectionId(9))
+        );
         // Different IP — no fallback.
         assert_eq!(registry.reuse(addr("10.0.0.2:5060"), Transport::Tls), None);
     }
@@ -947,7 +984,10 @@ mod tests {
         registry.register(peer, Transport::WebSocket, ConnectionId(4));
         assert_eq!(registry.reuse(peer, Transport::Tls), None);
         assert_eq!(registry.reuse(addr("10.0.0.1:5060"), Transport::Tls), None);
-        assert_eq!(registry.reuse(peer, Transport::WebSocket), Some(ConnectionId(4)));
+        assert_eq!(
+            registry.reuse(peer, Transport::WebSocket),
+            Some(ConnectionId(4))
+        );
     }
 
     #[test]
@@ -971,7 +1011,11 @@ mod tests {
     #[test]
     fn stream_connections_has_ip_is_transport_agnostic() {
         let registry = StreamConnections::new();
-        registry.register(addr("10.0.0.1:50000"), Transport::WebSocket, ConnectionId(1));
+        registry.register(
+            addr("10.0.0.1:50000"),
+            Transport::WebSocket,
+            ConnectionId(1),
+        );
         assert!(registry.has_ip("10.0.0.1".parse().unwrap()));
         assert!(!registry.has_ip("10.0.0.2".parse().unwrap()));
     }
@@ -981,7 +1025,11 @@ mod tests {
         // Registrant liveness: a WS UE from the same IP as a TLS trunk must
         // not be counted as the trunk's connection.
         let registry = StreamConnections::new();
-        registry.register(addr("10.0.0.1:50000"), Transport::WebSocket, ConnectionId(1));
+        registry.register(
+            addr("10.0.0.1:50000"),
+            Transport::WebSocket,
+            ConnectionId(1),
+        );
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         assert!(registry.has_ip_transport(ip, Transport::WebSocket));
         assert!(!registry.has_ip_transport(ip, Transport::Tls));
@@ -1027,7 +1075,10 @@ mod tests {
         assert_eq!(Transport::from_scheme("TCP"), Some(Transport::Tcp));
         assert_eq!(Transport::from_scheme("Tls"), Some(Transport::Tls));
         assert_eq!(Transport::from_scheme("ws"), Some(Transport::WebSocket));
-        assert_eq!(Transport::from_scheme("wss"), Some(Transport::WebSocketSecure));
+        assert_eq!(
+            Transport::from_scheme("wss"),
+            Some(Transport::WebSocketSecure)
+        );
         assert_eq!(Transport::from_scheme("sctp"), Some(Transport::Sctp));
         assert_eq!(Transport::from_scheme("carrier-pigeon"), None);
     }
@@ -1091,13 +1142,19 @@ mod tests {
 
         // Pinned to listener A → lands on A's channel.
         router.send(make(Some(addr_a))).unwrap();
-        assert_eq!(listener_a.1.try_recv().unwrap().source_local_addr, Some(addr_a));
+        assert_eq!(
+            listener_a.1.try_recv().unwrap().source_local_addr,
+            Some(addr_a)
+        );
         assert!(listener_b.1.try_recv().is_err());
         assert!(default.1.try_recv().is_err());
 
         // Pinned to listener B → lands on B's channel.
         router.send(make(Some(addr_b))).unwrap();
-        assert_eq!(listener_b.1.try_recv().unwrap().source_local_addr, Some(addr_b));
+        assert_eq!(
+            listener_b.1.try_recv().unwrap().source_local_addr,
+            Some(addr_b)
+        );
 
         // No source → default channel.
         router.send(make(None)).unwrap();
@@ -1212,36 +1269,61 @@ mod tests {
     #[test]
     fn listener_registry_resolves_only_configured_sockets() {
         let registry = ListenerRegistry::from_entries([
-            (Transport::Udp, addr("10.0.0.1:5060"), Some("sip.example.com".to_string())),
+            (
+                Transport::Udp,
+                addr("10.0.0.1:5060"),
+                Some("sip.example.com".to_string()),
+            ),
             (Transport::Udp, addr("192.168.1.1:5060"), None),
             (Transport::Tcp, addr("10.0.0.1:5060"), None),
         ]);
         assert_eq!(registry.len(), 3);
 
         // Exact transport+addr match resolves, carrying the advertised host.
-        let resolved = registry.resolve(Transport::Udp, addr("10.0.0.1:5060")).unwrap();
+        let resolved = registry
+            .resolve(Transport::Udp, addr("10.0.0.1:5060"))
+            .unwrap();
         assert_eq!(resolved.transport, Transport::Udp);
         assert_eq!(resolved.addr, addr("10.0.0.1:5060"));
-        assert_eq!(resolved.via_sent_by(), ("sip.example.com".to_string(), 5060));
+        assert_eq!(
+            resolved.via_sent_by(),
+            ("sip.example.com".to_string(), 5060)
+        );
 
         // No advertise → Via host falls back to the bound IP literal.
-        let plain = registry.resolve(Transport::Udp, addr("192.168.1.1:5060")).unwrap();
+        let plain = registry
+            .resolve(Transport::Udp, addr("192.168.1.1:5060"))
+            .unwrap();
         assert_eq!(plain.via_sent_by(), ("192.168.1.1".to_string(), 5060));
 
         // Same address, different transport is a distinct listener.
-        assert!(registry.resolve(Transport::Tcp, addr("10.0.0.1:5060")).is_some());
-        assert!(registry.resolve(Transport::Tls, addr("10.0.0.1:5060")).is_none());
+        assert!(registry
+            .resolve(Transport::Tcp, addr("10.0.0.1:5060"))
+            .is_some());
+        assert!(registry
+            .resolve(Transport::Tls, addr("10.0.0.1:5060"))
+            .is_none());
 
         // An address siphon isn't listening on does not resolve.
-        assert!(registry.resolve(Transport::Udp, addr("192.0.2.1:5060")).is_none());
+        assert!(registry
+            .resolve(Transport::Udp, addr("192.0.2.1:5060"))
+            .is_none());
     }
 
     #[test]
     fn listener_registry_resolve_family_picks_matching_family() {
         let registry = ListenerRegistry::from_entries([
-            (Transport::Udp, addr("192.0.2.10:5066"), Some("v4.example".to_string())),
+            (
+                Transport::Udp,
+                addr("192.0.2.10:5066"),
+                Some("v4.example".to_string()),
+            ),
             (Transport::Udp, addr("192.0.2.10:5060"), None),
-            (Transport::Udp, addr("[2001:db8::10]:5060"), Some("v6.example".to_string())),
+            (
+                Transport::Udp,
+                addr("[2001:db8::10]:5060"),
+                Some("v6.example".to_string()),
+            ),
         ]);
         // v6 selector → the v6 listener, carrying its advertise.
         let v6 = registry.resolve_family(Transport::Udp, true).unwrap();

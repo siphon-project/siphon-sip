@@ -247,9 +247,7 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::ProxyRequest(None) => true,
-                HandlerKind::ProxyRequest(Some(filter)) => {
-                    filter.split('|').any(|m| m == method)
-                }
+                HandlerKind::ProxyRequest(Some(filter)) => filter.split('|').any(|m| m == method),
                 _ => false,
             })
             .collect()
@@ -262,23 +260,24 @@ impl ScriptState {
     /// decoration-time validation, and the generic engine stays free of any
     /// Diameter-dictionary coupling.
     pub fn diameter_request_handlers(&self) -> impl Iterator<Item = (Option<&str>, &HandlerEntry)> {
-        self.handlers.iter().filter_map(|handler| match &handler.kind {
-            HandlerKind::DiameterOnRequest(filter) => Some((filter.as_deref(), handler)),
-            _ => None,
-        })
+        self.handlers
+            .iter()
+            .filter_map(|handler| match &handler.kind {
+                HandlerKind::DiameterOnRequest(filter) => Some((filter.as_deref(), handler)),
+                _ => None,
+            })
     }
 
     /// Return all `RtpEngineOnDtmf` handlers whose optional call-id/from-tag
     /// filters match the event.  `None` filters match everything.
-    pub fn dtmf_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn dtmf_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnDtmf { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnDtmf {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -290,15 +289,14 @@ impl ScriptState {
     /// Return all `RtpEngineOnMediaTimeout` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
-    pub fn media_timeout_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn media_timeout_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnMediaTimeout { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnMediaTimeout {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -313,7 +311,10 @@ impl ScriptState {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnText { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnText {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -325,15 +326,14 @@ impl ScriptState {
     /// Return all `RtpEngineOnWsTeeStarted` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
-    pub fn ws_tee_started_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn ws_tee_started_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnWsTeeStarted { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnWsTeeStarted {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -345,15 +345,14 @@ impl ScriptState {
     /// Return all `RtpEngineOnWsTeeEnded` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
-    pub fn ws_tee_ended_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn ws_tee_ended_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnWsTeeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnWsTeeEnded {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -369,7 +368,10 @@ impl ScriptState {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnPlayFinished { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnPlayFinished {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -381,15 +383,14 @@ impl ScriptState {
     /// Return all `RtpEngineOnWsBridgeStarted` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
-    pub fn ws_bridge_started_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn ws_bridge_started_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnWsBridgeStarted { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnWsBridgeStarted {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -401,15 +402,14 @@ impl ScriptState {
     /// Return all `RtpEngineOnWsBridgeEnded` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
-    pub fn ws_bridge_ended_handlers(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Vec<&HandlerEntry> {
+    pub fn ws_bridge_ended_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnWsBridgeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnWsBridgeEnded {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -424,7 +424,10 @@ impl ScriptState {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::RtpEngineOnBeep { call_id: filter_cid, from_tag: filter_ftag } => {
+                HandlerKind::RtpEngineOnBeep {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -444,14 +447,16 @@ impl ScriptState {
 
     /// Whether the script registered any B2BUA handlers.
     pub fn has_b2bua_handlers(&self) -> bool {
-        self.handlers.iter().any(|h| matches!(
-            h.kind,
-            HandlerKind::B2buaInvite
-                | HandlerKind::B2buaAnswer
-                | HandlerKind::B2buaFailure
-                | HandlerKind::B2buaBye
-                | HandlerKind::B2buaRefer
-        ))
+        self.handlers.iter().any(|h| {
+            matches!(
+                h.kind,
+                HandlerKind::B2buaInvite
+                    | HandlerKind::B2buaAnswer
+                    | HandlerKind::B2buaFailure
+                    | HandlerKind::B2buaBye
+                    | HandlerKind::B2buaRefer
+            )
+        })
     }
 
     /// Return all timer handlers.
@@ -512,8 +517,7 @@ impl ScriptEngine {
         // Initialise the free-threaded Python interpreter (no-op if already done).
         Python::initialize();
 
-        let include_paths: Vec<PathBuf> =
-            config.include_paths.iter().map(PathBuf::from).collect();
+        let include_paths: Vec<PathBuf> = config.include_paths.iter().map(PathBuf::from).collect();
 
         let state = Self::compile_script(&script_path, &include_paths)?;
 
@@ -546,10 +550,7 @@ impl ScriptEngine {
 
         let state = Self::compile_source_standalone(&script_path, source)?;
 
-        info!(
-            handlers = state.handlers.len(),
-            "embedded script loaded"
-        );
+        info!(handlers = state.handlers.len(), "embedded script loaded");
 
         let state = Arc::new(ArcSwap::from_pointee(state));
 
@@ -573,10 +574,7 @@ impl ScriptEngine {
 
         let state = Self::load_bytecode(&script_path, pyc)?;
 
-        info!(
-            handlers = state.handlers.len(),
-            "bytecode script loaded"
-        );
+        info!(handlers = state.handlers.len(), "bytecode script loaded");
 
         let state = Arc::new(ArcSwap::from_pointee(state));
 
@@ -717,9 +715,7 @@ impl ScriptEngine {
         let _registry_guard = REGISTRY_COMPILE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Python::attach(|python| {
-            Self::compile_source(python, path, &source, include_paths)
-        })
+        Python::attach(|python| Self::compile_source(python, path, &source, include_paths))
     }
 
     /// Load pre-compiled bytecode (.pyc) and execute it. Used for embedded bytecode.
@@ -799,9 +795,7 @@ impl ScriptEngine {
         let _registry_guard = REGISTRY_COMPILE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Python::attach(|python| {
-            Self::compile_source(python, path, source, &[])
-        })
+        Python::attach(|python| Self::compile_source(python, path, source, &[]))
     }
 
     /// Compile source code and extract handlers. Runs inside `Python::attach`.
@@ -1039,7 +1033,8 @@ fn purge_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
         let Ok(file_str) = file_attr.extract::<String>() else {
             continue;
         };
-        let module_path = std::fs::canonicalize(&file_str).unwrap_or_else(|_| PathBuf::from(&file_str));
+        let module_path =
+            std::fs::canonicalize(&file_str).unwrap_or_else(|_| PathBuf::from(&file_str));
         if dirs.iter().any(|dir| module_path.starts_with(dir)) {
             if let Ok(module_name) = name.extract::<String>() {
                 to_remove.push(module_name);
@@ -1124,8 +1119,7 @@ pub fn spawn_file_watcher(engine: Arc<ScriptEngine>) {
                     // Reload on a change to the main script OR any `.py` file in a
                     // watched dir (a sibling helper module the script imports).
                     let is_relevant = paths.iter().any(|p| {
-                        p.file_name() == file_name
-                            || p.extension().is_some_and(|ext| ext == "py")
+                        p.file_name() == file_name || p.extension().is_some_and(|ext| ext == "py")
                     });
                     if !is_relevant {
                         continue;
@@ -1169,10 +1163,7 @@ fn get_or_create_registry(python: Python<'_>) -> Result<Bound<'_, PyAny>> {
 }
 
 /// Read the handlers list from the Python registry and convert to Rust types.
-fn extract_handlers(
-    _python: Python<'_>,
-    registry: &Bound<'_, PyAny>,
-) -> Result<Vec<HandlerEntry>> {
+fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<Vec<HandlerEntry>> {
     let entries = registry
         .getattr("entries")
         .map_err(|error| SiphonError::Script(format!("registry.entries: {error}")))?
@@ -1194,12 +1185,16 @@ fn extract_handlers(
             .extract()
             .map_err(|error| SiphonError::Script(format!("entry[0] str: {error}")))?;
 
-        let filter: Option<String> = item
-            .get_item(1)
-            .ok()
-            .and_then(|v: Bound<'_, PyAny>| {
-                if v.is_none() { None } else { v.extract().ok() }
-            });
+        let filter: Option<String> =
+            item.get_item(1).ok().and_then(
+                |v: Bound<'_, PyAny>| {
+                    if v.is_none() {
+                        None
+                    } else {
+                        v.extract().ok()
+                    }
+                },
+            );
 
         let callable: Py<PyAny> = item
             .get_item(2)
@@ -1214,10 +1209,7 @@ fn extract_handlers(
             .map_err(|error| SiphonError::Script(format!("entry[3] bool: {error}")))?;
 
         // Optional 5th element: metadata dict (used by timer.every, etc.).
-        let metadata: Option<Bound<'_, PyAny>> = item
-            .get_item(4)
-            .ok()
-            .filter(|v| !v.is_none());
+        let metadata: Option<Bound<'_, PyAny>> = item.get_item(4).ok().filter(|v| !v.is_none());
 
         let kind = match kind_str.as_str() {
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
@@ -1247,19 +1239,29 @@ fn extract_handlers(
                 })?;
                 let interval_secs: u64 = meta
                     .get_item("seconds")
-                    .map_err(|error| SiphonError::Script(format!("timer metadata 'seconds': {error}")))?
+                    .map_err(|error| {
+                        SiphonError::Script(format!("timer metadata 'seconds': {error}"))
+                    })?
                     .extract()
-                    .map_err(|error| SiphonError::Script(format!("timer 'seconds' u64: {error}")))?;
+                    .map_err(|error| {
+                        SiphonError::Script(format!("timer 'seconds' u64: {error}"))
+                    })?;
                 let name: String = meta
                     .get_item("name")
-                    .map_err(|error| SiphonError::Script(format!("timer metadata 'name': {error}")))?
+                    .map_err(|error| {
+                        SiphonError::Script(format!("timer metadata 'name': {error}"))
+                    })?
                     .extract()
                     .map_err(|error| SiphonError::Script(format!("timer 'name' str: {error}")))?;
                 let jitter_secs: u64 = meta
                     .get_item("jitter")
                     .and_then(|v| v.extract())
                     .unwrap_or(0);
-                HandlerKind::TimerEvery { interval_secs, name, jitter_secs }
+                HandlerKind::TimerEvery {
+                    interval_secs,
+                    name,
+                    jitter_secs,
+                }
             }
             "rtpengine.on_dtmf" => {
                 let call_id: Option<String> = metadata
@@ -1360,7 +1362,9 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnWsBridgeEnded { call_id, from_tag }
             }
-            other => HandlerKind::Custom { kind: other.to_owned() },
+            other => HandlerKind::Custom {
+                kind: other.to_owned(),
+            },
         };
 
         // Custom handlers carry their metadata dict through verbatim so
@@ -1538,9 +1542,7 @@ pub(crate) fn run_coroutine_value(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    if let Some(value) =
-        crate::script::async_pool::run_coroutine_via_pool(python, coroutine)?
-    {
+    if let Some(value) = crate::script::async_pool::run_coroutine_via_pool(python, coroutine)? {
         return Ok(value);
     }
     let loop_handle = fallback_thread_loop(python)?;
@@ -2014,10 +2016,12 @@ async def specific_timeout(call_id, from_tag):
         let specific = state
             .handlers
             .iter()
-            .find(|h| matches!(
-                &h.kind,
-                HandlerKind::RtpEngineOnMediaTimeout { call_id: Some(c), .. } if c == "abc"
-            ))
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnMediaTimeout { call_id: Some(c), .. } if c == "abc"
+                )
+            })
             .expect("filtered media-timeout handler registered");
         assert!(specific.is_async);
     }
@@ -2051,10 +2055,12 @@ async def specific_text(call_id, from_tag, to_tag, text, direction):
         let specific = state
             .handlers
             .iter()
-            .find(|h| matches!(
-                &h.kind,
-                HandlerKind::RtpEngineOnText { call_id: Some(c), .. } if c == "abc"
-            ))
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnText { call_id: Some(c), .. } if c == "abc"
+                )
+            })
             .expect("filtered text handler registered");
         assert!(specific.is_async);
     }
@@ -2093,10 +2099,12 @@ async def specific_beep(call_id, from_tag, to_tag, frequency_hz, duration_ms, of
         let specific = state
             .handlers
             .iter()
-            .find(|h| matches!(
-                &h.kind,
-                HandlerKind::RtpEngineOnBeep { call_id: Some(c), .. } if c == "abc"
-            ))
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnBeep { call_id: Some(c), .. } if c == "abc"
+                )
+            })
             .expect("filtered beep handler registered");
         assert!(specific.is_async);
     }
@@ -2135,10 +2143,12 @@ async def specific_end(call_id, from_tag, stream_id, reason, frames_sent, frames
         let specific = state
             .handlers
             .iter()
-            .find(|h| matches!(
-                &h.kind,
-                HandlerKind::RtpEngineOnWsTeeEnded { call_id: Some(c), .. } if c == "abc"
-            ))
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnWsTeeEnded { call_id: Some(c), .. } if c == "abc"
+                )
+            })
             .expect("filtered ws-tee-ended handler registered");
         assert!(specific.is_async);
     }
@@ -2377,11 +2387,14 @@ def new_call(call):
         Python::attach(|python| {
             let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
             let callable = state.handlers[0].callable.bind(python);
-            callable.call1((call_obj.bind(python),)).expect("handler invocation failed");
+            callable
+                .call1((call_obj.bind(python),))
+                .expect("handler invocation failed");
 
             // Check that session_timer() set the override
             let borrowed = call_obj.borrow(python);
-            let override_config = borrowed.session_timer_override()
+            let override_config = borrowed
+                .session_timer_override()
                 .expect("session_timer_override should be set after handler runs");
             assert_eq!(override_config.session_expires, 3600);
             assert_eq!(override_config.min_se, 120);
@@ -2457,12 +2470,18 @@ def route(request):
         let message = message_arc.lock().unwrap();
         match &message.start_line {
             StartLine::Request(request_line) => {
-                assert_eq!(request_line.request_uri.user.as_deref(), Some("+31201234567"));
+                assert_eq!(
+                    request_line.request_uri.user.as_deref(),
+                    Some("+31201234567")
+                );
             }
             other => panic!("expected request, got {other:?}"),
         }
         let from = message.headers.from().unwrap();
-        assert!(from.contains("+31612345678"), "from userpart not rewritten: {from}");
+        assert!(
+            from.contains("+31612345678"),
+            "from userpart not rewritten: {from}"
+        );
         assert!(from.contains("\"Alice\""), "display name lost: {from}");
         assert!(from.contains("tag=num-test"), "From-tag lost: {from}");
         assert!(message.headers.to().unwrap().contains("+31201234567"));
@@ -2613,30 +2632,35 @@ def new_call(call):
         Python::attach(|python| {
             let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
             let callable = state.handlers[0].callable.bind(python);
-            callable.call1((call_obj.bind(python),)).expect("handler invocation failed");
+            callable
+                .call1((call_obj.bind(python),))
+                .expect("handler invocation failed");
 
             let borrowed = call_obj.borrow(python);
             let action = borrowed.action();
-            let CallAction::Dial { target, next_hop, .. } = action else {
+            let CallAction::Dial {
+                target, next_hop, ..
+            } = action
+            else {
                 panic!("expected Dial action, got {action:?}");
             };
 
             // Contract 1: target drives the B-leg R-URI host (preserves IMPU shape).
-            let target_parsed = parse_uri_standalone(target)
-                .expect("target_uri must parse");
+            let target_parsed = parse_uri_standalone(target).expect("target_uri must parse");
             assert_eq!(target_parsed.host, "ims.mnc001.mcc001.3gppnetwork.org");
             assert_eq!(target_parsed.user.as_deref(), Some("1000"));
 
             // Contract 2: next_hop is what the dispatcher resolves for the wire
             // destination — host = 192.0.2.178, port = 4060.
-            let next_hop_str = next_hop.as_deref()
-                .expect("next_hop must be set");
-            let next_hop_parsed = parse_uri_standalone(next_hop_str)
-                .expect("next_hop_uri must parse");
+            let next_hop_str = next_hop.as_deref().expect("next_hop must be set");
+            let next_hop_parsed =
+                parse_uri_standalone(next_hop_str).expect("next_hop_uri must parse");
             assert_eq!(next_hop_parsed.host, "192.0.2.178");
             assert_eq!(next_hop_parsed.port, Some(4060));
-            assert!(next_hop_parsed.user.is_none(),
-                "next_hop is a routing destination, not a called party");
+            assert!(
+                next_hop_parsed.user.is_none(),
+                "next_hop is a routing destination, not a called party"
+            );
         });
     }
 
@@ -2684,10 +2708,13 @@ def new_call(call):
         Python::attach(|python| {
             let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
             let callable = state.handlers[0].callable.bind(python);
-            callable.call1((call_obj.bind(python),)).expect("handler invocation failed");
+            callable
+                .call1((call_obj.bind(python),))
+                .expect("handler invocation failed");
 
             let borrowed = call_obj.borrow(python);
-            let override_config = borrowed.session_timer_override()
+            let override_config = borrowed
+                .session_timer_override()
                 .expect("session_timer_override should be set");
             // Defaults from #[pyo3(signature = (expires=1800, min_se=90, refresher="b2bua"))]
             assert_eq!(override_config.session_expires, 1800);
@@ -2786,7 +2813,10 @@ async def check_gateways():
         assert!(state.handlers[0].is_async);
         assert!(matches!(
             state.handlers[0].kind,
-            HandlerKind::TimerEvery { interval_secs: 60, .. }
+            HandlerKind::TimerEvery {
+                interval_secs: 60,
+                ..
+            }
         ));
     }
 
@@ -2856,19 +2886,9 @@ _r.register("audit.sink", None, my_handler, False, {"path": "/var/log/audit", "l
             .expect("custom handler should carry its metadata dict");
         Python::attach(|python| {
             let bound = options.bind(python);
-            let path: String = bound
-                .get_item("path")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
+            let path: String = bound.get_item("path").unwrap().unwrap().extract().unwrap();
             assert_eq!(path, "/var/log/audit");
-            let level: String = bound
-                .get_item("level")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
+            let level: String = bound.get_item("level").unwrap().unwrap().extract().unwrap();
             assert_eq!(level, "info");
         });
     }
@@ -2976,8 +2996,7 @@ def route(request):
     pass
 "#;
         let pyc = source_to_pyc(source);
-        let state =
-            ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
+        let state = ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
         assert_eq!(state.handlers.len(), 1);
         assert_eq!(state.handlers[0].kind, HandlerKind::ProxyRequest(None));
     }
@@ -2996,8 +3015,7 @@ async def new_call(call):
     pass
 "#;
         let pyc = source_to_pyc(source);
-        let state =
-            ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
+        let state = ScriptEngine::load_bytecode(Path::new("<test>"), &pyc).unwrap();
         assert_eq!(state.handlers.len(), 2);
         assert_eq!(
             state.handlers[0].kind,
@@ -3042,8 +3060,6 @@ def route(request):
     // -----------------------------------------------------------------
     // Host-registered user namespaces
     // -----------------------------------------------------------------
-
-    
 
     #[pyclass]
     struct UserNamespaceProbe {
@@ -3260,8 +3276,10 @@ assert replay_probe.answer() == 7
 
         crate::script::api::set_module_extension("dup_ext", Box::new(|_python, _parent| Ok(())))
             .unwrap();
-        let result =
-            crate::script::api::set_module_extension("dup_ext", Box::new(|_python, _parent| Ok(())));
+        let result = crate::script::api::set_module_extension(
+            "dup_ext",
+            Box::new(|_python, _parent| Ok(())),
+        );
         assert!(result.is_err());
         let error = format!("{}", result.unwrap_err());
         assert!(
@@ -3306,7 +3324,10 @@ assert replay_probe.answer() == 7
         let result = ScriptEngine::compile_script(file.path(), &[]);
         crate::script::api::clear_module_extensions();
 
-        let error = format!("{}", result.expect_err("mount failure must not be swallowed"));
+        let error = format!(
+            "{}",
+            result.expect_err("mount failure must not be swallowed")
+        );
         assert!(
             error.contains("failing_ext") && error.contains("extension mount blew up"),
             "unexpected error: {error}"
@@ -3322,11 +3343,10 @@ assert replay_probe.answer() == 7
 mod async_runner_tests {
     use super::*;
     use std::ffi::CString;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
 
     /// Tokio-backed coroutine bridged to Python via

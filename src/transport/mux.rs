@@ -126,7 +126,9 @@ pub async fn listen(
             let (tcp_stream, remote_addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    tracing::error!("{sip_transport}+{websocket_transport} mux accept error: {error}");
+                    tracing::error!(
+                        "{sip_transport}+{websocket_transport} mux accept error: {error}"
+                    );
                     continue;
                 }
             };
@@ -169,8 +171,7 @@ pub async fn listen(
                                 return;
                             }
                         };
-                        let local_addr =
-                            tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
+                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
                         dispatch(
                             tls_stream,
                             (Transport::Tls, Transport::WebSocketSecure),
@@ -229,10 +230,7 @@ async fn dispatch<S>(
         Ok(sniffed) => sniffed,
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
             warn!("non-SIP, non-WebSocket bytes from {remote_addr} on the {sip_transport}+{websocket_transport} mux; dropping connection");
-            crate::security::record_malformed_message(
-                remote_addr.ip(),
-                &sip_transport.to_string(),
-            );
+            crate::security::record_malformed_message(remote_addr.ip(), &sip_transport.to_string());
             return;
         }
         Err(error) => {
@@ -346,14 +344,22 @@ mod tests {
         // listen() binds inside a spawned task.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        Harness { addr, inbound_rx, sip_connection_map, websocket_connection_map }
+        Harness {
+            addr,
+            inbound_rx,
+            sip_connection_map,
+            websocket_connection_map,
+        }
     }
 
     async fn next_inbound(harness: &Harness) -> InboundMessage {
-        tokio::time::timeout(std::time::Duration::from_secs(3), harness.inbound_rx.recv_async())
-            .await
-            .expect("timed out waiting for an inbound message")
-            .expect("inbound channel closed")
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            harness.inbound_rx.recv_async(),
+        )
+        .await
+        .expect("timed out waiting for an inbound message")
+        .expect("inbound channel closed")
     }
 
     /// Wait for the connection to appear in `map` and hand back its sender.
@@ -384,11 +390,15 @@ mod tests {
         assert_eq!(sip_message.local_addr, harness.addr);
         assert!(String::from_utf8_lossy(&sip_message.data).starts_with("REGISTER"));
         assert!(
-            harness.sip_connection_map.contains_key(&sip_message.connection_id),
+            harness
+                .sip_connection_map
+                .contains_key(&sip_message.connection_id),
             "raw SIP connection must land in the SIP connection map"
         );
         assert!(
-            !harness.websocket_connection_map.contains_key(&sip_message.connection_id),
+            !harness
+                .websocket_connection_map
+                .contains_key(&sip_message.connection_id),
             "raw SIP connection must not land in the WebSocket map"
         );
 
@@ -403,22 +413,32 @@ mod tests {
         assert_eq!(websocket_message.transport, Transport::WebSocket);
         assert!(String::from_utf8_lossy(&websocket_message.data).starts_with("REGISTER"));
         assert!(
-            harness.websocket_connection_map.contains_key(&websocket_message.connection_id),
+            harness
+                .websocket_connection_map
+                .contains_key(&websocket_message.connection_id),
             "WebSocket connection must land in the WebSocket connection map"
         );
 
         // Each half answers on its own framing: raw bytes for SIP, a text frame
         // for WebSocket.
-        let sip_sender =
-            sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
-        sip_sender.send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n")).await.unwrap();
+        let sip_sender = sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
+        sip_sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .unwrap();
         let mut raw = vec![0u8; 18];
         sip_client.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"SIP/2.0 200 OK\r\n\r\n");
 
-        let websocket_sender =
-            sender_for(&harness.websocket_connection_map, websocket_message.connection_id).await;
-        websocket_sender.send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n")).await.unwrap();
+        let websocket_sender = sender_for(
+            &harness.websocket_connection_map,
+            websocket_message.connection_id,
+        )
+        .await;
+        websocket_sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .unwrap();
         match websocket.next().await.unwrap().unwrap() {
             Message::Text(text) => assert_eq!(text.as_str(), "SIP/2.0 200 OK\r\n\r\n"),
             other => panic!("expected a text frame, got {other:?}"),
@@ -452,10 +472,13 @@ mod tests {
         assert_eq!(message.transport, Transport::Tcp);
         assert_eq!(String::from_utf8_lossy(&message.data), REGISTER);
         let mut pong = [0u8; 2];
-        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_exact(&mut pong))
-            .await
-            .expect("timed out waiting for the CRLF pong")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_exact(&mut pong),
+        )
+        .await
+        .expect("timed out waiting for the CRLF pong")
+        .unwrap();
         assert_eq!(&pong, b"\r\n");
     }
 
@@ -466,10 +489,15 @@ mod tests {
         client.write_all(b"HELO example.com\r\n").await.unwrap();
         // The listener closes the connection; the next read returns EOF.
         let mut buffer = [0u8; 16];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut buffer))
-            .await
-            .expect("connection was not dropped");
-        assert_eq!(read.unwrap(), 0, "expected the probe's connection to be closed");
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut buffer))
+                .await
+                .expect("connection was not dropped");
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "expected the probe's connection to be closed"
+        );
         assert!(harness.inbound_rx.is_empty());
     }
 
@@ -477,8 +505,8 @@ mod tests {
 
     fn test_tls_config(directory: &tempfile::TempDir) -> TlsServerConfig {
         let key_pair = rcgen::KeyPair::generate().expect("keygen");
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-            .expect("cert params");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let certificate = params.self_signed(&key_pair).expect("self-sign");
         let certificate_path = directory.path().join("cert.pem");
         let private_key_path = directory.path().join("key.pem");
@@ -538,7 +566,9 @@ mod tests {
         let sip_message = next_inbound(&harness).await;
         assert_eq!(sip_message.transport, Transport::Tls);
         assert!(String::from_utf8_lossy(&sip_message.data).starts_with("REGISTER"));
-        assert!(harness.sip_connection_map.contains_key(&sip_message.connection_id));
+        assert!(harness
+            .sip_connection_map
+            .contains_key(&sip_message.connection_id));
 
         // A browser UE speaking WSS on the same port and the same certificate.
         let tls_stream = connect_tls(&connector, harness.addr).await;
@@ -554,16 +584,24 @@ mod tests {
             .contains_key(&websocket_message.connection_id));
 
         // Responses go back on the framing each half expects.
-        let sip_sender =
-            sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
-        sip_sender.send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n")).await.unwrap();
+        let sip_sender = sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
+        sip_sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .unwrap();
         let mut raw = vec![0u8; 18];
         sip_client.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"SIP/2.0 200 OK\r\n\r\n");
 
-        let websocket_sender =
-            sender_for(&harness.websocket_connection_map, websocket_message.connection_id).await;
-        websocket_sender.send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n")).await.unwrap();
+        let websocket_sender = sender_for(
+            &harness.websocket_connection_map,
+            websocket_message.connection_id,
+        )
+        .await;
+        websocket_sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .unwrap();
         match websocket.next().await.unwrap().unwrap() {
             Message::Text(text) => assert_eq!(text.as_str(), "SIP/2.0 200 OK\r\n\r\n"),
             other => panic!("expected a text frame, got {other:?}"),

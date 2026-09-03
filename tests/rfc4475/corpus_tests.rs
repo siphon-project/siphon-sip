@@ -573,10 +573,7 @@ fn messages_parse_or_are_rejected_per_rfc4475() {
         let Some(reason) = deviation else { continue };
         deviating.push(case.file);
 
-        if !KNOWN_DEVIATIONS
-            .iter()
-            .any(|known| known.file == case.file)
-        {
+        if !KNOWN_DEVIATIONS.iter().any(|known| known.file == case.file) {
             regressions.push(format!(
                 "  {:<22} §{:<9} {:<46} {}",
                 case.file, case.section, case.title, reason

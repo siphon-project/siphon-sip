@@ -45,7 +45,9 @@ pub fn extract_boundary(content_type: &str) -> Result<String, MultipartError> {
     } else {
         // Unquoted — terminated by `;`, `,`, whitespace, or end of string.
         let end = after_eq
-            .find(|character: char| character == ';' || character == ',' || character.is_whitespace())
+            .find(|character: char| {
+                character == ';' || character == ',' || character.is_whitespace()
+            })
             .unwrap_or(after_eq.len());
         &after_eq[..end]
     };
@@ -87,11 +89,12 @@ pub fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<MimePart>,
         }
 
         // Strip the closing delimiter suffix if present.
-        let section = if let Some(before_close) = section.strip_suffix(&close_delimiter[delimiter.len()..]) {
-            before_close
-        } else {
-            section
-        };
+        let section =
+            if let Some(before_close) = section.strip_suffix(&close_delimiter[delimiter.len()..]) {
+                before_close
+            } else {
+                section
+            };
 
         // Each part has headers separated from body by a blank line (\r\n\r\n).
         let header_end = if let Some(position) = section.find("\r\n\r\n") {
@@ -109,13 +112,18 @@ pub fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<MimePart>,
         } else {
             header_end + 2
         };
-        let part_body = section[body_start..].trim_end_matches("\r\n").trim_end_matches('\n');
+        let part_body = section[body_start..]
+            .trim_end_matches("\r\n")
+            .trim_end_matches('\n');
 
         // Extract Content-Type from the part headers.
         let mut part_content_type = None;
         for line in header_block.lines() {
             let line = line.trim();
-            if let Some(value) = line.strip_prefix("Content-Type:").or_else(|| line.strip_prefix("content-type:")) {
+            if let Some(value) = line
+                .strip_prefix("Content-Type:")
+                .or_else(|| line.strip_prefix("content-type:"))
+            {
                 part_content_type = Some(value.trim().to_string());
             }
         }
@@ -139,7 +147,9 @@ pub fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<MimePart>,
 ///
 /// Useful for extracting the SDP or metadata part from a SIPREC body.
 pub fn find_part<'a>(parts: &'a [MimePart], content_type_prefix: &str) -> Option<&'a MimePart> {
-    parts.iter().find(|part| part.content_type.starts_with(content_type_prefix))
+    parts
+        .iter()
+        .find(|part| part.content_type.starts_with(content_type_prefix))
 }
 
 // ---------------------------------------------------------------------------

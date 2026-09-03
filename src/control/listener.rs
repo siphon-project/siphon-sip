@@ -105,7 +105,8 @@ async fn handle_inbound_socket(
 ) {
     let conn = bus.register_connection(&app);
     info!(remote = %peer, %app, conn_id = conn.id, "control plane: connection open");
-    crate::metrics::try_metrics().inspect(|m| m.control_connections.with_label_values(&[&app]).inc());
+    crate::metrics::try_metrics()
+        .inspect(|m| m.control_connections.with_label_values(&[&app]).inc());
 
     let (ws_sink, mut ws_source) = socket.split();
     let writer_events = Arc::clone(&conn.events);
@@ -139,14 +140,18 @@ async fn handle_inbound_socket(
 
     conn.events.close();
     bus.unregister_connection(&conn);
-    crate::metrics::try_metrics().inspect(|m| m.control_connections.with_label_values(&[&app]).dec());
+    crate::metrics::try_metrics()
+        .inspect(|m| m.control_connections.with_label_values(&[&app]).dec());
     let _ = writer.await;
     info!(remote = %peer, %app, conn_id = conn.id, "control plane: connection closed");
 }
 
 /// The inbound connection's single write task: drains the ordered outbound queue
 /// (replies + events) onto the axum socket.
-async fn inbound_write_task(mut ws_sink: SplitSink<WebSocket, Message>, events: Arc<OutboundQueue>) {
+async fn inbound_write_task(
+    mut ws_sink: SplitSink<WebSocket, Message>,
+    events: Arc<OutboundQueue>,
+) {
     loop {
         let frames = events.recv_many().await;
         if frames.is_empty() {
@@ -301,14 +306,19 @@ async fn handle_command(
         );
         return;
     }
-    crate::metrics::try_metrics()
-        .inspect(|m| m.control_commands_total.with_label_values(&[&conn.app, &verb]).inc());
+    crate::metrics::try_metrics().inspect(|m| {
+        m.control_commands_total
+            .with_label_values(&[&conn.app, &verb])
+            .inc()
+    });
 
     // Async wait for the *local* result — never a far-end wait, never a thread
     // block (rules 4/5). The far-end outcome arrives later as an event.
     let result = match response_rx.await {
         Ok(result) => result,
-        Err(_) => ControlResult::error(ControlErrorCode::Unavailable, "control command was dropped"),
+        Err(_) => {
+            ControlResult::error(ControlErrorCode::Unavailable, "control command was dropped")
+        }
     };
     conn.events.push_reply(result.into_reply(id));
 }
@@ -357,9 +367,9 @@ mod tests {
         // Stand-in consumer: echo every command Ok (no real adapter in this test).
         tokio::spawn(async move {
             while let Ok(command) = command_rx.recv_async().await {
-                let _ = command
-                    .response_tx
-                    .send(ControlResult::Ok(serde_json::json!({ "verb": command.verb })));
+                let _ = command.response_tx.send(ControlResult::Ok(
+                    serde_json::json!({ "verb": command.verb }),
+                ));
             }
         });
         bus
@@ -379,7 +389,9 @@ mod tests {
         addr: SocketAddr,
         token: &str,
     ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
-        let mut request = format!("ws://{addr}/control/ws").into_client_request().unwrap();
+        let mut request = format!("ws://{addr}/control/ws")
+            .into_client_request()
+            .unwrap();
         request.headers_mut().insert(
             "Authorization",
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
@@ -434,11 +446,23 @@ mod tests {
             }
             found.expect("connection registered after hello")
         };
-        bus.register_channel("ch1", &conn, "call-uuid", "sipcid@h", "hangup", Default::default());
+        bus.register_channel(
+            "ch1",
+            &conn,
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            Default::default(),
+        );
         assert!(bus.publish_to_channel(
             "ch1",
             crate::control::protocol::EventFrame::new(
-                "StasisStart", "ch1", "ivr-app", "call-uuid", "sipcid@h", serde_json::json!({}),
+                "StasisStart",
+                "ch1",
+                "ivr-app",
+                "call-uuid",
+                "sipcid@h",
+                serde_json::json!({}),
             ),
         ));
 
@@ -534,7 +558,14 @@ mod tests {
             }
             found.unwrap()
         };
-        bus.register_channel("ch-live", &conn1, "call-uuid", "sipcid@h", "hangup", Default::default());
+        bus.register_channel(
+            "ch-live",
+            &conn1,
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            Default::default(),
+        );
 
         // Owner disconnects (drop the client socket) — the channel is orphaned
         // but kept for the reattach grace window.

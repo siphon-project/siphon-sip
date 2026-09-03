@@ -31,8 +31,8 @@ use siphon_rtp_proto::{
     frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
     PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
     WsBridgeEndReason as ProtoWsBridgeEndReason, WsTeeDirection as ProtoWsTeeDirection,
-    WsTeeEndReason as ProtoWsTeeEndReason,
-    WsVadEngine as ProtoWsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    WsTeeEndReason as ProtoWsTeeEndReason, WsVadEngine as ProtoWsVadEngine, X3EndReason,
+    X3TargetLeg, Xid,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -43,10 +43,10 @@ use tracing::{debug, info, trace, warn};
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
-    BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent,
-    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, TextStreamStats,
-    WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
-    WsTeeStarted, WsTeeEnded, X3EndedEvent, X3LossEvent, X3StartedEvent,
+    BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent,
+    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RtpEngineEvent, TextEvent,
+    TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason, WsTeeEnded,
+    WsTeeStarted, X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
@@ -237,8 +237,7 @@ impl SiphonRtpClient {
         event_tx: mpsc::Sender<RtpEngineEvent>,
     ) -> Arc<Self> {
         let pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>> = Arc::new(DashMap::new());
-        let play_pending: Arc<DashMap<u64, PlayWaiter>> =
-            Arc::new(DashMap::new());
+        let play_pending: Arc<DashMap<u64, PlayWaiter>> = Arc::new(DashMap::new());
         let writer: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
@@ -542,7 +541,10 @@ impl SiphonRtpClient {
             // HTTP source reports a fetch that failed, since that play never
             // produced audio.
             Ok(Ok((PlayEndReason::Error, _))) => {
-                warn!(call_id, play_id, "siphon-rtp play_media aborted (engine error)");
+                warn!(
+                    call_id,
+                    play_id, "siphon-rtp play_media aborted (engine error)"
+                );
                 Ok(outcome(None))
             }
             // A reason this build does not know. `PlayEndReason` is
@@ -560,7 +562,10 @@ impl SiphonRtpClient {
             }
             // Connection dropped (sender cleared on disconnect) — treat as not completed.
             Ok(Err(_)) => {
-                warn!(call_id, play_id, "siphon-rtp play_media: connection lost before completion");
+                warn!(
+                    call_id,
+                    play_id, "siphon-rtp play_media: connection lost before completion"
+                );
                 Ok(outcome(None))
             }
             // Fallback timeout — no PlayFinished within play_timeout_ms.
@@ -755,9 +760,7 @@ impl SiphonRtpClient {
                 call_id: call_id.to_string(),
                 from_tags: from_tags.iter().map(|tag| tag.to_string()).collect(),
                 sdp: None,
-                profile: profile_flags
-                    .map(profile_flags_from_ng)
-                    .unwrap_or_default(),
+                profile: profile_flags.map(profile_flags_from_ng).unwrap_or_default(),
             })
             .await?;
         match result {
@@ -845,11 +848,7 @@ impl SiphonRtpClient {
 
     /// Detach a call's WebSocket tee, closing its stream.  Idempotent — the
     /// engine does not treat detaching a call with no tee as an error.
-    pub async fn detach_ws_tee(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_ws_tee(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::DetachWsTee {
                 call_id: call_id.to_string(),
@@ -944,11 +943,7 @@ impl SiphonRtpClient {
 
     /// Stop X3 content delivery for a call. Idempotent — the engine does not
     /// treat detaching a call with no interception as an error.
-    pub async fn detach_x3(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::DetachX3 {
                 call_id: call_id.to_string(),
@@ -1079,10 +1074,7 @@ impl SiphonRtpClientSet {
         if self.clients.len() <= 1 || self.affinity.contains_key(call_id) {
             return;
         }
-        let tick = self
-            .counter
-            .load(Ordering::Relaxed)
-            .wrapping_sub(1);
+        let tick = self.counter.load(Ordering::Relaxed).wrapping_sub(1);
         let position = (tick % self.total_weight as u64) as u32;
         let index = self
             .cumulative_weights
@@ -1100,7 +1092,10 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self.select(call_id).offer(call_id, from_tag, sdp, flags).await?;
+        let result = self
+            .select(call_id)
+            .offer(call_id, from_tag, sdp, flags)
+            .await?;
         self.bind_affinity(call_id);
         Ok(result)
     }
@@ -1122,7 +1117,11 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        match self.select(call_id).reoffer(call_id, from_tag, sdp, flags).await {
+        match self
+            .select(call_id)
+            .reoffer(call_id, from_tag, sdp, flags)
+            .await
+        {
             Ok(rewritten) => Ok(rewritten),
             Err(error) if is_codec_change_refusal(&error) => {
                 tracing::warn!(
@@ -1132,7 +1131,10 @@ impl SiphonRtpClientSet {
                      ports are re-allocated and any WebSocket bridge, tee or SIPREC subscription \
                      on it is torn down"
                 );
-                let result = self.select(call_id).offer(call_id, from_tag, sdp, flags).await?;
+                let result = self
+                    .select(call_id)
+                    .offer(call_id, from_tag, sdp, flags)
+                    .await?;
                 self.bind_affinity(call_id);
                 Ok(result)
             }
@@ -1216,7 +1218,9 @@ impl SiphonRtpClientSet {
         from_tag: &str,
         play_id: Option<u64>,
     ) -> Result<(), RtpEngineError> {
-        self.select(call_id).stop_media(call_id, from_tag, play_id).await
+        self.select(call_id)
+            .stop_media(call_id, from_tag, play_id)
+            .await
     }
 
     /// Retune a running playback's gain via the affinity-bound instance.
@@ -1246,7 +1250,15 @@ impl SiphonRtpClientSet {
         to_tag: Option<&str>,
     ) -> Result<(), RtpEngineError> {
         self.select(call_id)
-            .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+            .play_dtmf(
+                call_id,
+                from_tag,
+                code,
+                duration_ms,
+                volume_dbm0,
+                pause_ms,
+                to_tag,
+            )
             .await
     }
 
@@ -1261,7 +1273,9 @@ impl SiphonRtpClientSet {
         call_id: &str,
         from_tag: &str,
     ) -> Result<(), RtpEngineError> {
-        self.select(call_id).unsilence_media(call_id, from_tag).await
+        self.select(call_id)
+            .unsilence_media(call_id, from_tag)
+            .await
     }
 
     /// Toggle echo-test mode on the affinity-bound instance.
@@ -1331,7 +1345,9 @@ impl SiphonRtpClientSet {
         from_tag: &str,
         to_tag: &str,
     ) -> Result<(), RtpEngineError> {
-        self.select(call_id).unsubscribe(call_id, from_tag, to_tag).await
+        self.select(call_id)
+            .unsubscribe(call_id, from_tag, to_tag)
+            .await
     }
 
     /// Attach a WebSocket tee on the instance owning this call.
@@ -1350,11 +1366,7 @@ impl SiphonRtpClientSet {
     }
 
     /// Detach the WebSocket tee on the instance owning this call.
-    pub async fn detach_ws_tee(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_ws_tee(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         self.select(call_id).detach_ws_tee(call_id, from_tag).await
     }
 
@@ -1377,7 +1389,9 @@ impl SiphonRtpClientSet {
         call_id: &str,
         from_tag: &str,
     ) -> Result<(), RtpEngineError> {
-        self.select(call_id).detach_ws_bridge(call_id, from_tag).await
+        self.select(call_id)
+            .detach_ws_bridge(call_id, from_tag)
+            .await
     }
 
     /// Begin X3 content delivery on the instance owning this call.
@@ -1396,11 +1410,7 @@ impl SiphonRtpClientSet {
     }
 
     /// Stop X3 content delivery on the instance owning this call.
-    pub async fn detach_x3(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         self.select(call_id).detach_x3(call_id, from_tag).await
     }
 
@@ -1425,7 +1435,10 @@ impl SiphonRtpClientSet {
 
     /// Total active call-ids across all instances.
     pub fn active_sessions(&self) -> usize {
-        self.clients.iter().map(|client| client.active_sessions()).sum()
+        self.clients
+            .iter()
+            .map(|client| client.active_sessions())
+            .sum()
     }
 
     /// Number of configured instances.
@@ -1537,10 +1550,9 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             volume,
             source,
         }),
-        Event::MediaTimeout { call_id, from_tag } => RtpEngineEvent::MediaTimeout {
-            call_id,
-            from_tag,
-        },
+        Event::MediaTimeout { call_id, from_tag } => {
+            RtpEngineEvent::MediaTimeout { call_id, from_tag }
+        }
         Event::CallSummary {
             call_id,
             reason,
@@ -1993,7 +2005,13 @@ async fn route_frame(
                 // fire-and-forget, so dropping the event whenever a waiter
                 // happened to exist would make an app's completion signal
                 // depend on an unrelated caller's choice.
-                if let Event::PlayFinished { play_id, reason, played_ms, .. } = &event {
+                if let Event::PlayFinished {
+                    play_id,
+                    reason,
+                    played_ms,
+                    ..
+                } = &event
+                {
                     debug!(play_id, ?reason, played_ms, "siphon-rtp play finished");
                     if let Some((_, sender)) = play_pending.remove(play_id) {
                         let _ = sender.send((*reason, *played_ms));
@@ -2016,7 +2034,10 @@ async fn route_frame(
                 if let Some((_, sender)) = pending.remove(&response.id) {
                     let _ = sender.send(response.result);
                 } else {
-                    trace!(id = response.id, "siphon-rtp response for unknown/expired request");
+                    trace!(
+                        id = response.id,
+                        "siphon-rtp response for unknown/expired request"
+                    );
                 }
             }
             Err(error) => warn!(%error, "siphon-rtp response decode failed; skipping"),
@@ -2056,13 +2077,12 @@ async fn authenticate(
                         if value.get("id").and_then(serde_json::Value::as_u64)
                             == Some(AUTH_REQUEST_ID)
                         {
-                            let response: Response = serde_json::from_value(value).map_err(
-                                |error| {
+                            let response: Response =
+                                serde_json::from_value(value).map_err(|error| {
                                     RtpEngineError::Protocol(format!(
                                         "auth response decode failed: {error}"
                                     ))
-                                },
-                            )?;
+                                })?;
                             return match response.result {
                                 CmdResult::Ok { .. } => Ok(()),
                                 CmdResult::Error { reason } => {
@@ -2175,10 +2195,14 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
-                    while let Some(request) = read_frame_opt::<Request, _>(&mut stream, &mut buffer).await {
+                    while let Some(request) =
+                        read_frame_opt::<Request, _>(&mut stream, &mut buffer).await
+                    {
                         let result = match request.command {
                             Command::Ping => CmdResult::Pong,
-                            Command::Offer { .. } | Command::Reoffer { .. } | Command::Answer { .. } => CmdResult::Ok {
+                            Command::Offer { .. }
+                            | Command::Reoffer { .. }
+                            | Command::Answer { .. } => CmdResult::Ok {
                                 sdp: Some("v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string()),
                                 duration_ms: None,
                                 to_tag: None,
@@ -2208,10 +2232,7 @@ mod tests {
         address
     }
 
-    fn channel() -> (
-        mpsc::Sender<RtpEngineEvent>,
-        mpsc::Receiver<RtpEngineEvent>,
-    ) {
+    fn channel() -> (mpsc::Sender<RtpEngineEvent>, mpsc::Receiver<RtpEngineEvent>) {
         mpsc::channel(16)
     }
 
@@ -2254,8 +2275,8 @@ mod tests {
                         let Some((request, consumed)) = decoded else {
                             return;
                         };
-                        let body =
-                            String::from_utf8_lossy(&buffer[frame::HEADER_LEN..consumed]).into_owned();
+                        let body = String::from_utf8_lossy(&buffer[frame::HEADER_LEN..consumed])
+                            .into_owned();
                         buffer.drain(..consumed);
                         let _ = capture_tx.send(body);
 
@@ -2279,7 +2300,14 @@ mod tests {
                                 play_id: None,
                             },
                         };
-                        write_frame(&mut stream, &Response { id: request.id, result }).await;
+                        write_frame(
+                            &mut stream,
+                            &Response {
+                                id: request.id,
+                                result,
+                            },
+                        )
+                        .await;
                     }
                 });
             }
@@ -2347,7 +2375,14 @@ mod tests {
                                 play_id: None,
                             },
                         };
-                        write_frame(&mut stream, &Response { id: request.id, result }).await;
+                        write_frame(
+                            &mut stream,
+                            &Response {
+                                id: request.id,
+                                result,
+                            },
+                        )
+                        .await;
                     }
                 });
             }
@@ -2369,9 +2404,18 @@ mod tests {
             .expect("reoffer");
 
         let json = capture_rx.recv().await.expect("captured frame");
-        assert!(json.contains(r#""command":"reoffer""#), "wire frame was: {json}");
-        assert!(!json.contains(r#""command":"offer""#), "wire frame was: {json}");
-        assert!(json.contains(r#""call_id":"call-1""#), "wire frame was: {json}");
+        assert!(
+            json.contains(r#""command":"reoffer""#),
+            "wire frame was: {json}"
+        );
+        assert!(
+            !json.contains(r#""command":"offer""#),
+            "wire frame was: {json}"
+        );
+        assert!(
+            json.contains(r#""call_id":"call-1""#),
+            "wire frame was: {json}"
+        );
     }
 
     /// A re-offer that changes the codec is the one case the engine refuses, and
@@ -2383,8 +2427,8 @@ mod tests {
     async fn reoffer_retries_as_offer_only_on_the_codec_change_refusal() {
         let (address, mut seen_rx) = spawn_codec_refusing_server().await;
         let (event_tx, _event_rx) = channel();
-        let set = SiphonRtpClientSet::new(vec![(address, 2_000, 1)], None, 5_000, event_tx)
-            .expect("set");
+        let set =
+            SiphonRtpClientSet::new(vec![(address, 2_000, 1)], None, 5_000, event_tx).expect("set");
 
         let rewritten = set
             .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
@@ -2762,9 +2806,10 @@ mod tests {
         assert_eq!(tone["source"], "tone");
         assert_eq!(tone["tone"], "425/1000,0/4000*inf");
 
-        let preset =
-            serde_json::to_value(proto_play_source(&PlayMediaSource::Tone("ringback_eu".into())))
-                .expect("serialize preset");
+        let preset = serde_json::to_value(proto_play_source(&PlayMediaSource::Tone(
+            "ringback_eu".into(),
+        )))
+        .expect("serialize preset");
         assert_eq!(preset["source"], "tone");
         assert_eq!(preset["tone"], "ringback_eu");
 
@@ -3032,7 +3077,11 @@ mod tests {
             PlayEndReason::Error,
         ] {
             let mapped = play_end_reason_from_proto(reason);
-            assert!(!mapped.is_completed(), "{} must not read as completed", mapped.as_str());
+            assert!(
+                !mapped.is_completed(),
+                "{} must not read as completed",
+                mapped.as_str()
+            );
         }
     }
 
@@ -3068,11 +3117,26 @@ mod tests {
     #[test]
     fn bridge_end_reasons_map_one_for_one() {
         for (proto, expected) in [
-            (ProtoWsBridgeEndReason::Detached, WsBridgeEndReason::Detached),
-            (ProtoWsBridgeEndReason::ServerClosed, WsBridgeEndReason::ServerClosed),
-            (ProtoWsBridgeEndReason::ServerStopped, WsBridgeEndReason::ServerStopped),
-            (ProtoWsBridgeEndReason::CallEnded, WsBridgeEndReason::CallEnded),
-            (ProtoWsBridgeEndReason::TransportError, WsBridgeEndReason::TransportError),
+            (
+                ProtoWsBridgeEndReason::Detached,
+                WsBridgeEndReason::Detached,
+            ),
+            (
+                ProtoWsBridgeEndReason::ServerClosed,
+                WsBridgeEndReason::ServerClosed,
+            ),
+            (
+                ProtoWsBridgeEndReason::ServerStopped,
+                WsBridgeEndReason::ServerStopped,
+            ),
+            (
+                ProtoWsBridgeEndReason::CallEnded,
+                WsBridgeEndReason::CallEnded,
+            ),
+            (
+                ProtoWsBridgeEndReason::TransportError,
+                WsBridgeEndReason::TransportError,
+            ),
         ] {
             assert_eq!(ws_bridge_end_reason_from_proto(proto), expected);
         }
@@ -3085,7 +3149,11 @@ mod tests {
             WsBridgeEndReason::CallEnded,
             WsBridgeEndReason::TransportError,
         ] {
-            assert!(reason.is_unexpected(), "{} must read as unexpected", reason.as_str());
+            assert!(
+                reason.is_unexpected(),
+                "{} must read as unexpected",
+                reason.as_str()
+            );
         }
     }
 
@@ -3344,9 +3412,7 @@ mod tests {
             assert_eq!(request.id, 1);
             match request.command {
                 Command::Offer {
-                    call_id,
-                    profile,
-                    ..
+                    call_id, profile, ..
                 } => {
                     assert_eq!(call_id, "call-1");
                     assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/SAVP"));
@@ -3377,7 +3443,10 @@ mod tests {
             transport_protocol: Some("RTP/SAVP".into()),
             ..NgFlags::default()
         };
-        let sdp = client.offer("call-1", "tag-a", b"v=0\r\n", &flags).await.unwrap();
+        let sdp = client
+            .offer("call-1", "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&sdp).contains("203.0.113.1"));
         assert_eq!(client.active_sessions(), 1);
         assert_eq!(client.instance_count(), 1);
@@ -3537,7 +3606,18 @@ mod tests {
         let (event_tx, _event_rx) = channel();
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = client
-            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
+            .play_media(
+                "call-play",
+                "tag-a",
+                &play_source(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(played.duration_ms, Some(1234));
@@ -3558,10 +3638,25 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
 
         let played = client
-            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
+            .play_media(
+                "call-play",
+                "tag-a",
+                &play_source(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
             .await
             .unwrap();
-        assert_eq!(played.duration_ms, Some(1234), "the waiter must still resolve");
+        assert_eq!(
+            played.duration_ms,
+            Some(1234),
+            "the waiter must still resolve"
+        );
 
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -3584,7 +3679,18 @@ mod tests {
         let (event_tx, _event_rx) = channel();
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = client
-            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
+            .play_media(
+                "call-play",
+                "tag-a",
+                &play_source(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(played.duration_ms, None);
@@ -3599,7 +3705,18 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = tokio::time::timeout(
             Duration::from_millis(500),
-            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, false),
+            client.play_media(
+                "call-play",
+                "tag-a",
+                &play_source(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+            ),
         )
         .await
         .expect("play_media(wait=false) must return on accept, not block")
@@ -3617,7 +3734,18 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 100, event_tx);
         let played = tokio::time::timeout(
             Duration::from_millis(2000),
-            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true),
+            client.play_media(
+                "call-play",
+                "tag-a",
+                &play_source(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+            ),
         )
         .await
         .expect("play_media must give up at the fallback timeout, not hang")

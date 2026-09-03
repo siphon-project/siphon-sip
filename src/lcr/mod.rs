@@ -422,7 +422,9 @@ impl LcrClient {
         let (Some(cache), Some(name)) = (&self.cache, &self.cache_name) else {
             return;
         };
-        let ttl = decision.cache_ttl_secs.unwrap_or(self.default_cache_ttl_secs);
+        let ttl = decision
+            .cache_ttl_secs
+            .unwrap_or(self.default_cache_ttl_secs);
         if ttl == 0 {
             return; // API opted out of caching for this decision.
         }
@@ -465,7 +467,10 @@ mod tests {
         assert_eq!(first.gateway_group.as_deref(), Some("carrier-a-pool"));
         assert_eq!(first.rate, Some(0.0042));
         assert_eq!(first.timeout_secs, Some(12));
-        assert_eq!(first.ruri.as_deref(), Some("sip:+12025550123@carrier-a.net"));
+        assert_eq!(
+            first.ruri.as_deref(),
+            Some("sip:+12025550123@carrier-a.net")
+        );
         assert!(first.is_routable());
 
         // Second route: only carrier_id + group + rate; every other field defaults.
@@ -561,7 +566,10 @@ mod tests {
         );
         let decision = with_fallback.fallback_response().expect("fallback present");
         assert_eq!(decision.routes.len(), 1);
-        assert_eq!(decision.routes[0].gateway_group.as_deref(), Some("emergency-pstn"));
+        assert_eq!(
+            decision.routes[0].gateway_group.as_deref(),
+            Some("emergency-pstn")
+        );
         assert_eq!(decision.routes[0].carrier_id, "fallback:emergency-pstn");
         assert!(decision.cache_ttl_secs.is_none());
 
@@ -598,8 +606,14 @@ mod tests {
         let route: Route = serde_json::from_str(json).expect("parse route");
         assert_eq!(route.tech_prefix.as_deref(), Some("1010288"));
         assert_eq!(route.number_policy.as_deref(), Some("pstn-national@2026"));
-        assert_eq!(route.headers.get("X-Account").map(String::as_str), Some("42"));
-        assert_eq!(route.cdr_fields.get("billing_id").map(String::as_str), Some("B-9"));
+        assert_eq!(
+            route.headers.get("X-Account").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            route.cdr_fields.get("billing_id").map(String::as_str),
+            Some("B-9")
+        );
         assert_eq!(route.reroute_causes, vec![404, 503]);
 
         let reparsed: Route =
@@ -708,11 +722,22 @@ mod tests {
     #[tokio::test]
     async fn client_falls_back_to_gateway_group_on_transport_error() {
         let url = closed_port_url().await;
-        let client = LcrClient::new(url, 500, None, None, None, 300, Some("emergency".to_string()));
+        let client = LcrClient::new(
+            url,
+            500,
+            None,
+            None,
+            None,
+            300,
+            Some("emergency".to_string()),
+        );
         match client.route(&sample_request()).await {
             LcrOutcome::Decision(decision) => {
                 assert_eq!(decision.routes.len(), 1);
-                assert_eq!(decision.routes[0].gateway_group.as_deref(), Some("emergency"));
+                assert_eq!(
+                    decision.routes[0].gateway_group.as_deref(),
+                    Some("emergency")
+                );
                 assert!(decision.cache_ttl_secs.is_none());
             }
             LcrOutcome::Unavailable => panic!("expected the fallback decision"),
@@ -779,13 +804,18 @@ mod tests {
         let response: LcrResponse = serde_json::from_str(json).expect("parses");
 
         assert_eq!(response.destination.as_deref(), Some("+12025550199"));
-        assert_eq!(response.routes[1].destination.as_deref(), Some("+12025550188"));
+        assert_eq!(
+            response.routes[1].destination.as_deref(),
+            Some("+12025550188")
+        );
 
         // Absent on the wire when unset, so the contract stays additive.
         let minimal: LcrResponse =
             serde_json::from_str(r#"{"routes":[{"carrier_id":"a"}]}"#).expect("parses");
         assert!(minimal.destination.is_none());
-        assert!(!serde_json::to_string(&minimal).unwrap().contains("destination"));
+        assert!(!serde_json::to_string(&minimal)
+            .unwrap()
+            .contains("destination"));
     }
 
     #[test]
@@ -801,9 +831,15 @@ mod tests {
         }"#;
         let response: LcrResponse = serde_json::from_str(json).expect("parses");
 
-        assert_eq!(response.routes[0].caller_id.as_deref(), Some("+12025550111"));
+        assert_eq!(
+            response.routes[0].caller_id.as_deref(),
+            Some("+12025550111")
+        );
         assert!(response.routes[0].caller_id_presentation.is_none());
-        assert_eq!(response.routes[1].caller_id.as_deref(), Some("+12025550122"));
+        assert_eq!(
+            response.routes[1].caller_id.as_deref(),
+            Some("+12025550122")
+        );
         assert_eq!(
             response.routes[1].caller_id_presentation.as_deref(),
             Some("restricted")

@@ -115,7 +115,11 @@ pub fn resolve_rewrite_policy(
 
     let mut locale = runtime.registry.default_locale.clone();
     if let Some(home) = home {
-        locale.country_code = home.trim().strip_prefix('+').unwrap_or(home.trim()).to_string();
+        locale.country_code = home
+            .trim()
+            .strip_prefix('+')
+            .unwrap_or(home.trim())
+            .to_string();
     }
 
     Ok(Arc::new(NumberPolicy::uniform(locale, format, walk)))
@@ -201,8 +205,11 @@ impl PyNumbersNamespace {
         let runtime = number_runtime();
         let mut locale = runtime.registry.default_locale.clone();
         if let Some(home) = home {
-            locale.country_code =
-                home.trim().strip_prefix('+').unwrap_or(home.trim()).to_string();
+            locale.country_code = home
+                .trim()
+                .strip_prefix('+')
+                .unwrap_or(home.trim())
+                .to_string();
         }
         let number = Number::parse(raw, &locale)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
@@ -211,12 +218,7 @@ impl PyNumbersNamespace {
 
     /// Names of the configured number policies.
     fn policy_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = number_runtime()
-            .registry
-            .policies
-            .keys()
-            .cloned()
-            .collect();
+        let mut names: Vec<String> = number_runtime().registry.policies.keys().cloned().collect();
         names.sort();
         names
     }

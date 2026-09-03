@@ -22,12 +22,22 @@ use std::path::Path;
 /// Open `path` for append, creating the file and any missing parent directory.
 pub fn open_append(path: impl AsRef<Path>) -> io::Result<std::fs::File> {
     let path = path.as_ref();
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::OpenOptions::new().create(true).append(true).open(path)
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
         }
         result => result,
     }
@@ -43,7 +53,10 @@ pub async fn open_append_async(path: impl AsRef<Path>) -> io::Result<tokio::fs::
         .await
     {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::OpenOptions::new()

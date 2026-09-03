@@ -152,7 +152,11 @@ fn hash_different_keys_may_select_different_destinations() {
     }
 
     // With 100 different keys and 2 destinations, both should be hit.
-    assert_eq!(seen.len(), 2, "hash did not distribute across both destinations");
+    assert_eq!(
+        seen.len(),
+        2,
+        "hash did not distribute across both destinations"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +376,9 @@ fn concurrent_select_and_health_toggling() {
     }
 
     for handle in handles {
-        handle.join().expect("thread panicked during concurrent gateway test");
+        handle
+            .join()
+            .expect("thread panicked during concurrent gateway test");
     }
 
     // Restore health and verify the system still works.

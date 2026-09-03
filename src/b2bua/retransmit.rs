@@ -44,7 +44,10 @@ pub struct RetransmitKey {
 
 impl RetransmitKey {
     pub fn new(branch: impl Into<String>, method: Method) -> Self {
-        Self { branch: branch.into(), method }
+        Self {
+            branch: branch.into(),
+            method,
+        }
     }
 }
 
@@ -171,7 +174,8 @@ impl B2buaRetransmits {
         // Re-arming an existing key (the 401/407 or 422 retry) replaces rather
         // than adds, so only a fresh key moves the counter.
         if replaced.is_none() {
-            self.armed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.armed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         true
     }
@@ -179,7 +183,8 @@ impl B2buaRetransmits {
     /// Stop retransmitting one request. Returns `true` if a schedule was armed.
     pub fn disarm(&self, key: &RetransmitKey) -> bool {
         if self.entries.remove(key).is_some() {
-            self.armed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.armed
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return true;
         }
         false
@@ -248,7 +253,11 @@ impl B2buaRetransmits {
 
         for (key, destination, attempts) in expired {
             if self.disarm(&key) {
-                due.push(Due::GaveUp { key, destination, attempts });
+                due.push(Due::GaveUp {
+                    key,
+                    destination,
+                    attempts,
+                });
             }
         }
 
@@ -322,7 +331,12 @@ mod tests {
         // RFC 3261 §17.1.1.2: Timer A fires at T1 and doubles on every fire.
         let store = store();
         let key = invite_key();
-        assert!(store.arm(key.clone(), Bytes::from_static(b"INVITE"), target(Transport::Udp), Instant::now()));
+        assert!(store.arm(
+            key.clone(),
+            Bytes::from_static(b"INVITE"),
+            target(Transport::Udp),
+            Instant::now()
+        ));
 
         let t1 = store.timers.t1;
         let gaps = schedule(&store, &key, 5);
@@ -341,7 +355,10 @@ mod tests {
         }
         // The fifth interval (16·T1 = 8s) is past T2, proving INVITE is not
         // capped the way non-INVITE is.
-        assert!(gaps[4] > store.timers.t2, "INVITE doubling must not be capped at T2");
+        assert!(
+            gaps[4] > store.timers.t2,
+            "INVITE doubling must not be capped at T2"
+        );
     }
 
     #[test]
@@ -349,7 +366,12 @@ mod tests {
         // RFC 3261 §17.1.2.2: Timer E doubles but never exceeds T2.
         let store = store();
         let key = RetransmitKey::new("z9hG4bK-bye-1", Method::Bye);
-        assert!(store.arm(key.clone(), Bytes::from_static(b"BYE"), target(Transport::Udp), Instant::now()));
+        assert!(store.arm(
+            key.clone(),
+            Bytes::from_static(b"BYE"),
+            target(Transport::Udp),
+            Instant::now()
+        ));
 
         let t2 = store.timers.t2;
         let gaps = schedule(&store, &key, 5);
@@ -377,7 +399,12 @@ mod tests {
         let store = store();
         let key = invite_key();
         let armed_at = Instant::now();
-        store.arm(key.clone(), Bytes::from_static(b"INVITE"), target(Transport::Udp), armed_at);
+        store.arm(
+            key.clone(),
+            Bytes::from_static(b"INVITE"),
+            target(Transport::Udp),
+            armed_at,
+        );
 
         // Just before the deadline the schedule is still live.
         let _ = store.due(armed_at + store.timers.timer_b() - Duration::from_millis(1));
@@ -385,7 +412,9 @@ mod tests {
 
         let events = store.due(armed_at + store.timers.timer_b());
         assert!(
-            events.iter().any(|event| matches!(event, Due::GaveUp { .. })),
+            events
+                .iter()
+                .any(|event| matches!(event, Due::GaveUp { .. })),
             "64·T1 must produce a GaveUp"
         );
         assert!(
@@ -408,7 +437,12 @@ mod tests {
         ] {
             let key = RetransmitKey::new(format!("z9hG4bK-{transport}"), Method::Invite);
             assert!(
-                !store.arm(key, Bytes::from_static(b"INVITE"), target(transport), Instant::now()),
+                !store.arm(
+                    key,
+                    Bytes::from_static(b"INVITE"),
+                    target(transport),
+                    Instant::now()
+                ),
                 "{transport} must not arm a retransmit schedule"
             );
         }
@@ -422,7 +456,12 @@ mod tests {
         let store = store();
         let key = invite_key();
         let armed_at = Instant::now();
-        store.arm(key.clone(), Bytes::from_static(b"INVITE"), target(Transport::Udp), armed_at);
+        store.arm(
+            key.clone(),
+            Bytes::from_static(b"INVITE"),
+            target(Transport::Udp),
+            armed_at,
+        );
 
         assert!(store.disarm(&key));
         assert!(store.due(armed_at + store.timers.timer_b() * 2).is_empty());
@@ -441,12 +480,26 @@ mod tests {
         let cancel = RetransmitKey::new(branch, Method::Cancel);
         let now = Instant::now();
 
-        store.arm(invite.clone(), Bytes::from_static(b"INVITE"), target(Transport::Udp), now);
-        store.arm(cancel.clone(), Bytes::from_static(b"CANCEL"), target(Transport::Udp), now);
+        store.arm(
+            invite.clone(),
+            Bytes::from_static(b"INVITE"),
+            target(Transport::Udp),
+            now,
+        );
+        store.arm(
+            cancel.clone(),
+            Bytes::from_static(b"CANCEL"),
+            target(Transport::Udp),
+            now,
+        );
         assert_eq!(store.len(), 2);
 
         store.disarm(&cancel);
-        assert_eq!(store.len(), 1, "disarming the CANCEL must leave the INVITE armed");
+        assert_eq!(
+            store.len(),
+            1,
+            "disarming the CANCEL must leave the INVITE armed"
+        );
 
         let events = store.due(now + store.timers.t1);
         match events.as_slice() {
@@ -460,9 +513,24 @@ mod tests {
         let store = store();
         let branch = "z9hG4bK-teardown";
         let now = Instant::now();
-        store.arm(RetransmitKey::new(branch, Method::Invite), Bytes::from_static(b"I"), target(Transport::Udp), now);
-        store.arm(RetransmitKey::new(branch, Method::Cancel), Bytes::from_static(b"C"), target(Transport::Udp), now);
-        store.arm(RetransmitKey::new("other", Method::Bye), Bytes::from_static(b"B"), target(Transport::Udp), now);
+        store.arm(
+            RetransmitKey::new(branch, Method::Invite),
+            Bytes::from_static(b"I"),
+            target(Transport::Udp),
+            now,
+        );
+        store.arm(
+            RetransmitKey::new(branch, Method::Cancel),
+            Bytes::from_static(b"C"),
+            target(Transport::Udp),
+            now,
+        );
+        store.arm(
+            RetransmitKey::new("other", Method::Bye),
+            Bytes::from_static(b"B"),
+            target(Transport::Udp),
+            now,
+        );
 
         assert_eq!(store.disarm_branch(branch), 2);
         assert_eq!(store.len(), 1, "an unrelated branch must survive");
@@ -479,14 +547,22 @@ mod tests {
         store.arm(key.clone(), original.clone(), target(Transport::Udp), now);
 
         match store.due(now + store.timers.t1).as_slice() {
-            [Due::Send { data, target: sent, attempt, .. }] => {
+            [Due::Send {
+                data,
+                target: sent,
+                attempt,
+                ..
+            }] => {
                 assert_eq!(data, &original, "retransmit must replay identical bytes");
                 assert_eq!(
                     sent.source_local_addr,
                     Some("192.0.2.1:6100".parse().expect("test source")),
                     "retransmit must leave the same local socket as the original"
                 );
-                assert_eq!(sent.destination, "192.0.2.10:5060".parse().expect("test destination"));
+                assert_eq!(
+                    sent.destination,
+                    "192.0.2.10:5060".parse().expect("test destination")
+                );
                 assert_eq!(*attempt, 1);
             }
             other => panic!("expected exactly one retransmit, got {other:?}"),
@@ -499,8 +575,18 @@ mod tests {
         let store = store();
         let key = invite_key();
         let now = Instant::now();
-        store.arm(key.clone(), Bytes::from_static(b"first"), target(Transport::Udp), now);
-        store.arm(key.clone(), Bytes::from_static(b"second"), target(Transport::Udp), now);
+        store.arm(
+            key.clone(),
+            Bytes::from_static(b"first"),
+            target(Transport::Udp),
+            now,
+        );
+        store.arm(
+            key.clone(),
+            Bytes::from_static(b"second"),
+            target(Transport::Udp),
+            now,
+        );
 
         assert_eq!(store.len(), 1);
         match store.due(now + store.timers.t1).as_slice() {
@@ -517,7 +603,12 @@ mod tests {
 
         for index in 0..2_000 {
             let key = RetransmitKey::new(format!("z9hG4bK-call-{index}"), Method::Invite);
-            store.arm(key.clone(), Bytes::from_static(b"INVITE"), target(Transport::Udp), Instant::now());
+            store.arm(
+                key.clone(),
+                Bytes::from_static(b"INVITE"),
+                target(Transport::Udp),
+                Instant::now(),
+            );
             store.disarm(&key);
         }
 
@@ -547,12 +638,22 @@ mod tests {
         let cancel = RetransmitKey::new("z9hG4bK-a", Method::Cancel);
         let bye = RetransmitKey::new("z9hG4bK-b", Method::Bye);
 
-        store.arm(invite.clone(), Bytes::from_static(b"I"), target(Transport::Udp), now);
+        store.arm(
+            invite.clone(),
+            Bytes::from_static(b"I"),
+            target(Transport::Udp),
+            now,
+        );
         check(&store, "arm");
         assert!(store.is_armed());
 
         // Re-arming the same key replaces — the count must not double.
-        store.arm(invite.clone(), Bytes::from_static(b"I2"), target(Transport::Udp), now);
+        store.arm(
+            invite.clone(),
+            Bytes::from_static(b"I2"),
+            target(Transport::Udp),
+            now,
+        );
         check(&store, "re-arm");
         assert_eq!(store.len(), 1);
 
@@ -566,8 +667,18 @@ mod tests {
         check(&store, "refused arm");
         assert_eq!(store.len(), 1);
 
-        store.arm(cancel, Bytes::from_static(b"C"), target(Transport::Udp), now);
-        store.arm(bye.clone(), Bytes::from_static(b"B"), target(Transport::Udp), now);
+        store.arm(
+            cancel,
+            Bytes::from_static(b"C"),
+            target(Transport::Udp),
+            now,
+        );
+        store.arm(
+            bye.clone(),
+            Bytes::from_static(b"B"),
+            target(Transport::Udp),
+            now,
+        );
         check(&store, "more arms");
 
         // A no-op disarm must not move it either.
@@ -582,7 +693,12 @@ mod tests {
         assert!(!store.is_armed(), "the store is empty again");
 
         // And the give-up path.
-        store.arm(invite.clone(), Bytes::from_static(b"I"), target(Transport::Udp), now);
+        store.arm(
+            invite.clone(),
+            Bytes::from_static(b"I"),
+            target(Transport::Udp),
+            now,
+        );
         let _ = store.due(now + store.timers.timer_b());
         check(&store, "give-up");
         assert!(!store.is_armed());
@@ -606,7 +722,9 @@ mod tests {
 
         let events = store.due(armed_at + store.timers.timer_b());
         assert_eq!(events.len(), 500);
-        assert!(events.iter().all(|event| matches!(event, Due::GaveUp { .. })));
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, Due::GaveUp { .. })));
         assert_eq!(store.len(), 0, "give-up must drain the store");
     }
 }

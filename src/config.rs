@@ -1,12 +1,12 @@
 //! YAML configuration — `siphon.yaml` deserialization via serde_yaml_ng.
 
+use crate::error::{Result, SiphonError};
+use crate::rtpengine::profile::{validate_ws_sample_rate, WsTeeDirection, WsVadEngine};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
-use crate::error::{Result, SiphonError};
-use crate::rtpengine::profile::{validate_ws_sample_rate, WsTeeDirection, WsVadEngine};
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion — `${VAR}` and `${VAR:-default}`
@@ -79,7 +79,6 @@ pub struct Config {
 
     // Optional top-level sections — all `None` when not present.
     // Rust holds them as data; wiring into the runtime happens in later phases.
-
     /// Public IP advertised in Via/Contact/SDP (e.g. EC2 public IP when binding 0.0.0.0).
     pub advertised_address: Option<String>,
 
@@ -919,11 +918,21 @@ pub struct DiameterCxConfig {
     pub reconnect_delay: u64,
 }
 
-fn default_diameter_port() -> u16 { 3868 }
-fn default_diameter_transport() -> String { "tcp".to_string() }
-fn default_watchdog_interval() -> u64 { 30 }
-fn default_reconnect_delay() -> u64 { 5 }
-fn default_diameter_route_algorithm() -> String { "failover".to_string() }
+fn default_diameter_port() -> u16 {
+    3868
+}
+fn default_diameter_transport() -> String {
+    "tcp".to_string()
+}
+fn default_watchdog_interval() -> u64 {
+    30
+}
+fn default_reconnect_delay() -> u64 {
+    5
+}
+fn default_diameter_route_algorithm() -> String {
+    "failover".to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Diameter peer + routing table (top-level `diameter:` section)
@@ -1245,11 +1254,11 @@ impl DiameterConfig {
             application_ids,
             watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
-            product_name: self.product_name.clone()
+            product_name: self
+                .product_name
+                .clone()
                 .unwrap_or_else(|| product_name.to_string()),
-            firmware_revision: crate::diameter::peer::version_to_firmware_revision(
-                product_version,
-            ),
+            firmware_revision: crate::diameter::peer::version_to_firmware_revision(product_version),
         }
     }
 }
@@ -2459,7 +2468,10 @@ where
 /// `ws://` / `wss://` can never connect.  Caught here rather than as a
 /// connect failure per call.  `field` is threaded through so an operator with
 /// a bad `ws_tee` is not told about `ws_uri`, a field they never set.
-fn validate_ws_uri_field<E>(value: Option<String>, field: &str) -> std::result::Result<Option<String>, E>
+fn validate_ws_uri_field<E>(
+    value: Option<String>,
+    field: &str,
+) -> std::result::Result<Option<String>, E>
 where
     E: serde::de::Error,
 {
@@ -2547,9 +2559,7 @@ where
 /// The media engine *fails* an offer/answer carrying an out-of-range rate rather
 /// than clamping it, so a profile with a bad value produces calls that answer
 /// and never get media.  Rejecting at load means the operator learns at boot.
-fn deserialize_ws_sample_rate<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<u32>, D::Error>
+fn deserialize_ws_sample_rate<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -2885,7 +2895,9 @@ pub enum RtpEngineSetConfig {
     /// A single RTPEngine instance (shorthand).
     Single(RtpEngineInstanceConfig),
     /// Multiple instances with optional weights for load-balancing.
-    Set { instances: Vec<RtpEngineInstanceConfig> },
+    Set {
+        instances: Vec<RtpEngineInstanceConfig>,
+    },
 }
 
 impl RtpEngineSetConfig {
@@ -3052,9 +3064,7 @@ impl GatewayDestConfig {
         let uri_lower = self.uri.to_lowercase();
         if let Some(pos) = uri_lower.find(";transport=") {
             let after = &uri_lower[pos + 11..];
-            let end = after
-                .find([';', '>', ' '])
-                .unwrap_or(after.len());
+            let end = after.find([';', '>', ' ']).unwrap_or(after.len());
             return after[..end].to_string();
         }
         "udp".to_string()
@@ -3204,9 +3214,15 @@ impl Default for RfConfig {
     }
 }
 
-fn default_true() -> bool { true }
-fn default_rf_node_functionality() -> String { "scscf".to_string() }
-fn default_rf_service_context_id() -> String { "32260@3gpp.org".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_rf_node_functionality() -> String {
+    "scscf".to_string()
+}
+fn default_rf_service_context_id() -> String {
+    "32260@3gpp.org".to_string()
+}
 
 /// Ro online charging (Diameter Credit-Control) configuration.
 ///
@@ -3325,18 +3341,30 @@ impl Default for RoConfig {
     }
 }
 
-fn default_ro_interval() -> u32 { 30 }
-fn default_ro_node_functionality() -> String { "pcscf".to_string() }
-fn default_ro_sms_service_context_id() -> String { "32274@3gpp.org".to_string() }
+fn default_ro_interval() -> u32 {
+    30
+}
+fn default_ro_node_functionality() -> String {
+    "pcscf".to_string()
+}
+fn default_ro_sms_service_context_id() -> String {
+    "32274@3gpp.org".to_string()
+}
 /// Chargeable duration runs from the answer (TS 32.260 §5): a call that rings
 /// and is never answered has no chargeable duration at all.
 fn default_ro_charge_from() -> String {
     "answer".to_string()
 }
 
-fn default_ro_charge() -> String { "orig".to_string() }
-fn default_ro_ocs_failure() -> String { "terminate".to_string() }
-fn default_ro_denied_status() -> u16 { 402 }
+fn default_ro_charge() -> String {
+    "orig".to_string()
+}
+fn default_ro_ocs_failure() -> String {
+    "terminate".to_string()
+}
+fn default_ro_denied_status() -> u16 {
+    402
+}
 
 // ---------------------------------------------------------------------------
 // CDR (Call Detail Records)
@@ -3427,22 +3455,31 @@ impl CdrYamlConfig {
     pub fn to_cdr_config(&self) -> crate::cdr::CdrConfig {
         let backend = match self.backend.as_str() {
             "syslog" => {
-                let target = self.syslog.as_ref()
+                let target = self
+                    .syslog
+                    .as_ref()
                     .map(|s| s.target.clone())
                     .unwrap_or_else(|| "127.0.0.1:514".to_string());
                 crate::cdr::CdrBackendType::Syslog { target }
             }
             "http" => {
-                let (url, auth_header) = self.http.as_ref()
+                let (url, auth_header) = self
+                    .http
+                    .as_ref()
                     .map(|h| (h.url.clone(), h.auth_header.clone()))
                     .unwrap_or_else(|| ("http://127.0.0.1:9080/cdr".to_string(), None));
                 crate::cdr::CdrBackendType::Http { url, auth_header }
             }
             _ => {
-                let (path, rotate_size_mb) = self.file.as_ref()
+                let (path, rotate_size_mb) = self
+                    .file
+                    .as_ref()
                     .map(|f| (f.path.clone(), f.rotate_size_mb))
                     .unwrap_or_else(|| (default_cdr_file_path(), default_cdr_rotate_size()));
-                crate::cdr::CdrBackendType::File { path, rotate_size_mb }
+                crate::cdr::CdrBackendType::File {
+                    path,
+                    rotate_size_mb,
+                }
             }
         };
 
@@ -3847,12 +3884,24 @@ pub struct LiTlsConfig {
     pub server_name: Option<String>,
 }
 
-fn default_li_x2_transport() -> String { "tcp".to_string() }
-fn default_li_reconnect_interval() -> u64 { 5 }
-fn default_li_channel_size() -> usize { 10_000 }
-fn default_siprec_session_copies() -> u32 { 1 }
-fn default_siprec_transport() -> String { "tcp".to_string() }
-fn default_siprec_src_profile() -> String { "siprec_src".to_string() }
+fn default_li_x2_transport() -> String {
+    "tcp".to_string()
+}
+fn default_li_reconnect_interval() -> u64 {
+    5
+}
+fn default_li_channel_size() -> usize {
+    10_000
+}
+fn default_siprec_session_copies() -> u32 {
+    1
+}
+fn default_siprec_transport() -> String {
+    "tcp".to_string()
+}
+fn default_siprec_src_profile() -> String {
+    "siprec_src".to_string()
+}
 
 // ---------------------------------------------------------------------------
 // SRS — Session Recording Server
@@ -3921,10 +3970,18 @@ pub struct SrsHttpConfig {
     pub upload_audio: bool,
 }
 
-fn default_srs_recording_dir() -> String { "/var/lib/siphon/recordings".to_string() }
-fn default_srs_max_sessions() -> usize { 1000 }
-fn default_srs_backend() -> String { "file".to_string() }
-fn default_srs_rtpengine_profile() -> String { "srs_recording".to_string() }
+fn default_srs_recording_dir() -> String {
+    "/var/lib/siphon/recordings".to_string()
+}
+fn default_srs_max_sessions() -> usize {
+    1000
+}
+fn default_srs_backend() -> String {
+    "file".to_string()
+}
+fn default_srs_rtpengine_profile() -> String {
+    "srs_recording".to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -3975,9 +4032,8 @@ pub enum LogFormat {
 impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            SiphonError::Config(format!("cannot read siphon.yaml: {e}"))
-        })?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| SiphonError::Config(format!("cannot read siphon.yaml: {e}")))?;
         let expanded = expand_env_vars(&content);
         let mut config = Self::from_str_raw(&expanded)?;
         config.anchor_script_paths(path);
@@ -4096,11 +4152,7 @@ impl Config {
         }
         // `enabled: false` is the same as no block at all, so a node that has
         // turned content off is not held to the backend requirement.
-        if !lawful_intercept
-            .x3
-            .as_ref()
-            .is_some_and(|x3| x3.enabled)
-        {
+        if !lawful_intercept.x3.as_ref().is_some_and(|x3| x3.enabled) {
             return Ok(());
         }
 
@@ -4160,11 +4212,7 @@ impl Config {
                         } else {
                             "those fields"
                         },
-                        if unsupported.len() == 1 {
-                            "it"
-                        } else {
-                            "them"
-                        },
+                        if unsupported.len() == 1 { "it" } else { "them" },
                     )));
                 }
             }
@@ -4187,11 +4235,7 @@ impl Config {
     /// should call [`Config::extension_config`] instead and walk the
     /// `serde_yaml_ng::Value` themselves.
     pub fn extension_path(&self, name: &str) -> Option<&Path> {
-        self.extensions
-            .as_ref()?
-            .get(name)?
-            .as_str()
-            .map(Path::new)
+        self.extensions.as_ref()?.get(name)?.as_str().map(Path::new)
     }
 
     /// Raw-value accessor for an extension entry. Returns the entry's
@@ -4677,7 +4721,10 @@ tls:
             tls.certificates[0].server_names,
             vec!["sip.tenant-a.example", "sip.tenant-a.net"]
         );
-        assert_eq!(tls.certificates[0].certificate, "/etc/siphon/tls/tenant-a.crt");
+        assert_eq!(
+            tls.certificates[0].certificate,
+            "/etc/siphon/tls/tenant-a.crt"
+        );
         assert_eq!(tls.certificates[1].server_names, vec!["*.tenant-b.example"]);
     }
 
@@ -5043,7 +5090,10 @@ log:
         assert_eq!(config.script.reload, ReloadMode::Sighup);
         assert_eq!(config.registrar.backend, RegistrarBackendType::Redis);
         assert_eq!(config.registrar.default_expires, 1800);
-        assert_eq!(config.registrar.redis.as_ref().unwrap().url, "redis://127.0.0.1:6379");
+        assert_eq!(
+            config.registrar.redis.as_ref().unwrap().url,
+            "redis://127.0.0.1:6379"
+        );
         assert_eq!(config.auth.users.get("alice").unwrap(), "secret");
         assert_eq!(config.log.level, LogLevel::Debug);
         assert_eq!(config.log.format, LogFormat::Json);
@@ -5379,7 +5429,10 @@ registrant:
             .profiles
             .get("whatsapp_dtls_in")
             .expect("whatsapp_dtls_in profile");
-        assert_eq!(dtls_in.answer.transport_protocol.as_deref(), Some("RTP/SAVPF"));
+        assert_eq!(
+            dtls_in.answer.transport_protocol.as_deref(),
+            Some("RTP/SAVPF")
+        );
         assert_eq!(dtls_in.answer.dtls.as_deref(), Some("passive"));
         let dtls_out = media
             .profiles
@@ -5674,7 +5727,14 @@ tls:
 
     #[test]
     fn tls_method_accepts_openssl_and_kamailio_spellings() {
-        for spelling in ["TLSv1_2", "TLSv1.2", "tlsv1_2", " TLSv1_2 ", "TLSv1.2+", "1.2"] {
+        for spelling in [
+            "TLSv1_2",
+            "TLSv1.2",
+            "tlsv1_2",
+            " TLSv1_2 ",
+            "TLSv1.2+",
+            "1.2",
+        ] {
             assert_eq!(
                 spelling.parse::<TlsMethod>(),
                 Ok(TlsMethod::Tls12),
@@ -5894,7 +5954,7 @@ media:
         assert_eq!(siphon_rtp.address.as_deref(), Some("127.0.0.1:8080"));
         assert_eq!(siphon_rtp.control_secret.as_deref(), Some("s3cret"));
         assert_eq!(siphon_rtp.timeout_ms, 2000); // default
-        // Single `address` normalizes to one (address, timeout, weight) tuple.
+                                                 // Single `address` normalizes to one (address, timeout, weight) tuple.
         let instances = siphon_rtp.instances();
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0], ("127.0.0.1:8080".to_string(), 2000, 1));
@@ -6031,7 +6091,10 @@ media:
         let media = config.media.unwrap();
         assert_eq!(media.profiles.len(), 1);
         let profile = media.profiles.get("srtp_to_srtp").unwrap();
-        assert_eq!(profile.offer.transport_protocol.as_deref(), Some("RTP/SAVP"));
+        assert_eq!(
+            profile.offer.transport_protocol.as_deref(),
+            Some("RTP/SAVP")
+        );
         assert_eq!(profile.offer.ice.as_deref(), Some("remove"));
         assert!(profile.offer.dtls.is_none());
         assert_eq!(profile.offer.direction, vec!["external", "internal"]);
@@ -6209,7 +6272,12 @@ media:
         let config = Config::from_str(&yaml).unwrap();
         let media = config.media.unwrap();
         assert_eq!(
-            media.profiles.get("voice_ai_custom").unwrap().offer.rtcp_mux,
+            media
+                .profiles
+                .get("voice_ai_custom")
+                .unwrap()
+                .offer
+                .rtcp_mux,
             vec!["offer", "require"]
         );
     }
@@ -6337,9 +6405,9 @@ media:
     #[test]
     fn rejects_media_profile_bad_ws_sample_rates() {
         for (field, value) in [
-            ("ws_sample_rate", "44100"),  // not a whole kHz
-            ("ws_sample_rate", "4000"),   // below the floor
-            ("ws_sample_rate", "96000"),  // above the ceiling
+            ("ws_sample_rate", "44100"), // not a whole kHz
+            ("ws_sample_rate", "4000"),  // below the floor
+            ("ws_sample_rate", "96000"), // above the ceiling
             ("ws_tee_sample_rate", "12345"),
             ("ws_tee_sample_rate", "0"),
         ] {
@@ -6347,8 +6415,7 @@ media:
                 SIPHON_RTP_BACKEND,
                 &format!("      offer:\n        {field}: {value}\n      answer: {{}}\n"),
             );
-            let error = Config::from_str(&yaml)
-                .expect_err("{field}={value} must be rejected");
+            let error = Config::from_str(&yaml).expect_err("{field}={value} must be rejected");
             assert!(
                 error.to_string().contains(field),
                 "error should name {field}: {error}"
@@ -6512,7 +6579,14 @@ media:
         );
         let config = Config::from_str(&yaml).expect("rtpengine honours both");
         let media = config.media.unwrap();
-        assert!(media.profiles.get("voice_ai_custom").unwrap().offer.received_from);
+        assert!(
+            media
+                .profiles
+                .get("voice_ai_custom")
+                .unwrap()
+                .offer
+                .received_from
+        );
     }
 
     #[test]
@@ -6673,7 +6747,10 @@ gateway:
         assert_eq!(group1.destinations[0].weight, 3);
         assert_eq!(group1.destinations[0].transport, None); // omitted
         assert_eq!(group1.destinations[0].effective_transport(), "udp"); // default
-        assert_eq!(group1.destinations[0].attrs.get("region").unwrap(), "us-east");
+        assert_eq!(
+            group1.destinations[0].attrs.get("region").unwrap(),
+            "us-east"
+        );
         assert_eq!(group1.destinations[1].transport, Some("tcp".to_string()));
         assert_eq!(group1.destinations[1].priority, 2);
 
@@ -6742,7 +6819,8 @@ session_timer: {}
             ("uac", SessionRefresher::Uac),
             ("uas", SessionRefresher::Uas),
         ] {
-            let yaml = format!(r#"
+            let yaml = format!(
+                r#"
 listen:
   udp:
     - "0.0.0.0:5060"
@@ -6753,7 +6831,8 @@ script:
   path: "scripts/proxy_default.py"
 session_timer:
   refresher: {variant}
-"#);
+"#
+            );
             let config = Config::from_str(&yaml).unwrap();
             assert_eq!(config.session_timer.unwrap().refresher, expected);
         }
@@ -6790,7 +6869,9 @@ session_timer:
         assert!(runtime.enabled);
         assert!(runtime.include_register);
         assert_eq!(runtime.channel_size, 5000);
-        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::File { ref path, rotate_size_mb } if path == "/tmp/cdr.jsonl" && rotate_size_mb == 50));
+        assert!(
+            matches!(runtime.backend, crate::cdr::CdrBackendType::File { ref path, rotate_size_mb } if path == "/tmp/cdr.jsonl" && rotate_size_mb == 50)
+        );
     }
 
     #[test]
@@ -6816,7 +6897,9 @@ session_timer:
         assert_eq!(cdr.backend, "http");
 
         let runtime = cdr.to_cdr_config();
-        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::Http { ref url, ref auth_header } if url == "https://collector.example.com/v1/cdr" && auth_header.as_deref() == Some("Bearer secret")));
+        assert!(
+            matches!(runtime.backend, crate::cdr::CdrBackendType::Http { ref url, ref auth_header } if url == "https://collector.example.com/v1/cdr" && auth_header.as_deref() == Some("Bearer secret"))
+        );
     }
 
     #[test]
@@ -6838,7 +6921,9 @@ session_timer:
         );
         let config = Config::from_str(yaml).unwrap();
         let runtime = config.cdr.unwrap().to_cdr_config();
-        assert!(matches!(runtime.backend, crate::cdr::CdrBackendType::Syslog { ref target } if target == "10.0.0.5:514"));
+        assert!(
+            matches!(runtime.backend, crate::cdr::CdrBackendType::Syslog { ref target } if target == "10.0.0.5:514")
+        );
     }
 
     #[test]
@@ -6924,7 +7009,10 @@ session_timer:
         assert_eq!(x2.transport, "tls");
         assert_eq!(x2.reconnect_interval_secs, 10);
         assert_eq!(x2.channel_size, 5000);
-        assert_eq!(x2.tls.unwrap().ca_cert.unwrap(), "/etc/siphon/li/mediation-ca.pem");
+        assert_eq!(
+            x2.tls.unwrap().ca_cert.unwrap(),
+            "/etc/siphon/li/mediation-ca.pem"
+        );
 
         // X3 is a switch and nothing more: the media engine frames the content
         // and delivers it to the destinations provisioned over X1.
@@ -7040,7 +7128,10 @@ session_timer:
         assert_eq!(diameter.peers[1].transport.as_deref(), Some("sctp"));
         assert_eq!(diameter.peers[1].watchdog_interval, Some(60));
         assert_eq!(diameter.peers[2].name, "ocs1");
-        assert_eq!(diameter.peers[2].destination_host.as_deref(), Some("ocs-primary.charging.example.com"));
+        assert_eq!(
+            diameter.peers[2].destination_host.as_deref(),
+            Some("ocs-primary.charging.example.com")
+        );
         assert_eq!(diameter.peers[2].port, 3868); // default
 
         // Routes
@@ -7178,7 +7269,8 @@ session_timer:
         let diameter = config.diameter.as_ref().unwrap();
 
         // Cx with matching realm
-        let cx_peers = diameter.peers_for_application(&DiameterApplication::Cx, Some("example.com"));
+        let cx_peers =
+            diameter.peers_for_application(&DiameterApplication::Cx, Some("example.com"));
         assert_eq!(cx_peers.len(), 2);
         assert_eq!(cx_peers[0].name, "hss1");
         assert_eq!(cx_peers[1].name, "hss2");
@@ -7388,17 +7480,21 @@ script:
 
     #[test]
     fn dscp_to_tos_conversion() {
-        assert_eq!(dscp_to_tos(0), 0);      // BE
-        assert_eq!(dscp_to_tos(24), 96);     // CS3 → signaling
-        assert_eq!(dscp_to_tos(46), 184);    // EF  → voice media
-        assert_eq!(dscp_to_tos(34), 136);    // AF41 → video
-        assert_eq!(dscp_to_tos(63), 252);    // max DSCP
+        assert_eq!(dscp_to_tos(0), 0); // BE
+        assert_eq!(dscp_to_tos(24), 96); // CS3 → signaling
+        assert_eq!(dscp_to_tos(46), 184); // EF  → voice media
+        assert_eq!(dscp_to_tos(34), 136); // AF41 → video
+        assert_eq!(dscp_to_tos(63), 252); // max DSCP
     }
 
     #[test]
     fn listen_config_defaults_to_cs3() {
         let config = Config::from_str(minimal_yaml()).unwrap();
-        assert_eq!(config.listen.dscp, Some(24), "default DSCP should be CS3 (24)");
+        assert_eq!(
+            config.listen.dscp,
+            Some(24),
+            "default DSCP should be CS3 (24)"
+        );
     }
 
     #[test]
@@ -7448,7 +7544,10 @@ script:
   path: "scripts/proxy_default.py"
 "#;
         let config = Config::from_str(yaml).unwrap();
-        assert_eq!(config.listen.mtu, None, "mtu must default to off (no behaviour change on a bump)");
+        assert_eq!(
+            config.listen.mtu, None,
+            "mtu must default to off (no behaviour change on a bump)"
+        );
     }
 
     #[test]
@@ -7491,7 +7590,10 @@ diameter:
         assert!(diameter.origin_host.is_empty());
 
         let tenant = diameter.tenants.get("default").expect("default tenant");
-        assert_eq!(tenant.identity.origin_host, "diam.epc.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(
+            tenant.identity.origin_host,
+            "diam.epc.mnc001.mcc001.3gppnetwork.org"
+        );
         assert_eq!(tenant.clients[0].name, "mme");
         assert_eq!(tenant.clients[0].allowed_ips, vec!["192.0.2.0/24"]);
         assert_eq!(tenant.servers[0].name, "hss");
@@ -7547,7 +7649,9 @@ diameter:
         assert_eq!(diameter.servers[0].name, "backend");
 
         let effective = diameter.effective_tenants();
-        let default = effective.get("default").expect("synthesized default tenant");
+        let default = effective
+            .get("default")
+            .expect("synthesized default tenant");
         assert_eq!(default.identity.origin_host, diameter.origin_host);
         assert_eq!(default.identity.origin_realm, diameter.origin_realm);
         assert_eq!(default.clients[0].name, "client-a");
@@ -7786,9 +7890,7 @@ log:
         // Numeric scalar — neither a path nor an inline mapping.
         assert!(config.extension_path("baz").is_none());
         assert_eq!(
-            config
-                .extension_config("baz")
-                .and_then(|v| v.as_u64()),
+            config.extension_config("baz").and_then(|v| v.as_u64()),
             Some(42),
         );
     }
@@ -7820,4 +7922,3 @@ log:
         assert_eq!(names, vec!["zeta", "alpha", "middle"]);
     }
 }
-

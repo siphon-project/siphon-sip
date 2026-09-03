@@ -18,9 +18,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::config::TlsServerConfig;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor};
+use crate::transport::{
+    configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
+    StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT,
+};
 
 /// Handle a single WebSocket connection after the upgrade handshake.
 /// Generic over the underlying stream (plain TCP for WS, TLS for WSS).
@@ -55,7 +58,11 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                 .headers()
                 .get("Sec-WebSocket-Protocol")
                 .and_then(|value| value.to_str().ok())
-                .map(|value| value.split(',').any(|proto| proto.trim().eq_ignore_ascii_case("sip")))
+                .map(|value| {
+                    value
+                        .split(',')
+                        .any(|proto| proto.trim().eq_ignore_ascii_case("sip"))
+                })
                 .unwrap_or(false);
             if offers_sip {
                 response
@@ -137,7 +144,11 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                     break;
                 }
                 Err(_) => {
-                    info!("WS connection {:?} idle timeout ({}s)", connection_id, CONNECTION_IDLE_TIMEOUT.as_secs());
+                    info!(
+                        "WS connection {:?} idle timeout ({}s)",
+                        connection_id,
+                        CONNECTION_IDLE_TIMEOUT.as_secs()
+                    );
                     break;
                 }
             }
@@ -183,7 +194,12 @@ pub async fn listen(
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
 ) {
-    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::WebSocket, None);
+    spawn_outbound_distributor(
+        outbound_rx,
+        connection_map.clone(),
+        Transport::WebSocket,
+        None,
+    );
 
     tokio::spawn(async move {
         let listener = match bind_tcp_listener(local_addr, tos) {
@@ -247,10 +263,11 @@ pub async fn listen_secure(
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
 ) {
-    let acceptor = crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
-        eprintln!("Failed to build TLS acceptor for WSS: {error}");
-        std::process::exit(1);
-    });
+    let acceptor =
+        crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
+            eprintln!("Failed to build TLS acceptor for WSS: {error}");
+            std::process::exit(1);
+        });
 
     spawn_outbound_distributor(
         outbound_rx,
@@ -340,7 +357,17 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a WebSocket client
@@ -360,24 +387,23 @@ mod tests {
             "Content-Length: 0\r\n",
             "\r\n",
         );
-        ws_stream
-            .send(Message::text(sip_message))
-            .await
-            .unwrap();
+        ws_stream.send(Message::text(sip_message)).await.unwrap();
 
         // Receive the inbound message
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("timed out waiting for inbound message")
-        .expect("inbound channel closed");
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("timed out waiting for inbound message")
+                .expect("inbound channel closed");
 
         assert_eq!(message.transport, Transport::WebSocket);
         assert!(!message.data.is_empty());
         let data_str = String::from_utf8_lossy(&message.data);
-        assert!(data_str.contains("REGISTER"), "expected REGISTER in data: {}", data_str);
+        assert!(
+            data_str.contains("REGISTER"),
+            "expected REGISTER in data: {}",
+            data_str
+        );
 
         // Verify connection is tracked
         assert!(connection_map.contains_key(&message.connection_id));
@@ -396,7 +422,17 @@ mod tests {
             Arc::new(DashMap::new());
         let registry = StreamConnections::new();
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), registry.clone(), None, None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            registry.clone(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -405,13 +441,11 @@ mod tests {
             .send(Message::text("REGISTER sip:test SIP/2.0\r\n\r\n"))
             .await
             .unwrap();
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         // The UE source address is the registry key; the relay path reuses it.
         assert_eq!(
@@ -419,7 +453,11 @@ mod tests {
             Some(message.connection_id),
             "WS connection must be registered for MT routing"
         );
-        assert!(registry.is_alive(message.remote_addr, Transport::WebSocket, message.connection_id));
+        assert!(registry.is_alive(
+            message.remote_addr,
+            Transport::WebSocket,
+            message.connection_id
+        ));
         // Must never be handed back for a TLS relay.
         assert_eq!(registry.reuse(message.remote_addr, Transport::Tls), None);
 
@@ -448,7 +486,17 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut request = format!("ws://127.0.0.1:{}", addr.port())
@@ -478,7 +526,17 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -489,13 +547,11 @@ mod tests {
             .send(Message::text("REGISTER sip:test SIP/2.0\r\n\r\n"))
             .await
             .unwrap();
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         let connection_id = message.connection_id;
         assert!(connection_map.contains_key(&connection_id));
@@ -521,7 +577,17 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -533,13 +599,11 @@ mod tests {
             .await
             .unwrap();
 
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(message.transport, Transport::WebSocket);
         let data_str = String::from_utf8_lossy(&message.data);
@@ -561,7 +625,18 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+        listen_secure(
+            addr,
+            &tls_config,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Build a TLS client config that trusts our self-signed cert
@@ -583,7 +658,10 @@ mod tests {
         // Manual TLS connect then WebSocket upgrade
         let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let tls_stream = tls_connector.connect(server_name, tcp_stream).await.unwrap();
+        let tls_stream = tls_connector
+            .connect(server_name, tcp_stream)
+            .await
+            .unwrap();
 
         let url = format!("wss://localhost:{}", addr.port());
         let request = url.parse::<http::Uri>().unwrap();
@@ -602,18 +680,13 @@ mod tests {
             "Content-Length: 0\r\n",
             "\r\n",
         );
-        ws_stream
-            .send(Message::text(sip_message))
-            .await
-            .unwrap();
+        ws_stream.send(Message::text(sip_message)).await.unwrap();
 
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("timed out")
-        .expect("channel closed");
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("timed out")
+                .expect("channel closed");
 
         assert_eq!(message.transport, Transport::WebSocketSecure);
         let data_str = String::from_utf8_lossy(&message.data);
@@ -625,7 +698,9 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate().expect("keygen");
         let certificate_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create cert params");
-        let certificate = certificate_params.self_signed(&key_pair).expect("self-sign");
+        let certificate = certificate_params
+            .self_signed(&key_pair)
+            .expect("self-sign");
         (certificate.pem(), key_pair.serialize_pem())
     }
 

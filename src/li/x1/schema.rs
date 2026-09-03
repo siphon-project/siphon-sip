@@ -128,7 +128,9 @@ impl X1Schema {
             ))
         })?;
         let document = uppsala::parse(&source).map_err(|error| {
-            X1Error::syntax(format!("the X1 schema entry point does not parse: {error:?}"))
+            X1Error::syntax(format!(
+                "the X1 schema entry point does not parse: {error:?}"
+            ))
         })?;
         XsdValidator::from_schema_with_base_path(&document, entry.parent()).map_err(|error| {
             X1Error::syntax(format!("the X1 schema set does not compile: {error:?}"))
@@ -342,7 +344,10 @@ mod tests {
         let error = schema()
             .validate("<X1Request><unclosed>")
             .expect_err("malformed XML must be rejected");
-        assert_eq!(error.code, super::super::error::ErrorCode::SyntaxSchemaError);
+        assert_eq!(
+            error.code,
+            super::super::error::ErrorCode::SyntaxSchemaError
+        );
     }
 
     #[test]

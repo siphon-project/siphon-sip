@@ -67,8 +67,7 @@ pub fn encode_hep3(info: &CaptureInfo<'_>) -> BytesMut {
         2 * (CHUNK_HEADER_LEN + 4) // two IPv4 address chunks (4 bytes each)
     };
 
-    let fixed_chunks_len =
-        (CHUNK_HEADER_LEN + 1)  // IP family
+    let fixed_chunks_len = (CHUNK_HEADER_LEN + 1)  // IP family
         + (CHUNK_HEADER_LEN + 1)  // IP protocol
         + addr_chunks_len
         + (CHUNK_HEADER_LEN + 2)  // src port
@@ -84,8 +83,7 @@ pub fn encode_hep3(info: &CaptureInfo<'_>) -> BytesMut {
         .map(|cid| CHUNK_HEADER_LEN + cid.len() as u16)
         .unwrap_or(0);
 
-    let total_len: u16 =
-        4 + 2 // magic + total_length field
+    let total_len: u16 = 4 + 2 // magic + total_length field
         + fixed_chunks_len
         + payload_chunk_len
         + correlation_chunk_len;
@@ -277,26 +275,24 @@ mod tests {
         assert_eq!(chunks.get(&CHUNK_IP_PROTOCOL).unwrap(), &[IPPROTO_UDP]);
 
         // Source IPv4
-        assert_eq!(
-            chunks.get(&CHUNK_IPV4_SRC).unwrap(),
-            &[192, 168, 1, 10]
-        );
+        assert_eq!(chunks.get(&CHUNK_IPV4_SRC).unwrap(), &[192, 168, 1, 10]);
 
         // Destination IPv4
-        assert_eq!(
-            chunks.get(&CHUNK_IPV4_DST).unwrap(),
-            &[10, 0, 0, 1]
-        );
+        assert_eq!(chunks.get(&CHUNK_IPV4_DST).unwrap(), &[10, 0, 0, 1]);
 
         // Source port
         let src_port = u16::from_be_bytes(
-            chunks.get(&CHUNK_SRC_PORT).unwrap()[..2].try_into().unwrap(),
+            chunks.get(&CHUNK_SRC_PORT).unwrap()[..2]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(src_port, 5060);
 
         // Destination port
         let dst_port = u16::from_be_bytes(
-            chunks.get(&CHUNK_DST_PORT).unwrap()[..2].try_into().unwrap(),
+            chunks.get(&CHUNK_DST_PORT).unwrap()[..2]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(dst_port, 5060);
     }
@@ -314,7 +310,10 @@ mod tests {
 
         // The encoder is a faithful writer: hand it the raw wildcard and it emits
         // `0.0.0.0`, which is exactly the leak the pre-fix HEP path produced.
-        let raw = CaptureInfo { source: wildcard, ..make_capture_info(payload) };
+        let raw = CaptureInfo {
+            source: wildcard,
+            ..make_capture_info(payload)
+        };
         let raw_chunks = parse_chunks(&encode_hep3(&raw)[6..]);
         assert_eq!(raw_chunks.get(&CHUNK_IPV4_SRC).unwrap(), &[0, 0, 0, 0]);
 
@@ -327,16 +326,25 @@ mod tests {
         assert_eq!(resolved.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
         assert_eq!(resolved.port(), 5060);
 
-        let fixed = CaptureInfo { source: resolved, ..make_capture_info(payload) };
+        let fixed = CaptureInfo {
+            source: resolved,
+            ..make_capture_info(payload)
+        };
         let fixed_chunks = parse_chunks(&encode_hep3(&fixed)[6..]);
-        assert_eq!(fixed_chunks.get(&CHUNK_IPV4_SRC).unwrap(), &[203, 0, 113, 7]);
+        assert_eq!(
+            fixed_chunks.get(&CHUNK_IPV4_SRC).unwrap(),
+            &[203, 0, 113, 7]
+        );
     }
 
     #[test]
     fn encode_hep3_ipv6_chunks() {
         let payload = sample_sip_payload();
         let source = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060);
-        let destination = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 5061);
+        let destination = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            5061,
+        );
         let info = CaptureInfo {
             source,
             destination,
@@ -476,10 +484,7 @@ mod tests {
             "i: compact-id@host\r\n",
             "\r\n",
         );
-        assert_eq!(
-            extract_call_id(payload.as_bytes()),
-            Some("compact-id@host")
-        );
+        assert_eq!(extract_call_id(payload.as_bytes()), Some("compact-id@host"));
     }
 
     #[test]
@@ -496,10 +501,7 @@ mod tests {
     fn extract_call_id_case_variations() {
         // Mixed case "Call-Id:"
         let payload = "Call-Id: mixed-case@host\r\n\r\n";
-        assert_eq!(
-            extract_call_id(payload.as_bytes()),
-            Some("mixed-case@host")
-        );
+        assert_eq!(extract_call_id(payload.as_bytes()), Some("mixed-case@host"));
 
         // Lowercase "call-id:"
         let payload = "call-id: lower@host\r\n\r\n";

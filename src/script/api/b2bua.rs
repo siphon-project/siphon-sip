@@ -128,7 +128,9 @@ impl PyB2buaControl {
                 ));
             }
             (Some(sdp), false) if sdp.trim().is_empty() => {
-                return Err(PyValueError::new_err("b2bua.originate sdp= must not be empty"));
+                return Err(PyValueError::new_err(
+                    "b2bua.originate sdp= must not be empty",
+                ));
             }
             (Some(sdp), false) => crate::dispatcher::OriginateMedia::Offer(sdp.to_string()),
             (None, true) => crate::dispatcher::OriginateMedia::Anchor {
@@ -223,9 +225,7 @@ impl PyB2buaControl {
             crate::dispatcher::b2bua_bridge_calls(params)
                 .await
                 .map(|_| true)
-                .map_err(|error| {
-                    PyValueError::new_err(format!("{}: {error}", error.code()))
-                })
+                .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
         })
     }
 
@@ -250,9 +250,7 @@ impl PyB2buaControl {
             crate::dispatcher::b2bua_unbridge_call(&call_id, &reason)
                 .await
                 .map(|_| true)
-                .map_err(|error| {
-                    PyValueError::new_err(format!("{}: {error}", error.code()))
-                })
+                .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
         })
     }
 

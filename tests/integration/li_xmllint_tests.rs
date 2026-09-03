@@ -32,8 +32,8 @@ use siphon::li::x1::message::{
 use siphon::li::x1::types::{
     DId, DeliveryAddress, DeliveryType, DestinationDeliveryStatus, IpAddressPort, Liid,
     MediationDeliveryType, NeStatus, OkValue, Port, ProvisioningStatus, ServiceType,
-    TargetIdentifier, TaskReportType, Timestamp, Token, TypeOfNeIssueMessage, Version, XId,
-    X1TransactionId, DEFAULT_VERSION,
+    TargetIdentifier, TaskReportType, Timestamp, Token, TypeOfNeIssueMessage, Version,
+    X1TransactionId, XId, DEFAULT_VERSION,
 };
 use siphon::li::x1::X1Error;
 
@@ -322,7 +322,10 @@ fn every_response_siphon_emits_is_accepted_by_xmllint() {
     ];
 
     for (kind, body) in cases {
-        assert_independently_valid(&format!("{} response", kind.as_str()), &response_document(kind, body));
+        assert_independently_valid(
+            &format!("{} response", kind.as_str()),
+            &response_document(kind, body),
+        );
     }
 }
 
@@ -410,8 +413,8 @@ fn xmllint_catches_the_uuid_facet_uppsala_misses() {
         .expect("the document carries a transaction id");
     let corrupted = document.replace(transaction_id, "not-a-uuid");
 
-    let error = xmllint_validate(&corrupted)
-        .expect_err("a malformed x1TransactionId must be rejected");
+    let error =
+        xmllint_validate(&corrupted).expect_err("a malformed x1TransactionId must be rejected");
     assert!(
         error.contains("pattern"),
         "expected a pattern-facet failure, got:\n{error}"

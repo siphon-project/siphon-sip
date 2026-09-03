@@ -21,10 +21,20 @@ fn test_method_from_str_extension_methods() {
 #[test]
 fn test_method_as_str_roundtrip() {
     let methods = vec![
-        Method::Invite, Method::Ack, Method::Bye, Method::Cancel,
-        Method::Options, Method::Register, Method::Info, Method::Update,
-        Method::Prack, Method::Subscribe, Method::Notify, Method::Refer,
-        Method::Message, Method::Publish,
+        Method::Invite,
+        Method::Ack,
+        Method::Bye,
+        Method::Cancel,
+        Method::Options,
+        Method::Register,
+        Method::Info,
+        Method::Update,
+        Method::Prack,
+        Method::Subscribe,
+        Method::Notify,
+        Method::Refer,
+        Method::Message,
+        Method::Publish,
     ];
 
     for method in methods {
@@ -103,6 +113,3 @@ fn test_request_uri_accessor() {
     let uri = msg.request_uri().unwrap();
     assert_eq!(uri.host, "example.com");
 }
-
-
-

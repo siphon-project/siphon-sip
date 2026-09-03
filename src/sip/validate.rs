@@ -45,8 +45,14 @@ const MAX_CSEQ: u64 = 1 << 31;
 /// two of them is the classic message-smuggling shape. siphon's framer and
 /// parser both take the first, but an upstream that takes the last then reads a
 /// different message out of the same bytes (RFC 4475 §3.3.9).
-const SINGLE_INSTANCE_HEADERS: &[&str] =
-    &["To", "From", "Call-ID", "CSeq", "Max-Forwards", "Content-Length"];
+const SINGLE_INSTANCE_HEADERS: &[&str] = &[
+    "To",
+    "From",
+    "Call-ID",
+    "CSeq",
+    "Max-Forwards",
+    "Content-Length",
+];
 
 /// Most header fields one message may carry. A VoLTE INVITE with a full IMS
 /// P-header set runs to about forty; this is an order of magnitude of headroom
@@ -148,7 +154,10 @@ fn validate_message_shape(message: &SipMessage) -> Result<(), Rejection> {
     if let Some(vias) = message.headers.get_all("Via") {
         // One header line may carry several comma-separated Via values
         // (§7.3.1), so count the values, not the lines.
-        let depth: usize = vias.iter().map(|value| value.matches(',').count() + 1).sum();
+        let depth: usize = vias
+            .iter()
+            .map(|value| value.matches(',').count() + 1)
+            .sum();
         if depth > MAX_VIA_DEPTH {
             return Err(Rejection::too_large(format!(
                 "Via stack is {depth} deep, over the {MAX_VIA_DEPTH} limit"
@@ -404,8 +413,7 @@ mod tests {
                 other => panic!("no fixture line for {other}"),
             };
             let raw = WELL_FORMED.replace("Via:", &format!("{line}Via:"));
-            let rejection = validate(&raw)
-                .expect_err(&format!("a second {name} must be refused"));
+            let rejection = validate(&raw).expect_err(&format!("a second {name} must be refused"));
             assert_eq!(rejection.status, 400, "{name}: {}", rejection.detail);
             assert!(rejection.detail.contains(name), "{}", rejection.detail);
         }
@@ -419,7 +427,10 @@ mod tests {
         let stack: String = (0..MAX_VIA_DEPTH + 1)
             .map(|n| format!("Via: SIP/2.0/UDP host{n}.example.com;branch=z9hG4bK{n}\r\n"))
             .collect();
-        let raw = WELL_FORMED.replace("Via: SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n", &stack);
+        let raw = WELL_FORMED.replace(
+            "Via: SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n",
+            &stack,
+        );
         let rejection = validate(&raw).expect_err("an over-deep Via stack must be refused");
         assert_eq!(rejection.status, 513);
 
@@ -433,7 +444,9 @@ mod tests {
             &format!("Via: {folded}\r\n"),
         );
         assert_eq!(
-            validate(&raw).expect_err("comma-separated Vias count too").status,
+            validate(&raw)
+                .expect_err("comma-separated Vias count too")
+                .status,
             513
         );
     }
@@ -504,7 +517,9 @@ mod tests {
             "To: \"Mr. J. User <sip:j.user@example.com>",
         );
         assert_eq!(
-            validate(&raw).expect_err("unbalanced quote must be refused").status,
+            validate(&raw)
+                .expect_err("unbalanced quote must be refused")
+                .status,
             400
         );
     }
@@ -516,7 +531,9 @@ mod tests {
             "To: \"Watson, Thomas\" < sip:t.watson@example.org >",
         );
         assert_eq!(
-            validate(&raw).expect_err("spaces within addr-spec must be refused").status,
+            validate(&raw)
+                .expect_err("spaces within addr-spec must be refused")
+                .status,
             400
         );
     }
@@ -528,7 +545,9 @@ mod tests {
             "To: sip:user@example.com?Route=%3Csip:sip.example.com%3E",
         );
         assert_eq!(
-            validate(&raw).expect_err("bare addr-spec with '?' must be refused").status,
+            validate(&raw)
+                .expect_err("bare addr-spec with '?' must be refused")
+                .status,
             400
         );
     }
@@ -540,7 +559,9 @@ mod tests {
             "Via: SIP/2.0/UDP 192.0.2.15;;,;,,",
         );
         assert_eq!(
-            validate(&raw).expect_err("extraneous separators must be refused").status,
+            validate(&raw)
+                .expect_err("extraneous separators must be refused")
+                .status,
             400
         );
     }
@@ -552,15 +573,21 @@ mod tests {
             "INVITE sip:user@example.com?Route=%3Csip:example.com%3E SIP/2.0",
         );
         assert_eq!(
-            validate(&raw).expect_err("escaped headers in R-URI must be refused").status,
+            validate(&raw)
+                .expect_err("escaped headers in R-URI must be refused")
+                .status,
             400
         );
     }
 
     #[test]
     fn a_quoted_display_name_containing_an_escaped_quote_is_balanced() {
-        assert!(!has_unbalanced_quote("\"J Rosenberg \\\"\" <sip:jdrosen@example.com>"));
-        assert!(has_unbalanced_quote("\"Mr. J. User <sip:j.user@example.com>"));
+        assert!(!has_unbalanced_quote(
+            "\"J Rosenberg \\\"\" <sip:jdrosen@example.com>"
+        ));
+        assert!(has_unbalanced_quote(
+            "\"Mr. J. User <sip:j.user@example.com>"
+        ));
     }
 
     #[test]

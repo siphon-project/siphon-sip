@@ -76,7 +76,14 @@ pub fn spawn_keepalive(
 
         loop {
             tick.tick().await;
-            ping_all_contacts(&registrar, &uac_sender, &stream_connections, &tracker, threshold).await;
+            ping_all_contacts(
+                &registrar,
+                &uac_sender,
+                &stream_connections,
+                &tracker,
+                threshold,
+            )
+            .await;
         }
     });
 }
@@ -104,7 +111,10 @@ async fn ping_all_contacts(
     threshold: u32,
 ) {
     let contacts = registrar.all_contacts();
-    let nat_count = contacts.iter().filter(|(_, c)| c.source_addr.is_some()).count();
+    let nat_count = contacts
+        .iter()
+        .filter(|(_, c)| c.source_addr.is_some())
+        .count();
     debug!(total = contacts.len(), nat = nat_count, "keepalive sweep");
 
     for (aor, contact) in contacts {
@@ -147,7 +157,10 @@ async fn ping_all_contacts(
                     "keepalive: sending OPTIONS on TLS connection"
                 );
                 let receiver = uac_sender.send_options_on_connection(
-                    source_addr, transport, request_uri, connection_id,
+                    source_addr,
+                    transport,
+                    request_uri,
+                    connection_id,
                 );
                 let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
                 match result {
@@ -158,20 +171,45 @@ async fn ping_all_contacts(
                     }
                     Ok(Ok(other)) => {
                         warn!(aor = %aor, result = ?other, "keepalive: unexpected UAC result");
-                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                        record_keepalive_failure(
+                            registrar,
+                            tracker,
+                            &aor,
+                            &contact_uri_string,
+                            &tracker_key,
+                            threshold,
+                        );
                     }
                     Ok(Err(error)) => {
                         warn!(aor = %aor, %error, "keepalive: UAC channel error");
-                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                        record_keepalive_failure(
+                            registrar,
+                            tracker,
+                            &aor,
+                            &contact_uri_string,
+                            &tracker_key,
+                            threshold,
+                        );
                     }
                     Err(_) => {
                         warn!(aor = %aor, source_addr = %source_addr, connection_id = ?connection_id, "keepalive: OPTIONS timed out (5s)");
-                        record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                        record_keepalive_failure(
+                            registrar,
+                            tracker,
+                            &aor,
+                            &contact_uri_string,
+                            &tracker_key,
+                            threshold,
+                        );
                     }
                 }
             } else {
-                let map_entries: Vec<String> = stream_connections.entries().iter()
-                    .map(|(addr, transport, connection_id)| format!("{addr}→{transport:?}/{connection_id:?}"))
+                let map_entries: Vec<String> = stream_connections
+                    .entries()
+                    .iter()
+                    .map(|(addr, transport, connection_id)| {
+                        format!("{addr}→{transport:?}/{connection_id:?}")
+                    })
                     .collect();
                 warn!(
                     aor = %aor,
@@ -180,7 +218,14 @@ async fn ping_all_contacts(
                     stream_connections = ?map_entries,
                     "keepalive: no TLS connection found for source_addr"
                 );
-                record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                record_keepalive_failure(
+                    registrar,
+                    tracker,
+                    &aor,
+                    &contact_uri_string,
+                    &tracker_key,
+                    threshold,
+                );
             }
             continue;
         }
@@ -198,7 +243,14 @@ async fn ping_all_contacts(
                 tracker.record_success(&tracker_key);
             }
             _ => {
-                record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
+                record_keepalive_failure(
+                    registrar,
+                    tracker,
+                    &aor,
+                    &contact_uri_string,
+                    &tracker_key,
+                    threshold,
+                );
             }
         }
     }
@@ -228,8 +280,8 @@ fn record_keepalive_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::uri::SipUri;
     use crate::registrar::RegistrarConfig;
+    use crate::sip::uri::SipUri;
     use crate::transport::{OutboundMessage, OutboundRouter};
     use std::net::SocketAddr;
 
@@ -255,7 +307,15 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = Arc::new(UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), std::collections::HashMap::new(), std::collections::HashMap::new(), None, None, None));
+        let sender = Arc::new(UacSender::new(
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+        ));
         (sender, vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx])
     }
 
@@ -285,8 +345,12 @@ mod tests {
             .save_with_source(
                 "sip:alice@example.com",
                 SipUri::new("192.168.1.100".to_string()).with_user("alice".to_string()),
-                3600, 1.0, "c1".into(), 1,
-                Some(source), None,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
+                Some(source),
+                None,
             )
             .unwrap();
 
@@ -315,7 +379,10 @@ mod tests {
             .save(
                 "sip:alice@example.com",
                 SipUri::new("10.0.0.1".to_string()).with_user("alice".to_string()),
-                3600, 1.0, "c1".into(), 1,
+                3600,
+                1.0,
+                "c1".into(),
+                1,
             )
             .unwrap();
 

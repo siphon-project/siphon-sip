@@ -350,7 +350,10 @@ mod tests {
             normalize_uri("\"Alice Smith\" <sip:alice@example.com>;tag=abc"),
             "sip:alice@example.com"
         );
-        assert_eq!(normalize_uri("<sip:bob@example.com>"), "sip:bob@example.com");
+        assert_eq!(
+            normalize_uri("<sip:bob@example.com>"),
+            "sip:bob@example.com"
+        );
     }
 
     #[test]
@@ -407,8 +410,14 @@ mod tests {
         let x_id = XId::generate();
         store.index(x_id, &[TargetIdentifier::E164Number("15551234567".into())]);
 
-        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
-        assert_eq!(store.match_uri("sip:+15551234567@carrier.example"), vec![x_id]);
+        assert_eq!(
+            store.match_uri("sip:15551234567@carrier.example"),
+            vec![x_id]
+        );
+        assert_eq!(
+            store.match_uri("sip:+15551234567@carrier.example"),
+            vec![x_id]
+        );
         assert_eq!(store.match_uri("tel:+1-555-123-4567"), vec![x_id]);
     }
 
@@ -419,7 +428,10 @@ mod tests {
         store.index(x_id, &[TargetIdentifier::TelUri("tel:+15551234567".into())]);
 
         assert_eq!(store.match_uri("tel:+15551234567"), vec![x_id]);
-        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
+        assert_eq!(
+            store.match_uri("sip:15551234567@carrier.example"),
+            vec![x_id]
+        );
     }
 
     #[test]
@@ -452,7 +464,9 @@ mod tests {
         let x_id = XId::generate();
         store.index(
             x_id,
-            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7))],
+            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(
+                198, 51, 100, 7,
+            ))],
         );
         assert_eq!(
             store.match_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
@@ -481,15 +495,23 @@ mod tests {
         let store = TargetStore::new();
         let imsi_task = XId::generate();
         let imei_task = XId::generate();
-        store.index(imsi_task, &[TargetIdentifier::Imsi("001010000000001".into())]);
-        store.index(imei_task, &[TargetIdentifier::Imei("01234567890123".into())]);
+        store.index(
+            imsi_task,
+            &[TargetIdentifier::Imsi("001010000000001".into())],
+        );
+        store.index(
+            imei_task,
+            &[TargetIdentifier::Imei("01234567890123".into())],
+        );
 
         assert_eq!(store.match_imsi("001010000000001"), vec![imsi_task]);
         assert_eq!(store.match_imei("01234567890123"), vec![imei_task]);
         assert!(store.match_imsi("01234567890123").is_empty());
         // And neither is reachable through URI matching, which would be a
         // cross-namespace false positive.
-        assert!(store.match_uri("sip:001010000000001@ims.example").is_empty());
+        assert!(store
+            .match_uri("sip:001010000000001@ims.example")
+            .is_empty());
     }
 
     #[test]
@@ -566,7 +588,9 @@ mod tests {
         let x_id = XId::generate();
         store.index(
             x_id,
-            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7))],
+            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(
+                198, 51, 100, 7,
+            ))],
         );
 
         let matched = store.match_message(
@@ -623,7 +647,10 @@ mod tests {
             ],
         );
         assert_eq!(store.match_uri("sip:alice@example.com"), vec![x_id]);
-        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
+        assert_eq!(
+            store.match_uri("sip:15551234567@carrier.example"),
+            vec![x_id]
+        );
     }
 
     #[test]
@@ -647,7 +674,12 @@ mod tests {
     struct Case {
         identifier: TargetIdentifier,
         /// Request-URI, From, To, source address.
-        message: (Option<&'static str>, Option<&'static str>, Option<&'static str>, Option<IpAddr>),
+        message: (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<IpAddr>,
+        ),
         expect: MatchedParty,
     }
 
@@ -961,7 +993,10 @@ mod tests {
         for index in 0..16 {
             let store = store.clone();
             handles.push(thread::spawn(move || {
-                store.index(XId::generate(), &[sip(&format!("sip:user{index}@example.com"))]);
+                store.index(
+                    XId::generate(),
+                    &[sip(&format!("sip:user{index}@example.com"))],
+                );
             }));
         }
         for handle in handles {

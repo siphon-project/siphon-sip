@@ -55,7 +55,12 @@ impl PyCacheNamespace {
     ///
     /// Returns the cached string value, or `None` if not found or cache
     /// doesn't exist. This is an async method on the Python side.
-    fn fetch<'py>(&self, py: Python<'py>, name: String, key: String) -> PyResult<Bound<'py, PyAny>> {
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let manager = Arc::clone(&self.manager);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(manager.fetch(&name, &key).await)

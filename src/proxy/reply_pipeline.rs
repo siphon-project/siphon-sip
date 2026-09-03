@@ -33,10 +33,7 @@ impl ReplyPipeline {
     /// 1. `ProxyRegisterReply` — if the request method is REGISTER
     /// 2. `ProxyFailure` — if all branches failed
     /// 3. `ProxyReply` — global reply handler (fallback)
-    pub fn classify(
-        request_method: &str,
-        all_branches_failed: bool,
-    ) -> Vec<HandlerKind> {
+    pub fn classify(request_method: &str, all_branches_failed: bool) -> Vec<HandlerKind> {
         let mut kinds = Vec::with_capacity(3);
 
         // REGISTER-specific reply handler takes priority.
@@ -79,29 +76,32 @@ mod tests {
     #[test]
     fn invite_all_failed_yields_failure_then_reply() {
         let kinds = ReplyPipeline::classify("INVITE", true);
-        assert_eq!(kinds, vec![
-            HandlerKind::ProxyFailure,
-            HandlerKind::ProxyReply,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![HandlerKind::ProxyFailure, HandlerKind::ProxyReply,]
+        );
     }
 
     #[test]
     fn register_200_yields_register_reply_then_reply() {
         let kinds = ReplyPipeline::classify("REGISTER", false);
-        assert_eq!(kinds, vec![
-            HandlerKind::ProxyRegisterReply,
-            HandlerKind::ProxyReply,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![HandlerKind::ProxyRegisterReply, HandlerKind::ProxyReply,]
+        );
     }
 
     #[test]
     fn register_all_failed_yields_all_three() {
         let kinds = ReplyPipeline::classify("REGISTER", true);
-        assert_eq!(kinds, vec![
-            HandlerKind::ProxyRegisterReply,
-            HandlerKind::ProxyFailure,
-            HandlerKind::ProxyReply,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                HandlerKind::ProxyRegisterReply,
+                HandlerKind::ProxyFailure,
+                HandlerKind::ProxyReply,
+            ]
+        );
     }
 
     #[test]
@@ -113,9 +113,9 @@ mod tests {
     #[test]
     fn options_failure_yields_failure_then_reply() {
         let kinds = ReplyPipeline::classify("OPTIONS", true);
-        assert_eq!(kinds, vec![
-            HandlerKind::ProxyFailure,
-            HandlerKind::ProxyReply,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![HandlerKind::ProxyFailure, HandlerKind::ProxyReply,]
+        );
     }
 }

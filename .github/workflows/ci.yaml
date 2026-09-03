@@ -60,6 +60,21 @@ jobs:
             server::tests::reaped_thread_releases_its_python_thread_state \
             --test-threads=1 --nocapture
 
+  # ── Formatting gate ─────────────────────────────────────────────────────
+  # `cargo fmt --all -- --check` on rustfmt defaults — no `rustfmt.toml`, which
+  # is what siphon-rtp does, so the two repos format identically. Needs no
+  # Python or libsctp: rustfmt parses the source, it does not build it, so this
+  # is the cheapest gate in the pipeline and fails in seconds.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
   # are needed for the crate to compile at all). `-D warnings` turns any

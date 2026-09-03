@@ -392,17 +392,41 @@ impl MediaBackend {
     ) -> Result<(), RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
-                set.play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
-                    .await
+                set.play_dtmf(
+                    call_id,
+                    from_tag,
+                    code,
+                    duration_ms,
+                    volume_dbm0,
+                    pause_ms,
+                    to_tag,
+                )
+                .await
             }
             Self::SiphonRtp(client) => {
                 client
-                    .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+                    .play_dtmf(
+                        call_id,
+                        from_tag,
+                        code,
+                        duration_ms,
+                        volume_dbm0,
+                        pause_ms,
+                        to_tag,
+                    )
                     .await
             }
             Self::RtpProxy(client) => {
                 client
-                    .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+                    .play_dtmf(
+                        call_id,
+                        from_tag,
+                        code,
+                        duration_ms,
+                        volume_dbm0,
+                        pause_ms,
+                        to_tag,
+                    )
                     .await
             }
         }
@@ -433,7 +457,12 @@ impl MediaBackend {
     /// Echo-test mode — reflect a leg's ingress audio back to itself (single-leg
     /// IVR echo). Native `siphon-rtp` backend only: rtpengine and rtpproxy have
     /// no echo verb, so those backends reject rather than silently no-op.
-    pub async fn echo(&self, call_id: &str, from_tag: &str, enabled: bool) -> Result<(), RtpEngineError> {
+    pub async fn echo(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        enabled: bool,
+    ) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(client) => client.echo(call_id, from_tag, enabled).await,
             Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
@@ -456,7 +485,9 @@ impl MediaBackend {
     ) -> Result<String, RtpEngineError> {
         match self {
             Self::SiphonRtp(client) => {
-                client.answer_local(call_id, from_tag, offer_sdp, flags).await
+                client
+                    .answer_local(call_id, from_tag, offer_sdp, flags)
+                    .await
             }
             Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
                 "answer_local is only supported by the native siphon-rtp backend".to_string(),
@@ -493,13 +524,18 @@ impl MediaBackend {
     ) -> Result<Vec<u8>, RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
-                set.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+                set.subscribe_request(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
             Self::SiphonRtp(client) => {
-                client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+                client
+                    .subscribe_request(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
             Self::RtpProxy(client) => {
-                client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+                client
+                    .subscribe_request(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
         }
     }
@@ -513,13 +549,18 @@ impl MediaBackend {
     ) -> Result<(Vec<u8>, String), RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
-                set.subscribe_request_siprec(call_id, from_tags, profile_flags).await
+                set.subscribe_request_siprec(call_id, from_tags, profile_flags)
+                    .await
             }
             Self::SiphonRtp(client) => {
-                client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
+                client
+                    .subscribe_request_siprec(call_id, from_tags, profile_flags)
+                    .await
             }
             Self::RtpProxy(client) => {
-                client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
+                client
+                    .subscribe_request_siprec(call_id, from_tags, profile_flags)
+                    .await
             }
         }
     }
@@ -565,13 +606,18 @@ impl MediaBackend {
     ) -> Result<Vec<u8>, RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
-                set.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+                set.subscribe_answer(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
             Self::SiphonRtp(client) => {
-                client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+                client
+                    .subscribe_answer(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
             Self::RtpProxy(client) => {
-                client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+                client
+                    .subscribe_answer(call_id, from_tag, to_tag, sdp, flags)
+                    .await
             }
         }
     }
@@ -626,11 +672,7 @@ impl MediaBackend {
 
     /// Detach a call's WebSocket tee.  Idempotent on `siphon-rtp`; unsupported
     /// on the other backends for the same reason as [`Self::attach_ws_tee`].
-    pub async fn detach_ws_tee(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_ws_tee(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(client) => client.detach_ws_tee(call_id, from_tag).await,
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
@@ -735,11 +777,7 @@ impl MediaBackend {
 
     /// Stop X3 content delivery. Idempotent on `siphon-rtp`; unsupported on the
     /// other backends for the same reason as [`Self::attach_x3`].
-    pub async fn detach_x3(
-        &self,
-        call_id: &str,
-        from_tag: &str,
-    ) -> Result<(), RtpEngineError> {
+    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(client) => client.detach_x3(call_id, from_tag).await,
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
@@ -860,7 +898,10 @@ mod tests {
             )
             .await;
         assert!(outcome.is_err(), "the dead address must not answer");
-        assert!(!MediaBackend::playback_started("leak-never-started", "tag-a"));
+        assert!(!MediaBackend::playback_started(
+            "leak-never-started",
+            "tag-a"
+        ));
         assert_eq!(playback_records_for("leak-never-started"), 0);
     }
 
@@ -908,7 +949,8 @@ mod tests {
         // framed and sent, then no response arrived) — the reject arms below
         // return synchronously and never time out.
         let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
-        let set = SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
+        let set =
+            SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
         let backend = MediaBackend::SiphonRtp(set);
 
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
@@ -920,7 +962,9 @@ mod tests {
 
     #[tokio::test]
     async fn echo_rejected_on_rtpproxy_backend() {
-        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+            .await
+            .unwrap();
         let backend = MediaBackend::RtpProxy(set);
 
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
@@ -930,7 +974,9 @@ mod tests {
 
     #[tokio::test]
     async fn echo_rejected_on_rtpengine_backend() {
-        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+            .await
+            .unwrap();
         let backend = MediaBackend::RtpEngine(Arc::new(set));
 
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
@@ -946,7 +992,9 @@ mod tests {
     #[tokio::test]
     async fn reoffer_delegates_to_offer_on_rtpengine_and_rtpproxy() {
         let rtpengine = MediaBackend::RtpEngine(Arc::new(
-            RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap(),
+            RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+                .await
+                .unwrap(),
         ));
         let error = rtpengine
             .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
@@ -958,7 +1006,9 @@ mod tests {
         );
 
         let rtpproxy = MediaBackend::RtpProxy(
-            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap(),
+            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+                .await
+                .unwrap(),
         );
         // rtpproxy's transport is UDP and it rewrites the SDP itself, so the
         // delegated offer succeeds rather than timing out — success here is the
@@ -979,10 +1029,14 @@ mod tests {
     #[tokio::test]
     async fn ws_bridge_verbs_are_refused_on_rtpengine_and_rtpproxy() {
         let rtpengine = MediaBackend::RtpEngine(Arc::new(
-            RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap(),
+            RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+                .await
+                .unwrap(),
         ));
         let rtpproxy = MediaBackend::RtpProxy(
-            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap(),
+            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+                .await
+                .unwrap(),
         );
 
         for (backend, name) in [(&rtpengine, "rtpengine"), (&rtpproxy, "rtpproxy")] {
@@ -998,7 +1052,10 @@ mod tests {
                 "{name} must refuse attach_ws_bridge, got {error:?}"
             );
 
-            let error = backend.detach_ws_bridge("call-1", "tag-a").await.unwrap_err();
+            let error = backend
+                .detach_ws_bridge("call-1", "tag-a")
+                .await
+                .unwrap_err();
             assert!(
                 matches!(
                     error,
@@ -1048,7 +1105,9 @@ mod tests {
 
     #[tokio::test]
     async fn answer_local_rejected_on_rtpproxy_backend() {
-        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+            .await
+            .unwrap();
         let backend = MediaBackend::RtpProxy(set);
 
         let error = backend
@@ -1061,7 +1120,9 @@ mod tests {
 
     #[tokio::test]
     async fn answer_local_rejected_on_rtpengine_backend() {
-        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+            .await
+            .unwrap();
         let backend = MediaBackend::RtpEngine(Arc::new(set));
 
         let error = backend
@@ -1075,12 +1136,16 @@ mod tests {
     // -- backend capability reporting -----------------------------------------
 
     async fn rtpengine_backend() -> MediaBackend {
-        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+            .await
+            .unwrap();
         MediaBackend::RtpEngine(Arc::new(set))
     }
 
     async fn rtpproxy_backend() -> MediaBackend {
-        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+            .await
+            .unwrap();
         MediaBackend::RtpProxy(set)
     }
 
@@ -1107,7 +1172,10 @@ mod tests {
     #[tokio::test]
     async fn kind_reports_the_configured_backend() {
         use crate::config::MediaBackendKind;
-        assert_eq!(rtpengine_backend().await.kind(), MediaBackendKind::Rtpengine);
+        assert_eq!(
+            rtpengine_backend().await.kind(),
+            MediaBackendKind::Rtpengine
+        );
         assert_eq!(rtpproxy_backend().await.kind(), MediaBackendKind::Rtpproxy);
         assert_eq!(siphon_rtp_backend().kind(), MediaBackendKind::SiphonRtp);
     }
@@ -1121,8 +1189,14 @@ mod tests {
             flags: vec!["trust-address".into()],
             ..NgFlags::default()
         };
-        assert!(rtpengine_backend().await.unsupported_flags(&plain).is_empty());
-        assert!(rtpproxy_backend().await.unsupported_flags(&plain).is_empty());
+        assert!(rtpengine_backend()
+            .await
+            .unsupported_flags(&plain)
+            .is_empty());
+        assert!(rtpproxy_backend()
+            .await
+            .unsupported_flags(&plain)
+            .is_empty());
         assert!(siphon_rtp_backend().unsupported_flags(&plain).is_empty());
     }
 
@@ -1137,7 +1211,9 @@ mod tests {
 
     #[tokio::test]
     async fn rtpengine_reports_every_websocket_and_dsp_flag_unsupported() {
-        let unsupported = rtpengine_backend().await.unsupported_flags(&ws_and_dsp_flags());
+        let unsupported = rtpengine_backend()
+            .await
+            .unsupported_flags(&ws_and_dsp_flags());
         assert_eq!(
             unsupported,
             vec![
@@ -1161,7 +1237,10 @@ mod tests {
             rtcp_mux: vec!["require".into()],
             ..NgFlags::default()
         };
-        assert!(rtpengine_backend().await.unsupported_flags(&flags).is_empty());
+        assert!(rtpengine_backend()
+            .await
+            .unsupported_flags(&flags)
+            .is_empty());
         assert!(siphon_rtp_backend().unsupported_flags(&flags).is_empty());
         assert_eq!(
             rtpproxy_backend().await.unsupported_flags(&flags),

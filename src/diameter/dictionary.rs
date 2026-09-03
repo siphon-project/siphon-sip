@@ -61,305 +61,1628 @@ const TGPP: u32 = 10415;
 /// Sorted by (vendor_id, code) for binary search.
 static AVP_TABLE: &[AvpDef] = &[
     // ── Base Diameter (RFC 6733), vendor_id = 0 ─────────────────────────────
-    AvpDef { code: 1,   vendor_id: 0, name: "User-Name",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 8,   vendor_id: 0, name: "Framed-IP-Address",            data_type: AvpType::OctetString },
-    AvpDef { code: 11,  vendor_id: 0, name: "Filter-Id",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 25,  vendor_id: 0, name: "Class",                        data_type: AvpType::OctetString },
-    AvpDef { code: 27,  vendor_id: 0, name: "Session-Timeout",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 33,  vendor_id: 0, name: "Proxy-State",                  data_type: AvpType::OctetString },
-    AvpDef { code: 44,  vendor_id: 0, name: "Acct-Session-Id",              data_type: AvpType::OctetString },
-    AvpDef { code: 50,  vendor_id: 0, name: "Acct-Multi-Session-Id",        data_type: AvpType::UTF8String },
-    AvpDef { code: 55,  vendor_id: 0, name: "Event-Timestamp",              data_type: AvpType::Time },
-    AvpDef { code: 85,  vendor_id: 0, name: "Acct-Interim-Interval",        data_type: AvpType::Unsigned32 },
-    AvpDef { code: 97,  vendor_id: 0, name: "Framed-IPv6-Prefix",           data_type: AvpType::OctetString },
-    AvpDef { code: 257, vendor_id: 0, name: "Host-IP-Address",              data_type: AvpType::Address },
-    AvpDef { code: 258, vendor_id: 0, name: "Auth-Application-Id",          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 259, vendor_id: 0, name: "Acct-Application-Id",          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 260, vendor_id: 0, name: "Vendor-Specific-Application-Id", data_type: AvpType::Grouped },
-    AvpDef { code: 263, vendor_id: 0, name: "Session-Id",                   data_type: AvpType::UTF8String },
-    AvpDef { code: 264, vendor_id: 0, name: "Origin-Host",                  data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 265, vendor_id: 0, name: "Supported-Vendor-Id",          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 266, vendor_id: 0, name: "Vendor-Id",                    data_type: AvpType::Unsigned32 },
-    AvpDef { code: 267, vendor_id: 0, name: "Firmware-Revision",            data_type: AvpType::Unsigned32 },
-    AvpDef { code: 268, vendor_id: 0, name: "Result-Code",                  data_type: AvpType::Unsigned32 },
-    AvpDef { code: 269, vendor_id: 0, name: "Product-Name",                 data_type: AvpType::UTF8String },
-    AvpDef { code: 270, vendor_id: 0, name: "Session-Binding",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 274, vendor_id: 0, name: "Auth-Grace-Period",            data_type: AvpType::Unsigned32 },
-    AvpDef { code: 277, vendor_id: 0, name: "Auth-Session-State",           data_type: AvpType::Enumerated },
-    AvpDef { code: 278, vendor_id: 0, name: "Origin-State-Id",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 279, vendor_id: 0, name: "Failed-AVP",                   data_type: AvpType::Grouped },
-    AvpDef { code: 281, vendor_id: 0, name: "Error-Message",                data_type: AvpType::UTF8String },
-    AvpDef { code: 282, vendor_id: 0, name: "Route-Record",                 data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 283, vendor_id: 0, name: "Destination-Realm",            data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 284, vendor_id: 0, name: "Proxy-Info",                   data_type: AvpType::Grouped },
-    AvpDef { code: 285, vendor_id: 0, name: "Re-Auth-Request-Type",         data_type: AvpType::Enumerated },
-    AvpDef { code: 291, vendor_id: 0, name: "Authorization-Lifetime",       data_type: AvpType::Unsigned32 },
-    AvpDef { code: 293, vendor_id: 0, name: "Destination-Host",             data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 295, vendor_id: 0, name: "Termination-Cause",            data_type: AvpType::Enumerated },
-    AvpDef { code: 296, vendor_id: 0, name: "Origin-Realm",                 data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 297, vendor_id: 0, name: "Experimental-Result",          data_type: AvpType::Grouped },
-    AvpDef { code: 298, vendor_id: 0, name: "Experimental-Result-Code",     data_type: AvpType::Unsigned32 },
-    AvpDef { code: 299, vendor_id: 0, name: "Inband-Security-Id",           data_type: AvpType::Unsigned32 },
-
+    AvpDef {
+        code: 1,
+        vendor_id: 0,
+        name: "User-Name",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 8,
+        vendor_id: 0,
+        name: "Framed-IP-Address",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 11,
+        vendor_id: 0,
+        name: "Filter-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 25,
+        vendor_id: 0,
+        name: "Class",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 27,
+        vendor_id: 0,
+        name: "Session-Timeout",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 33,
+        vendor_id: 0,
+        name: "Proxy-State",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 44,
+        vendor_id: 0,
+        name: "Acct-Session-Id",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 50,
+        vendor_id: 0,
+        name: "Acct-Multi-Session-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 55,
+        vendor_id: 0,
+        name: "Event-Timestamp",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 85,
+        vendor_id: 0,
+        name: "Acct-Interim-Interval",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 97,
+        vendor_id: 0,
+        name: "Framed-IPv6-Prefix",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 257,
+        vendor_id: 0,
+        name: "Host-IP-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 258,
+        vendor_id: 0,
+        name: "Auth-Application-Id",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 259,
+        vendor_id: 0,
+        name: "Acct-Application-Id",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 260,
+        vendor_id: 0,
+        name: "Vendor-Specific-Application-Id",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 263,
+        vendor_id: 0,
+        name: "Session-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 264,
+        vendor_id: 0,
+        name: "Origin-Host",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 265,
+        vendor_id: 0,
+        name: "Supported-Vendor-Id",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 266,
+        vendor_id: 0,
+        name: "Vendor-Id",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 267,
+        vendor_id: 0,
+        name: "Firmware-Revision",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 268,
+        vendor_id: 0,
+        name: "Result-Code",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 269,
+        vendor_id: 0,
+        name: "Product-Name",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 270,
+        vendor_id: 0,
+        name: "Session-Binding",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 274,
+        vendor_id: 0,
+        name: "Auth-Grace-Period",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 277,
+        vendor_id: 0,
+        name: "Auth-Session-State",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 278,
+        vendor_id: 0,
+        name: "Origin-State-Id",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 279,
+        vendor_id: 0,
+        name: "Failed-AVP",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 281,
+        vendor_id: 0,
+        name: "Error-Message",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 282,
+        vendor_id: 0,
+        name: "Route-Record",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 283,
+        vendor_id: 0,
+        name: "Destination-Realm",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 284,
+        vendor_id: 0,
+        name: "Proxy-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 285,
+        vendor_id: 0,
+        name: "Re-Auth-Request-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 291,
+        vendor_id: 0,
+        name: "Authorization-Lifetime",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 293,
+        vendor_id: 0,
+        name: "Destination-Host",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 295,
+        vendor_id: 0,
+        name: "Termination-Cause",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 296,
+        vendor_id: 0,
+        name: "Origin-Realm",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 297,
+        vendor_id: 0,
+        name: "Experimental-Result",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 298,
+        vendor_id: 0,
+        name: "Experimental-Result-Code",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 299,
+        vendor_id: 0,
+        name: "Inband-Security-Id",
+        data_type: AvpType::Unsigned32,
+    },
     // ── RFC 8506 (obsoletes RFC 4006) Credit-Control / Gy, vendor_id = 0 ───
     // Codes per the IANA aaa-parameters registry (RFC 8506 §12). The prior
     // table used a self-consistent but non-standard numbering that a real OCS
     // (CGRateS, go-diameter) rejects — every code below is the on-the-wire
     // value.
-    AvpDef { code: 412, vendor_id: 0, name: "CC-Input-Octets",              data_type: AvpType::Unsigned64 },
-    AvpDef { code: 413, vendor_id: 0, name: "CC-Money",                     data_type: AvpType::Grouped },
-    AvpDef { code: 414, vendor_id: 0, name: "CC-Output-Octets",             data_type: AvpType::Unsigned64 },
-    AvpDef { code: 415, vendor_id: 0, name: "CC-Request-Number",            data_type: AvpType::Unsigned32 },
-    AvpDef { code: 416, vendor_id: 0, name: "CC-Request-Type",              data_type: AvpType::Enumerated },
-    AvpDef { code: 417, vendor_id: 0, name: "CC-Service-Specific-Units",    data_type: AvpType::Unsigned64 },
-    AvpDef { code: 418, vendor_id: 0, name: "CC-Session-Failover",          data_type: AvpType::Enumerated },
-    AvpDef { code: 419, vendor_id: 0, name: "CC-Sub-Session-Id",            data_type: AvpType::Unsigned64 },
-    AvpDef { code: 420, vendor_id: 0, name: "CC-Time",                      data_type: AvpType::Unsigned32 },
-    AvpDef { code: 421, vendor_id: 0, name: "CC-Total-Octets",              data_type: AvpType::Unsigned64 },
-    AvpDef { code: 426, vendor_id: 0, name: "Credit-Control",               data_type: AvpType::Enumerated },
-    AvpDef { code: 427, vendor_id: 0, name: "Credit-Control-Failure-Handling", data_type: AvpType::Enumerated },
-    AvpDef { code: 428, vendor_id: 0, name: "Direct-Debiting-Failure-Handling", data_type: AvpType::Enumerated },
-    AvpDef { code: 430, vendor_id: 0, name: "Final-Unit-Indication",        data_type: AvpType::Grouped },
-    AvpDef { code: 431, vendor_id: 0, name: "Granted-Service-Unit",         data_type: AvpType::Grouped },
-    AvpDef { code: 432, vendor_id: 0, name: "Rating-Group",                 data_type: AvpType::Unsigned32 },
-    AvpDef { code: 433, vendor_id: 0, name: "Redirect-Address-Type",        data_type: AvpType::Enumerated },
-    AvpDef { code: 434, vendor_id: 0, name: "Redirect-Server",              data_type: AvpType::Grouped },
-    AvpDef { code: 435, vendor_id: 0, name: "Redirect-Server-Address",      data_type: AvpType::UTF8String },
-    AvpDef { code: 436, vendor_id: 0, name: "Requested-Action",             data_type: AvpType::Enumerated },
-    AvpDef { code: 437, vendor_id: 0, name: "Requested-Service-Unit",       data_type: AvpType::Grouped },
-    AvpDef { code: 438, vendor_id: 0, name: "Restriction-Filter-Rule",      data_type: AvpType::OctetString },
-    AvpDef { code: 439, vendor_id: 0, name: "Service-Identifier",           data_type: AvpType::Unsigned32 },
-    AvpDef { code: 443, vendor_id: 0, name: "Subscription-Id",              data_type: AvpType::Grouped },
-    AvpDef { code: 444, vendor_id: 0, name: "Subscription-Id-Data",         data_type: AvpType::UTF8String },
-    AvpDef { code: 446, vendor_id: 0, name: "Used-Service-Unit",            data_type: AvpType::Grouped },
-    AvpDef { code: 448, vendor_id: 0, name: "Validity-Time",                data_type: AvpType::Unsigned32 },
-    AvpDef { code: 449, vendor_id: 0, name: "Final-Unit-Action",            data_type: AvpType::Enumerated },
-    AvpDef { code: 450, vendor_id: 0, name: "Subscription-Id-Type",         data_type: AvpType::Enumerated },
-    AvpDef { code: 452, vendor_id: 0, name: "Tariff-Change-Usage",          data_type: AvpType::Enumerated },
-    AvpDef { code: 453, vendor_id: 0, name: "G-S-U-Pool-Identifier",        data_type: AvpType::Unsigned32 },
-    AvpDef { code: 455, vendor_id: 0, name: "Multiple-Services-Indicator",  data_type: AvpType::Enumerated },
-    AvpDef { code: 456, vendor_id: 0, name: "Multiple-Services-Credit-Control", data_type: AvpType::Grouped },
-    AvpDef { code: 457, vendor_id: 0, name: "G-S-U-Pool-Reference",         data_type: AvpType::Grouped },
-    AvpDef { code: 458, vendor_id: 0, name: "User-Equipment-Info",          data_type: AvpType::Grouped },
-    AvpDef { code: 459, vendor_id: 0, name: "User-Equipment-Info-Type",     data_type: AvpType::Enumerated },
-    AvpDef { code: 460, vendor_id: 0, name: "User-Equipment-Info-Value",    data_type: AvpType::OctetString },
-    AvpDef { code: 461, vendor_id: 0, name: "Service-Context-Id",           data_type: AvpType::UTF8String },
-    AvpDef { code: 480, vendor_id: 0, name: "Accounting-Record-Type",       data_type: AvpType::Enumerated },
-    AvpDef { code: 485, vendor_id: 0, name: "Accounting-Record-Number",     data_type: AvpType::Unsigned32 },
-
+    AvpDef {
+        code: 412,
+        vendor_id: 0,
+        name: "CC-Input-Octets",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 413,
+        vendor_id: 0,
+        name: "CC-Money",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 414,
+        vendor_id: 0,
+        name: "CC-Output-Octets",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 415,
+        vendor_id: 0,
+        name: "CC-Request-Number",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 416,
+        vendor_id: 0,
+        name: "CC-Request-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 417,
+        vendor_id: 0,
+        name: "CC-Service-Specific-Units",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 418,
+        vendor_id: 0,
+        name: "CC-Session-Failover",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 419,
+        vendor_id: 0,
+        name: "CC-Sub-Session-Id",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 420,
+        vendor_id: 0,
+        name: "CC-Time",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 421,
+        vendor_id: 0,
+        name: "CC-Total-Octets",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 426,
+        vendor_id: 0,
+        name: "Credit-Control",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 427,
+        vendor_id: 0,
+        name: "Credit-Control-Failure-Handling",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 428,
+        vendor_id: 0,
+        name: "Direct-Debiting-Failure-Handling",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 430,
+        vendor_id: 0,
+        name: "Final-Unit-Indication",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 431,
+        vendor_id: 0,
+        name: "Granted-Service-Unit",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 432,
+        vendor_id: 0,
+        name: "Rating-Group",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 433,
+        vendor_id: 0,
+        name: "Redirect-Address-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 434,
+        vendor_id: 0,
+        name: "Redirect-Server",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 435,
+        vendor_id: 0,
+        name: "Redirect-Server-Address",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 436,
+        vendor_id: 0,
+        name: "Requested-Action",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 437,
+        vendor_id: 0,
+        name: "Requested-Service-Unit",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 438,
+        vendor_id: 0,
+        name: "Restriction-Filter-Rule",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 439,
+        vendor_id: 0,
+        name: "Service-Identifier",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 443,
+        vendor_id: 0,
+        name: "Subscription-Id",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 444,
+        vendor_id: 0,
+        name: "Subscription-Id-Data",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 446,
+        vendor_id: 0,
+        name: "Used-Service-Unit",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 448,
+        vendor_id: 0,
+        name: "Validity-Time",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 449,
+        vendor_id: 0,
+        name: "Final-Unit-Action",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 450,
+        vendor_id: 0,
+        name: "Subscription-Id-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 452,
+        vendor_id: 0,
+        name: "Tariff-Change-Usage",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 453,
+        vendor_id: 0,
+        name: "G-S-U-Pool-Identifier",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 455,
+        vendor_id: 0,
+        name: "Multiple-Services-Indicator",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 456,
+        vendor_id: 0,
+        name: "Multiple-Services-Credit-Control",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 457,
+        vendor_id: 0,
+        name: "G-S-U-Pool-Reference",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 458,
+        vendor_id: 0,
+        name: "User-Equipment-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 459,
+        vendor_id: 0,
+        name: "User-Equipment-Info-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 460,
+        vendor_id: 0,
+        name: "User-Equipment-Info-Value",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 461,
+        vendor_id: 0,
+        name: "Service-Context-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 480,
+        vendor_id: 0,
+        name: "Accounting-Record-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 485,
+        vendor_id: 0,
+        name: "Accounting-Record-Number",
+        data_type: AvpType::Unsigned32,
+    },
     // ── 3GPP AVPs, vendor_id = 10415 (sorted by code) ─────────────────────
 
     // Rx (TS 29.214)
-    AvpDef { code: 500,  vendor_id: TGPP, name: "Abort-Cause",                        data_type: AvpType::Enumerated },
-    AvpDef { code: 501,  vendor_id: TGPP, name: "Access-Network-Charging-Address",    data_type: AvpType::Address },
-    AvpDef { code: 502,  vendor_id: TGPP, name: "Access-Network-Charging-Identifier", data_type: AvpType::Grouped },
-    AvpDef { code: 504,  vendor_id: TGPP, name: "AF-Application-Identifier",          data_type: AvpType::OctetString },
-    AvpDef { code: 505,  vendor_id: TGPP, name: "AF-Charging-Identifier",             data_type: AvpType::OctetString },
-    AvpDef { code: 507,  vendor_id: TGPP, name: "Flow-Description",                   data_type: AvpType::OctetString },
-    AvpDef { code: 508,  vendor_id: TGPP, name: "Flow-Grouping",                      data_type: AvpType::Grouped },
-    AvpDef { code: 509,  vendor_id: TGPP, name: "Flow-Number",                        data_type: AvpType::Unsigned32 },
-    AvpDef { code: 510,  vendor_id: TGPP, name: "Flows",                              data_type: AvpType::Grouped },
-    AvpDef { code: 511,  vendor_id: TGPP, name: "Flow-Status",                        data_type: AvpType::Enumerated },
-    AvpDef { code: 512,  vendor_id: TGPP, name: "Flow-Usage",                         data_type: AvpType::Enumerated },
-    AvpDef { code: 513,  vendor_id: TGPP, name: "Specific-Action",                    data_type: AvpType::Enumerated },
-    AvpDef { code: 515,  vendor_id: TGPP, name: "Max-Requested-Bandwidth-DL",         data_type: AvpType::Unsigned32 },
-    AvpDef { code: 516,  vendor_id: TGPP, name: "Max-Requested-Bandwidth-UL",         data_type: AvpType::Unsigned32 },
-    AvpDef { code: 517,  vendor_id: TGPP, name: "Media-Component-Description",        data_type: AvpType::Grouped },
-    AvpDef { code: 518,  vendor_id: TGPP, name: "Media-Component-Number",             data_type: AvpType::Unsigned32 },
-    AvpDef { code: 519,  vendor_id: TGPP, name: "Media-Sub-Component",                data_type: AvpType::Grouped },
-    AvpDef { code: 520,  vendor_id: TGPP, name: "Media-Type",                         data_type: AvpType::Enumerated },
-    AvpDef { code: 524,  vendor_id: TGPP, name: "Codec-Data",                         data_type: AvpType::OctetString },
-    AvpDef { code: 527,  vendor_id: TGPP, name: "Service-Info-Status",                data_type: AvpType::Enumerated },
-    AvpDef { code: 533,  vendor_id: TGPP, name: "Rx-Request-Type",                    data_type: AvpType::Enumerated },
+    AvpDef {
+        code: 500,
+        vendor_id: TGPP,
+        name: "Abort-Cause",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 501,
+        vendor_id: TGPP,
+        name: "Access-Network-Charging-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 502,
+        vendor_id: TGPP,
+        name: "Access-Network-Charging-Identifier",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 504,
+        vendor_id: TGPP,
+        name: "AF-Application-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 505,
+        vendor_id: TGPP,
+        name: "AF-Charging-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 507,
+        vendor_id: TGPP,
+        name: "Flow-Description",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 508,
+        vendor_id: TGPP,
+        name: "Flow-Grouping",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 509,
+        vendor_id: TGPP,
+        name: "Flow-Number",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 510,
+        vendor_id: TGPP,
+        name: "Flows",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 511,
+        vendor_id: TGPP,
+        name: "Flow-Status",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 512,
+        vendor_id: TGPP,
+        name: "Flow-Usage",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 513,
+        vendor_id: TGPP,
+        name: "Specific-Action",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 515,
+        vendor_id: TGPP,
+        name: "Max-Requested-Bandwidth-DL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 516,
+        vendor_id: TGPP,
+        name: "Max-Requested-Bandwidth-UL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 517,
+        vendor_id: TGPP,
+        name: "Media-Component-Description",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 518,
+        vendor_id: TGPP,
+        name: "Media-Component-Number",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 519,
+        vendor_id: TGPP,
+        name: "Media-Sub-Component",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 520,
+        vendor_id: TGPP,
+        name: "Media-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 524,
+        vendor_id: TGPP,
+        name: "Codec-Data",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 527,
+        vendor_id: TGPP,
+        name: "Service-Info-Status",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 533,
+        vendor_id: TGPP,
+        name: "Rx-Request-Type",
+        data_type: AvpType::Enumerated,
+    },
     // Cx/Dx (TS 29.228/229)
-    AvpDef { code: 600,  vendor_id: TGPP, name: "Visited-Network-Identifier",         data_type: AvpType::OctetString },
-    AvpDef { code: 601,  vendor_id: TGPP, name: "Public-Identity",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 602,  vendor_id: TGPP, name: "Server-Name",                        data_type: AvpType::UTF8String },
-    AvpDef { code: 603,  vendor_id: TGPP, name: "Server-Capabilities",                data_type: AvpType::Grouped },
-    AvpDef { code: 604,  vendor_id: TGPP, name: "Mandatory-Capability",               data_type: AvpType::Unsigned32 },
-    AvpDef { code: 605,  vendor_id: TGPP, name: "Optional-Capability",                data_type: AvpType::Unsigned32 },
-    AvpDef { code: 606,  vendor_id: TGPP, name: "User-Data",                          data_type: AvpType::OctetString },
-    AvpDef { code: 607,  vendor_id: TGPP, name: "SIP-Number-Auth-Items",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 608,  vendor_id: TGPP, name: "SIP-Authentication-Scheme",          data_type: AvpType::UTF8String },
-    AvpDef { code: 609,  vendor_id: TGPP, name: "SIP-Authenticate",                   data_type: AvpType::OctetString },
-    AvpDef { code: 610,  vendor_id: TGPP, name: "SIP-Authorization",                  data_type: AvpType::OctetString },
-    AvpDef { code: 611,  vendor_id: TGPP, name: "SIP-Authentication-Context",         data_type: AvpType::OctetString },
-    AvpDef { code: 612,  vendor_id: TGPP, name: "SIP-Auth-Data-Item",                 data_type: AvpType::Grouped },
-    AvpDef { code: 613,  vendor_id: TGPP, name: "SIP-Item-Number",                    data_type: AvpType::Unsigned32 },
-    AvpDef { code: 614,  vendor_id: TGPP, name: "Server-Assignment-Type",             data_type: AvpType::Enumerated },
-    AvpDef { code: 615,  vendor_id: TGPP, name: "Deregistration-Reason",              data_type: AvpType::Grouped },
-    AvpDef { code: 616,  vendor_id: TGPP, name: "Reason-Code",                        data_type: AvpType::Enumerated },
-    AvpDef { code: 617,  vendor_id: TGPP, name: "Reason-Info",                        data_type: AvpType::UTF8String },
-    AvpDef { code: 618,  vendor_id: TGPP, name: "Charging-Information",               data_type: AvpType::Grouped },
-    AvpDef { code: 619,  vendor_id: TGPP, name: "Primary-Event-Charging-Function-Name", data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 620,  vendor_id: TGPP, name: "Secondary-Event-Charging-Function-Name", data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 621,  vendor_id: TGPP, name: "Primary-Charging-Collection-Function-Name", data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 622,  vendor_id: TGPP, name: "Secondary-Charging-Collection-Function-Name", data_type: AvpType::DiameterIdentity },
-    AvpDef { code: 623,  vendor_id: TGPP, name: "User-Authorization-Type",            data_type: AvpType::Enumerated },
-    AvpDef { code: 624,  vendor_id: TGPP, name: "User-Data-Already-Available",        data_type: AvpType::Enumerated },
-    AvpDef { code: 625,  vendor_id: TGPP, name: "Confidentiality-Key",                data_type: AvpType::OctetString },
-    AvpDef { code: 626,  vendor_id: TGPP, name: "Integrity-Key",                      data_type: AvpType::OctetString },
-    AvpDef { code: 628,  vendor_id: TGPP, name: "Supported-Features",                 data_type: AvpType::Grouped },
-    AvpDef { code: 629,  vendor_id: TGPP, name: "Feature-List-ID",                    data_type: AvpType::Unsigned32 },
-    AvpDef { code: 630,  vendor_id: TGPP, name: "Feature-List",                       data_type: AvpType::Unsigned32 },
-    AvpDef { code: 631,  vendor_id: TGPP, name: "Supported-Applications",             data_type: AvpType::Grouped },
-    AvpDef { code: 632,  vendor_id: TGPP, name: "Associated-Identities",              data_type: AvpType::Grouped },
-    AvpDef { code: 633,  vendor_id: TGPP, name: "Originating-Request",                data_type: AvpType::Enumerated },
+    AvpDef {
+        code: 600,
+        vendor_id: TGPP,
+        name: "Visited-Network-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 601,
+        vendor_id: TGPP,
+        name: "Public-Identity",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 602,
+        vendor_id: TGPP,
+        name: "Server-Name",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 603,
+        vendor_id: TGPP,
+        name: "Server-Capabilities",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 604,
+        vendor_id: TGPP,
+        name: "Mandatory-Capability",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 605,
+        vendor_id: TGPP,
+        name: "Optional-Capability",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 606,
+        vendor_id: TGPP,
+        name: "User-Data",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 607,
+        vendor_id: TGPP,
+        name: "SIP-Number-Auth-Items",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 608,
+        vendor_id: TGPP,
+        name: "SIP-Authentication-Scheme",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 609,
+        vendor_id: TGPP,
+        name: "SIP-Authenticate",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 610,
+        vendor_id: TGPP,
+        name: "SIP-Authorization",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 611,
+        vendor_id: TGPP,
+        name: "SIP-Authentication-Context",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 612,
+        vendor_id: TGPP,
+        name: "SIP-Auth-Data-Item",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 613,
+        vendor_id: TGPP,
+        name: "SIP-Item-Number",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 614,
+        vendor_id: TGPP,
+        name: "Server-Assignment-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 615,
+        vendor_id: TGPP,
+        name: "Deregistration-Reason",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 616,
+        vendor_id: TGPP,
+        name: "Reason-Code",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 617,
+        vendor_id: TGPP,
+        name: "Reason-Info",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 618,
+        vendor_id: TGPP,
+        name: "Charging-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 619,
+        vendor_id: TGPP,
+        name: "Primary-Event-Charging-Function-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 620,
+        vendor_id: TGPP,
+        name: "Secondary-Event-Charging-Function-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 621,
+        vendor_id: TGPP,
+        name: "Primary-Charging-Collection-Function-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 622,
+        vendor_id: TGPP,
+        name: "Secondary-Charging-Collection-Function-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 623,
+        vendor_id: TGPP,
+        name: "User-Authorization-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 624,
+        vendor_id: TGPP,
+        name: "User-Data-Already-Available",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 625,
+        vendor_id: TGPP,
+        name: "Confidentiality-Key",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 626,
+        vendor_id: TGPP,
+        name: "Integrity-Key",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 628,
+        vendor_id: TGPP,
+        name: "Supported-Features",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 629,
+        vendor_id: TGPP,
+        name: "Feature-List-ID",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 630,
+        vendor_id: TGPP,
+        name: "Feature-List",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 631,
+        vendor_id: TGPP,
+        name: "Supported-Applications",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 632,
+        vendor_id: TGPP,
+        name: "Associated-Identities",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 633,
+        vendor_id: TGPP,
+        name: "Originating-Request",
+        data_type: AvpType::Enumerated,
+    },
     // Sh (TS 29.329)
-    AvpDef { code: 700,  vendor_id: TGPP, name: "User-Identity",                      data_type: AvpType::Grouped },
-    AvpDef { code: 701,  vendor_id: TGPP, name: "MSISDN",                             data_type: AvpType::ISDNAddressString },
-    AvpDef { code: 702,  vendor_id: TGPP, name: "User-Data-Sh",                       data_type: AvpType::OctetString },
-    AvpDef { code: 703,  vendor_id: TGPP, name: "Data-Reference",                     data_type: AvpType::Enumerated },
-    AvpDef { code: 704,  vendor_id: TGPP, name: "Service-Indication",                 data_type: AvpType::OctetString },
-    AvpDef { code: 705,  vendor_id: TGPP, name: "Subs-Req-Type",                      data_type: AvpType::Enumerated },
-    AvpDef { code: 706,  vendor_id: TGPP, name: "Requested-Domain",                   data_type: AvpType::Enumerated },
-    AvpDef { code: 707,  vendor_id: TGPP, name: "Current-Location",                   data_type: AvpType::Enumerated },
-    AvpDef { code: 708,  vendor_id: TGPP, name: "Identity-Set",                       data_type: AvpType::Enumerated },
-    AvpDef { code: 709,  vendor_id: TGPP, name: "Expiry-Time",                        data_type: AvpType::Time },
-    AvpDef { code: 710,  vendor_id: TGPP, name: "Send-Data-Indication",               data_type: AvpType::Enumerated },
-    AvpDef { code: 711,  vendor_id: TGPP, name: "DSAI-Tag",                           data_type: AvpType::OctetString },
+    AvpDef {
+        code: 700,
+        vendor_id: TGPP,
+        name: "User-Identity",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 701,
+        vendor_id: TGPP,
+        name: "MSISDN",
+        data_type: AvpType::ISDNAddressString,
+    },
+    AvpDef {
+        code: 702,
+        vendor_id: TGPP,
+        name: "User-Data-Sh",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 703,
+        vendor_id: TGPP,
+        name: "Data-Reference",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 704,
+        vendor_id: TGPP,
+        name: "Service-Indication",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 705,
+        vendor_id: TGPP,
+        name: "Subs-Req-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 706,
+        vendor_id: TGPP,
+        name: "Requested-Domain",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 707,
+        vendor_id: TGPP,
+        name: "Current-Location",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 708,
+        vendor_id: TGPP,
+        name: "Identity-Set",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 709,
+        vendor_id: TGPP,
+        name: "Expiry-Time",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 710,
+        vendor_id: TGPP,
+        name: "Send-Data-Indication",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 711,
+        vendor_id: TGPP,
+        name: "DSAI-Tag",
+        data_type: AvpType::OctetString,
+    },
     // Ro/Rf Charging (TS 32.299)
-    AvpDef { code: 823,  vendor_id: TGPP, name: "Event-Type",                         data_type: AvpType::Grouped },
-    AvpDef { code: 824,  vendor_id: TGPP, name: "SIP-Method",                         data_type: AvpType::UTF8String },
-    AvpDef { code: 825,  vendor_id: TGPP, name: "Event",                              data_type: AvpType::UTF8String },
-    AvpDef { code: 829,  vendor_id: TGPP, name: "Role-of-Node",                       data_type: AvpType::Enumerated },
-    AvpDef { code: 830,  vendor_id: TGPP, name: "User-Session-Id",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 831,  vendor_id: TGPP, name: "Calling-Party-Address",              data_type: AvpType::UTF8String },
-    AvpDef { code: 832,  vendor_id: TGPP, name: "Called-Party-Address",               data_type: AvpType::UTF8String },
-    AvpDef { code: 833,  vendor_id: TGPP, name: "Time-Stamps",                        data_type: AvpType::Grouped },
-    AvpDef { code: 834,  vendor_id: TGPP, name: "SIP-Request-Timestamp",              data_type: AvpType::Time },
-    AvpDef { code: 835,  vendor_id: TGPP, name: "SIP-Response-Timestamp",             data_type: AvpType::Time },
-    AvpDef { code: 836,  vendor_id: TGPP, name: "Application-Server",                 data_type: AvpType::UTF8String },
-    AvpDef { code: 837,  vendor_id: TGPP, name: "Application-Provided-Called-Party-Address", data_type: AvpType::UTF8String },
-    AvpDef { code: 838,  vendor_id: TGPP, name: "Inter-Operator-Identifier",          data_type: AvpType::Grouped },
-    AvpDef { code: 839,  vendor_id: TGPP, name: "Originating-IOI",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 840,  vendor_id: TGPP, name: "Terminating-IOI",                    data_type: AvpType::UTF8String },
-    AvpDef { code: 841,  vendor_id: TGPP, name: "IMS-Charging-Identifier",            data_type: AvpType::UTF8String },
-    AvpDef { code: 848,  vendor_id: TGPP, name: "Served-Party-IP-Address",            data_type: AvpType::Address },
-    AvpDef { code: 850,  vendor_id: TGPP, name: "Application-Server-Information",     data_type: AvpType::Grouped },
-    AvpDef { code: 851,  vendor_id: TGPP, name: "Trunk-Group-Id",                     data_type: AvpType::Grouped },
-    AvpDef { code: 852,  vendor_id: TGPP, name: "Incoming-Trunk-Group-Id",            data_type: AvpType::UTF8String },
-    AvpDef { code: 853,  vendor_id: TGPP, name: "Outgoing-Trunk-Group-Id",            data_type: AvpType::UTF8String },
-    AvpDef { code: 861,  vendor_id: TGPP, name: "Cause-Code",                         data_type: AvpType::Integer32 },
-    AvpDef { code: 862,  vendor_id: TGPP, name: "Node-Functionality",                 data_type: AvpType::Enumerated },
-    AvpDef { code: 873,  vendor_id: TGPP, name: "Service-Information",                data_type: AvpType::Grouped },
-    AvpDef { code: 874,  vendor_id: TGPP, name: "PS-Information",                     data_type: AvpType::Grouped },
-    AvpDef { code: 876,  vendor_id: TGPP, name: "IMS-Information",                    data_type: AvpType::Grouped },
+    AvpDef {
+        code: 823,
+        vendor_id: TGPP,
+        name: "Event-Type",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 824,
+        vendor_id: TGPP,
+        name: "SIP-Method",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 825,
+        vendor_id: TGPP,
+        name: "Event",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 829,
+        vendor_id: TGPP,
+        name: "Role-of-Node",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 830,
+        vendor_id: TGPP,
+        name: "User-Session-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 831,
+        vendor_id: TGPP,
+        name: "Calling-Party-Address",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 832,
+        vendor_id: TGPP,
+        name: "Called-Party-Address",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 833,
+        vendor_id: TGPP,
+        name: "Time-Stamps",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 834,
+        vendor_id: TGPP,
+        name: "SIP-Request-Timestamp",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 835,
+        vendor_id: TGPP,
+        name: "SIP-Response-Timestamp",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 836,
+        vendor_id: TGPP,
+        name: "Application-Server",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 837,
+        vendor_id: TGPP,
+        name: "Application-Provided-Called-Party-Address",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 838,
+        vendor_id: TGPP,
+        name: "Inter-Operator-Identifier",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 839,
+        vendor_id: TGPP,
+        name: "Originating-IOI",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 840,
+        vendor_id: TGPP,
+        name: "Terminating-IOI",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 841,
+        vendor_id: TGPP,
+        name: "IMS-Charging-Identifier",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 848,
+        vendor_id: TGPP,
+        name: "Served-Party-IP-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 850,
+        vendor_id: TGPP,
+        name: "Application-Server-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 851,
+        vendor_id: TGPP,
+        name: "Trunk-Group-Id",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 852,
+        vendor_id: TGPP,
+        name: "Incoming-Trunk-Group-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 853,
+        vendor_id: TGPP,
+        name: "Outgoing-Trunk-Group-Id",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 861,
+        vendor_id: TGPP,
+        name: "Cause-Code",
+        data_type: AvpType::Integer32,
+    },
+    AvpDef {
+        code: 862,
+        vendor_id: TGPP,
+        name: "Node-Functionality",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 873,
+        vendor_id: TGPP,
+        name: "Service-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 874,
+        vendor_id: TGPP,
+        name: "PS-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 876,
+        vendor_id: TGPP,
+        name: "IMS-Information",
+        data_type: AvpType::Grouped,
+    },
     // Address Address-Type / Address-Data envelope (TS 32.299 §7.2.8/§7.2.9)
-    AvpDef { code: 886,  vendor_id: TGPP, name: "Originator-Address",                 data_type: AvpType::Grouped },
-    AvpDef { code: 897,  vendor_id: TGPP, name: "Address-Data",                       data_type: AvpType::UTF8String },
-    AvpDef { code: 899,  vendor_id: TGPP, name: "Address-Type",                       data_type: AvpType::Enumerated },
+    AvpDef {
+        code: 886,
+        vendor_id: TGPP,
+        name: "Originator-Address",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 897,
+        vendor_id: TGPP,
+        name: "Address-Data",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 899,
+        vendor_id: TGPP,
+        name: "Address-Type",
+        data_type: AvpType::Enumerated,
+    },
     // Gx (TS 29.212) — codes per 3GPP / HSS crate reference
-    AvpDef { code: 1000, vendor_id: TGPP, name: "Bearer-Usage",                       data_type: AvpType::Enumerated },
-    AvpDef { code: 1001, vendor_id: TGPP, name: "Charging-Rule-Install",              data_type: AvpType::Grouped },
-    AvpDef { code: 1002, vendor_id: TGPP, name: "Charging-Rule-Remove",               data_type: AvpType::Grouped },
-    AvpDef { code: 1003, vendor_id: TGPP, name: "Charging-Rule-Definition",           data_type: AvpType::Grouped },
-    AvpDef { code: 1004, vendor_id: TGPP, name: "Charging-Rule-Base-Name",            data_type: AvpType::UTF8String },
-    AvpDef { code: 1005, vendor_id: TGPP, name: "Charging-Rule-Name",                 data_type: AvpType::OctetString },
-    AvpDef { code: 1006, vendor_id: TGPP, name: "Event-Trigger",                      data_type: AvpType::Enumerated },
-    AvpDef { code: 1007, vendor_id: TGPP, name: "Metering-Method",                    data_type: AvpType::Enumerated },
-    AvpDef { code: 1008, vendor_id: TGPP, name: "Offline",                            data_type: AvpType::Enumerated },
-    AvpDef { code: 1009, vendor_id: TGPP, name: "Online",                             data_type: AvpType::Enumerated },
-    AvpDef { code: 1010, vendor_id: TGPP, name: "Precedence",                         data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1011, vendor_id: TGPP, name: "Reporting-Level",                    data_type: AvpType::Enumerated },
-    AvpDef { code: 1013, vendor_id: TGPP, name: "TFT-Packet-Filter-Information",      data_type: AvpType::Grouped },
-    AvpDef { code: 1014, vendor_id: TGPP, name: "ToS-Traffic-Class",                  data_type: AvpType::OctetString },
-    AvpDef { code: 1016, vendor_id: TGPP, name: "QoS-Information",                    data_type: AvpType::Grouped },
-    AvpDef { code: 1018, vendor_id: TGPP, name: "Charging-Rule-Report",               data_type: AvpType::Grouped },
-    AvpDef { code: 1019, vendor_id: TGPP, name: "PCC-Rule-Status",                    data_type: AvpType::Enumerated },
-    AvpDef { code: 1020, vendor_id: TGPP, name: "Bearer-Identifier",                  data_type: AvpType::OctetString },
-    AvpDef { code: 1021, vendor_id: TGPP, name: "Bearer-Operation",                   data_type: AvpType::Enumerated },
-    AvpDef { code: 1022, vendor_id: TGPP, name: "Access-Network-Charging-Identifier-Gx", data_type: AvpType::Grouped },
-    AvpDef { code: 1023, vendor_id: TGPP, name: "Bearer-Control-Mode",                data_type: AvpType::Enumerated },
-    AvpDef { code: 1024, vendor_id: TGPP, name: "Network-Request-Support",            data_type: AvpType::Enumerated },
-    AvpDef { code: 1025, vendor_id: TGPP, name: "Guaranteed-Bitrate-DL",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1026, vendor_id: TGPP, name: "Guaranteed-Bitrate-UL",              data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1027, vendor_id: TGPP, name: "IP-CAN-Type",                        data_type: AvpType::Enumerated },
-    AvpDef { code: 1028, vendor_id: TGPP, name: "QoS-Class-Identifier",               data_type: AvpType::Enumerated },
-    AvpDef { code: 1031, vendor_id: TGPP, name: "Rule-Failure-Code",                  data_type: AvpType::Enumerated },
-    AvpDef { code: 1032, vendor_id: TGPP, name: "RAT-Type",                           data_type: AvpType::Enumerated },
-    AvpDef { code: 1034, vendor_id: TGPP, name: "Allocation-Retention-Priority",      data_type: AvpType::Grouped },
-    AvpDef { code: 1040, vendor_id: TGPP, name: "APN-Aggregate-Max-Bitrate-DL",       data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1041, vendor_id: TGPP, name: "APN-Aggregate-Max-Bitrate-UL",       data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1045, vendor_id: TGPP, name: "Session-Release-Cause",              data_type: AvpType::Enumerated },
-    AvpDef { code: 1046, vendor_id: TGPP, name: "Priority-Level",                     data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1047, vendor_id: TGPP, name: "Pre-emption-Capability",             data_type: AvpType::Enumerated },
-    AvpDef { code: 1048, vendor_id: TGPP, name: "Pre-emption-Vulnerability",          data_type: AvpType::Enumerated },
-    AvpDef { code: 1049, vendor_id: TGPP, name: "Default-EPS-Bearer-QoS",             data_type: AvpType::Grouped },
-    AvpDef { code: 1050, vendor_id: TGPP, name: "AN-GW-Address",                      data_type: AvpType::Address },
+    AvpDef {
+        code: 1000,
+        vendor_id: TGPP,
+        name: "Bearer-Usage",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1001,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Install",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1002,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Remove",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1003,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Definition",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1004,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Base-Name",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 1005,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Name",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1006,
+        vendor_id: TGPP,
+        name: "Event-Trigger",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1007,
+        vendor_id: TGPP,
+        name: "Metering-Method",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1008,
+        vendor_id: TGPP,
+        name: "Offline",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1009,
+        vendor_id: TGPP,
+        name: "Online",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1010,
+        vendor_id: TGPP,
+        name: "Precedence",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1011,
+        vendor_id: TGPP,
+        name: "Reporting-Level",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1013,
+        vendor_id: TGPP,
+        name: "TFT-Packet-Filter-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1014,
+        vendor_id: TGPP,
+        name: "ToS-Traffic-Class",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1016,
+        vendor_id: TGPP,
+        name: "QoS-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1018,
+        vendor_id: TGPP,
+        name: "Charging-Rule-Report",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1019,
+        vendor_id: TGPP,
+        name: "PCC-Rule-Status",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1020,
+        vendor_id: TGPP,
+        name: "Bearer-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1021,
+        vendor_id: TGPP,
+        name: "Bearer-Operation",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1022,
+        vendor_id: TGPP,
+        name: "Access-Network-Charging-Identifier-Gx",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1023,
+        vendor_id: TGPP,
+        name: "Bearer-Control-Mode",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1024,
+        vendor_id: TGPP,
+        name: "Network-Request-Support",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1025,
+        vendor_id: TGPP,
+        name: "Guaranteed-Bitrate-DL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1026,
+        vendor_id: TGPP,
+        name: "Guaranteed-Bitrate-UL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1027,
+        vendor_id: TGPP,
+        name: "IP-CAN-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1028,
+        vendor_id: TGPP,
+        name: "QoS-Class-Identifier",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1031,
+        vendor_id: TGPP,
+        name: "Rule-Failure-Code",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1032,
+        vendor_id: TGPP,
+        name: "RAT-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1034,
+        vendor_id: TGPP,
+        name: "Allocation-Retention-Priority",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1040,
+        vendor_id: TGPP,
+        name: "APN-Aggregate-Max-Bitrate-DL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1041,
+        vendor_id: TGPP,
+        name: "APN-Aggregate-Max-Bitrate-UL",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1045,
+        vendor_id: TGPP,
+        name: "Session-Release-Cause",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1046,
+        vendor_id: TGPP,
+        name: "Priority-Level",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1047,
+        vendor_id: TGPP,
+        name: "Pre-emption-Capability",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1048,
+        vendor_id: TGPP,
+        name: "Pre-emption-Vulnerability",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1049,
+        vendor_id: TGPP,
+        name: "Default-EPS-Bearer-QoS",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1050,
+        vendor_id: TGPP,
+        name: "AN-GW-Address",
+        data_type: AvpType::Address,
+    },
     // SMS-Information envelope: Recipient-Address (TS 32.299 §7.2.155)
-    AvpDef { code: 1201, vendor_id: TGPP, name: "Recipient-Address",                  data_type: AvpType::Grouped },
+    AvpDef {
+        code: 1201,
+        vendor_id: TGPP,
+        name: "Recipient-Address",
+        data_type: AvpType::Grouped,
+    },
     // S6a / S6d (TS 29.272) — MME/SGSN ↔ HSS for LTE attach + auth vectors
-    AvpDef { code: 1400, vendor_id: TGPP, name: "Subscription-Data",                  data_type: AvpType::Grouped },
-    AvpDef { code: 1401, vendor_id: TGPP, name: "Terminal-Information",               data_type: AvpType::Grouped },
-    AvpDef { code: 1402, vendor_id: TGPP, name: "IMEI",                               data_type: AvpType::UTF8String },
-    AvpDef { code: 1403, vendor_id: TGPP, name: "Software-Version",                   data_type: AvpType::UTF8String },
-    AvpDef { code: 1405, vendor_id: TGPP, name: "ULR-Flags",                          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1406, vendor_id: TGPP, name: "ULA-Flags",                          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1407, vendor_id: TGPP, name: "Visited-PLMN-Id",                    data_type: AvpType::OctetString },
-    AvpDef { code: 1408, vendor_id: TGPP, name: "Requested-EUTRAN-Authentication-Info", data_type: AvpType::Grouped },
-    AvpDef { code: 1410, vendor_id: TGPP, name: "Number-Of-Requested-Vectors",        data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1411, vendor_id: TGPP, name: "Re-Synchronization-Info",            data_type: AvpType::OctetString },
-    AvpDef { code: 1412, vendor_id: TGPP, name: "Immediate-Response-Preferred",       data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1413, vendor_id: TGPP, name: "Authentication-Info",                data_type: AvpType::Grouped },
-    AvpDef { code: 1414, vendor_id: TGPP, name: "E-UTRAN-Vector",                     data_type: AvpType::Grouped },
-    AvpDef { code: 1420, vendor_id: TGPP, name: "Cancellation-Type",                  data_type: AvpType::Enumerated },
-    AvpDef { code: 1447, vendor_id: TGPP, name: "RAND",                               data_type: AvpType::OctetString },
-    AvpDef { code: 1448, vendor_id: TGPP, name: "XRES",                               data_type: AvpType::OctetString },
-    AvpDef { code: 1449, vendor_id: TGPP, name: "AUTN",                               data_type: AvpType::OctetString },
-    AvpDef { code: 1450, vendor_id: TGPP, name: "KASME",                              data_type: AvpType::OctetString },
+    AvpDef {
+        code: 1400,
+        vendor_id: TGPP,
+        name: "Subscription-Data",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1401,
+        vendor_id: TGPP,
+        name: "Terminal-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1402,
+        vendor_id: TGPP,
+        name: "IMEI",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 1403,
+        vendor_id: TGPP,
+        name: "Software-Version",
+        data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 1405,
+        vendor_id: TGPP,
+        name: "ULR-Flags",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1406,
+        vendor_id: TGPP,
+        name: "ULA-Flags",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1407,
+        vendor_id: TGPP,
+        name: "Visited-PLMN-Id",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1408,
+        vendor_id: TGPP,
+        name: "Requested-EUTRAN-Authentication-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1410,
+        vendor_id: TGPP,
+        name: "Number-Of-Requested-Vectors",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1411,
+        vendor_id: TGPP,
+        name: "Re-Synchronization-Info",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1412,
+        vendor_id: TGPP,
+        name: "Immediate-Response-Preferred",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1413,
+        vendor_id: TGPP,
+        name: "Authentication-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1414,
+        vendor_id: TGPP,
+        name: "E-UTRAN-Vector",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1420,
+        vendor_id: TGPP,
+        name: "Cancellation-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 1447,
+        vendor_id: TGPP,
+        name: "RAND",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1448,
+        vendor_id: TGPP,
+        name: "XRES",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1449,
+        vendor_id: TGPP,
+        name: "AUTN",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 1450,
+        vendor_id: TGPP,
+        name: "KASME",
+        data_type: AvpType::OctetString,
+    },
     // S6c served-node identifiers (TS 29.336 / 29.272)
-    AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::ISDNAddressString },
-    AvpDef { code: 1635, vendor_id: TGPP, name: "PUR-Flags",                          data_type: AvpType::Unsigned32 },
-    AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::ISDNAddressString },
+    AvpDef {
+        code: 1489,
+        vendor_id: TGPP,
+        name: "SGSN-Number",
+        data_type: AvpType::ISDNAddressString,
+    },
+    AvpDef {
+        code: 1635,
+        vendor_id: TGPP,
+        name: "PUR-Flags",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 1645,
+        vendor_id: TGPP,
+        name: "MME-Number-for-MT-SMS",
+        data_type: AvpType::ISDNAddressString,
+    },
     // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
-    AvpDef { code: 2000, vendor_id: TGPP, name: "SMS-Information",                    data_type: AvpType::Grouped },
-    AvpDef { code: 2001, vendor_id: TGPP, name: "Data-Coding-Scheme",                 data_type: AvpType::Integer32 },
+    AvpDef {
+        code: 2000,
+        vendor_id: TGPP,
+        name: "SMS-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2001,
+        vendor_id: TGPP,
+        name: "Data-Coding-Scheme",
+        data_type: AvpType::Integer32,
+    },
     // Note: Multiple-Services-Credit-Control is base RFC 8506 code 456
     // (vendor 0), listed above — NOT a 3GPP vendor AVP. The prior (2006,10415)
     // entry collided with the real 3GPP Interface-Type and has been removed.
-    AvpDef { code: 2007, vendor_id: TGPP, name: "SM-Message-Type",                    data_type: AvpType::Enumerated },
-    AvpDef { code: 2008, vendor_id: TGPP, name: "Originator-SCCP-Address",            data_type: AvpType::Address },
-    AvpDef { code: 2009, vendor_id: TGPP, name: "Originator-Interface",               data_type: AvpType::Grouped },
-    AvpDef { code: 2010, vendor_id: TGPP, name: "Recipient-SCCP-Address",             data_type: AvpType::Address },
-    AvpDef { code: 2011, vendor_id: TGPP, name: "Reply-Path-Requested",               data_type: AvpType::Enumerated },
-    AvpDef { code: 2012, vendor_id: TGPP, name: "SM-Discharge-Time",                  data_type: AvpType::Time },
-    AvpDef { code: 2013, vendor_id: TGPP, name: "SM-Protocol-ID",                     data_type: AvpType::OctetString },
-    AvpDef { code: 2014, vendor_id: TGPP, name: "SM-Status",                          data_type: AvpType::OctetString },
-    AvpDef { code: 2015, vendor_id: TGPP, name: "SM-User-Data-Header",                data_type: AvpType::OctetString },
-    AvpDef { code: 2016, vendor_id: TGPP, name: "SMS-Node",                           data_type: AvpType::Enumerated },
+    AvpDef {
+        code: 2007,
+        vendor_id: TGPP,
+        name: "SM-Message-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 2008,
+        vendor_id: TGPP,
+        name: "Originator-SCCP-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 2009,
+        vendor_id: TGPP,
+        name: "Originator-Interface",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2010,
+        vendor_id: TGPP,
+        name: "Recipient-SCCP-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 2011,
+        vendor_id: TGPP,
+        name: "Reply-Path-Requested",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 2012,
+        vendor_id: TGPP,
+        name: "SM-Discharge-Time",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 2013,
+        vendor_id: TGPP,
+        name: "SM-Protocol-ID",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 2014,
+        vendor_id: TGPP,
+        name: "SM-Status",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 2015,
+        vendor_id: TGPP,
+        name: "SM-User-Data-Header",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 2016,
+        vendor_id: TGPP,
+        name: "SMS-Node",
+        data_type: AvpType::Enumerated,
+    },
     // TS 32.299 §7.2.171: code 2017 is SMSC-Address (the prior "Interface-Id"
     // label was wrong — Interface-Id is 2003 — and was never emitted). The old
     // (2024 Interface-Text / 2025 Interface-Type) rows were likewise mislabeled
     // and unused, so removed rather than left to poison the generic decoder.
-    AvpDef { code: 2017, vendor_id: TGPP, name: "SMSC-Address",                       data_type: AvpType::Address },
-    AvpDef { code: 2018, vendor_id: TGPP, name: "Client-Address",                     data_type: AvpType::Address },
-    AvpDef { code: 2019, vendor_id: TGPP, name: "Number-of-Messages-Sent",            data_type: AvpType::Unsigned32 },
-    AvpDef { code: 2026, vendor_id: TGPP, name: "Recipient-Info",                     data_type: AvpType::Grouped },
-    AvpDef { code: 2027, vendor_id: TGPP, name: "Originator-Received-Address",        data_type: AvpType::Grouped },
-    AvpDef { code: 2028, vendor_id: TGPP, name: "Recipient-Received-Address",         data_type: AvpType::Grouped },
-    AvpDef { code: 2029, vendor_id: TGPP, name: "SM-Service-Type",                    data_type: AvpType::Enumerated },
+    AvpDef {
+        code: 2017,
+        vendor_id: TGPP,
+        name: "SMSC-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 2018,
+        vendor_id: TGPP,
+        name: "Client-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 2019,
+        vendor_id: TGPP,
+        name: "Number-of-Messages-Sent",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 2026,
+        vendor_id: TGPP,
+        name: "Recipient-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2027,
+        vendor_id: TGPP,
+        name: "Originator-Received-Address",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2028,
+        vendor_id: TGPP,
+        name: "Recipient-Received-Address",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2029,
+        vendor_id: TGPP,
+        name: "SM-Service-Type",
+        data_type: AvpType::Enumerated,
+    },
     // Charging — Visited Network Identifier (TS 32.299 §7.2.74)
-    AvpDef { code: 2713, vendor_id: TGPP, name: "IMS-Visited-Network-Identifier",     data_type: AvpType::UTF8String },
+    AvpDef {
+        code: 2713,
+        vendor_id: TGPP,
+        name: "IMS-Visited-Network-Identifier",
+        data_type: AvpType::UTF8String,
+    },
     // SMS-Information extras (TS 32.299 §7.2.79) interleaved with S6c codes by code order
-    AvpDef { code: 3010, vendor_id: TGPP, name: "Application-Port-Identifier",        data_type: AvpType::Unsigned32 },
-    AvpDef { code: 3111, vendor_id: TGPP, name: "External-Identifier",                data_type: AvpType::UTF8String },
+    AvpDef {
+        code: 3010,
+        vendor_id: TGPP,
+        name: "Application-Port-Identifier",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 3111,
+        vendor_id: TGPP,
+        name: "External-Identifier",
+        data_type: AvpType::UTF8String,
+    },
     // S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
-    AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::ISDNAddressString },
-    AvpDef { code: 3301, vendor_id: TGPP, name: "SM-RP-UI",                           data_type: AvpType::OctetString },
-    AvpDef { code: 3308, vendor_id: TGPP, name: "SM-RP-MTI",                          data_type: AvpType::Enumerated },
-    AvpDef { code: 3316, vendor_id: TGPP, name: "SM-Delivery-Outcome",                data_type: AvpType::Grouped },
-    AvpDef { code: 3324, vendor_id: TGPP, name: "SMSMI-Correlation-ID",               data_type: AvpType::Grouped },
-    AvpDef { code: 3332, vendor_id: TGPP, name: "SMS-GMSC-Address",                   data_type: AvpType::Address },
+    AvpDef {
+        code: 3300,
+        vendor_id: TGPP,
+        name: "SC-Address",
+        data_type: AvpType::ISDNAddressString,
+    },
+    AvpDef {
+        code: 3301,
+        vendor_id: TGPP,
+        name: "SM-RP-UI",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3308,
+        vendor_id: TGPP,
+        name: "SM-RP-MTI",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 3316,
+        vendor_id: TGPP,
+        name: "SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3324,
+        vendor_id: TGPP,
+        name: "SMSMI-Correlation-ID",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3332,
+        vendor_id: TGPP,
+        name: "SMS-GMSC-Address",
+        data_type: AvpType::Address,
+    },
     // SMS-Information device-trigger / result extras (TS 32.299 §7.2.79).
     // MTC-IWF-Address is 3406 and SMS-Result is 3409 (verified against the
     // go-diameter tgpp_ro_rf dictionary). The prior 3413/3408 codes were wrong
     // — 3408 is SM-Sequence-Number and 3413 is Teleservice — and were emitted
     // on the Rf wire, so a CDF would misparse the SMS record.
-    AvpDef { code: 3405, vendor_id: TGPP, name: "SM-Device-Trigger-Information",      data_type: AvpType::Grouped },
-    AvpDef { code: 3406, vendor_id: TGPP, name: "MTC-IWF-Address",                    data_type: AvpType::Address },
-    AvpDef { code: 3407, vendor_id: TGPP, name: "SM-Device-Trigger-Indicator",        data_type: AvpType::Enumerated },
-    AvpDef { code: 3409, vendor_id: TGPP, name: "SMS-Result",                         data_type: AvpType::Unsigned32 },
+    AvpDef {
+        code: 3405,
+        vendor_id: TGPP,
+        name: "SM-Device-Trigger-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3406,
+        vendor_id: TGPP,
+        name: "MTC-IWF-Address",
+        data_type: AvpType::Address,
+    },
+    AvpDef {
+        code: 3407,
+        vendor_id: TGPP,
+        name: "SM-Device-Trigger-Indicator",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 3409,
+        vendor_id: TGPP,
+        name: "SMS-Result",
+        data_type: AvpType::Unsigned32,
+    },
 ];
 
 /// Look up an AVP definition by (code, vendor_id).
@@ -367,9 +1690,7 @@ static AVP_TABLE: &[AvpDef] = &[
 /// Uses binary search on the static table (sorted by vendor_id, then code).
 pub fn lookup_avp(code: u32, vendor_id: u32) -> Option<&'static AvpDef> {
     AVP_TABLE
-        .binary_search_by(|entry| {
-            entry.vendor_id.cmp(&vendor_id).then(entry.code.cmp(&code))
-        })
+        .binary_search_by(|entry| entry.vendor_id.cmp(&vendor_id).then(entry.code.cmp(&code)))
         .ok()
         .map(|idx| &AVP_TABLE[idx])
 }
@@ -514,9 +1835,7 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
         // S6c
         "send-routing-info-for-sm" | "srr" | "sra" => Some(CMD_SEND_ROUTING_INFO_FOR_SM),
         "alert-service-centre" | "alert-sc" | "alr" | "ala" => Some(CMD_ALERT_SERVICE_CENTRE),
-        "report-sm-delivery-status" | "rsr" | "rsa" => {
-            Some(CMD_REPORT_SM_DELIVERY_STATUS)
-        }
+        "report-sm-delivery-status" | "rsr" | "rsa" => Some(CMD_REPORT_SM_DELIVERY_STATUS),
         // SGd
         "mo-forward-short-message" | "ofr" | "ofa" => Some(CMD_MO_FORWARD_SHORT_MESSAGE),
         "mt-forward-short-message" | "tfr" | "tfa" => Some(CMD_MT_FORWARD_SHORT_MESSAGE),
@@ -869,7 +2188,6 @@ pub mod avp {
     pub const IMS_INFORMATION: u32 = 876;
     pub const IMS_VISITED_NETWORK_IDENTIFIER: u32 = 2713;
 
-
     // 3GPP S6c served-node identifiers
     pub const SGSN_NUMBER: u32 = 1489;
     pub const MME_NUMBER_FOR_MT_SMS: u32 = 1645;
@@ -948,8 +2266,10 @@ mod tests {
             assert!(
                 left < right,
                 "table not sorted at {} (v={}) vs {} (v={})",
-                pair[0].name, pair[0].vendor_id,
-                pair[1].name, pair[1].vendor_id,
+                pair[0].name,
+                pair[0].vendor_id,
+                pair[1].name,
+                pair[1].vendor_id,
             );
         }
     }
@@ -1005,7 +2325,10 @@ mod tests {
 
     #[test]
     fn avp_count_is_substantial() {
-        assert!(avp_count() > 100, "dictionary should have > 100 AVP entries");
+        assert!(
+            avp_count() > 100,
+            "dictionary should have > 100 AVP entries"
+        );
     }
 
     #[test]
@@ -1064,8 +2387,8 @@ mod tests {
             ("SMS-Result", 3409, TGPP),
         ];
         for &(name, code, vendor) in reference {
-            let entry = lookup_by_name(name)
-                .unwrap_or_else(|| panic!("dictionary missing AVP {name}"));
+            let entry =
+                lookup_by_name(name).unwrap_or_else(|| panic!("dictionary missing AVP {name}"));
             assert_eq!(entry.code, code, "{name} code");
             assert_eq!(entry.vendor_id, vendor, "{name} vendor");
             // Reverse lookup by (code, vendor) must round-trip to the same name.
@@ -1084,9 +2407,15 @@ mod tests {
         assert_ne!(lookup_by_name("Granted-Service-Unit").unwrap().code, 426);
         assert_ne!(lookup_by_name("CC-Time").unwrap().code, 454);
         assert_ne!(lookup_by_name("Final-Unit-Indication").unwrap().code, 431);
-        assert!(lookup_avp(2006, TGPP).is_none(), "stale 3GPP MSCC still present");
+        assert!(
+            lookup_avp(2006, TGPP).is_none(),
+            "stale 3GPP MSCC still present"
+        );
         assert_eq!(lookup_avp(426, 0).unwrap().name, "Credit-Control");
-        assert_eq!(lookup_avp(456, 0).unwrap().name, "Multiple-Services-Credit-Control");
+        assert_eq!(
+            lookup_avp(456, 0).unwrap().name,
+            "Multiple-Services-Credit-Control"
+        );
     }
 
     #[test]
@@ -1112,7 +2441,9 @@ mod tests {
         assert_eq!(lookup_avp_by_python_name("sm_rp_ui").unwrap().code, 3301);
         assert_eq!(lookup_avp_by_python_name("user_name").unwrap().code, 1);
         assert_eq!(
-            lookup_avp_by_python_name("visited_network_identifier").unwrap().code,
+            lookup_avp_by_python_name("visited_network_identifier")
+                .unwrap()
+                .code,
             600
         );
         assert!(lookup_avp_by_python_name("not_a_real_avp").is_none());
@@ -1162,10 +2493,19 @@ mod tests {
 
     #[test]
     fn command_code_by_name_handles_acronym_aliases() {
-        assert_eq!(command_code_by_name("SRR"), Some(CMD_SEND_ROUTING_INFO_FOR_SM));
+        assert_eq!(
+            command_code_by_name("SRR"),
+            Some(CMD_SEND_ROUTING_INFO_FOR_SM)
+        );
         assert_eq!(command_code_by_name("ALR"), Some(CMD_ALERT_SERVICE_CENTRE));
-        assert_eq!(command_code_by_name("TFR"), Some(CMD_MT_FORWARD_SHORT_MESSAGE));
-        assert_eq!(command_code_by_name("OFR"), Some(CMD_MO_FORWARD_SHORT_MESSAGE));
+        assert_eq!(
+            command_code_by_name("TFR"),
+            Some(CMD_MT_FORWARD_SHORT_MESSAGE)
+        );
+        assert_eq!(
+            command_code_by_name("OFR"),
+            Some(CMD_MO_FORWARD_SHORT_MESSAGE)
+        );
         assert_eq!(command_code_by_name("MAR"), Some(CMD_MULTIMEDIA_AUTH));
     }
 
@@ -1190,10 +2530,7 @@ mod tests {
             command_code_by_name("send-routing-info-for-sm-request"),
             command_code_by_name("Send-Routing-Info-for-SM-Request")
         );
-        assert_eq!(
-            command_code_by_name("alr"),
-            command_code_by_name("ALR"),
-        );
+        assert_eq!(command_code_by_name("alr"), command_code_by_name("ALR"),);
     }
 
     #[test]

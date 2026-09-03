@@ -72,35 +72,27 @@ impl PySubscribeState {
             .get("Call-ID")
             .or_else(|| message.headers.get("i"))
             .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Call-ID")
-            })?;
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Call-ID"))?;
 
         let from_raw = message
             .headers
             .get("From")
             .or_else(|| message.headers.get("f"))
             .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing From")
-            })?;
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing From"))?;
         let to_raw = message
             .headers
             .get("To")
             .or_else(|| message.headers.get("t"))
             .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing To")
-            })?;
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing To"))?;
 
         let contact_raw = message
             .headers
             .get("Contact")
             .or_else(|| message.headers.get("m"))
             .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Contact")
-            })?;
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Contact"))?;
 
         let event = message
             .headers
@@ -108,14 +100,11 @@ impl PySubscribeState {
             .or_else(|| message.headers.get("o"))
             .cloned()
             .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "SUBSCRIBE missing Event header",
-                )
+                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Event header")
             })?;
 
-        let remote_tag = extract_tag(&from_raw).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("SUBSCRIBE From has no tag")
-        })?;
+        let remote_tag = extract_tag(&from_raw)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE From has no tag"))?;
 
         // The SUBSCRIBE's To-tag is the notifier's (our) tag.  If the
         // SUBSCRIBE had no To-tag (first-in-dialog), we mint one now so
@@ -264,7 +253,9 @@ impl PySubscribeState {
             ))
         })?;
 
-        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+        let transport_hint = resolve_uri
+            .get_param("transport")
+            .map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
@@ -282,11 +273,7 @@ impl PySubscribeState {
             ))
         })?;
 
-        let transport = match target
-            .transport
-            .as_deref()
-            .or(transport_hint.as_deref())
-        {
+        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
             Some(hint) => match hint.to_lowercase().as_str() {
                 "tcp" => Transport::Tcp,
                 "tls" => Transport::Tls,
@@ -295,7 +282,13 @@ impl PySubscribeState {
                 "sctp" => Transport::Sctp,
                 _ => Transport::Udp,
             },
-            None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+            None => {
+                if scheme == "sips" {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                }
+            }
         };
 
         // Mint dialog identity on our side.
@@ -343,16 +336,11 @@ impl PySubscribeState {
             &extra_headers,
         )?;
 
-        let receiver = uac_sender.send_request_with_response(
-            message,
-            target.address,
-            transport,
-        );
+        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let result = crate::script::detach_block_on(async {
-            tokio::time::timeout(timeout, receiver).await
-        });
+        let result =
+            crate::script::detach_block_on(async { tokio::time::timeout(timeout, receiver).await });
 
         let response = match result {
             Ok(Ok(crate::uac::UacResult::Response(message))) => *message,
@@ -376,9 +364,7 @@ impl PySubscribeState {
             .get("To")
             .or_else(|| response.headers.get("t"))
             .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header")
-            })?;
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header"))?;
         let remote_tag = extract_tag(&to_raw).ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "2xx response To header missing tag — peer did not establish dialog",
@@ -448,12 +434,7 @@ impl PySubscribeState {
     /// and the To-tag is ours (our local_tag). Returns ``None`` if the
     /// dialog is unknown or terminated.
     #[pyo3(signature = (call_id, local_tag, remote_tag))]
-    fn find(
-        &self,
-        call_id: &str,
-        local_tag: &str,
-        remote_tag: &str,
-    ) -> Option<PySubscribeHandle> {
+    fn find(&self, call_id: &str, local_tag: &str, remote_tag: &str) -> Option<PySubscribeHandle> {
         self.store
             .find_by_tags(call_id, local_tag, remote_tag)
             .map(|dialog| PySubscribeHandle {
@@ -564,7 +545,12 @@ impl PySubscribeHandle {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("active;expires={}", dialog.remaining_secs()));
 
-        send_notify(&dialog, &subscription_state, content_type, body_bytes.as_deref())?;
+        send_notify(
+            &dialog,
+            &subscription_state,
+            content_type,
+            body_bytes.as_deref(),
+        )?;
         Ok(true)
     }
 
@@ -604,13 +590,19 @@ impl PySubscribeHandle {
                 Some(obj) => Some(super::request::extract_body_bytes(obj)?),
                 None => None,
             };
-            send_notify(&dialog, &subscription_state, content_type, body_bytes.as_deref())?;
+            send_notify(
+                &dialog,
+                &subscription_state,
+                content_type,
+                body_bytes.as_deref(),
+            )?;
         }
 
         // Mark terminated + remove.  Mark-then-remove gives a brief
         // window where get() returns None even if the cache still has
         // the entry (race-safe for cross-instance lookups).
-        self.store.update(&self.id, |dialog| dialog.terminated = true);
+        self.store
+            .update(&self.id, |dialog| dialog.terminated = true);
         self.store.remove(&self.id);
         Ok(true)
     }
@@ -724,7 +716,13 @@ fn send_notify(
     let resolve_target: String = dialog
         .route_set
         .first()
-        .map(|route| route.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        .map(|route| {
+            route
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
         .unwrap_or_else(|| dialog.remote_target.clone());
 
     let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
@@ -739,7 +737,9 @@ fn send_notify(
         ))
     })?;
 
-    let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+    let transport_hint = resolve_uri
+        .get_param("transport")
+        .map(|s: &str| s.to_string());
     let resolver_clone = Arc::clone(resolver);
     let host = resolve_uri.host.clone();
     let port = resolve_uri.port;
@@ -758,11 +758,7 @@ fn send_notify(
         ))
     })?;
 
-    let transport = match target
-        .transport
-        .as_deref()
-        .or(transport_hint.as_deref())
-    {
+    let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
         Some(hint) => match hint.to_lowercase().as_str() {
             "tcp" => Transport::Tcp,
             "tls" => Transport::Tls,
@@ -771,7 +767,13 @@ fn send_notify(
             "sctp" => Transport::Sctp,
             _ => Transport::Udp,
         },
-        None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+        None => {
+            if scheme == "sips" {
+                Transport::Tls
+            } else {
+                Transport::Udp
+            }
+        }
     };
 
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
@@ -809,9 +811,7 @@ fn send_notify(
     }
 
     let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to build NOTIFY: {error}"
-        ))
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build NOTIFY: {error}"))
     })?;
 
     // If called from inside a request handler, the dispatcher may defer
@@ -853,9 +853,8 @@ fn send_in_dialog_subscribe_with_timeout(
     })?;
     let receiver = uac_sender.send_request_with_response(message, target_addr, transport);
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let result = crate::script::detach_block_on(async {
-        tokio::time::timeout(timeout, receiver).await
-    });
+    let result =
+        crate::script::detach_block_on(async { tokio::time::timeout(timeout, receiver).await });
     match result {
         Ok(Ok(crate::uac::UacResult::Response(message))) => {
             let status = message.status_code().unwrap_or(0);
@@ -878,7 +877,11 @@ fn send_in_dialog_subscribe_with_timeout(
 fn build_in_dialog_subscribe(
     dialog: &SubscribeDialog,
     expires_secs: u64,
-) -> PyResult<(crate::sip::message::SipMessage, std::net::SocketAddr, Transport)> {
+) -> PyResult<(
+    crate::sip::message::SipMessage,
+    std::net::SocketAddr,
+    Transport,
+)> {
     let resolver = SEND_RESOLVER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "subscribe_state outbound unavailable: DNS resolver not initialized",
@@ -890,7 +893,13 @@ fn build_in_dialog_subscribe(
     let resolve_target: String = dialog
         .route_set
         .first()
-        .map(|route| route.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        .map(|route| {
+            route
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
         .unwrap_or_else(|| dialog.remote_target.clone());
 
     let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
@@ -905,7 +914,9 @@ fn build_in_dialog_subscribe(
         ))
     })?;
 
-    let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+    let transport_hint = resolve_uri
+        .get_param("transport")
+        .map(|s: &str| s.to_string());
     let resolver_clone = Arc::clone(resolver);
     let host = resolve_uri.host.clone();
     let port = resolve_uri.port;
@@ -923,11 +934,7 @@ fn build_in_dialog_subscribe(
         ))
     })?;
 
-    let transport = match target
-        .transport
-        .as_deref()
-        .or(transport_hint.as_deref())
-    {
+    let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
         Some(hint) => match hint.to_lowercase().as_str() {
             "tcp" => Transport::Tcp,
             "tls" => Transport::Tls,
@@ -936,7 +943,13 @@ fn build_in_dialog_subscribe(
             "sctp" => Transport::Sctp,
             _ => Transport::Udp,
         },
-        None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+        None => {
+            if scheme == "sips" {
+                Transport::Tls
+            } else {
+                Transport::Udp
+            }
+        }
     };
 
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
@@ -964,9 +977,7 @@ fn build_in_dialog_subscribe(
     builder = builder.content_length(0);
 
     let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to build SUBSCRIBE: {error}"
-        ))
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
     })?;
 
     Ok((message, target.address, transport))
@@ -1001,7 +1012,10 @@ fn build_outbound_subscribe(
     // Via sent-by is *our* advertised host:port so the notifier routes the
     // response back to us (RFC 3261 §18.2.1 / §20.42 — the sent-by may be an
     // FQDN), not to the destination or a loopback fallback.
-    let via = format!("SIP/2.0/{} {}:{};branch={}", transport, local_host, local_port, branch);
+    let via = format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport, local_host, local_port, branch
+    );
     let cseq_value: u32 = 1;
     let cseq_str = format!("{cseq_value} SUBSCRIBE");
 
@@ -1066,9 +1080,7 @@ fn build_outbound_subscribe(
     builder = builder.content_length(0);
 
     let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to build SUBSCRIBE: {error}"
-        ))
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
     })?;
 
     Ok((message, cseq_value, from_override))
@@ -1181,7 +1193,12 @@ pub(crate) fn strip_nameaddr(value: &str) -> String {
         }
     }
     // No angle brackets — strip any trailing ;tag=… or other params.
-    trimmed.split(';').next().unwrap_or(trimmed).trim().to_string()
+    trimmed
+        .split(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1295,7 +1312,11 @@ else:
 "#;
             let assertions = std::ffi::CString::new(script).expect("CString");
             python
-                .run(assertions.as_c_str(), Some(&module_globals), Some(&module_globals))
+                .run(
+                    assertions.as_c_str(),
+                    Some(&module_globals),
+                    Some(&module_globals),
+                )
                 .expect("stub surface assertions");
         });
     }
@@ -1312,7 +1333,10 @@ else:
         5070
     }
 
-    fn collect_header<'a>(message: &'a crate::sip::message::SipMessage, name: &str) -> Vec<&'a str> {
+    fn collect_header<'a>(
+        message: &'a crate::sip::message::SipMessage,
+        name: &str,
+    ) -> Vec<&'a str> {
         message
             .headers
             .get_all(name)

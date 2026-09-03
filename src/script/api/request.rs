@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use ipnet::IpNet;
 use pyo3::prelude::*;
 
+use super::sip_uri::PySipUri;
 use crate::sip::headers::cseq::CSeq;
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::headers::route::RouteEntry;
@@ -16,7 +17,6 @@ use crate::sip::headers::via::Via;
 use crate::sip::message::{SipMessage, StartLine};
 use crate::sip::parser::parse_uri_standalone;
 use crate::sip::uri::format_sip_host;
-use super::sip_uri::PySipUri;
 
 /// Shared list of local domains from config.
 pub type LocalDomains = Arc<Vec<String>>;
@@ -359,7 +359,11 @@ impl PyRequest {
 
     /// Set a reply action from Rust code (e.g., auth challenges).
     pub fn set_reply(&mut self, code: u16, reason: String) {
-        self.action = RequestAction::Reply { code, reason, reliable: false };
+        self.action = RequestAction::Reply {
+            code,
+            reason,
+            reliable: false,
+        };
     }
 
     /// Get the underlying SIP message.
@@ -443,7 +447,8 @@ impl PyRequest {
     /// callers — e.g. the registrar enumerating REGISTER 200 OK `Contact`
     /// bindings (RFC 3261 §10.3 step 8).
     pub fn push_reply_header_add(&mut self, name: &str, value: String) {
-        self.reply_headers.push((ReplyHeaderOp::Add, name.to_string(), value));
+        self.reply_headers
+            .push((ReplyHeaderOp::Add, name.to_string(), value));
     }
 
     /// Take the response body set by `set_reply_body()` (consumed by the dispatcher).
@@ -489,7 +494,9 @@ impl PyRequest {
                 poisoned.into_inner()
             }
         };
-        message.headers.from()
+        message
+            .headers
+            .from()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
             .unwrap_or_default()
@@ -504,7 +511,9 @@ impl PyRequest {
                 poisoned.into_inner()
             }
         };
-        message.headers.to()
+        message
+            .headers
+            .to()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
             .unwrap_or_default()
@@ -597,7 +606,9 @@ impl PyRequest {
                 poisoned.into_inner()
             }
         };
-        message.headers.from()
+        message
+            .headers
+            .from()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
     }
@@ -611,7 +622,9 @@ impl PyRequest {
                 poisoned.into_inner()
             }
         };
-        message.headers.to()
+        message
+            .headers
+            .to()
             .and_then(|v| NameAddr::parse(v).ok())
             .map(|na| na.uri.to_string())
     }
@@ -681,13 +694,12 @@ impl PyRequest {
             return Ok(());
         }
         // Fall back to string parsing
-        let uri_string: String = value.extract().or_else(|_| {
-            value.str().map(|s| s.to_string())
-        }).map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(
-                "ruri must be a string or SipUri object"
-            )
-        })?;
+        let uri_string: String = value
+            .extract()
+            .or_else(|_| value.str().map(|s| s.to_string()))
+            .map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("ruri must be a string or SipUri object")
+            })?;
         let parsed = parse_uri_standalone(&uri_string).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
         })?;
@@ -860,7 +872,9 @@ impl PyRequest {
             }
         }
         // Fall back to Expires header
-        Ok(message.headers.get("Expires")
+        Ok(message
+            .headers
+            .get("Expires")
             .and_then(|value| value.trim().parse::<u32>().ok()))
     }
 
@@ -996,7 +1010,11 @@ impl PyRequest {
         validate_send_socket(send_socket.as_deref())?;
         self.on_reply_callback = on_reply;
         self.on_failure_callback = on_failure;
-        self.action = RequestAction::Relay { next_hop, flow, send_socket };
+        self.action = RequestAction::Relay {
+            next_hop,
+            flow,
+            send_socket,
+        };
         Ok(())
     }
 
@@ -1114,8 +1132,7 @@ impl PyRequest {
             // that follow it and also point to us (double Record-Route from
             // transport bridging).  Same function the 2xx ACK path uses, so the
             // two in-dialog paths cannot disagree about one dialog's route set.
-            let consumed =
-                crate::proxy::core::consume_self_routes(&mut message.headers, identity);
+            let consumed = crate::proxy::core::consume_self_routes(&mut message.headers, identity);
             popped.extend(consumed.into_iter().map(|entry| entry.uri.to_string()));
         }
         self.consumed_routes.extend(popped);
@@ -1193,7 +1210,8 @@ impl PyRequest {
     /// For multi-value headers (Via, Route, Service-Route,
     /// P-Associated-URI), use ``add_reply_header`` instead.
     fn set_reply_header(&mut self, name: &str, value: &str) {
-        self.reply_headers.push((ReplyHeaderOp::Replace, name.to_string(), value.to_string()));
+        self.reply_headers
+            .push((ReplyHeaderOp::Replace, name.to_string(), value.to_string()));
     }
 
     /// Append a header to the response built by ``request.reply()`` or
@@ -1206,7 +1224,8 @@ impl PyRequest {
     ///
     /// For single-value headers, use ``set_reply_header`` instead.
     fn add_reply_header(&mut self, name: &str, value: &str) {
-        self.reply_headers.push((ReplyHeaderOp::Add, name.to_string(), value.to_string()));
+        self.reply_headers
+            .push((ReplyHeaderOp::Add, name.to_string(), value.to_string()));
     }
 
     /// Attach a To-tag to the response built by ``request.reply()``.
@@ -1225,17 +1244,17 @@ impl PyRequest {
             let message = self.lock()?;
             message.headers.to().cloned()
         };
-        let Some(to) = to_value else { return Ok(()); };
-        let mut parsed = NameAddr::parse(&to)
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(
-                format!("set_reply_to_tag: failed to parse To header '{to}': {error}"),
-            ))?;
+        let Some(to) = to_value else {
+            return Ok(());
+        };
+        let mut parsed = NameAddr::parse(&to).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "set_reply_to_tag: failed to parse To header '{to}': {error}"
+            ))
+        })?;
         parsed.tag = Some(tag.to_string());
-        self.reply_headers.push((
-            ReplyHeaderOp::Replace,
-            "To".to_string(),
-            parsed.to_string(),
-        ));
+        self.reply_headers
+            .push((ReplyHeaderOp::Replace, "To".to_string(), parsed.to_string()));
         Ok(())
     }
 
@@ -1245,17 +1264,15 @@ impl PyRequest {
     /// accepts ``str`` or ``bytes``.  Useful for PIDF-LO synthesis,
     /// SDP rewrite, XCAP/Ut document manipulation.
     #[pyo3(signature = (body, content_type=None))]
-    fn set_body(
-        &self,
-        body: &Bound<'_, PyAny>,
-        content_type: Option<&str>,
-    ) -> PyResult<()> {
+    fn set_body(&self, body: &Bound<'_, PyAny>, content_type: Option<&str>) -> PyResult<()> {
         let bytes = extract_body_bytes(body)?;
         let mut message = self.lock_mut()?;
         if let Some(ct) = content_type {
             message.headers.set("Content-Type", ct.to_string());
         }
-        message.headers.set("Content-Length", bytes.len().to_string());
+        message
+            .headers
+            .set("Content-Length", bytes.len().to_string());
         message.body = bytes;
         Ok(())
     }
@@ -1267,11 +1284,7 @@ impl PyRequest {
     /// ``str`` or ``bytes``.  Typical uses: PIDF-LO attachment on LIR/LRF
     /// 200 OK, XCAP/Ut responses, custom failure body.
     #[pyo3(signature = (body, content_type))]
-    fn set_reply_body(
-        &mut self,
-        body: &Bound<'_, PyAny>,
-        content_type: &str,
-    ) -> PyResult<()> {
+    fn set_reply_body(&mut self, body: &Bound<'_, PyAny>, content_type: &str) -> PyResult<()> {
         let bytes = extract_body_bytes(body)?;
         self.reply_body = Some((bytes, content_type.to_string()));
         Ok(())
@@ -1288,7 +1301,9 @@ impl PyRequest {
     fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
         let mut message = self.lock_mut()?;
         let prefix_lower = prefix.to_lowercase();
-        let names_to_remove: Vec<String> = message.headers.names()
+        let names_to_remove: Vec<String> = message
+            .headers
+            .names()
             .iter()
             .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
             .map(|name| name.to_string())
@@ -1426,7 +1441,9 @@ impl PyRequest {
         let mut message = self.lock_mut()?;
         let existing = message.headers.get("Route").cloned();
         match existing {
-            Some(old) => message.headers.set("Route", format!("{route_value}, {old}")),
+            Some(old) => message
+                .headers
+                .set("Route", format!("{route_value}, {old}")),
             None => message.headers.set("Route", route_value),
         }
         Ok(())
@@ -1601,16 +1618,21 @@ impl PyRequest {
     /// the host part so MT requests reach *this* P-CSCF instance, and
     /// the script doesn't have visibility to choose it correctly.
     fn add_pcscf_path(&self, token: &str) -> PyResult<()> {
-        let host = crate::script::api::ipsec::pcscf_path_host()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+        let host = crate::script::api::ipsec::pcscf_path_host().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
                 "add_pcscf_path: ipsec.path_host not configured — set it in \
                  siphon.yaml so MT requests route back to this P-CSCF instance",
-            ))?;
+            )
+        })?;
         // Quote-escape the token's user-info characters per RFC 3261
         // §25.1: the script-supplied token may legally contain only
         // unreserved chars / escaped triplets, but defend against bad
         // input rather than silently producing an invalid Path URI.
-        if token.is_empty() || token.chars().any(|c| c.is_whitespace() || c == '@' || c == '<' || c == '>') {
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|c| c.is_whitespace() || c == '@' || c == '<' || c == '>')
+        {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "add_pcscf_path: token must be non-empty and contain no whitespace / '@' / '<' / '>'",
             ));
@@ -1672,10 +1694,9 @@ impl PyRequest {
     ///
     /// Example: `request.source_ip_in(["10.0.0.0/8", "172.16.0.0/12"])`
     fn source_ip_in(&self, cidr_list: Vec<String>) -> PyResult<bool> {
-        let source_ip: IpAddr = self
-            .source_ip
-            .parse()
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("bad source IP: {error}")))?;
+        let source_ip: IpAddr = self.source_ip.parse().map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("bad source IP: {error}"))
+        })?;
         for cidr in &cidr_list {
             if let Ok(network) = cidr.parse::<IpNet>() {
                 if network.contains(&source_ip) {
@@ -1792,7 +1813,9 @@ fn rewrite_header_uri(
         .cloned();
     if let Some(raw) = raw {
         let mut nameaddr = NameAddr::parse(&raw).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!("cannot parse {primary} header: {error}"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "cannot parse {primary} header: {error}"
+            ))
         })?;
         nameaddr.uri = parse_uri_standalone(new_uri).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
@@ -1818,7 +1841,9 @@ fn rewrite_header_uri_user(
         .cloned();
     if let Some(raw) = raw {
         let mut nameaddr = NameAddr::parse(&raw).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!("cannot parse {primary} header: {error}"))
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "cannot parse {primary} header: {error}"
+            ))
         })?;
         nameaddr.uri.user = if user.is_empty() {
             None
@@ -2055,13 +2080,20 @@ mod tests {
 
         // Handler 1: "I have answered this."
         request.reply(200, "OK", false);
-        assert!(matches!(*request.action(), RequestAction::Reply { code: 200, .. }));
+        assert!(matches!(
+            *request.action(),
+            RequestAction::Reply { code: 200, .. }
+        ));
 
         // Handler 2, which never knew handler 1 ran.
         request.relay(None, None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
-            RequestAction::Relay { next_hop: None, flow: None, send_socket: None },
+            RequestAction::Relay {
+                next_hop: None,
+                flow: None,
+                send_socket: None
+            },
             "the reply is gone, not merged — only the last assignment executes"
         );
     }
@@ -2090,7 +2122,10 @@ mod tests {
         request.stop_propagation();
         request.stop_propagation();
         assert!(request.is_propagation_stopped());
-        assert!(matches!(*request.action(), RequestAction::Reply { code: 486, .. }));
+        assert!(matches!(
+            *request.action(),
+            RequestAction::Reply { code: 486, .. }
+        ));
     }
 
     #[test]
@@ -2099,14 +2134,26 @@ mod tests {
         request.relay(None, None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
-            RequestAction::Relay { next_hop: None, flow: None, send_socket: None }
+            RequestAction::Relay {
+                next_hop: None,
+                flow: None,
+                send_socket: None
+            }
         );
     }
 
     #[test]
     fn relay_with_next_hop() {
         let mut request = make_request();
-        request.relay(Some("sip:proxy@next.com:5060".to_string()), None, None, None, None).unwrap();
+        request
+            .relay(
+                Some("sip:proxy@next.com:5060".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
@@ -2130,7 +2177,9 @@ mod tests {
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 0xabcdef,
         };
-        request.relay(None, None, None, Some(flow.clone()), None).unwrap();
+        request
+            .relay(None, None, None, Some(flow.clone()), None)
+            .unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
@@ -2155,15 +2204,21 @@ mod tests {
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 7,
         };
-        request.relay(
-            Some("sip:ignored@example.com".to_string()),
-            None,
-            None,
-            Some(flow.clone()),
-            None,
-        ).unwrap();
+        request
+            .relay(
+                Some("sip:ignored@example.com".to_string()),
+                None,
+                None,
+                Some(flow.clone()),
+                None,
+            )
+            .unwrap();
         match request.action() {
-            RequestAction::Relay { next_hop, flow: action_flow, .. } => {
+            RequestAction::Relay {
+                next_hop,
+                flow: action_flow,
+                ..
+            } => {
                 assert_eq!(next_hop.as_deref(), Some("sip:ignored@example.com"));
                 assert_eq!(action_flow.as_ref(), Some(&flow));
             }
@@ -2177,10 +2232,7 @@ mod tests {
         // `request.flow` property must surface the same view that
         // `Contact.flow` would surface for the equivalent binding.
         let mut request = make_request();
-        request.set_inbound_flow(
-            "127.0.0.1:5066".parse().unwrap(),
-            0x1234_5678,
-        );
+        request.set_inbound_flow("127.0.0.1:5066".parse().unwrap(), 0x1234_5678);
         let flow = request.flow().expect("request.flow should be present");
         assert_eq!(flow.transport, "udp");
         assert_eq!(flow.local_addr.to_string(), "127.0.0.1:5066");
@@ -2215,7 +2267,13 @@ mod tests {
     fn relay_with_send_socket_stores_spec() {
         let mut request = make_request();
         request
-            .relay(None, None, None, None, Some("udp:10.0.0.1:5060".to_string()))
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                Some("udp:10.0.0.1:5060".to_string()),
+            )
             .unwrap();
         assert_eq!(
             *request.action(),
@@ -2232,12 +2290,32 @@ mod tests {
         // Format is validated at the API so a script author gets an immediate
         // ValueError rather than a silently-ignored egress pin.
         let mut request = make_request();
-        assert!(request.relay(None, None, None, None, Some("10.0.0.1:5060".to_string())).is_err());
-        assert!(request.relay(None, None, None, None, Some("udp:nonsense".to_string())).is_err());
-        assert!(request.relay(None, None, None, None, Some("pigeon:10.0.0.1:5060".to_string())).is_err());
+        assert!(request
+            .relay(None, None, None, None, Some("10.0.0.1:5060".to_string()))
+            .is_err());
+        assert!(request
+            .relay(None, None, None, None, Some("udp:nonsense".to_string()))
+            .is_err());
+        assert!(request
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                Some("pigeon:10.0.0.1:5060".to_string())
+            )
+            .is_err());
         // A well-formed spec is accepted here (existence is checked later, in
         // the dispatcher, against the configured listeners).
-        assert!(request.relay(None, None, None, None, Some("tls:[2001:db8::1]:5061".to_string())).is_ok());
+        assert!(request
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                Some("tls:[2001:db8::1]:5061".to_string())
+            )
+            .is_ok());
     }
 
     #[test]
@@ -2245,9 +2323,8 @@ mod tests {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {
             let mut request = make_request();
-            let targets: Vec<Bound<'_, PyAny>> = vec![
-                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
-            ];
+            let targets: Vec<Bound<'_, PyAny>> =
+                vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
             request
                 .fork(targets, "parallel", Some("tcp:10.0.0.1:5060".to_string()))
                 .unwrap();
@@ -2258,10 +2335,11 @@ mod tests {
                 other => panic!("expected Fork, got {other:?}"),
             }
 
-            let targets: Vec<Bound<'_, PyAny>> = vec![
-                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
-            ];
-            assert!(request.fork(targets, "parallel", Some("bad-spec".to_string())).is_err());
+            let targets: Vec<Bound<'_, PyAny>> =
+                vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
+            assert!(request
+                .fork(targets, "parallel", Some("bad-spec".to_string()))
+                .is_err());
         });
     }
 
@@ -2313,11 +2391,19 @@ mod tests {
             ];
             request.fork(targets, "sequential", None).unwrap();
             match request.action() {
-                RequestAction::Fork { targets, routes, .. } => {
+                RequestAction::Fork {
+                    targets, routes, ..
+                } => {
                     assert_eq!(targets.len(), 3);
                     assert_eq!(routes.len(), 3, "routes must stay parallel to targets");
-                    assert_eq!(routes[0], vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]);
-                    assert_eq!(routes[1], vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]);
+                    assert_eq!(
+                        routes[0],
+                        vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]
+                    );
+                    assert_eq!(
+                        routes[1],
+                        vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]
+                    );
                     assert!(routes[2].is_empty(), "bare string target carries no Path");
                 }
                 other => panic!("expected Fork, got {other:?}"),
@@ -2439,7 +2525,10 @@ mod tests {
             request.loose_route().unwrap(),
             "must recognise the Record-Route it inserted itself"
         );
-        assert!(route_header(&request).is_none(), "self-Route must be consumed");
+        assert!(
+            route_header(&request).is_none(),
+            "self-Route must be consumed"
+        );
         assert_eq!(request.consumed_routes().unwrap().len(), 1);
     }
 
@@ -2450,7 +2539,10 @@ mod tests {
         // stamped toward every v6 UE. Route hosts arrive bracketed.
         let mut request = bye_request(
             "<sip:[2001:db8:ac10::10]:5064;transport=udp;lr>",
-            &[("192.0.2.40", &[5060]), ("2001:db8:ac10::10", &[5064, 5066])],
+            &[
+                ("192.0.2.40", &[5060]),
+                ("2001:db8:ac10::10", &[5064, 5066]),
+            ],
         );
         assert!(
             request.loose_route().unwrap(),
@@ -2463,8 +2555,7 @@ mod tests {
     fn loose_route_still_rejects_foreign_route() {
         // Widening the match must not make us consume someone else's Route
         // (RFC 3261 §16.4) — relay() has to be able to follow it.
-        let mut request =
-            bye_request("<sip:scscf.example.net;lr>", &[("192.0.2.40", &[5060])]);
+        let mut request = bye_request("<sip:scscf.example.net;lr>", &[("192.0.2.40", &[5060])]);
         assert!(!request.loose_route().unwrap());
         assert!(route_header(&request).is_some());
         assert!(request.consumed_routes().unwrap().is_empty());
@@ -2473,8 +2564,7 @@ mod tests {
     #[test]
     fn loose_route_rejects_co_located_proxy_on_our_address() {
         // Same IP, a port we do not serve — a different proxy.
-        let mut request =
-            bye_request("<sip:192.0.2.40:6060;lr>", &[("192.0.2.40", &[5060])]);
+        let mut request = bye_request("<sip:192.0.2.40:6060;lr>", &[("192.0.2.40", &[5060])]);
         assert!(!request.loose_route().unwrap());
         assert!(route_header(&request).is_some());
     }
@@ -2505,7 +2595,10 @@ mod tests {
         let mut request = bye_request(
             "<sip:sip.example.com:5061;transport=tls;lr>, \
              <sip:192.0.2.40:5060;transport=udp;lr>",
-            &[("sip.example.com", &[5060, 5061]), ("192.0.2.40", &[5060, 5061])],
+            &[
+                ("sip.example.com", &[5060, 5061]),
+                ("192.0.2.40", &[5060, 5061]),
+            ],
         );
         assert!(request.loose_route().unwrap());
         assert!(route_header(&request).is_none());
@@ -2605,7 +2698,8 @@ mod tests {
                 headers.add(
                     "Route",
                     "<sip:orig@scscf.example.com;lr>, \
-                     <sip:scscf.example.com;lr;transport=tcp>".into(),
+                     <sip:scscf.example.com;lr;transport=tcp>"
+                        .into(),
                 );
                 headers
             },
@@ -2788,7 +2882,10 @@ mod tests {
     fn ensure_header_sets_when_absent() {
         let request = make_request();
         request.ensure_header("X-New", "value").unwrap();
-        assert_eq!(request.get_header("X-New").unwrap(), Some("value".to_string()));
+        assert_eq!(
+            request.get_header("X-New").unwrap(),
+            Some("value".to_string())
+        );
     }
 
     #[test]
@@ -2796,7 +2893,10 @@ mod tests {
         let request = make_request();
         request.set_header("X-Existing", "original").unwrap();
         request.ensure_header("X-Existing", "replacement").unwrap();
-        assert_eq!(request.get_header("X-Existing").unwrap(), Some("original".to_string()));
+        assert_eq!(
+            request.get_header("X-Existing").unwrap(),
+            Some("original".to_string())
+        );
     }
 
     #[test]
@@ -2804,7 +2904,10 @@ mod tests {
         let request = make_request();
         request.set_header("X-Multi", "A, B, C").unwrap();
         request.remove_from_header_list("X-Multi", "B").unwrap();
-        assert_eq!(request.get_header("X-Multi").unwrap(), Some("A, C".to_string()));
+        assert_eq!(
+            request.get_header("X-Multi").unwrap(),
+            Some("A, C".to_string())
+        );
     }
 
     #[test]
@@ -2826,7 +2929,9 @@ mod tests {
     #[test]
     fn add_path_prepends_before_existing() {
         let request = make_request();
-        request.set_header("Path", "<sip:old.example.com;lr>").unwrap();
+        request
+            .set_header("Path", "<sip:old.example.com;lr>")
+            .unwrap();
         request.add_path("sip:new.example.com").unwrap();
         let path = request.get_header("Path").unwrap().unwrap();
         assert!(path.starts_with("<sip:new.example.com;lr>"));
@@ -2836,7 +2941,9 @@ mod tests {
     #[test]
     fn prepend_route_adds_before_existing() {
         let request = make_request();
-        request.set_header("Route", "<sip:proxy2.example.com;lr>").unwrap();
+        request
+            .set_header("Route", "<sip:proxy2.example.com;lr>")
+            .unwrap();
         request.prepend_route("sip:proxy1.example.com").unwrap();
         let route = request.get_header("Route").unwrap().unwrap();
         assert!(route.starts_with("<sip:proxy1.example.com;lr>"));
@@ -2852,7 +2959,9 @@ mod tests {
     fn prepend_route_idempotent_with_existing_lr() {
         let request = make_request();
         request.remove_header("Route").unwrap();
-        request.prepend_route("sip:pcscf.ims.example.com:5060;lr").unwrap();
+        request
+            .prepend_route("sip:pcscf.ims.example.com:5060;lr")
+            .unwrap();
         let route = request.get_header("Route").unwrap().unwrap();
         assert_eq!(route, "<sip:pcscf.ims.example.com:5060;lr>");
         assert!(!route.contains(";lr;lr"));
@@ -2917,7 +3026,9 @@ mod tests {
         let request = make_request();
         request.remove_header("Route").unwrap();
         // ;lrid=foo is not loose-routing; siphon must still add ;lr.
-        request.prepend_route("sip:proxy.example.com;lrid=foo").unwrap();
+        request
+            .prepend_route("sip:proxy.example.com;lrid=foo")
+            .unwrap();
         let route = request.get_header("Route").unwrap().unwrap();
         assert_eq!(route, "<sip:proxy.example.com;lrid=foo;lr>");
     }
@@ -2962,7 +3073,9 @@ mod tests {
     #[test]
     fn add_contact_alias_appends_param() {
         let request = make_request();
-        request.set_header("Contact", "<sip:alice@10.0.0.1:5060>").unwrap();
+        request
+            .set_header("Contact", "<sip:alice@10.0.0.1:5060>")
+            .unwrap();
         request.add_contact_alias().unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
         assert!(contact.contains(";alias"));
@@ -2971,12 +3084,23 @@ mod tests {
     #[test]
     fn set_from_uri_replaces_uri_preserves_display_and_tag() {
         let request = make_request();
-        request.set_from_uri("sip:+3120@tenant.example.com:5070;transport=tcp").unwrap();
+        request
+            .set_from_uri("sip:+3120@tenant.example.com:5070;transport=tcp")
+            .unwrap();
         let from = request.get_header("From").unwrap().unwrap();
         assert!(from.contains("\"Alice\""), "display preserved: {from}");
-        assert!(from.contains("+3120@tenant.example.com:5070"), "uri replaced: {from}");
-        assert!(from.contains("transport=tcp"), "uri params preserved: {from}");
-        assert!(from.contains(";tag=1928301774"), "From tag preserved: {from}");
+        assert!(
+            from.contains("+3120@tenant.example.com:5070"),
+            "uri replaced: {from}"
+        );
+        assert!(
+            from.contains("transport=tcp"),
+            "uri params preserved: {from}"
+        );
+        assert!(
+            from.contains(";tag=1928301774"),
+            "From tag preserved: {from}"
+        );
         assert!(!from.contains("atlanta.com"), "old host gone: {from}");
     }
 
@@ -2993,34 +3117,60 @@ mod tests {
     #[test]
     fn set_contact_uri_replaces_contact() {
         let request = make_request();
-        request.set_header("Contact", "<sip:alice@10.0.0.1:5060>").unwrap();
-        request.set_contact_uri("sip:bob@192.0.2.9:5080;transport=tcp").unwrap();
+        request
+            .set_header("Contact", "<sip:alice@10.0.0.1:5060>")
+            .unwrap();
+        request
+            .set_contact_uri("sip:bob@192.0.2.9:5080;transport=tcp")
+            .unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
-        assert!(contact.contains("bob@192.0.2.9:5080"), "contact replaced: {contact}");
-        assert!(contact.contains("transport=tcp"), "params preserved: {contact}");
+        assert!(
+            contact.contains("bob@192.0.2.9:5080"),
+            "contact replaced: {contact}"
+        );
+        assert!(
+            contact.contains("transport=tcp"),
+            "params preserved: {contact}"
+        );
         assert!(!contact.contains("10.0.0.1"), "old contact gone: {contact}");
     }
 
     #[test]
     fn set_contact_user_rewrites_userpart_only() {
         let request = make_request();
-        request.set_header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>").unwrap();
+        request
+            .set_header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>")
+            .unwrap();
         request.set_contact_user("1001").unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
-        assert!(contact.contains("1001@10.0.0.1:5060"), "user rewritten, host/port kept: {contact}");
-        assert!(contact.contains("transport=tcp"), "uri params kept: {contact}");
+        assert!(
+            contact.contains("1001@10.0.0.1:5060"),
+            "user rewritten, host/port kept: {contact}"
+        );
+        assert!(
+            contact.contains("transport=tcp"),
+            "uri params kept: {contact}"
+        );
         assert!(!contact.contains("alice@"), "old user gone: {contact}");
     }
 
     #[test]
     fn set_contact_user_empty_clears_userpart() {
         let request = make_request();
-        request.set_header("Contact", "<sip:alice@10.0.0.1:5060>").unwrap();
+        request
+            .set_header("Contact", "<sip:alice@10.0.0.1:5060>")
+            .unwrap();
         request.set_contact_user("").unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
-        assert!(contact.contains("10.0.0.1:5060"), "host:port kept: {contact}");
+        assert!(
+            contact.contains("10.0.0.1:5060"),
+            "host:port kept: {contact}"
+        );
         assert!(!contact.contains("alice"), "user cleared: {contact}");
-        assert!(!contact.contains('@'), "no dangling @ once userpart cleared: {contact}");
+        assert!(
+            !contact.contains('@'),
+            "no dangling @ once userpart cleared: {contact}"
+        );
     }
 
     #[test]
@@ -3032,7 +3182,9 @@ mod tests {
     #[test]
     fn route_user_returns_user_part() {
         let request = make_request();
-        request.set_header("Route", "<sip:service@proxy.example.com;lr>").unwrap();
+        request
+            .set_header("Route", "<sip:service@proxy.example.com;lr>")
+            .unwrap();
         assert_eq!(request.route_user().unwrap(), Some("service".to_string()));
     }
 
@@ -3057,7 +3209,9 @@ mod tests {
     #[test]
     fn fix_nated_contact_rewrites_contact_uri() {
         let request = make_request();
-        request.set_header("Contact", "<sip:alice@192.168.1.100:6000>").unwrap();
+        request
+            .set_header("Contact", "<sip:alice@192.168.1.100:6000>")
+            .unwrap();
         request.fix_nated_contact().unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
         assert!(contact.contains("10.0.0.1"));
@@ -3114,10 +3268,7 @@ mod tests {
     fn source_ip_in_multiple_cidrs() {
         let request = make_request();
         assert!(request
-            .source_ip_in(vec![
-                "192.168.0.0/16".to_string(),
-                "10.0.0.0/8".to_string(),
-            ])
+            .source_ip_in(vec!["192.168.0.0/16".to_string(), "10.0.0.0/8".to_string(),])
             .unwrap());
     }
 
@@ -3192,7 +3343,8 @@ mod tests {
     fn set_ruri_from_string() {
         let request = make_request();
         // Use the Rust-level method directly (bypasses PyO3 Bound)
-        let parsed = crate::sip::parser::parse_uri_standalone("sip:newuser@newhost.com:5080").unwrap();
+        let parsed =
+            crate::sip::parser::parse_uri_standalone("sip:newuser@newhost.com:5080").unwrap();
         {
             let message_arc = request.message();
             let mut message = message_arc.lock().unwrap();
@@ -3240,7 +3392,9 @@ mod tests {
             .unwrap();
         let request = PyRequest::new(
             Arc::new(Mutex::new(message)),
-            "udp".to_string(), "10.0.0.1".to_string(), 5060,
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
         );
         assert_eq!(request.contact_expires().unwrap(), Some(3600));
     }
@@ -3261,7 +3415,9 @@ mod tests {
             .unwrap();
         let request = PyRequest::new(
             Arc::new(Mutex::new(message)),
-            "udp".to_string(), "10.0.0.1".to_string(), 5060,
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
         );
         assert_eq!(request.contact_expires().unwrap(), Some(0));
     }
@@ -3330,14 +3486,23 @@ mod tests {
             .build()
             .unwrap();
         let mut request = PyRequest::new(
-            Arc::new(Mutex::new(message)), "udp".to_string(), "10.0.0.1".to_string(), 5060,
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
         );
         request.set_reply_to_tag("fresh-tag").unwrap();
         let queued = request.take_reply_headers();
         assert_eq!(queued.len(), 1);
         let value = &queued[0].2;
-        assert!(value.contains(";tag=fresh-tag"), "expected fresh tag, got {value}");
-        assert!(!value.contains("stale-tag"), "stale tag must be overwritten, got {value}");
+        assert!(
+            value.contains(";tag=fresh-tag"),
+            "expected fresh tag, got {value}"
+        );
+        assert!(
+            !value.contains("stale-tag"),
+            "stale tag must be overwritten, got {value}"
+        );
     }
 
     #[test]

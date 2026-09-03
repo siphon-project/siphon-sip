@@ -9,8 +9,8 @@
 //! the SHAKEN/TNAuthList certificate profile. v1 supports EC P-256 chains
 //! (ECDSA-with-SHA-256); RSA STI-CA chains are a documented follow-up.
 
-use p256::ecdsa::{Signature, VerifyingKey};
 use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::ext::pkix::BasicConstraints;
 use x509_cert::Certificate;
@@ -59,7 +59,9 @@ pub fn validate_chain(
     now_unix: i64,
     require_tnauthlist: bool,
 ) -> Result<VerifyingKey, String> {
-    let leaf = chain.first().ok_or_else(|| "empty certificate chain".to_string())?;
+    let leaf = chain
+        .first()
+        .ok_or_else(|| "empty certificate chain".to_string())?;
     check_validity(leaf, now_unix)?;
     if require_tnauthlist && !has_tnauthlist(leaf) {
         return Err("leaf certificate is missing the RFC 8226 TNAuthList extension".to_string());
@@ -75,8 +77,10 @@ pub fn validate_chain(
 
         // 1. Does any trust anchor directly sign `current`? If so, done.
         for anchor in anchors {
-            if names_equal(anchor.tbs_certificate().subject(), current.tbs_certificate().issuer())?
-                && verify_signed_by(&current, anchor)?
+            if names_equal(
+                anchor.tbs_certificate().subject(),
+                current.tbs_certificate().issuer(),
+            )? && verify_signed_by(&current, anchor)?
             {
                 check_validity(anchor, now_unix)?;
                 return Ok(leaf_key);
@@ -181,7 +185,10 @@ fn check_validity(certificate: &Certificate, now_unix: i64) -> Result<(), String
 
 /// True when the certificate asserts CA:TRUE in basicConstraints.
 fn is_ca(certificate: &Certificate) -> bool {
-    match certificate.tbs_certificate().get_extension::<BasicConstraints>() {
+    match certificate
+        .tbs_certificate()
+        .get_extension::<BasicConstraints>()
+    {
         Ok(Some((_critical, basic_constraints))) => basic_constraints.ca,
         _ => false,
     }
@@ -208,9 +215,7 @@ pub(crate) mod testchain {
 
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::DecodePrivateKey;
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair,
-    };
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
     pub struct GeneratedChain {
         /// Self-signed root (the STI-CA trust anchor), PEM.
@@ -252,8 +257,8 @@ pub(crate) mod testchain {
             .expect("leaf sign");
         let leaf_pem = leaf_cert.pem();
 
-        let leaf_key = SigningKey::from_pkcs8_pem(&leaf_key_pair.serialize_pem())
-            .expect("load leaf p256 key");
+        let leaf_key =
+            SigningKey::from_pkcs8_pem(&leaf_key_pair.serialize_pem()).expect("load leaf p256 key");
 
         GeneratedChain {
             anchor_pem,
@@ -284,7 +289,10 @@ mod tests {
         let chain = parse_pem_chain(generated.leaf_pem.as_bytes()).unwrap();
         let wrong_anchors = parse_pem_chain(other.anchor_pem.as_bytes()).unwrap();
         let result = validate_chain(&chain, &wrong_anchors, 946_684_800, false);
-        assert!(result.is_err(), "leaf must not validate against a foreign root");
+        assert!(
+            result.is_err(),
+            "leaf must not validate against a foreign root"
+        );
     }
 
     #[test]
