@@ -47,21 +47,41 @@ pub type Aor = String;
 /// when populating the alias index, so both writes and reads of an AoR
 /// land on the same key regardless of how the input is spelled.
 pub fn normalize_aor(uri: &str) -> Aor {
+    normalize_aor_cow(uri).into_owned()
+}
+
+/// The canonical form of an AoR, borrowing when the input is already canonical.
+///
+/// Every registrar key is stored canonicalised, so this runs on the lookup path
+/// as well as the write path — and the input is almost always already canonical
+/// there, because the scripting API canonicalises at its own boundary. Trimming
+/// in place and only allocating for the one case that needs it (a scheme to
+/// prepend) keeps a lookup free of the four `String`s the all-owned form built
+/// and threw away.
+pub fn normalize_aor_cow(uri: &str) -> std::borrow::Cow<'_, str> {
     let uri = uri.trim_start_matches('<').trim_end_matches('>');
 
-    let uri = if uri.starts_with("sip:") || uri.starts_with("sips:") {
-        uri.to_string()
+    // The scheme decides which port counts as default, so read it before any
+    // trimming that could remove it.
+    let sips = uri.starts_with("sips:");
+    let has_scheme = sips || uri.starts_with("sip:");
+
+    // Parameters and headers are not part of the identity.
+    let uri = uri.split(';').next().unwrap_or(uri);
+    let uri = uri.split('?').next().unwrap_or(uri);
+
+    // Nor is a default port — but only the port that is default *for this
+    // scheme*, so `sip:…:5061` and `sips:…:5060` are explicit and survive.
+    let uri = if sips {
+        uri.trim_end_matches(":5061")
     } else {
-        format!("sip:{uri}")
+        uri.trim_end_matches(":5060")
     };
 
-    let uri = uri.split(';').next().unwrap_or(&uri).to_string();
-    let uri = uri.split('?').next().unwrap_or(&uri).to_string();
-
-    if uri.starts_with("sips:") {
-        uri.trim_end_matches(":5061").to_string()
+    if has_scheme {
+        std::borrow::Cow::Borrowed(uri)
     } else {
-        uri.trim_end_matches(":5060").to_string()
+        std::borrow::Cow::Owned(format!("sip:{uri}"))
     }
 }
 
@@ -454,10 +474,19 @@ impl Registrar {
     /// Every AoR-keyed Registrar method funnels its input through this
     /// helper before touching `bindings` / `associated_uris` / etc.
     fn resolve_alias(&self, aor: &str) -> Aor {
+        // Canonicalise first. Both the alias keys and the `bindings` keys are
+        // stored in normalised form, so looking up a raw AoR silently misses a
+        // binding that is present — and it misses by returning "not
+        // registered" rather than an error, which reads as a UE problem.
+        //
+        // The scripting API normalises at its own boundary, so scripts never
+        // saw this; every other entry point (the admin HTTP API takes the AoR
+        // straight off the URL path) went through unnormalised.
+        let aor = normalize_aor_cow(aor);
         self.aliases
-            .get(aor)
+            .get(aor.as_ref())
             .map(|entry| entry.value().clone())
-            .unwrap_or_else(|| aor.to_string())
+            .unwrap_or_else(|| aor.into_owned())
     }
 
     /// Drop every alias entry pointing at `primary`.  Used on dereg
@@ -3724,6 +3753,139 @@ mod tests {
         assert!(contacts[0].instance.is_none());
         assert_eq!(contacts[0].instance_id(), None);
         assert_eq!(contacts[0].instance_epoch(), None);
+    }
+
+    /// A caller that has not canonicalised its AoR still finds the binding.
+    ///
+    /// `bindings` and `aliases` are both keyed on the normalised form, so a raw
+    /// AoR used to miss — and miss silently, reading as "not registered". The
+    /// admin HTTP API takes the AoR straight off the URL path, so
+    /// `GET /admin/registrations/alice@example.com` 404'd on a live
+    /// registration.
+    #[test]
+    fn lookup_canonicalises_the_aor_it_is_given() {
+        let registrar = Registrar::default();
+        registrar
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
+            .unwrap();
+
+        for form in [
+            "sip:alice@example.com",
+            "alice@example.com",
+            "<sip:alice@example.com>",
+            "sip:alice@example.com:5060",
+            "sip:alice@example.com;transport=tcp",
+        ] {
+            assert!(
+                registrar.is_registered(form),
+                "{form} should resolve to the stored binding"
+            );
+            assert_eq!(registrar.lookup(form).len(), 1, "{form} should find it");
+        }
+    }
+
+    /// A `tel:` URI in an implicit registration set resolves.
+    ///
+    /// `normalize_aor` maps `tel:+1555…` to `sip:tel:+1555…`, so the alias is
+    /// stored under a key the raw form never matched.
+    #[test]
+    fn a_tel_uri_alias_resolves_to_its_primary() {
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com";
+        registrar
+            .save(
+                aor,
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
+            .unwrap();
+        registrar.set_associated_uris(aor, vec!["tel:+15551234567".to_string()]);
+
+        assert!(
+            registrar.is_registered("tel:+15551234567"),
+            "the tel: IMPU of an implicit set must resolve to the same bindings"
+        );
+        assert_eq!(registrar.lookup("tel:+15551234567").len(), 1);
+    }
+
+    /// The canonical form of every AoR shape the registrar is handed.
+    ///
+    /// Pinned as a table because `normalize_aor` decides the storage key for
+    /// bindings, aliases and the persisted Redis/Postgres records alike: a
+    /// change here silently re-keys an existing deployment's data.
+    #[test]
+    fn normalize_aor_canonical_forms() {
+        for (input, expected) in [
+            ("sip:alice@example.com", "sip:alice@example.com"),
+            ("sips:alice@example.com", "sips:alice@example.com"),
+            ("alice@example.com", "sip:alice@example.com"),
+            ("<sip:alice@example.com>", "sip:alice@example.com"),
+            // The scheme's own default port is not part of the identity...
+            ("sip:alice@example.com:5060", "sip:alice@example.com"),
+            ("sips:alice@example.com:5061", "sips:alice@example.com"),
+            // ...but the *other* scheme's default port is explicit, and stays.
+            ("sip:alice@example.com:5061", "sip:alice@example.com:5061"),
+            ("sips:alice@example.com:5060", "sips:alice@example.com:5060"),
+            (
+                "sip:alice@example.com;transport=tcp",
+                "sip:alice@example.com",
+            ),
+            ("sip:alice@example.com?header=x", "sip:alice@example.com"),
+            (
+                "sip:alice@example.com;transport=tcp?h=1",
+                "sip:alice@example.com",
+            ),
+            ("alice@example.com:5060", "sip:alice@example.com"),
+            (
+                "<sip:alice@example.com:5060;transport=tcp>",
+                "sip:alice@example.com",
+            ),
+            (
+                "sip:+15551234567@ims.example.com",
+                "sip:+15551234567@ims.example.com",
+            ),
+            // A tel: URI gets the sip: prefix like any other schemeless input.
+            // Odd-looking, but it is what keeps every registrar key inside the
+            // `sip:`/`sips:` namespace that `is_aor_key_safe` relies on.
+            ("tel:+15551234567", "sip:tel:+15551234567"),
+            ("", "sip:"),
+        ] {
+            assert_eq!(normalize_aor(input), expected, "normalizing {input:?}");
+        }
+    }
+
+    /// An AoR that is already canonical must not be reallocated — this runs on
+    /// the lookup path, where it is the overwhelmingly common case.
+    #[test]
+    fn normalize_aor_borrows_an_already_canonical_aor() {
+        use std::borrow::Cow;
+        assert!(matches!(
+            normalize_aor_cow("sip:alice@example.com"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_aor_cow("sips:alice@example.com"),
+            Cow::Borrowed(_)
+        ));
+        // Trimming still borrows; only prepending a scheme has to allocate.
+        assert!(matches!(
+            normalize_aor_cow("sip:alice@example.com;transport=tcp"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_aor_cow("alice@example.com"),
+            Cow::Owned(_)
+        ));
     }
 
     #[test]
