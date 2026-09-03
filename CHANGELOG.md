@@ -86,6 +86,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   200,000 single-binding AoRs with an instance identity configured: **777 → 641
   bytes per AoR, a 17.5% reduction**, on top of the single-slot change above.
 
+### Changed
+- **The always-on Python worker floor is re-derived against the corrected
+  per-worker heap.** `MIN_CORE_THREADS` is a floor on the worker *count*, and
+  8 was chosen when a warm worker was believed to cost ~2 MB — effectively a bet
+  that the pool's always-on heap would sit near 16 MB. `PER_WORKER_HEAP_MB` was
+  later measured at ~8 MB and the constant raised to 10, but the count was never
+  revisited, so the same floor came to mean a much larger always-on commitment
+  on every instance, 2 cores or 32. It is now 4: still double the 2-thread
+  baseline the floor exists to avoid, and on any box with 2 or more cores
+  `2 x cpus` already meets it, so the floor stops binding exactly where it was
+  costing the most for the least reason.
+
+  Measured on a 2-CPU box, `pool_size` 8 → 4 and thread count 17 → 13. The RSS
+  effect is smaller than the arithmetic suggests: ~2 MB at boot and ~7 MB after
+  40,000 handled requests, because a worker's mimalloc heap grows with the work
+  it does rather than being committed up front — with half the workers, each
+  one does twice the work. `PER_WORKER_HEAP_MB` describes a long-running IMS
+  deployment's steady state, not a fixed per-worker cost, so it should not be
+  read as "workers x 10 MB" on a lightly-loaded instance.
+
 ### Fixed
 - **A siphon-originated REFER no longer overtakes the answer it depends on.**
   A `call.refer()` issued from `@b2bua.on_answer` was emitted at the point the

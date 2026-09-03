@@ -120,7 +120,23 @@ const MIN_MAX_THREADS: usize = 32;
 /// Always-on core-worker floor. A small container (`cpus: 0.5`) reports
 /// `available_parallelism() == 1`, which `2×` alone would make a 2-thread
 /// baseline — too small for the hot inbound path.
-const MIN_CORE_THREADS: usize = 8;
+///
+/// Re-derived from the corrected per-worker heap. This is a floor on the worker
+/// *count*, and it was chosen as 8 when a warm worker was believed to cost
+/// ~2 MB — i.e. it was really a bet that the pool's always-on heap would sit
+/// around 16 MB. [`PER_WORKER_HEAP_MB`] was later measured at ~8 MB and the
+/// constant raised to 10, but this count was never revisited, so the same floor
+/// silently came to mean ~80 MB of always-on heap — on every instance, whether
+/// it has 2 cores or 32.
+///
+/// The memory budget cannot rescue it either: on a container started without a
+/// cgroup limit (the default `docker run` shape) the budget falls back to host
+/// RAM, and 30 % of a normal host never binds. So the count is the whole story,
+/// and 4 is the re-derivation: half the always-on cost, still double the
+/// 2-thread baseline the floor exists to avoid, and on any box with 2 or more
+/// cores `2 x cpus` already meets it, so the floor stops binding exactly where
+/// it was costing the most for the least reason.
+const MIN_CORE_THREADS: usize = 4;
 
 /// cgroup v1 reports "no limit" as a page-aligned value near `i64::MAX`
 /// (`PAGE_COUNTER_MAX × PAGE_SIZE`, ≈ 9.22e18). A real memory limit — even a
@@ -184,7 +200,7 @@ pub fn resolve_sizing(
         ((budget / per_worker_bytes as f64) as usize).max(1)
     });
 
-    // Core: 2× CPUs floored at 8, but never above what the memory budget affords.
+    // Core: 2× CPUs floored at MIN_CORE_THREADS, never above what the budget affords.
     let cpu_core = cpus.saturating_mul(2).max(MIN_CORE_THREADS);
     let core_threads = sync_pool_size
         .unwrap_or(match mem_cap {
@@ -1147,10 +1163,40 @@ mod tests {
     fn resolve_sizing_512mb_caps_max_to_memory_budget() {
         let sizing = resolve_sizing(2, Some(512 * MB), None, None);
         // mem budget = 512×0.30 / 10 MB ≈ 15.
-        assert_eq!(sizing.core_threads, 8); // min(max(8, 2×2)=8, 15)
+        // min(max(MIN_CORE_THREADS=4, 2×2)=4, 15). Was 8 while the floor was 8;
+        // the floor is now 4, so a 2-core NF starts at its CPU-derived 4 rather
+        // than being pushed up to 8 always-on workers by the floor alone.
+        assert_eq!(sizing.core_threads, 4);
         assert_eq!(sizing.max_threads, 15);
         assert_eq!(sizing.bound, SizingBound::Memory);
         assert!((12..=16).contains(&sizing.max_threads));
+    }
+
+    /// The always-on floor is a memory commitment, not just a thread count.
+    ///
+    /// A 1-core container gets exactly the floor, and `floor x
+    /// PER_WORKER_HEAP_MB` is heap resident from boot on every instance whether
+    /// it ever serves a request. Pinned because this number drifted once
+    /// already: the count was chosen against a ~2 MB per-worker belief and
+    /// survived the correction to ~10 MB unchanged, quadrupling the commitment
+    /// with nothing failing.
+    #[test]
+    fn the_always_on_floor_stays_within_its_memory_budget() {
+        let sizing = resolve_sizing(1, None, None, None);
+        assert_eq!(sizing.core_threads, MIN_CORE_THREADS);
+
+        let always_on_mb = sizing.core_threads as u64 * PER_WORKER_HEAP_MB;
+        assert!(
+            always_on_mb <= 40,
+            "a 1-core instance commits {always_on_mb} MB of always-on Python heap at \
+             boot — re-derive MIN_CORE_THREADS against PER_WORKER_HEAP_MB rather than \
+             raising this bound"
+        );
+        // ...while staying above the 2-thread baseline the floor exists to avoid.
+        assert!(
+            sizing.core_threads > 2,
+            "the floor must still lift a 1-core box off the 2-thread baseline"
+        );
     }
 
     /// A 256 MB NF budgets even fewer workers (~7).
