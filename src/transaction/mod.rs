@@ -47,9 +47,24 @@ pub struct ServerTransactionOutcome {
 }
 
 /// The transaction manager — holds all active transactions.
+///
+/// The map stores each transaction **boxed**. `Transaction` is 536 bytes —
+/// a `Nist` carries two whole `SipMessage`s inline (`original_request` for the
+/// synthesised 100, `last_response` for retransmission) — and storing that
+/// inline made the hash table's bucket 608 bytes. A `hashbrown` table sizes its
+/// bucket array for the peak number of live entries and **never shrinks it**,
+/// so a box that once ran at N concurrent transactions holds
+/// `N/0.875` rounded to a power of two, times 608 bytes, for the rest of the
+/// process's life — with `transactions_active` reading 0 the whole time.
+///
+/// Concurrency is `rate x Timer J` (32 s), so the retention is set by the
+/// busiest 32 seconds the process ever saw: at 5k cps that is ~160 MB, and it
+/// grows linearly with offered load. Boxing takes the bucket to 80 bytes and
+/// the retention with it, and moves the 536-byte payload off the memcpy path
+/// that every insert and every table growth pays.
 #[derive(Debug)]
 pub struct TransactionManager {
-    transactions: DashMap<TransactionKey, Transaction>,
+    transactions: DashMap<TransactionKey, Box<Transaction>>,
     timers: TimerConfig,
 }
 
@@ -159,7 +174,7 @@ impl TransactionManager {
         // duplicate of a request already in flight and must be absorbed.
         match self.transactions.entry(key.clone()) {
             Entry::Vacant(slot) => {
-                slot.insert(transaction);
+                slot.insert(Box::new(transaction));
                 Ok(ServerTransactionOutcome {
                     key,
                     actions,
@@ -195,7 +210,7 @@ impl TransactionManager {
             None => return Ok(None),
         };
 
-        let actions = match &mut *entry {
+        let actions = match &mut **entry {
             Transaction::Ist(ist) => ist.process(IstEvent::AckReceived(request.clone())),
             _ => {
                 // Not an IST — nothing to absorb
@@ -233,7 +248,7 @@ impl TransactionManager {
             None => return Ok(None),
         };
 
-        let actions = match &mut *entry {
+        let actions = match &mut **entry {
             Transaction::Ist(ist) => ist.process(IstEvent::InviteRetransmit(request.clone())),
             Transaction::Nist(nist) => nist.process(NistEvent::RequestRetransmit(request.clone())),
             _ => {
@@ -285,7 +300,7 @@ impl TransactionManager {
         // timers and leaving the request unanswered. Surface it instead.
         match self.transactions.entry(key.clone()) {
             Entry::Vacant(slot) => {
-                slot.insert(transaction);
+                slot.insert(Box::new(transaction));
                 Ok((key, actions))
             }
             Entry::Occupied(_) => Err(format!(
@@ -307,7 +322,7 @@ impl TransactionManager {
             .get_mut(key)
             .ok_or_else(|| format!("no transaction for key {key}"))?;
 
-        let actions = match (&mut *entry, event) {
+        let actions = match (&mut **entry, event) {
             (Transaction::Ist(ist), ServerEvent::Ist(event)) => ist.process(event),
             (Transaction::Nist(nist), ServerEvent::Nist(event)) => nist.process(event),
             _ => return Err("event type mismatch for transaction".to_string()),
@@ -335,7 +350,7 @@ impl TransactionManager {
             .get_mut(key)
             .ok_or_else(|| format!("no transaction for key {key}"))?;
 
-        let actions = match (&mut *entry, event) {
+        let actions = match (&mut **entry, event) {
             (Transaction::Ict(ict), ClientEvent::Ict(event)) => ict.process(event),
             (Transaction::Nict(nict), ClientEvent::Nict(event)) => nict.process(event),
             _ => return Err("event type mismatch for transaction".to_string()),
@@ -355,7 +370,7 @@ impl TransactionManager {
     pub fn remove(&self, key: &TransactionKey) -> Option<Transaction> {
         self.transactions
             .remove(key)
-            .map(|(_, transaction)| transaction)
+            .map(|(_, transaction)| *transaction)
     }
 }
 
@@ -437,6 +452,33 @@ mod tests {
         let key = TransactionManager::key_from_message(&options_request()).unwrap();
         assert_eq!(key.branch, "z9hG4bK-opts");
         assert_eq!(key.method, Method::Options);
+    }
+
+    /// The map stores a *pointer* to the transaction, not the transaction.
+    ///
+    /// `hashbrown` sizes its bucket array for the peak number of live entries
+    /// and never shrinks it, so whatever the value type costs per bucket is
+    /// retained for the life of the process at the high-water concurrency.
+    /// Concurrency here is `rate x Timer J` (32 s), which means inlining a
+    /// 536-byte `Transaction` cost ~160 MB at 5k cps and grew linearly with
+    /// offered load — all of it while `count()` reported 0.
+    #[test]
+    fn the_transaction_map_stores_a_pointer_not_the_transaction() {
+        let bucket = std::mem::size_of::<(TransactionKey, Box<Transaction>)>();
+        let key_only = std::mem::size_of::<TransactionKey>();
+        assert!(
+            bucket <= key_only + 16,
+            "map bucket is {bucket} B against a {key_only} B key — the transaction \
+             is being stored inline again, and the table will retain it at peak \
+             concurrency forever"
+        );
+        // Guard the premise as well: boxing only pays while the payload is big.
+        let payload = std::mem::size_of::<Transaction>();
+        assert!(
+            payload >= 256,
+            "Transaction is down to {payload} B — re-check whether boxing still earns \
+             its indirection"
+        );
     }
 
     #[test]

@@ -4,9 +4,16 @@ use siphon::SiphonServer;
 // Use jemalloc as the global allocator — eliminates glibc malloc arena
 // contention that dominates the flame graph above ~10k cps on multi-core
 // machines. See `Cargo.toml` for the rationale.
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+//
+// Via the macro rather than a bare `#[global_allocator]`, so siphon's own
+// binary gets the same page-decay tuning siphon ships for everyone else's.
+// A bare attribute leaves `malloc_conf` unset, which means jemalloc's stock
+// `background_thread:false` and `dirty_decay_ms:10000`: freed pages are only
+// returned opportunistically, while an arena is being allocated *into*. A
+// process that has just finished a burst is doing the opposite of that, so
+// exactly when there is most to give back, nothing is running to give it —
+// which is how RSS stays at its high-water mark long after the work is done.
+siphon::install_allocator!();
 
 #[derive(Parser)]
 #[command(

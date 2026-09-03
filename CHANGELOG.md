@@ -6,6 +6,46 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Performance
+- **The transaction table no longer holds its peak-concurrency footprint for
+  the life of the process.** `TransactionManager` stored the `Transaction`
+  enum inline in its `DashMap`. A `Nist` carries two whole `SipMessage`s
+  (`original_request` for the synthesised 100, `last_response` for
+  retransmission), which makes `Transaction` 536 bytes and the hash bucket 608.
+  `hashbrown` sizes its bucket array for the peak number of live entries and
+  never shrinks it, so a box that once ran at N concurrent transactions kept
+  `N/0.875` rounded up to a power of two, times 608 bytes, forever — while
+  `siphon_transactions_active` read 0 the whole time.
+
+  Concurrency is `rate x Timer J` (32 s), so the retention is set by the
+  busiest 32 seconds the process ever saw and grows linearly with offered load.
+  Transactions are now boxed: the bucket is 80 bytes, and the 536-byte payload
+  comes off the memcpy path that every insert and every table growth paid.
+
+- **siphon's own binary now uses siphon's own allocator tuning.** `src/main.rs`
+  installed jemalloc with a bare `#[global_allocator]` and never set
+  `malloc_conf`, so it ran jemalloc's stock `background_thread:false` +
+  `dirty_decay_ms:10000` — freed pages are returned only opportunistically,
+  while an arena is being allocated *into*, which is the opposite of what a
+  process does just after a burst. It now goes through `install_allocator!()`,
+  the same macro siphon already ships for downstream binaries. Scope: the
+  published container image builds `siphon-bin`, which already called the
+  macro, so this closes the gap for a source-built root `siphon-sip` binary
+  (`cargo install siphon-sip`), not for the official image.
+
+  Measured together, 100,000 registrations driven at 4,800 cps and then
+  fully de-registered:
+
+  | | peak RSS | drained RSS | drained live bytes |
+  |---|---|---|---|
+  | before | 563 MB | 292 MB | 158 MB |
+  | after | 452 MB | 158 MB | 83 MB |
+
+  Boxing accounts for the live-bytes drop (158 → 81 MB on its own), the decay
+  tuning for the resident drop (267 → 158 MB on its own). Against the
+  rate-independent floor of 51 MB, the concurrency-driven retention falls from
+  107 MB to 30 MB.
+
 ### Fixed
 - **Registrar lookups now canonicalise the AoR they are given.** `bindings` and
   `aliases` are both keyed on the normalised form, but `Registrar`'s own lookup
