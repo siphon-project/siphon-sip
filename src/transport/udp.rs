@@ -192,10 +192,20 @@ fn create_reusable_udp_socket(
     UdpSocket::from_std(socket.into())
 }
 
-/// Request `SO_RCVBUF` and report what the kernel actually granted.
+/// Raise `SO_RCVBUF` to at least `requested` and report what the kernel granted.
 ///
-/// Best-effort: a listener that cannot get the buffer it asked for is still a
-/// working listener, so a failure here warns rather than aborting the bind.
+/// The configured size is a **floor, not a target**: a host already tuned above
+/// it keeps its larger buffer. Without that check the knob silently *shrinks*
+/// the queue on a tuned host, because the two sides of the comparison are not
+/// measured the same way — an untouched socket carries `net.core.rmem_default`
+/// verbatim, while an explicit `setsockopt` is doubled by the kernel. Asking
+/// for 1 MiB on a host defaulting to 4 MiB therefore lands at 2 MiB, and since
+/// nothing was clamped the read-back warning below stays quiet, so the operator
+/// has no way to notice the loss.
+///
+/// Best-effort throughout: a listener that cannot get the buffer it asked for
+/// is still a working listener, so a failure here warns rather than aborting
+/// the bind.
 ///
 /// Linux returns roughly double the requested size from `getsockopt` (the extra
 /// is bookkeeping overhead), so "at least what we asked for" is the honest
@@ -205,6 +215,27 @@ fn create_reusable_udp_socket(
 fn apply_recv_buffer(socket: &socket2::Socket, local_addr: SocketAddr, requested: usize) {
     if requested == 0 {
         return;
+    }
+    // Compare against the raw size the socket already carries. Deliberately
+    // conservative about the kernel's doubling: this can decline to raise a
+    // buffer that is already within 2x of the floor, but it can never lower
+    // one, which is the failure worth avoiding.
+    match socket.recv_buffer_size() {
+        Ok(existing) if existing >= requested => {
+            debug!(
+                "[udp {}] leaving SO_RCVBUF at the kernel's {} bytes — already at or above the \
+                 configured {} byte floor",
+                local_addr, existing, requested
+            );
+            return;
+        }
+        Ok(_) => {}
+        // Unreadable: fall through and ask anyway, which is what siphon did
+        // before the floor existed.
+        Err(error) => debug!(
+            "[udp {}] could not read the current SO_RCVBUF ({}) — requesting {} bytes anyway",
+            local_addr, error, requested
+        ),
     }
     if let Err(error) = socket.set_recv_buffer_size(requested) {
         warn!(
@@ -230,9 +261,11 @@ fn apply_recv_buffer(socket: &socket2::Socket, local_addr: SocketAddr, requested
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// A listener asks the kernel for the configured `SO_RCVBUF` and gets at
-    /// least that much. Linux reports back roughly double the request, so the
-    /// assertion is "no less than asked", which is exactly the condition
+    /// A listener ends up with at least the configured floor, whether that
+    /// took a `setsockopt` or the host already gave it that much.
+    ///
+    /// Linux reports back roughly double an explicit request, so "no less than
+    /// asked" is the honest assertion, and it is exactly the condition
     /// `apply_recv_buffer` warns about when `net.core.rmem_max` clamps it.
     ///
     /// Uses a modest size so the test passes under a conservative `rmem_max`.
@@ -255,9 +288,39 @@ mod tests {
     }
 
     /// `0` is the documented "leave the kernel default alone" escape hatch, so
-    /// it must not fail the bind and must not raise the buffer.
+    /// it must not fail the bind and must leave the socket exactly where one
+    /// siphon never touched sits.
     #[tokio::test]
     async fn zero_recv_buffer_leaves_the_kernel_default() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+
+        let untouched = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("bare socket");
+        let untouched_size = untouched.recv_buffer_size().expect("SO_RCVBUF reads back");
+
+        let defaulted = create_reusable_udp_socket(addr, None, 0).expect("binds with 0");
+        let default_size = socket2::SockRef::from(&defaulted)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+
+        assert_eq!(
+            default_size, untouched_size,
+            "0 must leave SO_RCVBUF at the kernel default"
+        );
+    }
+
+    /// A floor above what the host gives by default is a real lift.
+    ///
+    /// Derived from the observed default rather than hardcoded: `SO_RCVBUF` is
+    /// clamped to `net.core.rmem_max` and then doubled, so on a host whose
+    /// `net.core.rmem_default` is already large a fixed constant asserts
+    /// nothing.
+    #[tokio::test]
+    async fn a_floor_above_the_kernel_default_raises_the_buffer() {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
 
         let defaulted = create_reusable_udp_socket(addr, None, 0).expect("binds with 0");
@@ -265,7 +328,7 @@ mod tests {
             .recv_buffer_size()
             .expect("SO_RCVBUF reads back");
 
-        let raised = create_reusable_udp_socket(addr, None, 4 * 1024 * 1024)
+        let raised = create_reusable_udp_socket(addr, None, default_size * 2)
             .expect("binds with an explicit size");
         let raised_size = socket2::SockRef::from(&raised)
             .recv_buffer_size()
@@ -273,8 +336,42 @@ mod tests {
 
         assert!(
             raised_size > default_size,
-            "an explicit request ({raised_size} B) should exceed the untouched default \
-             ({default_size} B)"
+            "a {} B floor on a host defaulting to {default_size} B should raise the buffer, \
+             got {raised_size} B",
+            default_size * 2
+        );
+    }
+
+    /// Regression: the configured size is a floor, not a target — a host tuned
+    /// above it keeps its larger buffer.
+    ///
+    /// siphon used to call `setsockopt` unconditionally. Because an untouched
+    /// socket reports `net.core.rmem_default` raw while an explicit request
+    /// comes back doubled, the 1 MiB default *halved* the receive queue on any
+    /// host tuned above 512 KiB, and did it silently: nothing was clamped, so
+    /// the read-back warning stayed quiet.
+    #[tokio::test]
+    async fn a_floor_below_the_kernel_default_does_not_shrink_the_buffer() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+
+        let defaulted = create_reusable_udp_socket(addr, None, 0).expect("binds with 0");
+        let default_size = socket2::SockRef::from(&defaulted)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+
+        let floor = default_size / 4;
+        let floored =
+            create_reusable_udp_socket(addr, None, floor).expect("binds with a low floor");
+        let floored_size = socket2::SockRef::from(&floored)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+
+        assert_eq!(
+            floored_size,
+            default_size,
+            "a {floor} B floor on a host already giving {default_size} B must leave the socket \
+             alone; requesting it would have landed at about {} B",
+            floor * 2
         );
     }
 
