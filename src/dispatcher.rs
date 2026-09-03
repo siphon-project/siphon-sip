@@ -2886,7 +2886,7 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         // half-open socket simply yields no answer within probe_timeout.
         // Detach so a slow UE can't stall the sweep.
         suspects += 1;
-        let binding_transport = transport_from_name(contact.source_transport.as_deref());
+        let binding_transport = contact.source_transport.unwrap_or(Transport::Udp);
         debug!(
             aor = %aor,
             ue = %ue_addr,
@@ -2948,17 +2948,6 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         tracked_misses = context.misses.len(),
         "registrar liveness: idle sweep census"
     );
-}
-
-/// Map a stored `source_transport` string to a `Transport` (defaults to UDP).
-fn transport_from_name(name: Option<&str>) -> Transport {
-    match name.map(|n| n.to_ascii_lowercase()).as_deref() {
-        Some("tcp") => Transport::Tcp,
-        Some("tls") => Transport::Tls,
-        Some("ws") => Transport::WebSocket,
-        Some("wss") => Transport::WebSocketSecure,
-        _ => Transport::Udp,
-    }
 }
 
 /// Send one OPTIONS over the captured flow (with a single retry); if the UE
@@ -29172,7 +29161,7 @@ mod tests {
                 format!("call-{user}"),
                 1,
                 Some(format!("{ue_ip}:5060").parse().unwrap()),
-                Some("tcp".to_string()),
+                Some(Transport::Tcp),
                 None,
                 None,
                 vec![],
@@ -29585,24 +29574,6 @@ mod tests {
             wire.contains("Authorization: Digest username=\"alice@example.com\""),
             "Authorization username should be the IMPI-shaped public id:\n{wire}"
         );
-    }
-
-    #[test]
-    fn transport_from_name_maps_known_transports_else_udp() {
-        assert!(matches!(transport_from_name(Some("tcp")), Transport::Tcp));
-        assert!(matches!(transport_from_name(Some("TLS")), Transport::Tls));
-        assert!(matches!(
-            transport_from_name(Some("ws")),
-            Transport::WebSocket
-        ));
-        assert!(matches!(
-            transport_from_name(Some("WSS")),
-            Transport::WebSocketSecure
-        ));
-        assert!(matches!(transport_from_name(Some("udp")), Transport::Udp));
-        // Unknown / absent transport falls back to UDP.
-        assert!(matches!(transport_from_name(None), Transport::Udp));
-        assert!(matches!(transport_from_name(Some("sctp")), Transport::Udp));
     }
 
     #[test]

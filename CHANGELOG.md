@@ -6,6 +6,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **A binding no longer carries its own copy of two per-process constants.**
+  `Contact` stored `instance_id` and `instance_epoch` as an owned `String`
+  pair, so a table of a million bindings held a million copies of the same two
+  values and paid two allocations per binding for them. They are now one shared
+  handle to the process identity, read through `Contact::instance_id()` /
+  `Contact::instance_epoch()`. The scripting API is unchanged — `contact.instance_id`
+  and `contact.instance_epoch` still return `str | None`. A restore from a
+  Redis/Postgres snapshot collapses to one handle per instance that wrote the
+  bindings, rather than one per binding.
+
+- **`Contact::source_transport` holds the parsed `Transport` instead of the
+  scheme token.** Every consumer wanted a `Transport` anyway — the routing path
+  re-parsed the string into one on each send, and two more places kept their own
+  copy of that conversion, all now removed. The persisted form is unchanged
+  (still the lowercase scheme token), so bindings stay readable across a
+  version rollback; an unrecognised scheme restores as "no transport recorded"
+  rather than failing the binding.
+
+  Together these take `Contact` from 480 to 416 bytes, which also drops the
+  per-AoR binding allocation into a smaller allocator size class. Measured over
+  200,000 single-binding AoRs with an instance identity configured: **777 → 641
+  bytes per AoR, a 17.5% reduction**, on top of the single-slot change above.
+
 ### Fixed
 - **A siphon-originated REFER no longer overtakes the answer it depends on.**
   A `call.refer()` issued from `@b2bua.on_answer` was emitted at the point the

@@ -116,12 +116,12 @@ impl StoredContact {
             call_id: contact.call_id.clone(),
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
-            source_transport: contact.source_transport.clone(),
+            source_transport: contact.source_transport.map(|t| t.as_scheme().to_string()),
             sip_instance: contact.sip_instance.clone(),
             reg_id: contact.reg_id,
             path: contact.path.clone(),
-            instance_id: contact.instance_id.clone(),
-            instance_epoch: contact.instance_epoch.clone(),
+            instance_id: contact.instance_id().map(str::to_string),
+            instance_epoch: contact.instance_epoch().map(str::to_string),
             flow_token: contact.flow_token.clone(),
             inbound_local_addr: contact.inbound_local_addr.map(|a| a.to_string()),
             inbound_connection_id: contact.inbound_connection_id,
@@ -200,13 +200,25 @@ impl StoredContact {
             call_id: self.call_id.clone(),
             cseq: self.cseq,
             source_addr,
-            source_transport: self.source_transport.clone(),
+            // An unrecognised scheme from a newer writer degrades to "no
+            // transport recorded" rather than failing the whole restore.
+            source_transport: self
+                .source_transport
+                .as_deref()
+                .and_then(crate::transport::Transport::from_scheme),
             sip_instance: self.sip_instance.clone(),
             reg_id: self.reg_id,
             path: self.path.clone(),
             pending: false,
-            instance_id: self.instance_id.clone(),
-            instance_epoch: self.instance_epoch.clone(),
+            // Both halves or neither: an id without an epoch cannot identify
+            // the process that wrote the binding, which is the only thing the
+            // pair is for, and the writer never emits one without the other.
+            instance: match (self.instance_id.clone(), self.instance_epoch.clone()) {
+                (Some(id), Some(epoch)) => {
+                    Some(std::sync::Arc::new(super::InstanceIdentity { id, epoch }))
+                }
+                _ => None,
+            },
             flow_token: self.flow_token.clone(),
             inbound_local_addr,
             inbound_connection_id: self.inbound_connection_id,
@@ -1407,6 +1419,10 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
     let aors = backend.all_aors().await?;
     let mut aor_count = 0usize;
     let mut contact_count = 0usize;
+    let mut instances: std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<super::InstanceIdentity>,
+    > = std::collections::HashMap::new();
 
     for aor in &aors {
         let stored = backend.load(aor).await?;
@@ -1422,6 +1438,17 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
             }
         }
         contacts_for_aor.shrink_to_fit();
+        // `to_contact` has to build an owned identity per record; collapse them
+        // so a snapshot of a million bindings holds one handle per instance
+        // that wrote them, not one per binding.
+        for contact in &mut contacts_for_aor {
+            if let Some(identity) = contact.instance.take() {
+                let shared = instances
+                    .entry((identity.id.clone(), identity.epoch.clone()))
+                    .or_insert(identity);
+                contact.instance = Some(std::sync::Arc::clone(shared));
+            }
+        }
         if !contacts_for_aor.is_empty() {
             // Sort by q-value descending (same as Registrar::save)
             contacts_for_aor
@@ -1685,7 +1712,7 @@ mod tests {
             call_id: "c1".to_string(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".into()),
-            source_transport: Some("udp".into()),
+            source_transport: Some("udp".to_string()),
             sip_instance: None,
             reg_id: None,
             path: vec![],
@@ -1973,6 +2000,76 @@ mod tests {
     /// AoR gets one slot, and an AoR whose snapshot held an expired contact is
     /// trimmed to what actually survived rather than keeping the dead slot
     /// reserved for the life of the process.
+    /// The persisted transport stays the lowercase scheme token.
+    ///
+    /// `Contact` holds the parsed enum now, but the stored form is the wire
+    /// contract with Redis/Postgres: a binding written by this build must
+    /// still be readable by one that predates the change, and `Display` on
+    /// `Transport` is the uppercase `Via` form, not this.
+    #[test]
+    fn the_persisted_transport_is_the_lowercase_scheme() {
+        for (transport, scheme) in [
+            (crate::transport::Transport::Udp, "udp"),
+            (crate::transport::Transport::Tcp, "tcp"),
+            (crate::transport::Transport::Tls, "tls"),
+            (crate::transport::Transport::WebSocket, "ws"),
+            (crate::transport::Transport::WebSocketSecure, "wss"),
+        ] {
+            let mut contact = sample_stored_contact().to_contact().expect("non-expired");
+            contact.source_transport = Some(transport);
+            let stored = StoredContact::from_contact(&contact);
+            assert_eq!(stored.source_transport.as_deref(), Some(scheme));
+            assert_eq!(
+                stored.to_contact().expect("non-expired").source_transport,
+                Some(transport),
+                "{scheme} must survive the round trip"
+            );
+        }
+    }
+
+    /// An unreadable transport degrades the one field rather than dropping the
+    /// binding — a newer writer's scheme must not cost an operator the
+    /// registration on a rollback.
+    #[test]
+    fn an_unknown_persisted_transport_degrades_to_none() {
+        let mut stored = sample_stored_contact();
+        stored.source_transport = Some("quic".to_string());
+        let contact = stored.to_contact().expect("the binding still restores");
+        assert_eq!(contact.source_transport, None);
+    }
+
+    /// Restored bindings written by the same instance share one identity
+    /// handle instead of allocating one each.
+    #[tokio::test]
+    async fn restore_shares_one_identity_per_writing_instance() {
+        let backend = MemoryBackend::new();
+        for index in 0..3 {
+            let mut stored = sample_stored_contact();
+            stored.uri = format!("sip:user{index}@10.0.0.1");
+            stored.instance_id = Some("siphon-pcscf-0".to_string());
+            stored.instance_epoch = Some("boot-1".to_string());
+            backend
+                .save(&format!("sip:user{index}@ims.example.com"), &[stored])
+                .await
+                .unwrap();
+        }
+
+        let registrar = Registrar::default();
+        restore_from_backend(&backend, &registrar).await.unwrap();
+
+        let first = registrar.lookup("sip:user0@ims.example.com");
+        let second = registrar.lookup("sip:user2@ims.example.com");
+        let (Some(first), Some(second)) = (first[0].instance.as_ref(), second[0].instance.as_ref())
+        else {
+            panic!("restored bindings carry the identity they were written with");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(first, second),
+            "one handle per writing instance, not one per restored binding"
+        );
+        assert_eq!(first.id, "siphon-pcscf-0");
+    }
+
     #[tokio::test]
     async fn restored_bindings_are_not_over_allocated() {
         let now_epoch = std::time::SystemTime::now()
