@@ -17,9 +17,14 @@ trait BytesTextExt {
 }
 impl BytesTextExt for quick_xml::events::BytesText<'_> {
     fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String> {
-        let decoded = self.decode().map_err(|error| error.to_string())?;
+        // quick-xml 0.42 made `BytesText` `str`-backed, so decoding happens in
+        // the reader and `decode()` is gone. `xml10_content()` is the
+        // replacement for that half — it applies XML 1.0 end-of-line
+        // normalisation (§2.11) and nothing else, so the entity resolution the
+        // old `unescape()` did still has to be layered on top.
+        let content = self.xml10_content();
         Ok(std::borrow::Cow::Owned(
-            quick_xml::escape::unescape(&decoded)
+            quick_xml::escape::unescape(&content)
                 .map_err(|error| error.to_string())?
                 .into_owned(),
         ))
@@ -167,6 +172,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
     let mut current_stream_id: Option<String> = None;
     let mut current_stream_session_id: Option<String> = None;
     let mut current_label: Option<String> = None;
+    let mut current_sip_session_id: Option<String> = None;
     let mut inside_label = false;
     let mut inside_name = false;
     let mut inside_sip_session_id = false;
@@ -177,7 +183,7 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(ref element)) | Ok(Event::Empty(ref element)) => {
                 let local_name = element.local_name();
-                let name = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+                let name = local_name.as_ref();
 
                 match name {
                     "session" => {
@@ -212,29 +218,51 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                     _ => {}
                 }
             }
+            // An entity reference splits the text node, so a value has to be
+            // accumulated across fragments rather than assigned from one — and
+            // trimmed once at the end, not per fragment, or interior spacing is
+            // eaten. Both `Text` and `GeneralRef` append here.
             Ok(Event::Text(ref text)) => {
-                if inside_label {
-                    if let Ok(value) = text.unescape() {
-                        current_label = Some(value.trim().to_string());
+                if let Ok(value) = text.unescape() {
+                    if inside_label {
+                        current_label
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
+                    }
+                    if inside_name {
+                        current_participant_name
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
+                    }
+                    if inside_sip_session_id {
+                        current_sip_session_id
+                            .get_or_insert_with(String::new)
+                            .push_str(&value);
                     }
                 }
-                if inside_name {
-                    if let Ok(value) = text.unescape() {
-                        current_participant_name = Some(value.trim().to_string());
+            }
+            Ok(Event::GeneralRef(ref reference)) => {
+                if let Some(resolved) = crate::xml_text::resolve_general_ref(reference) {
+                    if inside_label {
+                        current_label
+                            .get_or_insert_with(String::new)
+                            .push_str(&resolved);
                     }
-                }
-                if inside_sip_session_id {
-                    if let Ok(value) = text.unescape() {
-                        let trimmed = value.trim().to_string();
-                        if !trimmed.is_empty() {
-                            sip_session_ids.push(trimmed);
-                        }
+                    if inside_name {
+                        current_participant_name
+                            .get_or_insert_with(String::new)
+                            .push_str(&resolved);
+                    }
+                    if inside_sip_session_id {
+                        current_sip_session_id
+                            .get_or_insert_with(String::new)
+                            .push_str(&resolved);
                     }
                 }
             }
             Ok(Event::End(ref element)) => {
                 let local_name = element.local_name();
-                let name = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+                let name = local_name.as_ref();
 
                 match name {
                     "participant" => {
@@ -245,7 +273,9 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                             participants.push(Participant {
                                 participant_id,
                                 aor,
-                                name: current_participant_name.take(),
+                                name: current_participant_name
+                                    .take()
+                                    .map(|value| value.trim().to_string()),
                             });
                         }
                     }
@@ -256,11 +286,21 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
                             streams.push(StreamInfo {
                                 stream_id,
                                 session_id: stream_session_id,
-                                label: current_label.take().unwrap_or_default(),
+                                label: current_label.take().unwrap_or_default().trim().to_string(),
                             });
                         }
                     }
-                    "sipSessionID" => inside_sip_session_id = false,
+                    "sipSessionID" => {
+                        inside_sip_session_id = false;
+                        // Push once the whole value is in, so an entity split
+                        // across fragments does not become several ids.
+                        if let Some(value) = current_sip_session_id.take() {
+                            let trimmed = value.trim();
+                            if !trimmed.is_empty() {
+                                sip_session_ids.push(trimmed.to_string());
+                            }
+                        }
+                    }
                     "label" => inside_label = false,
                     "name" => inside_name = false,
                     _ => {}
@@ -287,7 +327,8 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
 /// Extract an attribute value from an XML element.
 fn get_attribute(element: &BytesStart, attribute_name: &str) -> Option<String> {
     for attribute in element.attributes().flatten() {
-        let key = std::str::from_utf8(attribute.key.as_ref()).unwrap_or("");
+        // Attribute keys are `str` in quick-xml 0.42.
+        let key = attribute.key.as_ref();
         if key == attribute_name {
             return attribute
                 .normalized_value(quick_xml::XmlVersion::Explicit1_0)
@@ -372,6 +413,32 @@ mod tests {
     }
 
     // --- Parsing tests ---
+
+    /// A display name carrying entity references parses whole.
+    ///
+    /// The value arrives in fragments — text, reference, text — so the parser
+    /// has to accumulate rather than assign, and trim only once at the end.
+    /// Assigning per fragment silently kept whichever fragment came last.
+    #[test]
+    fn parse_accumulates_entity_references_in_participant_name() {
+        let xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\n",
+            "  <session session_id=\"s1\"/>\n",
+            "  <participant participant_id=\"p1\">\n",
+            "    <nameID aor=\"sip:alice@example.com\"/>\n",
+            "    <name>Alice &amp; Bob &lt;Support&gt;</name>\n",
+            "  </participant>\n",
+            "</recording>\n",
+        );
+        let metadata = parse_recording_metadata(xml).unwrap();
+        assert_eq!(metadata.participants.len(), 1);
+        assert_eq!(
+            metadata.participants[0].name.as_deref(),
+            Some("Alice & Bob <Support>"),
+            "fragments around each entity must be joined, not overwritten"
+        );
+    }
 
     #[test]
     fn parse_roundtrip_no_original_call_id() {

@@ -44,6 +44,7 @@ pub mod subscribe_state;
 pub mod transaction;
 pub mod transport;
 pub mod uac;
+pub mod xml_text;
 
 pub use server::SiphonServer;
 

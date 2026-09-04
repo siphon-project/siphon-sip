@@ -326,9 +326,14 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
     }
     impl BytesTextExt for quick_xml::events::BytesText<'_> {
         fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String> {
-            let decoded = self.decode().map_err(|error| error.to_string())?;
+            // quick-xml 0.42 made `BytesText` `str`-backed, so decoding happens in
+            // the reader and `decode()` is gone. `xml10_content()` is the
+            // replacement for that half — it applies XML 1.0 end-of-line
+            // normalisation (§2.11) and nothing else, so the entity resolution the
+            // old `unescape()` did still has to be layered on top.
+            let content = self.xml10_content();
             Ok(std::borrow::Cow::Owned(
-                quick_xml::escape::unescape(&decoded)
+                quick_xml::escape::unescape(&content)
                     .map_err(|error| error.to_string())?
                     .into_owned(),
             ))
@@ -362,9 +367,10 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
             Event::Start(element) | Event::Empty(element) => {
                 let _ = is_empty; // captured above; used in branches below
                 let local_name = element.local_name();
-                let name_bytes = local_name.as_ref();
-                match name_bytes {
-                    b"reginfo" => {
+                // `local_name()` yields `str` in quick-xml 0.42, not bytes.
+                let name = local_name.as_ref();
+                match name {
+                    "reginfo" => {
                         let version = attr_required_u32(&element, "version")?;
                         let state = attr_required_str(&element, "state")?;
                         let parsed_state = match state.as_str() {
@@ -383,7 +389,7 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                             registrations: Vec::new(),
                         });
                     }
-                    b"registration" => {
+                    "registration" => {
                         if body.is_none() {
                             return Err(ReginfoParseError::MissingRoot);
                         }
@@ -416,7 +422,7 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                             }
                         }
                     }
-                    b"contact" => {
+                    "contact" => {
                         if current_registration.is_none() {
                             // Stray <contact> outside <registration> — skip.
                             continue;
@@ -483,11 +489,11 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                             }
                         }
                     }
-                    b"uri" => {
+                    "uri" => {
                         in_uri_text = true;
                         uri_text_buffer.clear();
                     }
-                    b"unknown-param" => {
+                    "unknown-param" => {
                         // RFC 3680 §5.3.2.  Flag form is self-closing
                         // (`<unknown-param name="…"/>`); valued form
                         // carries its value as inner text.  We stash the
@@ -509,6 +515,25 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                     }
                 }
             }
+            // An entity reference splits the text node: quick-xml ends the
+            // current `Text` at the `&`, emits the reference as its own event,
+            // and resumes `Text` after the `;`. Without this arm the reference
+            // is dropped and the value is silently rewritten — a contact URI
+            // with two headers (`sip:a@b?X=1&amp;Y=2`) loses its separator.
+            Event::GeneralRef(reference) => {
+                let resolved =
+                    crate::xml_text::resolve_general_ref(&reference).ok_or_else(|| {
+                        ReginfoParseError::Xml(format!(
+                            "unresolvable entity reference &{};  (siphon parses no DTD)",
+                            reference.as_ref() as &str
+                        ))
+                    })?;
+                if in_uri_text {
+                    uri_text_buffer.push_str(&resolved);
+                } else if pending_unknown_param_name.is_some() {
+                    unknown_param_text_buffer.push_str(&resolved);
+                }
+            }
             Event::Text(text) => {
                 if in_uri_text {
                     let s = text
@@ -526,7 +551,7 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                 let local_name = element.local_name();
                 let name_bytes = local_name.as_ref();
                 match name_bytes {
-                    b"uri" => {
+                    "uri" => {
                         if let Some(contact) = current_contact.as_mut() {
                             let trimmed = uri_text_buffer.trim();
                             if !trimmed.is_empty() {
@@ -536,7 +561,7 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         in_uri_text = false;
                         uri_text_buffer.clear();
                     }
-                    b"unknown-param" => {
+                    "unknown-param" => {
                         if let Some(name) = pending_unknown_param_name.take() {
                             let trimmed = unknown_param_text_buffer.trim();
                             let value = if trimmed.is_empty() {
@@ -550,14 +575,14 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         }
                         unknown_param_text_buffer.clear();
                     }
-                    b"contact" => {
+                    "contact" => {
                         if let Some(contact) = current_contact.take() {
                             if let Some(reg) = current_registration.as_mut() {
                                 reg.contacts.push(contact);
                             }
                         }
                     }
-                    b"registration" => {
+                    "registration" => {
                         if let Some(reg) = current_registration.take() {
                             if let Some(reginfo) = body.as_mut() {
                                 reginfo.registrations.push(reg);
@@ -589,7 +614,7 @@ fn attr_optional_str(
 ) -> Result<Option<String>, ReginfoParseError> {
     for attr in element.attributes().with_checks(false) {
         let attr = attr.map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
-        if attr.key.local_name().as_ref() == name.as_bytes() {
+        if attr.key.local_name().as_ref() == name {
             let value = attr
                 .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                 .map_err(|error| ReginfoParseError::Xml(error.to_string()))?;
@@ -882,6 +907,32 @@ mod tests {
     // -----------------------------------------------------------------
     // Parser tests
     // -----------------------------------------------------------------
+
+    /// Entity references in element text are resolved on parse.
+    ///
+    /// This is the path `BytesTextExt::unescape` exists for, and it had no
+    /// coverage: a SIP URI legitimately carries `&` (a header separator) and
+    /// `=`/`?`, so an escaping regression here silently rewrites the contact a
+    /// terminating request is routed to. quick-xml 0.42 made `BytesText`
+    /// `str`-backed and removed `decode()`, so the shim had to be rebuilt on
+    /// `xml10_content()` + `escape::unescape()`.
+    #[test]
+    fn parse_resolves_entity_references_in_uri_text() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full">
+  <registration aor="sip:alice@ims.example.com" id="reg-1" state="active">
+    <contact id="c-1" state="active" event="registered" expires="1800" q="1.0">
+      <uri>sip:alice@10.0.0.1:5060?X-A=1&amp;X-B=2&lt;3&gt;4&quot;5&apos;6&#38;7</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let body = parse_reginfo(xml).unwrap();
+        let contact = &body.registrations[0].contacts[0];
+        assert_eq!(
+            contact.uri, "sip:alice@10.0.0.1:5060?X-A=1&X-B=2<3>4\"5'6&7",
+            "every entity form (named, numeric) must resolve exactly once"
+        );
+    }
 
     #[test]
     fn parse_full_state_single_registration() {

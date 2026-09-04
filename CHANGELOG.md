@@ -37,6 +37,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
 
 ### Changed
+- **quick-xml 0.41 → 0.42.** `BytesText` is `str`-backed now, so the reader
+  decodes up front and `decode()` is gone; the content accessors
+  (`xml10_content()`) apply XML 1.0 end-of-line normalisation and leave entity
+  resolution to the caller. Element and attribute names are `str` rather than
+  bytes, which removes a set of `from_utf8` conversions at the parse sites.
+
 - **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
   instead of writing a second record.** With `cdr.auto_emit: true`, siphon
   already tracks a record for the call from the INVITE; a script's `extra`
@@ -126,6 +132,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
 
 ### Fixed
+- **XML entity references in element text were silently dropped, since v1.1.1.**
+  quick-xml does not deliver one text node per element: an entity reference
+  terminates the current `Text` event, arrives as its own `GeneralRef`, and the
+  remaining text follows as another `Text`. siphon's three hand-rolled parsers
+  read only `Text`, so every `&amp;`, `&lt;`, `&#38;` and the like vanished from
+  the value — no error, just a shorter string. The 0.37 → 0.41 bump in v1.1.1
+  (RUSTSEC-2026-0194/0195) introduced the split; the compatibility shim written
+  at the time restored `BytesText::unescape()` but never saw the references,
+  because they had already been routed to an event nobody handled.
+
+  This is not cosmetic for SIP. A URI carries `&` as soon as it has two headers
+  (`sip:a@b?X=1&Y=2`), which XML requires be written `&amp;` — so a contact URI
+  in a reg-event NOTIFY (RFC 3680), an Application-Server URI in an iFC
+  (3GPP TS 29.228) and a display name in SIPREC metadata (RFC 7866) all parsed
+  into a *different*, still well-formed value. Affected every release from
+  v1.1.1 through 1.8.0.
+
+  All three parsers now resolve `GeneralRef` through one shared
+  `xml_text::resolve_general_ref` — the five predefined entities plus decimal
+  and hexadecimal numeric references. An unresolvable reference fails the parse
+  rather than being dropped, since siphon reads no DTD and inventing
+  replacement text is how the bug looked in the first place. The SIPREC parser
+  additionally accumulates across fragments instead of assigning, which it had
+  to for a split value to survive at all.
+
 - **A media failure at answer no longer connects the call and starts charging.**
   An exception out of `@b2bua.on_answer` was logged and then ignored: the A-leg
   2xx went out a millisecond later, the ACK followed, and the charging clock
