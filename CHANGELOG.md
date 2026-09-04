@@ -29,6 +29,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Read-only, no new state, no behaviour change.
 
+### Fixed
+- **The INVITE a siphon-terminated transfer triggers now carries the REFER's
+  `Referred-By` (RFC 3892 §3).** That INVITE is built from the referrer's own
+  INVITE as a dial template, and `Referred-By` lives on the REFER rather than on
+  that template, so it was dropped — the transfer target was never told on whose
+  authority it was being called. It matters most on a REFER that carries no
+  `Replaces`: there it is the only thing tying the triggered INVITE back to the
+  referral, so a referrer that holds the consultation leg itself and expects the
+  triggered INVITE to come back to it has nothing to correlate on and answers it
+  as an unrelated new call. A stale `Referred-By` inherited from the template —
+  a call that itself arrived as a transfer — is now cleared rather than passed
+  on as this referral's, so a chained transfer stops naming the previous
+  referrer.
+- **A transfer target that refuses is now ACKed (RFC 3261 §17.1.1.3).** The
+  transfer-target response interception returns before the ordinary B-leg
+  failure handling, which is where every other B-leg non-2xx is ACKed, so
+  nothing ACKed this one: siphon reported the failure to the referrer on the
+  implicit subscription and moved on while the target retransmitted its final
+  response for the full 32 s of Timer H. The referrer and the surviving leg both
+  complete normally when this happens, which is why nothing upstream noticed —
+  the whole of the damage lands on the target. Covered end to end by a new SIPp
+  acceptance scenario (`b2bua-refer-terminate-busy`) that grades all three legs
+  and pins both fixes.
+
 ## [1.8.1] — 2026-09-04
 
 ### Security
