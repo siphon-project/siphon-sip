@@ -6,6 +6,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`Transform.alg` and `Transform.ealg` — the RFC 3329 wire names, readable
+  without an allocated SA.** A script that wants to advertise its transform
+  policy as a capability list had no way to get at the algorithm spellings:
+  `Transform` exposed only `compatible_with()` and `__repr__()`, and the
+  strings were reachable solely through `SecurityServerParams`, which requires
+  a completed `ipsec.allocate()` and therefore a real authentication vector.
+  That is exactly the material a server does *not* have when RFC 3329 §2.3.2
+  requires it to answer a request lacking the `sec-agree` option tag with a 421
+  (or 494) carrying a `Security-Server` header listing its capabilities. The
+  two getters return the same tokens the header uses — `"hmac-sha-1-96"`,
+  `"hmac-sha-256-128"`, `"aes-cbc"`, `"null"` — so the list can be built from
+  the policy constant a script already has, instead of hardcoding a second copy
+  of the mapping that silently rots when a transform is added.
+
+  ```python
+  capabilities = ", ".join(
+      f"ipsec-3gpp; alg={t.alg}; ealg={t.ealg}" for t in ALLOWED_TRANSFORMS
+  )
+  ```
+
+  Read-only, no new state, no behaviour change.
+
 ## [1.8.1] — 2026-09-04
 
 ### Security

@@ -451,6 +451,28 @@ impl PyTransform {
 
 #[pymethods]
 impl PyTransform {
+    /// Integrity algorithm name as it appears in a ``Security-Client`` /
+    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g.
+    /// ``"hmac-sha-1-96"``.
+    ///
+    /// Lets a script advertise its transform policy as a capability list
+    /// without first allocating an SA — :class:`SecurityServerParams` is
+    /// only reachable once :func:`siphon.ipsec.allocate` has consumed a
+    /// real authentication vector, which has not happened yet when a
+    /// server answers 421/494 per RFC 3329 §2.3.2.
+    #[getter(alg)]
+    fn py_alg(&self) -> &'static str {
+        self.alg_str()
+    }
+
+    /// Encryption algorithm name as it appears in a ``Security-Client`` /
+    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g. ``"aes-cbc"``
+    /// or ``"null"``.
+    #[getter(ealg)]
+    fn py_ealg(&self) -> &'static str {
+        self.ealg_str()
+    }
+
     /// Whether this transform is compatible with the UE's offer.
     ///
     /// True when the offer's ``alg`` and ``ealg`` strings match
@@ -1493,6 +1515,93 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every transform variant with its RFC 3329 §2.2 wire spelling.  One
+    /// table shared by the three tests below, so a newly added variant
+    /// cannot be pinned in one of them and forgotten in the others.
+    const RFC3329_NAMES: [(PyTransform, &str, &str); 6] = [
+        (PyTransform::HmacSha1_96Null, "hmac-sha-1-96", "null"),
+        (PyTransform::HmacMd5_96Null, "hmac-md5-96", "null"),
+        (PyTransform::HmacSha256_128Null, "hmac-sha-256-128", "null"),
+        (PyTransform::HmacSha1_96AesCbc128, "hmac-sha-1-96", "aes-cbc"),
+        (PyTransform::HmacMd5_96AesCbc128, "hmac-md5-96", "aes-cbc"),
+        (
+            PyTransform::HmacSha256_128AesCbc128,
+            "hmac-sha-256-128",
+            "aes-cbc",
+        ),
+    ];
+
+    /// The `alg` / `ealg` getters carry the RFC 3329 §2.2 wire spelling for
+    /// every variant, so a script can build a `Security-Server` capability
+    /// list without an allocated SA.  Pinned as literals rather than against
+    /// `alg_str()` / `ealg_str()` — comparing a getter to the function it
+    /// calls is a tautology, and it is the on-the-wire token that must not
+    /// drift.
+    #[test]
+    fn transform_exposes_rfc3329_names() {
+        for (transform, alg, ealg) in RFC3329_NAMES {
+            assert_eq!(transform.py_alg(), alg, "alg for {transform:?}");
+            assert_eq!(transform.py_ealg(), ealg, "ealg for {transform:?}");
+        }
+    }
+
+    /// The getters must be reachable from Python under exactly the names a
+    /// script writes — `t.alg` / `t.ealg`.  The Rust-side assertions above
+    /// call the methods directly and would stay green if the `#[getter(...)]`
+    /// name were wrong or the attribute were dropped altogether, which is the
+    /// failure this change exists to remove: a script reaches these through
+    /// attribute lookup, so a mismatch surfaces as an `AttributeError` when
+    /// the script is loaded, not as a red test here.
+    #[test]
+    fn transform_getters_are_reachable_from_python() {
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            for (transform, alg, ealg) in RFC3329_NAMES {
+                let bound = transform
+                    .into_pyobject(python)
+                    .expect("transform converts to a Python object")
+                    .into_any();
+
+                let python_alg: String = bound
+                    .getattr("alg")
+                    .unwrap_or_else(|_| panic!("no .alg attribute on {transform:?}"))
+                    .extract()
+                    .expect("alg extracts as str");
+                let python_ealg: String = bound
+                    .getattr("ealg")
+                    .unwrap_or_else(|_| panic!("no .ealg attribute on {transform:?}"))
+                    .extract()
+                    .expect("ealg extracts as str");
+
+                assert_eq!(python_alg, alg, "python .alg for {transform:?}");
+                assert_eq!(python_ealg, ealg, "python .ealg for {transform:?}");
+            }
+        });
+    }
+
+    /// A capability advertised by the getters must be one the negotiator
+    /// actually accepts back from a UE — otherwise a 421 would steer a UE
+    /// into an offer we then reject.
+    #[test]
+    fn advertised_names_round_trip_through_compatible_with() {
+        for (transform, _, _) in RFC3329_NAMES {
+            let offer = PySecurityOffer {
+                mechanism: "ipsec-3gpp".into(),
+                alg: transform.py_alg().to_string(),
+                ealg: transform.py_ealg().to_string(),
+                spi_c: 1,
+                spi_s: 2,
+                port_c: 5060,
+                port_s: 5062,
+                ue_addr: "198.51.100.2".into(),
+            };
+            assert!(
+                transform.compatible_with(&offer),
+                "advertised names rejected for {transform:?}"
+            );
+        }
+    }
 
     #[test]
     fn split_top_level_commas_respects_quotes() {
