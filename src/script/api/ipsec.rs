@@ -1523,7 +1523,11 @@ mod tests {
         (PyTransform::HmacSha1_96Null, "hmac-sha-1-96", "null"),
         (PyTransform::HmacMd5_96Null, "hmac-md5-96", "null"),
         (PyTransform::HmacSha256_128Null, "hmac-sha-256-128", "null"),
-        (PyTransform::HmacSha1_96AesCbc128, "hmac-sha-1-96", "aes-cbc"),
+        (
+            PyTransform::HmacSha1_96AesCbc128,
+            "hmac-sha-1-96",
+            "aes-cbc",
+        ),
         (PyTransform::HmacMd5_96AesCbc128, "hmac-md5-96", "aes-cbc"),
         (
             PyTransform::HmacSha256_128AesCbc128,
