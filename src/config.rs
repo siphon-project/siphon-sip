@@ -145,6 +145,21 @@ pub struct Config {
     pub number_policies:
         std::collections::HashMap<String, crate::numbers::policy::NumberPolicyConfig>,
 
+    /// Operator-defined B2BUA header policies (`"<name>@<version>" -> policy`),
+    /// selectable anywhere a built-in preset is: `b2bua.default_header_policy`
+    /// and `call.dial(header_policy=…)` / `call.fork(header_policy=…)`.
+    ///
+    /// Each entry either extends a built-in preset or declares both directions
+    /// in full; see
+    /// [`HeaderPolicyConfig`](crate::b2bua::header_policy::HeaderPolicyConfig).
+    /// Resolved and validated at load by
+    /// [`Self::validate_header_policies`], so a policy that could never work
+    /// stops the node at boot rather than at the first call across the
+    /// boundary it was meant to guard.
+    #[serde(default)]
+    pub header_policies:
+        std::collections::HashMap<String, crate::b2bua::header_policy::HeaderPolicyConfig>,
+
     /// Call Detail Records — billing and accounting.
     pub cdr: Option<CdrYamlConfig>,
 
@@ -224,10 +239,11 @@ pub struct Config {
 /// B2BUA-wide configuration knobs.
 ///
 /// Currently surfaces the default header policy applied to B2BUA calls when
-/// the script doesn't pass `header_policy=` on `call.dial()`.  The built-in
-/// presets ship with siphon — operators just pin the qualified name (e.g.
-/// `"transparent-b2bua@2026"`).  An unset/empty value falls back to
-/// `transparent-b2bua@2026`, which reproduces siphon's pre-policy B2BUA
+/// the script doesn't pass `header_policy=` on `call.dial()`.  Names either a
+/// built-in preset (e.g. `"transparent-b2bua@2026"`) or an operator-defined
+/// one from the top-level `header_policies:` map — one namespace, and a name
+/// that resolves to neither refuses to start.  An unset/empty value falls back
+/// to `transparent-b2bua@2026`, which reproduces siphon's pre-policy B2BUA
 /// behaviour (modulo the intentional `Proxy-Authenticate` strip).
 ///
 /// ```yaml
@@ -293,6 +309,19 @@ pub struct B2buaConfig {
 }
 
 impl B2buaConfig {
+    /// The header-policy name to apply when a call doesn't pass one.
+    ///
+    /// Unset, empty, or whitespace all mean "not configured" and resolve to
+    /// [`DEFAULT_PRESET_NAME`](crate::b2bua::header_policy::DEFAULT_PRESET_NAME);
+    /// anything else is taken verbatim and must exist in the registry (the
+    /// load-time check in [`Config::validate_header_policies`] proves it does).
+    pub fn resolved_default_header_policy(&self) -> &str {
+        match self.default_header_policy.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name,
+            _ => crate::b2bua::header_policy::DEFAULT_PRESET_NAME,
+        }
+    }
+
     /// Whether an inbound `Replaces` may take a dialog over. Defaults to
     /// `false` — see [`accept_replaces`](Self::accept_replaces).
     pub fn replaces_takeover_enabled(&self) -> bool {
@@ -4108,6 +4137,7 @@ impl Config {
         let config: Self = serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_media_profiles()?;
+        config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
         config.validate_max_message_bytes()?;
         Ok(config)
@@ -4227,6 +4257,33 @@ impl Config {
                     )));
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Reject a `header_policies:` entry that cannot compile, and a
+    /// `b2bua.default_header_policy` that names no known policy.
+    ///
+    /// Runs on every load path, so a policy with a typo in an op token, a rule
+    /// aimed at a framework-managed header, or a name nothing defines stops the
+    /// node at boot. The default in particular used to warn and silently fall
+    /// back to `transparent-b2bua@2026` — which is the *most* permissive
+    /// posture, so a typo in the name of a trust-boundary control opened the
+    /// boundary instead of closing it, on a node that came up reporting healthy.
+    fn validate_header_policies(&self) -> Result<()> {
+        let registry = crate::b2bua::header_policy::build_registry(&self.header_policies)
+            .map_err(|error| SiphonError::Config(error.to_string()))?;
+
+        let name = self.b2bua.resolved_default_header_policy();
+        if !registry.contains_key(name) {
+            let mut known: Vec<&str> = registry.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            return Err(SiphonError::Config(format!(
+                "b2bua.default_header_policy {name:?} names no known header policy — define it \
+                 under header_policies:, or pick one of: {}",
+                known.join(", ")
+            )));
         }
 
         Ok(())
@@ -6069,6 +6126,158 @@ media:
         // First inherits the parent timeout; second overrides it.
         assert_eq!(instances[0], ("10.0.0.1:22222".to_string(), 1500, 2));
         assert_eq!(instances[1], ("10.0.0.2:22222".to_string(), 3000, 1));
+    }
+
+    /// Minimum config the loader accepts, plus whatever the test is about.
+    fn config_with(extra: &str) -> Result<Config> {
+        Config::from_str(&format!(
+            concat!(
+                "listen:\n",
+                "  udp:\n",
+                "    - \"0.0.0.0:5060\"\n",
+                "domain:\n",
+                "  local:\n",
+                "    - \"example.com\"\n",
+                "script:\n",
+                "  path: \"scripts/proxy_default.py\"\n",
+                "{}"
+            ),
+            extra
+        ))
+    }
+
+    #[test]
+    fn parses_header_policies_in_both_forms() {
+        let config = config_with(concat!(
+            "header_policies:\n",
+            "  \"trunk-edge-plus@1\":\n",
+            "    extends: \"sip-trunk-edge@2026\"\n",
+            "    request:\n",
+            "      copy: [\"X-Account-Ref\"]\n",
+            "      strip: [\"Alert-Info\"]\n",
+            "      translate:\n",
+            "        Diversion: diversion-to-history-info\n",
+            "      rewrite:\n",
+            "        P-Asserted-Identity: host-to-advertised\n",
+            "    response:\n",
+            "      strip: [\"Server\"]\n",
+            "  \"locked-down@1\":\n",
+            "    request:\n",
+            "      default: strip\n",
+            "      copy: [\"Allow\", \"Supported\"]\n",
+            "    response:\n",
+            "      default: copy\n",
+            "      strip: [\"P-*\"]\n",
+            "b2bua:\n",
+            "  default_header_policy: \"trunk-edge-plus@1\"\n",
+        ))
+        .expect("both policy forms should load");
+
+        assert_eq!(config.header_policies.len(), 2);
+        let extended = config
+            .header_policies
+            .get("trunk-edge-plus@1")
+            .expect("policy present");
+        assert_eq!(extended.extends.as_deref(), Some("sip-trunk-edge@2026"));
+        let request = extended.request.as_ref().expect("request block present");
+        assert_eq!(request.copy, vec!["X-Account-Ref".to_string()]);
+        assert_eq!(
+            request
+                .rewrite
+                .get("P-Asserted-Identity")
+                .map(String::as_str),
+            Some("host-to-advertised")
+        );
+
+        let standalone = config
+            .header_policies
+            .get("locked-down@1")
+            .expect("policy present");
+        assert!(standalone.extends.is_none());
+        assert_eq!(
+            standalone
+                .request
+                .as_ref()
+                .and_then(|direction| direction.default),
+            Some(crate::b2bua::header_policy::DefaultVerb::Strip)
+        );
+
+        assert_eq!(
+            config.b2bua.resolved_default_header_policy(),
+            "trunk-edge-plus@1"
+        );
+    }
+
+    #[test]
+    fn header_policies_default_to_empty() {
+        let config = config_with("").expect("config without header_policies should load");
+        assert!(config.header_policies.is_empty());
+        assert_eq!(
+            config.b2bua.resolved_default_header_policy(),
+            crate::b2bua::header_policy::DEFAULT_PRESET_NAME
+        );
+    }
+
+    #[test]
+    fn rejects_a_header_policy_that_cannot_compile() {
+        // The load-time gate: an op token nobody implements would otherwise
+        // surface as a header silently not being rewritten, mid-call.
+        let error = config_with(concat!(
+            "header_policies:\n",
+            "  \"broken@1\":\n",
+            "    extends: \"transparent-b2bua@2026\"\n",
+            "    request:\n",
+            "      rewrite:\n",
+            "        P-Asserted-Identity: make-it-nice\n",
+        ))
+        .expect_err("an unknown rewrite op must refuse to load");
+        let message = error.to_string();
+        assert!(message.contains("broken@1"), "{message}");
+        assert!(message.contains("make-it-nice"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_undefined_default_header_policy() {
+        // Used to warn and fall back to transparent-b2bua@2026 — the most
+        // permissive posture — so a typo opened the boundary it was meant to
+        // close, on a node that came up healthy.
+        let error = config_with(concat!(
+            "b2bua:\n",
+            "  default_header_policy: \"trunk-edge-pluss@1\"\n",
+        ))
+        .expect_err("an undefined default must refuse to load");
+        let message = error.to_string();
+        assert!(message.contains("trunk-edge-pluss@1"), "{message}");
+        assert!(
+            message.contains("sip-trunk-edge@2026"),
+            "the error should list what is available: {message}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_default_naming_an_operator_defined_policy() {
+        let config = config_with(concat!(
+            "header_policies:\n",
+            "  \"our-trunk@1\":\n",
+            "    extends: \"sip-trunk-edge@2026\"\n",
+            "b2bua:\n",
+            "  default_header_policy: \"our-trunk@1\"\n",
+        ))
+        .expect("a default naming a custom policy should load");
+        assert_eq!(config.b2bua.resolved_default_header_policy(), "our-trunk@1");
+    }
+
+    #[test]
+    fn accepts_a_default_naming_a_builtin_preset() {
+        let config = config_with(concat!(
+            "b2bua:\n",
+            "  default_header_policy: \"ims-trust-domain-boundary@2026\"\n",
+        ))
+        .expect("a built-in name should still load");
+        assert_eq!(
+            config.b2bua.resolved_default_header_policy(),
+            "ims-trust-domain-boundary@2026"
+        );
     }
 
     #[test]

@@ -23,7 +23,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use crate::sip::message::SipMessage;
+
+/// Qualified name of the preset applied when nothing else resolves — an
+/// unset `b2bua.default_header_policy`, or a name that could not be found.
+pub const DEFAULT_PRESET_NAME: &str = "transparent-b2bua@2026";
 
 // ---------------------------------------------------------------------------
 // Verbs
@@ -59,6 +65,29 @@ pub enum RewriteOp {
     ReplaceWithUserAgentHeader,
 }
 
+impl RewriteOp {
+    /// Resolve a config token (the value side of a `rewrite:` entry in
+    /// `header_policies:`) to a rewrite op.  Returns `None` for an unknown
+    /// token; the caller reports it with the offending policy name.
+    pub fn from_token(token: &str) -> Option<RewriteOp> {
+        match token.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "host-to-advertised" => Some(RewriteOp::HostToAdvertised),
+            "replace-with-server-header" => Some(RewriteOp::ReplaceWithServerHeader),
+            "replace-with-user-agent-header" => Some(RewriteOp::ReplaceWithUserAgentHeader),
+            _ => None,
+        }
+    }
+
+    /// Every token [`Self::from_token`] accepts, for error messages.
+    pub fn tokens() -> &'static [&'static str] {
+        &[
+            "host-to-advertised",
+            "replace-with-server-header",
+            "replace-with-user-agent-header",
+        ]
+    }
+}
+
 /// Named cross-header transforms for the [`Verb::Translate`] verb.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranslateOp {
@@ -66,6 +95,24 @@ pub enum TranslateOp {
     /// Single-divert minimal mapping; full RFC 7044 chained-index carriage
     /// is out of scope for v1.
     DiversionToHistoryInfo,
+}
+
+impl TranslateOp {
+    /// Resolve a translate-op token to an op.  Shared by the script-facing
+    /// `call.dial(translate=[(…, "rfc7044")])` path and the `translate:` map
+    /// of an operator-defined policy, so the two can never accept different
+    /// spellings.  Returns `None` for an unknown token.
+    pub fn from_token(token: &str) -> Option<TranslateOp> {
+        match token.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "rfc7044" | "diversion-to-history-info" => Some(TranslateOp::DiversionToHistoryInfo),
+            _ => None,
+        }
+    }
+
+    /// Every token [`Self::from_token`] accepts, for error messages.
+    pub fn tokens() -> &'static [&'static str] {
+        &["rfc7044", "diversion-to-history-info"]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +131,42 @@ pub enum HeaderPattern {
 }
 
 impl HeaderPattern {
+    /// Parse a config token from a `copy:` / `strip:` list, or the key side of
+    /// a `rewrite:` / `translate:` map.
+    ///
+    /// `"Alert-Info"` → [`Self::Exact`], `"X-*"` → [`Self::Prefix`].  The `*`
+    /// is a trailing wildcard only — the engine matches on a name prefix, not
+    /// a glob — and a bare `"*"` is refused because it silently duplicates the
+    /// direction's `default:`.  Returns the reason on rejection so the caller
+    /// can name the offending policy alongside it.
+    pub fn from_token(token: &str) -> Result<HeaderPattern, String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("empty header name".to_string());
+        }
+        if let Some(prefix) = token.strip_suffix('*') {
+            if prefix.is_empty() {
+                return Err(
+                    "\"*\" would match every header — set the direction's `default:` instead"
+                        .to_string(),
+                );
+            }
+            if prefix.contains('*') {
+                return Err(
+                    "only one trailing \"*\" is supported — this is a prefix match, not a glob"
+                        .to_string(),
+                );
+            }
+            return Ok(HeaderPattern::Prefix(prefix.to_string()));
+        }
+        if token.contains('*') {
+            return Err(
+                "\"*\" is only supported as a trailing wildcard (e.g. \"X-*\")".to_string(),
+            );
+        }
+        Ok(HeaderPattern::Exact(token.to_string()))
+    }
+
     pub fn matches(&self, header_name: &str) -> bool {
         match self {
             HeaderPattern::Exact(name) => name.eq_ignore_ascii_case(header_name),
@@ -238,20 +321,23 @@ pub struct PolicyContext<'a> {
 /// strips them by default (the spec-correct posture), but a script can
 /// opt in via `call.dial(copy=["Proxy-Authenticate"])` for the rare
 /// transparent-proxy B2BUA case.
+pub(crate) const FRAMEWORK_AUTO_HEADERS: &[&str] = &[
+    "Via",
+    "Call-ID",
+    "CSeq",
+    "Max-Forwards",
+    "Content-Length",
+    "From",
+    "To",
+    "Contact",
+    "Record-Route",
+    "Route",
+];
+
 pub(crate) fn is_framework_auto(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "via"
-            | "call-id"
-            | "cseq"
-            | "max-forwards"
-            | "content-length"
-            | "from"
-            | "to"
-            | "contact"
-            | "record-route"
-            | "route"
-    )
+    FRAMEWORK_AUTO_HEADERS
+        .iter()
+        .any(|header| header.eq_ignore_ascii_case(name))
 }
 
 /// Apply the policy to a freshly-cloned B-leg request.  Operates on
@@ -341,9 +427,9 @@ fn apply_translate(value: &str, op: &TranslateOp) -> Option<(String, String)> {
 
 /// Minimal RFC 5806 → RFC 7044 mapping for the single-divert case.
 ///
-/// `Diversion: <sip:+3197010267609@sip.didww.com>;reason=unconditional;counter=1`
+/// `Diversion: <sip:+12025550123@example.com>;reason=unconditional;counter=1`
 /// →
-/// `History-Info: <sip:+3197010267609@sip.didww.com?Reason=SIP%3Bcause%3D302>;index=1`
+/// `History-Info: <sip:+12025550123@example.com?Reason=SIP%3Bcause%3D302>;index=1`
 ///
 /// Full RFC 7044 chained carriage (multiple `History-Info` entries with
 /// hierarchical index `1.1`, `1.1.1`) is out of scope for v1 — the BGCF use
@@ -397,6 +483,111 @@ pub enum PresetError {
 
     #[error("preset {0} has empty version — versioning is mandatory")]
     MissingVersion(String),
+
+    #[error(
+        "header policy {0:?} is not versioned — the map key is the name scripts pin, and it \
+         must be \"<name>@<version>\" (e.g. {0:?}@1) so a later edit to this policy cannot \
+         silently change what crosses the boundary for calls already pinning the old name"
+    )]
+    UnversionedName(String),
+
+    #[error(
+        "header policy {0:?} collides with a built-in preset of the same name — pick another \
+         name (a built-in's behaviour is pinned by its version and must not be redefined); \
+         to build on it, use `extends: {0:?}` under a name of your own"
+    )]
+    NameCollidesWithBuiltin(String),
+
+    #[error(
+        "header policy {policy:?} extends {base:?}, which is not a built-in preset — \
+         `extends:` must name one of: {known}"
+    )]
+    UnknownBase {
+        policy: String,
+        base: String,
+        known: String,
+    },
+
+    #[error("header policy {policy:?} ({direction}): {token:?} — {reason}")]
+    InvalidPattern {
+        policy: String,
+        direction: String,
+        token: String,
+        reason: String,
+    },
+
+    #[error(
+        "header policy {policy:?} ({direction}) names {token:?} more than once — one header \
+         gets one verb; remove the duplicate"
+    )]
+    DuplicatePattern {
+        policy: String,
+        direction: String,
+        token: String,
+    },
+
+    #[error(
+        "header policy {policy:?} ({direction}) names {token:?}, which matches the \
+         framework-managed header {header} — Via, Call-ID, CSeq, Max-Forwards, \
+         Content-Length, From, To, Contact, Record-Route and Route are per-leg dialog and \
+         routing state that no policy may touch, so this rule would never have taken effect"
+    )]
+    FrameworkAutoHeader {
+        policy: String,
+        direction: String,
+        token: String,
+        header: String,
+    },
+
+    #[error(
+        "header policy {policy:?} ({direction}) sets `rewrite: {header}: {token:?}`, which is \
+         not a rewrite op — expected one of: {known}"
+    )]
+    UnknownRewriteOp {
+        policy: String,
+        direction: String,
+        header: String,
+        token: String,
+        known: String,
+    },
+
+    #[error(
+        "header policy {policy:?} ({direction}) sets `translate: {header}: {token:?}`, which \
+         is not a translate op — expected one of: {known}"
+    )]
+    UnknownTranslateOp {
+        policy: String,
+        direction: String,
+        header: String,
+        token: String,
+        known: String,
+    },
+
+    #[error(
+        "header policy {policy:?} ({direction}) has no `default:` — a policy without \
+         `extends:` must say what happens to a header no rule matches (`default: copy` or \
+         `default: strip`)"
+    )]
+    MissingDefault { policy: String, direction: String },
+
+    #[error(
+        "header policy {policy:?} ({direction}) sets both `extends:` and `default:` — the \
+         base preset supplies the default; remove `default:`, or drop `extends:` and declare \
+         the policy in full"
+    )]
+    DefaultWithExtends { policy: String, direction: String },
+
+    #[error(
+        "header policy {policy:?} has no `{direction}:` block and no `extends:` — declare \
+         both directions, or extend a built-in preset to inherit them"
+    )]
+    MissingDirection { policy: String, direction: String },
+
+    #[error(
+        "header policy {0:?} is empty — declare `request:` / `response:` rules, or `extends:` \
+         a built-in preset to alias it under a name of your own"
+    )]
+    EmptyPolicy(String),
 }
 
 /// Reject preset configurations that would silently break Digest auth.
@@ -711,6 +902,368 @@ fn sip_trunk_edge_2026() -> Preset {
             ],
         },
     }
+}
+
+/// The preset applied when no other name resolves — [`DEFAULT_PRESET_NAME`].
+pub fn default_preset() -> Arc<Preset> {
+    Arc::new(transparent_b2bua_2026())
+}
+
+// ---------------------------------------------------------------------------
+// Operator-defined policies (`header_policies:` in siphon.yaml)
+// ---------------------------------------------------------------------------
+
+/// The catch-all verb of a direction block.
+///
+/// Only `copy` and `strip` are meaningful as a catch-all — `rewrite` and
+/// `translate` are per-header operations and are declared in their own maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultVerb {
+    Copy,
+    Strip,
+}
+
+impl From<DefaultVerb> for Verb {
+    fn from(value: DefaultVerb) -> Self {
+        match value {
+            DefaultVerb::Copy => Verb::Copy,
+            DefaultVerb::Strip => Verb::Strip,
+        }
+    }
+}
+
+/// One direction (`request:` or `response:`) of an operator-defined policy.
+///
+/// Every key of `copy` / `strip` — and every key of `rewrite` / `translate` —
+/// is a header name (exact, case-insensitive) or a `Prefix-*` trailing
+/// wildcard; see [`HeaderPattern::from_token`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectionConfig {
+    /// Catch-all verb for a header no rule matches.  Required when the policy
+    /// has no `extends:`; rejected when it does, since the base supplies it.
+    #[serde(default)]
+    pub default: Option<DefaultVerb>,
+    /// Header names to pass through.
+    #[serde(default)]
+    pub copy: Vec<String>,
+    /// Header names to drop.
+    #[serde(default)]
+    pub strip: Vec<String>,
+    /// Header name → rewrite-op token ([`RewriteOp::tokens`]).
+    #[serde(default)]
+    pub rewrite: HashMap<String, String>,
+    /// Header name → translate-op token ([`TranslateOp::tokens`]).
+    #[serde(default)]
+    pub translate: HashMap<String, String>,
+}
+
+impl DirectionConfig {
+    fn is_empty(&self) -> bool {
+        self.default.is_none()
+            && self.copy.is_empty()
+            && self.strip.is_empty()
+            && self.rewrite.is_empty()
+            && self.translate.is_empty()
+    }
+}
+
+/// One entry of the top-level `header_policies:` map.
+///
+/// The map key is the qualified name (`"<name>@<version>"`) that scripts pass
+/// to `call.dial(header_policy=…)` and that `b2bua.default_header_policy`
+/// pins — the same namespace as the built-in presets, which it may not
+/// collide with.
+///
+/// ```yaml
+/// header_policies:
+///   "trunk-edge-plus@1":
+///     extends: "sip-trunk-edge@2026"
+///     request:
+///       copy: ["X-Account-Ref"]
+///     response:
+///       strip: ["Server"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPolicyConfig {
+    /// Qualified name of a built-in preset to inherit from.  The base supplies
+    /// each direction's default and its rules; this policy's own rules are
+    /// matched first, so they win.  Omit to declare the policy in full, in
+    /// which case each direction needs an explicit `default:`.
+    pub extends: Option<String>,
+    /// A→B (request) direction.  Under `extends:`, omitting it inherits the
+    /// base direction verbatim.
+    pub request: Option<DirectionConfig>,
+    /// B→A (response) direction.  Under `extends:`, omitting it inherits the
+    /// base direction verbatim.
+    pub response: Option<DirectionConfig>,
+}
+
+impl HeaderPolicyConfig {
+    /// Compile into a [`Preset`], resolving `extends:` against `builtins`.
+    ///
+    /// `qualified_name` is the map key, which becomes the preset's
+    /// `name@version` and must already carry a version.
+    pub fn resolve(
+        &self,
+        qualified_name: &str,
+        builtins: &HashMap<String, Arc<Preset>>,
+    ) -> Result<Preset, PresetError> {
+        let (name, version) = split_qualified_name(qualified_name)?;
+
+        let base = match self.extends.as_deref().map(str::trim) {
+            Some(base_name) => {
+                let mut known: Vec<&str> = builtins.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                Some(
+                    builtins
+                        .get(base_name)
+                        .ok_or_else(|| PresetError::UnknownBase {
+                            policy: qualified_name.to_string(),
+                            base: base_name.to_string(),
+                            known: known.join(", "),
+                        })?,
+                )
+            }
+            None => None,
+        };
+
+        let declares_nothing =
+            declares_nothing(self.request.as_ref()) && declares_nothing(self.response.as_ref());
+        if base.is_none() && declares_nothing {
+            return Err(PresetError::EmptyPolicy(qualified_name.to_string()));
+        }
+
+        let request = build_direction(
+            qualified_name,
+            "request",
+            self.request.as_ref(),
+            base.map(|preset| &preset.request),
+        )?;
+        let response = build_direction(
+            qualified_name,
+            "response",
+            self.response.as_ref(),
+            base.map(|preset| &preset.response),
+        )?;
+
+        Ok(Preset {
+            name,
+            version,
+            request,
+            response,
+        })
+    }
+}
+
+/// Whether a direction block is absent or carries no rules at all.  Explicit
+/// match rather than `is_none_or`, which is newer than the project MSRV.
+fn declares_nothing(config: Option<&DirectionConfig>) -> bool {
+    match config {
+        Some(config) => config.is_empty(),
+        None => true,
+    }
+}
+
+/// Split a map key into `(name, version)`.  A key without a non-empty version
+/// after the last `@` is refused — see [`PresetError::UnversionedName`].
+fn split_qualified_name(qualified: &str) -> Result<(String, String), PresetError> {
+    match qualified.rsplit_once('@') {
+        Some((name, version)) if !name.is_empty() && !version.is_empty() => {
+            Ok((name.to_string(), version.to_string()))
+        }
+        _ => Err(PresetError::UnversionedName(qualified.to_string())),
+    }
+}
+
+/// Compile one direction of an operator-defined policy.
+///
+/// Rule order in the resulting [`DirectionPolicy::overrides`] is what decides
+/// behaviour, since [`DirectionPolicy::verb_for`] is first-match-wins:
+///
+/// 1. this policy's own rules, exact names before prefixes and longer prefixes
+///    before shorter ones — so `strip: ["X-*"]` alongside
+///    `copy: ["X-Account-Ref"]` in one block does the obvious thing;
+/// 2. the base preset's rules, so a custom rule beats an inherited one;
+/// 3. the base preset's `default` (or this policy's, when standalone).
+fn build_direction(
+    policy: &str,
+    direction: &str,
+    config: Option<&DirectionConfig>,
+    base: Option<&DirectionPolicy>,
+) -> Result<DirectionPolicy, PresetError> {
+    let Some(config) = config else {
+        return match base {
+            Some(base) => Ok(base.clone()),
+            None => Err(PresetError::MissingDirection {
+                policy: policy.to_string(),
+                direction: direction.to_string(),
+            }),
+        };
+    };
+
+    let default = match (config.default, base) {
+        (Some(_), Some(_)) => {
+            return Err(PresetError::DefaultWithExtends {
+                policy: policy.to_string(),
+                direction: direction.to_string(),
+            });
+        }
+        (Some(verb), None) => Verb::from(verb),
+        (None, Some(base)) => base.default.clone(),
+        (None, None) => {
+            return Err(PresetError::MissingDefault {
+                policy: policy.to_string(),
+                direction: direction.to_string(),
+            });
+        }
+    };
+
+    let mut overrides: Vec<(HeaderPattern, Verb)> = Vec::new();
+
+    for token in &config.strip {
+        push_rule(&mut overrides, policy, direction, token, Verb::Strip)?;
+    }
+    for token in &config.copy {
+        push_rule(&mut overrides, policy, direction, token, Verb::Copy)?;
+    }
+    // Sorted so a bad entry is reported deterministically across runs, HashMap
+    // iteration order being arbitrary.
+    for (header, token) in sorted_pairs(&config.rewrite) {
+        let operation =
+            RewriteOp::from_token(token).ok_or_else(|| PresetError::UnknownRewriteOp {
+                policy: policy.to_string(),
+                direction: direction.to_string(),
+                header: header.to_string(),
+                token: token.to_string(),
+                known: RewriteOp::tokens().join(", "),
+            })?;
+        push_rule(
+            &mut overrides,
+            policy,
+            direction,
+            header,
+            Verb::Rewrite(operation),
+        )?;
+    }
+    for (header, token) in sorted_pairs(&config.translate) {
+        let operation =
+            TranslateOp::from_token(token).ok_or_else(|| PresetError::UnknownTranslateOp {
+                policy: policy.to_string(),
+                direction: direction.to_string(),
+                header: header.to_string(),
+                token: token.to_string(),
+                known: TranslateOp::tokens().join(", "),
+            })?;
+        push_rule(
+            &mut overrides,
+            policy,
+            direction,
+            header,
+            Verb::Translate(operation),
+        )?;
+    }
+
+    // Stable sort, so rules of equal specificity keep declaration order.
+    overrides.sort_by_key(|(pattern, _)| specificity_key(pattern));
+
+    if let Some(base) = base {
+        overrides.extend(base.overrides.iter().cloned());
+    }
+
+    Ok(DirectionPolicy { default, overrides })
+}
+
+/// `(exact-before-prefix, longest-prefix-first)`.
+fn specificity_key(pattern: &HeaderPattern) -> (u8, std::cmp::Reverse<usize>) {
+    match pattern {
+        HeaderPattern::Exact(_) => (0, std::cmp::Reverse(0)),
+        HeaderPattern::Prefix(prefix) => (1, std::cmp::Reverse(prefix.len())),
+    }
+}
+
+fn sorted_pairs(map: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut pairs: Vec<(&str, &str)> = map
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable_by_key(|(key, _)| *key);
+    pairs
+}
+
+/// Parse one rule token and append it, rejecting a pattern that is malformed,
+/// already used in this direction, or aimed at a framework-managed header.
+fn push_rule(
+    overrides: &mut Vec<(HeaderPattern, Verb)>,
+    policy: &str,
+    direction: &str,
+    token: &str,
+    verb: Verb,
+) -> Result<(), PresetError> {
+    let pattern =
+        HeaderPattern::from_token(token).map_err(|reason| PresetError::InvalidPattern {
+            policy: policy.to_string(),
+            direction: direction.to_string(),
+            token: token.to_string(),
+            reason,
+        })?;
+
+    if let Some(header) = FRAMEWORK_AUTO_HEADERS
+        .iter()
+        .find(|header| pattern.matches(header))
+    {
+        return Err(PresetError::FrameworkAutoHeader {
+            policy: policy.to_string(),
+            direction: direction.to_string(),
+            token: token.to_string(),
+            header: (*header).to_string(),
+        });
+    }
+
+    if overrides.iter().any(|(existing, _)| *existing == pattern) {
+        return Err(PresetError::DuplicatePattern {
+            policy: policy.to_string(),
+            direction: direction.to_string(),
+            token: token.to_string(),
+        });
+    }
+
+    overrides.push((pattern, verb));
+    Ok(())
+}
+
+/// The full policy library: the built-in presets plus every operator-defined
+/// policy from `header_policies:`.
+///
+/// Built once at startup and shared read-only with the B2BUA paths.  A custom
+/// policy may not take a built-in's name, and `extends:` resolves against the
+/// built-ins only — so the result does not depend on the order the map
+/// happened to be iterated in.
+pub fn build_registry(
+    custom: &HashMap<String, HeaderPolicyConfig>,
+) -> Result<HashMap<String, Arc<Preset>>, PresetError> {
+    let builtins = builtin_presets();
+    let mut registry = builtins.clone();
+
+    // Sorted so a config with several bad policies always reports the same one.
+    let mut names: Vec<&String> = custom.keys().collect();
+    names.sort_unstable();
+
+    for name in names {
+        let Some(config) = custom.get(name) else {
+            continue;
+        };
+        if builtins.contains_key(name.as_str()) {
+            return Err(PresetError::NameCollidesWithBuiltin(name.to_string()));
+        }
+        let preset = config.resolve(name, &builtins)?;
+        validate_preset(&preset)?;
+        registry.insert(name.to_string(), Arc::new(preset));
+    }
+
+    Ok(registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1694,7 @@ mod tests {
     fn trust_boundary_translates_diversion_to_history_info() {
         let mut msg = invite_with(&[(
             "Diversion",
-            "<sip:+3197010267609@sip.didww.com>;reason=unconditional",
+            "<sip:+12025550123@example.com>;reason=unconditional",
         )]);
         apply_to_request(
             &mut msg,
@@ -1154,7 +1707,7 @@ mod tests {
             .get("History-Info")
             .expect("History-Info should be present");
         assert!(
-            hi.contains("+3197010267609@sip.didww.com"),
+            hi.contains("+12025550123@example.com"),
             "URI preserved: {hi}"
         );
         assert!(hi.contains("cause%3D302"), "unconditional → 302: {hi}");
@@ -1387,5 +1940,602 @@ mod tests {
         assert!(presets.contains_key("ims-intra-trust-domain@2026"));
         assert!(presets.contains_key("ims-trust-domain-boundary@2026"));
         assert!(presets.contains_key("sip-trunk-edge@2026"));
+    }
+
+    // ----- Operator-defined policies (`header_policies:`) -----
+
+    fn policies(yaml: &str) -> HashMap<String, HeaderPolicyConfig> {
+        serde_yaml_ng::from_str(yaml).expect("valid header_policies YAML")
+    }
+
+    /// Parse one policy out of a `header_policies:`-shaped YAML fragment and
+    /// resolve it against the built-in library.
+    fn resolve_one(yaml: &str, name: &str) -> Result<Preset, PresetError> {
+        let configs = policies(yaml);
+        configs
+            .get(name)
+            .expect("policy present in fragment")
+            .resolve(name, &builtin_presets())
+    }
+
+    fn resolved(yaml: &str, name: &str) -> ResolvedPolicy {
+        ResolvedPolicy::from_preset(Arc::new(
+            resolve_one(yaml, name).expect("policy should resolve"),
+        ))
+    }
+
+    #[test]
+    fn extends_lets_one_header_cross_and_leaves_the_rest_of_the_base_alone() {
+        // The motivating shape: a trunk-edge posture that has to let exactly
+        // one X- header through.  Everything else the base strips must still
+        // be stripped, or the policy has quietly opened the boundary.
+        let policy = resolved(
+            concat!(
+                "\"trunk-edge-plus@1\":\n",
+                "  extends: \"sip-trunk-edge@2026\"\n",
+                "  request:\n",
+                "    copy: [\"X-Account-Ref\"]\n",
+            ),
+            "trunk-edge-plus@1",
+        );
+
+        let mut msg = invite_with(&[
+            ("X-Account-Ref", "acct-1"),
+            ("X-Internal-Tag", "secret"),
+            ("P-Charging-Vector", "icid-value=foo"),
+            ("Subject", "Test"),
+        ]);
+        apply_to_request(&mut msg, &policy, &ctx());
+
+        assert!(
+            msg.headers.has("X-Account-Ref"),
+            "the opted-in header crosses"
+        );
+        assert!(
+            !msg.headers.has("X-Internal-Tag"),
+            "base X-* strip still applies"
+        );
+        assert!(
+            !msg.headers.has("P-Charging-Vector"),
+            "base P-* strip still applies"
+        );
+        assert!(
+            msg.headers.has("Subject"),
+            "base default (copy) still applies"
+        );
+    }
+
+    #[test]
+    fn custom_rule_beats_an_inherited_rule() {
+        let policy = resolved(
+            concat!(
+                "\"quiet@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    strip: [\"Subject\"]\n",
+            ),
+            "quiet@1",
+        );
+
+        let mut msg = invite_with(&[("Subject", "Test")]);
+        apply_to_request(&mut msg, &policy, &ctx());
+        assert!(
+            !msg.headers.has("Subject"),
+            "custom strip must beat the base default of copy"
+        );
+    }
+
+    #[test]
+    fn exact_rule_beats_prefix_rule_in_the_same_block() {
+        // The ordering that makes "strip the family, keep this one" expressible
+        // in a single block rather than needing two policies.
+        let policy = resolved(
+            concat!(
+                "\"selective@1\":\n",
+                "  request:\n",
+                "    default: copy\n",
+                "    strip: [\"X-*\"]\n",
+                "    copy: [\"X-Account-Ref\"]\n",
+                "  response:\n",
+                "    default: copy\n",
+            ),
+            "selective@1",
+        );
+
+        let mut msg = invite_with(&[("X-Account-Ref", "acct-1"), ("X-Internal-Tag", "secret")]);
+        apply_to_request(&mut msg, &policy, &ctx());
+        assert!(msg.headers.has("X-Account-Ref"));
+        assert!(!msg.headers.has("X-Internal-Tag"));
+    }
+
+    #[test]
+    fn longer_prefix_beats_shorter_prefix() {
+        let policy = resolved(
+            concat!(
+                "\"selective@1\":\n",
+                "  request:\n",
+                "    default: copy\n",
+                "    strip: [\"X-*\"]\n",
+                "    copy: [\"X-Keep-*\"]\n",
+                "  response:\n",
+                "    default: copy\n",
+            ),
+            "selective@1",
+        );
+
+        let mut msg = invite_with(&[("X-Keep-This", "yes"), ("X-Drop-This", "no")]);
+        apply_to_request(&mut msg, &policy, &ctx());
+        assert!(msg.headers.has("X-Keep-This"));
+        assert!(!msg.headers.has("X-Drop-This"));
+    }
+
+    #[test]
+    fn omitted_direction_inherits_the_base_verbatim() {
+        let preset = resolve_one(
+            concat!(
+                "\"boundary-plus@1\":\n",
+                "  extends: \"ims-trust-domain-boundary@2026\"\n",
+                "  request:\n",
+                "    copy: [\"X-Account-Ref\"]\n",
+            ),
+            "boundary-plus@1",
+        )
+        .expect("policy should resolve");
+
+        let base = builtin_presets();
+        let base = base
+            .get("ims-trust-domain-boundary@2026")
+            .expect("built-in present");
+        assert_eq!(preset.response.default, base.response.default);
+        assert_eq!(
+            preset.response.overrides.len(),
+            base.response.overrides.len()
+        );
+
+        // And it behaves like the base: default-strip with the safe set copied.
+        let policy = ResolvedPolicy::from_preset(Arc::new(preset));
+        let mut msg = ok_with(&[("Allow", "INVITE"), ("Organization", "Example")]);
+        apply_to_response(&mut msg, &policy, &ctx());
+        assert!(msg.headers.has("Allow"));
+        assert!(!msg.headers.has("Organization"));
+    }
+
+    #[test]
+    fn standalone_policy_declares_both_directions_in_full() {
+        let policy = resolved(
+            concat!(
+                "\"locked-down@1\":\n",
+                "  request:\n",
+                "    default: strip\n",
+                "    copy: [\"Allow\", \"Supported\"]\n",
+                "  response:\n",
+                "    default: copy\n",
+                "    strip: [\"P-*\", \"Server\"]\n",
+            ),
+            "locked-down@1",
+        );
+
+        let mut request = invite_with(&[("Allow", "INVITE"), ("Subject", "Test")]);
+        apply_to_request(&mut request, &policy, &ctx());
+        assert!(request.headers.has("Allow"));
+        assert!(!request.headers.has("Subject"), "default: strip applies");
+
+        let mut response = ok_with(&[("P-Charging-Vector", "icid-value=foo"), ("Allow", "INVITE")]);
+        apply_to_response(&mut response, &policy, &ctx());
+        assert!(!response.headers.has("P-Charging-Vector"));
+        assert!(response.headers.has("Allow"), "default: copy applies");
+    }
+
+    #[test]
+    fn extends_alone_aliases_the_base_under_a_local_name() {
+        // Legitimate: pin a stable local name so scripts don't carry the
+        // built-in's version around.
+        let preset = resolve_one(
+            "\"our-trunk@1\":\n  extends: \"sip-trunk-edge@2026\"\n",
+            "our-trunk@1",
+        )
+        .expect("alias should resolve");
+        let policy = ResolvedPolicy::from_preset(Arc::new(preset));
+
+        let mut msg = invite_with(&[("X-Internal-Tag", "secret"), ("Subject", "Test")]);
+        apply_to_request(&mut msg, &policy, &ctx());
+        assert!(!msg.headers.has("X-Internal-Tag"));
+        assert!(msg.headers.has("Subject"));
+    }
+
+    #[test]
+    fn config_rewrite_and_translate_ops_reach_the_engine() {
+        let policy = resolved(
+            concat!(
+                "\"edge@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    rewrite:\n",
+                "      P-Asserted-Identity: host-to-advertised\n",
+                "    translate:\n",
+                "      Diversion: diversion-to-history-info\n",
+            ),
+            "edge@1",
+        );
+
+        let mut msg = invite_with(&[
+            ("P-Asserted-Identity", "<sip:alice@internal.example>"),
+            (
+                "Diversion",
+                "<sip:+12025550123@example.com>;reason=user-busy",
+            ),
+        ]);
+        apply_to_request(&mut msg, &policy, &ctx());
+
+        let pai = msg
+            .headers
+            .get("P-Asserted-Identity")
+            .expect("P-Asserted-Identity present");
+        assert!(pai.contains("192.0.2.1"), "host rewritten: {pai}");
+        assert!(!msg.headers.has("Diversion"));
+        let history = msg
+            .headers
+            .get("History-Info")
+            .expect("History-Info present");
+        assert!(
+            history.contains("cause%3D486"),
+            "user-busy → 486: {history}"
+        );
+    }
+
+    // ----- Rejections -----
+
+    #[test]
+    fn rejects_unversioned_name() {
+        let error = resolve_one(
+            "trunk-edge-plus:\n  extends: \"sip-trunk-edge@2026\"\n",
+            "trunk-edge-plus",
+        )
+        .expect_err("an unversioned key must be refused");
+        assert!(matches!(error, PresetError::UnversionedName(_)), "{error}");
+    }
+
+    #[test]
+    fn rejects_empty_version() {
+        let error = resolve_one(
+            "\"trunk@\":\n  extends: \"sip-trunk-edge@2026\"\n",
+            "trunk@",
+        )
+        .expect_err("an empty version must be refused");
+        assert!(matches!(error, PresetError::UnversionedName(_)), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_name_that_collides_with_a_builtin() {
+        let error = build_registry(&policies(
+            "\"sip-trunk-edge@2026\":\n  extends: \"transparent-b2bua@2026\"\n",
+        ))
+        .expect_err("redefining a built-in must be refused");
+        assert!(
+            matches!(error, PresetError::NameCollidesWithBuiltin(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_extends_target() {
+        let error = resolve_one("\"x@1\":\n  extends: \"no-such-preset@2026\"\n", "x@1")
+            .expect_err("extending a non-existent preset must be refused");
+        assert!(matches!(error, PresetError::UnknownBase { .. }), "{error}");
+    }
+
+    #[test]
+    fn extends_cannot_name_another_custom_policy() {
+        // Resolution is against the built-ins only, so the result never depends
+        // on which order the map was iterated in.
+        let error = build_registry(&policies(concat!(
+            "\"a@1\":\n",
+            "  extends: \"sip-trunk-edge@2026\"\n",
+            "\"b@1\":\n",
+            "  extends: \"a@1\"\n",
+        )))
+        .expect_err("extending a custom policy must be refused");
+        assert!(matches!(error, PresetError::UnknownBase { .. }), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_rewrite_op() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    rewrite:\n",
+                "      P-Asserted-Identity: make-it-nice\n",
+            ),
+            "x@1",
+        )
+        .expect_err("an unknown rewrite op must be refused");
+        assert!(
+            matches!(error, PresetError::UnknownRewriteOp { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_translate_op() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    translate:\n",
+                "      Diversion: rfc9999\n",
+            ),
+            "x@1",
+        )
+        .expect_err("an unknown translate op must be refused");
+        assert!(
+            matches!(error, PresetError::UnknownTranslateOp { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_the_same_header_twice_in_one_direction() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    strip: [\"Alert-Info\"]\n",
+                "    copy: [\"Alert-Info\"]\n",
+            ),
+            "x@1",
+        )
+        .expect_err("a header with two verbs must be refused");
+        assert!(
+            matches!(error, PresetError::DuplicatePattern { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_rule_aimed_at_a_framework_managed_header() {
+        // Silently ignoring these is how someone concludes the feature is broken.
+        for token in &["Via", "call-id", "Record-Route"] {
+            let yaml = format!(
+                concat!(
+                    "\"x@1\":\n",
+                    "  extends: \"transparent-b2bua@2026\"\n",
+                    "  request:\n",
+                    "    copy: [\"{}\"]\n",
+                ),
+                token
+            );
+            let error =
+                resolve_one(&yaml, "x@1").expect_err("a framework-auto rule must be refused");
+            assert!(
+                matches!(error, PresetError::FrameworkAutoHeader { .. }),
+                "{token}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_prefix_that_would_swallow_a_framework_managed_header() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    strip: [\"Co*\"]\n",
+            ),
+            "x@1",
+        )
+        .expect_err("a prefix matching Contact/Content-Length must be refused");
+        assert!(
+            matches!(error, PresetError::FrameworkAutoHeader { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_bare_wildcard() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    strip: [\"*\"]\n",
+            ),
+            "x@1",
+        )
+        .expect_err("a bare wildcard must be refused");
+        assert!(
+            matches!(error, PresetError::InvalidPattern { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_leading_wildcard() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    strip: [\"*-Info\"]\n",
+            ),
+            "x@1",
+        )
+        .expect_err("a non-trailing wildcard must be refused");
+        assert!(
+            matches!(error, PresetError::InvalidPattern { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_standalone_direction_without_a_default() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  request:\n",
+                "    copy: [\"Allow\"]\n",
+                "  response:\n",
+                "    default: copy\n",
+            ),
+            "x@1",
+        )
+        .expect_err("a standalone direction needs a default");
+        assert!(
+            matches!(error, PresetError::MissingDefault { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_default_alongside_extends() {
+        let error = resolve_one(
+            concat!(
+                "\"x@1\":\n",
+                "  extends: \"transparent-b2bua@2026\"\n",
+                "  request:\n",
+                "    default: strip\n",
+            ),
+            "x@1",
+        )
+        .expect_err("extends supplies the default");
+        assert!(
+            matches!(error, PresetError::DefaultWithExtends { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_standalone_policy_missing_a_direction() {
+        let error = resolve_one("\"x@1\":\n  request:\n    default: copy\n", "x@1")
+            .expect_err("a standalone policy must declare both directions");
+        assert!(
+            matches!(error, PresetError::MissingDirection { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_policy() {
+        let error = resolve_one("\"x@1\": {}\n", "x@1").expect_err("an empty policy is a mistake");
+        assert!(matches!(error, PresetError::EmptyPolicy(_)), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_field() {
+        // `deny_unknown_fields` — a misspelled key must not be silently ignored.
+        let yaml = "\"x@1\":\n  extends: \"transparent-b2bua@2026\"\n  requests:\n    copy: []\n";
+        let parsed: std::result::Result<HashMap<String, HeaderPolicyConfig>, _> =
+            serde_yaml_ng::from_str(yaml);
+        assert!(parsed.is_err(), "misspelled `requests:` must not parse");
+    }
+
+    #[test]
+    fn preset_validation_runs_on_custom_policies_too() {
+        // Copying Authorization across a hop that rewrites a Digest-protected
+        // field breaks the hash — the same guard the built-ins are held to.
+        let error = build_registry(&policies(concat!(
+            "\"broken@1\":\n",
+            "  extends: \"transparent-b2bua@2026\"\n",
+            "  request:\n",
+            "    copy: [\"Authorization\"]\n",
+        )))
+        .expect_err("Authorization copy + inherited PAI rewrite must be refused");
+        assert!(
+            matches!(
+                error,
+                PresetError::AuthorizationCopyWithDigestProtectedRewrite(_)
+            ),
+            "{error}"
+        );
+    }
+
+    // ----- Registry -----
+
+    #[test]
+    fn registry_carries_builtins_alongside_custom_policies() {
+        let registry = build_registry(&policies(
+            "\"trunk-edge-plus@1\":\n  extends: \"sip-trunk-edge@2026\"\n",
+        ))
+        .expect("registry should build");
+
+        assert!(registry.contains_key("trunk-edge-plus@1"));
+        for builtin in &[
+            "transparent-b2bua@2026",
+            "ims-intra-trust-domain@2026",
+            "ims-trust-domain-boundary@2026",
+            "sip-trunk-edge@2026",
+        ] {
+            assert!(registry.contains_key(*builtin), "{builtin} must survive");
+        }
+    }
+
+    #[test]
+    fn registry_with_no_custom_policies_is_exactly_the_builtins() {
+        let registry = build_registry(&HashMap::new()).expect("registry should build");
+        assert_eq!(registry.len(), builtin_presets().len());
+    }
+
+    #[test]
+    fn custom_preset_reports_its_qualified_name_as_the_map_key() {
+        let preset = resolve_one(
+            "\"trunk-edge-plus@1\":\n  extends: \"sip-trunk-edge@2026\"\n",
+            "trunk-edge-plus@1",
+        )
+        .expect("policy should resolve");
+        assert_eq!(preset.qualified_name(), "trunk-edge-plus@1");
+        assert_eq!(preset.name, "trunk-edge-plus");
+        assert_eq!(preset.version, "1");
+    }
+
+    // ----- Op tokens -----
+
+    #[test]
+    fn translate_op_tokens_are_shared_with_the_dial_time_spelling() {
+        // `call.dial(translate=[(…, "rfc7044")])` and `translate: rfc7044` in
+        // config must never drift apart.
+        assert_eq!(
+            TranslateOp::from_token("rfc7044"),
+            Some(TranslateOp::DiversionToHistoryInfo)
+        );
+        assert_eq!(
+            TranslateOp::from_token("Diversion_To_History_Info"),
+            Some(TranslateOp::DiversionToHistoryInfo)
+        );
+        assert_eq!(TranslateOp::from_token("rfc5806"), None);
+    }
+
+    #[test]
+    fn rewrite_op_tokens_cover_every_op() {
+        assert_eq!(
+            RewriteOp::from_token("host-to-advertised"),
+            Some(RewriteOp::HostToAdvertised)
+        );
+        assert_eq!(
+            RewriteOp::from_token("replace-with-server-header"),
+            Some(RewriteOp::ReplaceWithServerHeader)
+        );
+        assert_eq!(
+            RewriteOp::from_token("replace-with-user-agent-header"),
+            Some(RewriteOp::ReplaceWithUserAgentHeader)
+        );
+        assert_eq!(RewriteOp::from_token("nope"), None);
+        assert_eq!(RewriteOp::tokens().len(), 3, "tokens() must list every op");
+    }
+
+    #[test]
+    fn header_pattern_from_token_reads_the_two_forms() {
+        assert_eq!(
+            HeaderPattern::from_token("Alert-Info"),
+            Ok(HeaderPattern::Exact("Alert-Info".to_string()))
+        );
+        assert_eq!(
+            HeaderPattern::from_token("X-*"),
+            Ok(HeaderPattern::Prefix("X-".to_string()))
+        );
+        assert!(HeaderPattern::from_token("  ").is_err());
     }
 }

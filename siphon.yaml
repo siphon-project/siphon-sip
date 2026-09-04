@@ -1536,6 +1536,79 @@ auth:
 # b2bua:
 #   default_number_policy: "ims-e164@2026"
 
+# ---------------------------------------------------------------------------
+# Header policies (B2BUA)
+# ---------------------------------------------------------------------------
+# Which headers cross the trust boundary between the A-leg and the B-leg.
+# Four presets ship with siphon and need no config:
+#
+#   transparent-b2bua@2026         general SBC (the default)
+#   ims-intra-trust-domain@2026    S-CSCF <-> AS; P-* and end-to-end PRACK pass
+#   ims-trust-domain-boundary@2026 P-CSCF / IBCF / BGCF edge; default-strip
+#   sip-trunk-edge@2026            plain SIP trunk; strips P-* and X-*
+#
+# `header_policies:` defines your own, in the same namespace: usable by
+# b2bua.default_header_policy below and by call.dial(header_policy="<name>") /
+# call.fork(header_policy="<name>"), exactly like a built-in. The map key is
+# the name scripts pin and must carry an @version, so a later edit to a policy
+# cannot silently change what crosses the boundary for calls pinning the old
+# name. A key may not take a built-in's name.
+#
+# header_policies:
+#
+#   # Form 1 — extend a built-in. The base supplies each direction's default
+#   # and its rules; the rules here are matched first, so they win. A direction
+#   # you leave out is inherited verbatim. Use this to say "that preset, except
+#   # for these" instead of repeating copy=[...] on every dial() call site.
+#   "trunk-edge-plus@1":
+#     extends: "sip-trunk-edge@2026"
+#     request:
+#       copy: ["X-Account-Ref"]           # crosses despite the base's X-* strip
+#       strip: ["Alert-Info"]
+#       rewrite:
+#         P-Asserted-Identity: host-to-advertised
+#       translate:
+#         Diversion: diversion-to-history-info
+#     response:
+#       strip: ["Server"]
+#
+#   # An extends: with no rules is a stable local alias for a built-in, so
+#   # scripts don't carry the built-in's version around.
+#   "our-trunk@1":
+#     extends: "sip-trunk-edge@2026"
+#
+#   # Form 2 — declare both directions in full. Without extends: each
+#   # direction needs its own default (copy | strip).
+#   "locked-down@1":
+#     request:
+#       default: strip
+#       copy: ["Allow", "Supported", "Content-Type"]
+#     response:
+#       default: copy
+#       strip: ["P-*", "Server", "User-Agent"]
+#
+# Header names are exact and case-insensitive; a trailing "*" is a prefix match
+# ("X-*"), not a glob. Within one direction an exact name beats a prefix and a
+# longer prefix beats a shorter one, so `strip: ["X-*"]` alongside
+# `copy: ["X-Account-Ref"]` does what it looks like.
+#
+# rewrite: ops    host-to-advertised, replace-with-server-header,
+#                 replace-with-user-agent-header
+# translate: ops  diversion-to-history-info (alias: rfc7044)
+#
+# Via, Call-ID, CSeq, Max-Forwards, Content-Length, From, To, Contact,
+# Record-Route and Route are per-leg dialog and routing state that the
+# framework owns; naming one in a rule is refused at load rather than ignored.
+#
+# Everything here is resolved and validated at startup, so a policy that could
+# never work stops the node instead of surfacing mid-call.
+#
+# B2BUA default (applied when a call doesn't pass header_policy=). Names a
+# built-in or one of your own; a name that resolves to neither refuses to
+# start. Unset means transparent-b2bua@2026.
+# b2bua:
+#   default_header_policy: "trunk-edge-plus@1"
+
 # Whether an inbound INVITE carrying a Replaces header (RFC 3891) may take over
 # the dialog it names — the transferee half of attended transfer, and the shape
 # of a directed call pickup.

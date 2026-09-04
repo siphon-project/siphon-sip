@@ -100,11 +100,71 @@ b2bua:
   default_header_policy: "ims-trust-domain-boundary@2026"
 ```
 
+Need a posture none of them quite match? Define your own — see
+[Custom policies](#custom-policies) below.
+
+### Custom policies
+
+When your posture is "that preset, except for these headers", define your own in
+`siphon.yaml` rather than repeating `copy=[…]` on every `dial()` call site. Custom
+policies live in the same namespace as the built-ins, so scripts and
+`default_header_policy` select them the same way.
+
+```yaml
+header_policies:
+  "trunk-edge-plus@1":
+    extends: "sip-trunk-edge@2026"
+    request:
+      copy: ["X-Account-Ref"]           # crosses despite the base's X-* strip
+      strip: ["Alert-Info"]
+      rewrite:
+        P-Asserted-Identity: host-to-advertised
+      translate:
+        Diversion: diversion-to-history-info
+    response:
+      strip: ["Server"]
+
+b2bua:
+  default_header_policy: "trunk-edge-plus@1"
+```
+
+The base supplies each direction's default and its rules; the rules you write are
+matched first, so they win. A direction you leave out is inherited verbatim, and an
+`extends:` with no rules at all is just a stable local alias for a built-in.
+
+Drop `extends:` to declare a policy in full, in which case each direction needs its
+own `default:` (`copy` or `strip`):
+
+```yaml
+header_policies:
+  "locked-down@1":
+    request:
+      default: strip
+      copy: ["Allow", "Supported", "Content-Type"]
+    response:
+      default: copy
+      strip: ["P-*", "Server", "User-Agent"]
+```
+
+Header names are exact and case-insensitive; a trailing `*` is a prefix match
+(`"X-*"`), not a glob. Within one direction an exact name beats a prefix and a longer
+prefix beats a shorter one, so `strip: ["X-*"]` alongside `copy: ["X-Account-Ref"]`
+does what it looks like. `rewrite:` ops are `host-to-advertised`,
+`replace-with-server-header` and `replace-with-user-agent-header`; `translate:` ops
+are `diversion-to-history-info` (alias `rfc7044`).
+
+The map key is the name scripts pin and must carry an `@version` — same rule as the
+built-ins — and it may not take a built-in's name. Policies are resolved and
+validated at startup, so an unknown op, a rule aimed at a framework-managed header,
+or a `default_header_policy` naming a policy nothing defines stops the node at boot
+instead of surfacing mid-call.
+
 ### Per-call deltas
 
 On top of the preset, `copy` / `strip` / `translate` apply per call — for emergency
-calls, aggregator quirks, etc. that the YAML preset can't express. `translate` ops in
-v1 are `rfc7044` and `diversion-to-history-info`.
+calls, aggregator quirks, etc. that a policy can't express. `translate` ops in v1 are
+`rfc7044` and `diversion-to-history-info`. Per-call deltas match exact header names
+only; prefix patterns are a config-side feature.
 
 ### Precedence (highest wins)
 

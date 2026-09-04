@@ -677,7 +677,7 @@ class Call:
                 mandatory for a WebSocket callee (RFC 7118 §5) whose Contact
                 URI is unresolvable.  Bypasses DNS resolution of
                 ``uri``/``next_hop``; guard on ``contact.is_local`` first.
-            header_policy: Qualified preset name selecting which header
+            header_policy: Qualified policy name selecting which header
                 policy the framework applies when building the B-leg
                 INVITE and forwarding responses back to the A-leg.
                 Defaults to ``b2bua.default_header_policy`` from
@@ -688,7 +688,13 @@ class Call:
                 passes P-* and end-to-end PRACK / preconditions),
                 ``"ims-trust-domain-boundary@2026"`` (BGCF/IBCF/P-CSCF
                 edge, strict trust-boundary hygiene),
-                ``"sip-trunk-edge@2026"`` (plain SIP trunk).
+                ``"sip-trunk-edge@2026"`` (plain SIP trunk).  An
+                operator-defined policy from the ``header_policies:``
+                block of ``siphon.yaml`` is named the same way — one
+                namespace, so a custom policy is indistinguishable from
+                a built-in here.  Reach for one of those when the posture
+                is "that preset, except for these headers", rather than
+                repeating ``copy=[…]`` on every call site.
             copy: Per-call delta — headers to copy verbatim regardless of
                 the preset's default verb (e.g. ``["X-Operator-Tag"]``).
             strip: Per-call delta — headers to strip regardless of the
@@ -811,9 +817,9 @@ class Call:
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch INVITE timeout in seconds.
-            header_policy: Header-policy preset applied to every branch of the
-                fork — same semantics as :meth:`dial` (per-branch policy is a
-                follow-up).
+            header_policy: Header policy applied to every branch of the fork —
+                same semantics as :meth:`dial`, built-in or operator-defined
+                (per-branch policy is a follow-up).
             copy: Per-call header copy deltas — same semantics as :meth:`dial`.
             strip: Per-call header strip deltas — same semantics as :meth:`dial`.
             translate: Per-call header translation deltas — same semantics as

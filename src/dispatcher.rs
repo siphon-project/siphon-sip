@@ -149,9 +149,11 @@ struct DispatcherState {
     rtpengine_profiles: Option<Arc<crate::rtpengine::ProfileRegistry>>,
     /// RFC 4028 session timer configuration (None when not configured).
     session_timer_config: Option<crate::config::SessionTimerConfig>,
-    /// B2BUA header policy preset library — keyed by qualified name
-    /// (e.g. `"transparent-b2bua@2026"`).  Built once at startup from
-    /// [`crate::b2bua::header_policy::builtin_presets`].
+    /// B2BUA header policy library — keyed by qualified name (e.g.
+    /// `"transparent-b2bua@2026"`).  Built once at startup by
+    /// [`crate::b2bua::header_policy::build_registry`]: the built-in presets
+    /// plus every operator-defined policy from `header_policies:`, in one
+    /// namespace, so a script naming either resolves the same way.
     header_policy_registry:
         Arc<std::collections::HashMap<String, Arc<crate::b2bua::header_policy::Preset>>>,
     /// Default header policy applied when the script doesn't pass
@@ -672,25 +674,34 @@ pub async fn run(
         }
     }
 
-    // B2BUA header policy library — built-in presets only in v1.
-    let header_policy_registry = Arc::new(crate::b2bua::header_policy::builtin_presets());
-    let default_policy_name = config
-        .b2bua
-        .default_header_policy
-        .as_deref()
-        .unwrap_or("transparent-b2bua@2026");
+    // B2BUA header policy library: the built-in presets plus every
+    // operator-defined policy from `header_policies:`.  Both were already
+    // resolved and validated at config load, so neither arm below should be
+    // reachable on a config that parsed — they exist so a future caller that
+    // builds a DispatcherState from a hand-made Config cannot panic.
+    let header_policy_registry = Arc::new(
+        match crate::b2bua::header_policy::build_registry(&config.header_policies) {
+            Ok(registry) => registry,
+            Err(error) => {
+                error!(
+                    %error,
+                    "header_policies failed to resolve — continuing with built-in presets only"
+                );
+                crate::b2bua::header_policy::builtin_presets()
+            }
+        },
+    );
+    let default_policy_name = config.b2bua.resolved_default_header_policy();
     let default_header_policy = header_policy_registry
         .get(default_policy_name)
         .cloned()
         .unwrap_or_else(|| {
             warn!(
                 requested = %default_policy_name,
-                "b2bua.default_header_policy unknown — falling back to transparent-b2bua@2026"
+                fallback = %crate::b2bua::header_policy::DEFAULT_PRESET_NAME,
+                "b2bua.default_header_policy unknown — falling back"
             );
-            header_policy_registry
-                .get("transparent-b2bua@2026")
-                .cloned()
-                .expect("builtin transparent-b2bua@2026 must exist")
+            crate::b2bua::header_policy::default_preset()
         });
 
     // Publish the call store for read-only observability (admin `/admin/calls`)
@@ -9540,12 +9551,7 @@ fn store_b_leg_route_set_from_2xx(
 /// to a [`crate::b2bua::header_policy::TranslateOp`].  Returns `None` for
 /// unknown names; the caller is expected to log and skip.
 fn parse_translate_op_name(name: &str) -> Option<crate::b2bua::header_policy::TranslateOp> {
-    match name.to_ascii_lowercase().as_str() {
-        "rfc7044" | "diversion-to-history-info" => {
-            Some(crate::b2bua::header_policy::TranslateOp::DiversionToHistoryInfo)
-        }
-        _ => None,
-    }
+    crate::b2bua::header_policy::TranslateOp::from_token(name)
 }
 
 /// Set `Allow` (RFC 3261 §20.5) to the methods siphon supports, but only when the
