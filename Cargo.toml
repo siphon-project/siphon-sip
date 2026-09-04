@@ -156,7 +156,7 @@ mime_guess = { version = "2", optional = true }
 rasn = "0.28"
 rasn-derive = "0.28"
 chrono = { version = "0.4", default-features = false }
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 # ETSI X1 (TS 103 221-1) schema validation. Pure Rust, zero transitive
 # dependencies, XSD 1.1 — validates every X1 message against the schemas
 # shipped in `schemas/etsi/` on the way in AND on the way out, rather than
