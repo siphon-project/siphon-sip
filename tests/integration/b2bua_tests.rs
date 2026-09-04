@@ -8,10 +8,12 @@ use siphon::b2bua::actor::{
     LegSide, ReferSubscription, SessionTimerState, TransportInfo,
 };
 use siphon::b2bua::header_policy::{
-    apply_to_request, apply_to_response, builtin_presets, validate_preset, DirectionPolicy,
-    HeaderPattern, PolicyContext, Preset, PresetError, ResolvedPolicy, RewriteOp, Verb,
+    apply_to_request, apply_to_response, build_registry, builtin_presets, validate_preset,
+    DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError, ResolvedPolicy, RewriteOp,
+    Verb,
 };
 use siphon::b2bua::transfer::TransferState;
+use siphon::config::Config;
 use siphon::dialog::{Dialog, DialogId, DialogState, DialogStore};
 use siphon::registrar::Registrar;
 use siphon::sip::builder::SipMessageBuilder;
@@ -1815,16 +1817,16 @@ fn call_actor_can_carry_resolved_header_policy() {
 
 #[test]
 fn bgcf_mtc_trace_headers_stripped_by_trust_boundary_preset() {
-    // The exact headers that leaked through to the Samsung S21 MT INVITE in
-    // the BGCF/FreeSWITCH trace that motivated the opt-in policy work.
+    // The headers that leaked through to the UE on an MT INVITE in the
+    // BGCF trace that motivated the opt-in policy work.
     let mut invite = make_invite(&[
         ("Alert-Info", "<urn:alert:service:call-waiting>"),
         (
             "Diversion",
-            "<sip:+3197010267609@sip.didww.com>;reason=unconditional",
+            "<sip:+12025550123@example.com>;reason=unconditional",
         ),
         ("P-Hint", "inbound"),
-        ("X-FS-Support", "update_display,send_info"),
+        ("X-Vendor-Support", "update_display,send_info"),
     ]);
 
     let preset = builtin_presets()
@@ -1834,18 +1836,120 @@ fn bgcf_mtc_trace_headers_stripped_by_trust_boundary_preset() {
     let policy = ResolvedPolicy::from_preset(preset);
     apply_to_request(&mut invite, &policy, &test_ctx());
 
-    // Alert-Info, P-Hint, X-FS-Support: stripped (not on safe-set)
+    // Alert-Info, P-Hint, X-Vendor-Support: stripped (not on safe-set)
     assert!(!invite.headers.has("Alert-Info"));
     assert!(!invite.headers.has("P-Hint"));
-    assert!(!invite.headers.has("X-FS-Support"));
+    assert!(!invite.headers.has("X-Vendor-Support"));
     // Diversion: translated to History-Info (RFC 7044)
     assert!(!invite.headers.has("Diversion"));
     let hi = invite
         .headers
         .get("History-Info")
         .expect("Diversion should have been translated to History-Info");
-    assert!(hi.contains("+3197010267609@sip.didww.com"));
+    assert!(hi.contains("+12025550123@example.com"));
     assert!(hi.contains("cause%3D302")); // unconditional → SIP 302
+}
+
+// ---------------------------------------------------------------------------
+// Operator-defined header policies: siphon.yaml -> registry -> applied message
+// ---------------------------------------------------------------------------
+
+/// A trunk-edge posture that has to let exactly one vendor header cross.
+const CUSTOM_POLICY_YAML: &str = concat!(
+    "listen:\n",
+    "  udp:\n",
+    "    - \"0.0.0.0:5060\"\n",
+    "domain:\n",
+    "  local:\n",
+    "    - \"example.com\"\n",
+    "script:\n",
+    "  path: \"scripts/b2bua_default.py\"\n",
+    "header_policies:\n",
+    "  \"trunk-edge-plus@1\":\n",
+    "    extends: \"sip-trunk-edge@2026\"\n",
+    "    request:\n",
+    "      copy: [\"X-Account-Ref\"]\n",
+    "b2bua:\n",
+    "  default_header_policy: \"trunk-edge-plus@1\"\n",
+);
+
+#[test]
+fn config_defined_policy_reaches_the_b_leg_invite() {
+    // The whole path a call takes: siphon.yaml parses, the registry is built
+    // from it, the configured default resolves out of that registry, and the
+    // resulting policy is what rewrites the B-leg INVITE.  A registry built
+    // from the built-ins alone cannot satisfy this.
+    let config = Config::from_str(CUSTOM_POLICY_YAML).expect("config should load");
+    let registry = build_registry(&config.header_policies).expect("registry should build");
+
+    let preset = registry
+        .get(config.b2bua.resolved_default_header_policy())
+        .expect("the configured default resolves")
+        .clone();
+    assert_eq!(preset.qualified_name(), "trunk-edge-plus@1");
+
+    let mut invite = make_invite(&[
+        ("X-Account-Ref", "acct-1"),
+        ("X-Internal-Tag", "secret"),
+        ("P-Charging-Vector", "icid-value=foo"),
+    ]);
+    apply_to_request(
+        &mut invite,
+        &ResolvedPolicy::from_preset(preset),
+        &test_ctx(),
+    );
+
+    assert!(
+        invite.headers.has("X-Account-Ref"),
+        "the header the policy opts in must cross the boundary"
+    );
+    assert!(
+        !invite.headers.has("X-Internal-Tag"),
+        "the base preset's X-* strip must still apply"
+    );
+    assert!(
+        !invite.headers.has("P-Charging-Vector"),
+        "the base preset's P-* strip must still apply"
+    );
+}
+
+#[test]
+fn config_defined_policy_is_selectable_by_name_like_a_builtin() {
+    // What `call.dial(header_policy="trunk-edge-plus@1")` resolves against —
+    // one namespace, so a script cannot tell a custom policy from a built-in.
+    let config = Config::from_str(CUSTOM_POLICY_YAML).expect("config should load");
+    let registry = build_registry(&config.header_policies).expect("registry should build");
+
+    assert!(registry.contains_key("trunk-edge-plus@1"));
+    for builtin in &[
+        "transparent-b2bua@2026",
+        "ims-intra-trust-domain@2026",
+        "ims-trust-domain-boundary@2026",
+        "sip-trunk-edge@2026",
+    ] {
+        assert!(
+            registry.contains_key(*builtin),
+            "custom policies must not displace {builtin}"
+        );
+    }
+}
+
+#[test]
+fn config_naming_an_undefined_default_policy_refuses_to_load() {
+    let yaml = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.com\"\n",
+        "script:\n",
+        "  path: \"scripts/b2bua_default.py\"\n",
+        "b2bua:\n",
+        "  default_header_policy: \"trunk-edge-plus@1\"\n",
+    );
+    let error = Config::from_str(yaml).expect_err("an undefined default must not start the node");
+    assert!(error.to_string().contains("trunk-edge-plus@1"));
 }
 
 #[test]

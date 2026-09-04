@@ -36,6 +36,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   alongside it, so the code the caller receives and the per-attempt record
   cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
 
+- **Header policies can now be defined in `siphon.yaml`.** `header_policies:` is
+  a top-level map of operator-owned policies, in the same namespace as the four
+  built-in presets and selectable the same way — by
+  `b2bua.default_header_policy` and by `call.dial(header_policy=…)` /
+  `call.fork(header_policy=…)`. It completes the set: `number_policies:` and
+  `media.profiles:` were already operator-definable, header policies were the
+  one named-policy surface that was not.
+
+  A policy either extends a built-in with `copy` / `strip` / `rewrite` /
+  `translate` deltas, or declares both directions in full with an explicit
+  `default:`. Under `extends:` the base supplies each direction's default and
+  rules, the policy's own rules are matched first, and a direction left out is
+  inherited verbatim — so an `extends:` with no rules is a stable local alias
+  for a built-in. Header names are exact and case-insensitive, with a trailing
+  `*` for a prefix match; within one direction an exact name beats a prefix and
+  a longer prefix beats a shorter one, so `strip: ["X-*"]` alongside
+  `copy: ["X-Account-Ref"]` is expressible in a single block.
+
+  This is what "that preset, except for these headers" was missing. Before it,
+  the only way to let one header cross was to repeat `copy=[…]` on every
+  `dial()` / `fork()` call site, which puts a trust-boundary decision in N
+  script locations instead of one reviewable config block. Per-call deltas are
+  unchanged and still take precedence (exact names only — patterns are a
+  config-side feature).
+
+  ```yaml
+  header_policies:
+    "trunk-edge-plus@1":
+      extends: "sip-trunk-edge@2026"
+      request:
+        copy: ["X-Account-Ref"]
+
+  b2bua:
+    default_header_policy: "trunk-edge-plus@1"
+  ```
+
 ### Changed
 - **quick-xml 0.41 → 0.42.** `BytesText` is `str`-backed now, so the reader
   decodes up front and `decode()` is gone; the content accessors
@@ -130,6 +166,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   where the BYE arrives, so an on-time BYE landed before SIPp had armed the
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
+
+- **`b2bua.default_header_policy` naming an unknown policy now refuses to
+  start.** It previously logged a warning and fell back to
+  `transparent-b2bua@2026` — the *most* permissive posture — so a typo in the
+  name of a trust-boundary control opened the boundary instead of closing it,
+  on a node that came up reporting healthy. A misspelled name, or one whose
+  `header_policies:` entry is missing, is now a config error naming the policy
+  and listing what is available. A policy that cannot compile (unknown
+  `rewrite:` / `translate:` op, an unversioned name, a name colliding with a
+  built-in, the same header given two verbs, or a rule aimed at a
+  framework-managed header such as `Via` or `Record-Route`) is refused at load
+  for the same reason. An unknown `header_policy=` passed by a *script* is
+  unchanged: it warns and falls back to the configured default, so a script
+  typo degrades to the operator's chosen posture rather than failing calls.
 
 ### Fixed
 - **XML entity references in element text were silently dropped, since v1.1.1.**
