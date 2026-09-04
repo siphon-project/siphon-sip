@@ -21,9 +21,14 @@ trait BytesTextExt {
 }
 impl BytesTextExt for quick_xml::events::BytesText<'_> {
     fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String> {
-        let decoded = self.decode().map_err(|error| error.to_string())?;
+        // quick-xml 0.42 made `BytesText` `str`-backed, so decoding happens in
+        // the reader and `decode()` is gone. `xml10_content()` is the
+        // replacement for that half — it applies XML 1.0 end-of-line
+        // normalisation (§2.11) and nothing else, so the entity resolution the
+        // old `unescape()` did still has to be layered on top.
+        let content = self.xml10_content();
         Ok(std::borrow::Cow::Owned(
-            quick_xml::escape::unescape(&decoded)
+            quick_xml::escape::unescape(&content)
                 .map_err(|error| error.to_string())?
                 .into_owned(),
         ))
@@ -393,6 +398,20 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                         .map_err(|error| IfcError::XmlParse(error.to_string()))?,
                 );
             }
+            // An entity reference arrives as its own event between two `Text`
+            // fragments; without this it is dropped and the iFC value silently
+            // loses characters (a ServiceInfo body or an SPT header value can
+            // legitimately contain `&`).
+            Ok(Event::GeneralRef(reference)) => {
+                let resolved =
+                    crate::xml_text::resolve_general_ref(&reference).ok_or_else(|| {
+                        IfcError::XmlParse(format!(
+                            "unresolvable entity reference &{};  (siphon parses no DTD)",
+                            reference.as_ref() as &str
+                        ))
+                    })?;
+                current_text.push_str(&resolved);
+            }
             Ok(Event::Eof) => break,
             Err(error) => return Err(IfcError::XmlParse(error.to_string())),
             _ => {}
@@ -406,7 +425,8 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
 fn local_name(element: &quick_xml::events::BytesStart, _reader: &Reader<&[u8]>) -> String {
     let full = element.name();
     let local = full.local_name();
-    String::from_utf8_lossy(local.as_ref()).to_string()
+    // quick-xml 0.42 yields `str` here, so there is nothing left to decode.
+    local.as_ref().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1101,41 @@ mod tests {
             "  </InitialFilterCriteria>\n",
             "</ServiceProfile>\n",
         )
+    }
+
+    /// Entity references in element text survive the parse.
+    ///
+    /// An AS URI carries `&` as soon as it has two URI headers, and XML
+    /// requires that be written `&amp;`. quick-xml delivers the reference as
+    /// its own event between two text fragments, so a parser reading only
+    /// `Event::Text` drops it and silently routes to a *different* AS.
+    #[test]
+    fn parse_resolves_entity_references_in_server_name() {
+        let xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>0</Priority>\n",
+            "    <TriggerPoint>\n",
+            "      <ConditionTypeCNF>0</ConditionTypeCNF>\n",
+            "      <SPT>\n",
+            "        <ConditionNegated>0</ConditionNegated>\n",
+            "        <Group>0</Group>\n",
+            "        <Method>INVITE</Method>\n",
+            "      </SPT>\n",
+            "    </TriggerPoint>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as@example.com?P-A=1&amp;P-B=2&#38;P-C=3</ServerName>\n",
+            "      <DefaultHandling>0</DefaultHandling>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        );
+        let ifcs = parse_service_profile(xml).unwrap();
+        assert_eq!(
+            ifcs[0].application_server.server_name, "sip:as@example.com?P-A=1&P-B=2&P-C=3",
+            "named and numeric references must both resolve, and neither be dropped"
+        );
     }
 
     #[test]
