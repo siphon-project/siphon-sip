@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-09-04
+
 ### Security
 - **Inbound connection ceilings, on by default.** Nothing bounded how many
   connections or concurrent handshakes a single source could hold: no per-source
