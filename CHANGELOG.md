@@ -6,157 +6,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-### Performance
-- **A proxy no longer pins a whole INVITE per answered call for the full
-  transaction timeout.** The `by_dialog_key` entry exists for one purpose:
-  routing the end-to-end 2xx ACK, which is a new request and so does not match
-  the INVITE server transaction (RFC 3261 §13.2.2.4). It was aged only by
-  64*T1 (32 s) from creation, so every *answered* call held its
-  `ProxySession` — including a full cloned `original_request` — for 32 s after
-  the call had otherwise finished. At 10k cps that is ~320k pinned INVITEs at
-  steady state, and it is the bulk of why a proxy row outweighs the equivalent
-  B2BUA row, which drops its call state at teardown.
-
-  Once that ACK has been routed the only thing still owed is absorbing a
-  *retransmitted* ACK, which the UAS sends in response to a retransmitted 2xx —
-  bounded by Timer I (T4, 5 s), not by the transaction timeout. Dialogs that
-  have seen their ACK now retire on that shorter window; dialogs still waiting
-  for one keep the full timeout unchanged, so a late ACK is never left
-  unroutable.
-
-  Measured on the reference box, `scripts/scale_test.sh 1200000 10000 8` (120 s
-  of sustained load, long enough for both arms to reach steady state), two
-  interleaved reps on jemalloc live bytes:
-
-  | | live bytes | peak CPS | peak CPU |
-  |---|---|---|---|
-  | before | 4147 / 4165 MB | 9952 / 9960 | 541 / 565 % |
-  | after | **2600 / 2628 MB** | 9928 / 9944 | 550 / 553 % |
-
-  **-1.54 GB (-37 %)**, with CPU a wash and CPS at parity.
-
-### Changed
-- **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
-  instead of writing a second record.** With `cdr.auto_emit: true`, siphon
-  already tracks a record for the call from the INVITE; a script's `extra`
-  fields are merged into it and emitted once at teardown, on the record that
-  also carries `timestamp_start` / `timestamp_answer` / `timestamp_end`,
-  `duration_secs`, `response_code` and `disconnect_initiator`.
-
-  Before, the script's call queued a separate record built from the identity
-  fields alone — no timings, no duration, `response_code: 0` — so attaching
-  billing metadata to a call produced two rows the collector had to join on
-  Call-ID, one of which was meaningless on its own. Repeat calls now merge on
-  top of each other (last write wins per key).
-
-  A standalone record is still written when there is nothing to merge into:
-  `auto_emit` off, a request the auto-emit hooks do not track (a MESSAGE, an
-  out-of-dialog request), or a call already finalized. **Operators counting CDR
-  rows per call will see one row where they saw two**; the fields are unchanged
-  and now all on the same row.
-
-- **The auto-emitted CDR carries the Rf correlation.** `rf_session_id` /
-  `rf_result_code` (TS 32.299) were stamped only onto a script-written record,
-  so an operator running auto-emit never saw them. The auto-emitted record now
-  resolves them at teardown — including for a B2BUA call, whose accounting
-  record is keyed on the internal call id rather than either leg's dialog, a
-  key the stamp never offered.
-
-- **A proxy call's CDR record is opened before the script handler runs and
-  finalized after it.** It used to be opened after the handler (only for an
-  INVITE the proxy forwarded) and, on the BYE, written before the handler — so
-  a `cdr.write(request, extra=…)` from either handler had nothing to attach to.
-  Both ends now bracket the handler, and the record is still written when the
-  script drops or rejects the BYE.
-
-  An INVITE the proxy does not forward still produces no CDR, as before —
-  unless the script attached fields to it, which is a deliberate ask for a
-  record of the attempt. That record now carries the code the script answered
-  (a 403, a 407) instead of the `response_code: 0` a script-built record had.
-
-- **The B2BUA call store no longer retains its peak-concurrency footprint.**
-  Third and largest instance of the same shape as the transaction map and the
-  timer wheel: `CallActorStore` held `DashMap<String, CallActor>` with the actor
-  **inline**, and `CallActor` is ~2.2 KB (an inline `a_leg: Leg`, the `b_legs`
-  vectors, session-timer and transfer state), making the bucket ~2.3 KB —
-  3.8x the transaction bucket and the biggest retained bucket in siphon.
-  `hashbrown` sizes its bucket array for the peak number of live calls and never
-  shrinks it, so a box that once carried N concurrent calls kept
-  `N/0.875` rounded to a power of two, times 2.3 KB, for the rest of its life,
-  with `call_count()` reading 0 the whole time. Boxed, the bucket is 32 bytes.
-
-  No measurable effect on the SIPp bench, and that is expected: the bench tears
-  every call down immediately, so concurrent `CallActor`s number in the tens and
-  the store never grows a bucket array worth retaining. Four interleaved A/B
-  reps of `MODE=b2bua scripts/scale_test.sh 5000 1000 4` on the reference box
-  came out as noise around zero (deltas -2.4, +3.0, -1.0 MB after discarding a
-  cold first run). The saving is proportional to the **peak concurrent call
-  count**, which this workload does not produce: a node that has once held 50k
-  simultaneous calls retains ~151 MB of bucket array for the rest of its life
-  inline, against ~2 MB boxed.
-
-### Performance
-- **The dispatcher's timer wheel no longer retains its peak-concurrency
-  footprint either.** Same shape as the transaction map fixed alongside it:
-  `timer_wheel` is a `DashMap<String, TimerEntry>` holding a 176-byte
-  `TimerEntry` inline, so the bucket was 200 bytes. `hashbrown` sizes its bucket
-  array for the peak number of live entries and never shrinks it, and the wheel
-  carries roughly one entry per live transaction timer — so its count tracks
-  `rate x Timer J` the same way, and the array stayed at the busiest moment the
-  process ever saw for the rest of its life. Boxed, the bucket is 32 bytes.
-
-  Measured on the same experiment (100,000 registrations at 4,800 cps, then
-  fully de-registered), against `main` with only this change reverted:
-
-  | | peak RSS | drained RSS | drained live bytes |
-  |---|---|---|---|
-  | before | 289 MB | 153 MB | 80 MB |
-  | after | 267 MB | 121 MB | **47 MB** |
-
-  Post-drain live bytes fall 41 %. Cumulatively with the registrar and
-  transaction work in this release, the same workload goes from 563 MB peak
-  RSS / 158 MB retained to 267 MB / 47 MB.
-
-### Performance
-- **The transaction table no longer holds its peak-concurrency footprint for
-  the life of the process.** `TransactionManager` stored the `Transaction`
-  enum inline in its `DashMap`. A `Nist` carries two whole `SipMessage`s
-  (`original_request` for the synthesised 100, `last_response` for
-  retransmission), which makes `Transaction` 536 bytes and the hash bucket 608.
-  `hashbrown` sizes its bucket array for the peak number of live entries and
-  never shrinks it, so a box that once ran at N concurrent transactions kept
-  `N/0.875` rounded up to a power of two, times 608 bytes, forever — while
-  `siphon_transactions_active` read 0 the whole time.
-
-  Concurrency is `rate x Timer J` (32 s), so the retention is set by the
-  busiest 32 seconds the process ever saw and grows linearly with offered load.
-  Transactions are now boxed: the bucket is 80 bytes, and the 536-byte payload
-  comes off the memcpy path that every insert and every table growth paid.
-
-- **siphon's own binary now uses siphon's own allocator tuning.** `src/main.rs`
-  installed jemalloc with a bare `#[global_allocator]` and never set
-  `malloc_conf`, so it ran jemalloc's stock `background_thread:false` +
-  `dirty_decay_ms:10000` — freed pages are returned only opportunistically,
-  while an arena is being allocated *into*, which is the opposite of what a
-  process does just after a burst. It now goes through `install_allocator!()`,
-  the same macro siphon already ships for downstream binaries. Scope: the
-  published container image builds `siphon-bin`, which already called the
-  macro, so this closes the gap for a source-built root `siphon-sip` binary
-  (`cargo install siphon-sip`), not for the official image.
-
-  Measured together, 100,000 registrations driven at 4,800 cps and then
-  fully de-registered:
-
-  | | peak RSS | drained RSS | drained live bytes |
-  |---|---|---|---|
-  | before | 563 MB | 292 MB | 158 MB |
-  | after | 452 MB | 158 MB | 83 MB |
-
-  Boxing accounts for the live-bytes drop (158 → 81 MB on its own), the decay
-  tuning for the resident drop (267 → 158 MB on its own). Against the
-  rate-independent floor of 51 MB, the concurrency-driven retention falls from
-  107 MB to 30 MB.
-
 ### Added
 - **An LCR failover now leaves a trace, and a record.** A call whose first
   carrier returned `500` and which then answered on the second showed nothing of
@@ -187,6 +36,95 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   alongside it, so the code the caller receives and the per-attempt record
   cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
 
+### Changed
+- **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
+  instead of writing a second record.** With `cdr.auto_emit: true`, siphon
+  already tracks a record for the call from the INVITE; a script's `extra`
+  fields are merged into it and emitted once at teardown, on the record that
+  also carries `timestamp_start` / `timestamp_answer` / `timestamp_end`,
+  `duration_secs`, `response_code` and `disconnect_initiator`.
+
+  Before, the script's call queued a separate record built from the identity
+  fields alone — no timings, no duration, `response_code: 0` — so attaching
+  billing metadata to a call produced two rows the collector had to join on
+  Call-ID, one of which was meaningless on its own. Repeat calls now merge on
+  top of each other (last write wins per key).
+
+  A standalone record is still written when there is nothing to merge into:
+  `auto_emit` off, a request the auto-emit hooks do not track (a MESSAGE, an
+  out-of-dialog request), or a call already finalized. **Operators counting CDR
+  rows per call will see one row where they saw two**; the fields are unchanged
+  and now all on the same row.
+- **The auto-emitted CDR carries the Rf correlation.** `rf_session_id` /
+  `rf_result_code` (TS 32.299) were stamped only onto a script-written record,
+  so an operator running auto-emit never saw them. The auto-emitted record now
+  resolves them at teardown — including for a B2BUA call, whose accounting
+  record is keyed on the internal call id rather than either leg's dialog, a
+  key the stamp never offered.
+- **A proxy call's CDR record is opened before the script handler runs and
+  finalized after it.** It used to be opened after the handler (only for an
+  INVITE the proxy forwarded) and, on the BYE, written before the handler — so
+  a `cdr.write(request, extra=…)` from either handler had nothing to attach to.
+  Both ends now bracket the handler, and the record is still written when the
+  script drops or rejects the BYE.
+
+  An INVITE the proxy does not forward still produces no CDR, as before —
+  unless the script attached fields to it, which is a deliberate ask for a
+  record of the attempt. That record now carries the code the script answered
+  (a 403, a 407) instead of the `response_code: 0` a script-built record had.
+- **A binding no longer carries its own copy of two per-process constants.**
+  `Contact` stored `instance_id` and `instance_epoch` as an owned `String`
+  pair, so a table of a million bindings held a million copies of the same two
+  values and paid two allocations per binding for them. They are now one shared
+  handle to the process identity, read through `Contact::instance_id()` /
+  `Contact::instance_epoch()`. The scripting API is unchanged — `contact.instance_id`
+  and `contact.instance_epoch` still return `str | None`. A restore from a
+  Redis/Postgres snapshot collapses to one handle per instance that wrote the
+  bindings, rather than one per binding.
+- **`Contact::source_transport` holds the parsed `Transport` instead of the
+  scheme token.** Every consumer wanted a `Transport` anyway — the routing path
+  re-parsed the string into one on each send, and two more places kept their own
+  copy of that conversion, all now removed. The persisted form is unchanged
+  (still the lowercase scheme token), so bindings stay readable across a
+  version rollback; an unrecognised scheme restores as "no transport recorded"
+  rather than failing the binding.
+
+  Together these take `Contact` from 480 to 416 bytes, which also drops the
+  per-AoR binding allocation into a smaller allocator size class. Measured over
+  200,000 single-binding AoRs with an instance identity configured: **777 → 641
+  bytes per AoR, a 17.5% reduction**, on top of the single-slot change above.
+- **The always-on Python worker floor is re-derived against the corrected
+  per-worker heap.** `MIN_CORE_THREADS` is a floor on the worker *count*, and
+  8 was chosen when a warm worker was believed to cost ~2 MB — effectively a bet
+  that the pool's always-on heap would sit near 16 MB. `PER_WORKER_HEAP_MB` was
+  later measured at ~8 MB and the constant raised to 10, but the count was never
+  revisited, so the same floor came to mean a much larger always-on commitment
+  on every instance, 2 cores or 32. It is now 4: still double the 2-thread
+  baseline the floor exists to avoid, and on any box with 2 or more cores
+  `2 x cpus` already meets it, so the floor stops binding exactly where it was
+  costing the most for the least reason.
+
+  Measured on a 2-CPU box, `pool_size` 8 → 4 and thread count 17 → 13. The RSS
+  effect is smaller than the arithmetic suggests: ~2 MB at boot and ~7 MB after
+  40,000 handled requests, because a worker's mimalloc heap grows with the work
+  it does rather than being committed up front — with half the workers, each
+  one does twice the work. `PER_WORKER_HEAP_MB` describes a long-running IMS
+  deployment's steady state, not a fixed per-worker cost, so it should not be
+  read as "workers x 10 MB" on a lightly-loaded instance.
+- **Every SIPp scenario now runs on every pull request.** Four had no runner at
+  all (`b2bua-refer-outbound`, `b2bua-reinvite-bleg`, `b2bua-reinvite-breject`,
+  `b2bua-reinvite-reject`), so the behaviour they described — B-leg-initiated
+  re-INVITE Via correctness, and dialog survival when a re-INVITE is rejected
+  from either side (RFC 3261 §14.1) — was asserted by nothing. The
+  reliable-provisional scenario (`b2bua-reliable-prov`, RFC 3262 100rel
+  interworking) existed but was driven only by `scripts/run-tests.sh`, so a
+  regression in it was not caught on the PR that caused it; it now has its own
+  CI job.
+- **Fixed a race in the `b2bua-reinvite-breject` scenario.** A `<pause>` sat
+  where the BYE arrives, so an on-time BYE landed before SIPp had armed the
+  `recv` and aborted the run as unexpected. Test-side only — siphon sends
+  exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
+
 ### Fixed
 - **A media failure at answer no longer connects the call and starts charging.**
   An exception out of `@b2bua.on_answer` was logged and then ignored: the A-leg
@@ -212,7 +150,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   must catch its own exceptions. Note also that `@b2bua.on_failure` can now fire
   for a call whose B-leg *did* answer and has already been BYEd, so a handler
   must not assume there was never a B-leg.
-
 - **`call.terminate()` now works from `@b2bua.on_answer`.** The deferred action a
   handler left behind was read back only for `call.refer()`; everything else was
   discarded on the grounds that the call is already answered. That is true of the
@@ -221,7 +158,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   just discovered could not work, and it was the one being dropped. An action
   that genuinely has no effect once the B-leg has answered is now logged by name
   rather than discarded silently.
-
 - **One event now carries one timestamp.** With `log.file` configured, siphon
   installed a console `fmt` layer and a file `fmt` layer, and each timed the
   event as it formatted it — so a single log line was stamped twice, at two
@@ -238,7 +174,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The event is now timed once, before either layer formats it, and both render
   that one value. It goes through the same timer as before, so the rendered
   format is byte-identical and nothing parsing these logs is affected.
-
 - **Registrar lookups now canonicalise the AoR they are given.** `bindings` and
   `aliases` are both keyed on the normalised form, but `Registrar`'s own lookup
   methods took the caller's string as-is, so an AoR that was not already
@@ -253,52 +188,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   This also makes a `tel:` URI in an implicit registration set resolvable:
   `normalize_aor` maps `tel:+1555…` to `sip:tel:+1555…`, so the alias was
   stored under a key the raw form never matched.
-
-### Changed
-- **A binding no longer carries its own copy of two per-process constants.**
-  `Contact` stored `instance_id` and `instance_epoch` as an owned `String`
-  pair, so a table of a million bindings held a million copies of the same two
-  values and paid two allocations per binding for them. They are now one shared
-  handle to the process identity, read through `Contact::instance_id()` /
-  `Contact::instance_epoch()`. The scripting API is unchanged — `contact.instance_id`
-  and `contact.instance_epoch` still return `str | None`. A restore from a
-  Redis/Postgres snapshot collapses to one handle per instance that wrote the
-  bindings, rather than one per binding.
-
-- **`Contact::source_transport` holds the parsed `Transport` instead of the
-  scheme token.** Every consumer wanted a `Transport` anyway — the routing path
-  re-parsed the string into one on each send, and two more places kept their own
-  copy of that conversion, all now removed. The persisted form is unchanged
-  (still the lowercase scheme token), so bindings stay readable across a
-  version rollback; an unrecognised scheme restores as "no transport recorded"
-  rather than failing the binding.
-
-  Together these take `Contact` from 480 to 416 bytes, which also drops the
-  per-AoR binding allocation into a smaller allocator size class. Measured over
-  200,000 single-binding AoRs with an instance identity configured: **777 → 641
-  bytes per AoR, a 17.5% reduction**, on top of the single-slot change above.
-
-### Changed
-- **The always-on Python worker floor is re-derived against the corrected
-  per-worker heap.** `MIN_CORE_THREADS` is a floor on the worker *count*, and
-  8 was chosen when a warm worker was believed to cost ~2 MB — effectively a bet
-  that the pool's always-on heap would sit near 16 MB. `PER_WORKER_HEAP_MB` was
-  later measured at ~8 MB and the constant raised to 10, but the count was never
-  revisited, so the same floor came to mean a much larger always-on commitment
-  on every instance, 2 cores or 32. It is now 4: still double the 2-thread
-  baseline the floor exists to avoid, and on any box with 2 or more cores
-  `2 x cpus` already meets it, so the floor stops binding exactly where it was
-  costing the most for the least reason.
-
-  Measured on a 2-CPU box, `pool_size` 8 → 4 and thread count 17 → 13. The RSS
-  effect is smaller than the arithmetic suggests: ~2 MB at boot and ~7 MB after
-  40,000 handled requests, because a worker's mimalloc heap grows with the work
-  it does rather than being committed up front — with half the workers, each
-  one does twice the work. `PER_WORKER_HEAP_MB` describes a long-running IMS
-  deployment's steady state, not a fixed per-worker cost, so it should not be
-  read as "workers x 10 MB" on a lightly-loaded instance.
-
-### Fixed
 - **A siphon-originated REFER no longer overtakes the answer it depends on.**
   A `call.refer()` issued from `@b2bua.on_answer` was emitted at the point the
   handler ran — which is *before* the A-leg 2xx is forwarded — so the caller
@@ -308,7 +197,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Found by `b2bua-refer-outbound`, a SIPp scenario that existed but was wired to
   no runner — the first time it ran, it caught this.
-
 - **B2BUA in-dialog ACKs now carry the dialog's route set (RFC 3261 §12.2.1.1).**
   Three ACK paths built the request with no `Route` header at all: the ACK for a
   re-INVITE's 2xx (so every hold, resume, session-timer refresh and transfer
@@ -333,23 +221,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it from. Those ACKs are also sent to the route set's first hop instead of the
   address the leg was dialled at, which is what §12.2.1.1 asks for and what the
   re-INVITE itself already did.
-
-### Changed
-- **Every SIPp scenario now runs on every pull request.** Four had no runner at
-  all (`b2bua-refer-outbound`, `b2bua-reinvite-bleg`, `b2bua-reinvite-breject`,
-  `b2bua-reinvite-reject`), so the behaviour they described — B-leg-initiated
-  re-INVITE Via correctness, and dialog survival when a re-INVITE is rejected
-  from either side (RFC 3261 §14.1) — was asserted by nothing. The
-  reliable-provisional scenario (`b2bua-reliable-prov`, RFC 3262 100rel
-  interworking) existed but was driven only by `scripts/run-tests.sh`, so a
-  regression in it was not caught on the PR that caused it; it now has its own
-  CI job.
-
-- **Fixed a race in the `b2bua-reinvite-breject` scenario.** A `<pause>` sat
-  where the BYE arrives, so an on-time BYE landed before SIPp had armed the
-  `recv` and aborted the run as unexpected. Test-side only — siphon sends
-  exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
-
 - **A registration that ended by expiring or by de-REGISTER left four
   per-AoR maps holding it forever.** `remove_all` tore down the auxiliary
   state through `drop_aor_state`, but neither of the two paths a registration
@@ -376,16 +247,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   bytes per registration, and the remainder is now flat across repeated cycles
   (35,828 KB then 35,826 KB) — hash-table capacity at its high-water mark,
   reused by the next registration rather than retained.
-
-### Performance
-- **De-registration no longer scans the whole alias index.** Pruning the
-  implicit-registration-set aliases for one AoR was a `retain` over every alias
-  the process held, so tearing down a registration cost O(total aliases) on the
-  write path — quadratic across a population of them. The entries to drop are
-  now derived from that AoR's own `associated_uris` list, which is what they
-  were built from. Taking 100,000 IMS registrations through de-REGISTER goes
-  from **50.7 s to 0.45 s**.
-
 - **The registrar reserved four contact slots for every AoR that only ever
   holds one.** `Vec::push` on an empty vec allocates `MIN_NON_ZERO_CAP` slots
   rather than one, which is 4 for any element of 1 KiB or less. `Contact` is
@@ -407,7 +268,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   one push at a time, which on a restart carrying a large binding set is the
   process's steady state rather than a transient) and the RFC 5626 flow-teardown
   partition, which sized for "nothing removed" and kept the freed slots.
-
 - **`listen.udp_recv_buffer_bytes` is a floor now, so it stops shrinking the
   receive queue on a tuned host.** siphon called `setsockopt(SO_RCVBUF)`
   unconditionally, which made the 1 MiB default a *reduction* on any host whose
@@ -422,6 +282,119 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   carries and leaves a larger buffer alone. Deliberately conservative about the
   doubling, so it can decline to raise a buffer already within 2x of the floor,
   but it can never lower one. `0` still means "don't touch the socket at all".
+
+### Performance
+- **A proxy no longer pins a whole INVITE per answered call for the full
+  transaction timeout.** The `by_dialog_key` entry exists for one purpose:
+  routing the end-to-end 2xx ACK, which is a new request and so does not match
+  the INVITE server transaction (RFC 3261 §13.2.2.4). It was aged only by
+  64*T1 (32 s) from creation, so every *answered* call held its
+  `ProxySession` — including a full cloned `original_request` — for 32 s after
+  the call had otherwise finished. At 10k cps that is ~320k pinned INVITEs at
+  steady state, and it is the bulk of why a proxy row outweighs the equivalent
+  B2BUA row, which drops its call state at teardown.
+
+  Once that ACK has been routed the only thing still owed is absorbing a
+  *retransmitted* ACK, which the UAS sends in response to a retransmitted 2xx —
+  bounded by Timer I (T4, 5 s), not by the transaction timeout. Dialogs that
+  have seen their ACK now retire on that shorter window; dialogs still waiting
+  for one keep the full timeout unchanged, so a late ACK is never left
+  unroutable.
+
+  Measured on the reference box, `scripts/scale_test.sh 1200000 10000 8` (120 s
+  of sustained load, long enough for both arms to reach steady state), two
+  interleaved reps on jemalloc live bytes:
+
+  | | live bytes | peak CPS | peak CPU |
+  |---|---|---|---|
+  | before | 4147 / 4165 MB | 9952 / 9960 | 541 / 565 % |
+  | after | **2600 / 2628 MB** | 9928 / 9944 | 550 / 553 % |
+
+  **-1.54 GB (-37 %)**, with CPU a wash and CPS at parity.
+- **The B2BUA call store no longer retains its peak-concurrency footprint.**
+  Third and largest instance of the same shape as the transaction map and the
+  timer wheel: `CallActorStore` held `DashMap<String, CallActor>` with the actor
+  **inline**, and `CallActor` is ~2.2 KB (an inline `a_leg: Leg`, the `b_legs`
+  vectors, session-timer and transfer state), making the bucket ~2.3 KB —
+  3.8x the transaction bucket and the biggest retained bucket in siphon.
+  `hashbrown` sizes its bucket array for the peak number of live calls and never
+  shrinks it, so a box that once carried N concurrent calls kept
+  `N/0.875` rounded to a power of two, times 2.3 KB, for the rest of its life,
+  with `call_count()` reading 0 the whole time. Boxed, the bucket is 32 bytes.
+
+  No measurable effect on the SIPp bench, and that is expected: the bench tears
+  every call down immediately, so concurrent `CallActor`s number in the tens and
+  the store never grows a bucket array worth retaining. Four interleaved A/B
+  reps of `MODE=b2bua scripts/scale_test.sh 5000 1000 4` on the reference box
+  came out as noise around zero (deltas -2.4, +3.0, -1.0 MB after discarding a
+  cold first run). The saving is proportional to the **peak concurrent call
+  count**, which this workload does not produce: a node that has once held 50k
+  simultaneous calls retains ~151 MB of bucket array for the rest of its life
+  inline, against ~2 MB boxed.
+- **The dispatcher's timer wheel no longer retains its peak-concurrency
+  footprint either.** Same shape as the transaction map fixed alongside it:
+  `timer_wheel` is a `DashMap<String, TimerEntry>` holding a 176-byte
+  `TimerEntry` inline, so the bucket was 200 bytes. `hashbrown` sizes its bucket
+  array for the peak number of live entries and never shrinks it, and the wheel
+  carries roughly one entry per live transaction timer — so its count tracks
+  `rate x Timer J` the same way, and the array stayed at the busiest moment the
+  process ever saw for the rest of its life. Boxed, the bucket is 32 bytes.
+
+  Measured on the same experiment (100,000 registrations at 4,800 cps, then
+  fully de-registered), against `main` with only this change reverted:
+
+  | | peak RSS | drained RSS | drained live bytes |
+  |---|---|---|---|
+  | before | 289 MB | 153 MB | 80 MB |
+  | after | 267 MB | 121 MB | **47 MB** |
+
+  Post-drain live bytes fall 41 %. Cumulatively with the registrar and
+  transaction work in this release, the same workload goes from 563 MB peak
+  RSS / 158 MB retained to 267 MB / 47 MB.
+- **The transaction table no longer holds its peak-concurrency footprint for
+  the life of the process.** `TransactionManager` stored the `Transaction`
+  enum inline in its `DashMap`. A `Nist` carries two whole `SipMessage`s
+  (`original_request` for the synthesised 100, `last_response` for
+  retransmission), which makes `Transaction` 536 bytes and the hash bucket 608.
+  `hashbrown` sizes its bucket array for the peak number of live entries and
+  never shrinks it, so a box that once ran at N concurrent transactions kept
+  `N/0.875` rounded up to a power of two, times 608 bytes, forever — while
+  `siphon_transactions_active` read 0 the whole time.
+
+  Concurrency is `rate x Timer J` (32 s), so the retention is set by the
+  busiest 32 seconds the process ever saw and grows linearly with offered load.
+  Transactions are now boxed: the bucket is 80 bytes, and the 536-byte payload
+  comes off the memcpy path that every insert and every table growth paid.
+- **siphon's own binary now uses siphon's own allocator tuning.** `src/main.rs`
+  installed jemalloc with a bare `#[global_allocator]` and never set
+  `malloc_conf`, so it ran jemalloc's stock `background_thread:false` +
+  `dirty_decay_ms:10000` — freed pages are returned only opportunistically,
+  while an arena is being allocated *into*, which is the opposite of what a
+  process does just after a burst. It now goes through `install_allocator!()`,
+  the same macro siphon already ships for downstream binaries. Scope: the
+  published container image builds `siphon-bin`, which already called the
+  macro, so this closes the gap for a source-built root `siphon-sip` binary
+  (`cargo install siphon-sip`), not for the official image.
+
+  Measured together, 100,000 registrations driven at 4,800 cps and then
+  fully de-registered:
+
+  | | peak RSS | drained RSS | drained live bytes |
+  |---|---|---|---|
+  | before | 563 MB | 292 MB | 158 MB |
+  | after | 452 MB | 158 MB | 83 MB |
+
+  Boxing accounts for the live-bytes drop (158 → 81 MB on its own), the decay
+  tuning for the resident drop (267 → 158 MB on its own). Against the
+  rate-independent floor of 51 MB, the concurrency-driven retention falls from
+  107 MB to 30 MB.
+- **De-registration no longer scans the whole alias index.** Pruning the
+  implicit-registration-set aliases for one AoR was a `retain` over every alias
+  the process held, so tearing down a registration cost O(total aliases) on the
+  write path — quadratic across a population of them. The entries to drop are
+  now derived from that AoR's own `associated_uris` list, which is what they
+  were built from. Taking 100,000 IMS registrations through de-REGISTER goes
+  from **50.7 s to 0.45 s**.
 
 ## [1.8.0] — 2026-09-02
 
