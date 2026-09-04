@@ -825,9 +825,9 @@ impl PyAuth {
             .or_else(|| message.headers.get("Proxy-Authorization"));
 
         match auth_header {
-            Some(value) => {
-                Ok(self.validate_credentials_with(value, realm, &method, supplied.as_ref()))
-            }
+            Some(value) => Ok(self
+                .validate_credentials_with(value, realm, &method, supplied.as_ref())
+                .is_valid()),
             None => Ok(false),
         }
     }
@@ -902,7 +902,7 @@ impl PyAuth {
             .get("Authorization")
             .or_else(|| message.headers.get("Proxy-Authorization"));
         match auth_header {
-            Some(value) => Ok(self.validate_credentials(value, realm, &method)),
+            Some(value) => Ok(self.validate_credentials(value, realm, &method).is_valid()),
             None => Ok(false),
         }
     }
@@ -911,6 +911,66 @@ impl PyAuth {
 // ---------------------------------------------------------------------------
 // Internal implementation
 // ---------------------------------------------------------------------------
+
+/// Outcome of checking a request's digest credentials.
+///
+/// A `bool` conflated two failures that are nothing alike: credentials the
+/// credential source actively rejected, and a credential source that could not
+/// answer at all. Both landed on the auto-ban's high-confidence path, so an
+/// outage of *our own* auth backend looked exactly like a password brute-force
+/// and banned real subscribers two REGISTER retries in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialCheck {
+    /// The digest response verified against the credential.
+    Valid,
+    /// The request carried no `Authorization` / `Proxy-Authorization` header.
+    /// The legitimate opening leg of challenge-response (RFC 3261 §22.2) — and
+    /// also what a bare scanner looks like, which is why it is counted by
+    /// policy ([`crate::security::AutoBanStore::record_missing_credentials`])
+    /// rather than treated as abuse outright.
+    Absent,
+    /// Credentials were present and are definitively wrong: a digest mismatch,
+    /// an unparseable or over-long header, a username the backend answered for
+    /// and denied, or a forged/stale/replayed nonce (RFC 7616 §3.3).
+    Rejected,
+    /// The credential source could not answer — a transport error or timeout
+    /// reaching the HTTP backend, or no usable backend configured. Says nothing
+    /// about the peer, so it must never feed the auto-ban.
+    Unavailable,
+}
+
+impl CredentialCheck {
+    /// Lift a backend that answered — and so can only have said yes or no —
+    /// into the four-way outcome.
+    fn from_verified(verified: bool) -> Self {
+        if verified {
+            Self::Valid
+        } else {
+            Self::Rejected
+        }
+    }
+
+    /// Whether the credentials verified. The only outcome that lets a request
+    /// through; every other one arms a challenge.
+    fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+/// Result of one credential lookup against the HTTP auth backend.
+///
+/// Split out of `Option<String>` for the same reason as [`CredentialCheck`]:
+/// "the backend said this user does not exist" and "the backend did not answer"
+/// are opposite signals, and collapsing them made an outage indistinguishable
+/// from an attack.
+enum CredentialLookup {
+    /// The backend returned a credential body (HA1 hex or plaintext password).
+    Found(String),
+    /// The backend answered with a non-success status: no such user.
+    NotFound,
+    /// The request failed outright — connection refused, timeout, read error.
+    Unavailable,
+}
 
 impl PyAuth {
     fn require_digest_inner(
@@ -945,14 +1005,21 @@ impl PyAuth {
 
         drop(message_guard);
 
-        // Distinguish a credential-less first leg (the legitimate opening of
-        // challenge-response, or a toll-fraud probe — weight 1) from a present-
-        // but-invalid attempt (wrong password, or a forged/stale/replayed nonce
-        // — a high-confidence abuse signal) handled in the failure arm below.
+        // Four-way, not two-way. A credential-less first leg (the legitimate
+        // opening of challenge-response, or a bare probe), a present-but-invalid
+        // attempt (wrong password or a forged/stale/replayed nonce — the
+        // high-confidence abuse signal) and a credential source that could not
+        // answer all arm the same challenge, but they are worth completely
+        // different things to the auto-ban. The failure arm below is where that
+        // is decided.
+        let outcome = match &auth_header {
+            Some(value) => self.validate_credentials_with(value, realm, &method, supplied),
+            None => CredentialCheck::Absent,
+        };
         let credentials_present = auth_header.is_some();
 
         match auth_header {
-            Some(value) if self.validate_credentials_with(&value, realm, &method, supplied) => {
+            Some(value) if outcome.is_valid() => {
                 // Extract username from the Authorization header
                 if let Some(username) = extract_username(&value) {
                     target.set_auth_user(username);
@@ -982,27 +1049,39 @@ impl PyAuth {
                 Ok(true)
             }
             _ => {
-                // A challenge is being issued. Count it toward the auto-ban:
-                //  * credentials absent → the toll-fraud pattern (REGISTER/INVITE
-                //    without creds, repeatedly) accrues weight 1; a legit client
-                //    is reset by the record_success above.
-                //  * credentials present but invalid → wrong password, or a
-                //    forged/stale/replayed nonce: a high-confidence abuse signal,
-                //    weighted heavier so brute-force bans faster. The heavier
-                //    weight only applies over a connection-oriented transport
-                //    whose handshake validates the source — a bad-nonce attempt
-                //    needs no round-trip, so over UDP its source is spoofable and
-                //    a heavier weight would amplify a reflected ban. Over UDP it
-                //    falls back to weight 1 (today's behaviour, unchanged).
+                // A challenge is being issued. What it is worth to the auto-ban
+                // depends entirely on *why*:
+                //  * `Rejected` — credentials present and definitively wrong
+                //    (bad password, or a forged/stale/replayed nonce): a
+                //    high-confidence abuse signal, weighted heavier so a
+                //    brute-force bans faster. The heavier weight only applies
+                //    over a connection-oriented transport whose handshake
+                //    validates the source — a bad-nonce attempt needs no
+                //    round-trip, so over UDP its source is spoofable and a
+                //    heavier weight would amplify a reflected ban. Over UDP it
+                //    falls back to weight 1.
+                //  * `Absent` — no credentials. This is RFC 3261 §22.2's
+                //    opening leg, which every client sends before it has a
+                //    nonce, and it is also what a bare scanner looks like. It
+                //    is counted at `missing_credentials_weight`, which defaults
+                //    to 0 (not counted): banning on protocol-legal behaviour
+                //    banned real subscribers, and behind CGNAT one handset in a
+                //    retry loop took out every subscriber sharing the address.
+                //  * `Unavailable` — our own credential source could not
+                //    answer. Nothing about the peer, so it counts nothing; an
+                //    auth-backend outage must not read as an attack.
+                //  * `Valid` never reaches here.
                 // trusted_cidrs are exempt inside the store.
                 let source_validated = target.transport_name() != "udp";
-                let strong = credentials_present && source_validated;
                 if let Some(ban) = crate::security::auto_ban() {
                     if let Ok(source) = target.source_ip_str().parse::<std::net::IpAddr>() {
-                        let newly_banned = if strong {
-                            ban.record_strong_failure(source)
-                        } else {
-                            ban.record_failure(source)
+                        let newly_banned = match outcome {
+                            CredentialCheck::Rejected if source_validated => {
+                                ban.record_strong_failure(source)
+                            }
+                            CredentialCheck::Rejected => ban.record_failure(source),
+                            CredentialCheck::Absent => ban.record_missing_credentials(source),
+                            CredentialCheck::Unavailable | CredentialCheck::Valid => false,
                         };
                         if newly_banned {
                             tracing::warn!(
@@ -1013,11 +1092,18 @@ impl PyAuth {
                         }
                     }
                 }
+                // Counted regardless of ban weight, so the volume of every shape
+                // stays visible even where the policy declines to act on it.
                 if let Some(metrics) = crate::metrics::try_metrics() {
-                    if credentials_present {
-                        metrics.credential_failures_total.inc();
-                    } else {
-                        metrics.auth_failures_total.inc();
+                    match outcome {
+                        CredentialCheck::Rejected => metrics.credential_failures_total.inc(),
+                        CredentialCheck::Absent => metrics.auth_failures_total.inc(),
+                        // `auth_backend_errors_total` is incremented where the
+                        // outcome is produced — the only place that knows which
+                        // backend failed and why, and the only one that also
+                        // covers the script-driven `verify_digest` path that
+                        // never reaches this challenge arm.
+                        CredentialCheck::Unavailable | CredentialCheck::Valid => {}
                     }
                 }
 
@@ -1197,7 +1283,7 @@ impl PyAuth {
     }
 
     /// Validate credentials by dispatching to the configured backend.
-    fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+    fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
         self.validate_credentials_with(auth_value, realm, method, None)
     }
 
@@ -1213,7 +1299,7 @@ impl PyAuth {
         realm: &str,
         method: &str,
         supplied: Option<&SuppliedSecret<'_>>,
-    ) -> bool {
+    ) -> CredentialCheck {
         // Anti-replay: reject a stale or forged nonce before any backend lookup
         // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
         // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
@@ -1222,22 +1308,32 @@ impl PyAuth {
             Some(nonce) if self.validate_nonce(&nonce) => {}
             _ => {
                 debug!("auth: rejecting digest with missing/stale/invalid nonce");
-                return false;
+                return CredentialCheck::Rejected;
             }
         }
         // A script-supplied secret short-circuits the backend entirely, so a
         // deployment that can derive the credential in-process needs no
         // credential source configured at all.
         if let Some(secret) = supplied {
-            return self.validate_supplied(auth_value, realm, method, secret);
+            return CredentialCheck::from_verified(
+                self.validate_supplied(auth_value, realm, method, secret),
+            );
         }
 
         match self.backend_type {
-            AuthBackendType::Static => self.validate_static(auth_value, realm, method),
+            AuthBackendType::Static => {
+                CredentialCheck::from_verified(self.validate_static(auth_value, realm, method))
+            }
             AuthBackendType::Http => self.validate_http(auth_value, realm, method),
             _ => {
+                // A backend siphon cannot dispatch to is an operator error, not
+                // a peer's: nothing here is evidence about the source, so it
+                // must not count toward a ban.
                 warn!(backend = ?self.backend_type, "unsupported auth backend");
-                false
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_backend_errors_total.inc();
+                }
+                CredentialCheck::Unavailable
             }
         }
     }
@@ -1303,10 +1399,10 @@ impl PyAuth {
     }
 
     /// HTTP backend: fetch HA1 (or password) from REST endpoint, then verify digest.
-    fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+    fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
         let fields = match DigestFields::parse(auth_value) {
             Some(f) => f,
-            None => return false,
+            None => return CredentialCheck::Rejected,
         };
 
         // Bound the attacker-controlled username before it becomes a URL and an
@@ -1317,14 +1413,19 @@ impl PyAuth {
                 username_len = fields.username.len(),
                 "rejecting HTTP auth: username empty or exceeds length limit"
             );
-            return false;
+            return CredentialCheck::Rejected;
         }
 
         let (http_config, client) = match (&self.http_config, &self.http_client) {
             (Some(c), Some(cl)) => (c, cl),
             _ => {
+                // Misconfiguration, not a credential decision — the backend was
+                // never asked, so the peer has told us nothing.
                 warn!("auth backend is http but no http config set");
-                return false;
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_backend_errors_total.inc();
+                }
+                return CredentialCheck::Unavailable;
             }
         };
 
@@ -1342,8 +1443,9 @@ impl PyAuth {
             None => {
                 let fetched =
                     match self.fetch_http_credential(http_config, client, &fields.username) {
-                        Some(body) => body,
-                        None => return false,
+                        CredentialLookup::Found(body) => body,
+                        CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                        CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
                     };
                 self.store_credential(&fields.username, &fetched);
                 fetched
@@ -1368,7 +1470,7 @@ impl PyAuth {
 
         let valid = fields.verify(&ha1, method);
         debug!(username = %fields.username, valid, "HTTP auth digest verification");
-        valid
+        CredentialCheck::from_verified(valid)
     }
 
     /// Return a cached credential body for `username` if caching is enabled and
@@ -1412,7 +1514,7 @@ impl PyAuth {
         http_config: &HttpAuthConfig,
         client: &reqwest::Client,
         username: &str,
-    ) -> Option<String> {
+    ) -> CredentialLookup {
         // Percent-encode the attacker-controlled digest username before it lands
         // in the URL path. Substituting it raw lets a crafted `username` break
         // out of the `{username}` segment — `../../admin` (path traversal),
@@ -1437,14 +1539,21 @@ impl PyAuth {
             });
 
         match outcome {
-            Ok(Some(body)) => Some(body),
+            Ok(Some(body)) => CredentialLookup::Found(body),
             Ok(None) => {
                 debug!(username = %username, "HTTP auth: user not found (non-success status)");
-                None
+                CredentialLookup::NotFound
             }
             Err(error) => {
+                // The backend did not answer. Distinct from "no such user":
+                // this says nothing about the peer, and counting it toward the
+                // auto-ban turns an outage of our own credential source into a
+                // wave of hour-long bans on legitimate subscribers.
                 warn!(error = %error, url = %url, "HTTP auth request/read failed");
-                None
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_backend_errors_total.inc();
+                }
+                CredentialLookup::Unavailable
             }
         }
     }
@@ -2415,11 +2524,19 @@ mod tests {
             "{:016x}.test",
             now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 100)
         );
-        assert!(!auth.validate_credentials(&build(&stale), "example.com", "REGISTER"));
+        // A stale nonce is a *rejection*, not an inconclusive check: the peer
+        // presented something and it was refused, so it still weighs on the ban.
+        assert_eq!(
+            auth.validate_credentials(&build(&stale), "example.com", "REGISTER"),
+            CredentialCheck::Rejected
+        );
 
         // The identical exchange with a fresh nonce authenticates.
         let fresh = format!("{:016x}.test", now_unix_secs());
-        assert!(auth.validate_credentials(&build(&fresh), "example.com", "REGISTER"));
+        assert_eq!(
+            auth.validate_credentials(&build(&fresh), "example.com", "REGISTER"),
+            CredentialCheck::Valid
+        );
     }
 
     #[test]
@@ -2977,6 +3094,90 @@ mod tests {
         })
         .unwrap();
         auth
+    }
+
+    /// Build an `Authorization` header that is well-formed and carries a fresh
+    /// nonce, so the check reaches the backend instead of being short-circuited
+    /// by the anti-replay guard.
+    fn well_formed_authorization(username: &str) -> String {
+        let nonce = format!("{:016x}.test", now_unix_secs());
+        format!(
+            "Digest username=\"{username}\", realm=\"example.com\", nonce=\"{nonce}\", \
+             uri=\"sip:example.com\", response=\"{}\"",
+            "0".repeat(32)
+        )
+    }
+
+    /// The second half of the ban regression: a credential source that cannot
+    /// answer is not a credential decision.
+    ///
+    /// `fetch_http_credential` used to fold "the backend said no such user" and
+    /// "the backend never answered" into the same `None`, which `validate_http`
+    /// turned into `false`, which the challenge arm read as present-but-invalid
+    /// credentials — the *strong* signal. Two REGISTER retries during an auth
+    /// backend outage therefore banned a real subscriber's address for an hour,
+    /// which is precisely backwards: during an outage every subscriber retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreachable_auth_backend_is_unavailable_not_rejected() {
+        pyo3::Python::initialize();
+        // Port 9 (discard) on loopback: nothing listens, so the connect is
+        // refused promptly rather than waiting out the timeout.
+        let auth = http_auth_with_cache(0);
+
+        assert_eq!(
+            auth.validate_credentials(
+                &well_formed_authorization("alice"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Unavailable,
+            "a backend that did not answer says nothing about the peer"
+        );
+    }
+
+    /// The distinction that has to survive: an answer of "no" is still a real
+    /// rejection and must keep its high-confidence weight, or turning the
+    /// outage case off would also disarm password brute-force detection.
+    #[test]
+    fn wrong_password_is_rejected_not_unavailable() {
+        let auth = make_auth();
+        let nonce = format!("{:016x}.test", now_unix_secs());
+        let wrong = format!(
+            "Digest username=\"alice\", realm=\"example.com\", nonce=\"{nonce}\", \
+             uri=\"sip:example.com\", response=\"{}\"",
+            "f".repeat(32)
+        );
+        assert_eq!(
+            auth.validate_credentials(&wrong, "example.com", "REGISTER"),
+            CredentialCheck::Rejected
+        );
+    }
+
+    /// An unparseable or absurd `Authorization` is the peer's doing, so it is a
+    /// rejection — the peer sent something and it was refused.
+    #[test]
+    fn malformed_authorization_is_rejected() {
+        let auth = make_auth();
+        assert_eq!(
+            auth.validate_credentials("Digest nonsense", "example.com", "REGISTER"),
+            CredentialCheck::Rejected
+        );
+    }
+
+    /// A backend siphon cannot dispatch to is an operator error. Nothing about
+    /// the request was ever evaluated, so it must not weigh on the source.
+    #[test]
+    fn unsupported_backend_is_unavailable() {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Database);
+        assert_eq!(
+            auth.validate_credentials(
+                &well_formed_authorization("alice"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Unavailable
+        );
     }
 
     #[test]

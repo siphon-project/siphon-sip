@@ -160,6 +160,20 @@ check still runs, so a captured `Authorization` cannot be replayed (RFC 7616
 `siphon_credential_failures_total` — a path that authenticates without counting
 would be a blind spot for anyone alerting on brute force.
 
+A *rejection* is the case above: credentials were presented and refused. Two
+neighbouring cases score differently, and both used to be conflated with it:
+
+- **No credentials at all.** The RFC 3261 §22.2 opening leg. Counted at
+  `failed_auth_ban.missing_credentials_weight`, which is `0` by default, and
+  visible in `siphon_auth_failures_total`.
+- **The credential source could not answer** — an HTTP auth backend timeout or
+  connection failure, or no usable backend configured. Never counted: it says
+  nothing about the peer. It increments `siphon_auth_backend_errors_total`,
+  which is worth an alert of its own — a non-zero rate means authentication is
+  failing into 401s for every subscriber.
+
+See [Hardening & security](../cookbook/security.md) for the full scoring table.
+
 ::: siphon_sdk.mock_module.MockAuth
 
 ## `ipsec` namespace

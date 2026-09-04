@@ -71,6 +71,17 @@ pub async fn listen(
                         debug!("TCP rejected {} by ACL", remote_addr);
                         continue;
                     }
+                    // See the TLS listener for why this is taken here, before
+                    // the spawn, and dropped silently rather than banned.
+                    let mut permit = match crate::security::try_accept_connection(remote_addr.ip())
+                    {
+                        Ok(permit) => permit,
+                        Err(reason) => {
+                            debug!("TCP refused {} by connection limit: {reason}", remote_addr);
+                            crate::security::record_connection_refused(reason);
+                            continue;
+                        }
+                    };
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
 
@@ -92,6 +103,9 @@ pub async fn listen(
                         else {
                             return;
                         };
+                        // Confirmed SIP: the handshake slot goes back, the
+                        // connection slot stays with `permit` below.
+                        permit.handshake_done();
 
                         let connection_id = next_connection_id();
                         debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
@@ -213,8 +227,7 @@ pub(crate) fn classify_incomplete_stream(buffer: &[u8]) -> StreamVerdict {
     // Wait for the first line to complete before judging its request/status shape.
     match buffer.windows(2).position(|window| window == b"\r\n") {
         Some(line_end) => {
-            let line = &buffer[..line_end];
-            if line.starts_with(b"SIP/2.0 ") || line.ends_with(b" SIP/2.0") {
+            if is_sip_start_line(&buffer[..line_end]) {
                 StreamVerdict::MaybeSip
             } else {
                 StreamVerdict::Garbage
@@ -224,6 +237,17 @@ pub(crate) fn classify_incomplete_stream(buffer: &[u8]) -> StreamVerdict {
         // (bounded by the size cap above and the connection idle timeout).
         None => StreamVerdict::MaybeSip,
     }
+}
+
+/// Whether `line` is a SIP start-line — a request-line (RFC 3261 §7.1) or a
+/// status-line (§7.2).
+///
+/// RFC 3261 permits extension methods, so the method token is deliberately not
+/// checked against a list: a request-line qualifies while it ends with
+/// ` SIP/2.0`, and a status-line while it starts with `SIP/2.0 `. Anything else
+/// with a complete first line is not SIP.
+pub(crate) fn is_sip_start_line(line: &[u8]) -> bool {
+    line.starts_with(b"SIP/2.0 ") || line.ends_with(b" SIP/2.0")
 }
 
 /// Verdict for one framing attempt over a stream accumulator.
@@ -261,11 +285,33 @@ pub fn frame_sip_message(buffer: &[u8], max_message_bytes: usize) -> FrameVerdic
             StreamVerdict::Garbage => FrameVerdict::Garbage,
         };
     };
+    // A complete header block is not the same thing as a SIP message. An HTTP
+    // request block also ends `\r\n\r\n`, and `extract_sip_message_length`
+    // defaults a missing `Content-Length` to zero, so a scanner's `GET /` frames
+    // as a complete "message" and reaches the parser — which has no connection
+    // to close and no source to count. The start line has to be judged here, on
+    // every message, because the sniff at accept
+    // ([`super::stream::sniff_stream`]) judges only the connection's *first*
+    // line and assumes SIP for a peer that stays silent past its window, so a
+    // probe that waits before speaking skips it entirely.
+    //
+    // Before the size check below: a non-SIP block that declares a huge
+    // `Content-Length` is garbage, not an oversized SIP message owed a 513.
+    let prefix = crate::sip::parser::leading_crlf_len(buffer);
+    let first_line_end = buffer[prefix..]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|end| prefix + end)
+        // Unreachable: `extract_sip_message_length` returned `Some`, so a
+        // `\r\n\r\n` exists past the prefix. Refuse rather than index blindly.
+        .unwrap_or(buffer.len());
+    if !is_sip_start_line(&buffer[prefix..first_line_end]) {
+        return FrameVerdict::Garbage;
+    }
     if len > max_message_bytes {
         // Safe: `extract_sip_message_length` returned `Some`, so `\r\n\r\n`
         // is present and the header block is fully buffered. Measured past any
         // leading CRLF keepalives, exactly as the length above was.
-        let prefix = crate::sip::parser::leading_crlf_len(buffer);
         let header_len = buffer[prefix..]
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -603,9 +649,9 @@ mod tests {
     }
 
     /// The pre-existing `classify_incomplete_stream` guards still fire through
-    /// the new entry point, unchanged: they apply only while the header block
-    /// is incomplete (a buffer that already holds `\r\n\r\n` frames as a
-    /// message and is judged further up the stack).
+    /// this entry point, unchanged, while the header block is incomplete. A
+    /// buffer that already holds `\r\n\r\n` is judged by the start-line check
+    /// instead — see [`http_request_block_is_garbage_not_a_message`].
     #[test]
     fn frame_sip_message_preserves_garbage_classification() {
         // A complete non-SIP first line, still mid-header-block.
@@ -627,6 +673,104 @@ mod tests {
         let mut flood = b"INVITE sip:bob@example.com SIP/2.0\r\n".to_vec();
         flood.resize(MAX_INCOMPLETE_HEADER_BYTES + 1, b'x');
         assert_eq!(frame_sip_message(&flood, CEILING), FrameVerdict::Garbage);
+    }
+
+    /// The probe this check exists to stop. A *complete* HTTP request block
+    /// satisfies `extract_sip_message_length` — it ends `\r\n\r\n` and carries
+    /// no `Content-Length`, which defaults to zero — so before the start-line
+    /// check it framed as a complete "message", reached the dispatcher, and was
+    /// rejected only by the parser, which has no connection to close and no
+    /// source to record. A scanner could probe indefinitely over one connection.
+    ///
+    /// It is not caught by the accept-time sniff either: that judges only the
+    /// connection's first line and assumes SIP for a peer that sends nothing
+    /// inside its window, so a probe that connects, waits, then speaks skips it.
+    #[test]
+    fn http_request_block_is_garbage_not_a_message() {
+        for probe in [
+            &b"GET / HTTP/1.1\r\nHost: sip.example.com:443\r\n\r\n"[..],
+            &b"GET / HTTP/1.0\r\n\r\n"[..],
+            &b"POST /phpinfo.php HTTP/1.1\r\nContent-Length: 0\r\n\r\n"[..],
+            // No recognisable protocol at all, but a well-formed header block.
+            &b"hello world\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                frame_sip_message(probe, CEILING),
+                FrameVerdict::Garbage,
+                "expected Garbage for {:?}",
+                String::from_utf8_lossy(probe)
+            );
+        }
+    }
+
+    /// Leading CRLF keepalives (RFC 5626 §4.4.1) must not hide the start line
+    /// from the check. The inbound readers drain them first, but the outbound
+    /// pool frames straight off its accumulator, so the start line is measured
+    /// past the same prefix the length is.
+    #[test]
+    fn http_request_block_behind_crlf_keepalives_is_garbage() {
+        assert_eq!(
+            frame_sip_message(b"\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", CEILING),
+            FrameVerdict::Garbage
+        );
+    }
+
+    /// A non-SIP block declaring a huge body is garbage, not an oversized SIP
+    /// message: the start-line check runs before the ceiling, so the peer is
+    /// disconnected rather than answered 513 (which would need a Via it has not
+    /// got, and would fingerprint the port to a scanner).
+    #[test]
+    fn non_sip_block_declaring_a_huge_body_is_garbage_not_oversized() {
+        assert_eq!(
+            frame_sip_message(
+                b"GET / HTTP/1.1\r\nContent-Length: 4000000000\r\n\r\n",
+                CEILING
+            ),
+            FrameVerdict::Garbage
+        );
+    }
+
+    /// Every legitimate start-line shape still frames. RFC 3261 §7.1 permits
+    /// extension methods, so the method token is never checked against a list —
+    /// only the ` SIP/2.0` tail (request) or `SIP/2.0 ` head (status).
+    #[test]
+    fn every_sip_start_line_shape_still_frames() {
+        let requests: [&[u8]; 4] = [
+            b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+            b"REGISTER sip:example.com SIP/2.0\r\n\r\n",
+            // Extension method (RFC 6086 INFO is registered; an unregistered
+            // token must frame just the same).
+            b"FROBNICATE sip:bob@example.com SIP/2.0\r\n\r\n",
+            b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ];
+        for message in requests {
+            assert_eq!(
+                frame_sip_message(message, CEILING),
+                FrameVerdict::Complete { len: message.len() },
+                "expected Complete for {:?}",
+                String::from_utf8_lossy(message)
+            );
+        }
+
+        // With a body, and behind keepalive CRLFs.
+        let with_body = b"\r\nSIP/2.0 200 OK\r\nContent-Length: 4\r\n\r\nAAAA";
+        assert_eq!(
+            frame_sip_message(with_body, CEILING),
+            FrameVerdict::Complete {
+                len: with_body.len()
+            }
+        );
+    }
+
+    #[test]
+    fn is_sip_start_line_accepts_requests_and_status_lines_only() {
+        assert!(is_sip_start_line(b"INVITE sip:bob@example.com SIP/2.0"));
+        assert!(is_sip_start_line(b"SIP/2.0 486 Busy Here"));
+        assert!(!is_sip_start_line(b"GET / HTTP/1.1"));
+        assert!(!is_sip_start_line(b"SIP/2.0"));
+        assert!(!is_sip_start_line(b""));
+        // A URI that merely mentions the token is not a start line.
+        assert!(!is_sip_start_line(b"Via: SIP/2.0/TCP host"));
     }
 
     /// The ceiling counts headers *and* body, so a message whose header block

@@ -18,13 +18,22 @@ security:
   scanner_block:
     user_agents: ["sipvicious", "friendly-scanner", "VaxSip", "sipcli"]
 
-  trusted_cidrs: ["10.0.0.0/8"] # own infra: never rate-limited, never banned
+  trusted_cidrs: ["10.0.0.0/8"] # own infra: never rate-limited, never banned,
+                                # never refused by connection_limits
+
+  connection_limits:            # always on — every field defaults
+    max_handshakes_per_source: 32
+    max_handshakes: 1024
+    max_connections_per_source: 256
+    max_connections: 16384
 
   failed_auth_ban:              # auto-ban at accept (UDP/TCP/TLS/WS/SCTP)
     threshold: 10               # weighted failures in window_secs → ban
     window_secs: 600
     ban_duration_secs: 3600
     strong_signal_weight: 3     # weight of a high-confidence abuse signal
+    missing_credentials_weight: 0   # default: a credential-less request is the
+                                    # RFC-mandated first leg, not evidence
 
   apiban:                       # optional: APIBAN community blocklist
     api_key: "your-api-key"
@@ -49,18 +58,65 @@ how hard they are to fake:
 
 | Signal | Score |
 |--------|-------|
-| 401/407 challenge with no follow-up success | 1 |
 | INVITE server-transaction timeout (never ACKed) | 1 |
-| Wrong password, or a forged/stale/replayed digest nonce | `strong_signal_weight` (default 3) |
+| Failed or timed-out TLS/WSS/WS handshake | 1 |
+| Wrong password, a username the auth backend denied, or a forged/stale/replayed digest nonce | `strong_signal_weight` (default 3) |
 | Non-SIP bytes on a TCP/TLS stream | `strong_signal_weight` |
-| Failed TLS/WSS/WS handshake | `strong_signal_weight` |
 | Scanner User-Agent (`scanner_block`) | `strong_signal_weight` |
+| 401/407 challenge because the request carried **no** credentials | `missing_credentials_weight` (default **0** — not counted) |
+| A credential check the auth backend could not answer | **never counted** |
 
-Signals arriving over TCP (handshake, malformed bytes) score high because the source
-IP is validated by the three-way handshake — it can't be spoofed, and a legitimate
-client never trips them. A **successful authentication resets the score to zero**,
-so a subscriber who mistypes a password twice then logs in is never banned, while an
-IP spraying garbage is banned ~3× faster than one just rattling doorknobs.
+Signals carrying present-but-wrong credentials, or garbage over TCP, score high
+because they are unambiguous: the source IP is validated by the three-way handshake
+so it cannot be spoofed, and a legitimate client never trips them. A **successful
+authentication resets the score to zero**, so a subscriber who mistypes a password
+twice then logs in is never banned, while an IP spraying garbage is banned 3× faster
+than one just rattling doorknobs.
+
+The last two rows are the ones worth understanding, because both were once counted
+and both banned real subscribers:
+
+- **A request with no credentials is not evidence.** RFC 3261 §22.2 makes it the
+  opening leg of challenge-response — every client sends one before it has a nonce.
+  Counting it means a handset stuck in a retry loop earns an hour-long ban, and
+  behind CGNAT that address is shared, so the ban lands on every subscriber behind
+  it. Volume still shows in `siphon_auth_failures_total`; set
+  `missing_credentials_weight: 1` if you want the old scoring back.
+- **An auth-backend outage is not an attack.** A `GET` to your credential endpoint
+  that times out tells you nothing about the peer. It used to be indistinguishable
+  from a wrong password, so two REGISTER retries during an outage banned the
+  subscriber — exactly when every subscriber is retrying. Alert on
+  `siphon_auth_backend_errors_total` instead; a non-zero rate means authentication
+  is failing into 401s for everyone.
+
+### Bounding what one source can spend
+
+`connection_limits` is a separate, always-on layer, and it covers what the ban
+counter structurally cannot: a source that opens 50 TLS connections at once and
+completes none of them never produces a *completed* failure to count, while each
+connection burns a real handshake and pins a task for the full 10 s handshake
+timeout.
+
+Two ceilings, because the resources differ. An in-flight handshake is CPU held
+briefly and no legitimate client has many at once, so that one is tight (32 per
+source). An established connection is a socket held until the peer leaves or the
+300 s idle timeout reaps it, and a busy NAT legitimately holds many, so that one is
+loose (256 per source). Each has a global twin for distributed floods. `0` disables
+a ceiling; `trusted_cidrs` are exempt from all of them.
+
+Refused connections are dropped silently and **not** banned — hitting a concurrency
+ceiling is a capacity fact, not proof of intent, and a NAT whose UEs all re-register
+after a network flap looks exactly like a flood.
+
+!!! warning "Carrier NAT and `max_connections_per_source`"
+    A CGNAT pool or a large enterprise NAT can legitimately front more registrations
+    from one address than the 256 default allows, and every one of them is a paying
+    subscriber. The default is a runaway detector, not a policy — raise it, or set
+    `0`, wherever that is your topology. Watch
+    `siphon_connections_refused_total{reason="connections_per_source"}`: it tells you
+    the ceiling is binding on real traffic before the support tickets do.
+    `siphon_stream_connections_active` and `siphon_handshakes_in_flight` are what you
+    size against.
 
 Bans are enforced at `recv()`/`accept()` — before any SIP parsing — and expire on
 their own. `trusted_cidrs` are exempt from scoring entirely, so put your load

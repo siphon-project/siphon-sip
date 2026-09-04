@@ -413,27 +413,79 @@ auth:
 #                               # Default 262144 (256 KB); minimum 4096. Applies
 #                               # even with no security block configured.
 #
+#   connection_limits:          # ALWAYS ON — ceilings on concurrent inbound
+#                               # stream connections. Every field defaults, so
+#                               # these apply with no security block at all.
+#                               # 0 disables an individual ceiling.
+#     max_handshakes_per_source: 32     # concurrent TLS/WS handshakes + first-
+#                               # line sniffs from one source. A legitimate
+#                               # client has one; abuse runs dozens at once,
+#                               # each pinning a task for the whole 10 s
+#                               # handshake timeout. The auto-ban cannot help
+#                               # here — it needs *completed* failures first.
+#     max_handshakes: 1024      # the same, across all sources: what bounds the
+#                               # CPU a distributed flood can spend, since the
+#                               # per-source ceiling says nothing about how many
+#                               # sources there are.
+#     max_connections_per_source: 256   # established stream connections from
+#                               # one source.
+#                               # >>> RAISE THIS (or set 0) IF ONE UPSTREAM
+#                               # ADDRESS LEGITIMATELY FRONTS HUNDREDS OF
+#                               # REGISTRATIONS — a carrier CGNAT pool, a large
+#                               # enterprise NAT, an aggregator. The default is
+#                               # a runaway detector, not a policy. Watch
+#                               # siphon_connections_refused_total
+#                               # {reason="connections_per_source"} to see it
+#                               # binding on real traffic before the tickets
+#                               # arrive.
+#     max_connections: 16384    # established connections across all sources.
+#     # Refused connections are dropped silently and are NOT banned: hitting a
+#     # concurrency ceiling is a capacity fact, not proof of intent (a NAT whose
+#     # UEs all re-register after a network flap looks exactly like a flood), and
+#     # the ceiling has already done the protective work. trusted_cidrs are
+#     # exempt from both ceilings, so a trunk or a probe is never refused.
+#     # Gauges: siphon_stream_connections_active, siphon_handshakes_in_flight.
+#
 #   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
 #     threshold: 10             # weighted failures within window_secs before a ban
 #     window_secs: 600          # sliding window for counting failures (default 600)
 #     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires)
 #     strong_signal_weight: 3   # weight of a high-confidence abuse signal toward
 #                               # threshold (default 3); a plain probe counts as 1
+#     missing_credentials_weight: 0     # weight of a challenge issued because the
+#                               # request carried NO credentials. Default 0 —
+#                               # not counted. That request is the RFC 3261 §22.2
+#                               # opening leg of challenge-response, which every
+#                               # client sends before it has a nonce, so counting
+#                               # it bans clients for behaving correctly; behind
+#                               # CGNAT one handset in a retry loop then takes
+#                               # out every subscriber sharing the address. Set
+#                               # to 1 for the pre-1.8 behaviour. Volume stays
+#                               # visible in siphon_auth_failures_total either way.
 #     # Failures counted toward the ban, by weight:
 #     #   weight 1 (low-confidence — may fire for a benign peer):
-#     #     - an auth challenge (401/407) not followed by a successful auth
 #     #     - a non-ACK INVITE server-transaction timeout (toll-fraud pattern)
 #     #     - a failed/timed-out TLS / WSS / WS handshake
 #     #   weight = strong_signal_weight (high-confidence abuse — bans faster):
-#     #     - present-but-invalid digest credentials (wrong password), or a
-#     #       forged / stale / replayed nonce  [over UDP this stays weight 1,
-#     #       since a UDP source is spoofable and would amplify a reflected ban]
-#     #     - non-SIP bytes on a TCP/TLS stream, decided from the connection's
-#     #       first line before the SIP framer runs (an HTTP probe such as a
-#     #       /phpinfo.php scan, a TLS record on the plaintext port, random
-#     #       bytes); the connection is closed and never answered
+#     #     - present-but-invalid digest credentials (wrong password), a username
+#     #       the auth backend denied, or a forged / stale / replayed nonce
+#     #       [over UDP this stays weight 1, since a UDP source is spoofable and
+#     #       would amplify a reflected ban]
+#     #     - non-SIP bytes on a TCP/TLS stream — decided from the connection's
+#     #       first line at accept AND from the start line of every message
+#     #       thereafter (an HTTP probe such as a /phpinfo.php scan, a TLS record
+#     #       on the plaintext port, random bytes); the connection is closed and
+#     #       never answered
 #     #     - a request whose User-Agent matched scanner_block, over a
 #     #       connection-oriented transport (UDP scanner UAs are dropped, not banned)
+#     #   weight = missing_credentials_weight (default 0 — not counted):
+#     #     - a challenge issued because the request carried no credentials
+#     # NOT counted at all:
+#     #     - a credential check the auth backend could not answer (HTTP timeout
+#     #       or connection failure, no usable backend configured). An outage of
+#     #       your own credential source is not evidence about the peer, and
+#     #       counting it banned real subscribers two REGISTER retries in. Alert
+#     #       on siphon_auth_backend_errors_total instead.
 #     # A successful auth resets the source's counter, so a legit client that
 #     # challenges-then-succeeds (or retries a stale nonce) never accumulates.
 #     # trusted_cidrs are exempt — put load balancers / health-check probes

@@ -16,6 +16,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use siphon::sip::parse_sip_message;
 use siphon::transaction::TransactionManager;
+use siphon::transport::tcp::{frame_sip_message, FrameVerdict};
 use std::hint::black_box;
 
 /// A realistic offer SDP — the common INVITE body the parser walks on every call.
@@ -236,12 +237,59 @@ fn bench_txn_key(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Stream framing (RFC 3261 §18.3) — the first thing every message over
+/// TCP/TLS/WS goes through, before the parser sees a byte. It scans for the
+/// end-of-headers marker, reads `Content-Length`, and checks the start line is
+/// SIP (a complete HTTP request block also ends `\r\n\r\n`, so length alone
+/// cannot tell a scanner's probe from a message).
+///
+/// Not benched before this, and it runs per message on every stream transport,
+/// so it belongs in the release-cut gate alongside parse and serialize.
+fn bench_framing(criterion: &mut Criterion) {
+    let invite_sdp = invite_with_sdp();
+    let invite = invite_sdp.as_bytes();
+    let response = RESPONSE_200.as_bytes();
+    // Two messages back to back — the pipelined case a busy TCP connection
+    // actually presents, where framing has to find the first boundary without
+    // being confused by the second message behind it.
+    let mut pipelined = invite_sdp.clone();
+    pipelined.push_str(RESPONSE_200);
+    let pipelined = pipelined.into_bytes();
+
+    let ceiling = 256 * 1024;
+    let mut group = criterion.benchmark_group("framing");
+    group.throughput(Throughput::Bytes(invite.len() as u64));
+    group.bench_function("invite_sdp", |bencher| {
+        bencher.iter(|| black_box(frame_sip_message(black_box(invite), ceiling)));
+    });
+    group.bench_function("response_200", |bencher| {
+        bencher.iter(|| black_box(frame_sip_message(black_box(response), ceiling)));
+    });
+    group.bench_function("pipelined", |bencher| {
+        bencher.iter(|| black_box(frame_sip_message(black_box(&pipelined), ceiling)));
+    });
+    // The rejection path: a scanner's HTTP probe, which must be refused rather
+    // than framed. Cheap by construction — it is decided on the first line.
+    let probe = b"GET / HTTP/1.1\r\nHost: sip.example.com\r\n\r\n";
+    group.bench_function("http_probe_refused", |bencher| {
+        bencher.iter(|| {
+            debug_assert!(matches!(
+                frame_sip_message(black_box(probe), ceiling),
+                FrameVerdict::Garbage
+            ));
+            black_box(frame_sip_message(black_box(probe), ceiling))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
     bench_serialize,
     bench_roundtrip,
     bench_headers,
-    bench_txn_key
+    bench_txn_key,
+    bench_framing
 );
 criterion_main!(benches);
