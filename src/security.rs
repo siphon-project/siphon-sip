@@ -1,12 +1,25 @@
 //! Auto-ban store — per-source-IP failure tracking with TTL bans.
 //!
 //! Feeds the transport ACL ([`crate::transport::acl::TransportAcl::is_allowed`])
-//! so a banned source is dropped at accept/recv, before any SIP parsing. Two
-//! failure signals increment the same per-IP counter:
-//!   * an auth challenge issued without valid credentials ([`crate::script::api`]
-//!     auth path), and
+//! so a banned source is dropped at accept/recv, before any SIP parsing. Several
+//! failure signals increment the same per-IP counter, at different weights:
+//!   * rejected credentials — a wrong password, a denied username, or a
+//!     forged/stale/replayed nonce ([`crate::script::api`] auth path): weight
+//!     `strong_signal_weight` over a transport whose handshake validates the
+//!     source, weight 1 over UDP where it does not;
+//!   * non-SIP bytes on a stream transport, and a scanner `User-Agent`: weight
+//!     `strong_signal_weight`;
+//!   * a failed or timed-out TLS/WS handshake: weight 1;
 //!   * a non-ACK INVITE **server**-transaction timeout (dispatcher) — the peer
-//!     sent an INVITE, got a final response, and never ACKed it.
+//!     sent an INVITE, got a final response, and never ACKed it: weight 1;
+//!   * a challenge issued because the request carried *no* credentials: weight
+//!     `missing_credentials_weight`, **0 by default**. That leg is required by
+//!     RFC 3261 §22.2, so counting it bans clients for behaving correctly.
+//!
+//! What is deliberately **not** a signal: a credential source that could not
+//! answer. An HTTP auth backend that times out is an outage of ours, not
+//! evidence about the peer, and counting it turned one backend blip into
+//! hour-long bans on real subscribers.
 //!
 //! A successful authentication resets the counter, so a legitimate client that
 //! challenges-then-succeeds never accumulates. Sources matching `trusted_cidrs`
@@ -17,6 +30,7 @@
 //! `security.failed_auth_ban` is configured.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -144,6 +158,395 @@ pub fn record_malformed_message(source: IpAddr, transport: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inbound connection limits
+// ---------------------------------------------------------------------------
+
+/// Default ceiling on concurrent in-flight handshakes from one source.
+///
+/// A legitimate client opens one connection and completes its handshake; even a
+/// large NAT re-registering after a network flap arrives as a stream of them,
+/// not as a wall of simultaneous half-open ones. Observed abuse ran ~50 at once
+/// from a single address, each pinning a task for the full handshake timeout.
+pub const DEFAULT_MAX_HANDSHAKES_PER_SOURCE: u32 = 32;
+
+/// Default ceiling on concurrent in-flight handshakes across all sources.
+///
+/// What bounds the CPU a *distributed* flood can spend: a TLS handshake is real
+/// asymmetric crypto, and the per-source cap alone does not bound how many
+/// sources there are.
+pub const DEFAULT_MAX_HANDSHAKES: u32 = 1024;
+
+/// Default ceiling on established stream connections from one source.
+///
+/// A runaway detector, not a policy — see the type-level note on
+/// [`ConnectionLimits`] about carrier NAT.
+pub const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: u32 = 256;
+
+/// Default ceiling on established stream connections across all sources.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 16_384;
+
+/// Ceilings on concurrent inbound stream connections, per source and overall.
+///
+/// Two different resources, because they are abused differently. An *in-flight
+/// handshake* is CPU and a task; it is held for at most the handshake timeout,
+/// and no legitimate peer has many at once, so that cap can be tight. An
+/// *established connection* is a socket, a read buffer and a slot in the
+/// connection map, held until the peer leaves or the 300 s idle timeout reaps
+/// it, and a busy NAT legitimately holds many — so that cap has to be loose.
+///
+/// **The established per-source cap and carrier NAT.** A CGNAT address can front
+/// far more registered UEs than the default allows, and every one of them is a
+/// paying subscriber. The default is sized to catch a runaway, not to express a
+/// policy: raise `max_connections_per_source` (or set it to 0) wherever one
+/// upstream address legitimately carries hundreds of registrations.
+/// `siphon_connections_refused_total{reason="connections_per_source"}` is how
+/// that shows up before the support tickets do.
+///
+/// Every field is a maximum; `0` disables that particular ceiling.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionLimits {
+    /// Concurrent handshakes (TLS/WS) plus first-line sniffs from one source.
+    pub max_handshakes_per_source: u32,
+    /// Concurrent handshakes across all sources.
+    pub max_handshakes: u32,
+    /// Established stream connections from one source.
+    pub max_connections_per_source: u32,
+    /// Established stream connections across all sources.
+    pub max_connections: u32,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            max_handshakes_per_source: DEFAULT_MAX_HANDSHAKES_PER_SOURCE,
+            max_handshakes: DEFAULT_MAX_HANDSHAKES,
+            max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
+/// Which ceiling refused a connection. Names the `reason` metric label so an
+/// operator can tell "one source is misbehaving" from "the box is full".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedReason {
+    HandshakesPerSource,
+    Handshakes,
+    ConnectionsPerSource,
+    Connections,
+}
+
+impl RefusedReason {
+    /// Metric label / log value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HandshakesPerSource => "handshakes_per_source",
+            Self::Handshakes => "handshakes",
+            Self::ConnectionsPerSource => "connections_per_source",
+            Self::Connections => "connections",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusedReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Process-wide inbound connection limiter. Installed unconditionally at
+/// startup (unlike the opt-in guards above) because the ceilings it enforces
+/// have to hold even for a deployment with no `security:` block at all.
+static CONNECTION_LIMITER: OnceLock<Arc<ConnectionLimiter>> = OnceLock::new();
+
+/// Install the process-wide connection limiter (idempotent — a second call is a
+/// no-op). Called once at server startup before any listener binds.
+pub fn set_connection_limiter(limiter: Arc<ConnectionLimiter>) {
+    let _ = CONNECTION_LIMITER.set(limiter);
+}
+
+/// The process-wide connection limiter, if one has been installed.
+pub fn connection_limiter() -> Option<&'static Arc<ConnectionLimiter>> {
+    CONNECTION_LIMITER.get()
+}
+
+/// Take a slot for a newly accepted stream connection from `source`.
+///
+/// Call from an accept loop right after the ACL check and before spawning the
+/// connection task, then move the returned permit into that task: the
+/// established slot is held for as long as the permit lives, so every exit path
+/// — clean close, error, panic — frees it. Release the handshake half with
+/// [`AcceptPermit::handshake_done`] once the connection is confirmed to speak
+/// SIP.
+///
+/// Returns an unmetered permit when no limiter is installed, so a caller never
+/// has to branch on whether the feature is on.
+pub fn try_accept_connection(source: IpAddr) -> Result<AcceptPermit, RefusedReason> {
+    match connection_limiter() {
+        Some(limiter) => limiter.try_accept(source),
+        None => Ok(AcceptPermit::unmetered(source)),
+    }
+}
+
+/// Per-source and global counters behind [`try_accept_connection`].
+pub struct ConnectionLimiter {
+    limits: ConnectionLimits,
+    /// Sources exempt from every ceiling (trunks, monitoring, own infra).
+    trusted: Vec<IpNet>,
+    /// IP → in-flight handshakes. Only populated when the per-source handshake
+    /// ceiling is enabled, so an unlimited policy allocates nothing per source.
+    handshakes: DashMap<IpAddr, u32>,
+    /// IP → established connections. Same conditional-population rule.
+    connections: DashMap<IpAddr, u32>,
+    handshakes_total: AtomicU32,
+    connections_total: AtomicU32,
+}
+
+impl ConnectionLimiter {
+    /// Build a limiter from the configured ceilings and `trusted_cidrs`.
+    /// Invalid CIDRs are ignored (logged by the caller), matching
+    /// [`AutoBanStore::new`].
+    pub fn new(limits: ConnectionLimits, trusted_cidrs: &[String]) -> Self {
+        Self {
+            limits,
+            trusted: trusted_cidrs
+                .iter()
+                .filter_map(|cidr| cidr.parse::<IpNet>().ok())
+                .collect(),
+            handshakes: DashMap::new(),
+            connections: DashMap::new(),
+            handshakes_total: AtomicU32::new(0),
+            connections_total: AtomicU32::new(0),
+        }
+    }
+
+    fn is_trusted(&self, source: IpAddr) -> bool {
+        self.trusted.iter().any(|net| net.contains(&source))
+    }
+
+    /// Take one established-connection slot and one handshake slot, or say
+    /// which ceiling refused.
+    ///
+    /// The connection slot is taken first: it is the longer-lived resource, so
+    /// refusing on it avoids doing handshake bookkeeping for a connection that
+    /// could never be served anyway.
+    pub fn try_accept(self: &Arc<Self>, source: IpAddr) -> Result<AcceptPermit, RefusedReason> {
+        if self.is_trusted(source) {
+            return Ok(AcceptPermit::unmetered(source));
+        }
+
+        if !take_global(&self.connections_total, self.limits.max_connections) {
+            return Err(RefusedReason::Connections);
+        }
+        if !take_per_source(
+            &self.connections,
+            source,
+            self.limits.max_connections_per_source,
+        ) {
+            release_global(&self.connections_total);
+            return Err(RefusedReason::ConnectionsPerSource);
+        }
+        if !take_global(&self.handshakes_total, self.limits.max_handshakes) {
+            release_per_source(&self.connections, source);
+            release_global(&self.connections_total);
+            return Err(RefusedReason::Handshakes);
+        }
+        if !take_per_source(
+            &self.handshakes,
+            source,
+            self.limits.max_handshakes_per_source,
+        ) {
+            release_global(&self.handshakes_total);
+            release_per_source(&self.connections, source);
+            release_global(&self.connections_total);
+            return Err(RefusedReason::HandshakesPerSource);
+        }
+
+        self.publish_gauges();
+        Ok(AcceptPermit {
+            limiter: Some(Arc::clone(self)),
+            source,
+            handshake_held: true,
+            connection_held: true,
+        })
+    }
+
+    fn release_handshake(&self, source: IpAddr) {
+        release_per_source(&self.handshakes, source);
+        release_global(&self.handshakes_total);
+        self.publish_gauges();
+    }
+
+    fn release_connection(&self, source: IpAddr) {
+        release_per_source(&self.connections, source);
+        release_global(&self.connections_total);
+        self.publish_gauges();
+    }
+
+    fn publish_gauges(&self) {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .handshakes_in_flight
+                .set(i64::from(self.handshakes_total.load(Ordering::Relaxed)));
+            metrics
+                .stream_connections_active
+                .set(i64::from(self.connections_total.load(Ordering::Relaxed)));
+        }
+    }
+
+    /// Number of sources currently holding at least one slot, as
+    /// `(handshakes, connections)`. Both must return to zero once every permit
+    /// is dropped — these maps are keyed by a live entity, so a row that
+    /// outlives its connection is a per-source leak.
+    #[cfg(test)]
+    fn tracked_sources(&self) -> (usize, usize) {
+        (self.handshakes.len(), self.connections.len())
+    }
+}
+
+/// Take one per-source slot, or report the ceiling was reached.
+///
+/// A zero ceiling means unlimited, and deliberately does not touch the map: an
+/// operator who turned the cap off should not pay a row per source for it.
+fn take_per_source(map: &DashMap<IpAddr, u32>, source: IpAddr, limit: u32) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let mut entry = map.entry(source).or_insert(0);
+    if *entry >= limit {
+        return false;
+    }
+    *entry += 1;
+    true
+}
+
+/// Give back one per-source slot, removing the row when it reaches zero.
+///
+/// The row must go, not merely decrement: leaving zeroes behind would grow the
+/// map by one entry per source ever seen, which is exactly the shape of leak
+/// this kind of table is prone to.
+fn release_per_source(map: &DashMap<IpAddr, u32>, source: IpAddr) {
+    // Never hold a shard guard across another operation on the same map — take
+    // the decision inside this scope and act on it after the guard is dropped.
+    let now_empty = {
+        match map.get_mut(&source) {
+            Some(mut entry) => {
+                *entry = entry.saturating_sub(1);
+                *entry == 0
+            }
+            // Unmetered (the ceiling is off) or already released.
+            None => false,
+        }
+    };
+    if now_empty {
+        map.remove_if(&source, |_, count| *count == 0);
+    }
+}
+
+/// Take one global slot. A zero ceiling still counts — the total is what the
+/// active-connections gauge reports.
+fn take_global(counter: &AtomicU32, limit: u32) -> bool {
+    if limit == 0 {
+        counter.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn release_global(counter: &AtomicU32) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
+/// A held pair of connection slots. Dropping it gives back whatever is still
+/// held, so no accept path can leak a slot by returning early.
+pub struct AcceptPermit {
+    /// `None` for a trusted source, or when no limiter is installed — nothing
+    /// was taken, so nothing is given back.
+    limiter: Option<Arc<ConnectionLimiter>>,
+    source: IpAddr,
+    handshake_held: bool,
+    connection_held: bool,
+}
+
+// Hand-written so the permit can be `unwrap_err`'d in tests and logged, without
+// dragging the whole limiter (two `DashMap`s) into a `Debug` impl.
+impl std::fmt::Debug for AcceptPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptPermit")
+            .field("source", &self.source)
+            .field("metered", &self.limiter.is_some())
+            .field("handshake_held", &self.handshake_held)
+            .field("connection_held", &self.connection_held)
+            .finish()
+    }
+}
+
+impl AcceptPermit {
+    /// A permit that counts against nothing.
+    fn unmetered(source: IpAddr) -> Self {
+        Self {
+            limiter: None,
+            source,
+            handshake_held: false,
+            connection_held: false,
+        }
+    }
+
+    /// Give back the handshake slot, keeping the established-connection slot.
+    ///
+    /// Call as soon as the connection is known to speak SIP — after the TLS
+    /// handshake and the first-line sniff. Holding it for the connection's whole
+    /// life would make the tight handshake ceiling behave like a second, much
+    /// stricter connection ceiling. Idempotent.
+    pub fn handshake_done(&mut self) {
+        if !self.handshake_held {
+            return;
+        }
+        self.handshake_held = false;
+        if let Some(limiter) = &self.limiter {
+            limiter.release_handshake(self.source);
+        }
+    }
+}
+
+impl Drop for AcceptPermit {
+    fn drop(&mut self) {
+        let Some(limiter) = &self.limiter else {
+            return;
+        };
+        if self.handshake_held {
+            limiter.release_handshake(self.source);
+        }
+        if self.connection_held {
+            limiter.release_connection(self.source);
+        }
+    }
+}
+
+/// Count one connection refused by [`try_accept_connection`], labelled by the
+/// ceiling that refused it.
+///
+/// Deliberately not an auto-ban signal. Hitting a concurrency ceiling is a
+/// capacity fact, not proof of intent — a NAT whose UEs all re-register after a
+/// network flap arrives exactly like a flood — and the ceiling has already done
+/// the protective work by refusing the connection.
+pub fn record_connection_refused(reason: RefusedReason) {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics
+            .connections_refused_total
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+}
+
 /// Fixed-window failure counter for one source IP.
 #[derive(Debug, Clone, Copy)]
 struct FailureWindow {
@@ -170,6 +573,20 @@ pub struct AutoBanStore {
     /// these unambiguous signals faster than a bare scanning probe (weight 1)
     /// while reusing the single per-IP window. Always ≥ 1.
     strong_weight: u32,
+    /// Failure weight applied by [`Self::record_missing_credentials`] — a
+    /// challenge issued because the request carried no credentials at all.
+    ///
+    /// **Zero by default, and that is deliberate.** RFC 3261 §22.2 makes the
+    /// credential-less request the opening leg of challenge-response: every
+    /// client sends one before it has a nonce, so counting it bans clients for
+    /// behaving correctly. It fired in production — a subscriber address
+    /// accrued five in one window and lost an hour — and behind CGNAT the blast
+    /// radius is every subscriber sharing the address, none of whom did
+    /// anything. The signal it was reaching for (a scanner that only ever
+    /// probes) is covered better by `scanner_block`, `rate_limit`, apiban and
+    /// the non-SIP/handshake signals, all of which a real client never trips.
+    /// Set it to 1 to restore the old behaviour.
+    missing_credentials_weight: u32,
     /// Optional kernel-firewall handle. When wired, every new ban is also
     /// pushed to the nf_tables set so the source is dropped pre-userspace.
     firewall: OnceLock<crate::firewall::KernelFirewall>,
@@ -184,20 +601,29 @@ impl AutoBanStore {
         ban_duration_secs: u32,
         trusted_cidrs: &[String],
         strong_weight: u32,
+        missing_credentials_weight: u32,
     ) -> Self {
         let trusted = trusted_cidrs
             .iter()
             .filter_map(|cidr| cidr.parse::<IpNet>().ok())
             .collect();
+        let threshold = threshold.max(1);
         Self {
             failures: DashMap::new(),
             bans: DashMap::new(),
             trusted,
             // Guard against a zero policy disabling the feature by accident.
-            threshold: threshold.max(1),
+            threshold,
             window: Duration::from_secs(u64::from(window_secs.max(1))),
             ban_duration: Duration::from_secs(u64::from(ban_duration_secs.max(1))),
             strong_weight: strong_weight.max(1),
+            // Zero is a meaningful value here (do not count it at all) and is
+            // the default, so unlike the others this one is not clamped up.
+            // Clamped down to the threshold only to keep it on the same scale
+            // it is measured against; at exactly the threshold one
+            // credential-less request bans, which is a policy an operator can
+            // legitimately ask for.
+            missing_credentials_weight: missing_credentials_weight.min(threshold),
             firewall: OnceLock::new(),
         }
     }
@@ -213,13 +639,24 @@ impl AutoBanStore {
     }
 
     /// Record one low-confidence failure for `source` (weight 1) — a signal that
-    /// could occasionally fire for a benign peer: an auth challenge without
-    /// credentials (the legitimate first leg of challenge-response), a non-ACK
-    /// INVITE server-transaction timeout, a failed transport handshake. Returns
-    /// `true` if this call newly banned the IP (so the caller can log/metric the
+    /// could occasionally fire for a benign peer: a non-ACK INVITE
+    /// server-transaction timeout, a failed transport handshake, or a rejected
+    /// credential over UDP (where the source is spoofable). Returns `true` if
+    /// this call newly banned the IP (so the caller can log/metric the
     /// transition once).
     pub fn record_failure(&self, source: IpAddr) -> bool {
         self.record_failure_weighted_at(source, 1, Instant::now())
+    }
+
+    /// Record a challenge issued because the request carried no credentials,
+    /// weighted by `missing_credentials_weight` (0 by default — see the field).
+    ///
+    /// At weight 0 this is a total no-op: it does not create a `failures` entry,
+    /// so a scanner sweeping a /16 cannot grow the map one row per source IP
+    /// through a signal that is not being acted on anyway. Returns `true` if
+    /// this call newly banned the IP.
+    pub fn record_missing_credentials(&self, source: IpAddr) -> bool {
+        self.record_failure_weighted_at(source, self.missing_credentials_weight, Instant::now())
     }
 
     /// Record one high-confidence abuse signal for `source`, weighted by
@@ -234,6 +671,12 @@ impl AutoBanStore {
     }
 
     fn record_failure_weighted_at(&self, source: IpAddr, weight: u32, now: Instant) -> bool {
+        // A zero-weight signal is not counted at all — and specifically does not
+        // touch `failures`, so a policy that declines to act on a signal also
+        // declines to allocate a per-source row for it.
+        if weight == 0 {
+            return false;
+        }
         if self.is_trusted(source) {
             return false;
         }
@@ -572,7 +1015,7 @@ mod tests {
 
     #[test]
     fn bans_after_threshold_failures() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.7");
         assert!(!store.record_failure(source)); // 1
         assert!(!store.record_failure(source)); // 2
@@ -584,7 +1027,7 @@ mod tests {
 
     #[test]
     fn success_resets_the_counter() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.8");
         store.record_failure(source);
         store.record_failure(source);
@@ -597,7 +1040,7 @@ mod tests {
 
     #[test]
     fn trusted_cidr_never_banned() {
-        let store = AutoBanStore::new(2, 600, 3600, &["10.0.0.0/8".to_string()], 1);
+        let store = AutoBanStore::new(2, 600, 3600, &["10.0.0.0/8".to_string()], 1, 0);
         let source = ip("10.1.2.3");
         for _ in 0..10 {
             assert!(!store.record_failure(source));
@@ -608,7 +1051,7 @@ mod tests {
 
     #[test]
     fn window_rolls_so_slow_failures_do_not_ban() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.9");
         let t0 = Instant::now();
         assert!(!store.record_failure_at(source, t0));
@@ -620,7 +1063,7 @@ mod tests {
 
     #[test]
     fn ban_expires_after_ttl() {
-        let store = AutoBanStore::new(1, 600, 60, &[], 1);
+        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0);
         let source = ip("203.0.113.10");
         let t0 = Instant::now();
         assert!(store.record_failure_at(source, t0)); // threshold 1 -> immediate ban
@@ -630,7 +1073,7 @@ mod tests {
 
     #[test]
     fn prune_drops_expired_entries() {
-        let store = AutoBanStore::new(1, 600, 60, &[], 1);
+        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0);
         let source = ip("203.0.113.11");
         let t0 = Instant::now();
         store.record_failure_at(source, t0);
@@ -641,7 +1084,7 @@ mod tests {
 
     #[test]
     fn already_banned_failure_is_noop() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.12");
         assert!(store.record_failure(source)); // ban
         assert!(!store.record_failure(source)); // already banned -> not "newly banned"
@@ -650,7 +1093,7 @@ mod tests {
 
     #[test]
     fn unban_lifts_an_active_ban() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.40");
         assert!(store.record_failure(source)); // threshold 1 -> banned
         assert!(store.is_banned(source));
@@ -661,7 +1104,7 @@ mod tests {
 
     #[test]
     fn unban_of_an_unbanned_source_is_false() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.41");
         // Never banned -> nothing to lift.
         assert!(!store.unban(source));
@@ -672,7 +1115,7 @@ mod tests {
 
     #[test]
     fn banned_sources_lists_active_bans_with_remaining() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
         let one = ip("203.0.113.42");
         let two = ip("2001:db8::42");
         store.record_failure(one);
@@ -692,7 +1135,7 @@ mod tests {
     fn strong_failures_ban_faster_than_plain_probes() {
         // threshold 6, strong weight 3: two high-confidence signals (3+3=6) ban,
         // while a plain probe (weight 1) needs the full six hits.
-        let store = AutoBanStore::new(6, 600, 3600, &[], 3);
+        let store = AutoBanStore::new(6, 600, 3600, &[], 3, 0);
 
         let abuser = ip("203.0.113.30");
         assert!(!store.record_strong_failure(abuser)); // 3 < 6
@@ -710,10 +1153,68 @@ mod tests {
     #[test]
     fn strong_weight_is_clamped_to_at_least_one() {
         // A misconfigured weight of 0 must not make strong signals free.
-        let store = AutoBanStore::new(2, 600, 3600, &[], 0);
+        let store = AutoBanStore::new(2, 600, 3600, &[], 0, 0);
         let source = ip("203.0.113.32");
         assert!(!store.record_strong_failure(source)); // 1
         assert!(store.record_strong_failure(source)); // 2 -> ban
+    }
+
+    /// The regression this default exists for. A client that keeps sending
+    /// credential-less requests — a handset in a retry loop, a UA that never
+    /// caches a nonce — is doing what RFC 3261 §22.2 tells it to, and it used to
+    /// earn an hour-long ban on the fifth one. Behind CGNAT that address is
+    /// shared, so the ban lands on every subscriber behind it.
+    #[test]
+    fn missing_credentials_do_not_ban_at_the_default_weight() {
+        let store = AutoBanStore::new(5, 600, 3600, &[], 3, 0);
+        let subscriber = ip("203.0.113.40");
+
+        for _ in 0..50 {
+            assert!(!store.record_missing_credentials(subscriber));
+        }
+        assert!(!store.is_banned(subscriber));
+
+        // …and it leaves no per-source row behind, so a scanner sweeping a range
+        // cannot grow the map through a signal nothing acts on.
+        assert_eq!(store.failures.len(), 0);
+
+        // A credential the backend actually rejected still bans, from the same
+        // source, on the same store: switching the default off did not disarm
+        // the signal that matters.
+        assert!(!store.record_strong_failure(subscriber)); // 3 < 5
+        assert!(store.record_strong_failure(subscriber)); // 6 -> ban
+    }
+
+    #[test]
+    fn missing_credentials_weight_is_configurable_back_on() {
+        // weight 1 restores the pre-1.7 behaviour: five in the window, ban.
+        let store = AutoBanStore::new(5, 600, 3600, &[], 3, 1);
+        let prober = ip("203.0.113.41");
+        for _ in 0..4 {
+            assert!(!store.record_missing_credentials(prober));
+        }
+        assert!(store.record_missing_credentials(prober));
+        assert!(store.is_banned(prober));
+    }
+
+    #[test]
+    fn missing_credentials_weight_is_clamped_to_the_threshold() {
+        // An over-large value stays on the scale it is measured against rather
+        // than saturating the counter in ways the window logic cannot reason
+        // about. At exactly the threshold, one request bans — a policy an
+        // operator can legitimately ask for.
+        let store = AutoBanStore::new(3, 600, 3600, &[], 3, 99);
+        let source = ip("203.0.113.42");
+        assert!(store.record_missing_credentials(source));
+        assert!(store.is_banned(source));
+    }
+
+    #[test]
+    fn trusted_sources_are_exempt_from_missing_credential_counting() {
+        let store = AutoBanStore::new(1, 600, 3600, &["203.0.113.0/24".to_string()], 3, 1);
+        let trusted = ip("203.0.113.43");
+        assert!(!store.record_missing_credentials(trusted));
+        assert!(!store.is_banned(trusted));
     }
 
     // --- transport auto-ban signals (handshake failure, non-SIP bytes) -----
@@ -741,7 +1242,7 @@ mod tests {
         // this, one such test bans loopback and every socket test that runs
         // after it is refused at accept.
         let loopback = ["127.0.0.0/8".to_string(), "::1/128".to_string()];
-        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &loopback, 3));
+        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &loopback, 3, 0));
         set_auto_ban(Arc::clone(&store));
 
         // Handshake failures accumulate per-IP across transports and ban at the
@@ -795,6 +1296,7 @@ mod tests {
             failed_auth_ban: None,
             apiban: None,
             firewall: None,
+            connection_limits: Default::default(),
         }
     }
 
@@ -968,5 +1470,245 @@ mod tests {
             rate.prune_at(now + Duration::from_secs(61));
         }
         assert_eq!(filter.rate_limit_bans(), 0);
+    }
+
+    // --- connection limits (ConnectionLimiter) -----------------------------
+
+    fn limits(
+        max_handshakes_per_source: u32,
+        max_handshakes: u32,
+        max_connections_per_source: u32,
+        max_connections: u32,
+    ) -> ConnectionLimits {
+        ConnectionLimits {
+            max_handshakes_per_source,
+            max_handshakes,
+            max_connections_per_source,
+            max_connections,
+        }
+    }
+
+    /// The abuse this exists for: one source opening far more simultaneous
+    /// connections than it could ever be doing legitimately, each one pinning a
+    /// task for the whole handshake timeout. The auto-ban cannot help — it needs
+    /// completed failures first, and these never complete.
+    #[test]
+    fn a_source_cannot_hold_more_handshakes_than_its_ceiling() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(3, 0, 0, 0), &[]));
+        let flood = ip("203.0.113.50");
+
+        let held: Vec<_> = (0..3)
+            .map(|_| limiter.try_accept(flood).expect("under the ceiling"))
+            .collect();
+        assert_eq!(
+            limiter.try_accept(flood).unwrap_err(),
+            RefusedReason::HandshakesPerSource
+        );
+
+        // A different source is unaffected — the ceiling is per source, so one
+        // abuser cannot deny service to everyone else.
+        let bystander = limiter.try_accept(ip("203.0.113.51"));
+        assert!(bystander.is_ok());
+
+        drop(held);
+        assert!(limiter.try_accept(flood).is_ok(), "slots come back");
+    }
+
+    #[test]
+    fn established_connections_have_their_own_per_source_ceiling() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(0, 0, 2, 0), &[]));
+        let source = ip("203.0.113.52");
+
+        let mut first = limiter.try_accept(source).unwrap();
+        let mut second = limiter.try_accept(source).unwrap();
+        // Finishing the handshakes must NOT free the connection slots, or the
+        // established ceiling would only ever bound connections mid-handshake.
+        first.handshake_done();
+        second.handshake_done();
+
+        assert_eq!(
+            limiter.try_accept(source).unwrap_err(),
+            RefusedReason::ConnectionsPerSource
+        );
+        drop(first);
+        assert!(limiter.try_accept(source).is_ok());
+    }
+
+    /// The per-source ceilings say nothing about how many sources there are, so
+    /// a distributed flood needs the global ones.
+    #[test]
+    fn global_ceilings_bound_a_distributed_flood() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(0, 2, 0, 0), &[]));
+        let _one = limiter.try_accept(ip("203.0.113.60")).unwrap();
+        let _two = limiter.try_accept(ip("203.0.113.61")).unwrap();
+        assert_eq!(
+            limiter.try_accept(ip("203.0.113.62")).unwrap_err(),
+            RefusedReason::Handshakes
+        );
+
+        let limiter = Arc::new(ConnectionLimiter::new(limits(0, 0, 0, 1), &[]));
+        let _held = limiter.try_accept(ip("203.0.113.63")).unwrap();
+        assert_eq!(
+            limiter.try_accept(ip("203.0.113.64")).unwrap_err(),
+            RefusedReason::Connections
+        );
+    }
+
+    /// `handshake_done` releases the tight ceiling and keeps the loose one.
+    /// Without that split, a 32-handshake ceiling would silently behave as a
+    /// 32-connection ceiling and cut off any busy NAT.
+    #[test]
+    fn handshake_done_releases_only_the_handshake_half() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(1, 0, 4, 0), &[]));
+        let source = ip("203.0.113.70");
+
+        let mut first = limiter.try_accept(source).unwrap();
+        assert_eq!(
+            limiter.try_accept(source).unwrap_err(),
+            RefusedReason::HandshakesPerSource
+        );
+
+        first.handshake_done();
+        let _second = limiter
+            .try_accept(source)
+            .expect("the handshake slot was returned");
+
+        // Idempotent: a second call must not double-release into an underflow
+        // that hands out free slots forever.
+        first.handshake_done();
+        first.handshake_done();
+        assert_eq!(
+            limiter.try_accept(source).unwrap_err(),
+            RefusedReason::HandshakesPerSource,
+            "the second connection still holds the only handshake slot"
+        );
+    }
+
+    /// Trunks and monitoring must never be refused: an outage caused by our own
+    /// ceiling on a carrier interconnect is worse than anything it prevents.
+    #[test]
+    fn trusted_sources_are_never_refused() {
+        let limiter = Arc::new(ConnectionLimiter::new(
+            limits(1, 1, 1, 1),
+            &["198.51.100.0/24".to_string()],
+        ));
+        let trunk = ip("198.51.100.7");
+        let held: Vec<_> = (0..64)
+            .map(|_| limiter.try_accept(trunk).expect("trusted is exempt"))
+            .collect();
+        assert_eq!(held.len(), 64);
+        // And an exempt source consumes none of the global budget that protects
+        // everyone else.
+        assert!(limiter.try_accept(ip("203.0.113.80")).is_ok());
+    }
+
+    /// A disabled ceiling must cost nothing — in particular it must not keep a
+    /// row per source that has ever connected.
+    #[test]
+    fn zero_means_unlimited_and_tracks_no_per_source_state() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(0, 0, 0, 0), &[]));
+        let held: Vec<_> = (0..1000)
+            .map(|index| {
+                limiter
+                    .try_accept(ip(&format!("203.0.113.{}", index % 250)))
+                    .expect("unlimited")
+            })
+            .collect();
+        assert_eq!(limiter.tracked_sources(), (0, 0));
+        drop(held);
+    }
+
+    /// Steady-state allocation check for the two per-source maps: they are
+    /// keyed by a live entity, so a row that outlives its connection is a leak
+    /// that grows with every source ever seen. Drives complete accept/release
+    /// cycles and asserts both maps return to their starting size.
+    #[test]
+    fn per_source_maps_drain_to_baseline_after_complete_cycles() {
+        let limiter = Arc::new(ConnectionLimiter::new(limits(8, 0, 8, 0), &[]));
+        assert_eq!(limiter.tracked_sources(), (0, 0));
+
+        for round in 0..200u32 {
+            // A fresh source each round is the shape that leaks: a scanner
+            // sweeping a range, or ordinary churn across a subscriber base.
+            let source = ip(&format!("198.51.100.{}", round % 250));
+            let mut permit = limiter.try_accept(source).unwrap();
+            permit.handshake_done();
+            drop(permit);
+        }
+
+        assert_eq!(
+            limiter.tracked_sources(),
+            (0, 0),
+            "every source that finished must leave no row behind"
+        );
+    }
+
+    #[test]
+    fn concurrent_accepts_never_exceed_the_ceiling() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        const CEILING: u32 = 16;
+        let limiter = Arc::new(ConnectionLimiter::new(limits(0, 0, CEILING, 0), &[]));
+        let source = ip("203.0.113.90");
+        let granted = Arc::new(AtomicUsize::new(0));
+
+        // Every thread takes a slot and holds it, so the ceiling has to be
+        // enforced across threads, not merely within one.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                let granted = Arc::clone(&granted);
+                thread::spawn(move || {
+                    let mut held = Vec::new();
+                    for _ in 0..32 {
+                        if let Ok(permit) = limiter.try_accept(source) {
+                            granted.fetch_add(1, Ordering::Relaxed);
+                            held.push(permit);
+                        }
+                    }
+                    held
+                })
+            })
+            .collect();
+
+        let held: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            granted.load(Ordering::Relaxed),
+            CEILING as usize,
+            "the ceiling must hold under contention, with no lost or double counts"
+        );
+
+        drop(held);
+        assert_eq!(limiter.tracked_sources(), (0, 0));
+        assert!(limiter.try_accept(source).is_ok());
+    }
+
+    #[test]
+    fn refused_reason_labels_are_stable() {
+        // These are metric label values; renaming one silently breaks a
+        // dashboard or an alert rule.
+        assert_eq!(
+            RefusedReason::HandshakesPerSource.as_str(),
+            "handshakes_per_source"
+        );
+        assert_eq!(RefusedReason::Handshakes.as_str(), "handshakes");
+        assert_eq!(
+            RefusedReason::ConnectionsPerSource.as_str(),
+            "connections_per_source"
+        );
+        assert_eq!(RefusedReason::Connections.as_str(), "connections");
+    }
+
+    #[test]
+    fn default_ceilings_are_the_documented_ones() {
+        let defaults = ConnectionLimits::default();
+        assert_eq!(defaults.max_handshakes_per_source, 32);
+        assert_eq!(defaults.max_handshakes, 1024);
+        assert_eq!(defaults.max_connections_per_source, 256);
+        assert_eq!(defaults.max_connections, 16_384);
     }
 }

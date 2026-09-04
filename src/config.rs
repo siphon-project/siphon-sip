@@ -1531,6 +1531,76 @@ pub struct SecurityConfig {
     /// cannot drive unbounded memory growth. Defaults to
     /// [`crate::security::DEFAULT_MAX_MESSAGE_BYTES`] (256 KB).
     pub max_message_bytes: Option<usize>,
+    /// Ceilings on concurrent inbound stream connections and handshakes.
+    ///
+    /// Unlike the guards above this one is **always on** — every field has a
+    /// default, so omitting the block (or the whole `security:` section) still
+    /// bounds what one source can make siphon spend. See
+    /// [`ConnectionLimitsConfig`].
+    #[serde(default)]
+    pub connection_limits: ConnectionLimitsConfig,
+}
+
+/// `security.connection_limits` — see [`crate::security::ConnectionLimits`] for
+/// what each ceiling bounds and why the two are sized so differently.
+///
+/// Every field defaults; `0` disables that ceiling.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConnectionLimitsConfig {
+    /// Concurrent in-flight handshakes (TLS/WS) plus first-line sniffs from one
+    /// source. Default 32.
+    #[serde(default = "default_max_handshakes_per_source")]
+    pub max_handshakes_per_source: u32,
+    /// Concurrent in-flight handshakes across all sources. Default 1024.
+    #[serde(default = "default_max_handshakes")]
+    pub max_handshakes: u32,
+    /// Established stream connections from one source. Default 256.
+    ///
+    /// **Raise this (or set 0) where one upstream address legitimately fronts
+    /// hundreds of registrations** — a carrier CGNAT pool, a large enterprise
+    /// NAT, an aggregator. The default is a runaway detector, not a policy, and
+    /// `siphon_connections_refused_total{reason="connections_per_source"}` is
+    /// what tells you it is binding on real traffic.
+    #[serde(default = "default_max_connections_per_source")]
+    pub max_connections_per_source: u32,
+    /// Established stream connections across all sources. Default 16384.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+}
+
+impl Default for ConnectionLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_handshakes_per_source: default_max_handshakes_per_source(),
+            max_handshakes: default_max_handshakes(),
+            max_connections_per_source: default_max_connections_per_source(),
+            max_connections: default_max_connections(),
+        }
+    }
+}
+
+impl From<&ConnectionLimitsConfig> for crate::security::ConnectionLimits {
+    fn from(config: &ConnectionLimitsConfig) -> Self {
+        Self {
+            max_handshakes_per_source: config.max_handshakes_per_source,
+            max_handshakes: config.max_handshakes,
+            max_connections_per_source: config.max_connections_per_source,
+            max_connections: config.max_connections,
+        }
+    }
+}
+
+fn default_max_handshakes_per_source() -> u32 {
+    crate::security::DEFAULT_MAX_HANDSHAKES_PER_SOURCE
+}
+fn default_max_handshakes() -> u32 {
+    crate::security::DEFAULT_MAX_HANDSHAKES
+}
+fn default_max_connections_per_source() -> u32 {
+    crate::security::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
+}
+fn default_max_connections() -> u32 {
+    crate::security::DEFAULT_MAX_CONNECTIONS
 }
 
 /// Smallest accepted `security.max_message_bytes`. A REGISTER or INVITE with a
@@ -1637,6 +1707,19 @@ pub struct FailedAuthBanConfig {
     /// per-IP window. Clamped to ≥ 1. Default: 3.
     #[serde(default = "default_strong_signal_weight")]
     pub strong_signal_weight: u32,
+    /// Weight applied to a challenge issued because the request carried no
+    /// credentials at all, toward `threshold`.
+    ///
+    /// **Default 0 — not counted.** RFC 3261 §22.2 makes the credential-less
+    /// request the opening leg of challenge-response, so every client sends one
+    /// before it has a nonce and counting it bans clients for behaving
+    /// correctly. Behind CGNAT the blast radius is every subscriber sharing the
+    /// address. The abuse this was reaching for is caught with far fewer false
+    /// positives by `scanner_block`, `rate_limit`, `apiban`, and the
+    /// non-SIP/handshake signals. Set to 1 to restore the pre-1.7 behaviour.
+    /// Clamped to `threshold`.
+    #[serde(default)]
+    pub missing_credentials_weight: u32,
 }
 
 fn default_failed_auth_window_secs() -> u32 {

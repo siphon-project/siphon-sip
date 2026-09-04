@@ -136,6 +136,19 @@ pub async fn listen(
                 debug!("{sip_transport}+{websocket_transport} mux rejected {remote_addr} by ACL");
                 continue;
             }
+            // See the TLS listener for why this is taken here, before the spawn,
+            // and dropped silently rather than banned.
+            let permit = match crate::security::try_accept_connection(remote_addr.ip()) {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    debug!(
+                        "{sip_transport}+{websocket_transport} mux refused {remote_addr} by \
+                         connection limit: {reason}"
+                    );
+                    crate::security::record_connection_refused(reason);
+                    continue;
+                }
+            };
             configure_tcp_socket(&tcp_stream, tos);
 
             // Read the *current* acceptor — it may have been swapped by the
@@ -177,6 +190,7 @@ pub async fn listen(
                             (Transport::Tls, Transport::WebSocketSecure),
                             local_addr,
                             remote_addr,
+                            permit,
                             inbound_tx,
                             sip_connection_map,
                             websocket_connection_map,
@@ -193,6 +207,7 @@ pub async fn listen(
                             (Transport::Tcp, Transport::WebSocket),
                             local_addr,
                             remote_addr,
+                            permit,
                             inbound_tx,
                             sip_connection_map,
                             websocket_connection_map,
@@ -216,6 +231,10 @@ async fn dispatch<S>(
     transports: (Transport, Transport),
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    // Connection slot taken at accept. Released when this function returns,
+    // so it covers the sniff and then the whole connection, whichever protocol
+    // won.
+    mut permit: crate::security::AcceptPermit,
     inbound_tx: flume::Sender<InboundMessage>,
     sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
@@ -238,6 +257,9 @@ async fn dispatch<S>(
             return;
         }
     };
+    // Protocol decided: the handshake slot goes back, the connection slot stays
+    // held by `permit` until this function returns.
+    permit.handshake_done();
 
     let connection_id = next_connection_id();
     match protocol {
@@ -274,6 +296,9 @@ async fn dispatch<S>(
                 connection_id,
                 local_addr,
                 remote_addr,
+                // Hands the connection slot on; its handshake half was already
+                // released above, and `handshake_done` is idempotent.
+                permit,
                 inbound_tx,
                 websocket_connection_map,
                 stream_connections,

@@ -544,6 +544,21 @@ pub async fn listen(
                         debug!("TLS rejected {} by ACL", remote_addr);
                         continue;
                     }
+                    // Take the connection + handshake slots before spawning, so
+                    // a refusal costs one accept() and nothing else — no task,
+                    // no TLS handshake, no CPU. Dropped silently: a port that
+                    // answers a probe fingerprints itself, and this is not a ban
+                    // signal (a NAT whose UEs all re-register after a flap is
+                    // bursty, not abusive).
+                    let mut permit = match crate::security::try_accept_connection(remote_addr.ip())
+                    {
+                        Ok(permit) => permit,
+                        Err(reason) => {
+                            debug!("TLS refused {} by connection limit: {reason}", remote_addr);
+                            crate::security::record_connection_refused(reason);
+                            continue;
+                        }
+                    };
                     // Read the *current* acceptor — it may have been swapped
                     // by the hot-reload watcher since the previous accept().
                     let acceptor = (**acceptor.load()).clone();
@@ -591,6 +606,10 @@ pub async fn listen(
                         else {
                             return;
                         };
+                        // Confirmed SIP: give the handshake slot back. The
+                        // connection slot stays with `permit` for the life of
+                        // the connection below.
+                        permit.handshake_done();
 
                         let connection_id = next_connection_id();
                         debug!("TLS accepted {} as {:?}", remote_addr, connection_id);

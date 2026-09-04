@@ -1136,6 +1136,36 @@ impl SiphonServer {
         crate::security::set_max_message_bytes(max_message_bytes);
         debug!(max_message_bytes, "stream message-size ceiling installed");
 
+        // --- Inbound connection ceilings ---
+        // Also always installed, and for the same reason: nothing else bounds
+        // how many connections or concurrent handshakes one source can make
+        // siphon carry, and a TLS handshake is real CPU held for the whole
+        // handshake timeout. `trusted_cidrs` are exempt so a trunk or a
+        // monitoring probe is never refused.
+        let connection_limits_config = config
+            .security
+            .as_ref()
+            .map(|sec| sec.connection_limits.clone())
+            .unwrap_or_default();
+        let trusted_cidrs = config
+            .security
+            .as_ref()
+            .map(|sec| sec.trusted_cidrs.clone())
+            .unwrap_or_default();
+        let connection_limits = crate::security::ConnectionLimits::from(&connection_limits_config);
+        crate::security::set_connection_limiter(Arc::new(crate::security::ConnectionLimiter::new(
+            connection_limits,
+            &trusted_cidrs,
+        )));
+        info!(
+            max_handshakes_per_source = connection_limits.max_handshakes_per_source,
+            max_handshakes = connection_limits.max_handshakes,
+            max_connections_per_source = connection_limits.max_connections_per_source,
+            max_connections = connection_limits.max_connections,
+            trusted_cidrs = trusted_cidrs.len(),
+            "inbound connection ceilings installed (0 = unlimited)"
+        );
+
         // --- Auto-ban (failed_auth_ban scanner protection) ---
         // Opt-in: only installed when configured. Once installed, the auth path
         // (challenge/success), the dispatcher (non-ACK INVITE Timer H), and the
@@ -1148,6 +1178,7 @@ impl SiphonServer {
                     fab.ban_duration_secs,
                     &sec.trusted_cidrs,
                     fab.strong_signal_weight,
+                    fab.missing_credentials_weight,
                 ));
                 crate::security::set_auto_ban(Arc::clone(&store));
                 if let Some(ref firewall) = kernel_firewall {
@@ -1158,6 +1189,7 @@ impl SiphonServer {
                     window_secs = fab.window_secs,
                     ban_duration_secs = fab.ban_duration_secs,
                     strong_signal_weight = fab.strong_signal_weight,
+                    missing_credentials_weight = fab.missing_credentials_weight,
                     trusted_cidrs = sec.trusted_cidrs.len(),
                     "failed_auth_ban scanner protection enabled"
                 );

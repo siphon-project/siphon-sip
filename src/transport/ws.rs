@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::acl::TransportAcl;
@@ -38,6 +38,9 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     connection_id: ConnectionId,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    // Connection slot taken at accept. Released when this function returns,
+    // so it covers the upgrade and then the whole connection.
+    mut permit: crate::security::AcceptPermit,
     inbound_tx: flume::Sender<InboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     stream_connections: StreamConnections,
@@ -84,6 +87,9 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
             return;
         }
     };
+    // Upgrade complete: give the handshake slot back, keep the connection slot
+    // for the life of this function.
+    permit.handshake_done();
 
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -217,6 +223,16 @@ pub async fn listen(
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
+                    // See the TLS listener for why this is taken here, before
+                    // the spawn, and dropped silently rather than banned.
+                    let permit = match crate::security::try_accept_connection(remote_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(reason) => {
+                            debug!("WS refused {remote_addr} by connection limit: {reason}");
+                            crate::security::record_connection_refused(reason);
+                            continue;
+                        }
+                    };
                     let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
@@ -234,6 +250,7 @@ pub async fn listen(
                             connection_id,
                             local,
                             remote_addr,
+                            permit,
                             inbound_tx,
                             connection_map,
                             stream_connections,
@@ -292,6 +309,16 @@ pub async fn listen_secure(
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
+                    // See the TLS listener for why this is taken here, before
+                    // the spawn, and dropped silently rather than banned.
+                    let permit = match crate::security::try_accept_connection(remote_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(reason) => {
+                            debug!("WSS refused {remote_addr} by connection limit: {reason}");
+                            crate::security::record_connection_refused(reason);
+                            continue;
+                        }
+                    };
                     // Hot-reloadable acceptor — read the live one each accept.
                     let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
@@ -322,6 +349,7 @@ pub async fn listen_secure(
                             connection_id,
                             local,
                             remote_addr,
+                            permit,
                             inbound_tx,
                             connection_map,
                             stream_connections,

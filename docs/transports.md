@@ -135,16 +135,38 @@ connection is closed before a byte reaches the SIP framer, and the source is
 counted as a strong `security.failed_auth_ban` signal.
 
 This is what stops a vulnerability scanner walking `/phpinfo.php`, `/info.php`
-and friends against a TLS SIP port. Framing alone cannot: an HTTP header block
-ends in `\r\n\r\n` and carries no `Content-Length`, so it looks like a complete
-message and is rejected only by the parser — after the probe has been queued,
-with the connection still open and nothing recorded against the source. Deciding
-from the first line closes the connection on the first probe and, at the default
-weights, bans the source on the fourth.
+and friends against a TLS SIP port. Framing on length alone cannot: an HTTP
+header block ends in `\r\n\r\n` and carries no `Content-Length`, so it looks like
+a complete message and would be rejected only by the parser — after the probe has
+been queued, with the connection still open and nothing recorded against the
+source. Deciding from the start line closes the connection on the first probe
+and, at the default weights, bans the source on the fourth.
+
+The check runs in **two** places, and both are load-bearing:
+
+- **At accept**, on the connection's first line, before a connection id is even
+  allocated — so a probe never enters the connection map or the accept log.
+- **In the framer, on the start line of every message**, because the accept-time
+  sniff assumes SIP for a peer that sends nothing inside its 2-second window.
+  That assumption is right (a connection held open for reuse must not be
+  dropped) but it is also a way past the first check: connect, wait, then send
+  the probe. Judging every message closes that, and the framer is where the
+  connection can actually be dropped and the source recorded.
 
 The connection is never answered. A SIP port that replies to a probe tells the
 prober what it found, which is also why a blocked request is dropped rather than
 rejected.
+
+### Connection ceilings
+
+Independently of any of the above, `security.connection_limits` bounds how many
+connections and how many concurrent handshakes one source — and the box as a
+whole — can hold. It is always on, and it covers what the ban counter cannot: a
+source that opens dozens of TLS connections and completes none of them never
+produces a *completed* failure to count, while each one costs a real handshake
+and a task held for the whole handshake timeout. See
+[Hardening & security](cookbook/security.md#bounding-what-one-source-can-spend),
+including the note on carrier NAT and `max_connections_per_source`.
 
 ### Per-domain certificates (inbound SNI)
 

@@ -6,6 +6,46 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Security
+- **Inbound connection ceilings, on by default.** Nothing bounded how many
+  connections or concurrent handshakes a single source could hold: no per-source
+  cap, no global cap, no limit around the TLS handshake. One address opening
+  dozens of connections at once pinned a task each for the full 10-second
+  handshake timeout, and the auto-ban could not help because it needs *completed*
+  failures first. `security.connection_limits` adds four ceilings —
+  `max_handshakes_per_source` (32), `max_handshakes` (1024),
+  `max_connections_per_source` (256), `max_connections` (16384) — with `0`
+  disabling any one of them and `trusted_cidrs` exempt from all of them. Every
+  field defaults, so the ceilings apply with no `security:` block configured.
+
+  In-flight handshakes and established connections are counted separately
+  because they are abused differently: a handshake is CPU held briefly and no
+  legitimate client has many at once, while an established connection is held
+  until the peer leaves or the 300 s idle timeout reaps it and a busy NAT
+  legitimately holds many. Refused connections are dropped silently and are
+  **not** banned — hitting a concurrency ceiling is a capacity fact, not proof of
+  intent. New metrics: `siphon_connections_refused_total{reason}`,
+  `siphon_stream_connections_active`, `siphon_handshakes_in_flight`.
+
+  **`max_connections_per_source` and carrier NAT:** a CGNAT pool or large
+  enterprise NAT can legitimately front more than 256 registrations from one
+  address. The default is a runaway detector, not a policy — raise it or set `0`
+  where that is your topology, and watch
+  `siphon_connections_refused_total{reason="connections_per_source"}`.
+- **A non-SIP probe is now refused on every message, not only a connection's
+  first line.** The accept-time sniff assumes SIP for a peer that sends nothing
+  within its 2-second window — correct for a connection held open for reuse, but
+  also a way past the check: connect, wait, then send. Past the sniff, framing
+  accepted any block ending `\r\n\r\n`, because a missing `Content-Length`
+  defaults to zero, so an HTTP request block framed as a complete "message",
+  reached the dispatcher and was rejected only by the parser — which has no
+  connection to close and no source to record, leaving a scanner free to probe
+  indefinitely over one connection. `frame_sip_message` now checks the start line
+  is a SIP request-line or status-line (RFC 3261 §7.1/§7.2; extension methods
+  still accepted), so the connection is closed and the source counted as a strong
+  `failed_auth_ban` signal wherever the probe arrives. UDP is unchanged — a UDP
+  source is spoofable and does not frame.
+
 ### Added
 - **An LCR failover now leaves a trace, and a record.** A call whose first
   carrier returned `500` and which then answered on the second showed nothing of
@@ -15,70 +55,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   burned a carrier on its way recorded that nowhere, so a failing carrier could
   not be alerted on, trended, or taken to the carrier.
 
-  - Each failed attempt is now recorded against the carrier that was in flight
-    (`carrier_id`, `status`, `elapsed_ms`; a ring timeout as `408`) and reported
-    at `info` along with the advance to the next carrier.
-  - `call.route_attempts` exposes that list to scripts wherever the `Call` is —
-    notably in `@b2bua.on_answer`, so a call that *answered* after failing over
-    can still name what it burned. `call.active_route` is unchanged and still
-    names the winner.
-  - `@b2bua.on_route_failure(call, route, code)` fires once per failed attempt,
-    including the last. It fires for every non-2xx a carrier returns — a
-    definitive `486` as much as a `503` — which is the same set
-    `route_attempts` records, so the two can never disagree; filter on `code`
-    for what you treat as a carrier's fault. Purely a notification: the failover
-    decision is already made and raising in it does not change the call.
-  - With `cdr.auto_emit` on, the attempts are stamped onto the CDR as
-    `lcr_attempts` (a compact JSON array), alongside the winning carrier's
-    existing `cdr_fields`.
-
-  `best_error` is now derived from the attempt list rather than accumulated
-  alongside it, so the code the caller receives and the per-attempt record
-  cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
-
-- **Header policies can now be defined in `siphon.yaml`.** `header_policies:` is
-  a top-level map of operator-owned policies, in the same namespace as the four
-  built-in presets and selectable the same way — by
-  `b2bua.default_header_policy` and by `call.dial(header_policy=…)` /
-  `call.fork(header_policy=…)`. It completes the set: `number_policies:` and
-  `media.profiles:` were already operator-definable, header policies were the
-  one named-policy surface that was not.
-
-  A policy either extends a built-in with `copy` / `strip` / `rewrite` /
-  `translate` deltas, or declares both directions in full with an explicit
-  `default:`. Under `extends:` the base supplies each direction's default and
-  rules, the policy's own rules are matched first, and a direction left out is
-  inherited verbatim — so an `extends:` with no rules is a stable local alias
-  for a built-in. Header names are exact and case-insensitive, with a trailing
-  `*` for a prefix match; within one direction an exact name beats a prefix and
-  a longer prefix beats a shorter one, so `strip: ["X-*"]` alongside
-  `copy: ["X-Account-Ref"]` is expressible in a single block.
-
-  This is what "that preset, except for these headers" was missing. Before it,
-  the only way to let one header cross was to repeat `copy=[…]` on every
-  `dial()` / `fork()` call site, which puts a trust-boundary decision in N
-  script locations instead of one reviewable config block. Per-call deltas are
-  unchanged and still take precedence (exact names only — patterns are a
-  config-side feature).
-
-  ```yaml
-  header_policies:
-    "trunk-edge-plus@1":
-      extends: "sip-trunk-edge@2026"
-      request:
-        copy: ["X-Account-Ref"]
-
-  b2bua:
-    default_header_policy: "trunk-edge-plus@1"
-  ```
-
 ### Changed
 - **quick-xml 0.41 → 0.42.** `BytesText` is `str`-backed now, so the reader
   decodes up front and `decode()` is gone; the content accessors
   (`xml10_content()`) apply XML 1.0 end-of-line normalisation and leave entity
   resolution to the caller. Element and attribute names are `str` rather than
   bytes, which removes a set of `from_utf8` conversions at the parse sites.
-
 - **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
   instead of writing a second record.** With `cdr.auto_emit: true`, siphon
   already tracks a record for the call from the INVITE; a script's `extra`
@@ -166,7 +148,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   where the BYE arrives, so an on-time BYE landed before SIPp had armed the
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
-
 - **`b2bua.default_header_policy` naming an unknown policy now refuses to
   start.** It previously logged a warning and fell back to
   `transparent-b2bua@2026` — the *most* permissive posture — so a typo in the
@@ -182,6 +163,92 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   typo degrades to the operator's chosen posture rather than failing calls.
 
 ### Fixed
+- **A request with no credentials no longer counts toward `failed_auth_ban`, and
+  an auth-backend outage never does.** Both banned real subscribers.
+
+  A challenge issued because the request carried no `Authorization` is the
+  RFC 3261 §22.2 opening leg of challenge-response — every client sends one
+  before it has a nonce — and it scored 1, so five in a window earned an hour-long
+  ban. Behind CGNAT that address is shared, so the ban landed on every subscriber
+  behind it. It is now weighted by the new
+  `failed_auth_ban.missing_credentials_weight`, which defaults to `0`; set it to
+  `1` for the previous behaviour. Volume stays visible in
+  `siphon_auth_failures_total` either way.
+
+  Worse, the HTTP auth backend returned the same "no credential" for *"no such
+  user"* and for *"the request failed"*, so a timeout or a connection refusal was
+  indistinguishable from a wrong password and scored the high-confidence weight of
+  3 — two REGISTER retries during a backend outage banned a subscriber's address
+  for an hour, precisely when every subscriber is retrying. The credential check
+  is now four-way (valid / absent / rejected / backend unavailable) and a backend
+  that could not answer counts nothing. It increments the new
+  `siphon_auth_backend_errors_total`, which is worth alerting on: a non-zero rate
+  means authentication is failing into 401s for everyone.
+
+  `siphon_credential_failures_total` now counts genuine rejections only; it
+  previously included backend errors.
+- **A siphon-originated REFER no longer overtakes the answer it depends on.**
+  A `call.refer()` issued from `@b2bua.on_answer` was emitted at the point the
+  handler ran — which is *before* the A-leg 2xx is forwarded — so the caller
+  received an in-dialog REFER for a dialog it had not yet confirmed (RFC 3261
+  §13.2.2.4: the UAC confirms the dialog on the 2xx). A real UA answers that
+  481. The REFER is now held until the 200 OK is on the wire.
+
+  - Each failed attempt is now recorded against the carrier that was in flight
+    (`carrier_id`, `status`, `elapsed_ms`; a ring timeout as `408`) and reported
+    at `info` along with the advance to the next carrier.
+  - `call.route_attempts` exposes that list to scripts wherever the `Call` is —
+    notably in `@b2bua.on_answer`, so a call that *answered* after failing over
+    can still name what it burned. `call.active_route` is unchanged and still
+    names the winner.
+  - `@b2bua.on_route_failure(call, route, code)` fires once per failed attempt,
+    including the last. It fires for every non-2xx a carrier returns — a
+    definitive `486` as much as a `503` — which is the same set
+    `route_attempts` records, so the two can never disagree; filter on `code`
+    for what you treat as a carrier's fault. Purely a notification: the failover
+    decision is already made and raising in it does not change the call.
+  - With `cdr.auto_emit` on, the attempts are stamped onto the CDR as
+    `lcr_attempts` (a compact JSON array), alongside the winning carrier's
+    existing `cdr_fields`.
+
+  `best_error` is now derived from the attempt list rather than accumulated
+  alongside it, so the code the caller receives and the per-attempt record
+  cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
+- **Header policies can now be defined in `siphon.yaml`.** `header_policies:` is
+  a top-level map of operator-owned policies, in the same namespace as the four
+  built-in presets and selectable the same way — by
+  `b2bua.default_header_policy` and by `call.dial(header_policy=…)` /
+  `call.fork(header_policy=…)`. It completes the set: `number_policies:` and
+  `media.profiles:` were already operator-definable, header policies were the
+  one named-policy surface that was not.
+
+  A policy either extends a built-in with `copy` / `strip` / `rewrite` /
+  `translate` deltas, or declares both directions in full with an explicit
+  `default:`. Under `extends:` the base supplies each direction's default and
+  rules, the policy's own rules are matched first, and a direction left out is
+  inherited verbatim — so an `extends:` with no rules is a stable local alias
+  for a built-in. Header names are exact and case-insensitive, with a trailing
+  `*` for a prefix match; within one direction an exact name beats a prefix and
+  a longer prefix beats a shorter one, so `strip: ["X-*"]` alongside
+  `copy: ["X-Account-Ref"]` is expressible in a single block.
+
+  This is what "that preset, except for these headers" was missing. Before it,
+  the only way to let one header cross was to repeat `copy=[…]` on every
+  `dial()` / `fork()` call site, which puts a trust-boundary decision in N
+  script locations instead of one reviewable config block. Per-call deltas are
+  unchanged and still take precedence (exact names only — patterns are a
+  config-side feature).
+
+  ```yaml
+  header_policies:
+    "trunk-edge-plus@1":
+      extends: "sip-trunk-edge@2026"
+      request:
+        copy: ["X-Account-Ref"]
+
+  b2bua:
+    default_header_policy: "trunk-edge-plus@1"
+  ```
 - **XML entity references in element text were silently dropped, since v1.1.1.**
   quick-xml does not deliver one text node per element: an entity reference
   terminates the current `Text` event, arrives as its own `GeneralRef`, and the
@@ -206,7 +273,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   replacement text is how the bug looked in the first place. The SIPREC parser
   additionally accumulates across fragments instead of assigning, which it had
   to for a split value to survive at all.
-
 - **A media failure at answer no longer connects the call and starts charging.**
   An exception out of `@b2bua.on_answer` was logged and then ignored: the A-leg
   2xx went out a millisecond later, the ACK followed, and the charging clock

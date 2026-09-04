@@ -192,22 +192,49 @@ pub struct SiphonMetrics {
     /// Source IPs currently auto-banned. Pruned periodically; trusted_cidrs are
     /// never counted. Alert on a sustained rise to spot a scanning campaign.
     pub banned_ips: IntGauge,
-    /// Total failures recorded toward the auto-ban: auth challenges that were not
-    /// followed by a success, plus non-ACK INVITE server-transaction timeouts.
+    /// Total challenges issued because the request carried no credentials — the
+    /// RFC 3261 §22.2 opening leg of challenge-response. Counted for visibility
+    /// whether or not `failed_auth_ban.missing_credentials_weight` acts on it
+    /// (it is 0 by default), so a scanning campaign is still measurable.
     pub auth_failures_total: IntCounter,
     /// Total TLS/WSS/WS handshakes that failed or timed out before completing,
     /// each recorded toward the auto-ban. These are TCP-validated source IPs
     /// (no spoofing), so a sustained rise is an unambiguous scanning campaign.
     pub handshake_failures_total: IntCounter,
     /// Total digest attempts carrying present-but-invalid credentials (wrong
-    /// password) or a forged/stale/replayed nonce, each recorded toward the
-    /// auto-ban as a high-confidence signal. Distinct from `auth_failures_total`
-    /// (which counts credential-less challenge first-legs).
+    /// password), a username the backend denied, or a forged/stale/replayed
+    /// nonce, each recorded toward the auto-ban as a high-confidence signal.
+    /// Distinct from `auth_failures_total` (credential-less first legs) and from
+    /// `auth_backend_errors_total` (the backend never answered).
     pub credential_failures_total: IntCounter,
+    /// Total credential checks that could not be decided because the credential
+    /// source did not answer — HTTP auth backend timeout / connection failure,
+    /// or no usable backend configured. Never counted toward the auto-ban: an
+    /// outage of our own backend is not evidence about the peer, and treating it
+    /// as one banned real subscribers two REGISTER retries into an outage.
+    ///
+    /// **Alert on this.** A non-zero rate means authentication is failing open
+    /// into 401s for everyone, and it is otherwise invisible — it used to be
+    /// indistinguishable from a password brute-force.
+    pub auth_backend_errors_total: IntCounter,
     /// Total non-SIP / unparseable messages received on a stream transport
     /// (TCP/TLS) and dropped, each recorded toward the auto-ban. Excludes
     /// incomplete-but-plausible frames, empty connections, and CRLF keepalives.
     pub malformed_messages_total: IntCounter,
+    /// Inbound stream connections refused by `security.connection_limits`,
+    /// labelled by which ceiling refused them (`handshakes_per_source`,
+    /// `handshakes`, `connections_per_source`, `connections`).
+    ///
+    /// A rising `connections_per_source` is the one to read carefully: it can
+    /// equally mean one source is misbehaving or that a carrier NAT legitimately
+    /// fronts more registrations than the ceiling allows. `handshakes` rising is
+    /// unambiguous — the box is at its concurrent-handshake ceiling.
+    pub connections_refused_total: IntCounterVec,
+    /// Inbound stream connections currently established across all sources.
+    pub stream_connections_active: IntGauge,
+    /// Inbound handshakes (TLS/WS) plus first-line sniffs currently in flight.
+    /// Sits near zero on a healthy edge; a sustained non-zero value is a flood.
+    pub handshakes_in_flight: IntGauge,
     /// Total inbound requests whose topmost Via carried no `branch` parameter,
     /// so no server transaction could be keyed for them (RFC 3261 §8.1.1.7
     /// makes it mandatory). siphon has no RFC 2543 legacy matching, so these
@@ -464,7 +491,7 @@ impl SiphonMetrics {
 
         let auth_failures_total = IntCounter::new(
             "siphon_auth_failures_total",
-            "Total failures recorded toward the auto-ban (auth challenges without a subsequent success + non-ACK INVITE server-transaction timeouts)",
+            "Total challenges issued because the request carried no credentials (the RFC 3261 opening leg of challenge-response); counted for visibility whether or not failed_auth_ban.missing_credentials_weight acts on it",
         )?;
 
         let handshake_failures_total = IntCounter::new(
@@ -474,12 +501,35 @@ impl SiphonMetrics {
 
         let credential_failures_total = IntCounter::new(
             "siphon_credential_failures_total",
-            "Total digest attempts with present-but-invalid credentials or a forged/stale/replayed nonce, each recorded toward the auto-ban as a high-confidence signal",
+            "Total digest attempts with present-but-invalid credentials, a denied username, or a forged/stale/replayed nonce, each recorded toward the auto-ban as a high-confidence signal",
+        )?;
+
+        let auth_backend_errors_total = IntCounter::new(
+            "siphon_auth_backend_errors_total",
+            "Total credential checks the credential source could not answer (HTTP auth backend timeout/connection failure, or no usable backend configured); never counted toward the auto-ban",
         )?;
 
         let malformed_messages_total = IntCounter::new(
             "siphon_malformed_messages_total",
             "Total non-SIP / unparseable messages received on a stream transport (TCP/TLS) and dropped, each recorded toward the auto-ban",
+        )?;
+
+        let connections_refused_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_connections_refused_total",
+                "Inbound stream connections refused by security.connection_limits, by which ceiling refused them",
+            ),
+            &["reason"],
+        )?;
+
+        let stream_connections_active = IntGauge::new(
+            "siphon_stream_connections_active",
+            "Inbound stream connections currently established across all sources",
+        )?;
+
+        let handshakes_in_flight = IntGauge::new(
+            "siphon_handshakes_in_flight",
+            "Inbound handshakes (TLS/WS) and first-line sniffs currently in flight",
         )?;
 
         let requests_without_branch_total = IntCounter::new(
@@ -676,7 +726,11 @@ impl SiphonMetrics {
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(handshake_failures_total.clone()))?;
         registry.register(Box::new(credential_failures_total.clone()))?;
+        registry.register(Box::new(auth_backend_errors_total.clone()))?;
         registry.register(Box::new(malformed_messages_total.clone()))?;
+        registry.register(Box::new(connections_refused_total.clone()))?;
+        registry.register(Box::new(stream_connections_active.clone()))?;
+        registry.register(Box::new(handshakes_in_flight.clone()))?;
         registry.register(Box::new(requests_without_branch_total.clone()))?;
         registry.register(Box::new(udp_datagrams_at_buffer_limit_total.clone()))?;
         registry.register(Box::new(scanner_blocked_total.clone()))?;
@@ -736,7 +790,11 @@ impl SiphonMetrics {
             auth_failures_total,
             handshake_failures_total,
             credential_failures_total,
+            auth_backend_errors_total,
             malformed_messages_total,
+            connections_refused_total,
+            stream_connections_active,
+            handshakes_in_flight,
             requests_without_branch_total,
             udp_datagrams_at_buffer_limit_total,
             scanner_blocked_total,
