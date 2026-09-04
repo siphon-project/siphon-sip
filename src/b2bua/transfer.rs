@@ -179,6 +179,36 @@ pub fn transfer_result_from_response(status_code: u16) -> TransferState {
     }
 }
 
+/// The `Referred-By` (RFC 3892) that the INVITE triggered by a
+/// siphon-terminated transfer must carry, given the `Referred-By` on the REFER
+/// that asked for it.
+///
+/// RFC 3892 §3: the referee SHOULD place the referrer's `Referred-By` on the
+/// request the referral triggers, so the target can see on whose authority it
+/// is being called. On a REFER without `Replaces` it is also the ONLY thing
+/// tying the triggered INVITE back to the referral — a referrer that keeps the
+/// consultation leg itself and expects the INVITE to come back to it has
+/// nothing else to correlate on, and answers it as an unrelated new call.
+///
+/// `Some(value)` is set on the triggered INVITE; `None` means the triggered
+/// INVITE must carry no `Referred-By` at all. `None` is not the same as "leave
+/// whatever is there": the transfer INVITE is built from the referrer's own
+/// INVITE as a template, so an A-leg that itself arrived as a transfer already
+/// carries a `Referred-By` — the PREVIOUS referrer's. Left alone it would name
+/// the wrong party on every transfer after the first in a chain, which is why
+/// the absent case is explicit rather than a no-op.
+///
+/// Whitespace-only is treated as absent (RFC 3261 §7.3.1 allows the surrounding
+/// LWS, and an empty value names nobody).
+pub fn triggered_referred_by(refer_header: Option<&str>) -> Option<String> {
+    let value = refer_header?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// Validate that a Replaces header matches an existing call.
 ///
 /// Returns `true` if the given call_id and tags match.
@@ -500,5 +530,44 @@ SIP/2.0 200 OK
         };
         assert!(context.refer_to.replaces.is_some());
         assert_eq!(context.initiated_by, TransferSide::BLeg);
+    }
+
+    // ----- Referred-By on the triggered INVITE (RFC 3892 §3) -----
+
+    #[test]
+    fn triggered_referred_by_carries_the_refers_value_verbatim() {
+        // A referrer's Referred-By is opaque: it can carry URI parameters that
+        // only the referrer understands, and they are exactly what a referrer
+        // correlating the triggered INVITE back to its referral reads. Anything
+        // less than verbatim breaks that.
+        let value = "<sip:proxy.example.net:5061;x-ti=11111111-2222-3333-4444-555555555555>";
+        assert_eq!(
+            triggered_referred_by(Some(value)),
+            Some(value.to_string()),
+            "the referrer's Referred-By must reach the target unmodified"
+        );
+    }
+
+    #[test]
+    fn triggered_referred_by_trims_surrounding_whitespace() {
+        // RFC 3261 §7.3.1 allows LWS around a header value; it is not part of it.
+        assert_eq!(
+            triggered_referred_by(Some("  <sip:alice@example.com>\t")),
+            Some("<sip:alice@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn triggered_referred_by_absent_when_the_refer_has_none() {
+        assert_eq!(triggered_referred_by(None), None);
+    }
+
+    #[test]
+    fn triggered_referred_by_treats_an_empty_value_as_absent() {
+        // An empty Referred-By names nobody. Reporting it as present would put a
+        // valueless header on the wire AND, worse, suppress the removal of a
+        // stale one inherited from the dial template.
+        assert_eq!(triggered_referred_by(Some("")), None);
+        assert_eq!(triggered_referred_by(Some("   ")), None);
     }
 }

@@ -780,6 +780,31 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate rm -sf sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas 2>/dev/null || true
 
+      # Graded per leg for the same reason as the referrer-BYE step below: on a
+      # FAILED transfer the referrer and the surviving leg both complete their
+      # scenarios cleanly, and the whole of the damage lands on the transfer
+      # target — a `Referred-By` that never arrived, and a 486 that is never
+      # ACKed. `--exit-code-from` on the UAC alone reports green over both.
+      - name: B2BUA REFER terminate, target refuses (RFC 3892 §3 Referred-By + RFC 3261 §17.1.1.3 ACK)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate-busy up \
+            sipp-b2bua-refer-terminate-busy-uac \
+            sipp-b2bua-refer-terminate-busy-bob-uas \
+            sipp-b2bua-refer-terminate-busy-carol-uas
+          status=0
+          for service in uac bob-uas carol-uas; do
+            code=$(docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate-busy \
+              ps -a --format '{{.Service}} {{.ExitCode}}' \
+              | awk -v s="sipp-b2bua-refer-terminate-busy-$service" '$1 == s { print $2 }')
+            echo "sipp-b2bua-refer-terminate-busy-$service exit=$code"
+            if [ "$code" != "0" ]; then status=1; fi
+          done
+          exit $status
+
+      - name: Cleanup terminate-busy containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate-busy rm -sf sipp-b2bua-refer-terminate-busy-uac sipp-b2bua-refer-terminate-busy-bob-uas sipp-b2bua-refer-terminate-busy-carol-uas 2>/dev/null || true
+
       # Every leg is graded, NOT just the UAC. The referrer completes its own
       # scenario cleanly even when the transfer is broken — the damage lands on
       # the surviving leg (an unexpected BYE) and on the transfer target (a 200

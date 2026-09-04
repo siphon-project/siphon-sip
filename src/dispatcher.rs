@@ -18315,6 +18315,35 @@ fn handle_b2bua_response(
             if (200..300).contains(&status_code) {
                 b2bua_complete_terminated_transfer(call_id, target_idx, message, state);
             } else if status_code >= 300 {
+                // RFC 3261 §17.1.1.3 — the INVITE client transaction MUST ACK a
+                // non-2xx final, on the SAME branch. Nothing else on this path
+                // does it: the interception returns before the ordinary B-leg
+                // failure handling below, which is where every other B-leg
+                // non-2xx is ACKed. Without this the target retransmits its
+                // final response for the full 32 s of Timer H — observed on a
+                // transfer whose target answered `486 Busy Here` (11 copies at
+                // T1-doubling to T2) while siphon had already reported the
+                // failure to the referrer and moved on.
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    let (ack_via_host, ack_via_port) =
+                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
+                    let ack = build_b2bua_ack_for_non2xx(
+                        message,
+                        branch,
+                        b_leg_target.as_deref(),
+                        b_transport,
+                        &ack_via_host,
+                        ack_via_port,
+                    );
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
+                } else {
+                    warn!(
+                        call_id = %call_id,
+                        status = status_code,
+                        "B2BUA REFER (terminate): transfer target failed but its flow is \
+                         unknown — cannot ACK, the target will retransmit until Timer H"
+                    );
+                }
                 b2bua_fail_terminated_transfer(call_id, target_idx, status_code, state);
             } else {
                 debug!(
@@ -27233,6 +27262,13 @@ fn b2bua_refer_accept(
                 _ => (None, None),
             };
 
+            // RFC 3892 §3: the triggered INVITE carries the REFER's own
+            // `Referred-By`. Read here, off the REFER, because the dial template
+            // below is the A-leg INVITE and never had it.
+            let referred_by = crate::b2bua::transfer::triggered_referred_by(
+                message.headers.get("Referred-By").map(String::as_str),
+            );
+
             // Clone the A-leg INVITE as the dial template, but point its To at
             // the Refer-To target (not the original callee). The generic B-leg
             // builder rewrites only the To host, so without this the dialed
@@ -27244,6 +27280,16 @@ fn b2bua_refer_accept(
                     Ok(invite) => {
                         let mut template = invite.clone();
                         template.headers.set("To", format!("<{target_uri}>"));
+                        // A referrer whose own call arrived as a transfer left
+                        // the PREVIOUS referrer's `Referred-By` on this
+                        // template. When the REFER in hand names someone it is
+                        // overwritten by the injection below; when it names
+                        // nobody the stale value has to go, or the target is
+                        // told it was called on the authority of a party that
+                        // has nothing to do with this referral.
+                        if referred_by.is_none() {
+                            template.headers.remove("Referred-By");
+                        }
                         // Offer the survivor's media (anchored or raw) instead of
                         // the referrer's; leave the referrer's body only when no
                         // survivor SDP was available.
@@ -27267,12 +27313,22 @@ fn b2bua_refer_accept(
                     None
                 }
             };
-            // Injected verbatim onto the triggered INVITE. `Replaces` is not a
-            // dialog-defining header for the dialog this INVITE creates — it
-            // references a *different* dialog — so it is safe in this slot.
-            let replaces_extra_headers: Vec<(String, String)> = replaces_header
+            // Injected verbatim onto the triggered INVITE, after the header
+            // policy. Neither `Replaces` nor `Referred-By` is dialog-defining
+            // for the dialog this INVITE creates — both reference something
+            // outside it — so they are safe in this slot.
+            //
+            // After the policy rather than on the template because neither is a
+            // header of the A-leg dialog that the policy governs the crossing
+            // of: they are properties of the referral, and a default-strip
+            // preset dropping them would break the transfer rather than hide an
+            // identity. No shipped preset strips either.
+            let mut triggered_extra_headers: Vec<(String, String)> = replaces_header
                 .map(|replaces| vec![("Replaces".to_string(), replaces.to_string())])
                 .unwrap_or_default();
+            if let Some(value) = referred_by {
+                triggered_extra_headers.push(("Referred-By".to_string(), value));
+            }
 
             let dialed = if let Some(template) = dial_template {
                 b2bua_send_b_leg_invite(
@@ -27288,7 +27344,7 @@ fn b2bua_refer_accept(
                     None,
                     None,
                     None,
-                    replaces_extra_headers.as_slice(),
+                    triggered_extra_headers.as_slice(),
                     state,
                 );
                 true
@@ -27640,8 +27696,14 @@ fn b2bua_complete_terminated_transfer(
 
 /// The dialed transfer target failed (non-2xx). Notify the referrer that the
 /// transfer failed (terminating sipfrag NOTIFY), drop the failed target leg, and
-/// keep the original call intact. The failed INVITE is ACKed by the client
-/// transaction layer (RFC 3261 §17.1.1.3).
+/// keep the original call intact.
+///
+/// The failed INVITE has already been ACKed by the caller (RFC 3261 §17.1.1.3).
+/// It is done there rather than here because the flow the ACK has to go out on
+/// — the target leg's destination, egress socket and Via sent-by — is only in
+/// scope in the response handler; this function sees the call, not the leg's
+/// transport. Do not assume a transaction layer covers it: B2BUA B-legs ACK
+/// their own non-2xx finals explicitly, everywhere on this path.
 fn b2bua_fail_terminated_transfer(
     call_id: &str,
     target_idx: usize,
