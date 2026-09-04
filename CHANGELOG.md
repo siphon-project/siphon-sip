@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.2] — 2026-09-04
+
 ### Added
 - **`Transform.alg` and `Transform.ealg` — the RFC 3329 wire names, readable
   without an allocated SA.** A script that wants to advertise its transform
