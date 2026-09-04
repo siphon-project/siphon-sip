@@ -306,6 +306,33 @@ pub struct B2buaConfig {
     ///   accept_replaces: true
     /// ```
     pub accept_replaces: Option<bool>,
+
+    /// Report every outbound B-leg INVITE at `info`, at the moment it is
+    /// handed to the transport.
+    ///
+    /// **Off by default** — this is one line per call on the busiest path
+    /// siphon has, so it is an operator's decision, not an upgrade's. The
+    /// LCR lines that already log at `info` fire only on failover, which is
+    /// why they need no knob.
+    ///
+    /// What it buys over logging the dial from the script: `call.dial()` only
+    /// *records* an action that the framework executes after the handler
+    /// returns, so a script-side line is written before the dial exists and
+    /// still claims it when the destination fails to resolve. This line is
+    /// emitted from the send itself, after routing, the header policy, the
+    /// number policy, LCR tech-prefix/retarget and CLIR have all had their
+    /// turn — so it reports the Request-URI that actually went on the wire,
+    /// not the string the script passed in, and it carries the B-leg Call-ID
+    /// the far end will quote back.
+    ///
+    /// Covers every B-leg INVITE — `call.dial()`, each `call.fork()` branch,
+    /// each `call.route()` carrier attempt, and a REFER-terminate re-dial.
+    ///
+    /// ```yaml
+    /// b2bua:
+    ///   log_dial: true
+    /// ```
+    pub log_dial: Option<bool>,
 }
 
 impl B2buaConfig {
@@ -326,6 +353,12 @@ impl B2buaConfig {
     /// `false` — see [`accept_replaces`](Self::accept_replaces).
     pub fn replaces_takeover_enabled(&self) -> bool {
         self.accept_replaces.unwrap_or(false)
+    }
+
+    /// Whether outbound B-leg INVITEs are reported at `info`. Defaults to
+    /// `false` — see [`log_dial`](Self::log_dial).
+    pub fn log_dial_enabled(&self) -> bool {
+        self.log_dial.unwrap_or(false)
     }
 
     /// Resolve the configured default REFER mode. `None`, empty, or an
@@ -4813,6 +4846,37 @@ codec:
             ..Default::default()
         }
         .replaces_takeover_enabled());
+    }
+
+    /// One `info` line per call on the busiest path siphon has is an
+    /// operator's decision, not an upgrade's — the LCR lines that already log
+    /// at `info` fire only on failover, which is why they carry no knob.
+    #[test]
+    fn dial_logging_is_off_unless_enabled() {
+        assert!(
+            !B2buaConfig::default().log_dial_enabled(),
+            "per-call dial logging is opt-in"
+        );
+        assert!(!B2buaConfig {
+            log_dial: Some(false),
+            ..Default::default()
+        }
+        .log_dial_enabled());
+        assert!(B2buaConfig {
+            log_dial: Some(true),
+            ..Default::default()
+        }
+        .log_dial_enabled());
+    }
+
+    #[test]
+    fn dial_logging_parses_from_yaml() {
+        let config: B2buaConfig =
+            serde_yaml_ng::from_str("log_dial: true").expect("b2bua block must parse");
+        assert!(config.log_dial_enabled());
+        let empty: B2buaConfig =
+            serde_yaml_ng::from_str("default_refer_mode: terminate").expect("must parse");
+        assert!(!empty.log_dial_enabled());
     }
 
     #[test]

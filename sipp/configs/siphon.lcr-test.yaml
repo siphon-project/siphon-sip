@@ -23,3 +23,6 @@ lcr:
 
 log:
   level: info
+
+b2bua:
+  log_dial: true

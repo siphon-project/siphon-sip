@@ -87,13 +87,40 @@ class TestCallRoute:
         call = Call(
             active_route=Route(carrier_id="carrier-b"),
             route_attempts=[
-                {"carrier_id": "carrier-a", "status": 503, "elapsed_ms": 1204},
+                {
+                    "carrier_id": "carrier-a",
+                    "status": 503,
+                    "elapsed_ms": 1204,
+                    "dialed": True,
+                },
             ],
         )
         assert call.active_route.carrier_id == "carrier-b"
         assert [a["carrier_id"] for a in call.route_attempts] == ["carrier-a"]
         assert call.route_attempts[0]["status"] == 503
         assert call.route_attempts[0]["elapsed_ms"] == 1204
+        assert call.route_attempts[0]["dialed"] is True
+
+    def test_an_undialled_carrier_is_recorded_but_marked_not_dialled(self):
+        # siphon never reached this carrier (group down, or the destination
+        # would not resolve), so the status is siphon's verdict on the route and
+        # not something the carrier answered. A script counting carrier faults
+        # filters on `dialed` — otherwise a local DNS problem is trended against
+        # the carrier and taken to them.
+        call = Call(
+            active_route=Route(carrier_id="carrier-b"),
+            route_attempts=[
+                {
+                    "carrier_id": "carrier-a",
+                    "status": 503,
+                    "elapsed_ms": 0,
+                    "dialed": False,
+                },
+            ],
+        )
+        assert call.route_attempts[0]["dialed"] is False
+        blameable = [a for a in call.route_attempts if a["dialed"]]
+        assert blameable == []
 
 
 class TestOnRouteFailure:

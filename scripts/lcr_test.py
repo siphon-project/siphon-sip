@@ -40,7 +40,8 @@ def answered(call, reply):
     for attempt in call.route_attempts:
         log.info(
             f"[{call.id}] burned {attempt['carrier_id']} "
-            f"{attempt['status']} after {attempt['elapsed_ms']}ms"
+            f"{attempt['status']} after {attempt['elapsed_ms']}ms "
+            f"dialed={attempt['dialed']}"
         )
 
 

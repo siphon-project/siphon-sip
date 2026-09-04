@@ -1681,6 +1681,30 @@ auth:
 # b2bua:
 #   accept_replaces: true
 
+# Report every outbound B-leg INVITE at info, as it is handed to the transport:
+#
+#   B2BUA: dialling B-leg  call_id=... b_leg_call_id=... ruri=sip:31612345678@carrier
+#                          next_hop=Some("sip:198.51.100.7:5060")
+#                          destination=198.51.100.7:5060 transport=udp source=...
+#
+# OFF by default — one line per call on the busiest path siphon has. (The LCR
+# failover lines already log at info without a knob because they fire only when
+# a carrier fails, not on every call.)
+#
+# Worth preferring over a log.info() next to your call.dial(): call.dial() only
+# records an action the framework executes after the handler returns, so a line
+# written in the script precedes the dial and still claims it when the
+# destination fails to resolve. This one is emitted from the send itself, after
+# routing, the header policy, the number policy and the LCR tech-prefix /
+# retarget / CLIR steps have run — so the R-URI is what actually went on the
+# wire, not the string the script passed, and b_leg_call_id is the Call-ID the
+# far end will quote back at you.
+#
+# Covers every B-leg INVITE: call.dial(), each call.fork() branch, each
+# call.route() carrier attempt, and a REFER-terminate re-dial.
+# b2bua:
+#   log_dial: true
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
