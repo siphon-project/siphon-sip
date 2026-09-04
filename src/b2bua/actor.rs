@@ -948,6 +948,16 @@ pub struct RouteAttempt {
     pub status: u16,
     /// How long the attempt was in flight, in milliseconds.
     pub elapsed_ms: u64,
+    /// Whether this carrier's INVITE actually reached the transport.
+    ///
+    /// `false` means siphon never sent it — the carrier's gateway group was
+    /// unknown or entirely down, or its destination would not resolve — so
+    /// `status` is siphon's own verdict on the route and **not** something the
+    /// carrier said. Without this the two are indistinguishable, and a local
+    /// DNS or gateway problem reads as a carrier fault in `route_attempts`, in
+    /// the CDR's `lcr_attempts`, and in `@b2bua.on_route_failure` — the data an
+    /// operator trends a carrier on, and takes to that carrier.
+    pub dialed: bool,
 }
 
 #[derive(Debug)]
@@ -1182,6 +1192,21 @@ impl CallActor {
     /// Returns the attempt, so the caller can log it and hand it to
     /// `@b2bua.on_route_failure` without re-reading the actor.
     pub fn record_route_failure(&mut self, status_code: u16) -> Option<RouteAttempt> {
+        self.record_route_attempt(status_code, true)
+    }
+
+    /// Record a carrier that was burned **without ever being dialled** — its
+    /// gateway group was unknown or entirely down, or its destination would not
+    /// resolve, so no INVITE left the box.
+    ///
+    /// It still belongs on the attempt list: the sequence consumed that carrier
+    /// and the caller's call took the consequences. `dialed: false` is what
+    /// keeps it from reading as the carrier's own answer.
+    pub fn record_route_undialed(&mut self, status_code: u16) -> Option<RouteAttempt> {
+        self.record_route_attempt(status_code, false)
+    }
+
+    fn record_route_attempt(&mut self, status_code: u16, dialed: bool) -> Option<RouteAttempt> {
         let sequence = self.route_sequence.as_mut()?;
         let attempt = RouteAttempt {
             carrier_id: sequence
@@ -1194,6 +1219,7 @@ impl CallActor {
                 .active_since
                 .map(|since| since.elapsed().as_millis() as u64)
                 .unwrap_or_default(),
+            dialed,
         };
         sequence.attempts.push(attempt.clone());
         Some(attempt)
@@ -2420,6 +2446,14 @@ impl CallActorStore {
             .record_route_failure(status_code)
     }
 
+    /// Record a carrier burned without ever being dialled — see
+    /// [`CallActor::record_route_undialed`].
+    pub fn record_route_undialed(&self, call_id: &str, status_code: u16) -> Option<RouteAttempt> {
+        self.calls
+            .get_mut(call_id)?
+            .record_route_undialed(status_code)
+    }
+
     /// Every failed attempt of a call's failover sequence, in order tried.
     pub fn route_attempts(&self, call_id: &str) -> Vec<RouteAttempt> {
         self.calls
@@ -3502,6 +3536,44 @@ mod tests {
         assert_eq!(actor.best_route_error(), Some(503));
     }
 
+    /// A carrier siphon never reached is still an attempt — the sequence
+    /// consumed it and the caller took the consequence — but it must not read
+    /// as the carrier's own answer. Without the distinction a local DNS or
+    /// gateway problem is indistinguishable from a carrier rejecting the call,
+    /// in `route_attempts`, in the CDR's `lcr_attempts` and in
+    /// `@b2bua.on_route_failure` alike: the figures an operator trends a
+    /// carrier on, and takes to that carrier.
+    #[test]
+    fn a_carrier_that_was_never_dialled_is_recorded_but_not_blamed() {
+        let mut actor = CallActor::new(make_a_leg());
+        actor.route_sequence = Some(RouteSequenceState {
+            pending: [lcr_route("a"), lcr_route("b")].into_iter().collect(),
+            ..Default::default()
+        });
+
+        actor.take_next_route().expect("carrier a");
+        let undialed = actor.record_route_undialed(503).expect("attempt recorded");
+        assert_eq!(undialed.carrier_id, "a");
+        assert_eq!(undialed.status, 503);
+        assert!(
+            !undialed.dialed,
+            "no INVITE reached the transport for this carrier"
+        );
+
+        actor.take_next_route().expect("carrier b");
+        let answered_badly = actor.record_route_failure(486).expect("attempt recorded");
+        assert!(
+            answered_badly.dialed,
+            "the carrier was dialled and answered 486 itself"
+        );
+
+        // Both are on the list — the sequence burned both — and the list is
+        // still what best_route_error derives from, so an exhausted sequence of
+        // unroutable carriers still hands the caller a code.
+        assert_eq!(actor.route_attempts().len(), 2);
+        assert_eq!(actor.best_route_error(), Some(503));
+    }
+
     /// A call with no failover sequence has nothing to report, and asking must
     /// not be an error — every `Call` handed to a script reads this property,
     /// LCR or not.
@@ -3510,6 +3582,7 @@ mod tests {
         let mut actor = CallActor::new(make_a_leg());
         assert!(actor.route_attempts().is_empty());
         assert!(actor.record_route_failure(503).is_none());
+        assert!(actor.record_route_undialed(503).is_none());
     }
 
     #[test]

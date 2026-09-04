@@ -29,6 +29,69 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Read-only, no new state, no behaviour change.
 
+- **`b2bua.log_dial` — report every outbound B-leg INVITE at `info`.** A B2BUA
+  call at `log.level: info` said nothing about where it was dialling. The line
+  existed but was `debug`, which in siphon is a firehose, so the practical
+  options were "no record of the outbound leg" or "everything".
+
+  ```yaml
+  b2bua:
+    log_dial: true      # default false
+  ```
+
+  ```
+  B2BUA: dialling B-leg  call_id=… b_leg_call_id=… ruri=sip:…@carrier
+                         next_hop=Some("sip:198.51.100.7:5060")
+                         destination=198.51.100.7:5060 transport=udp source=…
+  ```
+
+  Off by default: this is one line per call on the busiest path siphon has, and
+  that is an operator's decision rather than an upgrade's. (The LCR failover
+  lines log at `info` unconditionally because they fire only when a carrier
+  fails.)
+
+  It is emitted from the send itself rather than from `call.dial()`, and that is
+  the point. `call.dial()` only records an action the framework executes after
+  the handler returns, so a line written beside it in the script — the workaround
+  this replaces — precedes the dial and still claims it when the destination
+  fails to resolve. By the time this line is emitted, routing, the header
+  policy, the number policy and the LCR tech-prefix / retarget / CLIR steps have
+  all run, so the logged R-URI is the one on the wire rather than the string the
+  script passed, and `b_leg_call_id` is the Call-ID the far end will quote back.
+
+  Covers every B-leg INVITE — `call.dial()`, each `call.fork()` branch, each
+  `call.route()` carrier attempt, and a REFER-terminate re-dial — so it needs no
+  per-call-site opt-in and cannot be missed on one dial path out of three.
+
+- **An LCR failover now leaves a trace, and a record.** A call whose first
+  carrier returned `500` and which then answered on the second showed nothing of
+  it at `log.level: info` — the four lines describing the failover were `debug`,
+  and the only thing kept was `best_error`, a single code that exists to pick
+  what the A-leg gets once every carrier is exhausted. A completed call that
+  burned a carrier on its way recorded that nowhere, so a failing carrier could
+  not be alerted on, trended, or taken to the carrier.
+
+  - Each failed attempt is now recorded against the carrier that was in flight
+    (`carrier_id`, `status`, `elapsed_ms`; a ring timeout as `408`) and reported
+    at `info` along with the advance to the next carrier.
+  - `call.route_attempts` exposes that list to scripts wherever the `Call` is —
+    notably in `@b2bua.on_answer`, so a call that *answered* after failing over
+    can still name what it burned. `call.active_route` is unchanged and still
+    names the winner.
+  - `@b2bua.on_route_failure(call, route, code)` fires once per failed attempt,
+    including the last. It fires for every non-2xx a carrier returns — a
+    definitive `486` as much as a `503` — which is the same set
+    `route_attempts` records, so the two can never disagree; filter on `code`
+    for what you treat as a carrier's fault. Purely a notification: the failover
+    decision is already made and raising in it does not change the call.
+  - With `cdr.auto_emit` on, the attempts are stamped onto the CDR as
+    `lcr_attempts` (a compact JSON array), alongside the winning carrier's
+    existing `cdr_fields`.
+
+  `best_error` is now derived from the attempt list rather than accumulated
+  alongside it, so the code the caller receives and the per-attempt record
+  cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
+
 ### Fixed
 - **The INVITE a siphon-terminated transfer triggers now carries the REFER's
   `Referred-By` (RFC 3892 §3).** That INVITE is built from the referrer's own
@@ -52,6 +115,63 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the whole of the damage lands on the target. Covered end to end by a new SIPp
   acceptance scenario (`b2bua-refer-terminate-busy`) that grades all three legs
   and pins both fixes.
+
+- **A B2BUA call whose B-leg INVITE was never sent no longer costs the caller
+  the full ring timeout.** `b2bua_send_b_leg_invite` returned nothing, so every
+  caller was blind to whether the INVITE had actually reached the transport.
+  When the destination would not resolve it logged a warning and returned, and
+  the answer deadline — already armed — ran its course.
+
+  Measured with a `call.dial()` at a host that does not resolve: siphon knew in
+  0.4 ms, and the caller got ringback for **30.1 s** followed by a misleading
+  `408 Request Timeout`. It now receives `503 Destination Unreachable` in
+  **115 ms**, and `@b2bua.on_failure` fires with it so a script can release
+  whatever the call was holding (Rx / N5 QoS, an anchored media session, an
+  external reservation).
+
+  The proxy already answered `502` the instant a relay target would not resolve;
+  this is the B2BUA half that was missing. Per path:
+
+  - **`call.dial()`** — the A-leg is answered `503` immediately.
+  - **`call.fork()`** — a branch that cannot be sent is simply not a branch, and
+    the others ring as before. Only *all* of them failing fails the call, now at
+    once rather than at the ring timeout.
+  - **`call.route()` / `fork(strategy="sequential")`** — see below.
+  - **REFER-terminate** — the transfer's `dialed` flag was hardcoded `true` next
+    to a discarded result, so a target that would not resolve was treated as
+    dialled and the referrer was BYE'd for a leg that never existed.
+
+  The return value is now `#[must_use]`, so a future caller cannot silently
+  reintroduce this.
+
+- **An LCR sequence now fails over past an unreachable carrier immediately, and
+  stops blaming it.** A carrier whose INVITE never left the box was marked
+  in-flight anyway; the sequence then sat on that carrier's ring timeout before
+  advancing, and recorded the result as a `408` ring timeout against a carrier
+  that never received a packet. With a stale DNS name and a realistic 30 s
+  per-carrier timeout that is 30 s of dead air on every call.
+
+  Measured with an unresolvable first carrier on a 20 s timeout: **5.07 s → 0 s**
+  to reach the second carrier (the whole failover now completes in under a
+  millisecond).
+
+  That false `408` also reached `call.route_attempts`, the CDR's `lcr_attempts`
+  and `@b2bua.on_route_failure` — the figures an operator trends a carrier on,
+  and takes to that carrier. Attempts therefore gained a **`dialed`** field:
+
+  - `dialed: False` means siphon never put an INVITE on the wire for that
+    carrier, so its `status` (`503`) is siphon's verdict on the route rather
+    than the carrier's answer. Filter on it before counting a carrier fault.
+  - A carrier skipped as unroutable (gateway group unknown or entirely down, no
+    explicit next-hop) is now **recorded** as well, instead of being dropped
+    silently — `route_attempts` was meant to name every carrier a sequence
+    burned, and it did not.
+  - `@b2bua.on_route_failure` fires for these too, keeping the hook and the
+    attempt list describing the same set of carriers.
+
+  Existing fields (`carrier_id`, `status`, `elapsed_ms`) are unchanged, and
+  `best_error` selection is unchanged.
+
 
 ## [1.8.1] — 2026-09-04
 
@@ -94,15 +214,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   still accepted), so the connection is closed and the source counted as a strong
   `failed_auth_ban` signal wherever the probe arrives. UDP is unchanged — a UDP
   source is spoofable and does not frame.
-
-### Added
-- **An LCR failover now leaves a trace, and a record.** A call whose first
-  carrier returned `500` and which then answered on the second showed nothing of
-  it at `log.level: info` — the four lines describing the failover were `debug`,
-  and the only thing kept was `best_error`, a single code that exists to pick
-  what the A-leg gets once every carrier is exhausted. A completed call that
-  burned a carrier on its way recorded that nowhere, so a failing carrier could
-  not be alerted on, trended, or taken to the carrier.
 
 ### Changed
 - **quick-xml 0.41 → 0.42.** `BytesText` is `str`-backed now, so the reader

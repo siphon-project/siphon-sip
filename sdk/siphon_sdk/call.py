@@ -130,17 +130,26 @@ class Call:
         first — the counterpart to :attr:`active_route`, which names only the
         winner.
 
-        Each entry is a dict with ``carrier_id``, ``status`` and
-        ``elapsed_ms``. Empty for a non-LCR call, and for an LCR call whose
+        Each entry is a dict with ``carrier_id``, ``status``, ``elapsed_ms``
+        and ``dialed``. Empty for a non-LCR call, and for an LCR call whose
         first carrier answered. Available wherever the ``Call`` is, so a call
         that answered *after* burning a carrier can still record which one it
         burned — siphon stamps the same list onto the CDR as ``lcr_attempts``.
+
+        ``dialed`` is ``False`` when siphon never put an INVITE on the wire for
+        that carrier — its gateway group was unknown or entirely down, or its
+        destination would not resolve. ``status`` is then siphon's own verdict
+        on the route, not the carrier's answer, so filter on it before counting
+        a failure against a carrier: a local DNS or gateway problem is not the
+        carrier's fault and does not belong in their quality figures.
 
         Example::
 
             @b2bua.on_answer
             def answered(call, reply):
                 for attempt in call.route_attempts:
+                    if not attempt["dialed"]:
+                        continue        # siphon never reached this carrier
                     log.warn(f"carrier {attempt['carrier_id']} failed "
                              f"{attempt['status']} after {attempt['elapsed_ms']}ms")
         """

@@ -83,6 +83,41 @@ than returning a hollow success. The out-of-process twin is the control plane's
 
 ::: siphon_sdk.mock_module.MockB2bua.unbridge
 
+## Logging the outbound leg: `b2bua.log_dial`
+
+A B2BUA call says nothing at `log.level: info` about where it dialled. The
+obvious workaround is a `log.info()` next to the `call.dial()`, and it has a real
+flaw: `call.dial()` does not dial. It records an action that the framework
+executes once the handler returns, so the line is written before the dial exists
+and still claims it when the destination fails to resolve. It also logs the
+string the script passed, which is not necessarily what goes on the wire — the
+header policy, the number policy, and LCR's tech-prefix / retarget / CLIR steps
+all still get a turn.
+
+Turn the framework's own line on instead:
+
+```yaml
+b2bua:
+  log_dial: true      # default false
+```
+
+```
+B2BUA: dialling B-leg  call_id=… b_leg_call_id=… ruri=sip:…@carrier.example
+                       next_hop=Some("sip:198.51.100.7:5060")
+                       destination=198.51.100.7:5060 transport=udp source=…
+```
+
+It is emitted from the send itself, so the R-URI is the one on the wire and
+`b_leg_call_id` is the Call-ID the far end will quote back at you. It covers
+every outbound INVITE — `call.dial()`, each `call.fork()` branch, each
+`call.route()` carrier attempt, and a REFER-terminate re-dial — so there is no
+per-call-site flag to forget on one of three dial paths.
+
+It is off by default because it is one line per call on the busiest path siphon
+has, which is an operator's decision rather than an upgrade's. (The
+[LCR failover lines](../cookbook/least-cost-routing.md) log at `info`
+unconditionally — they fire only when a carrier fails, not on every call.)
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

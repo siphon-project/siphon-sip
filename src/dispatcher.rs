@@ -170,6 +170,11 @@ struct DispatcherState {
     /// unless the operator turned it on, because possession of a dialog's
     /// identifiers is not authority to end that dialog (RFC 3891 §5).
     accept_replaces: bool,
+    /// Whether every outbound B-leg INVITE is reported at `info` as it is
+    /// handed to the transport. Resolved from `config.b2bua.log_dial`; **off**
+    /// unless the operator turned it on — one line per call on the hottest
+    /// path siphon has.
+    log_dial: bool,
     /// Outbound registration manager (None when registrant is not configured).
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).
@@ -757,6 +762,7 @@ pub async fn run(
         default_header_policy,
         default_refer_mode: config.b2bua.resolved_default_refer_mode(),
         accept_replaces: config.b2bua.replaces_takeover_enabled(),
+        log_dial: config.b2bua.log_dial_enabled(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(
             product_name,
@@ -11814,10 +11820,11 @@ fn cdr_stamp_route_attempts(state: &DispatcherState, internal_call_id: &str) {
         .iter()
         .map(|attempt| {
             format!(
-                r#"{{"carrier_id":{},"status":{},"elapsed_ms":{}}}"#,
+                r#"{{"carrier_id":{},"status":{},"elapsed_ms":{},"dialed":{}}}"#,
                 serde_json::Value::String(attempt.carrier_id.clone()),
                 attempt.status,
-                attempt.elapsed_ms
+                attempt.elapsed_ms,
+                attempt.dialed
             )
         })
         .collect::<Vec<_>>()
@@ -14119,21 +14126,62 @@ fn lcr_destination_userpart(destination: &str) -> String {
 /// once the queue is exhausted. `original_request` is the stored A-leg INVITE
 /// (its R-URI is the default dial target when a route omits its own `ruri`);
 /// the caller passes the locked message so this never re-locks it.
+/// Outcome of one [`b2bua_advance_route`] pass.
+struct RouteAdvance {
+    /// Whether a carrier's INVITE actually reached the transport.
+    dialed: bool,
+    /// Carriers this pass burned **without dialling** — an unroutable one
+    /// (gateway group unknown or entirely down, no explicit next-hop) or one
+    /// whose INVITE could not be sent. Each is already on the call's attempt
+    /// list; the caller fires `@b2bua.on_route_failure` for them.
+    ///
+    /// Returned rather than dispatched here because the hook re-locks the A-leg
+    /// INVITE that every caller of this function is holding a guard on — the
+    /// same reason the reject and ring-timeout paths already fire it *before*
+    /// taking that guard. Firing it inline would deadlock the dispatcher.
+    burned: Vec<(crate::lcr::Route, u16)>,
+}
+
+impl RouteAdvance {
+    /// No carrier dialled and nothing burned — the queue was already empty, or
+    /// the A-leg INVITE could not be locked.
+    fn none() -> Self {
+        Self {
+            dialed: false,
+            burned: Vec::new(),
+        }
+    }
+}
+
+/// Status recorded against a carrier the sequence burned without dialling it.
+///
+/// `503` is what the A-leg already receives when no carrier at all is routable
+/// (`503 No Route`), so an exhausted sequence hands the caller the same code
+/// however it got there. The attempt's `dialed: false` is what says the carrier
+/// never answered this — it is siphon's verdict on the route.
+const LCR_UNDIALED_STATUS: u16 = 503;
+
 fn b2bua_advance_route(
     call_id: &str,
     original_request: &SipMessage,
     state: &DispatcherState,
-) -> bool {
+) -> RouteAdvance {
     let send_socket_str = state.call_actors.route_send_socket(call_id);
     let send_socket = state.resolve_send_socket(send_socket_str.as_deref());
     let a_leg_ruri = match &original_request.start_line {
         StartLine::Request(request_line) => request_line.request_uri.to_string(),
         _ => String::new(),
     };
+    let mut burned: Vec<(crate::lcr::Route, u16)> = Vec::new();
     loop {
         let route = match state.call_actors.take_next_route(call_id) {
             Some(route) => route,
-            None => return false,
+            None => {
+                return RouteAdvance {
+                    dialed: false,
+                    burned,
+                }
+            }
         };
         // Prefer a healthy gateway-group member; fall back to an explicit
         // next-hop. Warn (not silent) when the API named a group that siphon
@@ -14158,6 +14206,11 @@ fn b2bua_advance_route(
                 carrier = %route.carrier_id,
                 "LCR: carrier unroutable (group unknown/down, no next-hop), skipping",
             );
+            // Burned, so it belongs on the attempt list: the sequence consumed
+            // this carrier and the call took the consequence. Skipping it
+            // silently left `route_attempts` unable to name every carrier the
+            // call went through, which is the one thing that list is for.
+            b2bua_record_undialed_carrier(call_id, &route, &mut burned, state);
             continue;
         }
         let target = b2bua_carrier_ruri(&route, &a_leg_ruri, next_hop.as_deref());
@@ -14197,7 +14250,7 @@ fn b2bua_advance_route(
             next_hop = ?next_hop,
             "LCR: dialing carrier",
         );
-        b2bua_send_b_leg_invite(
+        let sent = b2bua_send_b_leg_invite(
             call_id,
             &target,
             next_hop.as_deref(),
@@ -14213,8 +14266,77 @@ fn b2bua_advance_route(
             &extra_headers,
             state,
         );
+        if !sent {
+            // The INVITE never left the box (unresolvable destination, dead
+            // egress). Arming the answer deadline here would sit on the caller
+            // for this carrier's whole ring timeout and then charge the carrier
+            // a 408 for a packet it never received. Burn it and take the next
+            // one now — the failure is already known.
+            b2bua_record_undialed_carrier(call_id, &route, &mut burned, state);
+            continue;
+        }
         set_b2bua_answer_deadline(call_id, timeout, state);
-        return true;
+        return RouteAdvance {
+            dialed: true,
+            burned,
+        };
+    }
+}
+
+/// Record a carrier burned without ever being dialled, and queue it for the
+/// `@b2bua.on_route_failure` notification its caller will fire.
+///
+/// Both halves matter: the attempt list is what `call.route_attempts`, the CDR's
+/// `lcr_attempts` and the hook all read, and the commitment is that the three
+/// never disagree about which carriers a sequence went through.
+fn b2bua_record_undialed_carrier(
+    call_id: &str,
+    route: &crate::lcr::Route,
+    burned: &mut Vec<(crate::lcr::Route, u16)>,
+    state: &DispatcherState,
+) {
+    if let Some(attempt) = state
+        .call_actors
+        .record_route_undialed(call_id, LCR_UNDIALED_STATUS)
+    {
+        info!(
+            call_id = %call_id,
+            carrier = %attempt.carrier_id,
+            status = attempt.status,
+            "LCR: carrier burned without dialling — advancing immediately (the carrier never saw this call)"
+        );
+    }
+    burned.push((route.clone(), LCR_UNDIALED_STATUS));
+}
+
+/// Fire `@b2bua.on_route_failure` for every carrier a [`RouteAdvance`] burned.
+///
+/// **Call this only once the A-leg INVITE guard is released** — the handler
+/// re-locks it (see [`RouteAdvance::burned`]).
+fn b2bua_dispatch_burned_routes(
+    call_id: &str,
+    burned: &[(crate::lcr::Route, u16)],
+    state: &DispatcherState,
+) {
+    if burned.is_empty() {
+        return;
+    }
+    let Some((a_leg, a_leg_invite)) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| (call.a_leg.clone(), call.a_leg_invite.clone()))
+    else {
+        return;
+    };
+    for (route, status) in burned {
+        b2bua_dispatch_route_failure(
+            call_id,
+            route,
+            *status,
+            &a_leg,
+            a_leg_invite.as_ref(),
+            state,
+        );
     }
 }
 
@@ -14345,9 +14467,11 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         state.call_actors.mark_active_b_legs_cancelled(call_id);
         let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
             Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
-            _ => false,
+            _ => RouteAdvance::none(),
         };
-        if advanced {
+        // The guard above is out of scope now, so the hook may lock the INVITE.
+        b2bua_dispatch_burned_routes(call_id, &advanced.burned, state);
+        if advanced.dialed {
             info!(call_id = %call_id, "LCR: advanced to next carrier after ring-timeout");
             return;
         }
@@ -15074,6 +15198,13 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         }
     }
 
+    // Filled by the LCR arm below and acted on after the match, once
+    // `message_guard` is released — `@b2bua.on_route_failure` re-locks the A-leg
+    // INVITE, and the teardown would take the call out from under it.
+    let mut burned_routes: Vec<(crate::lcr::Route, u16)> = Vec::new();
+    let mut teardown_after_hooks = false;
+    let mut fail_undialed = false;
+
     match action {
         CallAction::None => {
             debug!(call_id = %call_id, "B2BUA: silent drop (no action from script)");
@@ -15127,10 +15258,15 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 next_hop = ?next_hop,
                 flow = flow.is_some(),
                 routes = route.len(),
-                "B2BUA: dialling B-leg",
+                // The script's intent, as passed to `call.dial()` — before
+                // resolution, the header policy or any number reshaping. The
+                // dial that actually leaves the socket is the `b2bua.log_dial`
+                // line in `b2bua_send_b_leg_invite`; this one can still be
+                // followed by a resolve failure.
+                "B2BUA: dial requested by script",
             );
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
-            b2bua_send_b_leg_invite(
+            let sent = b2bua_send_b_leg_invite(
                 &call_id,
                 &target,
                 next_hop.as_deref(),
@@ -15146,7 +15282,23 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 &[],
                 state,
             );
-            set_b2bua_answer_deadline(&call_id, timeout, state);
+            if sent {
+                set_b2bua_answer_deadline(&call_id, timeout, state);
+            } else {
+                // Nothing was put on the wire, so nothing will ever answer.
+                // Arming the deadline instead would leave the caller in ringback
+                // for its full length (30 s by default) before a 408 — for a
+                // failure siphon already logged. The proxy answers 502 the
+                // moment a relay target will not resolve; this is that, for a
+                // B2BUA, as the 503 the LCR path already uses for a route it
+                // cannot take.
+                warn!(
+                    call_id = %call_id,
+                    target = %target,
+                    "B2BUA: B-leg INVITE was never sent — failing the call now",
+                );
+                fail_undialed = true;
+            }
         }
         CallAction::Fork {
             targets,
@@ -15158,6 +15310,7 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
+            let mut branches_sent = 0usize;
             for (index, target) in targets.iter().enumerate() {
                 // Each branch gets the route set of *its own* binding (RFC 3327
                 // §5.3), which also decides where the branch is sent.  A shared
@@ -15168,7 +15321,7 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 let branch_route = crate::proxy::core::route_set_from_path(branch_path)
                     .map(|value| vec![value])
                     .unwrap_or_default();
-                b2bua_send_b_leg_invite(
+                if b2bua_send_b_leg_invite(
                     &call_id,
                     target,
                     None,
@@ -15183,9 +15336,25 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                     None,
                     &[],
                     state,
-                );
+                ) {
+                    branches_sent += 1;
+                }
             }
-            set_b2bua_answer_deadline(&call_id, timeout, state);
+            // A branch that could not be sent is simply not a branch (RFC 3261
+            // §16.7 aggregates over the branches that exist), so one bad
+            // contact among several does not fail the call. All of them failing
+            // does: there is no branch left to answer, and waiting for the ring
+            // timeout would only turn a known failure into 30 s of ringback.
+            if branches_sent > 0 {
+                set_b2bua_answer_deadline(&call_id, timeout, state);
+            } else {
+                warn!(
+                    call_id = %call_id,
+                    branches = targets.len(),
+                    "B2BUA: no fork branch could be sent — failing the call now",
+                );
+                fail_undialed = true;
+            }
         }
         CallAction::RouteSequence {
             mut routes,
@@ -15214,7 +15383,9 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                     default_timeout,
                 },
             );
-            if !b2bua_advance_route(&call_id, &message_guard, state) {
+            let advanced = b2bua_advance_route(&call_id, &message_guard, state);
+            burned_routes = advanced.burned;
+            if !advanced.dialed {
                 // No carrier was routable (e.g. every gateway group down and no
                 // explicit next-hop) — answer the A-leg 503 instead of stalling.
                 debug!(call_id = %call_id, "B2BUA: LCR — no routable carrier");
@@ -15233,8 +15404,11 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                     Some(inbound.local_addr),
                     state,
                 );
-                state.call_actors.remove_call(&call_id);
-                state.call_event_receivers.remove(&call_id);
+                // Teardown is deferred to after the burned-carrier hooks below:
+                // they read the call's A-leg, and an exhausted sequence is
+                // exactly the case where a script most needs to hear which
+                // carriers it went through.
+                teardown_after_hooks = true;
             }
         }
         CallAction::Terminate => {
@@ -15285,6 +15459,91 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
             );
         }
     }
+
+    // Release the A-leg INVITE before anything that re-locks it. The hook does,
+    // via the `Call` it is handed, and it runs inline on this thread — holding
+    // the guard across it would deadlock the dispatcher on a non-reentrant
+    // mutex, which is why the reject and ring-timeout paths already fire it
+    // outside their own guards.
+    drop(message_guard);
+    b2bua_dispatch_burned_routes(&call_id, &burned_routes, state);
+    if fail_undialed {
+        b2bua_fail_undialed_call(&call_id, &message_arc, &inbound, state);
+    }
+    if teardown_after_hooks {
+        state.call_actors.remove_call(&call_id);
+        state.call_event_receivers.remove(&call_id);
+    }
+}
+
+/// Answer the A-leg and tear the call down when its B-leg INVITE never reached
+/// the transport.
+///
+/// The alternative — the behaviour this replaces — is to arm the answer deadline
+/// anyway and let the caller sit in ringback for its full length before a `408
+/// Request Timeout`, for a failure siphon logged milliseconds earlier. `503` is
+/// the code the LCR path already answers when it cannot take a route, and it is
+/// honest about whose problem this is: no callee ever saw the call.
+/// Called with **no lock held on `invite_arc`** — it locks to build the
+/// response, and `@b2bua.on_failure` locks again through the `Call` it is given.
+fn b2bua_fail_undialed_call(
+    call_id: &str,
+    invite_arc: &Arc<Mutex<SipMessage>>,
+    inbound: &InboundMessage,
+    state: &DispatcherState,
+) {
+    const REASON: &str = "Destination Unreachable";
+
+    let response = match invite_arc.lock() {
+        Ok(invite) => {
+            let mut response =
+                build_response(&invite, 503, REASON, state.server_header.as_deref(), &[]);
+            // siphon is the UAS on the A-leg, so this locally-generated final
+            // response carries the dialog's UAS To-tag (RFC 3261 §8.2.6.2) —
+            // same as the reject and answer-timeout paths.
+            if let Some(local_tag) = state
+                .call_actors
+                .get_call(call_id)
+                .map(|call| call.a_leg.dialog.local_tag.clone())
+            {
+                stamp_uas_to_tag(&mut response, &local_tag);
+            }
+            Some(response)
+        }
+        Err(_) => {
+            error!(call_id = %call_id, "B2BUA: A-leg INVITE lock poisoned — cannot answer an undialled call");
+            None
+        }
+    };
+    if let Some(response) = response {
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+    }
+
+    // The script asked for a dial and did not get one, so it hears about it the
+    // same way it would have if the callee had answered 503 — this is not the
+    // script's own `call.reject()`, and it may be holding per-call state (Rx /
+    // N5 QoS, an anchored media session, an external reservation) that only a
+    // failure notification releases.
+    if let Some(a_leg) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.clone())
+    {
+        b2bua_fire_failure_handlers(call_id, &a_leg, 503, REASON, state);
+    }
+
+    if crate::cdr::auto_emit_enabled() {
+        cdr_finalize_b2bua_fail(state, call_id, 503);
+    }
+    state.call_actors.remove_call(call_id);
+    state.call_event_receivers.remove(call_id);
 }
 
 /// Parameters for [`control_handover`], grouped to keep the arity sane.
@@ -15742,6 +16001,16 @@ fn advertise_option_tag(headers: &mut crate::sip::headers::SipHeaders, tag: &str
 /// R-URI must carry the canonical home-domain IMPU but the message has to
 /// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
 #[allow(clippy::too_many_arguments)]
+/// Build and send a B-leg INVITE. Returns whether it actually reached the
+/// transport.
+///
+/// **The return value is load-bearing** — every caller has already armed an
+/// answer deadline by the time this returns, so a caller that ignores a `false`
+/// leaves the A-leg ringing for the full ring timeout on a failure siphon knew
+/// about instantly (and, on the LCR path, blames the carrier for a `408` it
+/// never saw a packet for). The proxy's own relay answers `502` the moment a
+/// target will not resolve; this is the B2BUA half of that.
+#[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
@@ -15773,7 +16042,7 @@ fn b2bua_send_b_leg_invite(
     caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
-) {
+) -> bool {
     // Shadowed rather than branched so every flow-derived decision below — MTU
     // bias, egress pin, Via sent-by, Contact, leg connection id — treats a
     // Path-routed B-leg as the freshly-resolved leg it now is.
@@ -15812,7 +16081,7 @@ fn b2bua_send_b_leg_invite(
             "wss" => Transport::WebSocketSecure,
             other => {
                 warn!(call_id = %call_id, transport = %other, "B2BUA: unknown flow transport");
-                return;
+                return false;
             }
         };
         (flow.source_addr, transport)
@@ -15827,7 +16096,7 @@ fn b2bua_send_b_leg_invite(
                     route_next_hop = ?route_next_hop,
                     "B2BUA: cannot resolve destination",
                 );
-                return;
+                return false;
             }
         };
         (
@@ -16292,6 +16561,34 @@ fn b2bua_send_b_leg_invite(
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
+    // `b2bua.log_dial` — report the outbound leg at info, from the send itself.
+    // Deliberately here and not in `call.dial()`: that binding only records a
+    // `CallAction` the dispatcher executes after the handler returns, so a line
+    // written there (by siphon or by the script) precedes the dial and still
+    // claims it when the destination fails to resolve — the paths above this
+    // one that `warn!` and return. By this point routing, the header policy,
+    // the number policy and the LCR tech-prefix / retarget / CLIR steps have
+    // all run, so the R-URI logged is the one on the wire rather than the
+    // string the script passed, and `b_leg_call_id` is what the far end quotes
+    // back. Every B-leg INVITE funnels through here — dial, each fork branch,
+    // each LCR carrier attempt, a REFER-terminate re-dial.
+    if state.log_dial {
+        let ruri = match &b_leg_invite.start_line {
+            StartLine::Request(request_line) => request_line.request_uri.to_string(),
+            StartLine::Response(_) => String::new(),
+        };
+        info!(
+            call_id = %call_id,
+            b_leg_call_id = %b_leg.dialog.call_id,
+            ruri = %ruri,
+            next_hop = ?next_hop,
+            destination = %destination,
+            transport = %outbound_transport,
+            source = ?flow.map(|flow| flow.local_addr).or(send_socket.map(|pin| pin.addr)),
+            "B2BUA: dialling B-leg",
+        );
+    }
+
     // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool —
     // mirrors the proxy relay(flow=...) path) when one is attached, else via the
     // resolver/pool path.
@@ -16344,6 +16641,11 @@ fn b2bua_send_b_leg_invite(
         };
         if let Err(error) = state.outbound.send(outbound_message) {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
+            // The leg is registered and its actor spawned by this point, but the
+            // INVITE is not on the wire and nothing will ever answer it. Report
+            // the failure so the caller fails the call now instead of leaving it
+            // to the ring timeout; the leg goes with the call's teardown.
+            return false;
         }
     } else {
         let relay_target = RelayTarget {
@@ -16409,6 +16711,8 @@ fn b2bua_send_b_leg_invite(
         // the flow's socket.
         send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, flow_local_addr, state);
     }
+
+    true
 }
 
 /// Apply 401/407 digest-retry edits to a previously sent B-leg INVITE.
@@ -19967,9 +20271,11 @@ fn handle_b2bua_response(
                         }
                         let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
                             Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
-                            _ => false,
+                            _ => RouteAdvance::none(),
                         };
-                        if advanced {
+                        // Guard released — safe to run the hook (it re-locks).
+                        b2bua_dispatch_burned_routes(call_id, &advanced.burned, state);
+                        if advanced.dialed {
                             info!(call_id = %call_id, status = status_code,
                         "LCR: advanced to next carrier");
                             return;
@@ -22454,7 +22760,12 @@ pub fn b2bua_route_call(
         carriers = carrier_count,
         "control plane: route — un-parked, dialing B-leg via LCR sequential failover"
     );
-    if !b2bua_advance_route(&internal_call_id, &template, state) {
+    let advanced = b2bua_advance_route(&internal_call_id, &template, state);
+    // `template` is an owned clone, not a guard, so the hook is free to lock the
+    // stored INVITE. Fired before the teardown below, which would take the call
+    // out from under it.
+    b2bua_dispatch_burned_routes(&internal_call_id, &advanced.burned, state);
+    if !advanced.dialed {
         // No carrier was routable — answer the A-leg 503 and tear down, mirroring
         // the CallAction::RouteSequence "no routable carrier" arm.
         warn!(call_id = %internal_call_id, "control plane: route — no routable carrier, 503 to A-leg");
@@ -23437,7 +23748,7 @@ fn handle_originated_call_response(
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, internal_call_id, status_code);
     }
-    originate_fire_failure_handlers(internal_call_id, &leg, status_code, &reason_phrase, state);
+    b2bua_fire_failure_handlers(internal_call_id, &leg, status_code, &reason_phrase, state);
     control_notify_terminated_with_cause(
         &sip_call_id,
         "rejected",
@@ -23660,9 +23971,13 @@ fn originate_fire_answer_handlers(
     });
 }
 
-/// Fire `@b2bua.on_failure(call, code, reason)` for an originated call the
-/// callee rejected.
-fn originate_fire_failure_handlers(
+/// Fire `@b2bua.on_failure(call, code, reason)` for a call that failed before it
+/// was ever answered — an originated call the callee rejected, or one whose
+/// B-leg INVITE never reached the transport at all.
+///
+/// The caller must hold no lock on the A-leg INVITE: the `Call` handed to the
+/// handler locks it, and handlers run inline on this thread.
+fn b2bua_fire_failure_handlers(
     internal_call_id: &str,
     leg: &crate::b2bua::actor::Leg,
     status_code: u16,
@@ -27330,6 +27645,11 @@ fn b2bua_refer_accept(
                 triggered_extra_headers.push(("Referred-By".to_string(), value));
             }
 
+            // `dialed` decides whether the transfer proceeds, so it has to be
+            // what actually happened. It used to be hardcoded `true` next to a
+            // send whose result was discarded, so a target that would not
+            // resolve was treated as dialled and the referrer was BYE'd for a
+            // leg that never existed.
             let dialed = if let Some(template) = dial_template {
                 b2bua_send_b_leg_invite(
                     call_id,
@@ -27346,8 +27666,7 @@ fn b2bua_refer_accept(
                     None,
                     triggered_extra_headers.as_slice(),
                     state,
-                );
-                true
+                )
             } else {
                 false
             };

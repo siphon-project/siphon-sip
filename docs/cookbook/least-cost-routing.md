@@ -95,8 +95,12 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
   `@b2bua.on_failure` fires once, with the last carrier's response.
 - On answer, `call.active_route` is the carrier that won.
 - `call.route_attempts` lists the carriers it **burned** to get there — one
-  entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`), oldest
-  first. Empty when the first carrier answered.
+  entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`, `dialed`),
+  oldest first. Empty when the first carrier answered.
+- A carrier siphon could not **reach** (its gateway group unknown or entirely
+  down, or its destination would not resolve) is skipped **immediately** — the
+  sequence does not wait out that carrier's ring timeout for an INVITE it never
+  sent. It is still recorded, with `dialed: False`.
 
 ## Seeing a failover happen
 
@@ -126,6 +130,33 @@ the same set `call.route_attempts` records, so the two never disagree; filter on
 `code` for what you actually treat as a carrier health signal. It is purely a
 notification: the failover decision is already made, and raising in it does not
 change the call.
+
+### Not every burned carrier is the carrier's fault
+
+An attempt's `dialed` says whether siphon actually put an INVITE on the wire for
+that carrier. `False` means it did not — the gateway group was unknown or
+entirely down, or the next-hop would not resolve — so `status` (`503`) is
+siphon's own verdict on the route, not something the carrier said. The carrier
+never saw the call.
+
+**Filter on it before counting a failure against a carrier.** A stale DNS name
+or a down gateway group is a local configuration problem, and trending it as
+carrier quality sends you to the carrier with figures they cannot reconcile:
+
+```python
+@b2bua.on_route_failure
+def carrier_failed(call, route, code):
+    attempt = call.route_attempts[-1]
+    if not attempt["dialed"]:
+        # siphon never reached this carrier — alert your own config, not them.
+        unroutable_carriers.labels(carrier=route.carrier_id).inc()
+        return
+    if code in (408, 503):
+        carrier_failures.labels(carrier=route.carrier_id).inc()
+```
+
+siphon logs an undialled carrier at `info` too (`LCR: carrier burned without
+dialling`), so it is visible without a handler.
 
 When `cdr.auto_emit` is on, the same list is stamped onto the CDR as
 `lcr_attempts` (a compact JSON array), alongside the winning carrier's
