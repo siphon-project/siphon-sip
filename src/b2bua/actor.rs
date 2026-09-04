@@ -1631,6 +1631,38 @@ const TERMINATED_CALL_TTL: Duration = Duration::from_secs(32);
 /// call rates the TTL evicts long before the cap is in play.
 const TERMINATED_CALL_CAPACITY: usize = 65_536;
 
+#[cfg(test)]
+mod call_actor_footprint {
+    use super::*;
+
+    /// The call store holds a *pointer* to the actor, not the actor.
+    ///
+    /// `CallActor` is ~2.2 KB — an inline `a_leg: Leg`, the `b_legs` vectors,
+    /// session-timer and transfer state — and `hashbrown` sizes its bucket
+    /// array for the peak number of live calls and never shrinks it. Stored
+    /// inline that was the largest retained bucket in siphon, held at the
+    /// busiest moment the process ever saw for the rest of its life, with
+    /// `call_count()` reading 0 the whole time.
+    #[test]
+    fn the_call_store_holds_a_pointer_not_the_actor() {
+        let bucket = std::mem::size_of::<(String, Box<CallActor>)>();
+        let key_only = std::mem::size_of::<String>();
+        assert!(
+            bucket <= key_only + 16,
+            "call bucket is {bucket} B against a {key_only} B key — the actor is \
+             being stored inline again, and the table will retain it at peak \
+             concurrency forever"
+        );
+        // Guard the premise: boxing only pays while the payload is big.
+        let payload = std::mem::size_of::<CallActor>();
+        assert!(
+            payload >= 512,
+            "CallActor is down to {payload} B — re-check whether boxing still earns \
+             its indirection"
+        );
+    }
+}
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -1638,7 +1670,14 @@ const TERMINATED_CALL_CAPACITY: usize = 65_536;
 #[derive(Debug)]
 pub struct CallActorStore {
     /// Internal call ID → CallActor.
-    calls: DashMap<String, CallActor>,
+    /// Boxed: `CallActor` is ~2.2 KB (an inline `a_leg: Leg`, the `b_legs`
+    /// vectors, session-timer and transfer state), and `hashbrown` sizes its
+    /// bucket array for the peak number of live calls and never shrinks it.
+    /// Stored inline that is a ~2.3 KB bucket retained at the busiest moment
+    /// the process ever saw, for the rest of its life, with `calls.len()`
+    /// reading 0 — the same shape fixed for the transaction map and the timer
+    /// wheel. Boxed the bucket is 32 bytes.
+    calls: DashMap<String, Box<CallActor>>,
     /// SIP identifier routing table.
     pub registry: LegRegistry,
     /// Post-teardown re-INVITE ACK absorber, keyed by B-leg SIP Call-ID.
@@ -1774,7 +1813,7 @@ impl CallActorStore {
         let id = call.id.clone();
         self.registry.register_call_id(&sip_call_id, &id);
         self.registry.register_branch(&a_branch, &id);
-        self.calls.insert(id.clone(), call);
+        self.calls.insert(id.clone(), Box::new(call));
         id
     }
 
@@ -2279,7 +2318,7 @@ impl CallActorStore {
     pub fn get_call(
         &self,
         call_id: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, CallActor>> {
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, Box<CallActor>>> {
         self.calls.get(call_id)
     }
 
@@ -2287,7 +2326,7 @@ impl CallActorStore {
     pub fn get_call_mut(
         &self,
         call_id: &str,
-    ) -> Option<dashmap::mapref::one::RefMut<'_, String, CallActor>> {
+    ) -> Option<dashmap::mapref::one::RefMut<'_, String, Box<CallActor>>> {
         self.calls.get_mut(call_id)
     }
 
@@ -2867,7 +2906,7 @@ impl CallActorStore {
     }
 
     /// Iterate over all active calls (for session timer sweep).
-    pub fn iter_calls(&self) -> dashmap::iter::Iter<'_, String, CallActor> {
+    pub fn iter_calls(&self) -> dashmap::iter::Iter<'_, String, Box<CallActor>> {
         self.calls.iter()
     }
 
