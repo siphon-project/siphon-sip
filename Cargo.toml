@@ -191,7 +191,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # itself is Linux-only because the netlink protocol family does not exist
 # on other kernels; consumers gate the netlink backend on cfg(target_os).
 [target.'cfg(target_os = "linux")'.dependencies]
-netlink-sys = "0.8"
+netlink-sys = "0.9"
 # Already a hard dependency of netlink-sys (zero new crates) — declared
 # directly for the `SO_RCVTIMEO` setsockopt on the nf_tables ack socket, which
 # netlink-sys does not expose.
