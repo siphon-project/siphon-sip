@@ -14176,10 +14176,12 @@ fn b2bua_advance_route(
     loop {
         let route = match state.call_actors.take_next_route(call_id) {
             Some(route) => route,
-            None => return RouteAdvance {
-                dialed: false,
-                burned,
-            },
+            None => {
+                return RouteAdvance {
+                    dialed: false,
+                    burned,
+                }
+            }
         };
         // Prefer a healthy gateway-group member; fall back to an explicit
         // next-hop. Warn (not silent) when the API named a group that siphon
@@ -14327,7 +14329,14 @@ fn b2bua_dispatch_burned_routes(
         return;
     };
     for (route, status) in burned {
-        b2bua_dispatch_route_failure(call_id, route, *status, &a_leg, a_leg_invite.as_ref(), state);
+        b2bua_dispatch_route_failure(
+            call_id,
+            route,
+            *status,
+            &a_leg,
+            a_leg_invite.as_ref(),
+            state,
+        );
     }
 }
 
