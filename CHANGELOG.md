@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.3] — 2026-09-05
+
 ### Fixed
 - **`Supported: replaces` is now advertised, so a consultative transfer stays
   consultative.** siphon implements Replaces (RFC 3891) on both halves — it
