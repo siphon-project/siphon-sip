@@ -28044,7 +28044,10 @@ fn b2bua_complete_terminated_transfer(
     if let Some(cseq) = notify_cseq {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
-                ("Event", crate::b2bua::transfer::refer_event_header(event_id)),
+                (
+                    "Event",
+                    crate::b2bua::transfer::refer_event_header(event_id),
+                ),
                 (
                     "Subscription-State",
                     crate::b2bua::transfer::subscription_state_header(
@@ -28306,7 +28309,10 @@ fn b2bua_fail_terminated_transfer(
     {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
-                ("Event", crate::b2bua::transfer::refer_event_header(event_id)),
+                (
+                    "Event",
+                    crate::b2bua::transfer::refer_event_header(event_id),
+                ),
                 (
                     "Subscription-State",
                     crate::b2bua::transfer::subscription_state_header(&failure, 0),

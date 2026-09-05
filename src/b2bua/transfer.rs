@@ -434,7 +434,10 @@ SIP/2.0 200 OK
         let first = refer_event_header(4);
         let second = refer_event_header(7);
         assert_ne!(first, second);
-        assert!(first.starts_with("refer;"), "the event package stays 'refer'");
+        assert!(
+            first.starts_with("refer;"),
+            "the event package stays 'refer'"
+        );
         assert!(second.starts_with("refer;"));
     }
 
