@@ -6,6 +6,85 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **`Supported: replaces` is now advertised, so a consultative transfer stays
+  consultative.** siphon implements Replaces (RFC 3891) on both halves — it
+  turns a REFER's `Replaces` into the INVITE it sends the transfer target, and
+  it takes a dialog over on an inbound one — but it never put the option tag on
+  the wire. RFC 3891 §6.2 makes that a MUST for any UA that supports the
+  header, and RFC 5589 §7.3 is what it costs: a transferor learns that the
+  transferee supports Replaces "from the `Supported: replaces` header contained
+  in the 200 OK responses", so a transferor that gates on the tag silently
+  downgrades an attended transfer to a blind REFER carrying no `Replaces`.
+  siphon then dialled the target as an unrelated new call, and nothing ever
+  replaced the transferor's consultation dialog — the transferred party ended
+  up connected and correct while the transferor was left holding a
+  consultation call that no longer had anywhere to go, with its client
+  reporting the transfer as failed. The tag now goes on the A-leg 2xx, the
+  B-leg INVITE, and the 202 to a REFER, merged into any option tags already
+  there rather than emitted as a second `Supported` line. This is the same
+  failure mode, and the same downgrade-on-a-missing-advertisement mechanism, as
+  the `Allow: REFER, NOTIFY` advertisement fixed earlier.
+
+  Advertising is a statement about the header, not a blanket promise: an
+  inbound `INVITE` with `Replaces` still runs the `b2bua.accept_replaces` gate
+  and is declined `603` where the operator has not authorised takeovers (RFC
+  3891 §3's own answer for a dialog a UA is unwilling to replace). The half
+  this unblocks — siphon as the transferee — needs no such authorisation.
+
+- **The REFER-subscription NOTIFY carries `Event: refer;id=<CSeq>`.** The
+  subscription id was computed from the REFER's CSeq, stored on the
+  subscription and documented as being surfaced on the wire, but all three
+  NOTIFY build sites emitted a bare `Event: refer`. RFC 3515 §2.4.6 makes the
+  `id` parameter a MUST from the second REFER a UA receives in a given dialog
+  onward, and it is how a referrer tells two transfers on one dialog apart — so
+  a second transfer's progress could be read as the first one's. Emitted on
+  every NOTIFY of the subscription, including the first, so the token does not
+  change shape mid-subscription.
+
+- **A B2BUA response echoes the caller's own `From`/`To` again (RFC 3261
+  §8.2.6.2).** The section is unconditional: the response `From` MUST equal the
+  request's, and the response `To` MUST equal the request's `To` plus the UAS
+  tag. Three paths broke it, all by answering out of the wrong buffer.
+
+  The stored A-leg INVITE is a *shared, mutable* message that
+  `@b2bua.on_invite` reshapes for the B-leg, and every response built from it
+  echoed the reshaped form. B-leg identity shaping is the point of
+  `call.rewrite_identities()`, `set_from_user` / `set_to_user` and a
+  `number_policy`, so a handler that normalised the caller's number for the
+  dial plan had that normalisation answered back to the caller: an INVITE
+  offering `To: <sip:+15551000001@…>` was answered `To: <sip:15551000001@…>`,
+  on the 2xx, on the provisionals, and on a locally-generated `408` / `503` /
+  `call.reject()`. The A-leg now snapshots its `From`/`To` as they arrived —
+  before the handler runs, the same way `a_leg_supports_100rel` already did —
+  and every response echoes that. Shaping still applies to the B-leg, which is
+  where it was aimed.
+
+  A relayed re-INVITE or UPDATE answer was worse: it is a clone of the far
+  leg's response, and the B2BUA swapped the dialog tags on it but left the far
+  leg's URIs, so a hold or resume came back to the originator naming the *other
+  leg's* host. Its own `To: <sip:bob@sbc>` was answered `To: <sip:bob@carrier>`.
+  Both now restore the originator's `From`/`To` from the request, alongside the
+  Via and CSeq restored there already.
+
+  The same in-place rewrite also corrupted the 2xx ACK sent back to the
+  *responder*, which was built from the message after the rewrite and so
+  carried the originator's tag pair on the responder's dialog — un-matchable to
+  the transaction it acknowledged, leaving the responder retransmitting its 200
+  until the retransmission handler repeated the ACK. The responder's identity is
+  now captured before the rewrite, like its CSeq and Contact already were.
+
+  Wire-asserted by the `b2bua-reinvite` SIPp scenario, which existed but was
+  wired to no CI profile and now runs on every PR.
+
+- **The 202 Accepted to a REFER carries a `Contact`.** A REFER creates a
+  subscription, so its 2xx is dialog-forming and RFC 3515 §2.2 marks `Contact`
+  mandatory in it ("REFER creates a dialog, and MAY be Record-Routed, hence
+  MUST contain a single Contact header field value"). The response was built
+  with the mandatory echo headers only, leaving the referrer with no target
+  bound to the subscription it had just opened. It is the leg's own local
+  contact — the same value the subscription's NOTIFYs carry.
+
 ## [1.8.2] — 2026-09-04
 
 ### Added

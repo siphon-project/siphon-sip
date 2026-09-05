@@ -101,7 +101,26 @@ a=sendonly
   <recv response="100" optional="true" />
 
   <!-- 200 OK for hold re-INVITE -->
-  <recv response="200" rtd="true" crlf="true" />
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <!-- RFC 3261 §8.2.6.2: this answers the UAC's own re-INVITE, so its To
+           MUST equal the To that re-INVITE carried — `bob` at siphon
+           (172.20.0.50), tag and all. The forwarded answer is a clone of the
+           B-leg's 200, whose To names the far leg's dialog; the B2BUA swaps the
+           dialog tags but used to leave that URI in place, so the UAC saw its
+           own hold answered with the B-leg UAS's address. -->
+      <ereg regexp="bob@172\.20\.0\.50"
+            search_in="hdr" header="To:" check_it="true" assign_to="reinv_to_ok" />
+      <!-- The B-leg UAS (172.20.0.52) must not appear in the A-leg dialog
+           identity at all — that is the leak itself, not just a cosmetic one. -->
+      <ereg regexp="172\.20\.0\.52"
+            search_in="hdr" header="To:" check_it_inverse="true"
+            assign_to="reinv_to_no_bleg" />
+      <ereg regexp="alice@172\.20\.0\.53"
+            search_in="hdr" header="From:" check_it="true" assign_to="reinv_from_ok" />
+      <log message="re-INVITE 200 OK assertions: to=[$reinv_to_ok] no_bleg=[$reinv_to_no_bleg] from=[$reinv_from_ok]" />
+    </action>
+  </recv>
 
   <!-- ACK for hold re-INVITE -->
   <send>

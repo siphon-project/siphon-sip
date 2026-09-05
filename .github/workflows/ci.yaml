@@ -613,10 +613,17 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-cancel down sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
 
-      # RFC 3261 §14 re-INVITE variants. All three scenarios existed but were
+      # RFC 3261 §14 re-INVITE variants. All four scenarios existed but were
       # wired to nothing — neither CI nor scripts/run-tests.sh named their
       # profiles, so the behaviour they describe was asserted by nobody.
       # `--exit-code-from` names the side that carries the assertion in each.
+      - name: B2BUA re-INVITE from the A-leg (hold/resume, §8.2.6.2 dialog echo)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
+
+      - name: Cleanup reinvite containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true
+
       - name: B2BUA re-INVITE from the B-leg (Via branch correctness)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-bleg up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
 

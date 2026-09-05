@@ -131,6 +131,20 @@ pub fn parse_sipfrag_status(body: &[u8]) -> Option<(u16, String)> {
     Some((code, reason.to_string()))
 }
 
+/// Build the `Event` header value for a REFER-subscription NOTIFY
+/// (RFC 3515 §2.4.4 / §2.4.6).
+///
+/// `event_id` is the CSeq number of the REFER that created the subscription.
+/// RFC 3515 §2.4.6 makes the `id` parameter a MUST from the *second* REFER a UA
+/// receives in a given dialog onward, and a MAY for the first — but a referrer
+/// correlates a NOTIFY to a REFER by this token, so emitting it on every NOTIFY
+/// is what keeps two transfers on one dialog from being read as progress on
+/// whichever REFER the referrer happened to remember last. Emitting it from the
+/// first NOTIFY also means the value never changes shape mid-subscription.
+pub fn refer_event_header(event_id: u32) -> String {
+    format!("refer;id={event_id}")
+}
+
 /// Build a `Subscription-State` header value for a REFER-subscription NOTIFY
 /// (RFC 3515 §2.4.4 / RFC 6665 §4.1.3).
 ///
@@ -401,6 +415,27 @@ SIP/2.0 200 OK
             }
             other => panic!("Expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refer_event_header_carries_the_refer_cseq_as_id() {
+        // RFC 3515 §2.4.6: the id parameter is the CSeq number of the REFER
+        // that created the subscription. A referrer matches a NOTIFY to its
+        // REFER on this token.
+        assert_eq!(refer_event_header(4), "refer;id=4");
+        assert_eq!(refer_event_header(1), "refer;id=1");
+    }
+
+    #[test]
+    fn refer_event_header_distinguishes_two_transfers_on_one_dialog() {
+        // The case the id exists for: a second REFER in the same dialog. Both
+        // NOTIFYs carry Event: refer, so without the id the referrer cannot
+        // tell which transfer a result belongs to.
+        let first = refer_event_header(4);
+        let second = refer_event_header(7);
+        assert_ne!(first, second);
+        assert!(first.starts_with("refer;"), "the event package stays 'refer'");
+        assert!(second.starts_with("refer;"));
     }
 
     #[test]
