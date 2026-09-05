@@ -30,8 +30,47 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   interleaved runs here, which is what makes a sub-1% change legible at all.
   `SIPHON_BIN=` points it at a prebuilt binary so an A/B can alternate two arms
   without a rebuild between them.
+- **`tests/registrar_footprint_tests.rs`** — exact per-binding accounting, under
+  a counting global allocator in its own test binary. Where the SIPp harness
+  measures what a population costs the box, this measures what one binding *is*:
+  **526 bytes across 8 allocations**, deterministic rather than a settled RSS
+  reading, so it works as a regression gate. It also measures the **irreducible
+  floor** — the same AoR, contact URI and Call-ID in the cheapest container that
+  can still answer a lookup: **183 bytes across 3 allocations**. A binding is
+  therefore **2.9x its floor**, down from 3.5x. That ratio is published
+  deliberately: quoting a reduction without it makes the remaining gap
+  invisible, and the gap is the honest answer to how much further this can go.
+  Closing it needs a packed single-allocation representation, because the
+  remaining cost is `Contact` being one shape that serves residential SIP, IMS,
+  outbound registration and Path-token routing at once — no group of fields is
+  reliably absent across deployments, so boxing a "rare" group was measured and
+  rejected as a bad trade.
 
 ### Changed
+- **A plain registrar binding costs 641 -> 526 bytes of live data, across 9
+  allocations instead of 8.** A `Contact` is stored, compared and read, never
+  appended to, so `String`'s capacity word was 8 bytes per field carried for the
+  life of every contact in the table to describe growth that never happens;
+  `call_id`, `sip_instance`, `flow_token` and the RFC 3327 Path set are now
+  `Box<str>` / `Box<[Box<str>]>`. `Expires` is whole seconds (RFC 3261 §10.2.4),
+  so 12 of a `Duration`'s 16 bytes stored a nanosecond count that was always
+  zero; it is a `u32` of seconds. **The persisted form is unchanged** — the
+  Redis/PostgreSQL record still holds `String` and `Vec<String>` and the
+  conversion happens at that boundary, so a binding written by this version is
+  readable by the previous one and a rollback costs nothing.
+
+  `Contact` lands on **exactly 320 bytes, which is a jemalloc size class**. That
+  is the point rather than a coincidence: 328 and 352 both round up into the 384
+  class and would have bought nothing at all, so 8 bytes of struct is worth 64
+  bytes of resident memory per contact. The test asserts it in those terms.
+
+  Measured against the previous release over two interleaved arms at 200k
+  bindings: **jemalloc `allocated` 844 -> 723 bytes per binding (-14.3%)** and
+  **`resident` 1817 -> 1690 (-7.0%)**, the two arms of each figure inside 0.3%.
+  **No new dependency** — every one of these is `std`. Small-string crates were
+  considered and rejected: the same win is available from `Box<str>` and a
+  packed integer, and a dependency is a supply-chain decision, not a
+  convenience.
 - **A URI scheme is an enum, not a `String`.** `sip`, `sips` and `tel` cover
   every URI siphon routes on, so the common case is now a discriminant instead
   of a heap allocation; `Scheme::Other` keeps any other `absoluteURI` verbatim
