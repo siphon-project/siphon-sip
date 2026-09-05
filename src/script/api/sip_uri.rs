@@ -76,9 +76,15 @@ impl PySipUri {
     }
 
     /// Whether this is a tel: URI (scheme == "tel").
+    ///
+    /// Case-insensitive on the token, not `Scheme::is_tel`. The parser only
+    /// produces `Scheme::Tel` for a lowercase `tel:` (RFC 3966 §3); a
+    /// differently-cased one is an `absoluteURI` and lands in `Scheme::Other`
+    /// with its spelling intact. This property has always answered `True` for
+    /// that shape and scripts branch on it, so it keeps doing so.
     #[getter]
     fn is_tel(&self) -> bool {
-        self.inner.scheme.is_tel()
+        self.inner.scheme.as_str().eq_ignore_ascii_case("tel")
     }
 
     /// Whether the URI host matches one of the configured local domains.
@@ -222,6 +228,24 @@ mod tests {
 
         py_uri.set_port(None);
         assert_eq!(py_uri.port(), None);
+    }
+
+    /// A `TEL:` URI does not parse as RFC 3966 — it falls to the absoluteURI
+    /// branch, so its userpart is not extracted — but the property has always
+    /// reported it as a tel URI and a script's branch on it must not silently
+    /// flip when the scheme becomes an enum.
+    #[test]
+    fn is_tel_is_case_insensitive_on_the_token() {
+        let uri = SipUri {
+            scheme: Scheme::from_token("TEL"),
+            user: None,
+            host: "+12125551234".to_string(),
+            port: None,
+            params: Vec::new(),
+            headers: Vec::new(),
+            user_params: Vec::new(),
+        };
+        assert!(PySipUri::new(uri).is_tel());
     }
 
     #[test]
