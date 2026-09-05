@@ -247,8 +247,7 @@ mod tests {
             host: host.to_string(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         }
     }
 

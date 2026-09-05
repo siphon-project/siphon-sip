@@ -87,7 +87,12 @@ pub enum Scheme {
     /// `tel:` — RFC 3966.
     Tel,
     /// Any other `absoluteURI` scheme, kept verbatim for the 416 path.
-    Other(Box<str>),
+    ///
+    /// Doubly boxed so the variant is a *thin* pointer: a `Box<str>` is a fat
+    /// pointer and would make the enum 24 bytes, the same width as the `String`
+    /// this replaced. The extra indirection is paid only on the 416 path, which
+    /// no live network takes, and buys 8 bytes on every URI that is not on it.
+    Other(Box<Box<str>>),
 }
 
 impl Scheme {
@@ -107,7 +112,7 @@ impl Scheme {
             "sip" => Scheme::Sip,
             "sips" => Scheme::Sips,
             "tel" => Scheme::Tel,
-            other => Scheme::Other(other.into()),
+            other => Scheme::Other(Box::new(other.into())),
         }
     }
 
@@ -171,6 +176,30 @@ impl PartialEq<Scheme> for &str {
     }
 }
 
+/// The two URI parts that are absent from essentially every URI on a live
+/// network, held behind one pointer so they cost 8 bytes rather than 48.
+///
+/// `SipUri` is embedded in every `NameAddr`, so a message carries several and
+/// the registrar carries one per binding; two `Vec` headers that are empty
+/// every time are the kind of cost that only shows up at a million contacts.
+/// Boxed together rather than separately because the URIs that have one
+/// usually have neither and the ones that have either are rare enough that a
+/// single allocation covering both is the right trade.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UriExtras {
+    /// URI headers, after `?` (RFC 3261 §19.1.1).
+    pub headers: Vec<(String, Option<String>)>,
+    /// User parameters, between the user and `@` — e.g. `;phone-context=`
+    /// (RFC 3966 §5.1.5).
+    pub user_params: Vec<(String, Option<String>)>,
+}
+
+impl UriExtras {
+    fn is_empty(&self) -> bool {
+        self.headers.is_empty() && self.user_params.is_empty()
+    }
+}
+
 /// SIP URI as defined in RFC 3261
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipUri {
@@ -179,9 +208,11 @@ pub struct SipUri {
     pub host: String,
     pub port: Option<u16>,
     pub params: Vec<(String, Option<String>)>, // URI parameters (after hostport)
-    pub headers: Vec<(String, Option<String>)>, // URI headers (after ?)
-    /// User parameters (between user and @), e.g. ;phone-context=... (RFC 3966).
-    pub user_params: Vec<(String, Option<String>)>,
+    /// URI headers and user-params. `None` for the overwhelming majority of
+    /// URIs — read through [`headers`](Self::headers) /
+    /// [`user_params`](Self::user_params), which hand back an empty slice
+    /// rather than making every caller unwrap.
+    pub extras: Option<Box<UriExtras>>,
 }
 
 impl SipUri {
@@ -192,8 +223,7 @@ impl SipUri {
             host,
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         }
     }
 
@@ -210,6 +240,46 @@ impl SipUri {
     pub fn with_param(mut self, name: String, value: Option<String>) -> Self {
         self.params.push((name, value));
         self
+    }
+
+    /// URI headers (after `?`). Empty slice when the URI has none, which is
+    /// almost always.
+    pub fn headers(&self) -> &[(String, Option<String>)] {
+        self.extras.as_ref().map_or(&[], |e| e.headers.as_slice())
+    }
+
+    /// RFC 3966 user-params (between the user and `@`). Empty slice when the
+    /// URI has none.
+    pub fn user_params(&self) -> &[(String, Option<String>)] {
+        self.extras
+            .as_ref()
+            .map_or(&[], |e| e.user_params.as_slice())
+    }
+
+    /// Mutable access to the rare parts, allocating the box on first use.
+    /// Prefer [`set_extras`](Self::set_extras) when building a URI from parsed
+    /// pieces — it skips the allocation entirely when both parts are empty.
+    pub fn extras_mut(&mut self) -> &mut UriExtras {
+        self.extras.get_or_insert_with(Box::default)
+    }
+
+    /// Attach headers and user-params, allocating only if at least one is
+    /// non-empty. This is the constructor path: a URI with neither (which is
+    /// nearly all of them) keeps `extras: None` and pays nothing.
+    pub fn set_extras(
+        &mut self,
+        headers: Vec<(String, Option<String>)>,
+        user_params: Vec<(String, Option<String>)>,
+    ) {
+        let extras = UriExtras {
+            headers,
+            user_params,
+        };
+        self.extras = if extras.is_empty() {
+            None
+        } else {
+            Some(Box::new(extras))
+        };
     }
 
     pub fn get_param(&self, name: &str) -> Option<&str> {
@@ -233,7 +303,7 @@ impl fmt::Display for SipUri {
             // sip:/sips: URI: scheme:user[;user-params]@host:port
             if let Some(ref user) = self.user {
                 write!(f, "{user}")?;
-                for (name, value) in &self.user_params {
+                for (name, value) in self.user_params() {
                     write!(f, ";{name}")?;
                     if let Some(ref v) = value {
                         write!(f, "={v}")?;
@@ -256,10 +326,10 @@ impl fmt::Display for SipUri {
             }
         }
 
-        if !self.headers.is_empty() {
+        if !self.headers().is_empty() {
             write!(f, "?")?;
             let mut first = true;
-            for (name, value) in &self.headers {
+            for (name, value) in self.headers() {
                 if !first {
                     write!(f, "&")?;
                 }
@@ -403,8 +473,7 @@ mod tests {
             host: String::new(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         };
         assert_eq!(uri.to_string(), "tel:+15551234567");
     }
@@ -420,8 +489,7 @@ mod tests {
                 "phone-context".to_string(),
                 Some("ims.mnc001.mcc001.3gppnetwork.org".to_string()),
             )],
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         };
         assert_eq!(
             uri.to_string(),
@@ -441,8 +509,12 @@ mod scheme_tests {
     /// `Other` to a `String`, or adding a second payload variant, is silent
     /// without this.
     #[test]
-    fn scheme_is_no_wider_than_the_string_it_replaced() {
-        assert!(std::mem::size_of::<Scheme>() <= std::mem::size_of::<String>());
+    fn scheme_is_narrower_than_the_string_it_replaced() {
+        // A thin pointer plus a tag: 16, against `String`'s 24. Pinned because
+        // switching `Other` back to a bare `Box<str>` silently widens every
+        // `SipUri` in the process by 8 bytes.
+        assert_eq!(std::mem::size_of::<Scheme>(), 16);
+        assert!(std::mem::size_of::<Scheme>() < std::mem::size_of::<String>());
     }
 
     /// The actual win: the three schemes siphon routes carry no pointer at
@@ -480,9 +552,9 @@ mod scheme_tests {
     fn from_token_keeps_an_unknown_scheme_verbatim() {
         assert_eq!(
             Scheme::from_token("nobodyKnowsThisScheme"),
-            Scheme::Other("nobodyKnowsThisScheme".into())
+            Scheme::Other(Box::new("nobodyKnowsThisScheme".into()))
         );
-        assert_eq!(Scheme::from_token("SIP"), Scheme::Other("SIP".into()));
+        assert_eq!(Scheme::from_token("SIP"), Scheme::Other(Box::new("SIP".into())));
         assert_eq!(Scheme::from_token("SIP").as_str(), "SIP");
         assert_eq!(Scheme::from_token("soap.beep").to_string(), "soap.beep");
     }

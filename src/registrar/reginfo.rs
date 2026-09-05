@@ -690,7 +690,6 @@ fn xml_escape(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::sip::uri::SipUri;
-    use std::time::Duration;
 
     fn make_contact(uri_str: &str, expires_secs: u64) -> Contact {
         let mut uri = SipUri::new("10.0.0.1".to_string());
@@ -701,14 +700,14 @@ mod tests {
             uri,
             q: 1.0,
             registered_at: std::time::Instant::now(),
-            expires: Duration::from_secs(expires_secs),
-            call_id: "test-call-id".to_string(),
+            expires_secs: expires_secs as u32,
+            call_id: "test-call-id".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -1136,14 +1135,14 @@ mod tests {
                 .with_user("mmtel".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
-            expires: Duration::from_secs(3600),
-            call_id: String::new(),
+            expires_secs: 3600,
+            call_id: "".into(),
             cseq: 0,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,

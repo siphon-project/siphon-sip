@@ -242,8 +242,7 @@ mod tests {
             host: "+12125551234".to_string(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         };
         assert!(PySipUri::new(uri).is_tel());
     }
@@ -263,8 +262,7 @@ mod tests {
             host: String::new(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         };
         let py_uri = PySipUri::new(uri);
         assert!(py_uri.is_tel());

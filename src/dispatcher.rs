@@ -30783,7 +30783,7 @@ mod tests {
                 None,
                 vec![],
                 crate::registrar::FlowCapture {
-                    flow_token: Some(format!("tok-{user}")),
+                    flow_token: Some(format!("tok-{user}").into_boxed_str()),
                     inbound_local_addr: None,
                     inbound_connection_id: Some(connection_id),
                 },

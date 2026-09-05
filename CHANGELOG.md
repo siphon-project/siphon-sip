@@ -46,8 +46,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the new harness, four interleaved arms at 200k bindings: **live bytes
   844 -> 837 per binding** and **resident 1828 -> 1786**, which is the 8-byte
   jemalloc bin for a 3-byte `"sip"` and its page-level amplification, landing
-  exactly where the arithmetic says it should. Small on its own; it is the
-  cheapest instance of the general finding that on this workload cost tracks
+  exactly where the arithmetic says it should. It is **not** a parse-latency
+  win: three interleaved criterion reps per arm put every `parse/*` and
+  `roundtrip/*` median inside ±2.3% with signs both ways, and the within-arm
+  spread is wider than the between-arm gap. One 8-byte allocation out of a
+  ~1.3 µs parse was never going to be visible, and it is written down here so
+  nobody re-measures looking for it. Small on its own; it is the cheapest
+  instance of the general finding that on this workload cost tracks
   **allocation count** rather than bytes stored.
 - **Capacity planning now covers registrar memory and allocator tuning**
   ([docs/deployment.md](docs/deployment.md)). Budget ~1.8 KB resident per

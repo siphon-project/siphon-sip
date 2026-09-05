@@ -571,8 +571,7 @@ fn extract_uri_from_header(header_value: &str) -> Option<SipUri> {
         host,
         port,
         params: Vec::new(),
-        headers: Vec::new(),
-        user_params: Vec::new(),
+        extras: None,
     })
 }
 
