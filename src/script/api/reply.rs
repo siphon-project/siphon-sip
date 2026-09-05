@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use super::sip_uri::PySipUri;
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::{SipMessage, StartLine};
-use crate::sip::uri::SipUri;
+use crate::sip::uri::{Scheme, SipUri};
 
 /// Python-visible SIP reply object.
 ///
@@ -566,7 +566,7 @@ fn extract_uri_from_header(header_value: &str) -> Option<SipUri> {
     };
 
     Some(SipUri {
-        scheme: scheme.to_string(),
+        scheme: Scheme::from_token(scheme),
         user,
         host,
         port,

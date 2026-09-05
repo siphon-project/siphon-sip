@@ -264,7 +264,7 @@ impl PySubscribeState {
         let destination = crate::script::detach_block_on(resolver_clone.resolve(
             &host,
             port,
-            &scheme,
+            scheme.as_str(),
             transport_hint.as_deref(),
         ));
         let target = destination.into_iter().next().ok_or_else(|| {
@@ -748,7 +748,7 @@ fn send_notify(
     let destination = crate::script::detach_block_on(resolver_clone.resolve(
         &host,
         port,
-        &scheme,
+        scheme.as_str(),
         transport_hint.as_deref(),
     ));
 
@@ -925,7 +925,7 @@ fn build_in_dialog_subscribe(
     let destination = crate::script::detach_block_on(resolver_clone.resolve(
         &host,
         port,
-        &scheme,
+        scheme.as_str(),
         transport_hint.as_deref(),
     ));
     let target = destination.into_iter().next().ok_or_else(|| {

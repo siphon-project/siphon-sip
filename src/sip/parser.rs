@@ -2,7 +2,7 @@
 
 use crate::sip::headers::SipHeaders;
 use crate::sip::message::*;
-use crate::sip::uri::SipUri;
+use crate::sip::uri::{Scheme, SipUri};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while, take_while1},
@@ -313,7 +313,11 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     }
 
     let (input, scheme) = alt((tag("sip:"), tag("sips:"))).parse(input)?;
-    let scheme = scheme.trim_end_matches(':').to_string();
+    let scheme = if scheme == "sips:" {
+        Scheme::Sips
+    } else {
+        Scheme::Sip
+    };
 
     // Parse user part (optional).
     // Per RFC 3261 §19.1.1, userinfo includes user-params (e.g. ;phone-context=)
@@ -415,7 +419,7 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
     Ok((
         input,
         SipUri {
-            scheme: "tel".to_string(),
+            scheme: Scheme::Tel,
             user: Some(subscriber.to_string()),
             host,
             port: None,
@@ -475,7 +479,7 @@ fn parse_absolute_uri(input: &str) -> IResult<&str, SipUri> {
     Ok((
         &rest[end..],
         SipUri {
-            scheme: scheme.to_string(),
+            scheme: Scheme::from_token(scheme),
             user: None,
             host: host.to_string(),
             port,

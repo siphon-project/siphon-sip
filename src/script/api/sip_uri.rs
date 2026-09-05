@@ -42,7 +42,7 @@ impl PySipUri {
 impl PySipUri {
     #[getter]
     fn scheme(&self) -> &str {
-        &self.inner.scheme
+        self.inner.scheme.as_str()
     }
 
     #[getter]
@@ -78,7 +78,7 @@ impl PySipUri {
     /// Whether this is a tel: URI (scheme == "tel").
     #[getter]
     fn is_tel(&self) -> bool {
-        self.inner.scheme.eq_ignore_ascii_case("tel")
+        self.inner.scheme.is_tel()
     }
 
     /// Whether the URI host matches one of the configured local domains.
@@ -122,6 +122,7 @@ impl PySipUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::uri::Scheme;
 
     #[test]
     fn getters_return_uri_fields() {
@@ -233,7 +234,7 @@ mod tests {
     #[test]
     fn is_tel_true_for_tel_scheme() {
         let uri = SipUri {
-            scheme: "tel".to_string(),
+            scheme: Scheme::Tel,
             user: Some("+12125551234".to_string()),
             host: String::new(),
             port: None,
