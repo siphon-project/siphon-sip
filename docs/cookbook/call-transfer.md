@@ -262,6 +262,26 @@ def on_refer(call):
     The handler is `def on_refer(call):` — one argument, no reply object
     (`REFER` is a request).
 
+!!! note "If `call.refer_replaces` is always `None`, look at the advertisement"
+    A transferor decides whether it can *offer* an attended transfer by reading
+    `Supported: replaces` off the responses it gets (RFC 5589 §7.3). It is not a
+    negotiation you can force from the handler: a transferor that does not see
+    the tag falls back to a basic transfer and sends a `REFER` whose `Refer-To`
+    carries no `Replaces` at all, so the handler above sees `None` and dials the
+    target as an unrelated new call — the transferred party ends up connected
+    and correct, while the transferor is left holding a consultation call with
+    nowhere to go and usually reports the transfer as failed.
+
+    siphon advertises `replaces` on the A-leg 2xx, the B-leg INVITE and the 202
+    to a `REFER`, so this works by default. What can still suppress it is your
+    own script: `call.set_header("Supported", …)` is policy precedence 1 and
+    wins over the framework, so a script that sets the header wholesale needs to
+    keep `replaces` in the list it sets.
+
+    Note this is the *transferee* half and is always on. It is separate from
+    `b2bua.accept_replaces` below, which governs the unrelated question of
+    whether an inbound INVITE may take one of siphon's own dialogs over.
+
 !!! note "The other half: a transferee that calls *in*"
     The flow above is siphon placing the transferred call itself. The mirror is a
     transferee that calls siphon with a `Replaces` naming the dialog it is taking

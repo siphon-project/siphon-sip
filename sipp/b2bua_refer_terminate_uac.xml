@@ -83,10 +83,37 @@ Content-Length: 0
 ]]>
   </send>
 
-  <recv response="202" crlf="true" />
+  <recv response="202" crlf="true">
+    <action>
+      <!-- RFC 3515 §2.2 marks Contact "m" for a REFER and for its 2xx: the
+           REFER creates a subscription, so its 2xx is dialog-forming and MUST
+           carry a single Contact. Without it the referrer has no target bound
+           to the subscription it just opened. -->
+      <ereg regexp="sip:"
+            search_in="hdr" header="Contact:" check_it="true"
+            assign_to="accepted_contact_ok" />
+      <!-- RFC 3891 §6.2: a UA that supports Replaces MUST say so. RFC 5589
+           §7.3 is why it matters here — a transferor reads this to decide
+           whether it can offer an attended transfer at all. -->
+      <ereg regexp="replaces"
+            search_in="hdr" header="Supported:" check_it="true"
+            assign_to="accepted_replaces_ok" />
+      <log message="REFER 202 assertions: contact=[$accepted_contact_ok] replaces=[$accepted_replaces_ok]" />
+    </action>
+  </recv>
 
   <!-- sipfrag NOTIFY 100 Trying (siphon-originated). -->
-  <recv request="NOTIFY" crlf="true" />
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <!-- RFC 3515 §2.4.6: the id parameter is the CSeq number of the REFER
+           that created the subscription — 2 in this scenario. It is what lets
+           a referrer tell two transfers on one dialog apart. -->
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true"
+            assign_to="trying_event_ok" />
+      <log message="NOTIFY 100 Trying assertions: event=[$trying_event_ok]" />
+    </action>
+  </recv>
   <send>
     <![CDATA[
 SIP/2.0 200 OK
@@ -111,7 +138,16 @@ Content-Length: 0
 
   <!-- If the NOTIFY arrives first, branch to label 10; otherwise fall through
        to the BYE-first ordering below. -->
-  <recv request="NOTIFY" optional="true" next="10" crlf="true" />
+  <recv request="NOTIFY" optional="true" next="10" crlf="true">
+    <action>
+      <!-- The terminating NOTIFY carries the same subscription id as the
+           first one — the token must not change shape mid-subscription. -->
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true"
+            assign_to="final_event_ok_a" />
+      <log message="final NOTIFY (notify-first) assertions: event=[$final_event_ok_a]" />
+    </action>
+  </recv>
 
   <!-- ===== BYE arrived before the final NOTIFY ===== -->
   <recv request="BYE" crlf="true" />
@@ -127,7 +163,14 @@ Content-Length: 0
 
 ]]>
   </send>
-  <recv request="NOTIFY" crlf="true" next="20" />
+  <recv request="NOTIFY" crlf="true" next="20">
+    <action>
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true"
+            assign_to="final_event_ok_b" />
+      <log message="final NOTIFY (bye-first) assertions: event=[$final_event_ok_b]" />
+    </action>
+  </recv>
 
   <!-- ===== NOTIFY arrived first ===== -->
   <label id="10" />

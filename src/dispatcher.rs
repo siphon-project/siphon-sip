@@ -8990,6 +8990,38 @@ fn stamp_uas_to_tag(response: &mut SipMessage, local_tag: &str) {
     }
 }
 
+/// Stamp the UAS To-tag *and* restore the caller's own From/To onto a
+/// locally-generated A-leg response (RFC 3261 §8.2.6.2).
+///
+/// [`stamp_uas_to_tag`] fixes the tag; this also fixes the URIs. Every one of
+/// these responses is built by [`build_response`] from the **stored** A-leg
+/// INVITE, which is the shared buffer `@b2bua.on_invite` reshapes for the B-leg
+/// — `call.rewrite_identities()`, `set_from_user` / `set_to_user`, a
+/// `number_policy`. So a handler that normalised the caller's number for the
+/// dial plan and then rejected the call answered it with a From/To it never
+/// sent, which §8.2.6.2 does not allow: the response From MUST equal the
+/// request's, and the response To MUST equal the request's To plus our tag.
+///
+/// `stored_from` / `stored_to` are the A-leg's arrival snapshot. Falls back to
+/// tag-only stamping when there is none, which is the previous behaviour.
+fn stamp_uas_echo(
+    response: &mut SipMessage,
+    stored_from: Option<&String>,
+    stored_to: Option<&String>,
+    local_tag: &str,
+) {
+    if let Some(from) = stored_from {
+        response.headers.set("From", from.clone());
+    }
+    match stored_to {
+        Some(to) => {
+            let tagged = crate::b2bua::actor::ensure_tag(to, Some(local_tag));
+            response.headers.set("To", tagged);
+        }
+        None => stamp_uas_to_tag(response, local_tag),
+    }
+}
+
 /// Build a SIP response from a request, copying mandatory headers.
 fn build_response(
     request: &SipMessage,
@@ -9570,6 +9602,35 @@ fn advertise_supported_methods(headers: &mut SipHeaders) {
     }
 }
 
+/// Advertise the SIP extensions siphon implements as a UA, in `Supported`
+/// (RFC 3261 §20.37). The counterpart to [`advertise_supported_methods`]:
+/// `Allow` says which methods a peer may send, `Supported` says which
+/// extensions it may use inside them.
+///
+/// `replaces` (RFC 3891) is the load-bearing one, and it is not optional:
+/// §6.2 is "UAs which support the Replaces header MUST include the 'replaces'
+/// option tag in a Supported header field". It is also how a transferor picks
+/// between an attended transfer and a blind one — RFC 5589 §7.3 has the
+/// Transferor learn that the Transferee supports Replaces "from the
+/// `Supported: replaces` header contained in the 200 OK responses from both".
+/// Withhold the tag and a transferor that gates on it downgrades a
+/// consultative transfer to a REFER carrying no `Replaces`; siphon then dials
+/// the target as an unrelated new call and nothing ever replaces the
+/// transferor's consultation dialog, which is left up on the transferor's
+/// screen while the transfer itself appears to have worked. That is the same
+/// failure mode, and the same vendor, as the `Allow` advertisement above.
+///
+/// Advertising is a statement about the header, not a promise to honour every
+/// takeover: an inbound `INVITE` with `Replaces` still runs the
+/// `b2bua.accept_replaces` gate and is declined `603` when the operator has not
+/// authorised takeovers (RFC 3891 §3's own answer for a dialog a UA is
+/// unwilling to replace). The half that needs no authorisation — siphon as the
+/// transferee, turning a REFER's `Replaces` into the INVITE it sends the
+/// target — is unconditional, and that is the half this tag unblocks.
+fn advertise_supported_options(headers: &mut SipHeaders) {
+    advertise_option_tag(headers, "replaces");
+}
+
 /// Turn a 2xx OPTIONS into a proper capability response (RFC 3261 §11.2): add a
 /// `Contact` at the advertised sent-by and advertise the supported methods via
 /// `Allow`. Both are added only when absent, so a script-set `Contact`/`Allow`
@@ -9989,6 +10050,13 @@ fn sanitize_b2bua_response(
     // this way, and without it never hands siphon a REFER. Gated on absence so a
     // script `call.set_header("Allow", …)` (policy precedence 1) still wins.
     advertise_supported_methods(&mut response.headers);
+
+    // ...and the extensions, for the same reason and by the same route: the
+    // policy stripped the B-leg's `Supported` (not siphon's to relay), so
+    // without this the A-leg sees no option tags at all. RFC 5589 §7.3 has a
+    // transferor read `Supported: replaces` off exactly this response to decide
+    // whether it can offer an attended transfer.
+    advertise_supported_options(&mut response.headers);
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
@@ -14544,8 +14612,15 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 &[],
             );
             // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
-            // on our 1xx) so the final response terminates the same dialog.
-            stamp_uas_to_tag(&mut response, &a_leg.dialog.local_tag);
+            // on our 1xx) so the final response terminates the same dialog, and
+            // echo the caller's own From/To rather than the B-leg shaping the
+            // handler left on the stored INVITE (RFC 3261 §8.2.6.2).
+            stamp_uas_echo(
+                &mut response,
+                a_leg.stored_from.as_ref(),
+                a_leg.stored_to.as_ref(),
+                &a_leg.dialog.local_tag,
+            );
             // Pin the A-leg's arrival socket so the 408 leaves the port the caller
             // sent the INVITE to (multi-homed UDP symmetric signalling).
             send_message_from(
@@ -14902,6 +14977,24 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         a_leg.dialog.remote_to_uri = Some(from.clone());
     }
 
+    // The caller's From/To exactly as they arrived, snapshotted here — before the
+    // script runs — for the same reason as `a_leg_supports_100rel` below: the
+    // stored A-leg INVITE is a *shared, mutable* buffer that the handler shapes
+    // for the B-leg, and every response siphon sends the caller was echoing that
+    // mutated buffer.
+    //
+    // RFC 3261 §8.2.6.2 is unconditional: the response From MUST equal the
+    // request's, and the response To MUST equal the request's To (plus our tag).
+    // B-leg identity shaping — `call.rewrite_identities()`, `set_from_user` /
+    // `set_to_user`, a `number_policy` — is by design a mutation of this buffer,
+    // so its effect leaked back onto the A-leg answer: a caller that offered
+    // `To: <sip:+15551000001@…>` was answered `To: <sip:15551000001@…>` because
+    // the dial plan wanted the B-leg in plain form. The caller is entitled to see
+    // its own request echoed whatever siphon does downstream, so the echo reads
+    // this snapshot and the shaping stays where it was aimed.
+    a_leg.stored_from = message.headers.from().cloned();
+    a_leg.stored_to = message.headers.to().cloned();
+
     // Record the A-leg's own raw endpoint SDP (the caller's offer, before any
     // script/rtpengine rewrite) so a later siphon-terminated transfer where the
     // A-leg is the survivor can offer its real media to the transfer target.
@@ -15225,13 +15318,24 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
             // as the 408-timeout path. Load-bearing for a digest challenge:
             // the caller matches our 407 to its transaction and echoes the tag
             // on its ACK (RFC 3261 §17.1.1.3) before re-INVITEing with
-            // credentials.
-            if let Some(local_tag) = state
-                .call_actors
-                .get_call(&call_id)
-                .map(|call| call.a_leg.dialog.local_tag.clone())
+            // credentials. Same section requires the From/To it carries to be
+            // the caller's own, not the B-leg form the handler shaped before
+            // deciding to reject.
+            if let Some((stored_from, stored_to, local_tag)) =
+                state.call_actors.get_call(&call_id).map(|call| {
+                    (
+                        call.a_leg.stored_from.clone(),
+                        call.a_leg.stored_to.clone(),
+                        call.a_leg.dialog.local_tag.clone(),
+                    )
+                })
             {
-                stamp_uas_to_tag(&mut response, &local_tag);
+                stamp_uas_echo(
+                    &mut response,
+                    stored_from.as_ref(),
+                    stored_to.as_ref(),
+                    &local_tag,
+                );
             }
             send_message_from(
                 response,
@@ -15499,14 +15603,24 @@ fn b2bua_fail_undialed_call(
             let mut response =
                 build_response(&invite, 503, REASON, state.server_header.as_deref(), &[]);
             // siphon is the UAS on the A-leg, so this locally-generated final
-            // response carries the dialog's UAS To-tag (RFC 3261 §8.2.6.2) —
-            // same as the reject and answer-timeout paths.
-            if let Some(local_tag) = state
-                .call_actors
-                .get_call(call_id)
-                .map(|call| call.a_leg.dialog.local_tag.clone())
+            // response carries the dialog's UAS To-tag and the caller's own
+            // From/To (RFC 3261 §8.2.6.2) — same as the reject and
+            // answer-timeout paths.
+            if let Some((stored_from, stored_to, local_tag)) =
+                state.call_actors.get_call(call_id).map(|call| {
+                    (
+                        call.a_leg.stored_from.clone(),
+                        call.a_leg.stored_to.clone(),
+                        call.a_leg.dialog.local_tag.clone(),
+                    )
+                })
             {
-                stamp_uas_to_tag(&mut response, &local_tag);
+                stamp_uas_echo(
+                    &mut response,
+                    stored_from.as_ref(),
+                    stored_to.as_ref(),
+                    &local_tag,
+                );
             }
             Some(response)
         }
@@ -16484,6 +16598,12 @@ fn b2bua_send_b_leg_invite(
         // the tag into what the caller already advertised instead.
         advertise_option_tag(&mut b_leg_invite.headers, "timer");
     }
+
+    // The B-leg is siphon's own UA surface too, so it carries siphon's option
+    // tags rather than whatever the A-leg advertised. RFC 5589 §7.3 needs the
+    // transfer *target* to advertise `replaces` as well as the transferee, and
+    // the callee learns siphon's capability from this INVITE.
+    advertise_supported_options(&mut b_leg_invite.headers);
 
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
@@ -17729,6 +17849,24 @@ fn handle_b2bua_response(
         // the ACK is built from the responder's own 200. Only a bridged re-INVITE
         // (a real originator leg) rewrites the response identity.
         let is_bridged_reinvite = !b_leg_stored_vias.is_empty();
+
+        // The responder's OWN From/To, captured before the rewrite below edits
+        // them in place — the same "capture before we overwrite it" the CSeq and
+        // Contact below already do, and for the same consumer: the 2xx ACK that
+        // goes back to the responder.
+        //
+        // That ACK is part of the responder's dialog, so RFC 3261 §13.2.2.4 /
+        // §12.2.1.1 want the tags that dialog was established with. Building it
+        // from `message` after the rewrite sent the *originator's* tag pair to
+        // the responder — an A-leg tag pair on the B-leg dialog — which the
+        // responder cannot match to the transaction it just answered, so it
+        // retransmits its 200 until the ACK is repeated by the retransmission
+        // handler. Only visible on a bridged re-INVITE: the siphon-originated
+        // one skips the rewrite entirely, which is why the session-timer and
+        // transfer re-anchor refreshes were unaffected.
+        let responder_from = message.headers.from().cloned();
+        let responder_to = message.headers.to().cloned();
+
         if is_bridged_reinvite && is_a2b {
             // A→B: response from B-leg → rewrite B-leg identifiers back to A-leg
             if let Some((ref _b_cid, ref b_ftag)) = b_leg_dialog {
@@ -17772,6 +17910,21 @@ fn handle_b2bua_response(
         // match the request being responded to, which is the originator's re-INVITE).
         if let Some(ref cseq) = b_leg_stored_cseq {
             message.headers.set("CSeq", cseq.clone());
+        }
+        // ...and its From/To, from the same capture and under the same MUST.
+        // The rewrite above swaps the tags but leaves the responder-dialog URIs,
+        // so a hold/resume answered on the far leg came back to the originator
+        // naming the far leg's host — its own re-INVITE's To answered with a
+        // different URI than it sent. Only for a bridged re-INVITE: a
+        // siphon-originated one is absorbed, not forwarded, and its ACK is built
+        // from the responder's untouched 200.
+        if is_bridged_reinvite {
+            if let Some(ref from) = b_leg_stored_from {
+                message.headers.set("From", from.clone());
+            }
+            if let Some(ref to) = b_leg_stored_to {
+                message.headers.set("To", to.clone());
+            }
         }
 
         // The responder's OWN Contact, taken before the sanitize below overwrites
@@ -17953,8 +18106,12 @@ fn handle_b2bua_response(
                     };
                     // Use the responder's CSeq (captured before originator CSeq restoration).
                     let cseq_num = responder_cseq_num.clone();
-                    let from = message.headers.from().cloned().unwrap_or_default();
-                    let to = message.headers.to().cloned().unwrap_or_default();
+                    // The responder's own dialog identity, captured before the
+                    // originator rewrite (RFC 3261 §12.2.1.1 — this ACK belongs
+                    // to the responder's dialog, not the originator's). Reading
+                    // `message` here sent it the far leg's tag pair.
+                    let from = responder_from.clone().unwrap_or_default();
+                    let to = responder_to.clone().unwrap_or_default();
                     // RURI: the responder's own Contact as it arrived (RFC 3261
                     // §12.2.1.1), captured above before sanitize rewrote it to
                     // siphon's address — reading `message` here addressed the ACK
@@ -18179,10 +18336,18 @@ fn handle_b2bua_response(
             }
         }
 
-        // Restore originator's Via and CSeq (RFC 3261 §8.2.6.2).
+        // Restore originator's Via, CSeq and From/To (RFC 3261 §8.2.6.2). The
+        // rewrite above swaps the dialog tags but leaves the responder-dialog
+        // URIs on a header the originator must see echoed from its own UPDATE.
         message.headers.set_all("Via", b_leg_stored_vias.clone());
         if let Some(ref cseq) = b_leg_stored_cseq {
             message.headers.set("CSeq", cseq.clone());
+        }
+        if let Some(ref from) = b_leg_stored_from {
+            message.headers.set("From", from.clone());
+        }
+        if let Some(ref to) = b_leg_stored_to {
+            message.headers.set("To", to.clone());
         }
 
         // A-facing (is_a2b) response: anchor Contact to the A-leg's arrival socket;
@@ -19110,10 +19275,15 @@ fn handle_b2bua_response(
                         // host) — restore the A-leg caller's own From verbatim and its
                         // To with siphon's A-leg tag (the rewrite_headers tag-swap above
                         // only fixed the tags, not the URIs).
-                        if let Some(from) = invite.headers.from() {
+                        //
+                        // From the arrival snapshot, not this INVITE: the stored INVITE
+                        // is the buffer the script reshapes for the B-leg, so echoing it
+                        // returned the caller a rewritten form of its own identity. It
+                        // stays the fallback for a call with no snapshot.
+                        if let Some(from) = a_leg.stored_from.as_ref().or(invite.headers.from()) {
                             response.headers.set("From", from.clone());
                         }
-                        if let Some(to) = invite.headers.to() {
+                        if let Some(to) = a_leg.stored_to.as_ref().or(invite.headers.to()) {
                             response.headers.set(
                                 "To",
                                 crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag)),
@@ -19607,10 +19777,15 @@ fn handle_b2bua_response(
                         // From verbatim; restore the A-leg To URI while preserving
                         // whatever early-dialog To-tag the rewrite above established (a
                         // plain 180 has none, an early-dialog 18x carries siphon's tag).
-                        if let Some(from) = invite.headers.from() {
+                        //
+                        // From the arrival snapshot for the same reason as the 2xx path:
+                        // the stored INVITE is the script's B-leg shaping buffer, so a
+                        // provisional echoed the caller a rewritten form of its own
+                        // identity — and inconsistently with the 2xx that followed.
+                        if let Some(from) = a_leg.stored_from.as_ref().or(invite.headers.from()) {
                             message.headers.set("From", from.clone());
                         }
-                        if let Some(to) = invite.headers.to() {
+                        if let Some(to) = a_leg.stored_to.as_ref().or(invite.headers.to()) {
                             let existing_tag = message
                                 .headers
                                 .to()
@@ -25905,6 +26080,17 @@ fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &D
         );
         reinvite_leg.stored_vias = originator_vias;
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
+        // The originator's own From/To, kept verbatim for the same reason as its
+        // Via and CSeq: RFC 3261 §8.2.6.2 requires the response to echo the
+        // request being answered, and this re-INVITE is that request. The
+        // forwarded response is a clone of the *responder's* 200, whose From/To
+        // name the far leg's dialog, and swapping only the tags (what
+        // `Dialog::rewrite_headers` does) leaves the far leg's URIs in place.
+        // Both are in-dialog here, so the To arrives already tagged and is
+        // echoed as-is — §8.2.6.2's "if a request contained a To tag ... the To
+        // header field in the response MUST equal that of the request".
+        reinvite_leg.stored_from = message.headers.from().map(|f| f.to_string());
+        reinvite_leg.stored_to = message.headers.to().map(|t| t.to_string());
         // The route set the forwarded re-INVITE carries, so the ACK for its 200
         // is routed identically (RFC 3261 §12.2.1.1).
         reinvite_leg.dialog.route_set = target_route_set.clone();
@@ -26414,6 +26600,11 @@ fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: &Dis
         );
         update_leg.stored_vias = originator_vias;
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
+        // See the re-INVITE tracking leg: the response forwarded to this
+        // originator must echo this request's From/To (RFC 3261 §8.2.6.2), not
+        // the responder-dialog URIs the relayed answer carries.
+        update_leg.stored_from = message.headers.from().map(|f| f.to_string());
+        update_leg.stored_to = message.headers.to().map(|t| t.to_string());
         state.call_actors.add_b_leg(&call_id, update_leg);
 
         // Forward to the target leg. A→B: destination-keyed reuse via
@@ -27441,20 +27632,43 @@ fn b2bua_refer_accept(
             // as one ordered unit because two separate sends do NOT order on
             // UDP — the workers share the outbound channel and each owns its own
             // SO_REUSEPORT socket, so the NOTIFY could and did win the race.
-            let accepted = build_response(
+            let mut accepted = build_response(
                 &message,
                 202,
                 "Accepted",
                 state.server_header.as_deref(),
                 &[],
             );
-            let mut ordered = vec![accepted];
-
             let notify_cseq = state.call_actors.reserve_leg_cseq(call_id, from_a_leg);
             let origin_leg = state.call_actors.clone_leg(call_id, from_a_leg);
+
+            // A REFER creates a subscription, so its 2xx is dialog-forming and
+            // `Contact` is mandatory in it — RFC 3515 §2.2 marks Contact `m` for
+            // both REFER and its 2xx ("REFER creates a dialog, and MAY be
+            // Record-Routed, hence MUST contain a single Contact header field
+            // value"). `build_response` copies only the mandatory *echo*
+            // headers, which is right for a plain response and one header short
+            // for this one. It is the leg's own local contact, the same value
+            // the NOTIFYs below carry, so the referrer sees one target for the
+            // whole subscription.
+            if let Some(contact) = origin_leg
+                .as_ref()
+                .and_then(|leg| leg.dialog.local_contact.clone())
+            {
+                if !accepted.headers.has("Contact") {
+                    accepted.headers.set("Contact", contact);
+                }
+            }
+            advertise_supported_options(&mut accepted.headers);
+
+            let mut ordered = vec![accepted];
+
             if let (Some(cseq), Some(leg)) = (notify_cseq, origin_leg) {
                 let extra_headers = [
-                    ("Event", "refer".to_string()),
+                    (
+                        "Event",
+                        crate::b2bua::transfer::refer_event_header(refer_cseq),
+                    ),
                     (
                         "Subscription-State",
                         crate::b2bua::transfer::subscription_state_header(
@@ -27721,7 +27935,7 @@ fn b2bua_complete_terminated_transfer(
     // `referrer_gone` is set when the referrer already BYE'd this call while the
     // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
     // still completes, but there is no dialog left to NOTIFY or BYE.
-    let (referrer_on_a_leg, referrer_gone, transfer_profile, target_leg) =
+    let (referrer_on_a_leg, referrer_gone, event_id, transfer_profile, target_leg) =
         match state.call_actors.get_call(call_id) {
             Some(call) => {
                 let Some(subscription) = call
@@ -27734,6 +27948,7 @@ fn b2bua_complete_terminated_transfer(
                 (
                     subscription.on_a_leg,
                     subscription.referrer_gone,
+                    subscription.event_id,
                     subscription.media_profile.clone(),
                     call.b_legs.get(target_idx).cloned(),
                 )
@@ -27829,7 +28044,10 @@ fn b2bua_complete_terminated_transfer(
     if let Some(cseq) = notify_cseq {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
-                ("Event", "refer".to_string()),
+                (
+                    "Event",
+                    crate::b2bua::transfer::refer_event_header(event_id),
+                ),
                 (
                     "Subscription-State",
                     crate::b2bua::transfer::subscription_state_header(
@@ -28029,12 +28247,18 @@ fn b2bua_fail_terminated_transfer(
     status_code: u16,
     state: &DispatcherState,
 ) {
-    let Some((referrer_on_a_leg, referrer_gone)) =
+    let Some((referrer_on_a_leg, referrer_gone, event_id)) =
         state.call_actors.get_call(call_id).and_then(|call| {
             call.refer_subscriptions
                 .iter()
                 .find(|subscription| subscription.siphon_notifies)
-                .map(|subscription| (subscription.on_a_leg, subscription.referrer_gone))
+                .map(|subscription| {
+                    (
+                        subscription.on_a_leg,
+                        subscription.referrer_gone,
+                        subscription.event_id,
+                    )
+                })
         })
     else {
         return;
@@ -28085,7 +28309,10 @@ fn b2bua_fail_terminated_transfer(
     {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
-                ("Event", "refer".to_string()),
+                (
+                    "Event",
+                    crate::b2bua::transfer::refer_event_header(event_id),
+                ),
                 (
                     "Subscription-State",
                     crate::b2bua::transfer::subscription_state_header(&failure, 0),
@@ -30032,7 +30259,7 @@ mod tests {
         // Multi-homed host: INVITE arrived on :5066 while the default listener is
         // :5060. The A-leg Contact / dialog anchor must be the arrival port, else
         // in-dialog requests are directed to a port the dialog isn't on.
-        let arrival: SocketAddr = "172.31.24.94:5066".parse().unwrap();
+        let arrival: SocketAddr = "192.0.2.94:5066".parse().unwrap();
         assert_eq!(a_leg_advertised_port(Some(arrival), 5060), 5066);
     }
 
@@ -30798,6 +31025,111 @@ mod tests {
         headers.set("Allow", "INVITE, ACK, BYE".to_string());
         advertise_supported_methods(&mut headers);
         assert_eq!(headers.get("Allow").unwrap(), "INVITE, ACK, BYE");
+    }
+
+    #[test]
+    fn stamp_uas_echo_restores_the_callers_own_from_and_to() {
+        // The reported shape: the handler normalised the caller's number for the
+        // dial plan (`+15551000001` -> `15551000001`) on the shared A-leg INVITE,
+        // and the response built from that buffer answered the caller with an
+        // identity it never sent. RFC 3261 §8.2.6.2 requires the echo.
+        let mut response = SipMessageBuilder::new()
+            .response(503, "Service Unavailable".to_string())
+            .from("<sip:15550000001@example.test>;tag=caller-tag".to_string())
+            .to("<sip:15551000001@example.test>".to_string())
+            .build()
+            .unwrap();
+        let stored_from = "<sip:+15550000001@example.test>;tag=caller-tag".to_string();
+        let stored_to = "<sip:+15551000001@example.test>".to_string();
+        stamp_uas_echo(
+            &mut response,
+            Some(&stored_from),
+            Some(&stored_to),
+            "a-leg-uas-tag",
+        );
+        assert_eq!(response.headers.get("From").unwrap(), &stored_from);
+        // The To URI is the caller's, plus the UAS tag §8.2.6.2 also requires.
+        assert_eq!(
+            response.headers.get("To").unwrap(),
+            "<sip:+15551000001@example.test>;tag=a-leg-uas-tag"
+        );
+    }
+
+    #[test]
+    fn stamp_uas_echo_preserves_a_to_tag_the_request_already_carried() {
+        // An in-dialog request answers with the To it arrived with, tag and all
+        // (§8.2.6.2: "if a request contained a To tag ... MUST equal that of the
+        // request") — `ensure_tag` must not overwrite it with our dialog tag.
+        let mut response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .to("<sip:stale@example.test>;tag=stale".to_string())
+            .build()
+            .unwrap();
+        let stored_to = "<sip:+15551000001@example.test>;tag=uas-tag-from-the-request".to_string();
+        stamp_uas_echo(&mut response, None, Some(&stored_to), "a-different-tag");
+        assert_eq!(response.headers.get("To").unwrap(), &stored_to);
+    }
+
+    #[test]
+    fn stamp_uas_echo_without_a_snapshot_is_tag_only() {
+        // Fallback path — behaviour identical to stamp_uas_to_tag, so a call with
+        // no captured arrival snapshot is no worse off than before.
+        let mut response = SipMessageBuilder::new()
+            .response(408, "Request Timeout".to_string())
+            .from("<sip:caller@example.test>;tag=caller-tag".to_string())
+            .to("<sip:callee@example.test>".to_string())
+            .build()
+            .unwrap();
+        stamp_uas_echo(&mut response, None, None, "a-leg-uas-tag");
+        assert_eq!(
+            response.headers.get("From").unwrap(),
+            "<sip:caller@example.test>;tag=caller-tag"
+        );
+        assert_eq!(
+            response.headers.get("To").unwrap(),
+            "<sip:callee@example.test>;tag=a-leg-uas-tag"
+        );
+    }
+
+    #[test]
+    fn advertise_supported_options_sets_replaces_when_absent() {
+        let mut headers = SipHeaders::new();
+        advertise_supported_options(&mut headers);
+        // RFC 3891 §6.2: a UA that supports the Replaces header MUST advertise
+        // the option tag. RFC 5589 §7.3: this is what a transferor reads to
+        // decide between an attended transfer and a blind one.
+        assert_eq!(headers.get("Supported").unwrap(), "replaces");
+    }
+
+    #[test]
+    fn advertise_supported_options_merges_with_an_existing_tag() {
+        // `Supported` is a comma-separated list header — `replaces` belongs
+        // inside the existing value, not on a second line, and must not
+        // displace a tag already negotiated (here RFC 4028 `timer`).
+        let mut headers = SipHeaders::new();
+        headers.set("Supported", "timer".to_string());
+        advertise_supported_options(&mut headers);
+        assert_eq!(headers.get("Supported").unwrap(), "timer,replaces");
+        assert_eq!(headers.get_all("Supported").map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn advertise_supported_options_is_idempotent() {
+        // The A-leg response path can be re-sanitized; the tag must not stack.
+        let mut headers = SipHeaders::new();
+        advertise_supported_options(&mut headers);
+        advertise_supported_options(&mut headers);
+        assert_eq!(headers.get("Supported").unwrap(), "replaces");
+    }
+
+    #[test]
+    fn advertise_supported_options_respects_a_tag_the_peer_already_named() {
+        // Case-insensitive per RFC 3261 §7.3.1 — an option tag already present
+        // in any casing must not be duplicated.
+        let mut headers = SipHeaders::new();
+        headers.set("Supported", "timer, REPLACES".to_string());
+        advertise_supported_options(&mut headers);
+        assert_eq!(headers.get("Supported").unwrap(), "timer, REPLACES");
     }
 
     #[test]

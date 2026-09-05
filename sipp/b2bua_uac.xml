@@ -45,7 +45,22 @@ a=fmtp:101 0-15
   <recv response="180" optional="true" next="1" />
 
   <!-- Expect 200 OK from B2BUA -->
-  <recv response="200" rtd="true" crlf="true" />
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <!-- RFC 3891 §6.2 makes this a MUST for any UA that supports Replaces,
+           and RFC 5589 §7.3 is why the caller cares: a transferor reads
+           `Supported: replaces` off exactly this 200 OK to decide whether it
+           can offer an attended transfer. Without it a transferor that gates
+           on the tag downgrades to a blind REFER with no Replaces, and its
+           own consultation dialog is then left up with nothing to replace it.
+           The B2BUA terminates the dialog, so this is siphon's own capability,
+           not the B-leg's. -->
+      <ereg regexp="replaces"
+            search_in="hdr" header="Supported:" check_it="true"
+            assign_to="answer_replaces_ok" />
+      <log message="B2BUA 200 OK assertions: replaces=[$answer_replaces_ok]" />
+    </action>
+  </recv>
 
   <!-- Send ACK directly to B2BUA (no routes — B2BUA owns the dialog) -->
   <send>
