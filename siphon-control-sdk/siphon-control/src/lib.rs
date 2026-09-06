@@ -21,7 +21,8 @@
 //!       await call.answer()
 //!       await call.transfer("sip:agent@pbx")   # raises ControlError on a typed error
 //!
-//!   await client.run()
+//!   async with client:          # closes on the way out — see Shutdown below
+//!       await client.run()
 //!   ```
 //!
 //! - **Per-call-connect** — [`ControlServer`]. *siphon dials the app* at
@@ -41,7 +42,8 @@
 //!       await call.answer()
 //!       await call.transfer("sip:agent@pbx")
 //!
-//!   await server.serve()
+//!   async with server:
+//!       await server.serve()
 //!   ```
 //!
 //! Both modes reuse the SAME `@on_call` decorator and the SAME [`Call`] handle;
@@ -49,8 +51,24 @@
 //! Rust crate: `ControlClient.command(...)` is the generic `{module, verb,
 //! target, args}` primitive for any adapter, and the `on_call` decorator +
 //! `Call` verbs are the SIP facade on top.
+//!
+//! # Shutdown
+//!
+//! Both classes are async context managers, and `async with` is the recommended
+//! shape (`close()` is the same thing explicitly). `run()` / `serve()` are
+//! driven by a background tokio task, and each handed-over call is dispatched
+//! from another one; nothing joins them and the runtime outlives the
+//! interpreter, so an app that finishes without closing leaves them delivering
+//! results into an asyncio loop — and then a Python — that is no longer there.
+//!
+//! Not closing is handled rather than fatal: [`attach_if_running`] declines a
+//! re-entry into a departed interpreter instead of panicking, a handover onto a
+//! closed loop is dropped rather than dispatched, and a handler cancelled during
+//! teardown is not reported as a failure. That is damage control; closing is the
+//! fix.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,6 +83,74 @@ use siphon_control_client::sip::{
     Call as RustCall, DtmfOptions, PlayOptions, PlaySource, RouteTarget, SipClient, SipServer,
 };
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
+
+// ---------------------------------------------------------------------------
+// Interpreter lifecycle
+// ---------------------------------------------------------------------------
+
+/// Set once Python has begun shutting down, from the `atexit` hook registered
+/// at module import. See [`attach_if_running`].
+static INTERPRETER_GOING_AWAY: AtomicBool = AtomicBool::new(false);
+
+/// Run `body` attached to the interpreter, or return `None` if the interpreter
+/// is no longer there to attach to.
+///
+/// Every `Python::attach` in this file is reachable from a **detached** tokio
+/// task: the client's read loop hands a handover to `SipFacade::dispatch`,
+/// which `tokio::spawn`s the handler bridge, and `future_into_py` drives each
+/// awaitable on the same runtime. Nothing joins or aborts those tasks, and the
+/// runtime outlives the interpreter — so a task that wakes after Python has
+/// gone reaches `Python::attach`, which is not fallible: pyo3's
+/// `AttachGuard::attach` sees `Py_IsInitialized() == 0`, falls into
+/// `ensure_initialized()`, and asserts. That surfaces as a `tokio-rt-worker`
+/// panic advising the reader to call `Python::initialize()` — advice aimed at
+/// an embedder and meaningless to someone whose app just exited, printed
+/// *after* the app's own clean finish and easily mistaken for the cause of it.
+///
+/// Two checks, because they close different windows:
+///
+/// * `INTERPRETER_GOING_AWAY` is the one that does the work. `atexit` runs
+///   while Python is still fully alive, well before `Py_FinalizeEx` starts
+///   tearing anything down, so every late callback is already declining by the
+///   time finalization could race it.
+/// * `Py_IsInitialized` is the backstop for a teardown that never ran `atexit`
+///   at all — `os._exit`, an embedder finalizing directly.
+///
+/// A dropped callback is the correct outcome here, not a lossy one: the
+/// process is on its way out, and the work would have had nowhere to report to
+/// anyway. The same shutdown also closes the asyncio loop the handler bridge
+/// resolves its awaitables on, which is the milder form of this defect — a
+/// flood of `RuntimeError: Event loop is closed` from tasks still driving a
+/// loop the app has finished with.
+fn attach_if_running<R>(body: impl FnOnce(Python<'_>) -> R) -> Option<R> {
+    if INTERPRETER_GOING_AWAY.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: `Py_IsInitialized` reads a process-global flag. It is callable
+    // from any thread, attached or not, and touches no Python object — it is
+    // the one lifecycle call that is safe to make when we do not yet know
+    // whether there is an interpreter to talk to.
+    if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+        return None;
+    }
+    Some(Python::attach(body))
+}
+
+/// `atexit` hook: stop re-entering Python from tokio tasks. Registered at
+/// module import, so it fires before the interpreter tears anything down.
+#[pyfunction]
+fn _mark_interpreter_going_away() {
+    INTERPRETER_GOING_AWAY.store(true, Ordering::Release);
+}
+
+/// What an in-flight command resolves to when the interpreter went away under
+/// it. Nothing observes this — delivering *any* result needs Python — but it
+/// keeps the value in `PyResult` shape without re-entering an interpreter that
+/// is gone. `ControlError::new_err` builds the exception lazily, so
+/// constructing it does not itself touch Python.
+fn interpreter_gone() -> PyErr {
+    ControlError::new_err("the Python interpreter shut down while this command was in flight")
+}
 
 pyo3::create_exception!(
     siphon_control,
@@ -107,14 +193,20 @@ fn code_to_str(code: ControlErrorCode) -> Option<String> {
 }
 
 /// Map a client error to the Python `ControlError` exception, attaching `.code`.
+///
+/// Called from inside `future_into_py` futures, i.e. on the tokio runtime, so
+/// it can run after the interpreter has gone — attaching to set `.code` has to
+/// go through the lifecycle guard. Without the interpreter the exception keeps
+/// its message and simply carries no `.code`; `ControlError::new_err` builds
+/// lazily, so returning it re-enters nothing.
 fn to_pyerr(error: ClientError) -> PyErr {
     let code = error.code().and_then(code_to_str);
     let message = error.to_string();
-    Python::attach(|py| {
-        let err = ControlError::new_err(message);
+    let err = ControlError::new_err(message);
+    attach_if_running(|py| {
         let _ = err.value(py).setattr("code", code);
-        err
-    })
+    });
+    err
 }
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -414,7 +506,8 @@ impl Call {
                 .bridge(&with_channel, policy)
                 .await
                 .map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -439,7 +532,8 @@ impl Call {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let value = call.unbridge(reason.as_deref()).await.map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -477,7 +571,8 @@ impl Call {
                 .route(route_targets, Some(strategy.as_str()), extra_headers)
                 .await
                 .map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -653,7 +748,8 @@ impl Call {
         let args = optional_json(args)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let value = call.command(&verb, args).await.map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -662,13 +758,14 @@ impl Call {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match call.next_event().await {
-                Some(event) => Python::attach(|py| {
+                Some(event) => attach_if_running(|py| {
                     let dict = pyo3::types::PyDict::new(py);
                     dict.set_item("kind", event.kind.as_str())?;
                     dict.set_item("payload", json_to_py(py, &event.payload)?)?;
                     Ok(dict.into_any().unbind())
-                }),
-                None => Ok(Python::attach(|py| py.None())),
+                })
+                .unwrap_or_else(|| Err(interpreter_gone())),
+                None => attach_if_running(|py| py.None()).ok_or_else(interpreter_gone),
             }
         })
     }
@@ -747,7 +844,8 @@ impl ControlClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = ensure_client(&inner).await?;
             let value = client.describe().await.map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -771,7 +869,8 @@ impl ControlClient {
                 .command(module.as_deref(), &verb, target, args)
                 .await
                 .map_err(to_pyerr)?;
-            Python::attach(|py| json_to_py(py, &value))
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }
 
@@ -801,6 +900,42 @@ impl ControlClient {
             }
         }
     }
+
+    /// Stop the client and drop the registered handler, so nothing else is
+    /// dispatched into Python on this client.
+    ///
+    /// Prefer this — or the `async with` form below — over letting the process
+    /// exit with `run()` still in flight. `run()` is backed by a tokio task
+    /// that nothing joins, and both it and any handler still dispatching
+    /// re-enter Python to deliver their results; if the interpreter goes away
+    /// first, that lands on a dead interpreter. This crate declines those
+    /// re-entries rather than crashing (see `attach_if_running`), but declining
+    /// them is damage control — closing first means there is nothing in flight
+    /// to decline.
+    fn close(&self) {
+        self.shutdown();
+        // Drop the handler reference as well: a call handed over between the
+        // shutdown and the socket actually closing would otherwise still be
+        // dispatched into an app that has said it is done.
+        *lock(&self.inner.handler) = None;
+    }
+
+    /// `async with ControlClient(...) as client:` — closes on the way out,
+    /// including on an exception or a cancellation.
+    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let slf = slf.unbind();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(false) })
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -823,18 +958,51 @@ async fn ensure_client(inner: &Arc<ClientInner>) -> PyResult<Arc<SipClient>> {
 /// returned coroutine on the asyncio loop captured in `locals`.
 fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLocals) {
     client.set_call_handler(move |call: RustCall| {
-        let handler = Python::attach(|py| handler.clone_ref(py));
+        // Runs on a detached `tokio::spawn` from `SipFacade::dispatch`, so it
+        // can wake after the interpreter has gone — clone the handler through
+        // the lifecycle guard rather than `Python::attach` directly.
+        let handler = attach_if_running(|py| handler.clone_ref(py));
         let locals = locals.clone();
         async move {
-            dispatch_to_python(handler, locals, call).await;
+            // `None` = Python is on its way out. Drop the call: there is nobody
+            // left to hand it to and the process is not going to place it
+            // either. Dropped without a word on purpose — the point of this
+            // path is that a finished app exits quietly, and this crate has no
+            // logger of its own to say it through.
+            if let Some(handler) = handler {
+                dispatch_to_python(handler, locals, call).await;
+            }
             Ok(())
         }
     });
 }
 
 async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCall) {
-    let outcome = pyo3_async_runtimes::tokio::scope(locals, async move {
-        let awaitable = Python::attach(|py| -> PyResult<Option<_>> {
+    // The asyncio loop captured when `run()` was called can be closed while the
+    // client is still live — an app that finished without closing, which is the
+    // shape that produced this bug report. Dispatching onto a closed loop does
+    // not fail quietly: `pyo3-async-runtimes` resolves every awaitable through
+    // `loop.call_soon_threadsafe`, which raises `RuntimeError: Event loop is
+    // closed` and gets dumped as a traceback from inside the dependency, once
+    // per handed-over call. Nothing here can catch that after the fact, so
+    // check before handing the call over at all. One `is_closed()` per
+    // handover, against building a `Call` and driving a coroutine.
+    let loop_usable = attach_if_running(|py| {
+        locals
+            .event_loop(py)
+            .call_method0("is_closed")
+            .and_then(|closed| closed.extract::<bool>())
+            .map(|closed| !closed)
+            // An event loop that cannot answer `is_closed()` is not one to
+            // dispatch onto either.
+            .unwrap_or(false)
+    });
+    if loop_usable != Some(true) {
+        return;
+    }
+
+    let scoped = pyo3_async_runtimes::tokio::scope(locals, async move {
+        let awaitable = attach_if_running(|py| -> PyResult<Option<_>> {
             let py_call = Bound::new(py, Call { inner: call })?;
             let result = handler.bind(py).call1((py_call,))?;
             if result.hasattr("__await__")? {
@@ -842,16 +1010,33 @@ async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCa
             } else {
                 Ok(None)
             }
-        });
-        match awaitable {
+        })?;
+        Some(match awaitable {
             Ok(Some(future)) => future.await.map(|_| ()),
             Ok(None) => Ok(()),
             Err(error) => Err(error),
-        }
+        })
     })
     .await;
-    if let Err(error) = outcome {
-        Python::attach(|py| error.print(py));
+    // Printing a traceback is itself a Python call, and this one runs after the
+    // handler has already awaited — the widest window for shutdown to have
+    // started underneath it. If the interpreter is gone the traceback goes
+    // nowhere, which is correct: there is no stderr contract left to honour
+    // once the app has finished, and the alternative was the panic this guard
+    // exists to remove. `None` from the scope means the handler was never
+    // entered at all, for the same reason.
+    if let Some(Err(error)) = scoped {
+        attach_if_running(|py| {
+            // A handler cancelled as the loop shuts down is teardown, not a
+            // failure. asyncio does not print a traceback for a cancelled task
+            // and neither should this: with calls in flight it turns every
+            // clean exit into a wall of CancelledError, one per call, which is
+            // the same "the exit reason is buried under noise the app did not
+            // cause" problem as the panic above.
+            if !error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
+                error.print(py);
+            }
+        });
     }
 }
 
@@ -932,6 +1117,31 @@ impl ControlServer {
     fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.serve_impl(py)
     }
+
+    /// Drop the registered handler, so no further accepted call is dispatched
+    /// into Python. Same reasoning as [`ControlClient::close`]: close before
+    /// the interpreter goes away rather than leaving dispatches in flight for
+    /// the lifecycle guard to decline.
+    fn close(&self) {
+        *lock(&self.inner.handler) = None;
+    }
+
+    /// `async with ControlServer(...) as server:` — closes on the way out,
+    /// including on an exception or a cancellation.
+    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let slf = slf.unbind();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.close();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(false) })
+    }
 }
 
 impl ControlServer {
@@ -969,10 +1179,14 @@ async fn ensure_server(inner: &Arc<ServerInner>) -> PyResult<Arc<SipServer>> {
 /// per-call dispatch as the inbound client (identical `Call` + coroutine drive).
 fn install_server_handler_bridge(server: &SipServer, handler: Py<PyAny>, locals: TaskLocals) {
     server.set_call_handler(move |call: RustCall| {
-        let handler = Python::attach(|py| handler.clone_ref(py));
+        // Same detached-task lifetime as the client bridge above — guard the
+        // attach for the same reason.
+        let handler = attach_if_running(|py| handler.clone_ref(py));
         let locals = locals.clone();
         async move {
-            dispatch_to_python(handler, locals, call).await;
+            if let Some(handler) = handler {
+                dispatch_to_python(handler, locals, call).await;
+            }
             Ok(())
         }
     });
@@ -989,6 +1203,19 @@ fn siphon_control(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ControlServer>()?;
     module.add_class::<Call>()?;
     module.add("ControlError", module.py().get_type::<ControlError>())?;
+
+    // Stop driving Python from the tokio runtime once shutdown begins. The
+    // runtime outlives the interpreter and nothing joins its tasks, so without
+    // this a callback landing during teardown reaches `Python::attach` on a
+    // dead interpreter and panics — see `attach_if_running`. `atexit` is the
+    // right hook because it runs while Python is still fully alive, ahead of
+    // finalization rather than racing it.
+    let mark = wrap_pyfunction!(_mark_interpreter_going_away, module)?;
+    module
+        .py()
+        .import("atexit")?
+        .call_method1("register", (&mark,))?;
+    module.add("_mark_interpreter_going_away", mark)?;
     module.add(
         "__all__",
         PyList::new(

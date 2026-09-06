@@ -49,7 +49,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the registered UE, or dropping it silently, stays a script decision, and
   silent-drop semantics are untouched.
 
+- **`siphon-control` (Python SDK) no longer panics in a tokio worker when the
+  interpreter shuts down.** The extension drives Python from detached tokio
+  tasks — a handover is dispatched with `tokio::spawn`, and every awaitable is
+  resolved through the asyncio loop captured when `run()` was called. Nothing
+  joins those tasks and the runtime outlives the interpreter, so one waking
+  after the app had finished re-entered a Python that was no longer there.
+  `Python::attach` is not fallible: pyo3 sees `Py_IsInitialized() == 0` and
+  asserts. The app got a `tokio-rt-worker` panic advising it to call
+  `Python::initialize()` — advice aimed at an embedder, printed after the app's
+  own clean finish, and easily read as the reason it stopped.
+
+  Every re-entry from a Rust-owned task now goes through a lifecycle guard and
+  declines rather than crashing, backed by an `atexit` hook that sets the flag
+  while Python is still fully alive rather than racing finalization. Two
+  neighbours of the same defect went with it: a handover arriving after the
+  asyncio loop has closed is dropped instead of dispatched onto it (the
+  dependency reports that as `RuntimeError: Event loop is closed`, one traceback
+  per call), and a handler cancelled as the loop shuts down is no longer printed
+  as a failure — asyncio does not report a cancelled task that way either, and
+  with calls in flight it turned every clean exit into a wall of
+  `CancelledError`.
+
 ### Added
+- **`ControlClient.close()` / `ControlServer.close()`, and both classes as async
+  context managers** (`async with client: await client.run()`). Closing stops
+  the client and drops the handler, so teardown is deterministic instead of
+  leaving background tasks to be declined later by the guards above. The shipped
+  examples use it.
 - **`server.auto_options`** (default `true`) — set it to `false` and an OPTIONS
   that no script handler claims is dropped silently rather than answered, so
   siphon does not confirm its own existence to a probe nobody asked it to

@@ -38,7 +38,11 @@ async def handle(call):
     except ControlError as error:
         print("transfer rejected:", error.code)
 
-asyncio.run(client.run())
+async def main():
+    async with client:          # closes on the way out — see Shutdown below
+        await client.run()
+
+asyncio.run(main())
 ```
 
 ### Per-call-connect
@@ -57,8 +61,28 @@ async def handle(call):
     except ControlError as error:
         print("transfer rejected:", error.code)
 
-asyncio.run(server.serve())
+async def main():
+    async with server:
+        await server.serve()
+
+asyncio.run(main())
 ```
+
+## Shutdown
+
+Both classes are async context managers, and `async with` is the recommended
+shape. `close()` is the same thing explicitly.
+
+It matters more than it looks. `run()` / `serve()` are driven by a background
+tokio task, and every handed-over call is dispatched from another one. Nothing
+joins those tasks and the runtime outlives the interpreter, so an app that
+finishes without closing leaves them delivering results into an asyncio loop —
+and then into a Python — that is no longer there. Closing first means there is
+nothing in flight to strand.
+
+Not closing is handled rather than fatal: a handover arriving after the loop or
+interpreter has gone is dropped, and a handler cancelled during teardown is not
+reported as a failure. That is damage control, not a substitute for closing.
 
 ## API
 
@@ -71,6 +95,8 @@ asyncio.run(server.serve())
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
 - `await client.describe()` — adapter schema.
 - `client.shutdown()` — stop the client and unblock `run()`.
+- `client.close()` — shutdown, plus drop the handler so nothing else is
+  dispatched. `async with client:` does this on the way out. See Shutdown above.
 
 ### `ControlServer` (per-call-connect)
 
@@ -83,6 +109,8 @@ asyncio.run(server.serve())
 - `server.local_addr` — the bound address once `bind()` / `serve()` has run, else `None`.
 - `await server.serve()` / `await server.run()` — accept siphon's per-call dials
   forever (stop by cancelling the task).
+- `server.close()` — drop the handler so no further accepted call is dispatched.
+  `async with server:` does this on the way out. See Shutdown above.
 
 ### `Call` (shared by both modes)
 
