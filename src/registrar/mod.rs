@@ -11,9 +11,9 @@ pub mod reginfo;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 #[cfg(test)]
 use std::time::Duration;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -3934,7 +3934,11 @@ mod tests {
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert_eq!(
-            contacts[0].path.iter().map(|v| v.as_ref()).collect::<Vec<&str>>(),
+            contacts[0]
+                .path
+                .iter()
+                .map(|v| v.as_ref())
+                .collect::<Vec<&str>>(),
             path.iter().map(|v| v.as_str()).collect::<Vec<&str>>()
         );
     }
@@ -4124,7 +4128,11 @@ mod tests {
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert_eq!(
-            contacts[0].path.iter().map(|v| v.as_ref()).collect::<Vec<&str>>(),
+            contacts[0]
+                .path
+                .iter()
+                .map(|v| v.as_ref())
+                .collect::<Vec<&str>>(),
             vec!["<sip:new-pcscf.example.com;lr>"]
         );
     }

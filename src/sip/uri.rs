@@ -554,7 +554,10 @@ mod scheme_tests {
             Scheme::from_token("nobodyKnowsThisScheme"),
             Scheme::Other(Box::new("nobodyKnowsThisScheme".into()))
         );
-        assert_eq!(Scheme::from_token("SIP"), Scheme::Other(Box::new("SIP".into())));
+        assert_eq!(
+            Scheme::from_token("SIP"),
+            Scheme::Other(Box::new("SIP".into()))
+        );
         assert_eq!(Scheme::from_token("SIP").as_str(), "SIP");
         assert_eq!(Scheme::from_token("soap.beep").to_string(), "soap.beep");
     }

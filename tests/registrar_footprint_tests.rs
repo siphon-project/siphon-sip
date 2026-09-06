@@ -40,7 +40,10 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ARMED.load(Ordering::Relaxed) {
             FREES.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_sub(layout.size().min(BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
+            BYTES.fetch_sub(
+                layout.size().min(BYTES.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
         }
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -74,7 +77,10 @@ fn measure<T>(body: impl FnOnce() -> T) -> (T, usize, usize) {
     ARMED.store(false, Ordering::Relaxed);
     (
         value,
-        ALLOCS.load(Ordering::Relaxed) - FREES.load(Ordering::Relaxed).min(ALLOCS.load(Ordering::Relaxed)),
+        ALLOCS.load(Ordering::Relaxed)
+            - FREES
+                .load(Ordering::Relaxed)
+                .min(ALLOCS.load(Ordering::Relaxed)),
         BYTES.load(Ordering::Relaxed),
     )
 }
@@ -102,10 +108,8 @@ fn registrar() -> Registrar {
 /// A plain UE binding: what a residential proxy or a no-auth REGISTER load
 /// actually stores. No IMS extras, one contact per AoR.
 fn save_plain(registrar: &Registrar, index: usize) {
-    let uri = parse_uri_standalone(&format!(
-        "sip:u{index}@198.51.100.7:5060;transport=udp"
-    ))
-    .expect("contact uri");
+    let uri = parse_uri_standalone(&format!("sip:u{index}@198.51.100.7:5060;transport=udp"))
+        .expect("contact uri");
     registrar
         .save(
             &format!("sip:u{index}@example.com"),
@@ -235,6 +239,25 @@ fn irreducible_floor() {
             );
         }
     });
+
+    // Read it back. A floor that cannot answer the question a registrar exists
+    // to answer is not a floor, it is a smaller number — so the comparison only
+    // holds if every field measured above is actually reachable by AoR.
+    let probe = format!("sip:u{}@example.com", POPULATION + 1);
+    let found = store
+        .get(probe.as_str())
+        .expect("floor store must resolve an AoR");
+    assert_eq!(
+        &*found.contact_uri,
+        format!("sip:u{}@198.51.100.7:5060;transport=udp", POPULATION + 1).as_str()
+    );
+    assert_eq!(
+        &*found.call_id,
+        format!("{}-call-id@198.51.100.7", POPULATION + 1).as_str()
+    );
+    assert_eq!(found.expires_secs, 3600);
+    assert_eq!(found.cseq, 1);
+    drop(found);
 
     let floor_bytes = bytes / POPULATION;
     let floor_allocs = allocations as f64 / POPULATION as f64;
