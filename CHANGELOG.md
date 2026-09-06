@@ -6,6 +6,59 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **A method no script handler claims is no longer answered `500`, and OPTIONS
+  is answered by the stack.** Every method without a matching
+  `@proxy.on_request` handler got `500 Server Internal Error`, and OPTIONS is
+  such a method for any script whose handlers are method-filtered — which is
+  the shape a script naturally ends up in, because nothing prompts you to write
+  an OPTIONS branch. That made it a bug every registered deployment hit: a
+  registrar qualifies its bindings (Asterisk's `qualify_frequency` and its
+  equivalents) by sending OPTIONS to the registered contact on a timer for the
+  life of the registration, so a siphon registered to a provider answered `500`
+  to a liveness probe every few seconds, forever.
+
+  It stayed invisible because the thing it breaks accepts the wrong answer: a
+  qualifying registrar takes *any* final response as proof of life, so the
+  contact showed `Avail` with a healthy RTT and the only trace was one `WARN`
+  per probe that read as a script-authoring note. A peer with the stricter and
+  entirely reasonable reading — a 5xx is a failed probe — marks the contact down
+  and stops sending calls, while the siphon side still shows a healthy
+  registration.
+
+  An unclaimed OPTIONS is now answered `200` with `Contact` and `Allow` (RFC
+  3261 §11.2), and every other unclaimed method gets `405 Method Not Allowed`
+  with `Allow` (§8.2.1), which is both true and something the sender can act on
+  where `500` was neither. `Allow` advertises what the stack implements rather
+  than what the script routes, deliberately: deriving it from the registered
+  handlers would under-advertise every method the framework dispatches
+  elsewhere — REFER to `@b2bua.on_refer`, CANCEL and ACK to the transaction
+  layer — which is the same under-advertisement that stopped Teams Direct
+  Routing offering REFER once already.
+
+  Both answers are fed to the server transaction the way a script's own reply
+  is, so a retransmitted request is answered from the cached response (RFC 3261
+  §17.2.2) instead of falling into silence — over UDP that lost-probe case is
+  the whole point. The `405` to an unclaimed INVITE now also drives the INVITE
+  server transaction properly, so its ACK is absorbed rather than stranding the
+  transaction.
+
+  **This changes nothing for a script that handles the method itself**, and
+  that includes a catch-all `@proxy.on_request`, which matches every method:
+  the fallback runs only where no handler matched at all. Relaying OPTIONS to
+  the registered UE, or dropping it silently, stays a script decision, and
+  silent-drop semantics are untouched.
+
+### Added
+- **`server.auto_options`** (default `true`) — set it to `false` and an OPTIONS
+  that no script handler claims is dropped silently rather than answered, so
+  siphon does not confirm its own existence to a probe nobody asked it to
+  answer. The drop is a real one: it reaps the server transaction and its
+  auto-100 timer, because leaving those armed emits RFC 4320 §4.2's synthesized
+  `100 Trying` and tells the scanner exactly what the setting was meant to
+  withhold. Scoped to OPTIONS — every other unhandled method still gets its
+  `405` + `Allow`.
+
 ## [1.8.3] — 2026-09-05
 
 ### Fixed
