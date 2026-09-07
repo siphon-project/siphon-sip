@@ -1,0 +1,27 @@
+# siphon config for the maximum-call-duration SIPp test
+# (scripts/b2bua_max_duration_test.sh). Both parties answer and then sit still;
+# nothing else in this config can end the call, so the BYE the test waits for
+# can only come from the duration cap. `session_timer:` is deliberately absent —
+# it would end the call on its own and hide whether the cap works.
+#
+# MAX_CALL_DURATION_SECS is unset in the `dial` arm (the cap comes from
+# call.dial(max_duration=...)) and set in the `config` and `optout` arms.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_max_duration.py"
+
+b2bua:
+  max_call_duration_secs: ${MAX_CALL_DURATION_SECS:-0}
+
+log:
+  level: info

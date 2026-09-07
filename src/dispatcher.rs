@@ -178,6 +178,11 @@ struct DispatcherState {
     /// unless the operator turned it on — one line per call on the hottest
     /// path siphon has.
     log_dial: bool,
+    /// Ceiling on how long an answered B2BUA call may run, for calls that do
+    /// not set their own (`call.dial(max_duration=…)`). Resolved from
+    /// `config.b2bua.max_call_duration_secs`; `None` = uncapped, which is the
+    /// default and was the only behaviour before this existed.
+    default_max_call_duration_secs: Option<u32>,
     /// Outbound registration manager (None when registrant is not configured).
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).
@@ -829,6 +834,7 @@ pub async fn run(
         default_refer_mode: config.b2bua.resolved_default_refer_mode(),
         accept_replaces: config.b2bua.replaces_takeover_enabled(),
         log_dial: config.b2bua.log_dial_enabled(),
+        default_max_call_duration_secs: config.b2bua.resolved_max_call_duration_secs(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(
             product_name,
@@ -998,6 +1004,7 @@ pub async fn run(
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);
+                        check_b2bua_max_call_durations(&state);
                         check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);
                         check_orphaned_ro_sessions(&state);
@@ -14291,6 +14298,29 @@ fn check_b2bua_answer_timeouts(state: &DispatcherState) {
     }
 }
 
+/// Tear down every answered B2BUA call that has been up longer than its
+/// maximum duration (`call.dial(max_duration=…)`, else the configured
+/// `b2bua.max_call_duration_secs`).
+///
+/// The answered-call sibling of [`check_b2bua_answer_timeouts`], which bounds
+/// only the ring. Runs on the same fast interval so a short cap — an IVR that
+/// gives a caller 30 seconds — is honoured to within half a second rather than
+/// to within the 30 s cleanup sweep. Returns immediately when no call carries a
+/// cap and none is configured.
+fn check_b2bua_max_call_durations(state: &DispatcherState) {
+    let now = std::time::Instant::now();
+    for call_id in state
+        .call_actors
+        .take_calls_over_max_duration(now, state.default_max_call_duration_secs)
+    {
+        info!(
+            call_id = %call_id,
+            "B2BUA: maximum call duration reached, terminating call"
+        );
+        b2bua_max_duration_terminate(&call_id, state);
+    }
+}
+
 /// Give up on every leg replacement whose dialed target has blown its deadline:
 /// CANCEL that leg and run the ordinary replacement-failure path (`408`).
 ///
@@ -15076,6 +15106,48 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
 // B2BUA handlers
 // ---------------------------------------------------------------------------
 
+/// Everything `@b2bua.on_invite` left on the `Call` for the framework to act
+/// on, carried back out across the `Python::attach` boundary in one value.
+///
+/// A named struct rather than the positional tuple this was: the handler can
+/// set a dozen unrelated things, each early-return path had to spell every one
+/// of them out as a bare `None`/`false` in the right order, and adding a
+/// thirteenth meant editing three lists of anonymous placeholders correctly.
+#[derive(Default)]
+struct InviteHandlerOutcome {
+    action: CallAction,
+    timer_override: Option<crate::script::api::call::SessionTimerOverride>,
+    /// Outbound digest credentials for the B-leg 401/407 retry.
+    credentials: Option<(String, String)>,
+    li_record: bool,
+    preserve_call_id: bool,
+    policy_input: Option<crate::script::api::call::HeaderPolicyInput>,
+    from_host_override: Option<String>,
+    to_host_override: Option<String>,
+    contact_user_override: Option<String>,
+    contact_override: Option<String>,
+    auth_passthrough: bool,
+    auth_user: Option<String>,
+    /// `call.dial(max_duration=…)` / `call.set_max_duration()` — the ceiling on
+    /// how long the call may stay answered. `None` inherits
+    /// `b2bua.max_call_duration_secs`.
+    max_duration_secs: Option<u32>,
+}
+
+impl InviteHandlerOutcome {
+    /// The outcome for a handler that raised: reject the call `500`, and take
+    /// nothing else the script may have set on its way to failing.
+    fn script_error() -> Self {
+        Self {
+            action: CallAction::Reject {
+                code: 500,
+                reason: "Script Error".to_string(),
+            },
+            ..Self::default()
+        }
+    }
+}
+
 /// Handle an INVITE in B2BUA mode.
 ///
 /// Creates a Call object, invokes `@b2bua.on_invite`, and processes the
@@ -15450,7 +15522,7 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (
+    let InviteHandlerOutcome {
         action,
         timer_override,
         credentials,
@@ -15463,25 +15535,13 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         contact_override,
         auth_passthrough,
         auth_user,
-    ) = Python::attach(|python| {
+        max_duration_secs,
+    } = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (
-                    CallAction::None,
-                    None,
-                    None,
-                    false,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                );
+                return InviteHandlerOutcome::default();
             }
         };
 
@@ -15492,78 +15552,35 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             error!("async B2BUA on_invite handler error: {error}");
-                            return (
-                                CallAction::Reject {
-                                    code: 500,
-                                    reason: "Script Error".to_string(),
-                                },
-                                None,
-                                None,
-                                false,
-                                false,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                false,
-                                None,
-                            );
+                            return InviteHandlerOutcome::script_error();
                         }
                     }
                 }
                 Err(error) => {
                     error!("B2BUA on_invite handler error: {error}");
-                    return (
-                        CallAction::Reject {
-                            code: 500,
-                            reason: "Script Error".to_string(),
-                        },
-                        None,
-                        None,
-                        false,
-                        false,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        false,
-                        None,
-                    );
+                    return InviteHandlerOutcome::script_error();
                 }
             }
         }
 
         let borrowed = call_obj.borrow(python);
-        let action = borrowed.action().clone();
-        let timer_override = borrowed.session_timer_override().cloned();
-        let credentials = borrowed
-            .outbound_credentials()
-            .map(|(u, p)| (u.to_string(), p.to_string()));
-        let li_record = borrowed.li_record();
-        let preserve_cid = borrowed.preserve_call_id();
-        let policy_input = borrowed.header_policy_input().cloned();
-        let from_host_ovr = borrowed.from_host_override().map(String::from);
-        let to_host_ovr = borrowed.to_host_override().map(String::from);
-        let contact_user_ovr = borrowed.contact_user_override().map(String::from);
-        let contact_ovr = borrowed.contact_override().map(String::from);
-        let auth_passthrough = borrowed.auth_passthrough();
-        let auth_user = borrowed.get_auth_user().map(String::from);
-        (
-            action,
-            timer_override,
-            credentials,
-            li_record,
-            preserve_cid,
-            policy_input,
-            from_host_ovr,
-            to_host_ovr,
-            contact_user_ovr,
-            contact_ovr,
-            auth_passthrough,
-            auth_user,
-        )
+        InviteHandlerOutcome {
+            action: borrowed.action().clone(),
+            timer_override: borrowed.session_timer_override().cloned(),
+            credentials: borrowed
+                .outbound_credentials()
+                .map(|(user, password)| (user.to_string(), password.to_string())),
+            li_record: borrowed.li_record(),
+            preserve_call_id: borrowed.preserve_call_id(),
+            policy_input: borrowed.header_policy_input().cloned(),
+            from_host_override: borrowed.from_host_override().map(String::from),
+            to_host_override: borrowed.to_host_override().map(String::from),
+            contact_user_override: borrowed.contact_user_override().map(String::from),
+            contact_override: borrowed.contact_override().map(String::from),
+            auth_passthrough: borrowed.auth_passthrough(),
+            auth_user: borrowed.get_auth_user().map(String::from),
+            max_duration_secs: borrowed.max_duration_secs(),
+        }
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
@@ -15644,6 +15661,7 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         || contact_user_override.is_some()
         || contact_override.is_some()
         || auth_passthrough
+        || max_duration_secs.is_some()
     {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
@@ -15672,6 +15690,13 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 call.contact_override = contact_override;
             }
             call.auth_passthrough = auth_passthrough;
+            // Stored, not turned into a deadline: the clock starts at the
+            // answer, which has not happened yet. Applies to every action shape
+            // — a dial, a fork, an LCR sequence, a UAS-mode answer, a handover
+            // — because it lives on the `Call`, not inside the action.
+            if max_duration_secs.is_some() {
+                call.max_duration_secs = max_duration_secs;
+            }
         }
     }
 
@@ -22716,6 +22741,27 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     b2bua_terminate_call_inner(
         call_id,
         Some("Q.850;cause=102;text=\"Session timer expired\""),
+        "timeout",
+        state,
+    );
+}
+
+/// Terminate a call that has hit its maximum answered duration — BYE both legs
+/// through the same framework teardown as the session timer (Rf/Ro ACR-STOP,
+/// CDR, SIPREC, media release, `StasisEnd`).
+///
+/// Deliberately does not fire `@b2bua.on_bye`: no framework-initiated teardown
+/// does (session-timer expiry, `call.terminate()`, `b2bua.terminate()`), and
+/// `ByeInitiator.side` is defined as which *peer* sent the BYE. The CDR is the
+/// record — `disconnect_initiator="timeout"`, with the Reason text below as
+/// `sip_reason`, which is what separates this from a session-timer expiry.
+fn b2bua_max_duration_terminate(call_id: &str, state: &DispatcherState) {
+    // Q.850 cause 102 = "recovery on timer expiry" — the same class as the
+    // session timer, since this too is a local timer ending an established
+    // call rather than anything either peer did.
+    b2bua_terminate_call_inner(
+        call_id,
+        Some("Q.850;cause=102;text=\"Maximum call duration exceeded\""),
         "timeout",
         state,
     );

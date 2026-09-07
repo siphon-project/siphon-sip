@@ -1102,6 +1102,26 @@ pub struct CallActor {
     /// the call is still un-answered. `None` = no application timeout (the 24h
     /// orphan backstop still applies).
     pub answer_deadline: Option<std::time::Instant>,
+    /// When this call was answered, stamped by
+    /// [`transition_to`](Self::transition_to) on the first transition to
+    /// [`CallState::Answered`] and never moved afterwards (a re-INVITE or a leg
+    /// replacement re-enters `Answered` but does not restart the call).
+    /// `None` until then. The anchor [`max_duration_secs`] measures
+    /// from — the ring is already bounded by [`answer_deadline`], so a cap on
+    /// the whole call would otherwise vary with how long it rang.
+    ///
+    /// [`max_duration_secs`]: Self::max_duration_secs
+    /// [`answer_deadline`]: Self::answer_deadline
+    pub answered_at: Option<std::time::Instant>,
+    /// Ceiling on how long this call may stay answered, in seconds
+    /// (`call.dial(max_duration=…)` and friends). Once
+    /// `answered_at + max_duration_secs` passes, the framework BYEs both legs
+    /// through the ordinary teardown.
+    ///
+    /// `Some(0)` is an explicit opt-out for this call, which is how a script
+    /// escapes a configured `b2bua.max_call_duration_secs`; `None` inherits
+    /// that configured default (itself usually absent, i.e. uncapped).
+    pub max_duration_secs: Option<u32>,
     /// When true (`call.dial(auth_passthrough=True)`), a B-leg 401/407 with no
     /// siphon-side credentials is relayed to the caller as a non-terminal
     /// challenge: the dispatcher forwards it and keeps the call alive instead of
@@ -1188,6 +1208,8 @@ impl CallActor {
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
             answer_deadline: None,
+            answered_at: None,
+            max_duration_secs: None,
             auth_passthrough: false,
             route_sequence: None,
             control_app: None,
@@ -1465,10 +1487,28 @@ impl CallActor {
             .find(|(_, leg)| leg.branch == branch)
     }
 
+    /// Move this call to `state`, stamping [`answered_at`](Self::answered_at)
+    /// on the **first** transition to [`CallState::Answered`].
+    ///
+    /// Every state change goes through here so the stamp cannot be missed:
+    /// answering is reached from three unrelated directions — a winning B-leg
+    /// 2xx ([`set_winner`](Self::set_winner)), a promoted leg replacement, and
+    /// the store's [`set_state`](CallActorStore::set_state) for the UAS-mode
+    /// `call.answer()` and an originate's 2xx — and a cap that silently never
+    /// fires because one of them wrote the field directly is worse than no cap
+    /// at all. Only the first transition counts, so a re-INVITE or a leg
+    /// replacement re-entering `Answered` cannot push the deadline back out.
+    pub fn transition_to(&mut self, state: CallState) {
+        if state == CallState::Answered && self.answered_at.is_none() {
+            self.answered_at = Some(std::time::Instant::now());
+        }
+        self.state = state;
+    }
+
     /// Set the winner and update call state.
     pub fn set_winner(&mut self, index: usize) {
         self.winner = Some(index);
-        self.state = CallState::Answered;
+        self.transition_to(CallState::Answered);
         if index < self.b_leg_status.len() {
             self.b_leg_status[index] = BLegStatus::Answered;
         }
@@ -2070,7 +2110,7 @@ impl CallActorStore {
             call.b_leg_status.push(BLegStatus::Answered);
             call.b_leg_handles.push(None);
             call.winner = Some(0);
-            call.state = CallState::Answered;
+            call.transition_to(CallState::Answered);
             (replaced, survivor)
         };
 
@@ -2397,9 +2437,14 @@ impl CallActorStore {
     }
 
     /// Set call state.
+    ///
+    /// Delegates to [`CallActor::transition_to`] so a transition to `Answered`
+    /// stamps [`CallActor::answered_at`], the anchor
+    /// [`take_calls_over_max_duration`](Self::take_calls_over_max_duration)
+    /// measures a call's maximum duration from.
     pub fn set_state(&self, call_id: &str, state: CallState) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.state = state;
+            call.transition_to(state);
         }
     }
 
@@ -2461,7 +2506,7 @@ impl CallActorStore {
             return false;
         }
         if call.state == CallState::Calling {
-            call.state = CallState::Ringing;
+            call.transition_to(CallState::Ringing);
         }
         true
     }
@@ -3095,6 +3140,43 @@ impl CallActorStore {
                     && entry
                         .answer_deadline
                         .is_some_and(|deadline| now >= deadline)
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    /// Internal call IDs of answered calls that have been up longer than their
+    /// maximum duration (`call.dial(max_duration=…)`, else `default_secs` from
+    /// `b2bua.max_call_duration_secs`).
+    ///
+    /// The counterpart of [`take_timed_out_calls`](Self::take_timed_out_calls)
+    /// for the other half of a call's life: that one bounds the ring and only
+    /// ever looks at `Calling`/`Ringing`, so nothing bounded an *answered* call
+    /// except the optional RFC 4028 session timer.
+    ///
+    /// A per-call `Some(0)` is an explicit opt-out and wins over `default_secs`
+    /// — that is how a script escapes a configured ceiling. Does NOT remove
+    /// anything: the dispatcher runs the real teardown (BYE both legs, charging
+    /// stop, CDR, media release), which needs to build and send messages.
+    pub fn take_calls_over_max_duration(
+        &self,
+        now: std::time::Instant,
+        default_secs: Option<u32>,
+    ) -> Vec<String> {
+        self.calls
+            .iter()
+            .filter(|entry| {
+                if entry.state != CallState::Answered {
+                    return false;
+                }
+                let Some(seconds) = entry.max_duration_secs.or(default_secs).filter(|s| *s > 0)
+                else {
+                    return false;
+                };
+                entry.answered_at.is_some_and(|answered_at| {
+                    now.duration_since(answered_at)
+                        >= std::time::Duration::from_secs(seconds as u64)
+                })
             })
             .map(|entry| entry.id.clone())
             .collect()
@@ -4781,6 +4863,182 @@ mod tests {
         // Nothing was removed.
         assert_eq!(store.count(), 4);
         let _ = (waiting, answered, no_deadline);
+    }
+
+    /// Answer a call the way the winning-B-leg 2xx does (`try_win` →
+    /// `set_winner`), which is the path that has to stamp `answered_at`.
+    fn answer_call(store: &CallActorStore, call_id: &str) {
+        store.add_b_leg(call_id, make_b_leg(0));
+        store.set_winner(call_id, 0);
+    }
+
+    /// Backdate a call's answer so the maximum-duration sweep sees it as having
+    /// been up for `elapsed`, without sleeping in a unit test.
+    fn backdate_answer(store: &CallActorStore, call_id: &str, elapsed: std::time::Duration) {
+        let mut call = store.get_call_mut(call_id).expect("call exists");
+        let answered_at = call.answered_at.expect("call was answered");
+        call.answered_at = Some(answered_at - elapsed);
+    }
+
+    #[test]
+    fn answering_stamps_answered_at_once_and_never_moves_it() {
+        // The stamp is the anchor the maximum-duration cap measures from, so a
+        // call that re-enters Answered — a re-INVITE, a promoted leg
+        // replacement — must not get a fresh clock, or a call kept busy with
+        // re-INVITEs would never hit its cap.
+        let store = CallActorStore::new();
+
+        let call_id = store.create_call(make_a_leg());
+        assert!(
+            store
+                .get_call(&call_id)
+                .and_then(|c| c.answered_at)
+                .is_none(),
+            "an un-answered call has no answer stamp"
+        );
+
+        answer_call(&store, &call_id);
+        let first = store
+            .get_call(&call_id)
+            .and_then(|c| c.answered_at)
+            .expect("answering stamps answered_at");
+
+        // Re-entering Answered from either direction leaves the stamp alone.
+        store.set_state(&call_id, CallState::Answered);
+        store.set_winner(&call_id, 0);
+        assert_eq!(
+            store.get_call(&call_id).and_then(|c| c.answered_at),
+            Some(first),
+            "the answer stamp must not move once set"
+        );
+    }
+
+    #[test]
+    fn uas_mode_answer_also_stamps_answered_at() {
+        // A call answered by the script itself (`call.answer()`) or by an
+        // originate's 2xx never goes through set_winner — it flips state
+        // through the store. It must be capped like any other answered call.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        store.set_state(&call_id, CallState::Answered);
+
+        assert!(
+            store
+                .get_call(&call_id)
+                .and_then(|c| c.answered_at)
+                .is_some(),
+            "a UAS-mode answer must stamp answered_at too"
+        );
+    }
+
+    #[test]
+    fn take_calls_over_max_duration_only_answered_calls_past_their_cap() {
+        // The answered-call counterpart of the answer-timeout sweep: it must
+        // select only calls that ANSWERED and have been up longer than their
+        // own cap, and must not remove anything (the dispatcher runs the real
+        // teardown: BYE both legs, charging stop, CDR, media release).
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+
+        // Answered 61s ago with a 60s cap → over.
+        let over = store.create_call(make_a_leg());
+        answer_call(&store, &over);
+        backdate_answer(&store, &over, std::time::Duration::from_secs(61));
+        store
+            .get_call_mut(&over)
+            .expect("call exists")
+            .max_duration_secs = Some(60);
+
+        // Answered 61s ago with a 3600s cap → still inside it.
+        let inside = store.create_call(make_a_leg());
+        answer_call(&store, &inside);
+        backdate_answer(&store, &inside, std::time::Duration::from_secs(61));
+        store
+            .get_call_mut(&inside)
+            .expect("call exists")
+            .max_duration_secs = Some(3600);
+
+        // Never answered → the answer-timeout sweep's business, not this one.
+        // A ringing call has no answered_at at all, so a cap on it is inert.
+        let ringing = store.create_call(make_a_leg());
+        store.set_state(&ringing, CallState::Ringing);
+        store
+            .get_call_mut(&ringing)
+            .expect("call exists")
+            .max_duration_secs = Some(1);
+
+        // Answered, no cap and no configured default → uncapped.
+        let uncapped = store.create_call(make_a_leg());
+        answer_call(&store, &uncapped);
+        backdate_answer(&store, &uncapped, std::time::Duration::from_secs(86_400));
+
+        assert_eq!(store.take_calls_over_max_duration(now, None), vec![over]);
+        assert_eq!(store.count(), 4, "the sweep must not remove anything");
+        let _ = (inside, ringing, uncapped);
+    }
+
+    #[test]
+    fn max_duration_falls_back_to_the_configured_default() {
+        // `b2bua.max_call_duration_secs` is the operator's backstop for every
+        // call that didn't ask for its own — including one answered in UAS mode
+        // that never dialled anything.
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+
+        let call_id = store.create_call(make_a_leg());
+        answer_call(&store, &call_id);
+        backdate_answer(&store, &call_id, std::time::Duration::from_secs(120));
+
+        assert!(
+            store.take_calls_over_max_duration(now, None).is_empty(),
+            "no per-call cap and no default means uncapped"
+        );
+        assert!(
+            store
+                .take_calls_over_max_duration(now, Some(300))
+                .is_empty(),
+            "a default the call has not reached yet leaves it alone"
+        );
+        assert_eq!(
+            store.take_calls_over_max_duration(now, Some(60)),
+            vec![call_id],
+            "a call past the configured default is cut"
+        );
+    }
+
+    #[test]
+    fn per_call_max_duration_overrides_the_default_in_both_directions() {
+        // Both directions matter: a script tightening the ceiling for one call,
+        // and `max_duration=0` opting a call out of a configured ceiling
+        // entirely (a supervised conference, a long-running trunk session).
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+
+        // Tighter than the default → cut by its own cap.
+        let tighter = store.create_call(make_a_leg());
+        answer_call(&store, &tighter);
+        backdate_answer(&store, &tighter, std::time::Duration::from_secs(120));
+        store
+            .get_call_mut(&tighter)
+            .expect("call exists")
+            .max_duration_secs = Some(60);
+
+        // Explicitly uncapped → survives a default it is far past.
+        let opted_out = store.create_call(make_a_leg());
+        answer_call(&store, &opted_out);
+        backdate_answer(&store, &opted_out, std::time::Duration::from_secs(86_400));
+        store
+            .get_call_mut(&opted_out)
+            .expect("call exists")
+            .max_duration_secs = Some(0);
+
+        assert_eq!(
+            store.take_calls_over_max_duration(now, Some(3600)),
+            vec![tighter],
+            "max_duration=0 must beat a configured ceiling"
+        );
+        let _ = opted_out;
     }
 
     fn replacement(

@@ -597,6 +597,17 @@ async fn write_file_cdr(cdr: &Cdr, path: &str, rotate_size_mb: u64) {
                 error!("CDR file write error: {error}");
                 return;
             }
+            // Flush before the size check reads the length and before the
+            // handle drops. Tokio buffers the write and runs it on the
+            // blocking pool, so without this a busy pool leaves the check
+            // reading a length that does not include the record just written
+            // — the file then grows past the limit before it rotates — and
+            // leaves the record itself still in flight after this function has
+            // returned, which on a hard exit is a billing record lost.
+            if let Err(error) = file.flush().await {
+                error!("CDR file flush error: {error}");
+                return;
+            }
             // Rotate *after* the write, never mid-record: a CDR split across
             // two files is worse than a file a few hundred bytes over.
             if rotate_size_mb > 0 {
@@ -1366,6 +1377,69 @@ mod tests {
         write_file_cdr(&sample_cdr(), &path_str, 1).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
         assert_eq!(rotated_siblings(&path).len(), 1);
+    }
+
+    /// The record has to be on disk by the time the write call returns, and
+    /// the rotation size check has to observe the record it just wrote.
+    ///
+    /// Tokio buffers the write and runs it on the blocking pool; `write_all`
+    /// returns once the bytes are in the buffer, not once they are on disk,
+    /// and `metadata` does not wait for an in-flight write either. So without
+    /// an explicit flush the size check can read the length from before this
+    /// record — the file grows past the limit before it rotates — and the
+    /// record can still be in flight after the call returned, which on a hard
+    /// exit is a billing record lost.
+    ///
+    /// The race needs a busy blocking pool, so each round puts work on it and
+    /// the round is repeated: a single round reproduces roughly a third of the
+    /// time, which is why this loops rather than asserting once.
+    const DURABILITY_ROUNDS: usize = 40;
+
+    fn load_the_blocking_pool() {
+        for _ in 0..64 {
+            tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(8)));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_backend_record_is_on_disk_when_the_write_returns() {
+        for round in 0..DURABILITY_ROUNDS {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cdr.jsonl");
+            let path_str = path.to_string_lossy().into_owned();
+
+            load_the_blocking_pool();
+            // Rotation off, so the size check that would otherwise happen to
+            // force the buffer out is not called at all.
+            write_file_cdr(&sample_cdr(), &path_str, 0).await;
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap().lines().count(),
+                1,
+                "round {round}: the record must be readable once the write returned"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_backend_flushes_the_record_before_the_size_check() {
+        for round in 0..DURABILITY_ROUNDS {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cdr.jsonl");
+            let path_str = path.to_string_lossy().into_owned();
+            // One byte short of 1 MB, so this record is the one that tips the
+            // file over: the check can only rotate if it sees the record.
+            std::fs::write(&path, vec![b'x'; 1024 * 1024 - 1]).unwrap();
+
+            load_the_blocking_pool();
+            write_file_cdr(&sample_cdr(), &path_str, 1).await;
+
+            assert_eq!(
+                rotated_siblings(&path).len(),
+                1,
+                "round {round}: the size check must observe the record it just wrote"
+            );
+        }
     }
 
     #[tokio::test]

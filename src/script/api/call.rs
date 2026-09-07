@@ -23,9 +23,10 @@ pub struct SessionTimerOverride {
 ///
 /// Not `Eq`: [`CallAction::RouteSequence`] carries `lcr::Route`s whose `rate`
 /// is an `f64`. `PartialEq` is retained for tests.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum CallAction {
     /// No action taken yet.
+    #[default]
     None,
     /// Reject the call with a status code and reason.
     Reject { code: u16, reason: String },
@@ -340,6 +341,16 @@ pub struct PyCall {
     /// forward the challenge without firing `@b2bua.on_failure`, deleting media,
     /// or tearing the call down — so the caller can authenticate and re-INVITE.
     auth_passthrough_flag: bool,
+    /// Ceiling on how long this call may stay answered, in seconds — set by
+    /// `max_duration=` on `call.dial()` / `fork()` / `route()`, or directly via
+    /// `call.set_max_duration()`.
+    ///
+    /// Held here rather than inside the [`CallAction`] variants so that one
+    /// read site in the dispatcher covers every shape a call can take,
+    /// including the ones that never dial at all (`call.answer()` in UAS mode,
+    /// `call.handover()`). `Some(0)` opts this call out of a configured
+    /// `b2bua.max_call_duration_secs`; `None` inherits it.
+    max_duration_secs: Option<u32>,
     /// The carrier route that won (LCR) — injected by the dispatcher when it
     /// builds the `@b2bua.on_answer` / `on_bye` `Call` from the call actor's
     /// `route_sequence.active`. Read by scripts via `call.active_route` to stamp
@@ -449,6 +460,7 @@ impl PyCall {
             contact_override: None,
             header_policy_input: None,
             auth_passthrough_flag: false,
+            max_duration_secs: None,
             active_route: None,
             route_attempts: Vec::new(),
             auth_user: None,
@@ -560,6 +572,14 @@ impl PyCall {
     /// handling so a relayed challenge does not tear the call down.
     pub fn auth_passthrough(&self) -> bool {
         self.auth_passthrough_flag
+    }
+
+    /// The maximum answered duration this call asked for, in seconds
+    /// (`max_duration=` on the dial verbs, or `call.set_max_duration()`).
+    /// `None` leaves the call on `b2bua.max_call_duration_secs`. Read by the
+    /// dispatcher after the handler returns and stamped onto the call actor.
+    pub fn max_duration_secs(&self) -> Option<u32> {
+        self.max_duration_secs
     }
 
     /// Append the two auth headers to `copy` for `auth_passthrough`, unless the
@@ -1608,6 +1628,16 @@ impl PyCall {
 
     /// Dial a single target (simple B-leg).
     ///
+    /// A call has two independent bounds, and they measure different things:
+    /// `timeout` is how long the B-leg may **ring** before siphon gives up
+    /// (CANCEL, `@b2bua.on_failure`, `408` upstream), and `max_duration` is how
+    /// long it may stay **answered** before siphon BYEs both legs. The second
+    /// clock starts at the answer, so a call that rang for 25 seconds still
+    /// gets its full talk time.
+    ///
+    /// `max_duration=None` (the default) inherits `b2bua.max_call_duration_secs`;
+    /// `max_duration=0` opts this call out of that ceiling.
+    ///
     /// `next_hop` (optional) decouples R-URI construction from routing:
     /// the new INVITE's R-URI is still built from `uri` (so the IMPU shape
     /// is preserved), but the message is sent to `next_hop`.  Mirrors the
@@ -1634,12 +1664,13 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
+    #[pyo3(signature = (uri, timeout=30, max_duration=None, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
         uri: &str,
         timeout: u32,
+        max_duration: Option<u32>,
         next_hop: Option<&str>,
         flow: Option<super::registrar::PyFlow>,
         header_policy: Option<&str>,
@@ -1652,6 +1683,7 @@ impl PyCall {
         number_policy: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        self.max_duration_secs = max_duration.or(self.max_duration_secs);
         // Number normalization (explicit `number_policy=`, else the configured
         // `b2bua.default_number_policy`): reformat the A-leg identity headers
         // that flow to the B-leg, plus the dial target itself.
@@ -1702,13 +1734,14 @@ impl PyCall {
     /// `strategy="sequential"` carries the same route set per carrier (as an
     /// explicit next-hop plus a `Route` header), so serial failover across an
     /// AoR's bindings reaches each binding's own proxy chain.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, max_duration=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
         targets: Vec<Bound<'_, PyAny>>,
         strategy: &str,
         timeout: u32,
+        max_duration: Option<u32>,
         header_policy: Option<&str>,
         mut copy: Vec<String>,
         strip: Vec<String>,
@@ -1718,6 +1751,7 @@ impl PyCall {
         number_policy: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        self.max_duration_secs = max_duration.or(self.max_duration_secs);
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         let mut branch_paths: Vec<Vec<String>> = Vec::with_capacity(targets.len());
@@ -1809,14 +1843,19 @@ impl PyCall {
     ///
     /// Call from `@b2bua.on_invite`. Per-carrier shaping (tech-prefix, injected
     /// headers, R-URI override) and reroute causes are honored per route.
-    #[pyo3(signature = (routes, timeout=30, send_socket=None))]
+    #[pyo3(signature = (routes, timeout=30, max_duration=None, send_socket=None))]
     fn route(
         &mut self,
         routes: Vec<Bound<'_, PyAny>>,
         timeout: u32,
+        max_duration: Option<u32>,
         send_socket: Option<String>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        // The cap is on the call, not the attempt: `timeout` is per-carrier ring
+        // time, but a carrier that answers hands over one answered call whose
+        // clock starts there.
+        self.max_duration_secs = max_duration.or(self.max_duration_secs);
         let mut collected: Vec<crate::lcr::Route> = Vec::with_capacity(routes.len());
         for item in routes {
             let route: PyRef<super::lcr::PyRoute> = item.extract().map_err(|_| {
@@ -1842,6 +1881,26 @@ impl PyCall {
     /// Terminate the call (send BYE to both legs).
     fn terminate(&mut self) {
         self.action = CallAction::Terminate;
+    }
+
+    /// Cap how long this call may stay answered, in seconds.
+    ///
+    /// The same knob as `max_duration=` on `call.dial()` / `fork()` / `route()`,
+    /// reachable from a call that never dials — a UAS-mode `call.answer()`
+    /// (IVR, announcement) or a `call.handover()` to a control app — which
+    /// would otherwise be left on the configured `b2bua.max_call_duration_secs`
+    /// with no way to say anything else.
+    ///
+    /// The clock starts at the answer. On expiry siphon BYEs both legs through
+    /// the ordinary teardown (CDR, charging stop, media release) with
+    /// `Reason: Q.850;cause=102`; no Python handler fires, as for a session-timer
+    /// expiry. `0` means uncapped, overriding a configured ceiling.
+    ///
+    /// Usage in Python:
+    ///   call.set_max_duration(600)     # 10 minutes of talk time
+    ///   call.set_max_duration(0)       # uncapped, ignore the config ceiling
+    fn set_max_duration(&mut self, seconds: u32) {
+        self.max_duration_secs = Some(seconds);
     }
 
     /// Set per-call session timer parameters (overrides global config).
@@ -2855,6 +2914,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![],
             vec![],
             vec![],
@@ -2894,6 +2954,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![],
             vec![],
             vec![],
@@ -2926,6 +2987,7 @@ mod tests {
         call.dial(
             "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
             30,
+            None,
             Some("sip:192.0.2.178:4060"),
             None,
             None,
@@ -2963,6 +3025,7 @@ mod tests {
         call.dial(
             "sip:bob@10.0.0.2:5060",
             30,
+            None,
             None,
             None,
             Some("ims-trust-domain-boundary@2026"),
@@ -3005,6 +3068,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![],
             vec![],
             vec![],
@@ -3022,6 +3086,147 @@ mod tests {
         }
     }
 
+    /// A `PyCall` for the max-duration tests, which only care about what the
+    /// dial verbs record on the call, not about the message.
+    fn dialing_call() -> PyCall {
+        PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    #[test]
+    fn dial_records_max_duration_and_defaults_to_inheriting_the_config() {
+        // `timeout` bounds the ring and `max_duration` bounds the talk; they are
+        // independent, so setting one must not disturb the other. Omitting
+        // max_duration leaves the call on b2bua.max_call_duration_secs, which is
+        // what `None` means to the dispatcher.
+        let mut call = dialing_call();
+        call.dial(
+            "sip:bob@10.0.0.2:5060",
+            30,
+            Some(3600),
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(call.max_duration_secs(), Some(3600));
+        match call.action() {
+            CallAction::Dial { timeout, .. } => assert_eq!(*timeout, 30),
+            other => panic!("expected Dial, got {other:?}"),
+        }
+
+        let mut inherits = dialing_call();
+        inherits
+            .dial(
+                "sip:bob@10.0.0.2:5060",
+                30,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(inherits.max_duration_secs(), None);
+    }
+
+    #[test]
+    fn dial_accepts_zero_max_duration_as_an_explicit_opt_out() {
+        // Zero is not "unset": it is how a call escapes a configured
+        // b2bua.max_call_duration_secs, so it has to reach the dispatcher as a
+        // value rather than collapsing into the inherit case.
+        let mut call = dialing_call();
+        call.dial(
+            "sip:bob@10.0.0.2:5060",
+            30,
+            Some(0),
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(call.max_duration_secs(), Some(0));
+    }
+
+    #[test]
+    fn fork_and_route_record_max_duration_too() {
+        // The cap is on the call, not on the attempt: a fork branch or an LCR
+        // carrier that answers hands over one answered call.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let mut call = dialing_call();
+            let targets: Vec<Bound<'_, PyAny>> =
+                vec![pyo3::types::PyString::new(python, "sip:bob@10.0.0.2:5060").into_any()];
+            call.fork(
+                targets,
+                "parallel",
+                30,
+                Some(1800),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(call.max_duration_secs(), Some(1800));
+        });
+
+        let mut call = dialing_call();
+        call.route(Vec::new(), 30, Some(900), None)
+            .expect_err("an empty route list is still rejected");
+        assert_eq!(
+            call.max_duration_secs(),
+            Some(900),
+            "the cap is recorded before the route list is validated"
+        );
+    }
+
+    #[test]
+    fn set_max_duration_caps_a_call_that_never_dials() {
+        // A UAS-mode answer (IVR, announcement) or a handover never calls
+        // dial()/fork()/route(), so without this setter the only cap available
+        // to it would be the global config one.
+        let mut call = dialing_call();
+        assert_eq!(call.max_duration_secs(), None);
+
+        call.set_max_duration(600);
+        assert_eq!(call.max_duration_secs(), Some(600));
+
+        call.set_max_duration(0);
+        assert_eq!(
+            call.max_duration_secs(),
+            Some(0),
+            "the setter must be able to opt a call out, not only tighten it"
+        );
+    }
+
     #[test]
     fn call_dial_rejects_malformed_send_socket() {
         let message = Arc::new(Mutex::new(make_invite()));
@@ -3034,6 +3239,7 @@ mod tests {
         let result = call.dial(
             "sip:bob@10.0.0.2:5060",
             30,
+            None,
             None,
             None,
             None,
@@ -3107,6 +3313,7 @@ mod tests {
                 "parallel",
                 30,
                 None,
+                None,
                 vec![],
                 vec![],
                 vec![],
@@ -3165,6 +3372,7 @@ mod tests {
                 "sequential",
                 30,
                 None,
+                None,
                 vec![],
                 vec![],
                 vec![],
@@ -3218,6 +3426,7 @@ mod tests {
                 "parallel",
                 30,
                 None,
+                None,
                 vec![],
                 vec![],
                 vec![],
@@ -3262,6 +3471,7 @@ mod tests {
                 targets,
                 "parallel",
                 30,
+                None,
                 Some("sip-trunk-edge@2026"),
                 vec![],
                 vec!["X-Internal-Tag".to_string()],
@@ -3291,6 +3501,7 @@ mod tests {
         call.dial(
             "sip:bob@pbx.example.com:5060",
             30,
+            None,
             None,
             None,
             None,
@@ -3337,6 +3548,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec!["proxy-authenticate".to_string(), "X-Keep".to_string()],
             vec![],
             vec![],
@@ -3378,6 +3590,7 @@ mod tests {
         call.dial(
             "sip:bob@10.0.0.2:5060",
             30,
+            None,
             None,
             None,
             None,

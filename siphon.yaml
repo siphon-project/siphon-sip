@@ -1753,6 +1753,30 @@ auth:
 # b2bua:
 #   log_dial: true
 
+# Ceiling on how long an ANSWERED call may run, in seconds, for every call that
+# does not set its own call.dial(max_duration=...).
+#
+# UNSET by default — and unset means an answered call is bounded by nothing but
+# a peer BYE, a script terminate(), or the session_timer block above where it is
+# configured AND the far end honours it. This is the backstop for everything
+# else: a carrier leg that goes silent with its dialog still up holds a call
+# actor, a media anchor, a charging session and an RTP port pair until siphon
+# restarts.
+#
+# Measured from the ANSWER, not from the dial — the ring is already bounded by
+# call.dial(timeout=...), and a cap that counted ring time would give a call
+# that rang for 25 seconds less talk time than one picked up instantly.
+#
+# On expiry siphon BYEs both legs through the ordinary teardown: RFC 3326
+# Reason: Q.850;cause=102, a CDR with disconnect_initiator="timeout", Rf/Ro
+# ACR-STOP, media released. No Python handler fires, same as a session-timer
+# expiry — sip_reason on the CDR is what tells the two apart.
+#
+# A single call overrides it with call.dial(max_duration=<seconds>), and opts
+# out entirely with call.dial(max_duration=0).
+# b2bua:
+#   max_call_duration_secs: 14400   # 4h
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

@@ -102,3 +102,60 @@ class TestCallDial:
         # A well-formed IPv6 pin is accepted.
         call.dial("sip:bob@10.0.0.2:5060", send_socket="tls:[2001:db8::1]:5061")
         assert call._actions[-1].extras["send_socket"] == "tls:[2001:db8::1]:5061"
+
+
+class TestCallMaxDuration:
+    """``timeout`` bounds the ring, ``max_duration`` bounds the talk.
+
+    Two clocks, deliberately independent: ``timeout`` stops mattering the
+    moment a 2xx lands, and before ``max_duration`` existed nothing bounded an
+    answered call except a peer BYE or an RFC 4028 session timer.
+    """
+
+    def test_dial_records_max_duration_alongside_timeout(self):
+        call = Call()
+        call.dial("sip:bob@10.0.0.2:5060", timeout=30, max_duration=3600)
+        action = call._actions[0]
+        assert action.timeout == 30
+        assert action.extras["max_duration"] == 3600
+        assert call.max_duration == 3600
+
+    def test_dial_without_max_duration_inherits_the_config(self):
+        call = Call()
+        call.dial("sip:bob@10.0.0.2:5060")
+        assert call._actions[0].extras["max_duration"] is None
+        assert call.max_duration is None
+
+    def test_zero_is_an_opt_out_not_an_absent_value(self):
+        # 0 is how a call escapes a configured b2bua.max_call_duration_secs,
+        # so it has to survive as a value rather than collapsing into None.
+        call = Call()
+        call.dial("sip:bob@10.0.0.2:5060", max_duration=0)
+        assert call._actions[0].extras["max_duration"] == 0
+        assert call.max_duration == 0
+
+    def test_fork_and_route_take_max_duration_too(self):
+        forked = Call()
+        forked.fork(["sip:bob@10.0.0.2:5060", "sip:bob@10.0.0.3:5060"],
+                    timeout=20, max_duration=1800)
+        assert forked._actions[0].extras["max_duration"] == 1800
+        assert forked._actions[0].timeout == 20
+        assert forked.max_duration == 1800
+
+        from siphon_sdk.lcr import Route
+
+        routed = Call()
+        routed.route([Route(carrier_id="carrier-a", next_hop="sip:10.0.0.9:5060")],
+                     timeout=12, max_duration=900)
+        assert routed._actions[0].extras["max_duration"] == 900
+        assert routed.max_duration == 900
+
+    def test_set_max_duration_caps_a_call_that_never_dials(self):
+        # A UAS-mode answer or a handover never calls dial/fork/route, so this
+        # is the only per-call cap available to it.
+        call = Call()
+        assert call.max_duration is None
+        call.set_max_duration(600)
+        assert call.max_duration == 600
+        call.set_max_duration(0)
+        assert call.max_duration == 0

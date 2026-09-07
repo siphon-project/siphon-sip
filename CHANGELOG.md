@@ -7,6 +7,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **A maximum call duration — `max_duration=` on `call.dial()` / `call.fork()` /
+  `call.route()`, `call.set_max_duration()`, and `b2bua.max_call_duration_secs`.**
+  A B2BUA call had exactly one bound: `timeout=`, which is how long the B-leg may
+  ring. It stops mattering the moment a `2xx` lands, and after that an answered
+  call was bounded by nothing except a peer BYE, a script `terminate()`, or an
+  RFC 4028 session timer — which is off unless configured, needs the far end to
+  play along, and by design keeps a call up for as long as something keeps
+  refreshing it. So a carrier leg that went silent with its dialog still up, or
+  a call nobody was ever going to hang up, held a call actor, a media anchor, a
+  charging session and an RTP port pair until the process restarted. The new cap
+  measures from the **answer**, not from the dial: the ring is already bounded,
+  and a ceiling that counted ring time would hand a call that rang for 25
+  seconds less talk time than one picked up instantly. On a fork or an LCR
+  sequence it is per call rather than per branch or per carrier — `timeout`
+  bounds each attempt, but whichever one answers hands over a single answered
+  call. On expiry siphon BYEs both legs through the ordinary teardown, so the
+  call leaves the same accounting behind as any other: `Reason:
+  Q.850;cause=102`, a CDR with `disconnect_initiator="timeout"`, Rf/Ro
+  `ACR-STOP`, media released, `StasisEnd` on the control rail. No Python handler
+  fires, matching session-timer expiry and `call.terminate()` —
+  `@b2bua.on_bye` reports which *peer* hung up and here neither did; the CDR's
+  `sip_reason` is what tells a duration cut apart from a session-timer one.
+  `max_call_duration_secs` is the operator backstop for every call that does not
+  ask for its own, including calls answered in UAS mode or handed to a control
+  app; a call overrides it with `max_duration=<seconds>` and opts out entirely
+  with `max_duration=0`.
 - **`b2bua.replace_peer()` and the control plane's `replace_peer` verb** — swap
   one party of an answered call for a freshly dialled target, with no REFER
   anywhere. siphon has always been able to do this: it is what
@@ -194,6 +220,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **A CDR is on disk when the write returns, and the rotation size check sees
+  the record it just wrote.** The file backend wrote each record with
+  `write_all` and then read `metadata()` to decide whether to rotate, without
+  flushing in between. Tokio buffers the write and runs it on the blocking
+  pool: `write_all` returns once the bytes are in the buffer rather than on
+  disk, and `metadata()` does not wait for an in-flight write either. So on a
+  busy process the size check read the length from *before* the record and the
+  file grew past `rotate_size_mb` before it rotated, while the record itself
+  could still be in flight after the writer had moved on — on a hard exit, a
+  billing record lost. The LI audit log had the same missing flush and holds
+  its handle for the life of the process, so an audit line could sit in the
+  buffer indefinitely instead of being readable the moment the operation it
+  records happened.
 - **A prepaid call that never dialled anything no longer leaves its Ro session
   open.** `call.ro_authorize()` reserves credit *before* the B-leg is connected,
   so from the reservation until the first leg there is a live credit-control

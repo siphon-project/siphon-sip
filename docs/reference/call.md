@@ -158,6 +158,57 @@ has, which is an operator's decision rather than an upgrade's. (The
 [LCR failover lines](../cookbook/least-cost-routing.md) log at `info`
 unconditionally — they fire only when a carrier fails, not on every call.)
 
+## Bounding a call: `timeout` and `max_duration`
+
+A call has two clocks, and they measure different things.
+
+`timeout=` bounds the **ring**. If nothing answers in that many seconds siphon
+CANCELs the outstanding legs, fires `@b2bua.on_failure`, and answers the caller
+`408`. It stops mattering the moment a `2xx` lands.
+
+`max_duration=` bounds the **talk**. The clock starts at the answer, so a call
+that rang for 25 seconds still gets its full talk time. When it expires siphon
+BYEs both legs.
+
+```python
+@b2bua.on_invite
+def route(call):
+    # 30s to answer, then at most an hour connected.
+    call.dial(call.ruri, timeout=30, max_duration=3600)
+```
+
+Before this existed, an answered call was bounded by nothing but a peer BYE, a
+script `terminate()`, or an RFC 4028 session timer where one is configured *and*
+the far end honours it. A carrier leg that goes silent with its dialog still up
+holds a call actor, a media anchor, a charging session and an RTP port pair for
+as long as the process lives.
+
+The operator backstop is the same cap applied to every call that does not ask
+for its own:
+
+```yaml
+b2bua:
+  max_call_duration_secs: 14400    # 4h; unset means uncapped
+```
+
+A call overrides it with `max_duration=<seconds>` and opts out of it entirely
+with `max_duration=0`. The kwarg is on `call.dial()`, `call.fork()` and
+`call.route()`; on a fork or an LCR sequence it is per *call*, not per branch or
+per carrier — `timeout` bounds each attempt's ring, but whichever one answers
+hands over a single answered call. A call that never dials at all — a UAS-mode
+`call.answer()`, a `call.handover()` — reaches the same knob through
+`call.set_max_duration(seconds)`.
+
+On expiry siphon runs the ordinary teardown: a BYE to each leg carrying
+`Reason: Q.850;cause=102;text="Maximum call duration exceeded"` (RFC 3326), a
+CDR with `disconnect_initiator="timeout"`, Rf/Ro `ACR-STOP`, media released,
+`StasisEnd` on the control rail. **No Python handler fires** — `@b2bua.on_bye`
+reports which *peer* hung up, and here neither did, which is also how a
+session-timer expiry and `call.terminate()` behave. The CDR is the record; its
+`sip_reason` is what distinguishes a duration cut from a session-timer one.
+
+::: siphon_sdk.call.Call.set_max_duration
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

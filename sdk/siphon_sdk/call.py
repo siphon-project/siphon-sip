@@ -114,6 +114,11 @@ class Call:
         self._refer_side = refer_side
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
+        # Cap on how long the call may stay answered, from ``max_duration=`` on
+        # dial/fork/route or from ``set_max_duration()``.  ``None`` inherits
+        # ``b2bua.max_call_duration_secs``; ``0`` opts out of it.  Tests read it
+        # through the ``max_duration`` property.
+        self._max_duration_secs: Optional[int] = None
         # LCR: the carrier that won the sequential failover. In the engine the
         # dispatcher sets this on the on_answer/on_bye Call; in tests pass
         # ``active_route=`` (or set ``call._active_route``) to simulate the winner.
@@ -708,6 +713,7 @@ class Call:
         self,
         uri: str,
         timeout: int = 30,
+        max_duration: Optional[int] = None,
         next_hop: Optional[str] = None,
         flow: Optional["Flow"] = None,
         header_policy: Optional[str] = None,
@@ -723,7 +729,19 @@ class Call:
 
         Args:
             uri: Destination SIP URI — drives the B-leg R-URI.
-            timeout: INVITE timeout in seconds.
+            timeout: How long the B-leg may **ring** before siphon gives up,
+                in seconds.  On expiry siphon CANCELs, fires
+                ``@b2bua.on_failure`` and answers the caller ``408``.
+            max_duration: How long the call may stay **answered**, in seconds.
+                A different clock from ``timeout``: it starts at the answer, so
+                a call that rang for 25 seconds still gets its full talk time.
+                On expiry siphon BYEs both legs through the ordinary teardown
+                (CDR with ``disconnect_initiator="timeout"``, Rf/Ro
+                ``ACR-STOP``, media released) with
+                ``Reason: Q.850;cause=102``; no Python handler fires, the same
+                as for a session-timer expiry.  ``None`` (the default) inherits
+                ``b2bua.max_call_duration_secs``; ``0`` opts this call out of
+                that ceiling.
             next_hop: Optional routing destination.  When set, the new
                 INVITE's R-URI is still built from ``uri`` (so the called
                 party / IMPU shape is preserved), but the message is sent
@@ -801,6 +819,9 @@ class Call:
             # Basic dial (uses configured default policy)
             call.dial("sip:bob@10.0.0.2:5060", timeout=30)
 
+            # 30s to answer, then at most an hour of talk time.
+            call.dial("sip:bob@10.0.0.2:5060", timeout=30, max_duration=3600)
+
             # Device-driven proxy auth: let the extension authenticate to the
             # PBX itself; siphon just relays the challenge and credentials.
             call.dial("sip:bob@pbx.example.com:5060", auth_passthrough=True)
@@ -825,6 +846,8 @@ class Call:
             )
         """
         _validate_send_socket(send_socket)
+        if max_duration is not None:
+            self._max_duration_secs = max_duration
         uri = self._normalize_dial_targets([uri], number_policy)[0]
         self._actions.append(Action(
             kind="dial",
@@ -832,6 +855,7 @@ class Call:
             timeout=timeout,
             next_hop=next_hop,
             extras={
+                "max_duration": max_duration,
                 "flow": flow,
                 "header_policy": header_policy,
                 "copy": copy or [],
@@ -848,6 +872,7 @@ class Call:
         targets: list[Union[str, Contact]],
         strategy: str = "parallel",
         timeout: int = 30,
+        max_duration: Optional[int] = None,
         header_policy: Optional[str] = None,
         copy: Optional[list[str]] = None,
         strip: Optional[list[str]] = None,
@@ -873,7 +898,11 @@ class Call:
                 routing.
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
-            timeout: Per-branch INVITE timeout in seconds.
+            timeout: Per-branch ring timeout in seconds.
+            max_duration: Cap on how long the call may stay answered, in
+                seconds — same semantics as :meth:`dial`.  Unlike ``timeout``
+                this is not per-branch: whichever branch answers hands over one
+                answered call, and the cap is on that call.
             header_policy: Header policy applied to every branch of the fork —
                 same semantics as :meth:`dial`, built-in or operator-defined
                 (per-branch policy is a follow-up).
@@ -898,6 +927,8 @@ class Call:
             call.fork(contacts, strategy="parallel", timeout=30)
         """
         _validate_send_socket(send_socket)
+        if max_duration is not None:
+            self._max_duration_secs = max_duration
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         uris = self._normalize_dial_targets(uris, number_policy)
         self._actions.append(Action(
@@ -906,6 +937,7 @@ class Call:
             strategy=strategy,
             timeout=timeout,
             extras={
+                "max_duration": max_duration,
                 "header_policy": header_policy,
                 "copy": copy or [],
                 "strip": strip or [],
@@ -919,6 +951,7 @@ class Call:
         self,
         routes: list["Route"],
         timeout: int = 30,
+        max_duration: Optional[int] = None,
         send_socket: Optional[str] = None,
     ) -> None:
         """Route the call across an ordered list of carrier :class:`~siphon_sdk.lcr.Route`
@@ -935,6 +968,10 @@ class Call:
             routes: Ordered carriers (cheapest first).
             timeout: Default ring timeout (seconds) for a route without its own
                 ``timeout_secs``.
+            max_duration: Cap on how long the call may stay answered, in
+                seconds — same semantics as :meth:`dial`.  Per call, not per
+                attempt: ``timeout`` bounds each carrier's ring, but the
+                carrier that answers hands over one answered call.
             send_socket: Optional egress socket pin applied to every attempt.
 
         Example::
@@ -946,11 +983,17 @@ class Call:
                     call.route(decision.routes)
         """
         _validate_send_socket(send_socket)
+        if max_duration is not None:
+            self._max_duration_secs = max_duration
         self._actions.append(Action(
             kind="route",
             targets=[route.carrier_id for route in routes],
             timeout=timeout,
-            extras={"routes": list(routes), "send_socket": send_socket},
+            extras={
+                "max_duration": max_duration,
+                "routes": list(routes),
+                "send_socket": send_socket,
+            },
         ))
 
     def terminate(self) -> None:
@@ -977,6 +1020,38 @@ class Call:
         """
         self._state = "terminated"
         self._actions.append(Action(kind="terminate"))
+
+    @property
+    def max_duration(self) -> Optional[int]:
+        """The cap this call carries on how long it may stay answered, in
+        seconds, or ``None`` when it inherits ``b2bua.max_call_duration_secs``.
+
+        Read-only view of what ``max_duration=`` / :meth:`set_max_duration`
+        recorded, for test assertions.
+        """
+        return self._max_duration_secs
+
+    def set_max_duration(self, seconds: int) -> None:
+        """Cap how long this call may stay answered, in seconds.
+
+        The same knob as ``max_duration=`` on :meth:`dial` / :meth:`fork` /
+        :meth:`route`, reachable from a call that never dials — a UAS-mode
+        :meth:`answer` (IVR, announcement) or a :meth:`handover` — which would
+        otherwise be stuck on the configured ceiling.
+
+        The clock starts at the answer.  On expiry siphon BYEs both legs
+        through the ordinary teardown (CDR, charging stop, media release) with
+        ``Reason: Q.850;cause=102``; no Python handler fires.  ``0`` means
+        uncapped, overriding a configured ``b2bua.max_call_duration_secs``.
+
+        Example::
+
+            @b2bua.on_invite
+            def ivr(call):
+                call.set_max_duration(600)     # 10 minutes, then hang up
+                call.answer(200, "OK")
+        """
+        self._max_duration_secs = seconds
 
     def accept_refer(self, target: Optional[str] = None,
                      next_hop: Optional[str] = None,
