@@ -34,6 +34,16 @@ pub mod protocol;
 pub mod registry;
 pub mod sip_adapter;
 
+/// Bound on one WebSocket write to a controller.
+///
+/// The outbound queue in front of these writers never parks a producer (it is a
+/// mutex-and-notify queue with an explicit slow-consumer policy), so a stalled
+/// write cannot wedge the engine — but unbounded it still pins the write task,
+/// its connection and its queue for the life of the process, with the socket
+/// still showing as established. Bounding it closes the connection instead, and
+/// a controller that wants to come back can reconnect.
+pub(crate) const CONTROL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

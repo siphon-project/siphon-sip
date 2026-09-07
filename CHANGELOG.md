@@ -104,6 +104,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   threads per arena lock and the throughput ceiling has not been re-validated
   under it.
 
+### Fixed
+- **A collector that stopped reading its socket silently stopped delivery for
+  everything, not just itself.** Lawful-intercept X2, the HTTP CDR backend and
+  the HEP capture sender each run a *single* delivery task, and each wrote with
+  no timeout. A collector that accepts a connection and then stops draining it —
+  alive, still ACKing, receive window closed — parks that task for the life of
+  the process with the socket still showing as established. For X2 that is IRI
+  delivery stopping for every warrant; for CDR it is every subsequent record
+  being dropped at the producer's queue; for HEP it is capture going dead. All
+  three now time out and reconnect. The CDR HTTP exchange is bounded across
+  connect, write and read together, since the response read was unbounded too.
+- **SRS HTTP uploads now have a client timeout.** This was the only
+  `reqwest::Client` in the tree built without one, and with `upload_audio`
+  enabled it posts a multipart body of recorded audio, so a stalled endpoint held
+  the upload open indefinitely.
+- **Control-plane WebSocket writes are bounded.** A controller that stops reading
+  no longer pins its write task, connection and queue for the life of the
+  process; the connection is closed and the controller can reconnect.
+
 ## [1.8.3] — 2026-09-05
 
 ### Fixed
