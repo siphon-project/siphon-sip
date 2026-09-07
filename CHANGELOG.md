@@ -104,6 +104,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   threads per arena lock and the throughput ceiling has not been re-validated
   under it.
 
+### Fixed
+- **A Diameter peer that stopped reading its socket could park every script
+  handler that touched it, and abort the process.** The peer's writer task wrote
+  with no timeout, fed by a 64-slot channel whose producers enqueued with no
+  timeout. The request timeout on `send_request` covers waiting for the
+  *answer*, not waiting for a slot in front of a stalled writer, so it read as
+  guarded while being the opposite. Every scripting Diameter method — `cx_*`,
+  `sh_*`, `rx_*`, `rf_acr_*`, `s6a_*` and the generic `send_request` — reaches
+  that enqueue from a handler holding a script-executor worker, so a single
+  unresponsive HSS, PCRF or CDF could consume the pool until the executor
+  watchdog aborted the process.
+
+  Writes and enqueues are now bounded: a stalled connection is dropped so
+  callers fail fast instead of queueing behind it, and a request refused at the
+  enqueue no longer leaves its Hop-by-Hop entry behind in the correlation map.
+  The CER/CEA capabilities exchange is bounded on both legs too — it runs before
+  the reader and writer tasks exist, so nothing else covered it, and a peer that
+  connected and then went silent pinned the connect attempt and its reconnect
+  loop indefinitely.
+- **The Diameter reader task no longer parks on a full queue.** It is the only
+  thing that correlates answers to their requests, so an awaiting send of a
+  watchdog answer, a disconnect answer or an inbound request stopped every
+  in-flight request on that peer at once. These now shed with a warning: the
+  peer retries, which is recoverable, whereas a stalled reader is not.
+
 ## [1.8.3] — 2026-09-05
 
 ### Fixed
