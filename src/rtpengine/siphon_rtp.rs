@@ -1989,6 +1989,31 @@ async fn read_loop(
     }
 }
 
+/// Hand an event to the dispatcher without ever parking.
+///
+/// This runs on the control connection's **read** task, which is also what
+/// routes every `Response` back to its pending request. Awaiting a bounded
+/// channel here means a slow event consumer stops the read loop, so no response
+/// is routed, every in-flight and future command fails on its own timeout, and
+/// media control is dead process-wide with the connection still established —
+/// far worse than dropping one DTMF event. The comment on the old `let _ =
+/// send().await` called it best-effort; `try_send` is what actually makes it so.
+fn forward_event(event_tx: &mpsc::Sender<RtpEngineEvent>, event: RtpEngineEvent) {
+    match event_tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                "siphon-rtp event dropped: dispatcher event queue full (slow event \
+                 consumer) — dropping the event rather than stalling the control \
+                 read loop, which would fail every in-flight media command"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!("siphon-rtp event dropped: no event consumer");
+        }
+    }
+}
+
 /// Route one decoded JSON frame: a `Response` (has `id`) to its pending request,
 /// or an `Event` (has `event`) onto the event channel.
 async fn route_frame(
@@ -2021,13 +2046,12 @@ async fn route_frame(
                     }
                 }
                 let converted = convert_event(event);
-                let _ = event_tx.send(converted).await;
+                forward_event(event_tx, converted);
             }
             Ok(event) => {
                 let converted = convert_event(event);
                 debug!(?converted, "siphon-rtp event received");
-                // Best-effort: a dropped receiver just means no DTMF consumer.
-                let _ = event_tx.send(converted).await;
+                forward_event(event_tx, converted);
             }
             Err(error) => warn!(%error, "siphon-rtp event decode failed; skipping"),
         }
@@ -2065,10 +2089,23 @@ async fn authenticate(
         },
     })
     .map_err(|error| RtpEngineError::Protocol(format!("auth frame encode failed: {error}")))?;
-    write_half.write_all(&bytes).await?;
 
     let mut chunk = [0u8; READ_CHUNK];
     let deadline = Duration::from_millis(timeout_ms.max(1));
+
+    // Bounded by the same deadline as the ack read below. Unbounded, an engine
+    // that accepts the TCP connection and then never drains it wedges the
+    // reconnect task here forever — and because that task is what re-establishes
+    // control, every subsequent command then fails on its own timeout with
+    // nothing left to recover it.
+    match tokio::time::timeout(deadline, write_half.write_all(&bytes)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(RtpEngineError::Timeout {
+                timeout_ms: deadline.as_millis() as u64,
+            });
+        }
+    }
     tokio::time::timeout(deadline, async {
         loop {
             // Consume buffered frames first; the auth ack is the Response with the
