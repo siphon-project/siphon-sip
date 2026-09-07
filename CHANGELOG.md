@@ -60,8 +60,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `405` + `Allow`.
 
 ### Changed
-- **A plain registrar binding costs 641 -> 526 bytes of live data, across 9
-  allocations instead of 8.** A `Contact` is stored, compared and read, never
+- **A plain registrar binding costs 641 -> 526 bytes of live data, across 8
+  allocations instead of 9.** A `Contact` is stored, compared and read, never
   appended to, so `String`'s capacity word was 8 bytes per field carried for the
   life of every contact in the table to describe growth that never happens;
   `call_id`, `sip_instance`, `flow_token` and the RFC 3327 Path set are now
