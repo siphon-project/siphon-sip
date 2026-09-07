@@ -1094,15 +1094,13 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_air(
-                imsi,
-                &visited_plmn_id,
-                num_vectors,
-                immediate_response_preferred,
-                resync_info.as_deref(),
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_air(
+            imsi,
+            &visited_plmn_id,
+            num_vectors,
+            immediate_response_preferred,
+            resync_info.as_deref(),
+        ));
         match answer {
             Ok(message) => {
                 let parsed = match crate::diameter::s6a::parse_aia(&message) {
@@ -1159,14 +1157,12 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_ulr(
-                imsi,
-                rat_type,
-                ulr_flags,
-                &visited_plmn_id,
-            ))
-        });
+        let answer = crate::script::detach_block_on(client.send_ulr(
+            imsi,
+            rat_type,
+            ulr_flags,
+            &visited_plmn_id,
+        ));
         match answer {
             Ok(message) => {
                 let parsed = match crate::diameter::s6a::parse_ula(&message) {
@@ -1204,9 +1200,7 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.send_purge_ue(imsi, pur_flags))
-        });
+        let answer = crate::script::detach_block_on(client.send_purge_ue(imsi, pur_flags));
         match answer {
             Ok(message) => {
                 let dict = PyDict::new(python);
