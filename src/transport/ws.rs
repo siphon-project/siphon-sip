@@ -22,7 +22,7 @@ use crate::transport::acl::TransportAcl;
 use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
-    StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT,
+    StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
 };
 
 /// Handle a single WebSocket connection after the upgrade handshake.
@@ -166,9 +166,24 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
         while let Some(data) = outbound_rx.recv().await {
             // SIP messages are text — send as text frame
             let text = String::from_utf8_lossy(&data).into_owned();
-            if let Err(error) = ws_sink.send(Message::text(text)).await {
-                warn!("WS write error on {:?}: {}", connection_id, error);
-                break;
+            // Bounded: a browser or gateway that stops reading its socket leaves
+            // this send blocked forever, pinning the connection and its
+            // `connection_map` entry for the life of the process.
+            match tokio::time::timeout(WRITE_TIMEOUT, ws_sink.send(Message::text(text))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!("WS write error on {:?}: {}", connection_id, error);
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        connection_id = ?connection_id,
+                        timeout = ?WRITE_TIMEOUT,
+                        "WS write stalled — peer is not draining the connection; \
+                         closing it"
+                    );
+                    break;
+                }
             }
         }
     });
