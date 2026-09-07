@@ -586,6 +586,28 @@ pub struct NgFlags {
     /// A native `siphon-rtp` extension: the NG/bencode and rtpproxy backends
     /// have no equivalent and cannot honour it.
     pub echo_cancellation: bool,
+    /// How far from the reference [`NgFlags::echo_cancellation`] searches for
+    /// the returning echo, in milliseconds (16–1000, engine default 256).  The
+    /// window spans the media path twice rather than an acoustic hop, so a
+    /// carrier or mobile leg can exceed 200 ms on its own; an echo outside it is
+    /// not cancelled and the failure is silent, because the estimator commits
+    /// the tallest peak inside the window whatever that peak is.
+    ///
+    /// Inert without `echo_cancellation`.  A native `siphon-rtp` extension: the
+    /// NG/bencode and rtpproxy backends have no equivalent and cannot honour it.
+    pub echo_delay_search_ms: Option<u32>,
+    /// Span the echo path with the adaptive filter rather than estimating a bulk
+    /// delay first, making [`NgFlags::echo_delay_search_ms`] a tail length
+    /// instead of a search window.
+    ///
+    /// Inert without `echo_cancellation`.  A native `siphon-rtp` extension: the
+    /// NG/bencode and rtpproxy backends have no equivalent and cannot honour it.
+    pub echo_long_tail: bool,
+    /// Chain the residual-echo suppressor after the linear canceller.
+    ///
+    /// Inert without `echo_cancellation`.  A native `siphon-rtp` extension: the
+    /// NG/bencode and rtpproxy backends have no equivalent and cannot honour it.
+    pub echo_residual_suppression: bool,
     /// Bridge this call's offerer (leg A) audio to an external WebSocket media
     /// server — the voice-AI integration.  The engine dials this URI as a
     /// WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16
@@ -761,6 +783,9 @@ impl NgFlags {
             text_events: config.text_events,
             noise_suppression: config.noise_suppression,
             echo_cancellation: config.echo_cancellation,
+            echo_delay_search_ms: config.echo_delay_search_ms,
+            echo_long_tail: config.echo_long_tail,
+            echo_residual_suppression: config.echo_residual_suppression,
             ws_uri: config.ws_uri.clone(),
             ws_vad: config.ws_vad,
             ws_barge_in: config.ws_barge_in,
@@ -856,7 +881,8 @@ impl NgFlags {
         // ws_vad_engine, ws_vad_min_speech_ms, ws_sample_rate, ws_tee,
         // ws_tee_direction, ws_tee_channels, ws_tee_sample_rate,
         // beep_detection, beep_cadence_guard_ms, noise_suppression,
-        // echo_cancellation) are native siphon-rtp extensions with no NG
+        // echo_cancellation, echo_delay_search_ms, echo_long_tail,
+        // echo_residual_suppression) are native siphon-rtp extensions with no NG
         // equivalent, so they are deliberately not emitted here.  A profile that
         // sets them on this backend is rejected at config load rather than
         // silently degraded — see

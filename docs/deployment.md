@@ -241,6 +241,23 @@ Scrape `/metrics`. The handful that matter operationally:
 | `siphon_pyexec_pool_size` vs `_pool_max` | `pool_size == pool_max` **and** `inflight == pool_size` for minutes | Pool fully grown and saturated, approaching the liveness watchdog. |
 | `siphon_proxy_dialog_sessions` | grows unbounded under flat completed-call load | Dialog state not draining — a leak signature. |
 
+The allocator exposes its own numbers alongside those, and they answer different
+questions — reading only one is how a fragmentation problem gets misfiled as a
+data-structure problem:
+
+| Gauge | jemalloc stat | What it is |
+|---|---|---|
+| `siphon_memory_allocated_bytes` | `stats.allocated` | Live bytes. What the data structures actually cost. The leak signal. |
+| `siphon_memory_active_bytes` | `stats.active` | Bytes in pages holding live allocations. |
+| `siphon_memory_resident_bytes` | `stats.resident` | Physical pages the allocator holds. Tracks RSS. |
+| `siphon_memory_retained_bytes` | `stats.retained` | Virtual address space kept back rather than returned to the OS. Explains RSS above `allocated`. |
+| `siphon_memory_mapped_bytes` | `stats.mapped` | Total mapping. |
+| `siphon_memory_metadata_bytes` | `stats.metadata` | Allocator bookkeeping — arena headers, extents, bin metadata. Scales with **arena count**, not with traffic. |
+
+`resident - allocated` is the allocator's overhead, not yours. Diagnose a growing
+RSS by asking which of the two is moving before changing any code.
+
+
 See [handler-execution-model.md](handler-execution-model.md) for the pool internals
 and the blocking-handler contract that drives these.
 
@@ -248,10 +265,38 @@ and the blocking-handler contract that drives these.
 
 - **Throughput:** ~28–30k cps per node on commodity hardware (the README baseline);
   free-threaded CPython 3.14t is required to reach it (the container image ships it).
-- **Memory:** dominated by the handler pool — roughly
-  `sync_pool_max × ~2 MB` at peak. Lower `script.sync_pool_max` on
-  memory-constrained nodes; prefer `auth.http.cache_ttl_secs` so an auth storm never
-  needs the pool to grow in the first place.
+- **Memory:** three separate terms, and they scale differently.
+  - **Handler pool** — roughly `sync_pool_max × ~2 MB` at peak. Lower
+    `script.sync_pool_max` on memory-constrained nodes; prefer
+    `auth.http.cache_ttl_secs` so an auth storm never needs the pool to grow in
+    the first place.
+  - **Registrar bindings** — budget **~1.8 KB resident per binding**
+    (~0.85 KB of live data, the rest allocator page overhead). So 600k contacts
+    is roughly 1 GB on top of the fixed cost. Measure it for your own contact
+    shape with [`scripts/registrar_scale_test.sh`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/registrar_scale_test.sh),
+    which registers a population of unique AoRs and reports marginal bytes per
+    binding against an idle baseline from the same process.
+  - **Allocator metadata** — jemalloc defaults to `4 × ncpus` arenas, and each
+    one costs bookkeeping. On a 24-core box that is ~30 MB of
+    `siphon_memory_metadata_bytes` before a single call. See below.
+- **Trimming the fixed cost on a small node.** `narenas` is settable without
+  rebuilding, via jemalloc's own environment variable (the `_rjem_` prefix is
+  `tikv-jemallocator`'s symbol prefix, not a typo):
+
+  ```bash
+  _RJEM_MALLOC_CONF=narenas:4 siphon -c siphon.yaml
+  ```
+
+  Measured on a 24-core box, 200k bindings, `narenas:4` against the default 96
+  arenas: **idle RSS 89 MB → 78 MB** and allocator metadata **30 MB → 8.6 MB**,
+  with the **marginal cost per binding unchanged** (1790 vs 1787 bytes resident).
+  So this is a fixed-cost lever, worth taking on a container with a small limit
+  and close to irrelevant at large contact counts, where the per-binding term
+  dominates. It is not the default because fewer arenas means more threads per
+  arena lock, and SIPhon's throughput ceiling has not been re-validated under it
+  — if you set it on a node that matters, re-run your own throughput row first.
+  A binary that embeds SIPhon as a library can bake the same string in via
+  `siphon::install_allocator!("narenas:4,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0")`.
 - **Stability over heroics:** if a node is unstable under load, fix the instability —
   don't paper over it with more nodes. The liveness watchdog
   (`script.handler_stall_abort_secs`) converts a hang into a fast supervised restart

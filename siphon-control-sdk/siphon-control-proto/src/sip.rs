@@ -846,7 +846,10 @@ mod tests {
         for name in ["TransferProgress", "TransferCompleted", "TransferFailed"] {
             let parsed = SipEvent::from(name);
             assert_eq!(parsed.as_str(), name);
-            assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{name}\"")
+            );
         }
         assert_eq!(
             SipEvent::from("TransferProgress"),
@@ -860,7 +863,10 @@ mod tests {
         for name in ["ChannelBridged", "BridgeFailed", "ChannelUnbridged"] {
             let parsed = SipEvent::from(name);
             assert_eq!(parsed.as_str(), name);
-            assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{name}\"")
+            );
         }
         assert_eq!(SipEvent::from("ChannelBridged"), SipEvent::ChannelBridged);
         assert_eq!(SipEvent::from("BridgeFailed"), SipEvent::BridgeFailed);
@@ -973,7 +979,10 @@ mod tests {
             assert_eq!(TransferStage::from(token), stage);
             assert_eq!(stage.as_str(), token);
             assert_eq!(stage.to_string(), token);
-            assert_eq!(serde_json::to_string(&stage).unwrap(), format!("\"{token}\""));
+            assert_eq!(
+                serde_json::to_string(&stage).unwrap(),
+                format!("\"{token}\"")
+            );
         }
         // A stage a newer server invents must not break decoding.
         let novel: TransferStage = serde_json::from_str("\"something_new\"").unwrap();
@@ -1030,7 +1039,10 @@ mod tests {
             assert_eq!(BridgeRole::from(token), role);
             assert_eq!(role.as_str(), token);
             assert_eq!(role.to_string(), token);
-            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{token}\""));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{token}\"")
+            );
         }
         let novel: BridgeRole = serde_json::from_str("\"observer\"").unwrap();
         assert_eq!(novel, BridgeRole::Other("observer".to_string()));
@@ -1117,7 +1129,11 @@ mod tests {
         ] {
             let parsed = SipEvent::from(wire);
             assert_eq!(parsed, expected, "{wire} must parse to its own variant");
-            assert_eq!(parsed.as_str(), wire, "{wire} must serialise back unchanged");
+            assert_eq!(
+                parsed.as_str(),
+                wire,
+                "{wire} must serialise back unchanged"
+            );
             assert!(
                 !matches!(parsed, SipEvent::Other(_)),
                 "{wire} fell through to Other"

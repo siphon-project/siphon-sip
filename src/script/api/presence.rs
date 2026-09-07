@@ -407,7 +407,7 @@ impl PyPresence {
         let destination = crate::script::detach_block_on(resolver_clone.resolve(
             &host,
             port,
-            &scheme,
+            scheme.as_str(),
             transport_hint.as_deref(),
         ));
 

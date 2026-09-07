@@ -13,7 +13,7 @@ pub use builder::SipMessageBuilder;
 pub use headers::SipHeaders;
 pub use message::*;
 pub use parser::parse_sip_message;
-pub use uri::SipUri;
+pub use uri::{Scheme, SipUri};
 
 /// SIP methods siphon implements, formatted for an `Allow` header (RFC 3261
 /// §20.5). Advertised verbatim on siphon's own UA surfaces — OPTIONS responses,

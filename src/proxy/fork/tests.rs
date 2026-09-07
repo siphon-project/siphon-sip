@@ -1,18 +1,17 @@
 //! Unit tests for proxy fork aggregation — RFC 3261 §16.7.
 
 use super::*;
-use crate::sip::uri::SipUri;
+use crate::sip::uri::{Scheme, SipUri};
 
 /// Helper: build a `SipUri` from a user@host string.
 fn uri(user: &str, host: &str) -> SipUri {
     SipUri {
-        scheme: "sip".to_string(),
+        scheme: Scheme::Sip,
         user: Some(user.to_string()),
         host: host.to_string(),
         port: None,
         params: Vec::new(),
-        headers: Vec::new(),
-        user_params: Vec::new(),
+        extras: None,
     }
 }
 

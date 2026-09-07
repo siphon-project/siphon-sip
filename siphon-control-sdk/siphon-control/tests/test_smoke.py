@@ -17,6 +17,7 @@ Run: ``python -m pytest tests/`` (needs ``websockets`` installed).
 import asyncio
 import contextlib
 import json
+import time
 
 import pytest
 import websockets
@@ -618,3 +619,164 @@ def test_server_mode_rejects_bad_token():
             await asyncio.wait_for(serve_task, timeout=5)
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Shutdown behaviour
+# ---------------------------------------------------------------------------
+#
+# The Rust side drives Python from detached tokio tasks that nothing joins: a
+# handover is dispatched with `tokio::spawn`, and every awaitable is resolved
+# through the asyncio loop captured when `run()` was called. The runtime
+# outlives both the loop and the interpreter, so a task waking after the app has
+# finished used to re-enter a Python that was no longer there -- as a
+# `tokio-rt-worker` panic telling the reader to call `Python::initialize()`,
+# printed after the app's own clean exit and easily read as its cause.
+
+
+def test_module_exposes_close_and_async_context_manager():
+    """The deterministic teardown path exists on both connection modes."""
+    for cls in (ControlClient, ControlServer):
+        assert hasattr(cls, "close"), cls
+        assert hasattr(cls, "__aenter__"), cls
+        assert hasattr(cls, "__aexit__"), cls
+
+
+def test_close_stops_dispatching_into_python():
+    """After close(), a handover already on the wire is not handed to the handler.
+
+    This is what makes teardown deterministic: an app that closes has nothing in
+    flight for the interpreter/loop guards to decline later. The stub keeps
+    pushing handovers on a timer, so the events keep arriving after close() —
+    the client has to be the thing that stops, not the sender.
+    """
+    async def scenario():
+        pushing = asyncio.Event()
+
+        async def pushing_stub(websocket):
+            said_hello = False
+            sequence = 0
+
+            async def push_forever():
+                nonlocal sequence
+                while True:
+                    sequence += 1
+                    try:
+                        await websocket.send(json.dumps({
+                            "type": "event", "event": "StasisStart",
+                            "channel": f"ch{sequence}", "app": APP,
+                            "call_id": f"call-{sequence}",
+                            "sip_call_id": f"sip{sequence}@host", "payload": {},
+                        }))
+                    except Exception:
+                        return
+                    await asyncio.sleep(0.02)
+
+            async for message in websocket:
+                frame = json.loads(message)
+                if not said_hello:
+                    await _reply_ok(websocket, frame.get("id"), {
+                        "app": APP, "protocol": 1, "subprotocol": SUBPROTOCOL,
+                    })
+                    said_hello = True
+                    asyncio.ensure_future(push_forever())
+                    pushing.set()
+                    continue
+                await _reply_ok(websocket, frame.get("id"), {"state": "answered"})
+
+        async with websockets.serve(
+            pushing_stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            calls = []
+
+            @client.on_call
+            async def handle(call):
+                calls.append(call.channel_id)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.wait_for(pushing.wait(), timeout=5)
+            await asyncio.sleep(0.3)
+            assert calls, "handler must run while the client is open"
+
+            client.close()
+            settled = len(calls)
+            await asyncio.sleep(0.3)
+            assert len(calls) == settled, "close() must stop dispatching into Python"
+
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_async_context_manager_closes_on_exit():
+    """`async with` closes on the way out, including when the body raises."""
+    async def scenario():
+        async with _serve_stub() as url:
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+
+            @client.on_call
+            async def handle(call):
+                pass
+
+            with contextlib.suppress(RuntimeError):
+                async with client as entered:
+                    assert entered is client
+                    await client.connect()
+                    run_task = asyncio.ensure_future(client.run())
+                    await asyncio.sleep(0.3)
+                    raise RuntimeError("the app blew up")
+
+            # __aexit__ closed the client despite the exception, so the
+            # connection is gone and a further command has nowhere to go.
+            with pytest.raises(ControlError) as excinfo:
+                await client.command("test_push_stasis")
+            assert "closed" in str(excinfo.value)
+
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_teardown_is_quiet(capfd):
+    """A finished app exits without a traceback, closed or not.
+
+    Handlers still in flight are cancelled when the loop closes; a cancelled
+    handler is teardown, not a failure, and printing one traceback per in-flight
+    call is the same "the exit reason is buried" problem as the panic. Handovers
+    that arrive after the loop is gone are dropped rather than dispatched onto a
+    closed loop, which the dependency would report as `RuntimeError: Event loop
+    is closed`.
+    """
+    async def scenario():
+        async with _serve_stub() as url:
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            entered = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                if not entered.done():
+                    entered.set_result(True)
+                await asyncio.sleep(60)   # still in flight at teardown
+
+            await client.connect()
+            asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(entered, timeout=5)
+
+    asyncio.run(scenario())
+    # asyncio.run has now cancelled the in-flight handler and closed the loop,
+    # but the reaction to that lands on a tokio worker, not on this thread —
+    # give it time to print whatever it is going to print. Without this wait the
+    # assertions below race past the noise and pass even on the unfixed build.
+    time.sleep(1.0)
+    err = capfd.readouterr().err
+    assert "CancelledError" not in err, err
+    assert "Event loop is closed" not in err, err
+    assert "panicked" not in err, err

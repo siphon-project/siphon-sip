@@ -332,6 +332,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "active": metrics.memory_active_bytes.get(),
             "retained": metrics.memory_retained_bytes.get(),
             "mapped": metrics.memory_mapped_bytes.get(),
+            "metadata": metrics.memory_metadata_bytes.get(),
             "glibc_system": metrics.glibc_system_bytes.get(),
             "glibc_in_use": metrics.glibc_in_use_bytes.get(),
             "glibc_arenas": metrics.glibc_arena_count.get(),

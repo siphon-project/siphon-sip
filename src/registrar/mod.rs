@@ -11,7 +11,9 @@ pub mod reginfo;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -137,10 +139,20 @@ pub struct Contact {
     pub q: f32,
     /// When this binding was created/refreshed.
     pub registered_at: Instant,
-    /// How long the binding is valid (from `registered_at`).
-    pub expires: Duration,
+    /// How long the binding is valid, in whole seconds from `registered_at`.
+    ///
+    /// Seconds rather than a `Duration`: RFC 3261 §10.2.4 expresses `Expires`
+    /// in whole seconds, so the nanosecond half of a `Duration` was always
+    /// zero, and 12 of its 16 bytes were carried on every binding in the table
+    /// to store nothing. A `u32` covers 136 years.
+    pub expires_secs: u32,
     /// Call-ID from the REGISTER that created this binding.
-    pub call_id: String,
+    ///
+    /// `Box<str>` rather than `String` throughout this struct: a binding is
+    /// stored, compared and read, never appended to, so the capacity word is
+    /// 8 bytes per field carried for the life of every contact in the table to
+    /// describe growth that never happens.
+    pub call_id: Box<str>,
     /// CSeq sequence number (for replay protection).
     pub cseq: u32,
     /// Source address the REGISTER came from (for NAT traversal routing).
@@ -154,11 +166,14 @@ pub struct Contact {
     /// re-parse this string back into one on each send.
     pub source_transport: Option<Transport>,
     /// RFC 5627 GRUU: `+sip.instance` (URN, e.g. "urn:uuid:f81d4fae-...").
-    pub sip_instance: Option<String>,
+    pub sip_instance: Option<Box<str>>,
     /// RFC 5626 Outbound: `reg-id` parameter.
     pub reg_id: Option<u32>,
     /// RFC 3327 Path headers from the REGISTER (for terminating request routing).
-    pub path: Vec<String>,
+    ///
+    /// A boxed slice: the Path set is fixed at the moment the binding is
+    /// created and never grown, so a `Vec`'s capacity word is dead weight.
+    pub path: Box<[Box<str>]>,
     /// IMS registration state: pending (awaiting SAR) vs active.
     pub pending: bool,
     /// Identity of the siphon process that accepted this REGISTER — the
@@ -180,7 +195,7 @@ pub struct Contact {
     /// the proxy advertises upstream, and `Registrar::lookup_by_token`
     /// resolves it back to the binding when the request comes back via the
     /// consumed Route header (RFC 3327 §5 / TS 24.229 §5.2.7.2).
-    pub flow_token: Option<String>,
+    pub flow_token: Option<Box<str>>,
     /// The local socket the inbound REGISTER landed on.  Lets the relay
     /// path egress an MT request from the same listener — load-bearing
     /// for IPSec sec-agree where `pcscf_port_s` is non-default and the
@@ -267,12 +282,12 @@ impl Contact {
     /// Seconds remaining until this contact expires.
     pub fn remaining_seconds(&self) -> u64 {
         let elapsed = self.registered_at.elapsed();
-        self.expires.as_secs().saturating_sub(elapsed.as_secs())
+        u64::from(self.expires_secs).saturating_sub(elapsed.as_secs())
     }
 
     /// Whether this contact has expired.
     pub fn is_expired(&self) -> bool {
-        self.registered_at.elapsed() >= self.expires
+        self.registered_at.elapsed().as_secs() >= u64::from(self.expires_secs)
     }
 
     /// Seconds since this binding was created or last refreshed.
@@ -330,7 +345,7 @@ impl Default for RegistrarConfig {
 /// identically to a pre-feature binding.
 #[derive(Debug, Clone, Default)]
 pub struct FlowCapture {
-    pub flow_token: Option<String>,
+    pub flow_token: Option<Box<str>>,
     pub inbound_local_addr: Option<SocketAddr>,
     pub inbound_connection_id: Option<u64>,
 }
@@ -785,17 +800,17 @@ impl Registrar {
             uri: uri.clone(),
             q,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(expires_secs as u64),
-            call_id,
+            expires_secs,
+            call_id: call_id.into_boxed_str(),
             cseq,
             source_addr,
             source_transport,
-            sip_instance,
+            sip_instance: sip_instance.map(String::into_boxed_str),
             reg_id,
-            path,
+            path: path.into_iter().map(String::into_boxed_str).collect(),
             pending: false,
             instance,
-            flow_token: flow_token.clone(),
+            flow_token: flow_token.as_deref().map(Box::from),
             inbound_local_addr,
             inbound_connection_id,
             params,
@@ -821,7 +836,7 @@ impl Registrar {
         contacts.retain(|c| {
             if c.is_expired() {
                 if let Some(token) = &c.flow_token {
-                    tokens_to_remove.push(token.clone());
+                    tokens_to_remove.push(token.to_string());
                 }
                 if is_stream_transport(c.source_transport) {
                     if let Some(id) = c.inbound_connection_id {
@@ -843,7 +858,7 @@ impl Registrar {
             contacts.retain(|c| {
                 if c.kind == ContactKind::Ue && c.uri.to_string() == uri_string {
                     if let Some(token) = &c.flow_token {
-                        tokens_to_remove.push(token.clone());
+                        tokens_to_remove.push(token.to_string());
                     }
                     if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
@@ -923,7 +938,7 @@ impl Registrar {
             // re-indexed below; if the connection is unchanged the deindex +
             // reindex nets to a no-op.
             if let Some(old_token) = &contacts[idx].flow_token {
-                tokens_to_remove.push(old_token.clone());
+                tokens_to_remove.push(old_token.to_string());
             }
             if is_stream_transport(contacts[idx].source_transport) {
                 if let Some(id) = contacts[idx].inbound_connection_id {
@@ -963,7 +978,7 @@ impl Registrar {
             }
         }
         if let Some(token) = &flow_token {
-            self.tokens.insert(token.clone(), aor_owned.clone());
+            self.tokens.insert(token.to_string(), aor_owned.clone());
         }
 
         // Maintain the stream connection reverse index: retire the ids of any
@@ -999,7 +1014,7 @@ impl Registrar {
         if let Some((_, contacts)) = removed {
             for contact in contacts {
                 if let Some(token) = contact.flow_token {
-                    self.tokens.remove(&token);
+                    self.tokens.remove(token.as_ref());
                 }
                 if is_stream_transport(contact.source_transport) {
                     if let Some(id) = contact.inbound_connection_id {
@@ -1033,7 +1048,7 @@ impl Registrar {
         if let Some((_, contacts)) = self.bindings.remove(aor) {
             for contact in contacts {
                 if let Some(token) = contact.flow_token {
-                    self.tokens.remove(&token);
+                    self.tokens.remove(token.as_ref());
                 }
                 if is_stream_transport(contact.source_transport) {
                     if let Some(id) = contact.inbound_connection_id {
@@ -1077,7 +1092,7 @@ impl Registrar {
                     );
                     if evict {
                         if let Some(token) = &c.flow_token {
-                            tokens_to_remove.push(token.clone());
+                            tokens_to_remove.push(token.to_string());
                         }
                         if is_stream_transport(c.source_transport) {
                             if let Some(id) = c.inbound_connection_id {
@@ -1323,7 +1338,7 @@ impl Registrar {
             entry.value_mut().retain(|c| {
                 if c.uri.to_string() == contact_uri {
                     if let Some(token) = &c.flow_token {
-                        tokens_to_remove.push(token.clone());
+                        tokens_to_remove.push(token.to_string());
                     }
                     if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
@@ -1457,14 +1472,14 @@ impl Registrar {
             uri,
             q,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(expires_secs as u64),
-            call_id: String::new(),
+            expires_secs,
+            call_id: "".into(),
             cseq: 0,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -1637,7 +1652,7 @@ impl Registrar {
                     continue;
                 }
                 if let Some(token) = &contact.flow_token {
-                    self.tokens.insert(token.clone(), aor.clone());
+                    self.tokens.insert(token.to_string(), aor.clone());
                 }
             }
         }
@@ -1810,7 +1825,7 @@ impl Registrar {
                         kept.push(contact);
                     } else if on_this_flow {
                         if let Some(token) = &contact.flow_token {
-                            tokens_to_remove.push(token.clone());
+                            tokens_to_remove.push(token.to_string());
                         }
                         removed.push((aor.clone(), contact));
                     } else {
@@ -1971,14 +1986,14 @@ impl Registrar {
             uri: uri.clone(),
             q,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(expires_secs as u64),
-            call_id,
+            expires_secs,
+            call_id: call_id.into_boxed_str(),
             cseq,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: true,
             instance,
             flow_token: None,
@@ -2049,7 +2064,7 @@ impl Registrar {
             entry.value_mut().retain(|c| {
                 if c.is_expired() {
                     if let Some(token) = &c.flow_token {
-                        tokens_to_remove.push(token.clone());
+                        tokens_to_remove.push(token.to_string());
                     }
                     if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
@@ -2354,7 +2369,7 @@ mod tests {
                 None,
                 vec![],
                 FlowCapture {
-                    flow_token: Some(flow_token.to_string()),
+                    flow_token: Some(Box::from(flow_token)),
                     inbound_local_addr: None,
                     inbound_connection_id: Some(connection_id),
                 },
@@ -2695,7 +2710,7 @@ mod tests {
         // Age the binding out without sleeping.
         if let Some(mut entry) = registrar.bindings.get_mut("sip:a@example.com") {
             for contact in entry.value_mut().iter_mut() {
-                contact.expires = Duration::ZERO;
+                contact.expires_secs = 0;
             }
         }
         assert_eq!(registrar.expire_stale(), 1);
@@ -3190,7 +3205,7 @@ mod tests {
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
-        assert_eq!(contacts[0].expires, Duration::from_secs(1800));
+        assert_eq!(contacts[0].expires_secs, 1800);
     }
 
     #[test]
@@ -3283,14 +3298,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "c".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: Some(Arc::new(InstanceIdentity {
                 id: "siphon-7".to_string(),
@@ -3335,14 +3350,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(3600),
-            call_id: "test".to_string(),
+            expires_secs: 3600,
+            call_id: "test".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -3365,14 +3380,14 @@ mod tests {
                 uri: contact_uri("alice", "10.0.0.1"),
                 q: 1.0,
                 registered_at: Instant::now() - Duration::from_secs(7200),
-                expires: Duration::from_secs(3600),
-                call_id: "old".to_string(),
+                expires_secs: 3600,
+                call_id: "old".into(),
                 cseq: 1,
                 source_addr: None,
                 source_transport: None,
                 sip_instance: None,
                 reg_id: None,
-                path: vec![],
+                path: Box::default(),
                 pending: false,
                 instance: None,
                 flow_token: None,
@@ -3422,14 +3437,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
-            call_id: "expired".to_string(),
+            expires_secs: 3600,
+            call_id: "expired".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -3550,14 +3565,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
-            call_id: "expired".to_string(),
+            expires_secs: 3600,
+            call_id: "expired".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -3639,7 +3654,7 @@ mod tests {
                     None,
                     vec![],
                     FlowCapture {
-                        flow_token: Some(format!("token-{index}")),
+                        flow_token: Some(format!("token-{index}").into_boxed_str()),
                         inbound_local_addr: None,
                         inbound_connection_id: Some(index as u64),
                     },
@@ -3918,7 +3933,14 @@ mod tests {
 
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts[0].path, path);
+        assert_eq!(
+            contacts[0]
+                .path
+                .iter()
+                .map(|v| v.as_ref())
+                .collect::<Vec<&str>>(),
+            path.iter().map(|v| v.as_str()).collect::<Vec<&str>>()
+        );
     }
 
     #[test]
@@ -3966,7 +3988,7 @@ mod tests {
         // Age the first binding so recency is unambiguous.
         if let Some(mut entry) = registrar.bindings.get_mut("sip:alice@example.com") {
             for contact in entry.value_mut().iter_mut() {
-                if contact.call_id == "old-handset" {
+                if &*contact.call_id == "old-handset" {
                     contact.registered_at = Instant::now() - Duration::from_secs(600);
                 }
             }
@@ -3974,8 +3996,8 @@ mod tests {
 
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 2);
-        assert_eq!(contacts[0].call_id, "new-handset");
-        assert_eq!(contacts[1].call_id, "old-handset");
+        assert_eq!(&*contacts[0].call_id, "new-handset");
+        assert_eq!(&*contacts[1].call_id, "old-handset");
     }
 
     #[test]
@@ -4019,14 +4041,14 @@ mod tests {
             .unwrap();
         if let Some(mut entry) = registrar.bindings.get_mut("sip:alice@example.com") {
             for contact in entry.value_mut().iter_mut() {
-                if contact.call_id == "preferred-but-old" {
+                if &*contact.call_id == "preferred-but-old" {
                     contact.registered_at = Instant::now() - Duration::from_secs(3000);
                 }
             }
         }
 
         let contacts = registrar.lookup("sip:alice@example.com");
-        assert_eq!(contacts[0].call_id, "preferred-but-old");
+        assert_eq!(&*contacts[0].call_id, "preferred-but-old");
     }
 
     #[test]
@@ -4105,7 +4127,14 @@ mod tests {
 
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts[0].path, vec!["<sip:new-pcscf.example.com;lr>"]);
+        assert_eq!(
+            contacts[0]
+                .path
+                .iter()
+                .map(|v| v.as_ref())
+                .collect::<Vec<&str>>(),
+            vec!["<sip:new-pcscf.example.com;lr>"]
+        );
     }
 
     #[test]
@@ -4789,7 +4818,7 @@ mod tests {
 
     fn flow_capture(token: &str, local_port: u16, remote_port: u16) -> FlowCapture {
         FlowCapture {
-            flow_token: Some(token.to_string()),
+            flow_token: Some(token.into()),
             inbound_local_addr: Some(format!("127.0.0.1:{local_port}").parse().unwrap()),
             inbound_connection_id: Some(0xfeed_face_dead_beef ^ remote_port as u64),
         }
@@ -4997,14 +5026,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "stale".into(),
             cseq: 1,
             source_addr: None,
             source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: Some("tok-gc".into()),
@@ -5035,14 +5064,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "c1".into(),
             cseq: 1,
             source_addr: None,
             source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: Some("tok-restored".into()),
@@ -5075,14 +5104,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "stale".into(),
             cseq: 1,
             source_addr: None,
             source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: Some("tok-expired".into()),
@@ -5168,14 +5197,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "c1".into(),
             cseq: 1,
             source_addr: None,
             source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: Some("tok".into()),
@@ -5226,7 +5255,7 @@ mod tests {
                         None,
                         vec![],
                         FlowCapture {
-                            flow_token: Some(token),
+                            flow_token: Some(token.into_boxed_str()),
                             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
                             inbound_connection_id: Some(thread_id * 1000 + i),
                         },
@@ -5624,14 +5653,14 @@ mod tests {
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
-            expires: Duration::from_secs(3600),
+            expires_secs: 3600,
             call_id: "c1".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -5644,14 +5673,14 @@ mod tests {
             uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
             q: 1.0,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(3600),
-            call_id: String::new(),
+            expires_secs: 3600,
+            call_id: "".into(),
             cseq: 0,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,
@@ -5681,14 +5710,14 @@ mod tests {
             uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
             q: 1.0,
             registered_at: Instant::now(),
-            expires: Duration::from_secs(3600),
-            call_id: String::new(),
+            expires_secs: 3600,
+            call_id: "".into(),
             cseq: 0,
             source_addr: None,
             source_transport: None,
             sip_instance: None,
             reg_id: None,
-            path: vec![],
+            path: Box::default(),
             pending: false,
             instance: None,
             flow_token: None,

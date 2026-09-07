@@ -2126,10 +2126,34 @@ pub struct ServerIdentityConfig {
     /// deployments.  When unset, siphon falls back to the ``HOSTNAME``
     /// environment variable, then to ``"siphon"`` as a last resort.
     pub instance_id: Option<String>,
+    /// Answer an OPTIONS that **no** script handler claims with `200 OK` plus
+    /// `Contact` and `Allow` (RFC 3261 §11.2). Default: true.
+    ///
+    /// Every registrar qualifies its bindings — Asterisk's `qualify_frequency`
+    /// and its equivalents probe the registered contact on a timer for the life
+    /// of the registration — so a siphon that registers to a provider answers
+    /// one of these forever, and making each deployment hand-write the same
+    /// handler meant nobody did.
+    ///
+    /// This only governs the case where no `@proxy.on_request` handler matches:
+    /// a script that registers one (including a catch-all `@proxy.on_request`)
+    /// owns OPTIONS entirely and is unaffected either way.
+    ///
+    /// Set to false and an unclaimed OPTIONS is dropped silently rather than
+    /// answered — no response at all, the same policy the scripting API uses for
+    /// scanner traffic, so siphon does not confirm its own existence to a probe
+    /// nobody asked it to answer. Turning it off without registering a handler
+    /// means OPTIONS goes unanswered; that is the point of turning it off.
+    #[serde(default = "default_auto_options")]
+    pub auto_options: bool,
 }
 
 fn default_drain_secs() -> u64 {
     30
+}
+
+fn default_auto_options() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2300,6 +2324,15 @@ impl MediaBackendKind {
             }
             if flags.echo_cancellation {
                 unsupported.push("echo_cancellation");
+            }
+            if flags.echo_delay_search_ms.is_some() {
+                unsupported.push("echo_delay_search_ms");
+            }
+            if flags.echo_long_tail {
+                unsupported.push("echo_long_tail");
+            }
+            if flags.echo_residual_suppression {
+                unsupported.push("echo_residual_suppression");
             }
             if flags.ws_tee.is_some() {
                 unsupported.push("ws_tee");
@@ -2895,6 +2928,29 @@ pub struct NgFlagsConfig {
     /// against the audio played toward that party.  `siphon-rtp` backend only.
     #[serde(default)]
     pub echo_cancellation: bool,
+    /// How far from the reference the echo canceller searches for the returning
+    /// echo, in milliseconds (16–1000, default 256).  `siphon-rtp` backend only,
+    /// and inert without `echo_cancellation`.
+    ///
+    /// The window has to span the whole media path twice, not an acoustic
+    /// loudspeaker-to-microphone hop, so a carrier or mobile leg can sit past
+    /// 200 ms on its own.  **An echo outside the window is not cancelled and
+    /// nothing says so** — the estimator commits the tallest peak it can see and
+    /// then adapts against a reference that is not the echo — so widen it for a
+    /// leg reached through a carrier, and narrow it for a LAN softphone that
+    /// should not pay for the larger estimator state.
+    #[serde(default)]
+    pub echo_delay_search_ms: Option<u32>,
+    /// Span the echo path with the adaptive filter itself instead of estimating
+    /// a bulk delay first, which makes `echo_delay_search_ms` a tail length
+    /// rather than a search window.  `siphon-rtp` backend only, and inert
+    /// without `echo_cancellation`.
+    #[serde(default)]
+    pub echo_long_tail: bool,
+    /// Chain the residual-echo suppressor after the linear canceller.
+    /// `siphon-rtp` backend only, and inert without `echo_cancellation`.
+    #[serde(default)]
+    pub echo_residual_suppression: bool,
     /// Bridge this leg's audio to an external WebSocket media server: the engine
     /// dials this URI and relays the leg's RTP to it as L16.  `siphon-rtp`
     /// backend only.
@@ -4372,6 +4428,22 @@ impl Config {
                         if unsupported.len() == 1 { "it" } else { "them" },
                     )));
                 }
+
+                // 16..=1000 ms is the engine's own accepted range, and it
+                // refuses an out-of-range value at the control plane — that is,
+                // on every media offer, at call time, on a node that came up
+                // reporting perfectly healthy. Catching it here turns "every
+                // call fails" into a boot failure that names the profile.
+                if let Some(window) = flags.echo_delay_search_ms {
+                    if !(16..=1000).contains(&window) {
+                        return Err(SiphonError::Config(format!(
+                            "media profile {name:?} sets echo_delay_search_ms to {window} on its \
+                             {direction} flags, outside the 16-1000 ms the engine accepts — it \
+                             refuses the value on every offer, so a node carrying this config \
+                             starts healthy and then fails every call"
+                        )));
+                    }
+                }
             }
         }
 
@@ -4730,6 +4802,73 @@ fn default_lcr_cache_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `server.auto_options` defaults ON, and it has to default ON from *both*
+    /// directions: an absent `server:` block (the common case — nobody adds one
+    /// to get an OPTIONS answered) and a present block that simply does not
+    /// mention the key. A `#[serde(default)]` covers the second; only the
+    /// dispatcher's own `map_or(true, …)` on the absent block covers the first,
+    /// which is why the no-block case is asserted through that same shape
+    /// rather than against the struct alone. (`map_or` and not `is_none_or`
+    /// there and here: the latter is stable since 1.82 and the crate's MSRV is
+    /// 1.80.)
+    #[test]
+    fn auto_options_defaults_on() {
+        let with_block = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+            "server:\n",
+            "  drain_secs: 5\n",
+        ))
+        .expect("config must parse");
+        assert!(
+            with_block
+                .server
+                .as_ref()
+                .map_or(true, |server| server.auto_options),
+            "a server: block that omits auto_options must still answer OPTIONS"
+        );
+
+        let without_block = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+        ))
+        .expect("config must parse");
+        assert!(
+            without_block
+                .server
+                .as_ref()
+                .map_or(true, |server| server.auto_options),
+            "no server: block at all must still answer OPTIONS"
+        );
+    }
+
+    #[test]
+    fn auto_options_can_be_turned_off() {
+        let config = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+            "server:\n",
+            "  auto_options: false\n",
+        ))
+        .expect("config must parse");
+        assert!(!config
+            .server
+            .as_ref()
+            .map_or(true, |server| server.auto_options));
+    }
 
     /// Codec manipulation is an rtpengine NG capability. The native engine's
     /// `ProfileFlags` has no codec fields and rtpproxy is a plain relay, so a
@@ -6615,6 +6754,104 @@ media:
             error.to_string().contains("ws_uri"),
             "error should name the field: {error}"
         );
+    }
+
+    /// The three echo-tuning knobs reach the config, and the search window is
+    /// carried as a number rather than being flattened into the `flags` list.
+    #[test]
+    fn parses_media_profile_echo_tuning() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        echo_cancellation: true\n        \
+             echo_delay_search_ms: 600\n        echo_long_tail: true\n        \
+             echo_residual_suppression: true\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.echo_cancellation);
+        assert_eq!(offer.echo_delay_search_ms, Some(600));
+        assert!(offer.echo_long_tail);
+        assert!(offer.echo_residual_suppression);
+    }
+
+    /// Absent means "engine default" for all three, so upgrading the pin does
+    /// not change what an existing profile asks for.
+    #[test]
+    fn media_profile_echo_tuning_defaults_off() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        echo_cancellation: true\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.echo_delay_search_ms.is_none());
+        assert!(!offer.echo_long_tail);
+        assert!(!offer.echo_residual_suppression);
+    }
+
+    /// Out of range is refused at load. The engine refuses it too, but only per
+    /// offer — which is a node that boots healthy and then fails every call, so
+    /// the boot failure is the one worth having.
+    #[test]
+    fn rejects_media_profile_echo_delay_search_out_of_range() {
+        for window in ["15", "1001"] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!(
+                    "      offer:\n        echo_cancellation: true\n        \
+                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                ),
+            );
+            let error = Config::from_str(&yaml)
+                .expect_err("a window outside 16-1000 ms must be refused at load");
+            assert!(
+                error.to_string().contains("echo_delay_search_ms"),
+                "error should name the field: {error}"
+            );
+        }
+    }
+
+    /// The bounds themselves are accepted — the check is inclusive, so a config
+    /// sitting exactly on 16 or 1000 is not refused by an off-by-one.
+    #[test]
+    fn accepts_media_profile_echo_delay_search_at_the_bounds() {
+        for window in ["16", "1000"] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!(
+                    "      offer:\n        echo_cancellation: true\n        \
+                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                ),
+            );
+            Config::from_str(&yaml).expect("the range bounds must be accepted");
+        }
+    }
+
+    /// All three are native siphon-rtp extensions with no NG or rtpproxy
+    /// equivalent, so a profile that sets them on those backends is refused
+    /// rather than silently ignored by an engine that never sees them.
+    #[test]
+    fn rejects_echo_tuning_on_backends_that_cannot_express_it() {
+        for backend in [RTPENGINE_BACKEND, RTPPROXY_BACKEND] {
+            for (field, value) in [
+                ("echo_delay_search_ms", "600"),
+                ("echo_long_tail", "true"),
+                ("echo_residual_suppression", "true"),
+            ] {
+                let yaml = ws_profile_yaml(
+                    backend,
+                    &format!("      offer:\n        {field}: {value}\n      answer: {{}}\n"),
+                );
+                let error = Config::from_str(&yaml)
+                    .expect_err("a native-only field must be refused on this backend");
+                assert!(
+                    error.to_string().contains(field),
+                    "error should name {field}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

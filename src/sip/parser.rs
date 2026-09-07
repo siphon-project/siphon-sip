@@ -2,7 +2,7 @@
 
 use crate::sip::headers::SipHeaders;
 use crate::sip::message::*;
-use crate::sip::uri::SipUri;
+use crate::sip::uri::{Scheme, SipUri};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while, take_while1},
@@ -313,7 +313,11 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     }
 
     let (input, scheme) = alt((tag("sip:"), tag("sips:"))).parse(input)?;
-    let scheme = scheme.trim_end_matches(':').to_string();
+    let scheme = if scheme == "sips:" {
+        Scheme::Sips
+    } else {
+        Scheme::Sip
+    };
 
     // Parse user part (optional).
     // Per RFC 3261 §19.1.1, userinfo includes user-params (e.g. ;phone-context=)
@@ -376,18 +380,19 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     let (input, headers) = opt(preceded(char('?'), parse_uri_headers)).parse(input)?;
     let headers = headers.unwrap_or_default();
 
-    Ok((
-        input,
-        SipUri {
-            scheme,
-            user: user.map(|s| s.to_string()),
-            host: host_str.to_string(),
-            port,
-            params,
-            headers,
-            user_params,
-        },
-    ))
+    let mut uri = SipUri {
+        scheme,
+        user: user.map(|s| s.to_string()),
+        host: host_str.to_string(),
+        port,
+        params,
+        extras: None,
+    };
+    // Allocates only when the URI actually carries one of them, which on a live
+    // network is close to never.
+    uri.set_extras(headers, user_params);
+
+    Ok((input, uri))
 }
 
 /// Parse tel: URI (RFC 3966): tel:+1234567890;phone-context=example.com
@@ -415,13 +420,12 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
     Ok((
         input,
         SipUri {
-            scheme: "tel".to_string(),
+            scheme: Scheme::Tel,
             user: Some(subscriber.to_string()),
             host,
             port: None,
             params,
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         },
     ))
 }
@@ -475,13 +479,12 @@ fn parse_absolute_uri(input: &str) -> IResult<&str, SipUri> {
     Ok((
         &rest[end..],
         SipUri {
-            scheme: scheme.to_string(),
+            scheme: Scheme::from_token(scheme),
             user: None,
             host: host.to_string(),
             port,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         },
     ))
 }
@@ -1022,8 +1025,8 @@ mod tests {
         assert_eq!(uri.user.as_deref(), Some("0017"));
         assert_eq!(uri.host, "ims.mnc090.mcc208.3gppnetwork.org");
         assert_eq!(
-            uri.user_params,
-            vec![(
+            uri.user_params(),
+            [(
                 "phone-context".to_string(),
                 Some("ims.mnc001.mcc206.3gppnetwork.org".to_string())
             )],
@@ -1094,7 +1097,7 @@ mod tests {
         let uri = parse_uri_standalone(input).expect("should parse");
         assert_eq!(uri.user.as_deref(), Some("alice"));
         assert_eq!(uri.host, "example.com");
-        assert!(uri.user_params.is_empty());
+        assert!(uri.user_params().is_empty());
         assert!(uri.params.iter().any(|(n, _)| n == "transport"));
     }
 
