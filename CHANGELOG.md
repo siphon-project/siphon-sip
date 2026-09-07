@@ -143,6 +143,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **B2BUA B-leg event receivers are now reaped with their call.** This was the
+  one call-lifetime store in the orphan sweep with no backstop: every teardown
+  path removes it, but a call whose teardown never reached the dispatcher — and
+  which the sweep beside it already reaped — left its receiver behind for the
+  life of the process, holding a whole 64-slot channel of pending call events.
+  It also matters for liveness rather than only memory: the leg actors send on
+  that channel with an unbounded wait, so a full channel parks the actor until
+  something drops the receiver, and dropping it here is what guarantees the
+  actor is released. Reaped by asking whether the call still exists rather than
+  by age, so it catches an orphan from any cause.
 - **One stuck script event handler could take media control down for the whole
   process.** The background loops that deliver media and registration events to
   `@rtpengine.*` and `@registrar.on_change` / `@registrant.on_change` handlers
