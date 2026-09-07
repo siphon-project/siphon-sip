@@ -12,7 +12,7 @@ use siphon::b2bua::header_policy::{
     DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError, ResolvedPolicy, RewriteOp,
     Verb,
 };
-use siphon::b2bua::transfer::TransferState;
+use siphon::b2bua::transfer::{ReplacementOrigin, TransferState};
 use siphon::config::Config;
 use siphon::dialog::{Dialog, DialogId, DialogState, DialogStore};
 use siphon::registrar::Registrar;
@@ -2420,11 +2420,13 @@ fn refer_subscription_push_query_clear() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: false, // subscriber role (siphon-originated REFER)
+            origin: ReplacementOrigin::Refer,
             event_id: 4,
             notify_cseq: 4,
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
@@ -2538,11 +2540,13 @@ fn transfer_referrer_bye_is_recognised_and_flags_the_subscription() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: true,
+            origin: ReplacementOrigin::Refer,
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
@@ -2572,11 +2576,13 @@ fn transfer_referrer_bye_is_idempotent_for_retransmissions() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: true,
+            origin: ReplacementOrigin::Refer,
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
@@ -2615,11 +2621,13 @@ fn surviving_party_bye_during_transfer_still_tears_the_call_down() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: true,
+            origin: ReplacementOrigin::Refer,
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
@@ -2654,11 +2662,13 @@ fn originated_refer_subscription_never_flags_referrer_gone() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: false,
+            origin: ReplacementOrigin::Refer,
             event_id: 3,
             notify_cseq: 3,
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
@@ -2753,15 +2763,111 @@ fn refer_notifier_subscription_is_not_a_subscriber_one() {
         ReferSubscription {
             on_a_leg: true,
             siphon_notifies: true,
+            origin: ReplacementOrigin::Refer,
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            deadline: None,
             media_profile: None,
         },
     );
     assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+}
+
+fn siphon_initiated(target: &str, deadline: Option<std::time::Instant>) -> ReferSubscription {
+    ReferSubscription {
+        on_a_leg: false,
+        siphon_notifies: true,
+        origin: ReplacementOrigin::SiphonInitiated,
+        // No REFER, so no CSeq to echo. Nothing on this path reads it.
+        event_id: 0,
+        notify_cseq: 0,
+        state: TransferState::Trying,
+        target_leg_call_id: Some(target.to_string()),
+        referrer_gone: false,
+        deadline,
+        media_profile: None,
+    }
+}
+
+#[test]
+fn a_siphon_initiated_replacement_owes_no_notify_but_still_owes_the_bye() {
+    // The split the origin discriminator exists for. Both terminal paths used
+    // to derive "is a NOTIFY owed" and "is a BYE owed" from `referrer_gone`
+    // alone, which has no value that is right here: suppressing the NOTIFY that
+    // way would also drop the BYE for a leg that is still up, and allowing the
+    // BYE that way would send a terminated-subscription sipfrag, carrying a
+    // fabricated event id, to a peer that never subscribed.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("replace@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    store.push_refer_subscription(&call_id, siphon_initiated("target@test", None));
+
+    let call = store.get_call(&call_id).unwrap();
+    let subscription = call.refer_subscriptions.first().expect("recorded");
+    assert!(!subscription.origin.notifies_referrer());
+    // It is still a notifier-role record: it dialed a leg and owns the
+    // promotion, which is what the response path matches on.
+    assert!(subscription.siphon_notifies);
+    assert_eq!(
+        subscription.target_leg_call_id.as_deref(),
+        Some("target@test")
+    );
+    // And it is not a subscriber subscription, so an inbound NOTIFY on this
+    // call is not absorbed as if siphon had sent a REFER.
+    assert!(!store.has_subscriber_refer_subscription(&call_id, false));
+}
+
+#[test]
+fn the_replaced_party_hanging_up_flags_a_siphon_initiated_replacement_too() {
+    // `mark_transfer_referrer_gone` keys on the notifier role, not on a REFER
+    // having arrived, so it covers this origin as well — and it has to: the leg
+    // being replaced hanging up mid-replacement is exactly the case where the
+    // completion path must skip the BYE it would otherwise send to a dialog
+    // that is already gone.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("replace-race@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    store.push_refer_subscription(&call_id, siphon_initiated("target@test", None));
+
+    // The replaced side here is the B-leg (`on_a_leg: false`).
+    assert!(!store.mark_transfer_referrer_gone(&call_id, true));
+    assert!(store.mark_transfer_referrer_gone(&call_id, false));
+    assert!(store.transfer_referrer_gone(&call_id, false));
+}
+
+#[test]
+fn replacement_records_drain_to_baseline() {
+    // Per-call state that is not released is the leak this class of store is
+    // most prone to: one entry per replacement, on a call that outlives it.
+    // Both terminal paths clear on the replaced leg, so a batch of completed
+    // replacements must return the vector to where it started.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("drain@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let baseline = store
+        .get_call(&call_id)
+        .map(|call| call.refer_subscriptions.len())
+        .unwrap();
+    assert_eq!(baseline, 0);
+
+    for index in 0..25 {
+        store.push_refer_subscription(&call_id, siphon_initiated(&format!("t{index}@test"), None));
+        store.clear_refer_subscriptions_on_leg(&call_id, false);
+    }
+
+    assert_eq!(
+        store
+            .get_call(&call_id)
+            .map(|call| call.refer_subscriptions.len()),
+        Some(baseline)
+    );
 }
 
 #[test]

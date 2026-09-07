@@ -545,6 +545,65 @@ impl Call {
         })
     }
 
+    /// Replace one leg of this answered call with a freshly dialed target,
+    /// with no REFER involved.
+    ///
+    /// The transfer siphon already runs for a REFER it terminates, reachable
+    /// because *this app* decided: an IVR that has worked out where the caller
+    /// should go, a controller handing a call from an AI to a human, a
+    /// supervisor take-over. siphon dials `target` as a new leg on the same
+    /// call, re-anchors the surviving party's media onto it, and once the
+    /// target answers promotes it into the surviving pair and BYEs the leg it
+    /// replaced.
+    ///
+    /// The replaced leg **stays up while the target rings**, so the surviving
+    /// party hears ringback rather than silence, and a target that refuses or
+    /// never answers leaves the call exactly as it was.
+    ///
+    /// `replace_a_leg` picks the direction: `False` (default) replaces the
+    /// callee and keeps the caller, `True` does the reverse. `profile` names the
+    /// media profile for the pair this creates — required when the call is
+    /// anchored with a direction-bound one, whose answer half describes the
+    /// party that is leaving. `timeout` bounds the ring in seconds (`0` = no
+    /// ring policy, only siphon's guard against a target that answers nothing).
+    ///
+    /// Returns as soon as the INVITE is on the wire
+    /// (`{"channel", "replacement": "dialing", "target"}`) and says nothing
+    /// about the target. Wait for the `PeerReplaced` / `ReplaceFailed` event
+    /// for the outcome — acting on the reply alone would tear down a call whose
+    /// replacement is still ringing.
+    ///
+    /// Raises `ControlError` with `code == "not_found"` (no such call),
+    /// `"invalid_state"` (not answered, no peer leg, or a replacement already
+    /// in flight — all worth retrying later), or `"bad_request"` (the target
+    /// will not parse or route).
+    #[pyo3(signature = (target, next_hop=None, replace_a_leg=None, profile=None, timeout=None))]
+    fn replace_peer<'py>(
+        &self,
+        py: Python<'py>,
+        target: String,
+        next_hop: Option<String>,
+        replace_a_leg: Option<bool>,
+        profile: Option<String>,
+        timeout: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = call
+                .replace_peer(
+                    &target,
+                    next_hop.as_deref(),
+                    replace_a_leg,
+                    profile.as_deref(),
+                    timeout,
+                )
+                .await
+                .map_err(to_pyerr)?;
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
+        })
+    }
+
     /// Un-park this controlled call and dial the B-leg via siphon's LCR
     /// sequential-failover engine, returning control to siphon.
     ///

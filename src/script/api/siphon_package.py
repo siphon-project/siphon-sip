@@ -395,6 +395,71 @@ class _B2buaNamespace:
             return False
         return control.refer(call_id, target, replaces)
 
+    def replace_peer(
+        self,
+        call_id,
+        target,
+        next_hop=None,
+        replace_a_leg=False,
+        profile=None,
+        timeout=30,
+    ):
+        """Replace one leg of an answered call with a freshly dialed target.
+
+        The transfer siphon already knows how to run, reachable without a remote
+        party asking for it: it dials ``target`` as a new leg on the same call,
+        re-anchors the surviving party's media onto it, and when the target
+        answers promotes it into the surviving pair and BYEs the leg it
+        replaced. An IVR that has decided where a caller goes next, a controller
+        handing a call from an AI to a human, a supervisor take-over.
+
+        The replaced leg **stays up while the target rings** and is released only
+        once the target answers, so the surviving party hears ringback rather
+        than silence, and a target that rejects or never answers leaves the
+        original call exactly as it was.
+
+        Acts now, so it works from an out-of-band event callback
+        (``@rtpengine.on_dtmf``), a timer, or a normal handler.
+
+        Args:
+            call_id: SIP Call-ID of the call to act on.
+            target: URI to dial as the replacement.
+            next_hop: steer egress without reshaping the R-URI, as on
+                ``call.dial()``.
+            replace_a_leg: False (default) replaces the callee and keeps the
+                caller; True does the reverse.
+            profile: media profile for the pair this creates. Required when the
+                call is anchored with a direction-bound profile — the inherited
+                one describes the party that is leaving.
+            timeout: seconds to wait for the target to answer. 0 means no ring
+                policy, only siphon's guard against a target that never answers.
+
+        Returns:
+            bool: True once the INVITE is on the wire. It does not wait for the
+            target — the replacement completes later, and ``@b2bua.on_bye``
+            fires for the leg that was replaced.
+
+        Raises:
+            ValueError: the call is unknown, has not answered, has no peer leg
+                to replace, already has a replacement in flight, or the target
+                will not route. The message is prefixed with the stable cause
+                token (``not_found``, ``invalid_state``, ``bad_request``,
+                ``unavailable``).
+
+        Usage:
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "0":
+                    b2bua.replace_peer(call_id, "sip:operator@pbx.example",
+                                       timeout=45)
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.replace_peer requires a running siphon B2BUA")
+        return control.replace_peer(
+            call_id, target, next_hop, replace_a_leg, profile, timeout
+        )
+
     @staticmethod
     def on_invite(fn):
         """Register handler for new INVITE (new call)."""

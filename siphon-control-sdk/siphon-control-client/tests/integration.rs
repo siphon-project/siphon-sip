@@ -152,6 +152,21 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
                 )
                 .await;
             }
+            "replace_peer" => {
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "channel": frame["target"]["channel"],
+                        "replacement": "dialing",
+                        "target": frame["args"]["target"],
+                        // Echoed back so the test can assert the client put the
+                        // optional arguments on the wire under their wire names.
+                        "echo_args": frame["args"],
+                    }),
+                )
+                .await;
+            }
             "unbridge" => {
                 send_ok(
                     &mut socket,
@@ -339,6 +354,37 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
         .expect("unbridge ok");
     assert_eq!(unbridged["state"], "unbridged");
     assert_eq!(unbridged["reason"], "agent hung up");
+
+    // replace_peer carries every optional argument under its wire name, and
+    // resolves on the accept — the outcome is an event, not this reply.
+    let replacing = call
+        .replace_peer(
+            "sip:operator@pbx.example",
+            Some("sip:10.0.0.9:5060"),
+            Some(true),
+            Some("ims_to_trunk"),
+            Some(45),
+        )
+        .await
+        .expect("replace_peer ok");
+    assert_eq!(replacing["replacement"], "dialing");
+    assert_eq!(replacing["target"], "sip:operator@pbx.example");
+    let sent = &replacing["echo_args"];
+    assert_eq!(sent["target"], "sip:operator@pbx.example");
+    assert_eq!(sent["next_hop"], "sip:10.0.0.9:5060");
+    assert_eq!(sent["replace_a_leg"], true);
+    assert_eq!(sent["profile"], "ims_to_trunk");
+    assert_eq!(sent["timeout"], 45);
+
+    // Omitted options are absent rather than sent as null, so the server's own
+    // defaults apply instead of being overwritten with nothing.
+    let minimal = call
+        .replace_peer("sip:agent@pbx.example", None, None, None, None)
+        .await
+        .expect("replace_peer minimal ok");
+    let sent = &minimal["echo_args"];
+    assert!(sent.get("next_hop").is_none(), "next_hop leaked: {sent}");
+    assert!(sent.get("timeout").is_none(), "timeout leaked: {sent}");
 
     // A backend-gated verb (ws_tee is siphon-rtp-only) surfaces the server's
     // unsupported_verb as a typed error.

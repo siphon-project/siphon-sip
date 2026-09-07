@@ -83,6 +83,46 @@ than returning a hollow success. The out-of-process twin is the control plane's
 
 ::: siphon_sdk.mock_module.MockB2bua.unbridge
 
+## Swapping a party mid-call: `b2bua.replace_peer`
+
+`bridge` joins two calls the script owns. `replace_peer` does something
+different: it takes one answered call and swaps out one of its two parties for
+somebody new, without either party's endpoint asking for it.
+
+This is the transfer siphon already runs when it terminates an inbound REFER
+(`call.accept_refer(mode="terminate")`), reachable when *siphon* is the one
+deciding. It dials the target as a new leg on the same call, re-anchors the
+surviving party's media onto it, and once the target answers promotes it into
+the surviving pair and BYEs the leg it replaced. An IVR that has worked out
+where the caller should go, a supervisor take-over, a controller handing a call
+from an AI to a human.
+
+The obvious hand-rolled version — hang up one leg, then re-INVITE the other with
+new SDP — is worse in two ways that only show up in production. The caller hears
+dead air for the whole ring, because the leg is gone before the target has even
+been dialled. And the call's own state is left behind: no `@b2bua.on_bye`, no
+CDR, no charging stop, no media release, and a later `terminate` re-BYEs a
+dialog that is already dead. `replace_peer` keeps the replaced leg up until the
+target answers and releases it through the real teardown.
+
+```python
+from siphon import b2bua, rtpengine
+
+@rtpengine.on_dtmf
+def zero_for_an_operator(call_id, from_tag, digit, duration_ms, volume):
+    if digit == "0":
+        # The caller stays connected to the IVR while the operator's phone
+        # rings; if nobody picks up in 45s the call is left exactly as it was.
+        b2bua.replace_peer(call_id, "sip:operator@pbx.example", timeout=45)
+```
+
+Every refusal raises `ValueError` prefixed with a stable cause token — a caller
+that cannot tell a refused replacement from a started one will tear down a call
+that is still up. The out-of-process twin is the control plane's
+[`replace_peer` verb](control-plane.md#swapping-a-party-replace_peer).
+
+::: siphon_sdk.mock_module.MockB2bua.replace_peer
+
 ## Logging the outbound leg: `b2bua.log_dial`
 
 A B2BUA call says nothing at `log.level: info` about where it dialled. The

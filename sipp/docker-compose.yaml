@@ -1555,6 +1555,7 @@ services:
       - b2bua-refer-terminate-busy
       - b2bua-refer-referrer-bye
       - b2bua-refer-attended
+      - b2bua-replace-peer
       - b2bua-refer-outbound
 
   sipp-b2bua-refer-modes-register:
@@ -1588,6 +1589,7 @@ services:
       - b2bua-refer-terminate-busy
       - b2bua-refer-referrer-bye
       - b2bua-refer-attended
+      - b2bua-replace-peer
       - b2bua-refer-outbound
 
   sipp-b2bua-refer-reject-uas:
@@ -1719,6 +1721,89 @@ services:
       - -trace_err
     profiles:
       - b2bua-refer-terminate
+
+  # --- replace_peer: siphon swaps the callee, with no REFER anywhere ---
+  # alice survives, bob is the party being replaced, carol the replacement. The
+  # script arms it from a timer off an X-Replace-Peer header on alice's INVITE.
+  # What this pins that no unit test can: bob is still up while carol rings, and
+  # alice's media is re-pointed only after carol answers.
+
+  sipp-b2bua-replace-peer-bob-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-refer-modes-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_replace_peer_bob_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -trace_err
+    profiles:
+      - b2bua-replace-peer
+
+  sipp-b2bua-replace-peer-carol-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.54
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_replace_peer_carol_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -trace_err
+    profiles:
+      - b2bua-replace-peer
+
+  sipp-b2bua-replace-peer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+      sipp-b2bua-replace-peer-bob-uas:
+        condition: service_started
+      sipp-b2bua-replace-peer-carol-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_replace_peer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -trace_err
+    profiles:
+      - b2bua-replace-peer
 
   # --- REFER terminate, referrer hangs up mid-transfer (RFC 5589 §7) ---
   # The Teams blind-transfer ordering: alice REFERs, then BYEs her own dialog

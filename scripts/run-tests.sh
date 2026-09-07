@@ -523,6 +523,14 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate down 2>/dev/null || true
 
+  # No REFER anywhere: siphon replaces the callee because the script said so.
+  # The ordering is the point — bob is still up while carol rings, and alice is
+  # re-INVITEd only once carol answers, so the caller never hears dead air.
+  echo "=== B2BUA replace_peer test (siphon swaps a party, no REFER on the wire) ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replace-peer up -d --wait siphon-b2bua-refer-modes
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-replace-peer up --abort-on-container-exit --exit-code-from sipp-b2bua-replace-peer-uac sipp-b2bua-replace-peer-uac sipp-b2bua-replace-peer-bob-uas sipp-b2bua-replace-peer-carol-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replace-peer down 2>/dev/null || true
+
   # siphon-originated REFER from @b2bua.on_answer. Caught a real ordering bug
   # the first time it ran: the deferred call.refer() went out before the A-leg
   # 2xx, so the caller saw an in-dialog REFER for an unconfirmed dialog.

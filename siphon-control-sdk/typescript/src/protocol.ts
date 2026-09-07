@@ -190,6 +190,7 @@ export const SipVerb = {
   RejectRefer: "reject_refer",
   Bridge: "bridge",
   Unbridge: "unbridge",
+  ReplacePeer: "replace_peer",
   Play: "play",
   Stop: "stop",
   Dtmf: "dtmf",
@@ -217,6 +218,8 @@ export type SipEventKind =
   | "ChannelBridged"
   | "BridgeFailed"
   | "ChannelUnbridged"
+  | "PeerReplaced"
+  | "ReplaceFailed"
   | "PlayFinished"
   | "WsTeeStarted"
   | "WsTeeEnded"
@@ -435,6 +438,49 @@ export interface ChannelUnbridgedPayload {
   peer_sip_call_id: string;
   /** The reason the `unbridge` carried (default `"unbridged"`). */
   reason: string;
+}
+
+/**
+ * The `payload` of a `PeerReplaced` event — a leg replacement completed.
+ *
+ * The target answered, was promoted into the surviving pair, and the leg it
+ * replaced was released. The `replace_peer` reply reported only that the INVITE
+ * had left the box; this is when the call actually changed shape.
+ */
+export interface PeerReplacedPayload {
+  /** The SIP `Call-ID` of the leg that took the replaced party's place. */
+  target_sip_call_id: string;
+  /**
+   * Whether the replaced leg was actually BYE'd. `false` when it had already
+   * hung up while the target was still ringing — the replacement completed
+   * regardless, there was simply nothing left to release.
+   */
+  replaced_leg_released: boolean;
+  /**
+   * `"refer"` when a remote party asked for this (an inbound REFER siphon
+   * terminated), `"siphon"` when a script or a controller decided.
+   */
+  origin: string;
+}
+
+/**
+ * The `payload` of a `ReplaceFailed` event — a leg replacement did not happen.
+ *
+ * Branch on `call_kept`: normally the original call is intact and still has
+ * both its parties, so another target can be tried on the same channel. It is
+ * `false` only when the leg being replaced had already hung up, which leaves
+ * the survivor with nobody and the call released.
+ */
+export interface ReplaceFailedPayload {
+  /**
+   * The SIP status the target refused with, or `408` when it never answered at
+   * all and the replacement timed out.
+   */
+  status: number;
+  /** Whether the original call survives. */
+  call_kept: boolean;
+  /** `"refer"` or `"siphon"`, as on {@link PeerReplacedPayload}. */
+  origin: string;
 }
 
 /**

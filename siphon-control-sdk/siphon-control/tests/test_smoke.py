@@ -369,6 +369,17 @@ def test_media_header_refer_verbs_roundtrip():
                 await call.bridge("ch3")
                 await call.unbridge("supervisor took over")
                 await call.unbridge()
+                # replace_peer: every optional argument reaches the wire
+                # under its wire name, and omitted ones stay off it so the
+                # server's defaults apply rather than being nulled out.
+                await call.replace_peer(
+                    "sip:operator@pbx",
+                    next_hop="sip:sbc",
+                    replace_a_leg=True,
+                    profile="ims_to_trunk",
+                    timeout=45,
+                )
+                await call.replace_peer("sip:agent@pbx")
                 # A policy the server would refuse is refused locally instead,
                 # before anything touches the two live calls.
                 with pytest.raises(ValueError):
@@ -413,6 +424,17 @@ def test_media_header_refer_verbs_roundtrip():
             unbridge_args = [f["args"] for f in recorded if f["verb"] == "unbridge"]
             assert unbridge_args[0] == {"reason": "supervisor took over"}
             assert unbridge_args[1] == {}
+            replace_args = [
+                f["args"] for f in recorded if f["verb"] == "replace_peer"
+            ]
+            assert replace_args[0] == {
+                "target": "sip:operator@pbx",
+                "next_hop": "sip:sbc",
+                "replace_a_leg": True,
+                "profile": "ims_to_trunk",
+                "timeout": 45,
+            }
+            assert replace_args[1] == {"target": "sip:agent@pbx"}
             for frame in recorded:
                 assert frame["module"] == "sip"
                 assert frame["target"]["channel"] == "ch1"

@@ -502,6 +502,57 @@ export class Call {
     return this.sip(SipVerb.Unbridge, reason !== undefined ? { reason } : {});
   }
 
+  /**
+   * Replace one leg of this answered call with a freshly dialed target, with no
+   * REFER involved.
+   *
+   * The transfer siphon already runs for a REFER it terminates, reachable
+   * because *this app* decided: an IVR that has worked out where the caller
+   * should go, a controller handing a call from an AI to a human, a supervisor
+   * take-over. siphon dials `target` as a new leg on the same call, re-anchors
+   * the surviving party's media onto it, and once the target answers promotes
+   * it into the surviving pair and BYEs the leg it replaced.
+   *
+   * The replaced leg **stays up while the target rings**, so the surviving
+   * party hears ringback rather than silence, and a target that refuses or
+   * never answers leaves the call exactly as it was.
+   *
+   * `replaceALeg` picks the direction: omitted/`false` replaces the callee and
+   * keeps the caller, `true` does the reverse. `profile` names the media
+   * profile for the pair this creates — required when the call is anchored with
+   * a direction-bound one, whose answer half describes the party that is
+   * leaving. `timeout` bounds the ring in seconds (`0` = no ring policy, only
+   * siphon's guard against a target that answers nothing).
+   *
+   * Resolves as soon as the INVITE is on the wire
+   * (`{channel, replacement: "dialing", target}`) and says nothing about the
+   * target. Wait for the `PeerReplaced`
+   * ({@link import("./protocol").PeerReplacedPayload}) or `ReplaceFailed`
+   * ({@link import("./protocol").ReplaceFailedPayload}) event for the outcome —
+   * acting on the reply alone would tear down a call whose replacement is still
+   * ringing.
+   *
+   * Rejects with `code === "not_found"` (no such call), `"invalid_state"` (not
+   * answered, no peer leg, or a replacement already in flight — all worth
+   * retrying later) or `"bad_request"` (the target will not parse or route).
+   */
+  async replacePeer(
+    target: string,
+    options: {
+      nextHop?: string;
+      replaceALeg?: boolean;
+      profile?: string;
+      timeout?: number;
+    } = {},
+  ): Promise<unknown> {
+    const args: Record<string, unknown> = { target };
+    if (options.nextHop !== undefined) args.next_hop = options.nextHop;
+    if (options.replaceALeg !== undefined) args.replace_a_leg = options.replaceALeg;
+    if (options.profile !== undefined) args.profile = options.profile;
+    if (options.timeout !== undefined) args.timeout = options.timeout;
+    return this.sip(SipVerb.ReplacePeer, args);
+  }
+
   /** Set a header on the stored A-leg INVITE. */
   async setHeader(name: string, value: string): Promise<void> {
     await this.sip(SipVerb.SetHeader, { name, value });

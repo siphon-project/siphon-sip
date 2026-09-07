@@ -861,6 +861,32 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate rm -sf sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas 2>/dev/null || true
 
+      # The same dial / promote / BYE round with no REFER anywhere: the script
+      # arms it from a timer, so nothing on the wire asks for the transfer.
+      # Graded per leg rather than on the UAC alone, for the reason the busy
+      # step below spells out — a replacement that never happened still lets
+      # alice complete her scenario, and lands the damage on bob (never
+      # released) and carol (never dialled).
+      - name: B2BUA replace_peer (siphon swaps a party, replaced leg held until the target answers)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replace-peer up \
+            sipp-b2bua-replace-peer-uac \
+            sipp-b2bua-replace-peer-bob-uas \
+            sipp-b2bua-replace-peer-carol-uas
+          status=0
+          for service in uac bob-uas carol-uas; do
+            code=$(docker compose -f sipp/docker-compose.yaml --profile b2bua-replace-peer \
+              ps -a --format '{{.Service}} {{.ExitCode}}' \
+              | awk -v s="sipp-b2bua-replace-peer-$service" '$1 == s { print $2 }')
+            echo "sipp-b2bua-replace-peer-$service exit=$code"
+            if [ "$code" != "0" ]; then status=1; fi
+          done
+          exit $status
+
+      - name: Cleanup replace-peer containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-replace-peer rm -sf sipp-b2bua-replace-peer-uac sipp-b2bua-replace-peer-bob-uas sipp-b2bua-replace-peer-carol-uas 2>/dev/null || true
+
       # Graded per leg for the same reason as the referrer-BYE step below: on a
       # FAILED transfer the referrer and the surviving leg both complete their
       # scenarios cleanly, and the whole of the damage lands on the transfer

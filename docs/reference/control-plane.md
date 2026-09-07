@@ -228,6 +228,7 @@ chunk, so logs join Homer and billing with no mapping table.
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
 | `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
+| `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -543,6 +544,69 @@ control-owned leg, bridged or not.
 
 In-process, the same primitives are
 [`b2bua.bridge(...)` / `b2bua.unbridge(...)`](call.md#joining-two-calls-b2buabridge).
+
+## Swapping a party: `replace_peer`
+
+`bridge` joins two calls the app owns. `replace_peer` swaps one party of a single
+answered call for somebody new, with no REFER anywhere — the app decides, the way
+an IVR decides where a caller goes next, or a controller hands a call from an AI
+to a human.
+
+siphon has always been able to do this; it was reachable only when a remote
+endpoint asked, by sending a REFER that siphon terminated. The verb runs that
+same machinery on the app's say-so: dial the target as a new leg on the call,
+re-anchor the surviving party's media onto it, and when the target answers
+promote it into the surviving pair and BYE the leg it replaced.
+
+```jsonc
+{"type":"command","id":"c9","module":"sip","verb":"replace_peer",
+ "target":{"channel":"ch1"},
+ "args":{"target":"sip:operator@pbx.example","timeout":45}}
+```
+
+**The replaced leg stays up while the target rings.** It is released only once
+the target answers, so the surviving party hears ringback instead of dead air,
+and a target that refuses or never answers leaves the call exactly as it was.
+This is the whole reason to use the verb rather than a `hangup` followed by a
+re-INVITE: that sequence silences the caller for the length of the ring, and it
+leaves the call's own state behind — no `on_bye`, no CDR, no charging stop, no
+media release.
+
+`replace_a_leg` picks the direction. Omitted or `false` replaces the callee and
+keeps the caller; `true` does the reverse. `profile` names the media profile for
+the pair this creates, and is required when the call is anchored with a
+direction-bound one, whose answer half was written for the party that is
+leaving. `timeout` bounds the ring in seconds; `0` means no ring policy, leaving
+only siphon's own guard against a target that answers nothing at all.
+
+**The reply is the local action, not the outcome** — `{channel, replacement:
+"dialing", target}`, which means the INVITE is on the wire and nothing more. An
+app that acts on it alone will tear down a call whose replacement is still
+ringing. The verdict arrives as an event:
+
+| event | payload | when |
+|---|---|---|
+| `PeerReplaced` | `{target_sip_call_id, replaced_leg_released, origin}` | the target answered, was promoted into the pair, and the replaced leg was released |
+| `ReplaceFailed` | `{status, call_kept, origin}` | the target refused, or never answered (`status: 408`) |
+
+Branch on `ReplaceFailed.call_kept`: normally the original call is intact and
+still has both parties, so another target can be tried on the same channel. It
+is `false` only when the leg being replaced had already hung up while the target
+was ringing, which leaves the survivor with nobody and the call released.
+`origin` is `"siphon"` for this verb and `"refer"` when the same events describe
+a REFER-driven transfer.
+
+Refusals are typed the same way as `bridge`'s:
+
+| code | when |
+|---|---|
+| `bad_request` | no `args.target`, a target or `next_hop` that will not parse, a nonsense `timeout`, or a target siphon cannot route to |
+| `not_found` | no such channel, or the call is already gone |
+| `invalid_state` | the call has not answered, has no peer leg to replace, or already has a replacement in flight — all worth retrying later |
+| `unavailable` | the B2BUA is not running |
+
+In-process, the same primitive is
+[`b2bua.replace_peer(...)`](call.md#swapping-a-party-mid-call-b2buareplace_peer).
 
 An **outbound REFER** — the `refer` verb, where the app asks siphon to transfer a
 call — reports its far-end verdict as events, never in the command reply. The
