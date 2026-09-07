@@ -144,6 +144,12 @@ pub struct SiphonMetrics {
     pub memory_retained_bytes: IntGauge,
     /// Total mapped bytes (`stats.mapped`).
     pub memory_mapped_bytes: IntGauge,
+    /// Allocator bookkeeping — arena headers, extent structures, bin metadata
+    /// (`stats.metadata`).  Scales with arena count, which jemalloc defaults to
+    /// `4 x ncpus`, so on a many-core box this is the part of RSS that is
+    /// neither live data nor retained pages and is the one to read before
+    /// reaching for `narenas`.
+    pub memory_metadata_bytes: IntGauge,
     /// Currently-allocated CPython memory blocks (`sys.getallocatedblocks()`).
     /// Python objects use CPython's own allocator (mimalloc on free-threaded
     /// builds), NOT jemalloc — so this is the leak signal for the *Python* side
@@ -436,6 +442,10 @@ impl SiphonMetrics {
             "siphon_memory_mapped_bytes",
             "Total mapped bytes (jemalloc stats.mapped)",
         )?;
+        let memory_metadata_bytes = IntGauge::new(
+            "siphon_memory_metadata_bytes",
+            "Allocator bookkeeping: arena headers, extents, bin metadata (jemalloc stats.metadata)",
+        )?;
         let python_allocated_blocks = IntGauge::new(
             "siphon_python_allocated_blocks",
             "Currently-allocated CPython memory blocks (sys.getallocatedblocks) — the Python-side leak signal",
@@ -712,6 +722,7 @@ impl SiphonMetrics {
         registry.register(Box::new(memory_active_bytes.clone()))?;
         registry.register(Box::new(memory_retained_bytes.clone()))?;
         registry.register(Box::new(memory_mapped_bytes.clone()))?;
+        registry.register(Box::new(memory_metadata_bytes.clone()))?;
         registry.register(Box::new(python_allocated_blocks.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
@@ -776,6 +787,7 @@ impl SiphonMetrics {
             memory_active_bytes,
             memory_retained_bytes,
             memory_mapped_bytes,
+            memory_metadata_bytes,
             python_allocated_blocks,
             script_executions_total,
             script_errors_total,
@@ -909,6 +921,9 @@ pub fn update_memory_stats() {
     }
     if let Ok(value) = tikv_jemalloc_ctl::stats::mapped::read() {
         metrics.memory_mapped_bytes.set(value as i64);
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::metadata::read() {
+        metrics.memory_metadata_bytes.set(value as i64);
     }
 }
 
@@ -1098,6 +1113,27 @@ mod tests {
             &output[..output.len().min(500)]
         );
         assert!(output.contains("siphon_registrations_active"));
+    }
+
+    /// Every jemalloc statistic siphon reads has to reach `/metrics`, or the
+    /// operator is asked to reason about resident memory from a subset of the
+    /// allocator's own numbers. `metadata` is the one that was missing:
+    /// `resident - allocated - retained` is otherwise unattributed, and it is
+    /// the arena-count term.
+    #[test]
+    fn every_jemalloc_stat_is_exported() {
+        init().unwrap();
+        let output = encode_metrics();
+        for gauge in [
+            "siphon_memory_allocated_bytes",
+            "siphon_memory_resident_bytes",
+            "siphon_memory_active_bytes",
+            "siphon_memory_retained_bytes",
+            "siphon_memory_mapped_bytes",
+            "siphon_memory_metadata_bytes",
+        ] {
+            assert!(output.contains(gauge), "{gauge} missing from /metrics");
+        }
     }
 
     #[test]

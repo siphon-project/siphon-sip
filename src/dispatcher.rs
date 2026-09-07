@@ -3150,7 +3150,7 @@ async fn send_liveness_network_dereg(context: &LivenessDeregCtx, aor: &str, cont
             return;
         }
     };
-    let scheme = if route_uri.scheme == "sips" {
+    let scheme = if route_uri.scheme.is_sips() {
         "sips"
     } else {
         "sip"
@@ -8230,7 +8230,7 @@ fn resolve_candidates_inner(
             tokio::runtime::Handle::current().block_on(resolver.resolve(
                 &uri.host,
                 uri.port,
-                &uri.scheme,
+                uri.scheme.as_str(),
                 transport_hint.as_deref(),
             ))
         });
@@ -8311,7 +8311,7 @@ fn resolve_tcp_path(
                 tokio::runtime::Handle::current().block_on(resolver.resolve(
                     &uri.host,
                     uri.port,
-                    &uri.scheme,
+                    uri.scheme.as_str(),
                     Some("tcp"),
                 ))
             });
@@ -30929,7 +30929,7 @@ mod tests {
                 None,
                 vec![],
                 crate::registrar::FlowCapture {
-                    flow_token: Some(format!("tok-{user}")),
+                    flow_token: Some(format!("tok-{user}").into_boxed_str()),
                     inbound_local_addr: None,
                     inbound_connection_id: Some(connection_id),
                 },

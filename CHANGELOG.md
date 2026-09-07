@@ -6,6 +6,117 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`siphon_memory_metadata_bytes`** — jemalloc's `stats.metadata`, the last of
+  the allocator's own numbers that siphon read but did not export. Without it
+  `resident - allocated - retained` is unattributed, and it is the term that
+  scales with **arena count** rather than with traffic: jemalloc defaults to
+  `4 x ncpus` arenas, which on a 24-core box is ~30 MB of bookkeeping before a
+  single call is handled. It appears on `/metrics` and in
+  `/admin/metrics.json` under `memory.metadata`, alongside the existing
+  allocated / active / resident / retained / mapped gauges.
+- **`scripts/registrar_scale_test.sh` + `sipp/register_unique_aor.xml`** — a
+  registrar *scale* measurement, the counterpart to
+  `scale_test.sh MODE=register`. That row measures how fast a REGISTER is
+  accepted; this one measures what it costs to hold the binding: register a
+  population of unique AoRs, settle, and report marginal bytes per binding over
+  an idle baseline taken from the same process. Two details make the number
+  mean something. It settles past **Timer J** (RFC 3261 §17.2.2, 64*T1 = 32 s)
+  and gates on the transaction store having drained, because a shorter settle
+  bills every completed REGISTER's retained server transaction to the bindings
+  and reads ~7.0 KB/binding where the true figure is ~0.85 KB. And it gates on
+  jemalloc `stats.allocated` (live bytes) rather than RSS, reporting resident
+  and RSS alongside as context — `allocated` reproduced within 0.5% across
+  interleaved runs here, which is what makes a sub-1% change legible at all.
+  `SIPHON_BIN=` points it at a prebuilt binary so an A/B can alternate two arms
+  without a rebuild between them.
+- **`tests/registrar_footprint_tests.rs`** — exact per-binding accounting, under
+  a counting global allocator in its own test binary. Where the SIPp harness
+  measures what a population costs the box, this measures what one binding *is*:
+  **526 bytes across 8 allocations**, deterministic rather than a settled RSS
+  reading, so it works as a regression gate. It also measures the **irreducible
+  floor** — the same AoR, contact URI and Call-ID in the cheapest container that
+  can still answer a lookup: **183 bytes across 3 allocations**. A binding is
+  therefore **2.9x its floor**, down from 3.5x. That ratio is published
+  deliberately: quoting a reduction without it makes the remaining gap
+  invisible, and the gap is the honest answer to how much further this can go.
+  Closing it needs a packed single-allocation representation, because the
+  remaining cost is `Contact` being one shape that serves residential SIP, IMS,
+  outbound registration and Path-token routing at once — no group of fields is
+  reliably absent across deployments, so boxing a "rare" group was measured and
+  rejected as a bad trade.
+- **`ControlClient.close()` / `ControlServer.close()`, and both classes as async
+  context managers** (`async with client: await client.run()`). Closing stops
+  the client and drops the handler, so teardown is deterministic instead of
+  leaving background tasks to be declined later by the guards above. The shipped
+  examples use it.
+- **`server.auto_options`** (default `true`) — set it to `false` and an OPTIONS
+  that no script handler claims is dropped silently rather than answered, so
+  siphon does not confirm its own existence to a probe nobody asked it to
+  answer. The drop is a real one: it reaps the server transaction and its
+  auto-100 timer, because leaving those armed emits RFC 4320 §4.2's synthesized
+  `100 Trying` and tells the scanner exactly what the setting was meant to
+  withhold. Scoped to OPTIONS — every other unhandled method still gets its
+  `405` + `Allow`.
+
+### Changed
+- **A plain registrar binding costs 641 -> 526 bytes of live data, across 9
+  allocations instead of 8.** A `Contact` is stored, compared and read, never
+  appended to, so `String`'s capacity word was 8 bytes per field carried for the
+  life of every contact in the table to describe growth that never happens;
+  `call_id`, `sip_instance`, `flow_token` and the RFC 3327 Path set are now
+  `Box<str>` / `Box<[Box<str>]>`. `Expires` is whole seconds (RFC 3261 §10.2.4),
+  so 12 of a `Duration`'s 16 bytes stored a nanosecond count that was always
+  zero; it is a `u32` of seconds. **The persisted form is unchanged** — the
+  Redis/PostgreSQL record still holds `String` and `Vec<String>` and the
+  conversion happens at that boundary, so a binding written by this version is
+  readable by the previous one and a rollback costs nothing.
+
+  `Contact` lands on **exactly 320 bytes, which is a jemalloc size class**. That
+  is the point rather than a coincidence: 328 and 352 both round up into the 384
+  class and would have bought nothing at all, so 8 bytes of struct is worth 64
+  bytes of resident memory per contact. The test asserts it in those terms.
+
+  Measured against the previous release over two interleaved arms at 200k
+  bindings: **jemalloc `allocated` 844 -> 723 bytes per binding (-14.3%)** and
+  **`resident` 1817 -> 1690 (-7.0%)**, the two arms of each figure inside 0.3%.
+  **No new dependency** — every one of these is `std`. Small-string crates were
+  considered and rejected: the same win is available from `Box<str>` and a
+  packed integer, and a dependency is a supply-chain decision, not a
+  convenience.
+- **A URI scheme is an enum, not a `String`.** `sip`, `sips` and `tel` cover
+  every URI siphon routes on, so the common case is now a discriminant instead
+  of a heap allocation; `Scheme::Other` keeps any other `absoluteURI` verbatim
+  in a `Box<str>` for the 416 Unsupported URI Scheme path (RFC 3261 §8.2.2,
+  RFC 4475 §3.3.2 / §3.3.3). The allocation was paid per URI, and a message
+  carries several — R-URI, From, To, Contact, every Route and Record-Route — so
+  it lands on the parse path on every message, and once per binding in the
+  registrar. Recognition is exact-match lowercase, mirroring the parser's own
+  `starts_with("sip:")` dispatch, so an oddly-cased scheme keeps its spelling
+  and every message still re-serialises byte-for-byte (RFC4475 torture and the
+  serialize proptests are unchanged). Measured on the registrar workload with
+  the new harness, four interleaved arms at 200k bindings: **live bytes
+  844 -> 837 per binding** and **resident 1828 -> 1786**, which is the 8-byte
+  jemalloc bin for a 3-byte `"sip"` and its page-level amplification, landing
+  exactly where the arithmetic says it should. It is **not** a parse-latency
+  win: three interleaved criterion reps per arm put every `parse/*` and
+  `roundtrip/*` median inside ±2.3% with signs both ways, and the within-arm
+  spread is wider than the between-arm gap. One 8-byte allocation out of a
+  ~1.3 µs parse was never going to be visible, and it is written down here so
+  nobody re-measures looking for it. Small on its own; it is the cheapest
+  instance of the general finding that on this workload cost tracks
+  **allocation count** rather than bytes stored.
+- **Capacity planning now covers registrar memory and allocator tuning**
+  ([docs/deployment.md](docs/deployment.md)). Budget ~1.8 KB resident per
+  binding, and note that `narenas` is settable without a rebuild via
+  `_RJEM_MALLOC_CONF=narenas:4`. Measured here at 200k bindings, that takes
+  **idle RSS 89 MB -> 78 MB** and allocator metadata **30 MB -> 8.6 MB** while
+  leaving the **marginal cost per binding unchanged** (1790 vs 1787 bytes) — so
+  it is a fixed-cost lever for a small container, not the answer to a large
+  contact population, and it is not the default because fewer arenas means more
+  threads per arena lock and the throughput ceiling has not been re-validated
+  under it.
+
 ### Fixed
 - **A method no script handler claims is no longer answered `500`, and OPTIONS
   is answered by the stack.** Every method without a matching
@@ -70,21 +181,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   as a failure — asyncio does not report a cancelled task that way either, and
   with calls in flight it turned every clean exit into a wall of
   `CancelledError`.
-
-### Added
-- **`ControlClient.close()` / `ControlServer.close()`, and both classes as async
-  context managers** (`async with client: await client.run()`). Closing stops
-  the client and drops the handler, so teardown is deterministic instead of
-  leaving background tasks to be declined later by the guards above. The shipped
-  examples use it.
-- **`server.auto_options`** (default `true`) — set it to `false` and an OPTIONS
-  that no script handler claims is dropped silently rather than answered, so
-  siphon does not confirm its own existence to a probe nobody asked it to
-  answer. The drop is a real one: it reaps the server transaction and its
-  auto-100 timer, because leaving those armed emits RFC 4320 §4.2's synthesized
-  `100 Trying` and tells the scanner exactly what the setting was meant to
-  withhold. Scoped to OPTIONS — every other unhandled method still gets its
-  `405` + `Allow`.
 
 ## [1.8.3] — 2026-09-05
 

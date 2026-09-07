@@ -442,7 +442,7 @@ fn entry_privacy_restricted(entry: &NameAddr) -> bool {
             .any(|(name, value)| name.eq_ignore_ascii_case("privacy") && restricted(value))
         || entry
             .uri
-            .headers
+            .headers()
             .iter()
             .any(|(name, value)| name.eq_ignore_ascii_case("privacy") && restricted(value))
 }

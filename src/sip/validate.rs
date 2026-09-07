@@ -256,7 +256,7 @@ fn validate_request_uri(message: &SipMessage) -> Result<(), Rejection> {
         return Ok(());
     };
 
-    if !request.request_uri.headers.is_empty() {
+    if !request.request_uri.headers().is_empty() {
         return Err(Rejection::bad_request(
             "Request-URI carries escaped headers (RFC 4475 §3.1.2.11)",
         ));

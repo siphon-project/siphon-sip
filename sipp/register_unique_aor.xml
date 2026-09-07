@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  REGISTER a unique AoR per call, no authentication.
+
+  The counterpart to register_load.xml. That scenario re-registers one identity
+  for the whole run so the binding store sits at steady state, which is what a
+  *throughput* row wants; this one binds `[service][call_number]` (the prefix comes from sipp's -s) so
+  the store grows by
+  one AoR and one contact per transaction, which is what a *registrar scale*
+  row wants — the cost of holding a population, not the cost of accepting a
+  refresh.
+
+  Expires is deliberately long (3600) so nothing expires mid-run and the
+  measurement covers the whole population rather than a moving subset.
+
+  Driven by scripts/registrar_scale_test.sh.
+-->
+<scenario name="REGISTER unique AoR (registrar scale)">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service][call_number]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service][call_number]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:[service][call_number]@[local_ip]:[local_port];transport=[transport]>;expires=3600
+Max-Forwards: 70
+User-Agent: SIPp/siphon-registrar-scale
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- siphon's NIST may auto-emit a 100 for a REGISTER that takes longer than
+       transaction.auto_100_delay to answer, which only happens under load.
+       Optional so it never blocks the scenario. -->
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" />
+
+</scenario>
