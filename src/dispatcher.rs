@@ -2410,6 +2410,34 @@ async fn sweep_stale_entries(state: &DispatcherState) {
     // never refreshed), returns the number reaped.
     let expired_calls = state.call_actors.sweep_stale(ORPHAN_CALL_TTL) as u64;
 
+    // B-leg event receivers — the one call-lifetime store in this function that
+    // had no backstop. Every teardown path removes it, but a call whose teardown
+    // never reached the dispatcher (and which the sweep above just reaped) left
+    // its receiver behind forever, holding up to a full 64-slot channel of
+    // `CallEvent`s.
+    //
+    // It also matters for liveness, not just memory: the leg actors send on that
+    // channel with an unbounded `await`, so a full channel parks the actor until
+    // *something* drops the receiver. Dropping it here is what guarantees the
+    // actor is eventually released (as `Closed`) instead of parking for the life
+    // of the process. Keyed on the call still existing rather than on an age, so
+    // it catches an orphan from any cause, not only from the sweep above.
+    //
+    // The brief window in `recv_b_leg_classification_event`, where the receiver
+    // is extracted and re-inserted around a blocking recv, can re-add an entry
+    // for a call reaped in the same pass; the next sweep collects it.
+    let receivers_before = state.call_event_receivers.len();
+    state
+        .call_event_receivers
+        .retain(|call_id, _| state.call_actors.contains_call(call_id));
+    let expired_call_events = receivers_before.saturating_sub(state.call_event_receivers.len());
+    if expired_call_events > 0 {
+        debug!(
+            expired_call_events,
+            "swept B-leg event receivers whose call is gone"
+        );
+    }
+
     // Proxy Rf charging sessions — one Arc may be filed under several keys
     // (storage_keys aliases), so retain on the value's age to drop every alias
     // of an orphan in one pass.
