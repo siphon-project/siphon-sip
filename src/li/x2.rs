@@ -43,12 +43,31 @@ impl Connection {
     }
 }
 
+/// Bound on one X2 delivery write.
+///
+/// A mediation function that accepts the connection and then stops reading —
+/// alive, still ACKing, receive window closed — makes both the write and the
+/// flush block indefinitely. There is a *single* delivery task for every
+/// warrant, so unbounded that stalls IRI delivery for all of them, silently and
+/// for the life of the process. Bounding it turns a stalled MDF into a logged
+/// reconnect against that one address.
+const X2_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn write_and_flush<W>(stream: &mut W, bytes: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    stream.write_all(bytes).await?;
-    stream.flush().await
+    tokio::time::timeout(X2_WRITE_TIMEOUT, async {
+        stream.write_all(bytes).await?;
+        stream.flush().await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "X2 write timed out — mediation function is not draining its socket",
+        ))
+    })
 }
 
 /// How to reach one mediation function.
@@ -517,6 +536,59 @@ mod tests {
     use tokio::net::TcpListener;
 
     const RAW_INVITE: &[u8] = b"INVITE sip:bob@example.com SIP/2.0\r\nCall-ID: call-123\r\n\r\n";
+
+    /// A mediation function that accepts the connection and then never reads:
+    /// no error, no close, simply no progress.
+    struct NeverDrains;
+
+    impl AsyncWrite for NeverDrains {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// There is one delivery task for every warrant, so an unbounded write to a
+    /// stalled mediation function stops IRI delivery for all of them — silently,
+    /// with the socket still established, for the life of the process. That is
+    /// warrant loss, not just a slow collector, so the write has to be bounded
+    /// and the address reconnected.
+    ///
+    /// Time is paused: against the unbounded write this does not fail, it hangs.
+    #[tokio::test(start_paused = true)]
+    async fn a_mediation_function_that_stops_reading_times_out_rather_than_stalling_delivery() {
+        let mut stalled = NeverDrains;
+
+        let outcome =
+            tokio::time::timeout(X2_WRITE_TIMEOUT * 10, write_and_flush(&mut stalled, b"pdu"))
+                .await
+                .expect(
+                    "write_and_flush parked on a mediation function that stopped reading \
+             — every warrant's IRI delivery stops with it",
+                );
+
+        let error = outcome.expect_err("a write to a stalled peer cannot succeed");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the delivery task must see a timeout it can reconnect on"
+        );
+    }
 
     fn test_iri_event() -> IriEvent {
         IriEvent {

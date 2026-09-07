@@ -25,6 +25,45 @@ nothing stores a hand-edited version that could disagree with it:
 tags, and pushes. The tag push publishes crate + SDK + image + GitHub Release,
 all at `X.Y.Z`, in lockstep.
 
+### The one thing deliberately outside lockstep: the control-plane SDKs
+
+`siphon-control-sdk/` — `siphon-control-proto` and `siphon-control-client` on
+crates.io, `siphon-control` on PyPI, `@siphon-project/control` on npm — carries
+its **own** `0.x` version and its **own** tag (`control-sdk-v*`,
+`release-control-sdk.yaml`). It is not a hole in the rule above; it is a
+different kind of artifact, for three reasons:
+
+1. **Its compatibility contract is the wire protocol, not the package
+   version.** The SDK and the server agree on `siphon-control.v1` /
+   `PROTOCOL_VERSION`, and `src/control/listener.rs` *enforces* it at the
+   handshake. Any SDK speaking v1 works against any SIPhon speaking v1.
+   Numbering the SDK `1.8.4` would advertise a pairing the handshake
+   explicitly negotiates away, and would leave nothing to say when the
+   protocol itself goes to v2.
+2. **Lockstep would let a client library drive the server's major version.**
+   The rule below bumps on the highest-severity change across any protected
+   surface. The control SDK's own API is still growing verbs, so its first
+   breaking change would force a MAJOR bump of the proxy, the image and the
+   scripting API — none of which changed. The `0.x` line is what keeps that
+   freedom until the surface settles.
+3. **It is not the `sdk/` SDK.** `siphon-sip` on PyPI is lockstepped because it
+   *mirrors* the in-process scripting API (contract surface 4 below) and
+   genuinely moves with the server. The control SDKs are clients of a network
+   protocol, consumed by external applications that pin them in their own
+   manifests.
+
+Consequence: a control-SDK release is cut by hand, and the version does have to
+be edited — in `siphon-control-sdk/Cargo.toml` (`[workspace.package]`), in the
+two inter-crate `version =` pins that crates.io requires, and in
+`typescript/package.json` plus its lockfile. `release-control-sdk.yaml`'s
+`verify-version` job refuses to publish if the workspace version and the tag
+disagree.
+
+When the control-plane surface stabilises, folding it into lockstep is a
+reasonable thing to revisit — most cleanly by keeping it out of contract the
+way the Rust crate's `pub` API already is, so one number does not drag the
+major version.
+
 ## What a version protects (the public contract)
 
 A bump reflects the **highest-severity change across any of these surfaces** in

@@ -741,6 +741,9 @@ impl std::fmt::Debug for HttpState {
 }
 
 /// POST a CDR as JSON to the HTTP webhook endpoint.
+/// Bound on one HTTP CDR delivery (connect + write + read together).
+const HTTP_CDR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn write_http_cdr(cdr: &Cdr, state: &HttpState) {
     let body = match serde_json::to_string(cdr) {
         Ok(json) => json,
@@ -773,34 +776,54 @@ async fn write_http_cdr(cdr: &Cdr, state: &HttpState) {
 
     let address = format!("{}:{}", state.host, state.port);
 
-    if state.use_tls {
-        // TLS connection
-        match connect_tls(&address, &state.host).await {
-            Ok(mut stream) => {
-                if let Err(error) = stream.write_all(request.as_bytes()).await {
-                    error!("CDR HTTP TLS write error: {error}");
-                    return;
+    // One budget across connect, write and read — what any HTTP client would
+    // apply. There is a single writer task behind this, so a collector that
+    // accepts and then stops reading (or never answers) would otherwise stall
+    // CDR delivery for every call, permanently and silently: the queue in front
+    // of the task then overflows and each later record is dropped at its
+    // `try_send`.
+    let exchange = async {
+        if state.use_tls {
+            match connect_tls(&address, &state.host).await {
+                Ok(mut stream) => {
+                    if let Err(error) = stream.write_all(request.as_bytes()).await {
+                        error!("CDR HTTP TLS write error: {error}");
+                        return;
+                    }
+                    let mut response = vec![0u8; 256];
+                    let _ = stream.read(&mut response).await;
+                    check_http_response(&response, &cdr.call_id);
                 }
-                let mut response = vec![0u8; 256];
-                let _ = stream.read(&mut response).await;
-                check_http_response(&response, &cdr.call_id);
+                Err(error) => error!("CDR HTTP TLS connect error: {error}"),
             }
-            Err(error) => error!("CDR HTTP TLS connect error: {error}"),
-        }
-    } else {
-        // Plain TCP connection
-        match tokio::net::TcpStream::connect(&address).await {
-            Ok(mut stream) => {
-                if let Err(error) = stream.write_all(request.as_bytes()).await {
-                    error!("CDR HTTP write error: {error}");
-                    return;
+        } else {
+            match tokio::net::TcpStream::connect(&address).await {
+                Ok(mut stream) => {
+                    if let Err(error) = stream.write_all(request.as_bytes()).await {
+                        error!("CDR HTTP write error: {error}");
+                        return;
+                    }
+                    let mut response = vec![0u8; 256];
+                    let _ = stream.read(&mut response).await;
+                    check_http_response(&response, &cdr.call_id);
                 }
-                let mut response = vec![0u8; 256];
-                let _ = stream.read(&mut response).await;
-                check_http_response(&response, &cdr.call_id);
+                Err(error) => error!("CDR HTTP connect error to {address}: {error}"),
             }
-            Err(error) => error!("CDR HTTP connect error to {address}: {error}"),
         }
+    };
+
+    if tokio::time::timeout(HTTP_CDR_TIMEOUT, exchange)
+        .await
+        .is_err()
+    {
+        error!(
+            call_id = %cdr.call_id,
+            address = %address,
+            timeout = ?HTTP_CDR_TIMEOUT,
+            "CDR HTTP exchange timed out — collector is not draining or not \
+             answering; dropping this record rather than stalling the CDR writer \
+             for every call"
+        );
     }
 }
 

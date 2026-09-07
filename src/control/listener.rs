@@ -32,6 +32,7 @@ use super::protocol::{
     CommandFrame, ControlErrorCode, ControlResult, HelloArgs, PROTOCOL_VERSION, SUBPROTOCOL,
 };
 use super::registry::{ConnHandle, ControlBus, ControlCommand, OutboundFrame, OutboundQueue};
+use super::CONTROL_WRITE_TIMEOUT;
 
 /// Start the inbound control-plane WebSocket server. Mirrors `admin::serve`:
 /// logs and returns on bind error rather than panicking.
@@ -160,9 +161,32 @@ async fn inbound_write_task(
         for frame in frames {
             match frame.to_json() {
                 Ok(text) => {
-                    if ws_sink.send(Message::Text(text.into())).await.is_err() {
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        return;
+                    // Bounded: a controller that stops reading its socket would
+                    // otherwise pin this task, and with it the connection and
+                    // its queue, for the life of the process.
+                    match tokio::time::timeout(
+                        CONTROL_WRITE_TIMEOUT,
+                        ws_sink.send(Message::Text(text.into())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            let _ = tokio::time::timeout(
+                                CONTROL_WRITE_TIMEOUT,
+                                ws_sink.send(Message::Close(None)),
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout = ?CONTROL_WRITE_TIMEOUT,
+                                "control plane: write stalled — controller is not \
+                                 draining its socket; closing the connection"
+                            );
+                            return;
+                        }
                     }
                 }
                 Err(error) => warn!(%error, "control plane: failed to serialize outbound frame"),
@@ -172,7 +196,7 @@ async fn inbound_write_task(
             break;
         }
     }
-    let _ = ws_sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, ws_sink.send(Message::Close(None))).await;
 }
 
 // ---------------------------------------------------------------------------

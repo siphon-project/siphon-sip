@@ -28,7 +28,7 @@ use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTr
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
-    Transport,
+    Transport, WRITE_TIMEOUT,
 };
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
@@ -51,6 +51,18 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// turns a doomed send into a fast `Err` the caller already handles, instead of
 /// a process abort.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on handing a message to a connection's writer task.
+///
+/// The producers are SIP relays running *inside* a Python handler job, so a
+/// parked producer burns a script-executor worker; enough of them and the
+/// watchdog aborts the process.  This is deliberately a short park rather than
+/// [`tokio::sync::mpsc::Sender::try_send`]: the outbound distributor sheds
+/// instantly because a dropped *response* is cheap, but shedding a *request*
+/// costs the caller a 503 (RFC 3261 §16.9), so a scheduler hiccup on a healthy
+/// peer must not look like a dead one.  250 ms absorbs that and is still three
+/// orders of magnitude short of the 30 s watchdog window.
+const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Key for a pooled connection: destination address + transport type + the
 /// requested local *bind* address.
@@ -118,6 +130,13 @@ pub struct ConnectionPool {
     /// A field rather than a bare const so tests can drive a short value and
     /// exercise the timeout branch in milliseconds.
     connect_timeout: Duration,
+    /// Per-write bound in the writer tasks (defaults to [`WRITE_TIMEOUT`]).
+    /// A field for the same reason as `connect_timeout`: a test needs to make a
+    /// non-draining peer time out in milliseconds, not seconds.
+    write_timeout: Duration,
+    /// Bound on handing a message to a writer task (defaults to
+    /// [`ENQUEUE_TIMEOUT`]).  A field for the same reason.
+    enqueue_timeout: Duration,
 }
 
 /// A client identity siphon presents on OUTBOUND TLS connections when the
@@ -302,6 +321,63 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+/// Outcome of the coalesced-establishment step, carried out of the
+/// per-destination lock so the enqueue can happen with the guard released.
+enum Coalesced {
+    /// Another caller established the connection while we waited for the lock.
+    Reuse((ConnectionId, mpsc::Sender<Bytes>)),
+    /// We established it ourselves; the message went out with the handshake.
+    Established(Result<ConnectionId, std::io::Error>),
+}
+
+/// What happened when we tried to hand a message to a writer task.
+enum Enqueued {
+    /// The writer took it.
+    Sent,
+    /// The receiver is gone: the writer task exited, so the connection is dead.
+    /// Evict the pool entry and establish a fresh one.
+    Closed,
+    /// The channel stayed full for the whole window.  The peer is backed up but
+    /// the connection is not provably dead, so keep it — [`WRITE_TIMEOUT`] in
+    /// the writer task is what decides that — and shed this message.
+    Backlogged,
+}
+
+/// Hand `data` to a connection's writer task without ever parking indefinitely.
+///
+/// The `Sender` is taken by value (cheap `Arc` clone) rather than borrowed out
+/// of the `connections` map, because awaiting while holding a `DashMap` read
+/// guard blocks every insert and remove landing on the same shard — a second
+/// way to wedge the pool, and the one `spawn_outbound_distributor` calls out.
+async fn enqueue(sender: &mpsc::Sender<Bytes>, data: Bytes, timeout: Duration) -> Enqueued {
+    match sender.send_timeout(data, timeout).await {
+        Ok(()) => Enqueued::Sent,
+        Err(mpsc::error::SendTimeoutError::Closed(_)) => Enqueued::Closed,
+        Err(mpsc::error::SendTimeoutError::Timeout(_)) => Enqueued::Backlogged,
+    }
+}
+
+/// The error a backlogged peer produces.
+///
+/// `WouldBlock` rather than `BrokenPipe`: nothing is broken, the peer is not
+/// draining.  Callers treat any `Err` here the same way (RFC 3261 §16.9 — a
+/// transport refusal is a 503 on that branch), so this only has to be honest in
+/// the log.
+fn backlogged(destination: SocketAddr, timeout: Duration) -> std::io::Error {
+    warn!(
+        destination = %destination,
+        timeout = ?timeout,
+        "pool: peer is not draining its socket — outbound queue still full after \
+         the enqueue window; shedding this message rather than stranding the \
+         caller (the writer's own timeout will tear the connection down if it \
+         stays stuck)"
+    );
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "pooled connection outbound queue full",
+    )
+}
+
 impl ConnectionPool {
     pub fn new(
         connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
@@ -323,6 +399,8 @@ impl ConnectionPool {
             stream_connections,
             crlf_pong_tracker,
             connect_timeout: TCP_CONNECT_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
+            enqueue_timeout: ENQUEUE_TIMEOUT,
         }
     }
 
@@ -377,51 +455,97 @@ impl ConnectionPool {
             bind: Some(bind_addr),
         };
 
-        // Fast path: reuse a live pooled connection without taking the
-        // per-destination establishment lock.
-        if let Some(entry) = self.connections.get(&key) {
-            if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
-                return Ok(entry.connection_id);
+        // At most two attempts: the second exists only for the race where the
+        // connection we just resolved dies before we can hand it the message,
+        // which is the self-heal the pre-bounded code got from re-establishing
+        // inline.  It is a bounded loop rather than recursion so the future
+        // stays `Sized`.
+        for _ in 0..2 {
+            // Fast path: reuse a live pooled connection without taking the
+            // per-destination establishment lock.
+            if let Some((connection_id, sender)) = self.pooled(&key) {
+                match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+                    Enqueued::Sent => return Ok(connection_id),
+                    Enqueued::Backlogged => {
+                        return Err(backlogged(destination, self.enqueue_timeout))
+                    }
+                    // Writer task gone — drop the corpse and establish afresh.
+                    Enqueued::Closed => {
+                        self.connections.remove(&key);
+                    }
+                }
             }
-            // Connection dead — remove and create new
-            drop(entry);
-            self.connections.remove(&key);
+
+            // Coalesce concurrent establishment to this destination onto a
+            // single connection.  A second concurrent connect from the fixed
+            // IPsec source port would `bind`/`connect` the same `(src, dst)`
+            // 4-tuple and fail `EADDRNOTAVAIL`/`EADDRINUSE`; instead the first
+            // caller establishes under the lock while the rest wait and reuse
+            // the result.
+            let connect_lock = self
+                .connect_locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let coalesced = {
+                let _establish_guard = connect_lock.lock().await;
+                // Re-check: a peer may have established the connection while we
+                // were waiting for the lock.
+                match self.pooled(&key) {
+                    // Someone else established it.  Carry the sender out and
+                    // enqueue *after* the guard is released — parking here,
+                    // even for the bounded window, convoys every other caller
+                    // for this destination behind us, which is how one stuck
+                    // peer became a per-destination stall.
+                    Some(existing) => Coalesced::Reuse(existing),
+                    None => Coalesced::Established(
+                        self.establish_tcp_connection(key, bind_addr, destination, data.clone())
+                            .await,
+                    ),
+                }
+            };
+            // Drop our per-destination lock once no waiter remains (map ref +
+            // our local clone == 2).  Keeps `connect_locks` bounded even as a
+            // UE's `port_us` rotates each re-AKA.
+            self.connect_locks
+                .remove_if(&key, |_, lock| Arc::strong_count(lock) <= 2);
+
+            match coalesced {
+                Coalesced::Established(result) => return result,
+                Coalesced::Reuse((connection_id, sender)) => {
+                    match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+                        Enqueued::Sent => return Ok(connection_id),
+                        Enqueued::Backlogged => {
+                            return Err(backlogged(destination, self.enqueue_timeout))
+                        }
+                        // Died in the window between the re-check and the
+                        // enqueue.  Evict and take the second attempt, which
+                        // will establish.
+                        Enqueued::Closed => {
+                            self.connections.remove(&key);
+                        }
+                    }
+                }
+            }
         }
 
-        // Coalesce concurrent establishment to this destination onto a single
-        // connection.  A second concurrent connect from the fixed IPsec source
-        // port would `bind`/`connect` the same `(src, dst)` 4-tuple and fail
-        // `EADDRNOTAVAIL`/`EADDRINUSE`; instead the first caller establishes
-        // under the lock while the rest wait and reuse the result.
-        let connect_lock = self
-            .connect_locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let result = {
-            let _establish_guard = connect_lock.lock().await;
-            // Re-check: a peer may have established the connection while we
-            // were waiting for the lock.
-            if let Some(entry) = self.connections.get(&key) {
-                if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
-                    Ok(entry.connection_id)
-                } else {
-                    drop(entry);
-                    self.connections.remove(&key);
-                    self.establish_tcp_connection(key, bind_addr, destination, data)
-                        .await
-                }
-            } else {
-                self.establish_tcp_connection(key, bind_addr, destination, data)
-                    .await
-            }
-        };
-        // Drop our per-destination lock once no waiter remains (map ref + our
-        // local clone == 2).  Keeps `connect_locks` bounded even as a UE's
-        // `port_us` rotates each re-AKA.
-        self.connect_locks
-            .remove_if(&key, |_, lock| Arc::strong_count(lock) <= 2);
-        result
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "pooled connection closed twice while sending",
+        ))
+    }
+
+    /// Snapshot a pooled connection: its id plus a *cloned* sender.
+    ///
+    /// Cloning the sender out — and letting the map guard die with the closure
+    /// — is what lets callers await an enqueue without holding a `DashMap`
+    /// shard guard across it.  Holding one blocks every insert and remove that
+    /// hashes to the same shard, which is a second way to wedge the pool and
+    /// the one `spawn_outbound_distributor` documents.
+    fn pooled(&self, key: &PoolKey) -> Option<(ConnectionId, mpsc::Sender<Bytes>)> {
+        self.connections
+            .get(key)
+            .map(|entry| (entry.connection_id, entry.sender.clone()))
     }
 
     /// Establish a fresh outbound TCP connection to `destination`, bound to
@@ -638,21 +762,44 @@ impl ConnectionPool {
         });
 
         // Write task
+        let write_timeout = self.write_timeout;
         tokio::spawn(async move {
             while let Some(data) = write_rx.recv().await {
-                if let Err(error) = writer.write_all(&data).await {
-                    warn!("pool: TCP write error on {:?}: {}", connection_id, error);
-                    break;
+                match tokio::time::timeout(write_timeout, writer.write_all(&data)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!("pool: TCP write error on {:?}: {}", connection_id, error);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            connection_id = ?connection_id,
+                            destination = %destination,
+                            timeout = ?write_timeout,
+                            "pool: TCP write stalled — peer accepted the connection \
+                             but is not draining it (zero receive window); dropping \
+                             the connection so callers stop queueing behind it"
+                        );
+                        break;
+                    }
                 }
             }
         });
 
-        // Send the initial data
-        if write_tx.send(data).await.is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "pooled connection closed immediately",
-            ));
+        // Send the initial data.  Bounded like every other enqueue: the writer
+        // task above is live but a peer that never reads still backs the
+        // channel up, and this runs on a script-executor worker.
+        match enqueue(&write_tx, data, self.enqueue_timeout).await {
+            Enqueued::Sent => {}
+            Enqueued::Closed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pooled connection closed immediately",
+                ));
+            }
+            Enqueued::Backlogged => {
+                return Err(backlogged(destination, self.enqueue_timeout));
+            }
         }
 
         // Store in pool
@@ -718,14 +865,18 @@ impl ConnectionPool {
             bind: bind_addr,
         };
 
-        // Try existing connection first
-        if let Some(entry) = self.connections.get(&key) {
-            if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
-                return Ok(entry.connection_id);
+        // Try existing connection first.  Bounded, and with the sender cloned
+        // out of the map so no shard guard is held across the await — same
+        // reasoning as the TCP path.
+        if let Some((connection_id, sender)) = self.pooled(&key) {
+            match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+                Enqueued::Sent => return Ok(connection_id),
+                Enqueued::Backlogged => return Err(backlogged(destination, self.enqueue_timeout)),
+                // Connection dead — remove and create new
+                Enqueued::Closed => {
+                    self.connections.remove(&key);
+                }
             }
-            // Connection dead — remove and create new
-            drop(entry);
-            self.connections.remove(&key);
         }
 
         // Create new TCP connection, then wrap with TLS handshake.
@@ -926,21 +1077,42 @@ impl ConnectionPool {
         });
 
         // Write task
+        let write_timeout = self.write_timeout;
         tokio::spawn(async move {
             while let Some(data) = write_rx.recv().await {
-                if let Err(error) = writer.write_all(&data).await {
-                    warn!("pool: TLS write error on {:?}: {}", connection_id, error);
-                    break;
+                match tokio::time::timeout(write_timeout, writer.write_all(&data)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!("pool: TLS write error on {:?}: {}", connection_id, error);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            connection_id = ?connection_id,
+                            destination = %destination,
+                            timeout = ?write_timeout,
+                            "pool: TLS write stalled — peer is not draining the \
+                             connection; dropping it so callers stop queueing \
+                             behind it"
+                        );
+                        break;
+                    }
                 }
             }
         });
 
-        // Send the initial data
-        if write_tx.send(data).await.is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "pooled TLS connection closed immediately",
-            ));
+        // Send the initial data (bounded — see the TCP path).
+        match enqueue(&write_tx, data, self.enqueue_timeout).await {
+            Enqueued::Sent => {}
+            Enqueued::Closed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pooled TLS connection closed immediately",
+                ));
+            }
+            Enqueued::Backlogged => {
+                return Err(backlogged(destination, self.enqueue_timeout));
+            }
         }
 
         // Store in pool
@@ -1097,6 +1269,79 @@ mod tests {
 
     fn ensure_crypto_provider() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn test_pool() -> ConnectionPool {
+        ensure_crypto_provider();
+        ConnectionPool::new(
+            Arc::new(DashMap::new()),
+            flume::unbounded().0,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        )
+    }
+
+    /// A peer that completes the handshake and then never reads a byte.
+    ///
+    /// This is the shape the field incident had: the socket stays established
+    /// and the peer keeps ACKing, but its receive window closes, so our writes
+    /// stop draining. `SO_KEEPALIVE` never fires against it (probes are
+    /// suppressed with data in flight or in the persist state), which is why an
+    /// unbounded write there is unbounded in the real sense, not the "eventually
+    /// errors" sense.
+    ///
+    /// The small receive buffer is what keeps the test fast: the peer's window
+    /// closes after a few KB instead of the megabytes autotuning would otherwise
+    /// allow.
+    async fn spawn_non_draining_peer() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(2 * 1024)
+            .unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            // Hold every accepted socket open, and never read from any of them.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Keep sending until the pool refuses, bounded so the test fails by
+    /// *hanging* rather than by asserting a count if the enqueue is ever
+    /// unbounded again. 8 KB per message fills a closed window and then the
+    /// 64-slot channel in well under a second.
+    async fn send_until_refused(pool: &ConnectionPool, peer: SocketAddr) -> usize {
+        let payload = Bytes::from(vec![b'x'; 8 * 1024]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for attempt in 0..2000usize {
+                if pool.send_tcp(peer, payload.clone()).await.is_err() {
+                    return attempt;
+                }
+            }
+            panic!("2000 sends to a peer that never reads all reported success");
+        })
+        .await
+        .expect(
+            "send_tcp parked on a peer that accepted the connection and then \
+             stopped draining it. That is the process-abort path: the write \
+             never returns, the bounded channel behind it fills, is_closed() \
+             still reports the connection healthy because full is not closed, \
+             and every caller — each one a script-executor worker — parks \
+             forever until the watchdog aborts the process.",
+        )
     }
 
     #[tokio::test]
@@ -1435,10 +1680,22 @@ mod tests {
             1,
             "exactly one pooled connection"
         );
+        // The accept count is produced by a separate task, and the kernel
+        // completes a loopback handshake off the listen backlog without that
+        // task having run — so reading it the instant the sends return is a
+        // race, and under parallel test load it reads 0. Wait for the first
+        // accept, then hold still long enough that a second one would have
+        // shown up. Both halves matter: the wait alone would pass if
+        // establishment stopped coalescing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while accepted.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             1,
-            "server accepted more than one connection — establishment did not coalesce"
+            "establishment did not coalesce onto a single connection"
         );
     }
 
@@ -1929,6 +2186,150 @@ mod tests {
             pool.active_connections(),
             1,
             "reload must evict the pooled TLS connection but keep the TCP one"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A peer that stops draining must never park the caller
+    // -----------------------------------------------------------------------
+
+    /// The unit half: the enqueue helper both the TCP and TLS paths share must
+    /// give up on a channel that stays full, rather than waiting for capacity
+    /// that a stalled writer will never release.
+    #[tokio::test]
+    async fn enqueue_sheds_when_the_channel_stays_full() {
+        let (sender, _receiver) = mpsc::channel::<Bytes>(2);
+        sender.send(Bytes::from_static(b"one")).await.unwrap();
+        sender.send(Bytes::from_static(b"two")).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = enqueue(
+            &sender,
+            Bytes::from_static(b"three"),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Enqueued::Backlogged),
+            "a channel that never drains must report Backlogged, not park"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the enqueue must give up at its own timeout"
+        );
+    }
+
+    /// A closed channel is a dead connection, and has to stay distinguishable
+    /// from a merely backed-up one: `Closed` evicts and re-establishes, whereas
+    /// `Backlogged` keeps the connection (the writer's own timeout is what
+    /// decides a peer is stuck).
+    #[tokio::test]
+    async fn enqueue_reports_closed_when_the_writer_is_gone() {
+        let (sender, receiver) = mpsc::channel::<Bytes>(2);
+        drop(receiver);
+
+        let outcome = enqueue(
+            &sender,
+            Bytes::from_static(b"anything"),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Enqueued::Closed),
+            "a dropped receiver must report Closed immediately, not wait out the \
+             timeout"
+        );
+    }
+
+    /// The regression for the process abort.
+    ///
+    /// Before the bound, this test does not fail — it *hangs*, which is the
+    /// point: in the field the same wait was 30 s of a completely silent
+    /// process, three script-executor workers gone, and then `abort()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn send_to_a_peer_that_stops_draining_fails_instead_of_parking_the_caller() {
+        let (peer, _accepted) = spawn_non_draining_peer().await;
+
+        let mut pool = test_pool();
+        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.write_timeout = Duration::from_millis(200);
+
+        let refused_at = send_until_refused(&pool, peer).await;
+
+        assert!(
+            refused_at > 0,
+            "the first send should still have gone out — the peer accepts, it \
+             just never reads"
+        );
+    }
+
+    /// Once the writer gives up, the connection must not stay in the pool as a
+    /// corpse that every later caller queues behind. The writer dropping its
+    /// receiver closes the channel, which the next send sees as `Closed` and
+    /// replaces — so a peer that recovers gets a fresh connection rather than
+    /// permanent 503s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_connection_is_replaced_on_the_next_send() {
+        let (peer, accepted) = spawn_non_draining_peer().await;
+
+        let mut pool = test_pool();
+        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.write_timeout = Duration::from_millis(200);
+
+        send_until_refused(&pool, peer).await;
+        let first_round = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first_round, 1, "one connection so far");
+
+        // Past the writer's own timeout, so it has given up and closed the
+        // channel behind it.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // The next send must establish a *new* connection rather than error
+        // forever against the wedged entry.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.send_tcp(peer, Bytes::from_static(b"PING")),
+        )
+        .await
+        .expect("a send after the writer gave up must not park either");
+
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) > first_round,
+            "a stalled connection must be replaced, not kept as a corpse every \
+             later caller queues behind"
+        );
+    }
+
+    /// Source-level, for the same reason the dispatcher guards its CDR wiring
+    /// that way: the property is an *ordering* one, and the race that exposes it
+    /// behaviourally is too tight to drive reliably.
+    ///
+    /// The per-destination establishment lock exists so concurrent first-sends
+    /// coalesce onto one connection. It must not still be held while handing the
+    /// message to the writer: one caller parked there — even for the bounded
+    /// window — convoys every other caller for that destination behind it, which
+    /// is how a single stuck peer became a per-destination stall.
+    #[test]
+    fn the_establishment_lock_is_released_before_the_message_is_enqueued() {
+        let source = include_str!("pool.rs");
+
+        let guarded = source
+            .split("let _establish_guard = connect_lock.lock().await;")
+            .nth(1)
+            .expect("the establishment lock is still taken");
+        let guarded = guarded
+            .split("};")
+            .next()
+            .expect("the guarded block is still delimited");
+
+        assert!(
+            !guarded.contains("enqueue("),
+            "the re-check enqueue moved back inside the establishment lock, so a \
+             caller waiting on a peer that is not draining now convoys every \
+             other caller to the same destination behind it. The guarded block \
+             was:{guarded}"
         );
     }
 }

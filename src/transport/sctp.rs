@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::transport::acl::TransportAcl;
 use crate::transport::{
     next_connection_id, ConnectionId, InboundMessage, OutboundMessage, Transport,
+    CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
 };
 
 /// Spawn an SCTP listener.
@@ -104,7 +105,29 @@ pub async fn listen(
                         let read_task = tokio::spawn(async move {
                             loop {
                                 let mut buffer = BytesMut::with_capacity(65536);
-                                match reader.recvmsg_buf(&mut buffer).await {
+                                // Idle-bounded, as the TCP/TLS/WS listeners are:
+                                // without it a peer that stops sending *and*
+                                // stops reading leaves this task, the write task
+                                // and the `connection_map` entry alive for the
+                                // life of the process, because neither half ever
+                                // reaches a break.
+                                let received = tokio::time::timeout(
+                                    CONNECTION_IDLE_TIMEOUT,
+                                    reader.recvmsg_buf(&mut buffer),
+                                )
+                                .await;
+                                let received = match received {
+                                    Ok(received) => received,
+                                    Err(_) => {
+                                        info!(
+                                            "SCTP connection {:?} idle timeout ({}s)",
+                                            connection_id,
+                                            CONNECTION_IDLE_TIMEOUT.as_secs()
+                                        );
+                                        break;
+                                    }
+                                };
+                                match received {
                                     Ok((0, _, _)) => {
                                         info!("SCTP connection {:?} closed by peer", connection_id);
                                         break;
@@ -137,9 +160,26 @@ pub async fn listen(
                         let write_task = tokio::spawn(async move {
                             let options = SendOptions::default();
                             while let Some(data) = outbound_rx.recv().await {
-                                if let Err(error) = writer.sendmsg(&data, None, &options).await {
-                                    warn!("SCTP write error on {:?}: {}", connection_id, error);
-                                    break;
+                                match tokio::time::timeout(
+                                    WRITE_TIMEOUT,
+                                    writer.sendmsg(&data, None, &options),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(error)) => {
+                                        warn!("SCTP write error on {:?}: {}", connection_id, error);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            connection_id = ?connection_id,
+                                            timeout = ?WRITE_TIMEOUT,
+                                            "SCTP write stalled — peer is not draining \
+                                             the association; closing it"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         });
