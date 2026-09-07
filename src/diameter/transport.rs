@@ -58,8 +58,18 @@ impl SctpAsyncStream {
                         if n == 0 {
                             break;
                         }
-                        if tx.write_all(&buf[..n]).await.is_err() {
-                            break;
+                        // Bounded: the duplex pipe is 64 KB, so a Diameter
+                        // reader that stops draining backs this up and an
+                        // unbounded write parks the task holding the SCTP
+                        // association open with nothing draining either side.
+                        match tokio::time::timeout(
+                            crate::diameter::peer::HANDSHAKE_TIMEOUT,
+                            tx.write_all(&buf[..n]),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            _ => break,
                         }
                     }
                     Err(_) => break,
@@ -76,8 +86,16 @@ impl SctpAsyncStream {
                 match rx.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        if stream2.sendmsg(&buf[..n], None, &opts).await.is_err() {
-                            break;
+                        // Bounded for the mirror reason: a peer that stops
+                        // draining the association must not pin this task.
+                        match tokio::time::timeout(
+                            crate::diameter::peer::HANDSHAKE_TIMEOUT,
+                            stream2.sendmsg(&buf[..n], None, &opts),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            _ => break,
                         }
                     }
                     Err(_) => break,

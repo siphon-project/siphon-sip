@@ -64,6 +64,37 @@ type PendingRequest = oneshot::Sender<DiameterMessage>;
 /// [`DiameterPeer::send_request_timeout`].
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on a single write to a peer.
+///
+/// A peer that stops reading — alive, still ACKing, receive window closed —
+/// makes `write_all` block for as long as it likes, and `SO_KEEPALIVE` cannot
+/// see it (probes are suppressed with data unacked or the socket in persist).
+/// Unbounded, the writer task never returns to its `recv`, the bounded channel
+/// in front of it fills, and every producer parks — including the script
+/// handlers that reach this through the Cx/Sh/Rx/Rf/S6a methods, each one
+/// holding a script-executor worker until the watchdog aborts the process.
+///
+/// Breaking out on expiry drops the receiver, so the channel closes and
+/// subsequent sends fail fast instead of queueing behind a corpse.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on handing a message to the writer task.
+///
+/// Short, because the callers are request paths that already own an answer
+/// timeout and, on the scripting API, a script-executor worker. Long enough
+/// that a scheduler hiccup on a healthy peer is absorbed rather than reported
+/// as a failure.
+const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Bound on each leg of the CER/CEA capabilities exchange.
+///
+/// The handshake runs before the reader and writer tasks exist, so neither
+/// [`WRITE_TIMEOUT`] nor the request timeout covers it. A peer that completes
+/// the transport handshake and then never reads or never answers would
+/// otherwise pin the connect attempt — and the reconnect loop driving it —
+/// indefinitely.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Connection lifecycle state of a peer, used by the peer pool to skip dead
 /// backends without a separate registry. Backed by an `AtomicU8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +235,33 @@ impl DiameterPeer {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(hbh, tx);
 
-        self.write_tx
-            .send(msg)
-            .await
-            .map_err(|e| format!("write channel closed: {}", e))?;
+        // Bounded. The `timeout` below covers waiting for the *answer*; without
+        // a bound here the wait for a slot in front of a stalled writer is
+        // unbounded, which is where a handler thread is actually lost. The
+        // pending entry was inserted above, so every early return has to take
+        // it back out or a shed request leaks one entry per attempt.
+        if let Err(error) = self.write_tx.send_timeout(msg, ENQUEUE_TIMEOUT).await {
+            self.pending.lock().await.remove(&hbh);
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics
+                    .diameter_request_errors_total
+                    .with_label_values(&["write_blocked"])
+                    .inc();
+            }
+            return Err(match error {
+                mpsc::error::SendTimeoutError::Closed(_) => "write channel closed".to_string(),
+                mpsc::error::SendTimeoutError::Timeout(_) => {
+                    warn!(
+                        peer = %self.config.host,
+                        timeout = ?ENQUEUE_TIMEOUT,
+                        "Diameter: peer is not draining its socket — outbound queue \
+                         still full after the enqueue window; failing the request \
+                         rather than stranding the caller"
+                    );
+                    "peer outbound queue full".to_string()
+                }
+            });
+        }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(answer)) => {
@@ -244,10 +298,15 @@ impl DiameterPeer {
 
     /// Send a response (no answer expected).
     pub async fn send_response(&self, msg: Vec<u8>) -> Result<(), String> {
+        // Bounded for the same reason as the request path: answering an inbound
+        // request must never be what parks the task that is answering it.
         self.write_tx
-            .send(msg)
+            .send_timeout(msg, ENQUEUE_TIMEOUT)
             .await
-            .map_err(|e| format!("write channel closed: {}", e))
+            .map_err(|error| match error {
+                mpsc::error::SendTimeoutError::Closed(_) => "write channel closed".to_string(),
+                mpsc::error::SendTimeoutError::Timeout(_) => "peer outbound queue full".to_string(),
+            })
     }
 
     /// Shutdown the peer connection.
@@ -477,9 +536,24 @@ where
                 msg = write_rx.recv() => {
                     match msg {
                         Some(data) => {
-                            if let Err(e) = writer.write_all(&data).await {
-                                error!("Diameter: write error: {}", e);
-                                break;
+                            match tokio::time::timeout(
+                                WRITE_TIMEOUT,
+                                writer.write_all(&data),
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!("Diameter: write error: {}", e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    error!(
+                                        timeout = ?WRITE_TIMEOUT,
+                                        "Diameter: write stalled — peer is not draining \
+                                         its socket; dropping the connection so callers \
+                                         fail fast instead of queueing behind it"
+                                    );
+                                    break;
+                                }
                             }
                         }
                         None => break,
@@ -514,26 +588,46 @@ where
                             let cmd = codec::command_name(decoded.command_code, decoded.is_request);
 
                             if decoded.is_request {
+                                // This task is the only thing that correlates
+                                // answers to their pending requests, so it must
+                                // never park: an awaiting send here against a
+                                // stalled writer or a backed-up dispatcher stops
+                                // every in-flight request on this peer, and the
+                                // peer then looks dead to all of them at once.
+                                // A dropped watchdog answer is recoverable (the
+                                // peer re-DWRs, or its own watchdog closes us);
+                                // a stalled reader is not.
                                 if decoded.command_code == dictionary::CMD_DEVICE_WATCHDOG {
                                     let dwa = build_dwa(&origin_host, &origin_realm, decoded.hop_by_hop, decoded.end_to_end);
-                                    let _ = write_tx_r.send(dwa).await;
+                                    if write_tx_r.try_send(dwa).is_err() {
+                                        warn!("Diameter: dropped DWA — peer outbound queue full or closed");
+                                    }
                                 } else if decoded.command_code == dictionary::CMD_DISCONNECT_PEER {
                                     // RFC 6733 §5.4: acknowledge the DPR with a
                                     // DPA before tearing the connection down.
                                     info!("Diameter: received DPR, sending DPA and closing");
                                     let dpa = build_dpa(&origin_host, &origin_realm, decoded.hop_by_hop, decoded.end_to_end);
-                                    let _ = write_tx_r.send(dpa).await;
+                                    if write_tx_r.try_send(dpa).is_err() {
+                                        warn!("Diameter: dropped DPA — peer outbound queue full or closed");
+                                    }
                                     break;
                                 } else {
                                     info!("Diameter: received {} from peer", cmd);
-                                    let _ = incoming_tx.send(IncomingRequest {
+                                    if incoming_tx.try_send(IncomingRequest {
                                         command_code: decoded.command_code,
                                         application_id: decoded.application_id,
                                         hop_by_hop: decoded.hop_by_hop,
                                         end_to_end: decoded.end_to_end,
                                         avps: decoded.avps,
                                         raw: msg_bytes,
-                                    }).await;
+                                    }).is_err() {
+                                        warn!(
+                                            command = cmd,
+                                            "Diameter: dropped inbound request — dispatch queue \
+                                             full or closed; the peer will time out and retry \
+                                             rather than this connection stalling"
+                                        );
+                                    }
                                 }
                             } else {
                                 let mut map = pending_r.lock().await;
@@ -628,18 +722,27 @@ pub async fn connect_with_transport(
 
     info!("Diameter: connected to {} via {}", addr, transport);
 
-    // Send CER
+    // Send CER.  Bounded: a peer that completes the TCP handshake and then
+    // never reads would otherwise hold this connect attempt — and whatever
+    // drives it, including the reconnect loop — open indefinitely.
     let cer = build_cer(&config, 1, 1);
-    stream
-        .write_all(&cer)
-        .await
-        .map_err(|e| format!("CER write failed: {}", e))?;
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.write_all(&cer)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("CER write failed: {}", e)),
+        Err(_) => return Err(format!("CER write timed out after {HANDSHAKE_TIMEOUT:?}")),
+    }
     info!("Diameter: sent CER to {}", addr);
 
-    // Read CEA
-    let cea_bytes = codec::read_diameter_message(&mut stream)
-        .await
-        .map_err(|e| format!("CEA read failed: {}", e))?;
+    // Read CEA.  Bounded for the mirror reason: a peer that accepts and then
+    // says nothing must not pin the handshake forever.
+    let cea_bytes =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, codec::read_diameter_message(&mut stream))
+            .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(format!("CEA read failed: {}", e)),
+            Err(_) => return Err(format!("CEA read timed out after {HANDSHAKE_TIMEOUT:?}")),
+        };
     let cea = codec::decode_diameter(&cea_bytes).ok_or("failed to decode CEA")?;
 
     if cea.command_code != dictionary::CMD_CAPABILITIES_EXCHANGE || cea.is_request {
@@ -749,10 +852,11 @@ pub async fn accept(
         cer.hop_by_hop,
         cer.end_to_end,
     );
-    stream
-        .write_all(&cea)
-        .await
-        .map_err(|e| format!("CEA write failed: {}", e))?;
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.write_all(&cea)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("CEA write failed: {}", e)),
+        Err(_) => return Err(format!("CEA write timed out after {HANDSHAKE_TIMEOUT:?}")),
+    }
     info!("Diameter: sent CEA to {} (result=2001)", peer_addr);
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
@@ -1017,6 +1121,110 @@ mod tests {
             peer.pending.lock().await.len(),
             0,
             "pending request map must drain under concurrent in-flight load"
+        );
+    }
+
+    /// Stand up a real [`DiameterPeer`] whose far end completes the TCP
+    /// handshake and then never reads a byte — alive, still ACKing, receive
+    /// window closed. The small receive buffer is what makes the test fast: the
+    /// window shuts after a few KB rather than after megabytes of autotuning.
+    async fn loopback_peer_that_never_reads() -> (Arc<DiameterPeer>, mpsc::Receiver<IncomingRequest>)
+    {
+        use tokio::net::TcpStream;
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(2 * 1024)
+            .unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(8).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (incoming_tx, incoming_rx) = mpsc::channel(16);
+        let peer = spawn_connection_tasks(
+            leak_test_config(),
+            DiameterStream::Tcp(client_stream),
+            incoming_tx,
+        );
+        (peer, incoming_rx)
+    }
+
+    /// The regression for the process abort.
+    ///
+    /// Every scripting Diameter method — `cx_*`, `sh_*`, `rx_*`, `rf_acr_*`,
+    /// `s6a_*`, the generic `send_request` — reaches this enqueue from a script
+    /// handler, holding a script-executor worker while it waits. The request
+    /// timeout below it covers waiting for the *answer*, not for a slot in front
+    /// of a writer that a non-draining peer has stalled, so before the bound
+    /// this call never returned: worker after worker was consumed until the
+    /// executor watchdog aborted the process.
+    ///
+    /// Against unbounded code this test does not fail, it hangs — which is
+    /// exactly what it looked like in the field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_stops_reading_fails_the_request_instead_of_parking_the_caller() {
+        let (peer, _incoming_rx) = loopback_peer_that_never_reads().await;
+        let config = peer.config().clone();
+
+        // Fill the socket and then the 64-slot channel behind it. `send_response`
+        // is fire-and-forget, so this fills the pipe without waiting on answers
+        // that a peer which never reads could never send.
+        let filler = vec![0u8; 8 * 1024];
+        let refusal = tokio::time::timeout(Duration::from_secs(20), async {
+            for _ in 0..2000 {
+                if let Err(error) = peer.send_response(filler.clone()).await {
+                    return error;
+                }
+            }
+            panic!("2000 sends to a peer that never reads all reported success");
+        })
+        .await
+        .expect(
+            "send_response parked on a peer that accepted the connection and \
+             then stopped draining it — the write never returns, the channel \
+             behind it fills, and every caller parks with it",
+        );
+        assert!(
+            refusal.contains("queue full"),
+            "expected the backlogged refusal, got: {refusal}"
+        );
+
+        // Now the path that matters: a request from a script handler.
+        let before = peer.pending.lock().await.len();
+        let request = build_cer(&config, peer.next_hbh(), 1);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            peer.send_request_timeout(request, Duration::from_secs(30)),
+        )
+        .await
+        .expect(
+            "send_request parked on the enqueue. This is the process-abort path: \
+             the request timeout covers the answer, not the wait for a slot in \
+             front of a stalled writer, so the handler thread is gone for good.",
+        );
+
+        let error = outcome.expect_err("a request to a peer that never reads cannot succeed");
+        assert!(
+            error.contains("queue full"),
+            "expected the backlogged refusal, got: {error}"
+        );
+
+        // The pending entry is inserted before the enqueue, so the shed path has
+        // to take it back out — otherwise every refused request leaks one
+        // `oneshot::Sender` for the life of the connection.
+        assert_eq!(
+            peer.pending.lock().await.len(),
+            before,
+            "a request refused at the enqueue must not leave its Hop-by-Hop entry \
+             behind in the correlation map"
         );
     }
 
