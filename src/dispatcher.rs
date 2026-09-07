@@ -309,10 +309,16 @@ struct DispatcherState {
     /// Ro online-charging service (RFC 8506 / TS 32.299) — `None` when `ro:`
     /// is unset/disabled or no Diameter peers are configured.
     ro_charger: Option<Arc<crate::diameter::ro_service::RoChargingService>>,
-    /// Live per-call Ro credit sessions, keyed `b2bua:<internal-call-id>`, so
-    /// the BYE handler can send CCR-TERMINATION. Empty when `ro_charger` is
-    /// `None`; the mid-call teardown is driven Rust-side by the session's own
-    /// re-auth timer, not from here.
+    /// Live per-call Ro credit sessions, keyed [`RO_B2BUA_KEY_PREFIX`] +
+    /// internal call UUID, so the BYE handler can send CCR-TERMINATION. Empty
+    /// when `ro_charger` is `None`; the mid-call teardown is driven Rust-side by
+    /// the session's own re-auth timer, not from here.
+    ///
+    /// `call.ro_authorize()` reserves *before* the B-leg is connected, so unlike
+    /// Rf — whose ACR-START only fires on a successful answer — this store has
+    /// to survive everything that can end a call before it is answered, and
+    /// every one of those paths owes it a release. [`check_orphaned_ro_sessions`]
+    /// is the backstop that catches one that does not.
     ro_sessions: Arc<DashMap<String, crate::diameter::ro_service::CcCreditSession>>,
     /// Per-call CDR tracking for `cdr.auto_emit` (INVITE → answer → BYE).
     ///
@@ -974,9 +980,11 @@ pub async fn run(
         tokio::spawn(async move {
             // Timer check interval: 100ms for responsive retransmissions
             let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-            // B2BUA answer-timeout check: 500ms so a short per-carrier LCR ring
+            // B2BUA call-lifetime checks: 500ms so a short per-carrier LCR ring
             // timeout re-routes within ~0.5s of its deadline (previously this was
-            // folded into the 30s sweep, making short ring timeouts unusable).
+            // folded into the 30s sweep, making short ring timeouts unusable),
+            // and so an orphaned Ro reservation is released well inside one
+            // re-auth window instead of billing against a call that has ended.
             let mut answer_timeout_interval =
                 tokio::time::interval(std::time::Duration::from_millis(500));
             // Stale entry cleanup: every 30s
@@ -992,6 +1000,7 @@ pub async fn run(
                         check_b2bua_answer_timeouts(&state);
                         check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);
+                        check_orphaned_ro_sessions(&state);
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
@@ -12659,13 +12668,106 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
     }
 }
 
-/// Spawn ACR-START for a B2BUA call when the A-leg INVITE has been
-/// answered.  No-op when `rf_charger` is unset or auto-emit disabled.
-/// Stores the resulting [`ProxyRfState`] in `state.rf_sessions` keyed
-/// by `b2bua:<internal_call_id>` so the BYE handler can find it.
+/// Key prefix for a B2BUA call's Ro session in `state.ro_sessions`.
+///
+/// Load-bearing in both directions: [`ro_b2bua_key`] writes it and
+/// [`orphaned_ro_session_keys`] reads it back to recover the internal call UUID
+/// and ask whether that call is still alive. Any future non-B2BUA Ro session
+/// filed in the same map under a different prefix is left alone by the orphan
+/// backstop rather than reaped against a call store that never knew it.
+const RO_B2BUA_KEY_PREFIX: &str = "ro-b2bua:";
+
 /// Format the B2BUA Ro-session key from the internal call UUID.
 fn ro_b2bua_key(internal_call_id: &str) -> String {
-    format!("ro-b2bua:{internal_call_id}")
+    format!("{RO_B2BUA_KEY_PREFIX}{internal_call_id}")
+}
+
+/// The `ro_sessions` keys whose B2BUA call is gone — a credit reservation that
+/// outlived the call it was made for.
+///
+/// The invariant: `call.ro_authorize()` reserves *before* the B-leg is
+/// connected, so from the reservation until the call ends there is a live Ro
+/// session whose only owner is the call actor. Every terminal path is supposed
+/// to release it, and the ones that answer the A-leg do, carrying the status
+/// they sent as the `Cause-Code`. This is the backstop for the ones that do
+/// not: a reservation whose call actor has been removed can never be released
+/// by anything else, and left alone its re-auth timer keeps sending CCR-UPDATE
+/// for a call that no longer exists (and, in the undialled cases, never had a
+/// leg at all) until the charging layer's own 24-hour max-lifetime fires.
+///
+/// Keyed on the call still existing rather than on an age — the same rule the
+/// B-leg event-receiver backstop uses — so it catches an orphan from any cause,
+/// including a terminal path that has not been written yet. That covers the
+/// transferee's transient call in a `Replaces` takeover too, whose actor is
+/// removed when its leg is adopted: the merged conversation keeps charging on
+/// the *surviving* call's own session, so the reservation left on the id that
+/// ceased to exist is a duplicate and releasing it is right.
+///
+/// Generic over the value so the decision logic is testable without standing up
+/// a Diameter peer: what is worth testing here is the key mapping and the
+/// liveness question, and both are wrong in a *dangerous* direction — a broken
+/// prefix strip reaps live calls' reservations, cutting charging on calls that
+/// are still up.
+fn orphaned_ro_session_keys<V>(
+    ro_sessions: &DashMap<String, V>,
+    call_actors: &CallActorStore,
+) -> Vec<String> {
+    ro_sessions
+        .iter()
+        .filter(|entry| {
+            entry
+                .key()
+                .strip_prefix(RO_B2BUA_KEY_PREFIX)
+                .is_some_and(|internal_call_id| !call_actors.contains_call(internal_call_id))
+        })
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+/// Release Ro credit reservations whose B2BUA call is gone (see
+/// [`orphaned_ro_session_keys`]).
+///
+/// Runs on the 500 ms call-lifetime tick rather than the 30 s stale sweep so an
+/// orphan is released inside one `MIN_REAUTH_SECS` window — the point is that
+/// **no** CCR-UPDATE goes out for a call that has already ended, and a 30 s
+/// cadence would let several through.
+///
+/// The `warn!` is the diagnosis, not noise: reaching here at all means a
+/// terminal path removed a call without releasing its reservation, and the call
+/// UUID is what points at which one. `None` for the `Cause-Code` — the AVP is
+/// omitted rather than reported as `0`, because siphon does not know what status
+/// the A-leg was sent from here and "normal end" would be a claim, not a gap.
+fn check_orphaned_ro_sessions(state: &DispatcherState) {
+    // Ro off, or nothing reserved: the overwhelmingly common case, and the
+    // reason this is cheap enough for a 500 ms tick.
+    if state.ro_charger.is_none() || state.ro_sessions.is_empty() {
+        return;
+    }
+    // Collect first, then remove: iterating a DashMap while removing from it on
+    // the same thread can deadlock on a shard lock.
+    let orphans = orphaned_ro_session_keys(&state.ro_sessions, &state.call_actors);
+    if orphans.is_empty() {
+        return;
+    }
+    let Some(charger) = state.ro_charger.as_ref().map(Arc::clone) else {
+        return;
+    };
+    for key in orphans {
+        let Some((key, session)) = state.ro_sessions.remove(&key) else {
+            continue;
+        };
+        warn!(
+            ro_session_key = %key,
+            session_id = %session.session_id(),
+            "ro: credit reservation outlived its call — a B2BUA teardown path \
+             removed the call without releasing it; terminating (no Cause-Code: \
+             the status the A-leg was sent is not knowable from here)"
+        );
+        let charger = Arc::clone(&charger);
+        tokio::spawn(async move {
+            charger.terminate_call(&session, None).await;
+        });
+    }
 }
 
 /// Outcome of a script `call.ro_authorize()` gate — returned to Python as a
@@ -12868,6 +12970,10 @@ fn spawn_ro_b2bua_stop(state: &DispatcherState, internal_call_id: &str, cause_co
     });
 }
 
+/// Spawn ACR-START for a B2BUA call when the A-leg INVITE has been
+/// answered.  No-op when `rf_charger` is unset or auto-emit disabled.
+/// Stores the resulting [`ProxyRfState`] in `state.rf_sessions` keyed
+/// by `b2bua:<internal_call_id>` so the BYE handler can find it.
 fn spawn_rf_b2bua_start(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -15591,7 +15697,11 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
     // `message_guard` is released — `@b2bua.on_route_failure` re-locks the A-leg
     // INVITE, and the teardown would take the call out from under it.
     let mut burned_routes: Vec<(crate::lcr::Route, u16)> = Vec::new();
-    let mut teardown_after_hooks = false;
+    // `Some(status)` = tear the call down after the hooks, carrying the final
+    // status the A-leg was actually sent. The status travels with the flag
+    // because the teardown owes an Ro `Cause-Code` derived from it, and a bare
+    // bool would leave the next arm that sets this to invent one.
+    let mut teardown_after_hooks: Option<u16> = None;
     let mut fail_undialed = false;
 
     match action {
@@ -15808,7 +15918,7 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 // they read the call's A-leg, and an exhausted sequence is
                 // exactly the case where a script most needs to hear which
                 // carriers it went through.
-                teardown_after_hooks = true;
+                teardown_after_hooks = Some(503);
             }
         }
         CallAction::Terminate => {
@@ -15870,7 +15980,19 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
     if fail_undialed {
         b2bua_fail_undialed_call(&call_id, &message_arc, &inbound, state);
     }
-    if teardown_after_hooks {
+    if let Some(status) = teardown_after_hooks {
+        // Release any Ro reservation `call.ro_authorize()` made before the
+        // routing decision. Nothing was ever dialled, so there is no B-leg
+        // status to read and no BYE coming — without this the session outlives
+        // the call it was reserved for and its re-auth timer keeps sending
+        // CCR-UPDATEs for a call that never had a leg. The cause is the status
+        // the A-leg was actually sent, from the same mapping Rf's ACR-STOP uses
+        // so the two interfaces never disagree about why the call ended.
+        spawn_ro_b2bua_stop(
+            state,
+            &call_id,
+            crate::diameter::rf::sip_status_to_cause_code(status),
+        );
         state.call_actors.remove_call(&call_id);
         state.call_event_receivers.remove(&call_id);
     }
@@ -15952,6 +16074,20 @@ fn b2bua_fail_undialed_call(
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, call_id, 503);
     }
+
+    // Release any Ro reservation `call.ro_authorize()` made before the dial that
+    // never happened. This is the sharpest case of the reserve-before-connect
+    // window: the failure handlers above run precisely because the script may be
+    // holding per-call state that only a failure notification releases, and the
+    // engine's own reservation is exactly that. No B-leg was sent, so there is
+    // no branch status to read — the cause is the 503 the A-leg was answered
+    // with, from the same mapping Rf's ACR-STOP uses.
+    spawn_ro_b2bua_stop(
+        state,
+        call_id,
+        crate::diameter::rf::sip_status_to_cause_code(503),
+    );
+
     state.call_actors.remove_call(call_id);
     state.call_event_receivers.remove(call_id);
 }
@@ -22553,6 +22689,20 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
     // closed (603). RFC 3261 §8.1.3.4 leaves the meaning to the code plus the
     // reason phrase, so both go out.
     control_notify_terminated_with_cause(&sip_call_id, reason, Some(code), Some(reason));
+
+    // Release any Ro reservation on the call. A script is free to
+    // `call.ro_authorize()` and then `call.handover(...)`, which parks a call
+    // holding a reservation with no B-leg behind it — and every way out of that
+    // park that is not an answer lands here: the app declined, the handoff
+    // deadline degraded, an unanswered hangup closed it, or `b2bua_route_call`
+    // found no routable carrier. Same pre-answer window as the undialled paths,
+    // and the final non-2xx just sent is the only status there is to report.
+    spawn_ro_b2bua_stop(
+        state,
+        internal_call_id,
+        crate::diameter::rf::sip_status_to_cause_code(code),
+    );
+
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
     true
@@ -36859,5 +37009,120 @@ mod originate_tests {
             None,
             "a non-UTF-8 body is reported by its absence, never mangled onto a JSON rail"
         );
+    }
+}
+
+#[cfg(test)]
+mod ro_orphan_backstop_tests {
+    use super::*;
+
+    fn store_with_call() -> (CallActorStore, String) {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(Leg::new_a_leg(
+            "call-1@192.0.2.1".to_string(),
+            "tag-a".to_string(),
+            "z9hG4bK-a".to_string(),
+            LegTransport {
+                remote_addr: "192.0.2.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        ));
+        (store, call_id)
+    }
+
+    /// A reservation whose call is still up must never be reaped.
+    ///
+    /// This is the dangerous direction: the backstop terminates credit control,
+    /// so a mis-recovered key would cut charging on calls that are still
+    /// connected — a far worse failure than the leak it exists to close.
+    #[test]
+    fn a_live_calls_reservation_is_never_an_orphan() {
+        let (call_actors, call_id) = store_with_call();
+        let ro_sessions: DashMap<String, ()> = DashMap::new();
+        ro_sessions.insert(ro_b2bua_key(&call_id), ());
+
+        assert!(
+            orphaned_ro_session_keys(&ro_sessions, &call_actors).is_empty(),
+            "the call is still in the store — its reservation is live, not orphaned"
+        );
+    }
+
+    /// The leak this closes: a terminal path removed the call and left the
+    /// reservation behind. Nothing else can release it, so the backstop must
+    /// find it, and removing what it finds must drain the store to empty.
+    #[test]
+    fn a_reservation_left_behind_by_a_teardown_is_found_and_drains_the_store() {
+        let (call_actors, call_id) = store_with_call();
+        let ro_sessions: DashMap<String, ()> = DashMap::new();
+        ro_sessions.insert(ro_b2bua_key(&call_id), ());
+
+        call_actors.remove_call(&call_id);
+
+        let orphans = orphaned_ro_session_keys(&ro_sessions, &call_actors);
+        assert_eq!(orphans, vec![ro_b2bua_key(&call_id)]);
+
+        for key in orphans {
+            ro_sessions.remove(&key);
+        }
+        assert!(
+            ro_sessions.is_empty(),
+            "ro_sessions must be empty once the call it was reserved for is gone"
+        );
+    }
+
+    /// Live and gone must be separated within a single pass, not all-or-nothing.
+    #[test]
+    fn only_the_gone_calls_reservation_is_reaped() {
+        let (call_actors, live_call) = store_with_call();
+        let gone_call = call_actors.create_call(Leg::new_a_leg(
+            "call-2@192.0.2.2".to_string(),
+            "tag-b".to_string(),
+            "z9hG4bK-b".to_string(),
+            LegTransport {
+                remote_addr: "192.0.2.2:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        ));
+        let ro_sessions: DashMap<String, ()> = DashMap::new();
+        ro_sessions.insert(ro_b2bua_key(&live_call), ());
+        ro_sessions.insert(ro_b2bua_key(&gone_call), ());
+
+        call_actors.remove_call(&gone_call);
+
+        assert_eq!(
+            orphaned_ro_session_keys(&ro_sessions, &call_actors),
+            vec![ro_b2bua_key(&gone_call)]
+        );
+    }
+
+    /// A session filed under any other prefix is not a B2BUA call's, so the
+    /// call store has no opinion on it and the backstop must not reap it
+    /// against one. Guards a future non-B2BUA Ro user of the same map.
+    #[test]
+    fn a_session_that_is_not_a_b2bua_calls_is_left_alone() {
+        let (call_actors, call_id) = store_with_call();
+        call_actors.remove_call(&call_id);
+
+        let ro_sessions: DashMap<String, ()> = DashMap::new();
+        ro_sessions.insert(format!("ro-sms:{call_id}"), ());
+        ro_sessions.insert(call_id.clone(), ());
+
+        assert!(
+            orphaned_ro_session_keys(&ro_sessions, &call_actors).is_empty(),
+            "neither key carries the B2BUA prefix, so neither names a call actor"
+        );
+    }
+
+    /// The prefix is written by one function and read back by another; a change
+    /// to either that does not change the other silently turns every live
+    /// reservation into an orphan.
+    #[test]
+    fn the_key_written_is_the_key_read_back() {
+        let key = ro_b2bua_key("abc-123");
+        assert_eq!(key.strip_prefix(RO_B2BUA_KEY_PREFIX), Some("abc-123"));
     }
 }

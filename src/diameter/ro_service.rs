@@ -1809,4 +1809,73 @@ mod tests {
             "reported {sum}s across all records but only {total_chargeable}s was chargeable",
         );
     }
+
+    /// A call that reserved credit and then never dialled anything.
+    ///
+    /// `call.ro_authorize()` reserves *before* the B-leg is connected, so a
+    /// routing decision that turns out to be undialable — every gateway group
+    /// of an LCR answer unresolved, or no fork branch that could be sent —
+    /// leaves a live session with no dialogue behind it. Two dispatcher paths
+    /// used to answer the A-leg `503` and drop the call without releasing it,
+    /// and what the OCS then saw was a call that was live and never ended:
+    /// reserved credit never released, and a CCR-UPDATE carrying zero used
+    /// units every re-auth interval, against nobody.
+    ///
+    /// The wire shape a released one has to have: `INITIAL` then `TERMINATION`,
+    /// nothing in between and nothing after, carrying the status the A-leg was
+    /// actually sent and no chargeable time.
+    #[tokio::test]
+    async fn a_reservation_released_before_any_leg_reports_the_status_the_caller_got() {
+        use crate::diameter::rf::sip_status_to_cause_code;
+
+        // A 1-second grant, so the re-auth loop is armed on the shortest
+        // cadence it can run (floored at MIN_REAUTH_SECS) — if the release did
+        // not disarm it, the sleep below is long enough for it to fire.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(1), 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let baseline = service.active_session_count();
+        let session = granted_session(&service).await;
+
+        // No dial, no ring, no answer: straight to the 503 the A-leg gets.
+        service
+            .terminate_call(&session, sip_status_to_cause_code(503))
+            .await;
+        tokio::time::sleep(Duration::from_secs(MIN_REAUTH_SECS as u64 + 2)).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        let types: Vec<Option<u64>> = ccrs
+            .iter()
+            .map(|c| c.get("CC-Request-Type").and_then(|v| v.as_u64()))
+            .collect();
+        assert_eq!(
+            types,
+            vec![Some(1), Some(3)],
+            "the OCS must see exactly INITIAL then TERMINATION — a CCR-UPDATE \
+             here is the re-auth timer billing a call that never had a leg",
+        );
+
+        let terminate = ccr_of_type(&ccrs, 3);
+        assert_eq!(
+            ims_information(&terminate)
+                .and_then(|i| i.get("Cause-Code"))
+                .and_then(|v| v.as_i64()),
+            Some(-503),
+            "the cause is the status the A-leg was answered with, from the same \
+             mapping Rf's ACR-STOP uses, so the two interfaces cannot disagree",
+        );
+        assert_eq!(
+            terminate
+                .get("Multiple-Services-Credit-Control")
+                .and_then(|m| m.get("Used-Service-Unit"))
+                .and_then(|u| u.get("CC-Time"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "nothing was ever connected, so nothing is chargeable",
+        );
+        assert_eq!(
+            service.active_session_count(),
+            baseline,
+            "the reservation must be released, not just reported on",
+        );
+    }
 }
