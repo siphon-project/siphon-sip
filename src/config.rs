@@ -4759,9 +4759,11 @@ mod tests {
     /// directions: an absent `server:` block (the common case — nobody adds one
     /// to get an OPTIONS answered) and a present block that simply does not
     /// mention the key. A `#[serde(default)]` covers the second; only the
-    /// dispatcher's own `is_none_or` covers the first, which is why the
-    /// no-block case is asserted against the same helper the dispatcher uses
-    /// rather than against the struct alone.
+    /// dispatcher's own `map_or(true, …)` on the absent block covers the first,
+    /// which is why the no-block case is asserted through that same shape
+    /// rather than against the struct alone. (`map_or` and not `is_none_or`
+    /// there and here: the latter is stable since 1.82 and the crate's MSRV is
+    /// 1.80.)
     #[test]
     fn auto_options_defaults_on() {
         let with_block = Config::from_str(concat!(
