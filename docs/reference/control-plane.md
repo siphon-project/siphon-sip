@@ -47,8 +47,19 @@ async def handle(call):
         print("transfer rejected:", error.code)  # stable code: not_found, forbidden, …
     await call.hangup()
 
-asyncio.run(client.run())                     # connect, dispatch, reconnect + resync
+async def main():
+    async with client:                        # closes on the way out
+        await client.run()                    # connect, dispatch, reconnect + resync
+
+asyncio.run(main())
 ```
+
+Close the client when the app is done — `async with`, or `close()` explicitly.
+`run()` is driven by a background task, and each handed-over call is dispatched
+from another one; nothing joins them and they outlive the asyncio loop, so an app
+that exits without closing leaves them delivering results into a loop, and then
+an interpreter, that is no longer there. The SDK drops those late callbacks
+rather than crashing on them, but closing means there is nothing to drop.
 
 `Call` verbs: `answer()` / `answer_with(code, …)`, `ring(reason=None)`, `progress()`,
 `reject(code, reason)`, `hangup(reason=None)`, `refer(to)` / `transfer(to)`,

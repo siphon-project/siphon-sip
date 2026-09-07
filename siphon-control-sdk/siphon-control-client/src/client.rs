@@ -80,7 +80,9 @@ impl EventStream {
 type EventCallback = Arc<dyn Fn(ClientEvent) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(crate) struct ClientShared {
@@ -141,7 +143,12 @@ impl ClientShared {
 
     async fn resync_and_reattach(self: &Arc<Self>, core: &Arc<SessionCore>) {
         match core
-            .send_command(None, "resync", serde_json::Value::Null, serde_json::Value::Null)
+            .send_command(
+                None,
+                "resync",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
             .await
         {
             Ok(value) => match serde_json::from_value::<ResyncResult>(value) {
@@ -223,24 +230,31 @@ impl ControlClient {
         target: serde_json::Value,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ControlError> {
-        let core = self
-            .shared
-            .current_session()
-            .ok_or(ControlError::Closed)?;
+        let core = self.shared.current_session().ok_or(ControlError::Closed)?;
         core.send_command(module.map(str::to_string), verb, target, args)
             .await
     }
 
     /// Fetch the registered adapters' verb/event schema (`describe`).
     pub async fn describe(&self) -> Result<serde_json::Value, ControlError> {
-        self.command(None, "describe", serde_json::Value::Null, serde_json::Value::Null)
-            .await
+        self.command(
+            None,
+            "describe",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+        .await
     }
 
     /// Re-enumerate the channels this connection owns (`resync`).
     pub async fn resync(&self) -> Result<Vec<ChannelSnapshot>, ControlError> {
         let value = self
-            .command(None, "resync", serde_json::Value::Null, serde_json::Value::Null)
+            .command(
+                None,
+                "resync",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
             .await?;
         let result: ResyncResult = serde_json::from_value(value)?;
         Ok(result.channels)

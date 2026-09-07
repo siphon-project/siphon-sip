@@ -13,3 +13,11 @@
 # lines still lands here — git can only skip a revision for lines it modified,
 # not for lines it introduced.
 1dba47657ba2f239fc5207a07aecab9abdd4a4dd
+
+# style(control-sdk): format the sdk workspace and gate it in ci (#288)
+# 8 files across the three siphon-control-sdk crates, on rustfmt defaults.
+# The workspace is excluded from the root one, so `cargo fmt --all` at the
+# repo root never reached it and the drift had accumulated unchecked. Layout
+# only: the character multiset either side of the diff is identical once
+# whitespace, braces and commas are excluded.
+974876cdbc050518324d56e96ee9f1ac943de539

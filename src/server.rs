@@ -2031,7 +2031,23 @@ impl SiphonServer {
                                     manager_for_task.register(peer_name.clone(), client);
                                     info!(peer = %peer_name, "Diameter peer connected");
 
-                                    // Forward incoming requests until the peer disconnects
+                                    // Forward incoming requests until the peer disconnects.
+                                    //
+                                    // The awaiting send is deliberate, and is the one
+                                    // shape of it that is correct: this task does nothing
+                                    // else, holds no lock, no handler thread and no read
+                                    // loop, so parking it on a full dispatch queue is
+                                    // backpressure rather than a stall. It resumes in
+                                    // order when capacity frees, losing nothing.
+                                    //
+                                    // What must not happen is that backpressure reaching
+                                    // the peer's *reader* task, which is also what
+                                    // correlates answers — that would fail every
+                                    // in-flight request on the peer at once. It cannot:
+                                    // the reader sheds into `incoming_rx` rather than
+                                    // awaiting it, so a wedged dispatcher degrades to
+                                    // dropped inbound requests (the peer retries) and
+                                    // never to a stalled connection.
                                     let tx_inner = tx.clone();
                                     let peer_for_forward = Arc::clone(&peer);
                                     while let Some(request) = incoming_rx.recv().await {

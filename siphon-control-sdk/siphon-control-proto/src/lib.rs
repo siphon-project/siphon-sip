@@ -391,7 +391,13 @@ mod tests {
     /// bytes stay identical.
     #[test]
     fn substrate_command_serializes_null_target_and_args() {
-        let frame = CommandFrame::new("c-2", None, "resync", serde_json::Value::Null, serde_json::Value::Null);
+        let frame = CommandFrame::new(
+            "c-2",
+            None,
+            "resync",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
             r#"{"id":"c-2","type":"command","verb":"resync","target":null,"args":null}"#
@@ -555,6 +561,9 @@ mod tests {
         let parsed: ResyncResult = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.channels.len(), 1);
         assert_eq!(parsed.channels[0].channel, "ch-live");
-        assert_eq!(parsed.channels[0].vars.get("queue").map(String::as_str), Some("support"));
+        assert_eq!(
+            parsed.channels[0].vars.get("queue").map(String::as_str),
+            Some("support")
+        );
     }
 }

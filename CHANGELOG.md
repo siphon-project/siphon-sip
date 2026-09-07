@@ -7,6 +7,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`echo_delay_search_ms`, `echo_long_tail` and `echo_residual_suppression` on
+  a `media.profiles` entry** (`siphon-rtp` backend only, inert without
+  `echo_cancellation`), and the `siphon-rtp-proto` pin moves `0.4` → `0.5` to
+  reach them.
+
+  `echo_delay_search_ms` is the one to know about. The echo canceller searches
+  for the returning echo within that window of the reference, and the window has
+  to span the whole media path **twice** — it is not an acoustic
+  loudspeaker-to-microphone hop — so a carrier or mobile leg at 100–200 ms each
+  way can put the echo outside it on its own. An echo beyond the window is **not
+  cancelled and nothing reports it**: the estimator commits the tallest peak
+  inside the window whatever that peak is, so the filter adapts against a
+  reference that is not the echo, cancels nothing, and returns no error. On a
+  voice-AI bridge that surfaces two components away, as an agent that hears its
+  own voice on the uplink, correctly calls it speech, and interrupts itself on a
+  caller who said nothing.
+
+  The engine's default window widens from 128 ms to 256 ms with this pin, so a
+  leg whose echo was already inside 128 ms behaves as before, one lock later
+  (~0.8 s → ~1.5 s of far-end-active audio at 16 kHz before the first lock).
+  Range 16–1000 ms, **refused at config load** rather than per offer: the engine
+  rejects an out-of-range value on every offer, which is a node that starts
+  healthy and then fails every call. All three are native `siphon-rtp`
+  extensions with no NG/bencode or rtpproxy equivalent, so setting one on those
+  backends is refused at load the way the existing `echo_cancellation` is.
 - **`siphon_memory_metadata_bytes`** — jemalloc's `stats.metadata`, the last of
   the allocator's own numbers that siphon read but did not export. Without it
   `resident - allocated - retained` is unattributed, and it is the term that
@@ -45,10 +70,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   outbound registration and Path-token routing at once — no group of fields is
   reliably absent across deployments, so boxing a "rare" group was measured and
   rejected as a bad trade.
+- **`ControlClient.close()` / `ControlServer.close()`, and both classes as async
+  context managers** (`async with client: await client.run()`). Closing stops
+  the client and drops the handler, so teardown is deterministic instead of
+  leaving background tasks to be declined later by the guards above. The shipped
+  examples use it.
+- **`server.auto_options`** (default `true`) — set it to `false` and an OPTIONS
+  that no script handler claims is dropped silently rather than answered, so
+  siphon does not confirm its own existence to a probe nobody asked it to
+  answer. The drop is a real one: it reaps the server transaction and its
+  auto-100 timer, because leaving those armed emits RFC 4320 §4.2's synthesized
+  `100 Trying` and tells the scanner exactly what the setting was meant to
+  withhold. Scoped to OPTIONS — every other unhandled method still gets its
+  `405` + `Allow`.
 
 ### Changed
-- **A plain registrar binding costs 641 -> 526 bytes of live data, across 9
-  allocations instead of 8.** A `Contact` is stored, compared and read, never
+- **A plain registrar binding costs 641 -> 526 bytes of live data, across 8
+  allocations instead of 9.** A `Contact` is stored, compared and read, never
   appended to, so `String`'s capacity word was 8 bytes per field carried for the
   life of every contact in the table to describe growth that never happens;
   `call_id`, `sip_instance`, `flow_token` and the RFC 3327 Path set are now
@@ -127,6 +165,154 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   engine that accepted the connection and then stopped draining it wedged the
   reconnect task — and since that task is what re-establishes control, nothing
   was left to recover from it.
+- **A collector that stopped reading its socket silently stopped delivery for
+  everything, not just itself.** Lawful-intercept X2, the HTTP CDR backend and
+  the HEP capture sender each run a *single* delivery task, and each wrote with
+  no timeout. A collector that accepts a connection and then stops draining it —
+  alive, still ACKing, receive window closed — parks that task for the life of
+  the process with the socket still showing as established. For X2 that is IRI
+  delivery stopping for every warrant; for CDR it is every subsequent record
+  being dropped at the producer's queue; for HEP it is capture going dead. All
+  three now time out and reconnect. The CDR HTTP exchange is bounded across
+  connect, write and read together, since the response read was unbounded too.
+- **SRS HTTP uploads now have a client timeout.** This was the only
+  `reqwest::Client` in the tree built without one, and with `upload_audio`
+  enabled it posts a multipart body of recorded audio, so a stalled endpoint held
+  the upload open indefinitely.
+- **Control-plane WebSocket writes are bounded.** A controller that stops reading
+  no longer pins its write task, connection and queue for the life of the
+  process; the connection is closed and the controller can reconnect.
+- **A Diameter peer that stopped reading its socket could park every script
+  handler that touched it, and abort the process.** The peer's writer task wrote
+  with no timeout, fed by a 64-slot channel whose producers enqueued with no
+  timeout. The request timeout on `send_request` covers waiting for the
+  *answer*, not waiting for a slot in front of a stalled writer, so it read as
+  guarded while being the opposite. Every scripting Diameter method — `cx_*`,
+  `sh_*`, `rx_*`, `rf_acr_*`, `s6a_*` and the generic `send_request` — reaches
+  that enqueue from a handler holding a script-executor worker, so a single
+  unresponsive HSS, PCRF or CDF could consume the pool until the executor
+  watchdog aborted the process.
+
+  Writes and enqueues are now bounded: a stalled connection is dropped so
+  callers fail fast instead of queueing behind it, and a request refused at the
+  enqueue no longer leaves its Hop-by-Hop entry behind in the correlation map.
+  The CER/CEA capabilities exchange is bounded on both legs too — it runs before
+  the reader and writer tasks exist, so nothing else covered it, and a peer that
+  connected and then went silent pinned the connect attempt and its reconnect
+  loop indefinitely.
+- **The Diameter reader task no longer parks on a full queue.** It is the only
+  thing that correlates answers to their requests, so an awaiting send of a
+  watchdog answer, a disconnect answer or an inbound request stopped every
+  in-flight request on that peer at once. These now shed with a warning: the
+  peer retries, which is recoverable, whereas a stalled reader is not.
+- **A peer that stopped reading its socket could park every handler thread and
+  abort the process.** The per-connection writer tasks wrote with no timeout,
+  fed by a 64-slot channel whose producers enqueued with no timeout. A peer that
+  accepts a connection and then stops draining it — alive, still ACKing, receive
+  window closed — makes the write block indefinitely, so the writer never
+  returns to its receive, the channel fills, and every producer parks. The
+  `is_closed()` guard in front of the enqueue does not catch it, because a full
+  channel is not a closed one, and `SO_KEEPALIVE` does not either, because
+  probes are suppressed while there is unacknowledged data or the socket is in
+  the persist state, which is exactly this case. On the SIP relay path the
+  producer runs inside a script handler job, so each parked send consumed a
+  script-executor worker until the executor watchdog aborted the process. The
+  bounded connect added earlier covered establishment only; a reused pooled
+  connection never goes near it, which is why the failure was completely silent.
+
+  Writes are now bounded and a stalled connection is dropped rather than kept as
+  something later callers queue behind; enqueues are bounded and shed, which the
+  caller already handles as a transport refusal (RFC 3261 §16.9). Applies to the
+  outbound TCP and TLS pool, accepted TCP/TLS/WS/WSS connections, and SCTP.
+  Sockets also now set `TCP_USER_TIMEOUT`, so the kernel gives up on a peer that
+  stops acknowledging instead of probing a zero window forever.
+- **The outbound pool no longer holds its per-destination establishment lock
+  while handing a message to a connection.** One slow peer stalled every other
+  caller for the same destination behind that lock. Nor does it hold a shard
+  guard of the connection map across the handoff, which blocked unrelated
+  inserts and removes.
+- **An idle SCTP association is now reaped.** Its read task had no idle timeout,
+  unlike every other connection-oriented transport, so a peer that stopped both
+  sending and reading left both tasks and the connection entry alive for the
+  life of the process.
+- **Three S6a scripting methods blocked while still attached to the
+  interpreter, risking an engine-wide deadlock.** `diameter.s6a_air()`,
+  `diameter.s6a_ulr()` and `diameter.s6a_purge_ue()` waited for the HSS answer
+  with a bare `block_in_place` + `block_on` instead of the wrapper every one of
+  their eighteen siblings uses, which releases the interpreter for the blocking
+  window. A handler parked in the bare form never reaches a garbage-collection
+  safe point, so the next thread to allocate cyclic garbage — which Python does
+  constantly — blocks behind the stop-the-world pause. That surfaces either as
+  intermittent handler stalls or, when the only thread that could complete the
+  Diameter call is itself caught in the pause, as a permanent deadlock across
+  every handler in the process. All three now release the interpreter while
+  they wait. A source-level test guards the whole scripting-API namespace
+  against the same drift, including files added later, since the two forms
+  compile and behave identically until the collector happens to run at the
+  wrong moment.
+- **A method no script handler claims is no longer answered `500`, and OPTIONS
+  is answered by the stack.** Every method without a matching
+  `@proxy.on_request` handler got `500 Server Internal Error`, and OPTIONS is
+  such a method for any script whose handlers are method-filtered — which is
+  the shape a script naturally ends up in, because nothing prompts you to write
+  an OPTIONS branch. That made it a bug every registered deployment hit: a
+  registrar qualifies its bindings (Asterisk's `qualify_frequency` and its
+  equivalents) by sending OPTIONS to the registered contact on a timer for the
+  life of the registration, so a siphon registered to a provider answered `500`
+  to a liveness probe every few seconds, forever.
+
+  It stayed invisible because the thing it breaks accepts the wrong answer: a
+  qualifying registrar takes *any* final response as proof of life, so the
+  contact showed `Avail` with a healthy RTT and the only trace was one `WARN`
+  per probe that read as a script-authoring note. A peer with the stricter and
+  entirely reasonable reading — a 5xx is a failed probe — marks the contact down
+  and stops sending calls, while the siphon side still shows a healthy
+  registration.
+
+  An unclaimed OPTIONS is now answered `200` with `Contact` and `Allow` (RFC
+  3261 §11.2), and every other unclaimed method gets `405 Method Not Allowed`
+  with `Allow` (§8.2.1), which is both true and something the sender can act on
+  where `500` was neither. `Allow` advertises what the stack implements rather
+  than what the script routes, deliberately: deriving it from the registered
+  handlers would under-advertise every method the framework dispatches
+  elsewhere — REFER to `@b2bua.on_refer`, CANCEL and ACK to the transaction
+  layer — which is the same under-advertisement that stopped Teams Direct
+  Routing offering REFER once already.
+
+  Both answers are fed to the server transaction the way a script's own reply
+  is, so a retransmitted request is answered from the cached response (RFC 3261
+  §17.2.2) instead of falling into silence — over UDP that lost-probe case is
+  the whole point. The `405` to an unclaimed INVITE now also drives the INVITE
+  server transaction properly, so its ACK is absorbed rather than stranding the
+  transaction.
+
+  **This changes nothing for a script that handles the method itself**, and
+  that includes a catch-all `@proxy.on_request`, which matches every method:
+  the fallback runs only where no handler matched at all. Relaying OPTIONS to
+  the registered UE, or dropping it silently, stays a script decision, and
+  silent-drop semantics are untouched.
+
+- **`siphon-control` (Python SDK) no longer panics in a tokio worker when the
+  interpreter shuts down.** The extension drives Python from detached tokio
+  tasks — a handover is dispatched with `tokio::spawn`, and every awaitable is
+  resolved through the asyncio loop captured when `run()` was called. Nothing
+  joins those tasks and the runtime outlives the interpreter, so one waking
+  after the app had finished re-entered a Python that was no longer there.
+  `Python::attach` is not fallible: pyo3 sees `Py_IsInitialized() == 0` and
+  asserts. The app got a `tokio-rt-worker` panic advising it to call
+  `Python::initialize()` — advice aimed at an embedder, printed after the app's
+  own clean finish, and easily read as the reason it stopped.
+
+  Every re-entry from a Rust-owned task now goes through a lifecycle guard and
+  declines rather than crashing, backed by an `atexit` hook that sets the flag
+  while Python is still fully alive rather than racing finalization. Two
+  neighbours of the same defect went with it: a handover arriving after the
+  asyncio loop has closed is dropped instead of dispatched onto it (the
+  dependency reports that as `RuntimeError: Event loop is closed`, one traceback
+  per call), and a handler cancelled as the loop shuts down is no longer printed
+  as a failure — asyncio does not report a cancelled task that way either, and
+  with calls in flight it turned every clean exit into a wall of
+  `CancelledError`.
 
 ## [1.8.3] — 2026-09-05
 
