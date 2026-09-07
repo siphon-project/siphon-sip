@@ -42,7 +42,7 @@ impl PySipUri {
 impl PySipUri {
     #[getter]
     fn scheme(&self) -> &str {
-        &self.inner.scheme
+        self.inner.scheme.as_str()
     }
 
     #[getter]
@@ -76,9 +76,15 @@ impl PySipUri {
     }
 
     /// Whether this is a tel: URI (scheme == "tel").
+    ///
+    /// Case-insensitive on the token, not `Scheme::is_tel`. The parser only
+    /// produces `Scheme::Tel` for a lowercase `tel:` (RFC 3966 §3); a
+    /// differently-cased one is an `absoluteURI` and lands in `Scheme::Other`
+    /// with its spelling intact. This property has always answered `True` for
+    /// that shape and scripts branch on it, so it keeps doing so.
     #[getter]
     fn is_tel(&self) -> bool {
-        self.inner.scheme.eq_ignore_ascii_case("tel")
+        self.inner.scheme.as_str().eq_ignore_ascii_case("tel")
     }
 
     /// Whether the URI host matches one of the configured local domains.
@@ -122,6 +128,7 @@ impl PySipUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::uri::Scheme;
 
     #[test]
     fn getters_return_uri_fields() {
@@ -223,6 +230,23 @@ mod tests {
         assert_eq!(py_uri.port(), None);
     }
 
+    /// A `TEL:` URI does not parse as RFC 3966 — it falls to the absoluteURI
+    /// branch, so its userpart is not extracted — but the property has always
+    /// reported it as a tel URI and a script's branch on it must not silently
+    /// flip when the scheme becomes an enum.
+    #[test]
+    fn is_tel_is_case_insensitive_on_the_token() {
+        let uri = SipUri {
+            scheme: Scheme::from_token("TEL"),
+            user: None,
+            host: "+12125551234".to_string(),
+            port: None,
+            params: Vec::new(),
+            extras: None,
+        };
+        assert!(PySipUri::new(uri).is_tel());
+    }
+
     #[test]
     fn is_tel_false_for_sip() {
         let uri = SipUri::new("example.com".to_string());
@@ -233,13 +257,12 @@ mod tests {
     #[test]
     fn is_tel_true_for_tel_scheme() {
         let uri = SipUri {
-            scheme: "tel".to_string(),
+            scheme: Scheme::Tel,
             user: Some("+12125551234".to_string()),
             host: String::new(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         };
         let py_uri = PySipUri::new(uri);
         assert!(py_uri.is_tel());

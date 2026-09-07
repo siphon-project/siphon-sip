@@ -238,17 +238,16 @@ fn error_priority(code: u16) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::uri::SipUri;
+    use crate::sip::uri::{Scheme, SipUri};
 
     fn uri(user: &str, host: &str) -> SipUri {
         SipUri {
-            scheme: "sip".to_string(),
+            scheme: Scheme::Sip,
             user: Some(user.to_string()),
             host: host.to_string(),
             port: None,
             params: Vec::new(),
-            headers: Vec::new(),
-            user_params: Vec::new(),
+            extras: None,
         }
     }
 

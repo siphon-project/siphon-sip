@@ -113,16 +113,16 @@ impl StoredContact {
             registered_at_epoch: Some(
                 now_epoch.saturating_sub(contact.registered_at.elapsed().as_secs()),
             ),
-            call_id: contact.call_id.clone(),
+            call_id: contact.call_id.to_string(),
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
             source_transport: contact.source_transport.map(|t| t.as_scheme().to_string()),
-            sip_instance: contact.sip_instance.clone(),
+            sip_instance: contact.sip_instance.as_ref().map(|v| v.to_string()),
             reg_id: contact.reg_id,
-            path: contact.path.clone(),
+            path: contact.path.iter().map(|v| v.to_string()).collect(),
             instance_id: contact.instance_id().map(str::to_string),
             instance_epoch: contact.instance_epoch().map(str::to_string),
-            flow_token: contact.flow_token.clone(),
+            flow_token: contact.flow_token.as_ref().map(|v| v.to_string()),
             inbound_local_addr: contact.inbound_local_addr.map(|a| a.to_string()),
             inbound_connection_id: contact.inbound_connection_id,
             params: contact.params.clone(),
@@ -196,8 +196,8 @@ impl StoredContact {
             uri,
             q: self.q,
             registered_at: self.restored_registered_at(),
-            expires: Duration::from_secs(remaining),
-            call_id: self.call_id.clone(),
+            expires_secs: remaining as u32,
+            call_id: self.call_id.as_str().into(),
             cseq: self.cseq,
             source_addr,
             // An unrecognised scheme from a newer writer degrades to "no
@@ -206,9 +206,9 @@ impl StoredContact {
                 .source_transport
                 .as_deref()
                 .and_then(crate::transport::Transport::from_scheme),
-            sip_instance: self.sip_instance.clone(),
+            sip_instance: self.sip_instance.as_deref().map(Box::from),
             reg_id: self.reg_id,
-            path: self.path.clone(),
+            path: self.path.iter().map(|v| v.as_str().into()).collect(),
             pending: false,
             // Both halves or neither: an id without an epoch cannot identify
             // the process that wrote the binding, which is the only thing the
@@ -219,7 +219,7 @@ impl StoredContact {
                 }
                 _ => None,
             },
-            flow_token: self.flow_token.clone(),
+            flow_token: self.flow_token.as_deref().map(Box::from),
             inbound_local_addr,
             inbound_connection_id: self.inbound_connection_id,
             params: self.params.clone(),
@@ -1498,7 +1498,7 @@ mod tests {
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
             registered_at_epoch: None,
-            call_id: "call-1".to_string(),
+            call_id: "call-1".into(),
             cseq: 1,
             source_addr: None,
             source_transport: None,
@@ -1521,7 +1521,7 @@ mod tests {
         let contact = stored.to_contact().unwrap();
         assert_eq!(contact.uri.to_string(), "sip:alice@10.0.0.1");
         assert_eq!(contact.q, 1.0);
-        assert_eq!(contact.call_id, "call-1");
+        assert_eq!(&*contact.call_id, "call-1");
 
         let back = StoredContact::from_contact(&contact);
         assert_eq!(back.uri, stored.uri);
@@ -1709,7 +1709,7 @@ mod tests {
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
             registered_at_epoch: None,
-            call_id: "c1".to_string(),
+            call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".into()),
             source_transport: Some("udp".to_string()),
@@ -1916,7 +1916,7 @@ mod tests {
                     expires_secs: 3600,
                     expires_at: Some(now_epoch + 3600),
                     registered_at_epoch: None,
-                    call_id: "c1".to_string(),
+                    call_id: "c1".into(),
                     cseq: 1,
                     source_addr: None,
                     source_transport: None,
@@ -1944,7 +1944,7 @@ mod tests {
                         expires_secs: 3600,
                         expires_at: Some(now_epoch + 3600),
                         registered_at_epoch: None,
-                        call_id: "c2".to_string(),
+                        call_id: "c2".into(),
                         cseq: 1,
                         source_addr: None,
                         source_transport: None,
@@ -1965,7 +1965,7 @@ mod tests {
                         expires_secs: 1800,
                         expires_at: Some(now_epoch + 1800),
                         registered_at_epoch: None,
-                        call_id: "c3".to_string(),
+                        call_id: "c3".into(),
                         cseq: 2,
                         source_addr: None,
                         source_transport: None,
@@ -2124,7 +2124,7 @@ mod tests {
                     expires_secs: 0,
                     expires_at: Some(1), // long expired
                     registered_at_epoch: None,
-                    call_id: "c1".to_string(),
+                    call_id: "c1".into(),
                     cseq: 1,
                     source_addr: None,
                     source_transport: None,
@@ -2169,7 +2169,7 @@ mod tests {
                     expires_secs: 3600,
                     expires_at: Some(now_epoch + 3600),
                     registered_at_epoch: None,
-                    call_id: "c1".to_string(),
+                    call_id: "c1".into(),
                     cseq: 1,
                     source_addr: None,
                     source_transport: None,

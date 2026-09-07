@@ -774,14 +774,14 @@ fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contac
             .with_port(5060),
         q: 1.0,
         registered_at: std::time::Instant::now(),
-        expires: std::time::Duration::from_secs(3600),
-        call_id: format!("reg-{host}"),
+        expires_secs: 3600,
+        call_id: format!("reg-{host}").into_boxed_str(),
         cseq: 1,
         source_addr: None,
         source_transport: Some(siphon::transport::Transport::Udp),
         sip_instance: None,
         reg_id: None,
-        path,
+        path: path.into_iter().map(String::into_boxed_str).collect(),
         pending: false,
         instance: None,
         flow_token: None,
@@ -897,7 +897,7 @@ fn registrar_lookup_orders_bindings_newest_first() {
 
     let contacts = registrar.lookup("sip:alice@example.com");
     assert_eq!(contacts.len(), 2);
-    assert_eq!(contacts[0].call_id, "new-handset");
-    assert_eq!(contacts[1].call_id, "old-handset");
+    assert_eq!(&*contacts[0].call_id, "new-handset");
+    assert_eq!(&*contacts[1].call_id, "old-handset");
     assert!(contacts[1].age_seconds() >= contacts[0].age_seconds());
 }
