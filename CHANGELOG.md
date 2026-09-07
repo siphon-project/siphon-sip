@@ -7,6 +7,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`call.local_tag` and `call.set_body()`** — the two things a B2BUA script
+  needed when the media for a call is negotiated by something outside siphon.
+  `call.local_tag` exposes the UAS To-tag siphon minted for the A-leg dialog: it
+  is generated with the dialog, so it reads from the first handler onwards,
+  before any response goes out, and it is the tag stamped on every response the
+  framework sends. It was reachable from nowhere in the script API — the To-tag
+  is a header *parameter*, so `call.to_uri` cannot carry it, and it never
+  appears in the inbound INVITE the script API holds because siphon generates
+  it — which left a controller keying an offer/answer on
+  `(call-id, from-tag, to-tag)` no way to agree with siphon about the dialog it
+  was answering for, and minting its own there desynchronises the media answer
+  from the dialog. `call.set_body(body, content_type=None)` replaces the body of
+  the captured A-leg INVITE, restating `Content-Length` (and `Content-Type` when
+  given), which is the `dial()`-time counterpart of `set_ruri_user()` /
+  `set_from_user()`: the B-leg INVITE is built from that message, so it is the
+  only place to put a rewritten offer. `request.set_body()` has always existed;
+  its `Call` twin did not, so a script that anchored media and then needed to
+  strip or rewrite an attribute before the offer went out had nowhere to put the
+  result. Omitting `content_type` leaves the existing one alone — the body
+  changed, the type did not — and an empty body clears it with
+  `Content-Length: 0` rather than being refused, since a delayed-offer INVITE is
+  a legitimate thing to build.
 - **`echo_delay_search_ms`, `echo_long_tail` and `echo_residual_suppression` on
   a `media.profiles` entry** (`siphon-rtp` backend only, inert without
   `echo_cancellation`), and the `siphon-rtp-proto` pin moves `0.4` → `0.5` to

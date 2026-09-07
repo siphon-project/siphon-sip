@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
 from siphon_sdk.request import _parse_uri, _validate_send_socket
 from siphon_sdk.lcr import Route
+
+# Distinguishes "caller said nothing about local_tag" (generate one, like the
+# engine does when it creates the dialog) from an explicit ``local_tag=None``
+# (simulate a call that is no longer live).
+_UNSET_LOCAL_TAG: Any = object()
 
 
 def _validate_replaces(replaces: Optional[dict]) -> None:
@@ -73,6 +78,7 @@ class Call:
         active_route: Optional[Route] = None,
         route_attempts: Optional[list[dict]] = None,
         flow: Optional[Flow] = None,
+        local_tag: Optional[str] = _UNSET_LOCAL_TAG,
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
         self._from_uri = _parse_uri(from_uri)
@@ -86,6 +92,15 @@ class Call:
         # produces a record carrying the A-leg transport, like the engine does.
         self._transport = transport
         self._body = body
+        # siphon mints the A-leg To-tag with the dialog, so a live call always
+        # has one — default to a generated tag rather than None, or every mock
+        # call would look like a torn-down one. ``local_tag=None`` opts into
+        # exactly that case.
+        self._local_tag = (
+            f"sb-{uuid.uuid4().hex[:12]}"
+            if local_tag is _UNSET_LOCAL_TAG
+            else local_tag
+        )
         self._call_id = call_id or self._id
         self._headers: dict[str, str] = dict(headers) if headers else {}
         self._actions: list[Action] = []
@@ -341,6 +356,39 @@ class Call:
     def body(self) -> Optional[bytes]:
         """SDP body content, or ``None``."""
         return self._body
+
+    @property
+    def local_tag(self) -> Optional[str]:
+        """The UAS To-tag siphon minted for this call's A-leg.
+
+        siphon owns this tag: it is generated with the A-leg dialog, so it is
+        readable from the first handler onwards — before any response goes
+        out — and it is the tag stamped on every response the framework sends,
+        from the ``progress()`` 18x through the ``answer()`` 2xx and on into
+        in-dialog requests.  It does not change for the life of the dialog.
+        ``None`` only when the call is no longer live.
+
+        Read it when something outside siphon has to agree with siphon about
+        the dialog's identity — an external media controller keying an
+        offer/answer on ``(call-id, from-tag, to-tag)`` needs the same to-tag
+        siphon put on the wire, and minting its own there desynchronises the
+        media answer from the dialog.
+
+        Example::
+
+            @b2bua.on_invite
+            def new_call(call):
+                answer_sdp = media_control.answer(
+                    call_id=call.call_id,
+                    to_tag=call.local_tag,
+                    offer=call.body,
+                )
+                call.answer(200, "OK", answer_sdp, "application/sdp")
+
+        In tests, pass ``local_tag=`` to pin it, or ``local_tag=None`` to
+        simulate reading it on a call that has already gone away.
+        """
+        return self._local_tag
 
     @property
     def media(self) -> MediaHandle:
@@ -1511,6 +1559,45 @@ class Call:
     def set_header(self, name: str, value: str) -> None:
         """Set (replace) a header value."""
         self._headers[name] = value
+
+    def set_body(
+        self,
+        body: Union[str, bytes],
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Replace the body of the captured A-leg INVITE.
+
+        Updates ``Content-Type`` and ``Content-Length`` to match.  ``body``
+        accepts ``str`` or ``bytes``.
+
+        The B-leg INVITE is built from this message, so a body set here is the
+        body the callee receives — this is the ``dial()``-time counterpart of
+        :meth:`set_ruri_user` / :meth:`set_from_user` and must be called
+        *before* :meth:`dial` / :meth:`fork`.  The typical use is sanitising
+        the SDP an anchoring step left behind: ``rtpengine.offer(call)``
+        rewrites the captured INVITE in place, and a script that needs to strip
+        or rewrite attributes before the offer goes out has nowhere else to put
+        the result.
+
+        Args:
+            body: Replacement body, ``str`` or ``bytes``.
+            content_type: Content-Type to set.  Omit to leave the existing one
+                in place — the body changed, the type did not.
+
+        Example::
+
+            @b2bua.on_invite
+            async def new_call(call):
+                await rtpengine.offer(call, profile="trunk_to_ims")
+                cleaned = strip_unwanted_attributes(call.body)
+                call.set_body(cleaned, "application/sdp")
+                call.dial("sip:bob@example.com")
+        """
+        payload = body.encode() if isinstance(body, str) else bytes(body)
+        self._body = payload or None
+        if content_type is not None:
+            self.set_header("Content-Type", content_type)
+        self.set_header("Content-Length", str(len(payload)))
 
     def set_charging_param(self, name: str, value: str) -> None:
         """Stash a charging-param for the Rf B2BUA auto-emit hook.
