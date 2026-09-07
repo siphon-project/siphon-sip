@@ -7,6 +7,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`echo_delay_search_ms`, `echo_long_tail` and `echo_residual_suppression` on
+  a `media.profiles` entry** (`siphon-rtp` backend only, inert without
+  `echo_cancellation`), and the `siphon-rtp-proto` pin moves `0.4` → `0.5` to
+  reach them.
+
+  `echo_delay_search_ms` is the one to know about. The echo canceller searches
+  for the returning echo within that window of the reference, and the window has
+  to span the whole media path **twice** — it is not an acoustic
+  loudspeaker-to-microphone hop — so a carrier or mobile leg at 100–200 ms each
+  way can put the echo outside it on its own. An echo beyond the window is **not
+  cancelled and nothing reports it**: the estimator commits the tallest peak
+  inside the window whatever that peak is, so the filter adapts against a
+  reference that is not the echo, cancels nothing, and returns no error. On a
+  voice-AI bridge that surfaces two components away, as an agent that hears its
+  own voice on the uplink, correctly calls it speech, and interrupts itself on a
+  caller who said nothing.
+
+  The engine's default window widens from 128 ms to 256 ms with this pin, so a
+  leg whose echo was already inside 128 ms behaves as before, one lock later
+  (~0.8 s → ~1.5 s of far-end-active audio at 16 kHz before the first lock).
+  Range 16–1000 ms, **refused at config load** rather than per offer: the engine
+  rejects an out-of-range value on every offer, which is a node that starts
+  healthy and then fails every call. All three are native `siphon-rtp`
+  extensions with no NG/bencode or rtpproxy equivalent, so setting one on those
+  backends is refused at load the way the existing `echo_cancellation` is.
 - **`siphon_memory_metadata_bytes`** — jemalloc's `stats.metadata`, the last of
   the allocator's own numbers that siphon read but did not export. Without it
   `resident - allocated - retained` is unattributed, and it is the term that
