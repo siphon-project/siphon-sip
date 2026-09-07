@@ -108,6 +108,9 @@ struct DispatcherState {
     mtu: Option<u16>,
     /// Server header value injected into locally-generated responses.
     server_header: Option<String>,
+    /// Answer an OPTIONS no script handler claims with 200 (`server.auto_options`).
+    /// False drops it silently instead — see the config field for why.
+    auto_options: bool,
     /// User-Agent header value for outbound requests (UAC, registrant).
     #[allow(dead_code)]
     user_agent_header: Option<String>,
@@ -636,6 +639,10 @@ pub async fn run(
             .and_then(|s| s.user_agent_header.clone())
             .unwrap_or(default_server),
     );
+    // `map_or(true, …)` not `is_none_or` — the latter is stable since 1.82 and
+    // the crate's MSRV is 1.80 (clippy::incompatible_msrv gates on it).
+    #[allow(clippy::unnecessary_map_or)]
+    let auto_options = config.server.as_ref().map_or(true, |s| s.auto_options);
 
     let tx_config = config.transaction.as_ref();
     let transaction_timeout = std::time::Duration::from_secs(
@@ -741,6 +748,7 @@ pub async fn run(
         listen_addrs,
         listener_registry,
         server_header,
+        auto_options,
         user_agent_header,
         transaction_timeout,
         call_actors,
@@ -4494,22 +4502,117 @@ fn handle_request(
     let handlers = engine_state.proxy_request_handlers(&method);
 
     if handlers.is_empty() {
-        warn!(method = %method, "no script handler registered");
-        let response = build_response(
+        // No script handler claims this method, and that means two different
+        // things depending on the method, so it gets two different answers.
+        //
+        // OPTIONS is a liveness probe, and answering it is the stack's job
+        // rather than every script's. A registrar qualifies its bindings —
+        // Asterisk's `qualify_frequency` and its equivalents send OPTIONS to the
+        // registered contact on a timer for the life of the registration — so a
+        // siphon that registers to a provider answers one of these forever. RFC
+        // 3261 §11.2 has a UAS respond 200 with its capabilities. Requiring each
+        // deployment to hand-write that handler got it wrong twice over: the
+        // answer was a 5xx (below), and the failure was invisible, because a
+        // qualifying registrar accepts *any* final response as proof of life and
+        // shows the contact reachable with a healthy RTT. A peer with the
+        // stricter reading — 5xx is a failed probe — stops sending calls while
+        // the siphon side still shows a perfectly healthy registration.
+        //
+        // Everything else gets 405 + `Allow` (RFC 3261 §8.2.1: a UAS that does
+        // not support the method "MUST generate a 405 (Method Not Allowed)
+        // response" and "MUST add an Allow header field"). That is what is
+        // actually true and it is something the sender can act on; 500 says this
+        // server is broken, and invites a retry that fails identically.
+        //
+        // `Allow` states what the *stack* implements, not what this script
+        // routes, and the difference is deliberate. Deriving the set from the
+        // registered handlers would under-advertise every method the framework
+        // dispatches somewhere other than `@proxy.on_request` — REFER to
+        // `@b2bua.on_refer`, CANCEL and ACK to the transaction layer — and
+        // under-advertising `Allow` is exactly how Teams Direct Routing stopped
+        // offering REFER once already (see `crate::sip::SUPPORTED_METHODS`).
+        let Some(response) = build_no_handler_response(
             &message,
-            500,
-            "No Script Handler",
+            &method,
+            state.auto_options,
             state.server_header.as_deref(),
-            &[],
-        );
-        send_message_from(
-            response,
+            // Family-matched to the socket the probe arrived on, so a v6 probe
+            // gets a v6 Contact and the exact arrival port.
+            &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+            inbound.local_addr.port(),
             inbound.transport,
-            inbound.remote_addr,
-            inbound.connection_id,
-            Some(inbound.local_addr),
-            state,
-        );
+        ) else {
+            debug!(
+                method = %method,
+                "no script handler and server.auto_options is off — dropping OPTIONS silently"
+            );
+            // Reap the server transaction exactly as the script's own silent
+            // drop does (`RequestAction::None` below): a NIST whose TU never
+            // sends a final response never reaches Terminated (RFC 3261 §17.2
+            // assumes the TU always answers), so it would sit in the map holding
+            // a full SipMessage clone — an unbounded leak under exactly the
+            // probe flood this knob exists for. Dropping the auto-100 timer with
+            // it is what makes the drop actually silent: leave it armed and RFC
+            // 4320 §4.2's synthesized `100 Trying` goes out anyway, which both
+            // strands the transaction and tells the scanner something is
+            // listening — the one thing turning this off was meant to prevent.
+            if let Some(ref key) = server_key {
+                state.transaction_manager.remove(key);
+                state
+                    .timer_wheel
+                    .remove(&format!("{}:{:?}", key, TimerName::Trying100));
+            }
+            return;
+        };
+        if method == "OPTIONS" {
+            debug!(method = %method, "no script handler — answering OPTIONS locally (RFC 3261 §11.2)");
+        } else {
+            warn!(method = %method, "no script handler registered — answering 405");
+        }
+
+        // Feed it to the server transaction the way a script's own reply is fed
+        // (RFC 3261 §17.2.1/§17.2.2), so a retransmitted request is answered
+        // from the cached response instead of falling into silence — over UDP
+        // that lost-probe case is the whole reason this path matters. Falls back
+        // to a direct send when no transaction was created (a topmost Via
+        // carrying no branch).
+        let mut sent_by_transaction = false;
+        if let Some(ref key) = server_key {
+            let event = if key.method == crate::sip::message::Method::Invite {
+                // Only reachable as the 405 — an OPTIONS never keys an IST.
+                ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()))
+            } else {
+                ServerEvent::Nist(NistEvent::TuFinal(response.clone()))
+            };
+            match state.transaction_manager.process_server_event(key, event) {
+                Ok(actions) => {
+                    sent_by_transaction =
+                        actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                    process_timer_actions(
+                        &actions,
+                        key,
+                        Some(inbound.remote_addr),
+                        Some(inbound.transport),
+                        Some(inbound.connection_id),
+                        Some(inbound.local_addr),
+                        state,
+                    );
+                }
+                Err(error) => {
+                    debug!(key = %key, "failed to feed no-handler reply to server transaction: {error}");
+                }
+            }
+        }
+        if !sent_by_transaction {
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+        }
         return;
     }
 
@@ -9655,6 +9758,49 @@ fn augment_options_response(
         );
     }
     advertise_supported_methods(&mut response.headers);
+}
+
+/// The response siphon sends when no `@proxy.on_request` handler claims the
+/// method — see the call site in [`handle_request`] for why this is two answers
+/// and not one.
+///
+/// `OPTIONS` is answered `200` with `Contact` + `Allow` (RFC 3261 §11.2), so a
+/// registrar qualifying its bindings gets a real capability response without
+/// every deployment writing the same handler. Every other method is answered
+/// `405 Method Not Allowed` with `Allow` (RFC 3261 §8.2.1), which is both true
+/// and actionable where the previous `500` was neither.
+///
+/// `None` means send nothing at all, and only an OPTIONS can produce it: an
+/// operator who sets `server.auto_options: false` is saying siphon must not
+/// answer for a script that did not ask it to, and the honest form of that is
+/// silence rather than a different status code — the same reasoning behind the
+/// scripting API's silent drop, which exists so a probe gets no confirmation
+/// that anything is listening. The 405 is not opt-out-able: a method siphon
+/// genuinely will not handle owes the sender that answer.
+///
+/// `via_host` / `via_port` / `transport` describe the socket the request
+/// arrived on, and are only read for the OPTIONS `Contact`.
+fn build_no_handler_response(
+    request: &SipMessage,
+    method: &str,
+    auto_options: bool,
+    server_header: Option<&str>,
+    via_host: &str,
+    via_port: u16,
+    transport: Transport,
+) -> Option<SipMessage> {
+    if method == "OPTIONS" {
+        if !auto_options {
+            return None;
+        }
+        let mut response = build_response(request, 200, "OK", server_header, &[]);
+        augment_options_response(&mut response, via_host, via_port, transport);
+        Some(response)
+    } else {
+        let mut response = build_response(request, 405, "Method Not Allowed", server_header, &[]);
+        advertise_supported_methods(&mut response.headers);
+        Some(response)
+    }
 }
 
 /// The port siphon advertises to the A-leg (Contact) and anchors the A-leg
@@ -31166,6 +31312,176 @@ mod tests {
             response.headers.get("Allow").unwrap(),
             crate::sip::SUPPORTED_METHODS
         );
+    }
+
+    /// A minimal well-formed request, for the no-handler response tests below.
+    fn request_for(method: &str) -> SipMessage {
+        let raw = format!(
+            concat!(
+                "{} sip:probe@siphon.invalid SIP/2.0\r\n",
+                "Via: SIP/2.0/UDP peer.invalid:5060;branch=z9hG4bK-nohandler\r\n",
+                "From: <sip:peer@peer.invalid>;tag=abc\r\n",
+                "To: <sip:probe@siphon.invalid>\r\n",
+                "Call-ID: no-handler-test\r\n",
+                "CSeq: 1 {}\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            ),
+            method, method
+        );
+        crate::sip::parser::parse_sip_message(&raw).unwrap().1
+    }
+
+    #[test]
+    fn no_handler_options_is_answered_200_with_contact_and_allow() {
+        // RFC 3261 §11.2 — a UAS SHOULD answer OPTIONS 200 with its
+        // capabilities. This is the case every registered deployment hits: a
+        // registrar qualifies its bindings on a timer forever, and before this
+        // the probe was answered `500 No Script Handler`. It looked healthy from
+        // both ends because a qualifying registrar takes any final response as
+        // proof of life, so the only symptom was one WARN per probe.
+        let response = build_no_handler_response(
+            &request_for("OPTIONS"),
+            "OPTIONS",
+            true,
+            Some("siphon"),
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .expect("auto_options on must answer");
+        assert_eq!(response.status_code(), Some(200));
+        assert_eq!(
+            response.headers.get("Allow").unwrap(),
+            crate::sip::SUPPORTED_METHODS
+        );
+        // Some peers (Teams Direct Routing) reject an OPTIONS answer carrying
+        // neither Contact nor Record-Route.
+        assert_eq!(
+            response.headers.get("Contact").unwrap(),
+            "<sip:sbc.example.org:5060;transport=udp>"
+        );
+    }
+
+    #[test]
+    fn no_handler_other_methods_are_answered_405_with_allow() {
+        // RFC 3261 §8.2.1 — a UAS that does not support the method MUST answer
+        // 405 and MUST add Allow. 500 said "this server is broken" and invited a
+        // retry that would fail identically.
+        for method in ["INVITE", "REGISTER", "SUBSCRIBE", "FOO"] {
+            let response = build_no_handler_response(
+                &request_for(method),
+                method,
+                true,
+                Some("siphon"),
+                "sbc.example.org",
+                5060,
+                Transport::Udp,
+            )
+            .unwrap_or_else(|| panic!("{method}: only OPTIONS may be dropped"));
+            assert_eq!(response.status_code(), Some(405), "{method}");
+            assert_eq!(
+                response.headers.get("Allow").map(String::as_str),
+                Some(crate::sip::SUPPORTED_METHODS),
+                "{method}: RFC 3261 §8.2.1 makes Allow mandatory on a 405",
+            );
+            // A 405 is not a capability response — no Contact is owed, and
+            // inventing one would put siphon in the peer's route set.
+            assert!(!response.headers.has("Contact"), "{method}");
+        }
+    }
+
+    #[test]
+    fn no_handler_response_echoes_the_dialog_identifiers() {
+        // Whatever the code, the response has to be routable back: Via drives
+        // response routing (§18.2.2) and From/To/Call-ID/CSeq are mandatory in
+        // every response (§8.2.6.2).
+        let response = build_no_handler_response(
+            &request_for("MESSAGE"),
+            "MESSAGE",
+            true,
+            None,
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .expect("a 405 is never dropped");
+        assert_eq!(
+            response.headers.get("Via").unwrap(),
+            "SIP/2.0/UDP peer.invalid:5060;branch=z9hG4bK-nohandler"
+        );
+        assert_eq!(response.headers.get("Call-ID").unwrap(), "no-handler-test");
+        assert_eq!(response.headers.get("CSeq").unwrap(), "1 MESSAGE");
+        assert_eq!(
+            response.headers.get("From").unwrap(),
+            "<sip:peer@peer.invalid>;tag=abc"
+        );
+    }
+
+    #[test]
+    fn no_handler_options_match_is_case_sensitive_on_the_method_token() {
+        // RFC 3261 §7.1: the method is a case-SENSITIVE token, so `Options` is
+        // not `OPTIONS` — it is an unknown method and 405 is the right answer.
+        // Pinned because the parser hands the method through verbatim and a
+        // careless `eq_ignore_ascii_case` here would answer 200 to a method
+        // siphon does not implement.
+        let response = build_no_handler_response(
+            &request_for("Options"),
+            "Options",
+            true,
+            None,
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .expect("an unknown method is answered, not dropped");
+        assert_eq!(response.status_code(), Some(405));
+    }
+
+    #[test]
+    fn auto_options_off_drops_an_unclaimed_options_silently() {
+        // `server.auto_options: false` means siphon must not answer for a script
+        // that never asked it to, and the honest form of that is silence: a
+        // status code — any status code — confirms to a scanner that something
+        // is listening, which is the same reason the scripting API drops rather
+        // than 403s. The operator who turns this off and registers no handler
+        // has chosen an unanswered OPTIONS.
+        assert!(build_no_handler_response(
+            &request_for("OPTIONS"),
+            "OPTIONS",
+            false,
+            Some("siphon"),
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn auto_options_off_does_not_suppress_the_405() {
+        // The knob is scoped to OPTIONS. A method siphon genuinely will not
+        // handle still owes the sender a 405 + Allow (RFC 3261 §8.2.1) — going
+        // silent there would turn one misconfigured script into a peer retrying
+        // into a black hole.
+        for method in ["INVITE", "REGISTER", "MESSAGE"] {
+            let response = build_no_handler_response(
+                &request_for(method),
+                method,
+                false,
+                Some("siphon"),
+                "sbc.example.org",
+                5060,
+                Transport::Udp,
+            )
+            .unwrap_or_else(|| panic!("{method}: auto_options must not gate the 405"));
+            assert_eq!(response.status_code(), Some(405), "{method}");
+            assert_eq!(
+                response.headers.get("Allow").map(String::as_str),
+                Some(crate::sip::SUPPORTED_METHODS),
+                "{method}",
+            );
+        }
     }
 
     #[test]

@@ -17,8 +17,10 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
-    BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload, PlayFinishedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
-    WsBridgeEndedPayload, WsBridgeStartedPayload, WsTeeEndedPayload, WsTeeStartedPayload,
+    BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload,
+    PlayFinishedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload,
+    TransferRequestedPayload, WsBridgeEndedPayload, WsBridgeStartedPayload, WsTeeEndedPayload,
+    WsTeeStartedPayload,
 };
 // The `bridge` verb's teardown policy is an argument of this facade, so it is
 // re-exported here rather than reached for through the proto crate.
@@ -32,7 +34,9 @@ use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -347,10 +351,7 @@ impl CallEvent {
     /// Whether this event ends a bridge this app asked for — exactly one such
     /// event arrives per `bridge`, so this is the signal to stop waiting.
     pub fn is_bridge_final(&self) -> bool {
-        matches!(
-            self.kind,
-            SipEvent::ChannelBridged | SipEvent::BridgeFailed
-        )
+        matches!(self.kind, SipEvent::ChannelBridged | SipEvent::BridgeFailed)
     }
 
     /// The typed [`PlayFinishedPayload`] when this is a
@@ -417,9 +418,7 @@ impl CallEvent {
     pub fn is_unexpected_stream_end(&self) -> bool {
         match self.kind {
             SipEvent::WsTeeEnded => self.ws_tee_ended().is_some_and(|end| end.unexpected),
-            SipEvent::WsBridgeEnded => {
-                self.ws_bridge_ended().is_some_and(|end| end.unexpected)
-            }
+            SipEvent::WsBridgeEnded => self.ws_bridge_ended().is_some_and(|end| end.unexpected),
             _ => false,
         }
     }
@@ -520,10 +519,19 @@ impl Call {
         json!({ "channel": self.inner.channel_id })
     }
 
-    async fn sip(&self, verb: SipVerb, args: serde_json::Value) -> Result<serde_json::Value, ControlError> {
+    async fn sip(
+        &self,
+        verb: SipVerb,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, ControlError> {
         self.inner
             .commander
-            .command(Some(MODULE_SIP.to_string()), verb.as_str().to_string(), self.target(), args)
+            .command(
+                Some(MODULE_SIP.to_string()),
+                verb.as_str().to_string(),
+                self.target(),
+                args,
+            )
             .await
     }
 
@@ -542,9 +550,12 @@ impl Call {
         body: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<(), ControlError> {
-        self.sip(SipVerb::Answer, response_args(code, reason, body, content_type))
-            .await
-            .map(drop)
+        self.sip(
+            SipVerb::Answer,
+            response_args(code, reason, body, content_type),
+        )
+        .await
+        .map(drop)
     }
 
     /// Send `180 Ringing`: alerting only, no early media.
@@ -559,7 +570,9 @@ impl Call {
 
     /// [`Call::ring`] with an explicit reason phrase.
     pub async fn ring_with_reason(&self, reason: &str) -> Result<(), ControlError> {
-        self.sip(SipVerb::Ring, json!({ "reason": reason })).await.map(drop)
+        self.sip(SipVerb::Ring, json!({ "reason": reason }))
+            .await
+            .map(drop)
     }
 
     /// Send a UAS 1xx, optionally opening an early-media path (default
@@ -576,9 +589,12 @@ impl Call {
         body: Option<&str>,
         content_type: Option<&str>,
     ) -> Result<(), ControlError> {
-        self.sip(SipVerb::Progress, response_args(code, reason, body, content_type))
-            .await
-            .map(drop)
+        self.sip(
+            SipVerb::Progress,
+            response_args(code, reason, body, content_type),
+        )
+        .await
+        .map(drop)
     }
 
     /// Send a final non-2xx and tear the call down.
@@ -597,7 +613,9 @@ impl Call {
 
     /// Hang up with a `Reason` header value.
     pub async fn hangup_with_reason(&self, reason: &str) -> Result<(), ControlError> {
-        self.sip(SipVerb::Hangup, json!({ "reason": reason })).await.map(drop)
+        self.sip(SipVerb::Hangup, json!({ "reason": reason }))
+            .await
+            .map(drop)
     }
 
     /// Send an in-dialog REFER on the A-leg (blind transfer).
@@ -609,7 +627,9 @@ impl Call {
     /// `TransferFailed`. [`CallEvent::transfer_outcome`] decodes them and
     /// [`CallEvent::is_transfer_final`] says when to stop waiting.
     pub async fn refer(&self, to: &str) -> Result<(), ControlError> {
-        self.sip(SipVerb::Refer, json!({ "to": to })).await.map(drop)
+        self.sip(SipVerb::Refer, json!({ "to": to }))
+            .await
+            .map(drop)
     }
 
     /// Blind-transfer alias for [`Call::refer`].
@@ -792,7 +812,9 @@ impl Call {
 
     /// Read a header from the stored A-leg INVITE (`None` when absent).
     pub async fn get_header(&self, name: &str) -> Result<Option<String>, ControlError> {
-        let result = self.sip(SipVerb::GetHeader, json!({ "name": name })).await?;
+        let result = self
+            .sip(SipVerb::GetHeader, json!({ "name": name }))
+            .await?;
         Ok(string_value(&result))
     }
 
@@ -809,7 +831,12 @@ impl Call {
     pub async fn set_var(&self, key: &str, value: &str) -> Result<(), ControlError> {
         self.inner
             .commander
-            .command(None, "set_var".to_string(), self.target(), json!({ "key": key, "value": value }))
+            .command(
+                None,
+                "set_var".to_string(),
+                self.target(),
+                json!({ "key": key, "value": value }),
+            )
             .await
             .map(drop)
     }
@@ -819,7 +846,12 @@ impl Call {
         let result = self
             .inner
             .commander
-            .command(None, "get_var".to_string(), self.target(), json!({ "key": key }))
+            .command(
+                None,
+                "get_var".to_string(),
+                self.target(),
+                json!({ "key": key }),
+            )
             .await?;
         Ok(string_value(&result))
     }
@@ -834,11 +866,7 @@ impl Call {
     /// shaping. Resolves once the media backend *accepts* the command; the far-end
     /// playback outcome is not the reply. A call with no anchored media session →
     /// [`ControlError`] with `code == "not_found"`.
-    pub async fn play(
-        &self,
-        source: PlaySource,
-        options: PlayOptions,
-    ) -> Result<(), ControlError> {
+    pub async fn play(&self, source: PlaySource, options: PlayOptions) -> Result<(), ControlError> {
         let mut args = serde_json::Map::new();
         source.insert_into(&mut args);
         options.insert_into(&mut args);
@@ -849,7 +877,8 @@ impl Call {
 
     /// Convenience for [`Call::play`] of a server-side file with default options.
     pub async fn play_file(&self, file: &str) -> Result<(), ControlError> {
-        self.play(PlaySource::file(file), PlayOptions::default()).await
+        self.play(PlaySource::file(file), PlayOptions::default())
+            .await
     }
 
     /// Stop the announcement currently playing on the A-leg media.
@@ -916,7 +945,12 @@ impl Call {
     ) -> Result<serde_json::Value, ControlError> {
         self.inner
             .commander
-            .command(Some(MODULE_SIP.to_string()), verb.to_string(), self.target(), args)
+            .command(
+                Some(MODULE_SIP.to_string()),
+                verb.to_string(),
+                self.target(),
+                args,
+            )
             .await
     }
 
@@ -945,7 +979,10 @@ impl std::fmt::Debug for Call {
 }
 
 fn string_value(result: &serde_json::Value) -> Option<String> {
-    result.get("value").and_then(|value| value.as_str()).map(|value| value.to_string())
+    result
+        .get("value")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn response_args(
@@ -996,7 +1033,8 @@ impl SipFacade {
         F: Fn(Call) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), ControlError>> + Send + 'static,
     {
-        let boxed: CallHandler = Arc::new(move |call| Box::pin(handler(call)) as BoxFuture<'static, _>);
+        let boxed: CallHandler =
+            Arc::new(move |call| Box::pin(handler(call)) as BoxFuture<'static, _>);
         *lock(&self.handler) = Some(boxed);
     }
 
@@ -1391,19 +1429,30 @@ mod tests {
         });
         let call = make_call(recorder.clone());
 
-        call.play(PlaySource::file("/prompts/welcome.wav"), PlayOptions::default())
-            .await
-            .expect("play file ok");
+        call.play(
+            PlaySource::file("/prompts/welcome.wav"),
+            PlayOptions::default(),
+        )
+        .await
+        .expect("play file ok");
         call.play(
             PlaySource::blob(b"hi".to_vec()),
-            PlayOptions { repeat: Some(2), duration_ms: Some(10_000), ..Default::default() },
+            PlayOptions {
+                repeat: Some(2),
+                duration_ms: Some(10_000),
+                ..Default::default()
+            },
         )
         .await
         .expect("play blob ok");
         call.stop().await.expect("stop ok");
         call.dtmf(
             "123#",
-            DtmfOptions { duration_ms: Some(100), volume_dbm0: Some(-8), ..Default::default() },
+            DtmfOptions {
+                duration_ms: Some(100),
+                volume_dbm0: Some(-8),
+                ..Default::default()
+            },
         )
         .await
         .expect("dtmf ok");
@@ -1416,23 +1465,37 @@ mod tests {
 
         let recorded = lock(&recorder.calls).clone();
         let by_verb = |verb: &str| -> serde_json::Value {
-            recorded.iter().find(|call| call.verb == verb).expect("verb recorded").args.clone()
+            recorded
+                .iter()
+                .find(|call| call.verb == verb)
+                .expect("verb recorded")
+                .args
+                .clone()
         };
         // Every media verb rides the sip module against this channel.
         for call in &recorded {
             assert_eq!(call.module.as_deref(), Some("sip"));
             assert_eq!(call.target, json!({ "channel": "ch1" }));
         }
-        assert_eq!(by_verb("play").get("file").and_then(|v| v.as_str()), Some("/prompts/welcome.wav"));
+        assert_eq!(
+            by_verb("play").get("file").and_then(|v| v.as_str()),
+            Some("/prompts/welcome.wav")
+        );
         // A blob is base64-encoded on the wire ("hi" → "aGk=").
         let blob_args: Vec<&serde_json::Value> = recorded
             .iter()
             .filter(|call| call.verb == "play")
             .map(|call| &call.args)
             .collect();
-        assert_eq!(blob_args[1], &json!({ "blob": "aGk=", "repeat": 2, "duration_ms": 10_000 }));
+        assert_eq!(
+            blob_args[1],
+            &json!({ "blob": "aGk=", "repeat": 2, "duration_ms": 10_000 })
+        );
         assert_eq!(by_verb("stop"), json!({}));
-        assert_eq!(by_verb("dtmf"), json!({ "digits": "123#", "duration_ms": 100, "volume_dbm0": -8 }));
+        assert_eq!(
+            by_verb("dtmf"),
+            json!({ "digits": "123#", "duration_ms": 100, "volume_dbm0": -8 })
+        );
         assert_eq!(by_verb("hold"), json!({}));
         assert_eq!(by_verb("unhold"), json!({}));
         assert_eq!(
@@ -1459,7 +1522,9 @@ mod tests {
         )
         .await
         .expect("accept_refer ok");
-        call.reject_refer(603, Some("Decline")).await.expect("reject_refer ok");
+        call.reject_refer(603, Some("Decline"))
+            .await
+            .expect("reject_refer ok");
 
         let recorded = lock(&recorder.calls).clone();
         assert_eq!(recorded[0].verb, "remove_header");
@@ -1477,7 +1542,10 @@ mod tests {
             })
         );
         assert_eq!(recorded[2].verb, "reject_refer");
-        assert_eq!(recorded[2].args, json!({ "code": 603, "reason": "Decline" }));
+        assert_eq!(
+            recorded[2].args,
+            json!({ "code": 603, "reason": "Decline" })
+        );
     }
 
     /// An omitted profile is absent from the frame rather than sent as null, so
@@ -1510,10 +1578,17 @@ mod tests {
         let call = make_call(recorder.clone());
 
         call.ring().await.expect("ring ok");
-        call.ring_with_reason("Alerting").await.expect("ring_with_reason ok");
-        call.progress_with(183, Some("Session Progress"), Some("v=0\r\n"), Some("application/sdp"))
+        call.ring_with_reason("Alerting")
             .await
-            .expect("progress ok");
+            .expect("ring_with_reason ok");
+        call.progress_with(
+            183,
+            Some("Session Progress"),
+            Some("v=0\r\n"),
+            Some("application/sdp"),
+        )
+        .await
+        .expect("progress ok");
 
         let recorded = lock(&recorder.calls).clone();
         assert_eq!(recorded[0].verb, "ring");
@@ -1602,7 +1677,10 @@ mod tests {
         );
         assert_eq!(recorded[1].args, json!({ "with": "ch3" }));
         assert_eq!(recorded[2].verb, "unbridge");
-        assert_eq!(recorded[2].args, json!({ "reason": "supervisor took over" }));
+        assert_eq!(
+            recorded[2].args,
+            json!({ "reason": "supervisor took over" })
+        );
         assert_eq!(recorded[3].args, json!({}));
     }
 
@@ -1610,7 +1688,12 @@ mod tests {
     fn bridge_verdicts_parse_from_frames() {
         let frame = |event: &str, payload: serde_json::Value| {
             CallEvent::from_frame(EventFrame::new(
-                event, "ch1", "ivr-app", "call-uuid", "sip@host", payload,
+                event,
+                "ch1",
+                "ivr-app",
+                "call-uuid",
+                "sip@host",
+                payload,
             ))
         };
 
@@ -1709,7 +1792,12 @@ mod tests {
     fn outbound_transfer_verdicts_parse_from_frames() {
         let frame = |event: &str, payload: serde_json::Value| {
             CallEvent::from_frame(EventFrame::new(
-                event, "ch1", "ivr-app", "call-uuid", "sip@host", payload,
+                event,
+                "ch1",
+                "ivr-app",
+                "call-uuid",
+                "sip@host",
+                payload,
             ))
         };
 

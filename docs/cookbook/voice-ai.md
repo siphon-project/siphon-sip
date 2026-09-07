@@ -70,6 +70,7 @@ media:
         replace: ["origin"]
         noise_suppression: true           # clean the uplink toward the AI
         echo_cancellation: true           # AI downlink is the echo reference
+        echo_delay_search_ms: 400         # widen past a carrier/mobile leg
         ws_vad: true                      # turn boundaries without server-side VAD
         ws_barge_in: true                 # cut playout on the caller's speech edge
         ws_vad_hangover_ms: 300
@@ -79,6 +80,27 @@ media:
 `ws_uri` is deliberately unset in the built-in — there is no sensible default
 endpoint — so it comes from your profile override or, as above, per call from the
 script.
+
+### If the agent interrupts itself, suspect the echo window before the VAD
+
+`echo_cancellation` looks for the returning echo within `echo_delay_search_ms`
+of the reference (default 256 ms), and that window has to span the whole media
+path **twice** — it is not an acoustic loudspeaker-to-microphone hop. A carrier
+or mobile leg runs 100–200 ms each way on its own, which puts a
+mobile-behind-a-carrier echo outside the default window entirely.
+
+An echo beyond the window is **not cancelled, and nothing reports it.** The
+estimator commits the tallest peak inside the window whatever that peak is, so
+the failure is a lock on noise rather than a missing lock: the filter then adapts
+against a reference that is not the echo, cancels nothing, allocates nothing,
+returns no error and logs nothing. From outside, "the estimator never found the
+echo" and "this leg has no echo" look identical.
+
+What you see is two components away: the agent starts a sentence, hears its own
+voice return on the caller's uplink, its VAD correctly calls that speech, and
+barge-in cuts it off — on a caller who said nothing. Widen the window to
+400–600 ms on a carrier-reached leg. It is not free: the estimator's state and
+the audio it needs before its first lock both scale with it.
 
 ## The wire your server sees
 

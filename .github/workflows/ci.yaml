@@ -297,6 +297,80 @@ jobs:
       - name: Clippy (patched to this tree — the released composition)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features ui -- -D warnings
 
+  # ── External control-plane SDKs (siphon-control-sdk/) ──────────────────
+  # `siphon-control-sdk/` is a SEPARATE, excluded standalone workspace with its
+  # own Cargo.lock (the same arrangement as `siphon-bin/`), so every job above
+  # resolves the siphon-sip graph alone and none of them compiles a line of it.
+  # Before this job it appeared in CI exactly once — as a cargo-deny matrix
+  # entry, which reads its lockfile and never builds the code. A break in the
+  # three crates therefore surfaced for the first time in
+  # release-control-sdk.yaml: at tag time, on the one workflow that publishes to
+  # PyPI and crates.io, with the tag already cut.
+  #
+  # Unlike siphon-bin this is NOT a bit-rot guard. Those crates git-dep a
+  # published siphon-sip, so that job can be green against a lib many commits
+  # behind; these three path-dep each other inside this workspace, so the job
+  # compiles THIS checkout and a break fails on the PR that introduced it.
+  #
+  # The Python leg is why an interpreter is installed at all.
+  # `siphon-control` is a PyO3 extension, and `tests/test_smoke.py` drives the
+  # REAL module against an in-process `websockets` stub that speaks the
+  # `siphon-control.v1` handshake — so it needs the extension built and
+  # installed, not merely compiled. It is the only coverage the pyo3 surface
+  # has: the `sdk-tests` job below is scoped to `sdk/` (the `siphon` script-API
+  # mock) and never sees this package.
+  #
+  # One interpreter is deliberate. This job answers "does the extension build,
+  # and does its surface still behave"; release-control-sdk.yaml owns the
+  # per-interpreter matrix (cp314 + cp314t across manylinux, macOS and Windows)
+  # that answers "does it build for everyone we ship to". Duplicating that here
+  # would cost minutes on every PR to re-prove what only the release needs.
+  control-sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: siphon-control-sdk
+    steps:
+      - uses: actions/checkout@v7
+
+      # Before the Rust steps: the `siphon-control` crate links against this
+      # interpreter, so `cargo test` over the workspace needs it present.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: siphon-control-sdk
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The wire-format tests on siphon-control-proto and the client's
+      # integration suite. `--all-targets` above type-checks them; this runs
+      # them.
+      - name: Tests (proto + client)
+        run: cargo test
+
+      # `pip install -e .` and not `maturin develop`: the pyproject already
+      # declares the maturin backend, so pip builds the extension through it,
+      # and it needs no virtualenv of its own — the same shape the `sdk-tests`
+      # job uses for the script-API mock.
+      - name: Build and install the extension
+        working-directory: siphon-control-sdk/siphon-control
+        run: pip install -e . pytest websockets
+
+      - name: Python smoke tests
+        working-directory: siphon-control-sdk/siphon-control
+        run: pytest -v
+
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest

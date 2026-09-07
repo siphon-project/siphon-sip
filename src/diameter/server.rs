@@ -168,10 +168,19 @@ impl ServerHandshake {
             cer.hop_by_hop,
             cer.end_to_end,
         );
-        stream
-            .write_all(&cea)
-            .await
-            .map_err(|error| HandshakeError::Io(error.to_string()))?;
+        // Bounded: this runs before the connection's writer task exists, so
+        // nothing else covers it. A client that connects and then never reads
+        // would otherwise pin this handshake task for the life of the process.
+        match tokio::time::timeout(peer::HANDSHAKE_TIMEOUT, stream.write_all(&cea)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(HandshakeError::Io(error.to_string())),
+            Err(_) => {
+                return Err(HandshakeError::Io(format!(
+                    "CEA write timed out after {:?}",
+                    peer::HANDSHAKE_TIMEOUT
+                )))
+            }
+        }
 
         let admitted = peer::spawn_connection_tasks(conn_config, stream, incoming_tx);
         info!(
@@ -197,7 +206,10 @@ impl ServerHandshake {
     {
         let config = self.config_with_identity(origin_host, origin_realm);
         let cea = peer::build_cea(&config, result_code, hbh, e2e);
-        let _ = stream.write_all(&cea).await;
+        // Bounded, same reason as the accept path. This is the reject leg, so
+        // the result is discarded either way — but discarding it must not mean
+        // waiting forever for a client that never reads its own rejection.
+        let _ = tokio::time::timeout(peer::HANDSHAKE_TIMEOUT, stream.write_all(&cea)).await;
     }
 
     fn config_with_identity(&self, origin_host: &str, origin_realm: &str) -> PeerConfig {
