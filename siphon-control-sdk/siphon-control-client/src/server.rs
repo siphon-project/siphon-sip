@@ -27,8 +27,7 @@ use crate::session::{spawn_session, CommandTransport, EventSink, SessionCore};
 
 /// A sink the server calls for each event, carrying the [`CommandTransport`] of
 /// the connection that produced it (so a facade commands back on the right one).
-pub(crate) type ConnEventSink =
-    Arc<dyn Fn(EventFrame, Arc<dyn CommandTransport>) + Send + Sync>;
+pub(crate) type ConnEventSink = Arc<dyn Fn(EventFrame, Arc<dyn CommandTransport>) + Send + Sync>;
 
 /// How a [`ControlServer`] listens for siphon's per-call dials.
 #[derive(Debug, Clone)]
@@ -56,7 +55,9 @@ impl ServerConfig {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The protocol-agnostic per-call-connect control server.
@@ -157,7 +158,8 @@ async fn drive_accepted(
         let slot = Arc::clone(&core_slot);
         Arc::new(move |frame: EventFrame| {
             if let (Some(core), Some(server_sink)) = (slot.get(), server_sink.as_ref()) {
-                let commander: Arc<dyn CommandTransport> = Arc::clone(core) as Arc<dyn CommandTransport>;
+                let commander: Arc<dyn CommandTransport> =
+                    Arc::clone(core) as Arc<dyn CommandTransport>;
                 server_sink(frame, commander);
             }
         })
