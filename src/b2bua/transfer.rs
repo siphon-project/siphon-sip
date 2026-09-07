@@ -45,6 +45,122 @@ impl fmt::Display for TransferState {
     }
 }
 
+/// What asked for a leg to be replaced.
+///
+/// Both origins drive the *same* machinery — dial the target as a new leg,
+/// promote it into the surviving pair, BYE the leg it replaces — and differ in
+/// exactly one thing: whether a referrer is owed sipfrag NOTIFYs.
+///
+/// That distinction used to be derived from `ReferSubscription::referrer_gone`,
+/// which conflates "no subscription to notify" with "no dialog to BYE". They
+/// coincide for a REFER (the referrer holds both) and come apart for a
+/// siphon-decided replacement, which has no subscription at all and a live leg
+/// that still has to be released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementOrigin {
+    /// An inbound REFER siphon terminated (RFC 3515). The referrer holds an
+    /// implicit subscription and is owed `NOTIFY`s for the transfer's progress.
+    Refer,
+    /// A script or an out-of-process controller decided, with no REFER
+    /// anywhere. Nobody subscribed, so nobody is notified; the replaced leg is
+    /// still BYE'd exactly as it is for a REFER.
+    SiphonInitiated,
+}
+
+impl ReplacementOrigin {
+    /// Whether this replacement owes sipfrag `NOTIFY`s to a referrer.
+    pub fn notifies_referrer(&self) -> bool {
+        matches!(self, ReplacementOrigin::Refer)
+    }
+}
+
+/// Why a `replace_peer` was refused.
+///
+/// Mirrors [`BridgeError`](crate::b2bua::bridge::BridgeError): one variant per
+/// cause with its own stable token, so "that call has not answered" never reads
+/// the same as "a replacement is already running on it". A refusal is always an
+/// error, never a `false` — a caller that cannot tell a rejected replacement
+/// from a completed one will tear down a call that is still up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceError {
+    /// No such call (unknown Call-ID, or it is already gone).
+    UnknownCall {
+        /// The identifier that resolved to nothing.
+        id: String,
+    },
+    /// The call exists but has not answered. A replacement re-INVITEs the
+    /// surviving leg, and RFC 3261 §14 defines the re-INVITE only inside a
+    /// confirmed dialog, so an unanswered call is refused rather than queued.
+    NotAnswered {
+        /// The call that is in the wrong state.
+        id: String,
+        /// Its current state.
+        state: String,
+    },
+    /// The call has no peer leg to replace — a UAS-mode call that answered
+    /// without ever dialling, so there is no second party to swap out.
+    NoPeerLeg {
+        /// The call named.
+        id: String,
+    },
+    /// A replacement (or a REFER-driven transfer) is already in flight on this
+    /// call. Two at once would race for the same promotion slot, and the second
+    /// target's 2xx would promote against a pair the first already changed.
+    ReplacementInFlight {
+        /// The call already replacing a leg.
+        id: String,
+    },
+    /// The target URI does not parse, or no route to it exists.
+    Unroutable {
+        /// The target as given.
+        target: String,
+    },
+    /// The dispatcher is not running, or the INVITE to the target could not be
+    /// put on the wire.
+    Unavailable(String),
+}
+
+impl ReplaceError {
+    /// The stable machine-readable token for this refusal.
+    ///
+    /// One token per cause, shared by both rails: the control adapter renders
+    /// it as the reply's `error.code`, and the in-process verb prefixes its
+    /// `ValueError` with it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ReplaceError::UnknownCall { .. } => "not_found",
+            ReplaceError::NotAnswered { .. }
+            | ReplaceError::NoPeerLeg { .. }
+            | ReplaceError::ReplacementInFlight { .. } => "invalid_state",
+            ReplaceError::Unroutable { .. } => "bad_request",
+            ReplaceError::Unavailable(_) => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for ReplaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplaceError::UnknownCall { id } => write!(formatter, "no such call: {id}"),
+            ReplaceError::NotAnswered { id, state } => {
+                write!(formatter, "call {id} has not answered (state: {state})")
+            }
+            ReplaceError::NoPeerLeg { id } => {
+                write!(formatter, "call {id} has no peer leg to replace")
+            }
+            ReplaceError::ReplacementInFlight { id } => {
+                write!(formatter, "a leg replacement is already in flight on {id}")
+            }
+            ReplaceError::Unroutable { target } => {
+                write!(formatter, "cannot route to replacement target: {target}")
+            }
+            ReplaceError::Unavailable(detail) => write!(formatter, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplaceError {}
+
 /// Context for an active transfer operation on a call.
 #[derive(Debug, Clone)]
 pub struct TransferContext {
@@ -607,5 +723,76 @@ SIP/2.0 200 OK
         // stale one inherited from the dial template.
         assert_eq!(triggered_referred_by(Some("")), None);
         assert_eq!(triggered_referred_by(Some("   ")), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // ReplacementOrigin / ReplaceError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_a_refer_driven_replacement_owes_notifies() {
+        // The whole reason the discriminator exists: a siphon-decided
+        // replacement has no subscriber, so a sipfrag NOTIFY would land on a
+        // peer that never subscribed and draw a 481 — ahead of the BYE, in the
+        // same ordered send unit.
+        assert!(ReplacementOrigin::Refer.notifies_referrer());
+        assert!(!ReplacementOrigin::SiphonInitiated.notifies_referrer());
+    }
+
+    #[test]
+    fn every_replace_refusal_has_its_own_wire_code() {
+        // A caller that cannot tell "already replacing" from "never answered"
+        // retries the wrong thing, so each cause keeps a distinct token — and
+        // "not routable" must not read as an internal failure.
+        assert_eq!(
+            ReplaceError::UnknownCall { id: "c".into() }.code(),
+            "not_found"
+        );
+        assert_eq!(
+            ReplaceError::NotAnswered {
+                id: "c".into(),
+                state: "ringing".into()
+            }
+            .code(),
+            "invalid_state"
+        );
+        assert_eq!(
+            ReplaceError::NoPeerLeg { id: "c".into() }.code(),
+            "invalid_state"
+        );
+        assert_eq!(
+            ReplaceError::ReplacementInFlight { id: "c".into() }.code(),
+            "invalid_state"
+        );
+        assert_eq!(
+            ReplaceError::Unroutable {
+                target: "sip:nowhere".into()
+            }
+            .code(),
+            "bad_request"
+        );
+        assert_eq!(
+            ReplaceError::Unavailable("down".into()).code(),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn replace_refusals_say_which_call_and_which_state() {
+        // The message is what reaches a script author through ValueError, so it
+        // has to name the call and the reason, not just the token.
+        let message = ReplaceError::NotAnswered {
+            id: "call-7@example.com".into(),
+            state: "ringing".into(),
+        }
+        .to_string();
+        assert!(message.contains("call-7@example.com"), "{message}");
+        assert!(message.contains("ringing"), "{message}");
+
+        let message = ReplaceError::ReplacementInFlight {
+            id: "call-8@example.com".into(),
+        }
+        .to_string();
+        assert!(message.contains("already in flight"), "{message}");
     }
 }

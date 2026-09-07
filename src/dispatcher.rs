@@ -938,6 +938,7 @@ pub async fn run(
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);
+                        check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);
                     }
                     _ = cleanup_interval.tick() => {
@@ -14104,6 +14105,75 @@ fn check_b2bua_answer_timeouts(state: &DispatcherState) {
     }
 }
 
+/// Give up on every leg replacement whose dialed target has blown its deadline:
+/// CANCEL that leg and run the ordinary replacement-failure path (`408`).
+///
+/// The sibling of [`check_b2bua_answer_timeouts`] for the calls that one cannot
+/// see. A replacement — a siphon-terminated REFER transfer, or
+/// `b2bua.replace_peer()` — dials its target on a call that is already
+/// `Answered`, and the answer-timeout sweep filters on `Calling`/`Ringing`
+/// precisely so a long answered call is never touched. So a target that sends a
+/// `180` and then goes silent hit nothing at all: the subscription stayed
+/// armed, the response path kept matching its Call-ID, and the surviving party
+/// stayed bridged to a leg that was never going to answer.
+///
+/// The original call survives — [`b2bua_fail_terminated_transfer`] drops the
+/// target leg and clears the replacement, exactly as it does for a target that
+/// answers `486`. The one exception is its own: a call whose replaced leg
+/// already left has nobody for the survivor to talk to, and is released.
+fn check_b2bua_replacement_timeouts(state: &DispatcherState) {
+    let now = std::time::Instant::now();
+    for (call_id, target_call_id) in state.call_actors.take_timed_out_replacements(now) {
+        // Re-resolve the leg under the lock: it may have answered, failed or
+        // been removed between the sweep and here, and the index is only
+        // meaningful for as long as `b_legs` has not shifted.
+        let Some((target_idx, cancel)) = state.call_actors.get_call(&call_id).and_then(|call| {
+            let index = call
+                .b_legs
+                .iter()
+                .position(|leg| leg.dialog.call_id == target_call_id)?;
+            let leg = call.b_legs.get(index)?;
+            state.b2bua_retransmits.disarm_branch(&leg.branch);
+            let cancel = leg.b_leg_invite.as_ref().and_then(|invite| {
+                invite.lock().ok().and_then(|invite| {
+                    build_cancel_from_invite(&invite).map(|message| {
+                        (
+                            message,
+                            leg.transport.transport,
+                            leg.transport.remote_addr,
+                            leg.transport.connection_id,
+                            leg.transport.local_addr,
+                        )
+                    })
+                })
+            });
+            Some((index, cancel))
+        }) else {
+            continue;
+        };
+
+        // RFC 3261 §9.1: the target still has an INVITE server transaction open,
+        // so abandon it rather than walking away and leaving it ringing.
+        if let Some((cancel, transport, destination, connection_id, local_addr)) = cancel {
+            send_message_from(
+                cancel,
+                transport,
+                destination,
+                connection_id,
+                local_addr,
+                state,
+            );
+        }
+
+        warn!(
+            call_id = %call_id,
+            target_leg = %target_call_id,
+            "B2BUA: leg replacement target never answered — cancelling it and keeping the original call"
+        );
+        b2bua_fail_terminated_transfer(&call_id, target_idx, 408, state);
+    }
+}
+
 /// Answer every controlled call's inbound REFER whose decision deadline passed
 /// without the owning control app calling `accept_refer` / `reject_refer` — a
 /// `603 Decline`, matching the no-`@b2bua.on_refer`-handler default. Drains the
@@ -22816,6 +22886,10 @@ fn b2bua_send_outbound_refer(
         crate::b2bua::actor::ReferSubscription {
             on_a_leg,
             siphon_notifies: false,
+            // Subscriber role: siphon sent the REFER, so this is a REFER
+            // subscription in the plain sense. It dials nothing and promotes
+            // nothing, so `origin` never gates anything here.
+            origin: crate::b2bua::transfer::ReplacementOrigin::Refer,
             event_id: cseq,
             notify_cseq: cseq,
             state: crate::b2bua::transfer::TransferState::Trying,
@@ -22823,6 +22897,9 @@ fn b2bua_send_outbound_refer(
             // Subscriber role: siphon is the referrer here, so there is no
             // remote referrer whose departure this could track.
             referrer_gone: false,
+            // No leg of siphon's own is being waited on — the far end runs the
+            // transfer and reports by NOTIFY — so there is nothing to time out.
+            deadline: None,
             media_profile: None,
         },
     );
@@ -22915,6 +22992,128 @@ pub fn b2bua_accept_refer_call(
         state,
     );
     true
+}
+
+/// Replace one leg of an answered B2BUA call with a freshly dialed target,
+/// decided by siphon rather than by a REFER (`b2bua.replace_peer()`).
+///
+/// Runs the machinery a siphon-terminated REFER already runs — dial the target
+/// as a new leg on the same call actor, re-anchor the surviving party's media
+/// onto it, promote it into the surviving pair when it answers, BYE the leg it
+/// replaced — with the one difference that nobody subscribed, so nobody is
+/// notified. That path was reachable only through
+/// [`b2bua_accept_refer_call`], which opens by taking a *pending inbound
+/// REFER* and bails when there is none, so a script or controller that decided
+/// on its own had no way in.
+///
+/// **The replaced leg stays up while the target rings** and is released only
+/// once the target answers, so the surviving party hears the transfer rather
+/// than silence, and a target that rejects leaves the original call exactly as
+/// it was. `timeout_secs` bounds the ring (`0` = no ring policy, just the
+/// `LEG_REPLACEMENT_GUARD_SECS` leak guard).
+///
+/// `replace_a_leg` picks the direction: `false` (the common case) replaces the
+/// callee and keeps the caller, `true` does the reverse. Safe from any thread —
+/// enters the dispatcher runtime, mirroring [`b2bua_accept_refer_call`].
+pub fn b2bua_replace_peer(
+    sip_call_id: &str,
+    target: &str,
+    next_hop: Option<&str>,
+    replace_a_leg: bool,
+    media_profile: Option<&str>,
+    timeout_secs: u32,
+) -> Result<(), crate::b2bua::transfer::ReplaceError> {
+    use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
+
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err(ReplaceError::Unavailable(
+            "B2BUA is not running".to_string(),
+        ));
+    };
+    let state = &control.state;
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        return Err(ReplaceError::UnknownCall {
+            id: sip_call_id.to_string(),
+        });
+    };
+
+    {
+        let Some(call) = state.call_actors.get_call(&internal_call_id) else {
+            return Err(ReplaceError::UnknownCall {
+                id: sip_call_id.to_string(),
+            });
+        };
+        // A replacement re-INVITEs the survivor, and RFC 3261 §14 defines the
+        // re-INVITE only inside a confirmed dialog — so an unanswered call is
+        // refused rather than queued behind its own answer.
+        if call.state != crate::b2bua::actor::CallState::Answered {
+            return Err(ReplaceError::NotAnswered {
+                id: sip_call_id.to_string(),
+                state: format!("{:?}", call.state).to_lowercase(),
+            });
+        }
+        // Two replacements at once would race for the same promotion slot: the
+        // second target's 2xx would promote against a pair the first already
+        // changed. `push_refer_subscription` is a bare push with no dedup, so
+        // this is the only thing standing between a caller and that race.
+        if call
+            .refer_subscriptions
+            .iter()
+            .any(|subscription| subscription.siphon_notifies)
+        {
+            return Err(ReplaceError::ReplacementInFlight {
+                id: sip_call_id.to_string(),
+            });
+        }
+    }
+
+    // Both legs must exist: the one being replaced and the one that survives to
+    // be re-INVITEd. `clone_leg(_, false)` resolves the *winning* B-leg, so this
+    // also rules out a UAS-mode call that answered without ever dialling.
+    if state
+        .call_actors
+        .clone_leg(&internal_call_id, false)
+        .is_none()
+    {
+        return Err(ReplaceError::NoPeerLeg {
+            id: sip_call_id.to_string(),
+        });
+    }
+
+    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
+    // connect); the caller may be on a non-tokio thread (a script handler, a
+    // timer, the control apply task).
+    let _enter = control.runtime.enter();
+
+    let dialed = b2bua_start_leg_replacement(
+        &internal_call_id,
+        replace_a_leg,
+        target,
+        next_hop,
+        // No REFER, so no attended `Replaces` to translate and no `Referred-By`
+        // to carry: this INVITE is triggered by siphon, on nobody's authority
+        // but its own. `event_id` is meaningless for the same reason.
+        None,
+        None,
+        media_profile,
+        0,
+        ReplacementOrigin::SiphonInitiated,
+        timeout_secs,
+        state,
+    );
+    if !dialed {
+        return Err(ReplaceError::Unroutable {
+            target: target.to_string(),
+        });
+    }
+    info!(
+        call_id = %internal_call_id,
+        target = %target,
+        replace_a_leg,
+        timeout_secs,
+        "B2BUA: leg replacement started (siphon-initiated, no REFER)"
+    );
+    Ok(())
 }
 
 /// Reject a *controlled* call's pending inbound REFER — the control-plane
@@ -27847,215 +28046,282 @@ fn b2bua_refer_accept(
                 state,
             );
 
-            // Dial the transfer target as a new leg, then record the
-            // subscription tagged with that leg's Call-ID. The leg's 2xx is
-            // intercepted in the response path (b2bua_complete_terminated_transfer)
-            // to promote it into the surviving pair, BYE the referrer, and send
-            // the terminating sipfrag NOTIFY 200.
-            let a_leg_invite = state
-                .call_actors
-                .get_call(call_id)
-                .and_then(|call| call.a_leg_invite.clone());
-
-            // The transfer target must be offered the SURVIVING party's media,
-            // not the referrer's (the referrer is being dropped). The survivor is
-            // the non-referrer leg.
-            let survivor_on_a_leg = !from_a_leg;
-            let survivor = state.call_actors.clone_leg(call_id, survivor_on_a_leg);
-            let survivor_tag = survivor
-                .as_ref()
-                .and_then(|leg| leg.dialog.remote_tag.clone());
-            let survivor_sdp = survivor.as_ref().and_then(|leg| leg.last_sdp.clone());
-
-            // If the call is media-anchored, re-anchor the survivor on a FRESH
-            // rtpengine call-id so the survivor↔target media stays on the anchor;
-            // the target's INVITE then carries the anchored offer, and this fresh
-            // id is forced onto the target leg's Call-ID so the post-promotion
-            // store key lines up (see b2bua_complete_terminated_transfer). Absent
-            // an anchor, offer the survivor's raw SDP directly.
-            //
-            // The profile is the script's to choose (`accept_refer(profile=…)`),
-            // because only it knows what the surviving pair looks like. Falling
-            // back to the call's own profile is right for a symmetric one and
-            // silently wrong for a direction-bound one: `srtp_to_rtp`'s answer
-            // half exists to talk to the SRTP party, and after the transfer that
-            // party is the one that left, so the survivor gets re-INVITEd with
-            // SRTP it never spoke and answers `m=audio 0`. Warned about here
-            // rather than guessed at.
-            let inherited_profile = state
-                .call_actors
-                .get_call(call_id)
-                .map(|c| c.a_leg.dialog.call_id.clone())
-                .and_then(|key| {
-                    state
-                        .rtpengine_sessions
-                        .as_ref()
-                        .and_then(|store| store.get(&key))
-                        .map(|session| session.profile.clone())
-                });
-            if media_profile.is_none() {
-                if let Some(inherited) = inherited_profile.as_deref() {
-                    if state
-                        .rtpengine_profiles
-                        .as_ref()
-                        .and_then(|registry| registry.get(inherited))
-                        .map(|entry| entry.is_direction_bound())
-                        .unwrap_or(false)
-                    {
-                        warn!(
-                            call_id = %call_id,
-                            profile = %inherited,
-                            "REFER terminate: inheriting a direction-bound media profile for the transfer — its answer half was written for the party being transferred away, so the surviving leg will be re-offered that party's transport. Pass accept_refer(profile=…) naming the profile for the pair that remains."
-                        );
-                    }
-                }
-            }
-            let anchored_profile = media_profile
-                .map(|name| name.to_string())
-                .or(inherited_profile);
-            let fresh_cid = crate::b2bua::actor::generate_call_id();
-            let (target_offer_sdp, forced_cid) = match (
-                &anchored_profile,
-                &survivor_sdp,
-                &survivor_tag,
-            ) {
-                (Some(profile), Some(sdp), Some(tag)) => {
-                    // Anchored: rtpengine-offer the survivor's media on the
-                    // fresh call-id → the SDP to put in the target's INVITE.
-                    match b2bua_transfer_rtpengine_offer(state, &fresh_cid, tag, sdp, profile) {
-                        Some(anchored) => (Some(anchored), Some(fresh_cid.as_str())),
-                        None => {
-                            warn!(call_id = %call_id, "REFER terminate: rtpengine offer for transfer target failed — falling back to raw survivor SDP");
-                            (Some(sdp.clone()), None)
-                        }
-                    }
-                }
-                // Not anchored, but we have the survivor's SDP: offer it raw.
-                (None, Some(sdp), _) => (Some(sdp.clone()), None),
-                // No survivor SDP captured (pre-existing call, or capture
-                // missed): fall back to the referrer's INVITE body below.
-                _ => (None, None),
-            };
-
             // RFC 3892 §3: the triggered INVITE carries the REFER's own
-            // `Referred-By`. Read here, off the REFER, because the dial template
-            // below is the A-leg INVITE and never had it.
+            // `Referred-By`. Read here, off the REFER, because the dial
+            // template is the A-leg INVITE and never had it.
             let referred_by = crate::b2bua::transfer::triggered_referred_by(
                 message.headers.get("Referred-By").map(String::as_str),
             );
-
-            // Clone the A-leg INVITE as the dial template, but point its To at
-            // the Refer-To target (not the original callee). The generic B-leg
-            // builder rewrites only the To host, so without this the dialed
-            // INVITE would carry the original callee's userpart on the target's
-            // host (e.g. To: <sip:bob@carol-host>) — wrong for a transfer
-            // (RFC 3261 §8.1.1.2). Cloning also lets the lock drop before the send.
-            let dial_template = match a_leg_invite {
-                Some(invite_arc) => match invite_arc.lock() {
-                    Ok(invite) => {
-                        let mut template = invite.clone();
-                        template.headers.set("To", format!("<{target_uri}>"));
-                        // A referrer whose own call arrived as a transfer left
-                        // the PREVIOUS referrer's `Referred-By` on this
-                        // template. When the REFER in hand names someone it is
-                        // overwritten by the injection below; when it names
-                        // nobody the stale value has to go, or the target is
-                        // told it was called on the authority of a party that
-                        // has nothing to do with this referral.
-                        if referred_by.is_none() {
-                            template.headers.remove("Referred-By");
-                        }
-                        // Offer the survivor's media (anchored or raw) instead of
-                        // the referrer's; leave the referrer's body only when no
-                        // survivor SDP was available.
-                        if let Some(ref sdp) = target_offer_sdp {
-                            template.body = sdp.clone();
-                            template
-                                .headers
-                                .set("Content-Length", template.body.len().to_string());
-                        } else {
-                            warn!(call_id = %call_id, "REFER terminate: no survivor SDP — dialling target with the referrer's SDP (media may be misaimed until re-negotiated)");
-                        }
-                        Some(template)
-                    }
-                    Err(_) => {
-                        error!(call_id = %call_id, "REFER terminate: a_leg_invite lock poisoned");
-                        None
-                    }
-                },
-                None => {
-                    warn!(call_id = %call_id, "REFER terminate: no stored A-leg INVITE to dial the target");
-                    None
-                }
-            };
-            // Injected verbatim onto the triggered INVITE, after the header
-            // policy. Neither `Replaces` nor `Referred-By` is dialog-defining
-            // for the dialog this INVITE creates — both reference something
-            // outside it — so they are safe in this slot.
-            //
-            // After the policy rather than on the template because neither is a
-            // header of the A-leg dialog that the policy governs the crossing
-            // of: they are properties of the referral, and a default-strip
-            // preset dropping them would break the transfer rather than hide an
-            // identity. No shipped preset strips either.
-            let mut triggered_extra_headers: Vec<(String, String)> = replaces_header
-                .map(|replaces| vec![("Replaces".to_string(), replaces.to_string())])
-                .unwrap_or_default();
-            if let Some(value) = referred_by {
-                triggered_extra_headers.push(("Referred-By".to_string(), value));
-            }
-
-            // `dialed` decides whether the transfer proceeds, so it has to be
-            // what actually happened. It used to be hardcoded `true` next to a
-            // send whose result was discarded, so a target that would not
-            // resolve was treated as dialled and the referrer was BYE'd for a
-            // leg that never existed.
-            let dialed = if let Some(template) = dial_template {
-                b2bua_send_b_leg_invite(
-                    call_id,
-                    target_uri,
-                    next_hop,
-                    None,
-                    &[],
-                    None,
-                    forced_cid,
-                    &template,
-                    None,
-                    None,
-                    None,
-                    None,
-                    triggered_extra_headers.as_slice(),
-                    state,
-                )
-            } else {
-                false
-            };
-
-            // The dialed target is the last b_leg; capture its Call-ID so the
-            // response path matches only THIS leg as the transfer target.
-            let target_leg_call_id = if dialed {
-                state
-                    .call_actors
-                    .get_call(call_id)
-                    .and_then(|call| call.b_legs.last().map(|leg| leg.dialog.call_id.clone()))
-            } else {
-                None
-            };
-            state.call_actors.push_refer_subscription(
+            b2bua_start_leg_replacement(
                 call_id,
-                crate::b2bua::actor::ReferSubscription {
-                    on_a_leg: from_a_leg,
-                    siphon_notifies: true,
-                    event_id: refer_cseq,
-                    notify_cseq: refer_cseq,
-                    state: crate::b2bua::transfer::TransferState::Trying,
-                    target_leg_call_id,
-                    referrer_gone: false,
-                    media_profile: media_profile.map(|name| name.to_string()),
-                },
+                from_a_leg,
+                target_uri,
+                next_hop,
+                replaces_header,
+                referred_by,
+                media_profile,
+                refer_cseq,
+                crate::b2bua::transfer::ReplacementOrigin::Refer,
+                0,
+                state,
             );
         }
     }
+}
+
+/// Upper bound on how long a leg replacement waits for the target it dialed.
+///
+/// Not a ring policy — a leak guard, and the reason one is needed is that a
+/// replacement runs on an **answered** call while the answer-timeout sweep
+/// looks only at `Calling`/`Ringing` ones. Without it a target that sends a
+/// `180` and then nothing at all leaves the replacement armed for the life of
+/// the call, the response path still matching its Call-ID, and the surviving
+/// party bridged to nobody.
+///
+/// Three minutes, for the reason RFC 3261 §16.6 gives Timer C the same shape:
+/// an INVITE that never completes has to be bounded by something, and the
+/// bound has to sit beyond any legitimate ring rather than in the middle of it.
+const LEG_REPLACEMENT_GUARD_SECS: u64 = 180;
+
+/// Dial a replacement for one leg of an answered B2BUA call.
+///
+/// The shared body of both leg replacements: the REFER-terminated transfer
+/// (RFC 3515, `origin: Refer`) and the siphon-decided one
+/// (`b2bua.replace_peer()`, `origin: SiphonInitiated`). Everything that is
+/// genuinely REFER-bound — the `202`, the opening sipfrag NOTIFY, the CSeq that
+/// becomes `event_id`, `Referred-By`, the flow those go back on — stays with
+/// the caller; what is left is pure topology and identical for both.
+///
+/// Offers the **surviving** party's media to the target (the leg being replaced
+/// is the one going away), re-anchoring it on a fresh media call-id when the
+/// call is anchored, and records the replacement tagged with the dialed leg's
+/// Call-ID so the response path matches that leg and no other.
+///
+/// Returns whether the INVITE reached the transport. A `false` means no
+/// replacement is in flight and the call is untouched.
+#[allow(clippy::too_many_arguments)]
+fn b2bua_start_leg_replacement(
+    call_id: &str,
+    replaced_on_a_leg: bool,
+    target_uri: &str,
+    next_hop: Option<&str>,
+    replaces_header: Option<crate::sip::headers::refer::Replaces>,
+    referred_by: Option<String>,
+    media_profile: Option<&str>,
+    event_id: u32,
+    origin: crate::b2bua::transfer::ReplacementOrigin,
+    timeout_secs: u32,
+    state: &DispatcherState,
+) -> bool {
+    // Dial the target as a new leg, then record the replacement tagged with
+    // that leg's Call-ID. The leg's 2xx is intercepted in the response path
+    // (b2bua_complete_terminated_transfer) to promote it into the surviving
+    // pair, BYE the leg it replaces, and — for a REFER — send the terminating
+    // sipfrag NOTIFY 200.
+    let a_leg_invite = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.a_leg_invite.clone());
+
+    // The target must be offered the SURVIVING party's media, not that of
+    // the leg being replaced — that one is going away. The survivor is the
+    // other leg.
+    let survivor_on_a_leg = !replaced_on_a_leg;
+    let survivor = state.call_actors.clone_leg(call_id, survivor_on_a_leg);
+    let survivor_tag = survivor
+        .as_ref()
+        .and_then(|leg| leg.dialog.remote_tag.clone());
+    let survivor_sdp = survivor.as_ref().and_then(|leg| leg.last_sdp.clone());
+
+    // If the call is media-anchored, re-anchor the survivor on a FRESH
+    // rtpengine call-id so the survivor↔target media stays on the anchor;
+    // the target's INVITE then carries the anchored offer, and this fresh
+    // id is forced onto the target leg's Call-ID so the post-promotion
+    // store key lines up (see b2bua_complete_terminated_transfer). Absent
+    // an anchor, offer the survivor's raw SDP directly.
+    //
+    // The profile is the script's to choose (`accept_refer(profile=…)` /
+    // `replace_peer(profile=…)`),
+    // because only it knows what the surviving pair looks like. Falling
+    // back to the call's own profile is right for a symmetric one and
+    // silently wrong for a direction-bound one: `srtp_to_rtp`'s answer
+    // half exists to talk to the SRTP party, and after the transfer that
+    // party is the one that left, so the survivor gets re-INVITEd with
+    // SRTP it never spoke and answers `m=audio 0`. Warned about here
+    // rather than guessed at.
+    let inherited_profile = state
+        .call_actors
+        .get_call(call_id)
+        .map(|c| c.a_leg.dialog.call_id.clone())
+        .and_then(|key| {
+            state
+                .rtpengine_sessions
+                .as_ref()
+                .and_then(|store| store.get(&key))
+                .map(|session| session.profile.clone())
+        });
+    if media_profile.is_none() {
+        if let Some(inherited) = inherited_profile.as_deref() {
+            if state
+                .rtpengine_profiles
+                .as_ref()
+                .and_then(|registry| registry.get(inherited))
+                .map(|entry| entry.is_direction_bound())
+                .unwrap_or(false)
+            {
+                warn!(
+                    call_id = %call_id,
+                    profile = %inherited,
+                    "leg replacement: inheriting a direction-bound media profile — its answer half was written for the party being transferred away, so the surviving leg will be re-offered that party's transport. Pass profile=… naming the profile for the pair that remains."
+                );
+            }
+        }
+    }
+    let anchored_profile = media_profile
+        .map(|name| name.to_string())
+        .or(inherited_profile);
+    let fresh_cid = crate::b2bua::actor::generate_call_id();
+    let (target_offer_sdp, forced_cid) = match (&anchored_profile, &survivor_sdp, &survivor_tag) {
+        (Some(profile), Some(sdp), Some(tag)) => {
+            // Anchored: rtpengine-offer the survivor's media on the
+            // fresh call-id → the SDP to put in the target's INVITE.
+            match b2bua_transfer_rtpengine_offer(state, &fresh_cid, tag, sdp, profile) {
+                Some(anchored) => (Some(anchored), Some(fresh_cid.as_str())),
+                None => {
+                    warn!(call_id = %call_id, "leg replacement: rtpengine offer for the target failed — falling back to raw survivor SDP");
+                    (Some(sdp.clone()), None)
+                }
+            }
+        }
+        // Not anchored, but we have the survivor's SDP: offer it raw.
+        (None, Some(sdp), _) => (Some(sdp.clone()), None),
+        // No survivor SDP captured (pre-existing call, or capture
+        // missed): fall back to the replaced leg's INVITE body below.
+        _ => (None, None),
+    };
+
+    // Clone the A-leg INVITE as the dial template, but point its To at
+    // the Refer-To target (not the original callee). The generic B-leg
+    // builder rewrites only the To host, so without this the dialed
+    // INVITE would carry the original callee's userpart on the target's
+    // host (e.g. To: <sip:bob@carol-host>) — wrong for a transfer
+    // (RFC 3261 §8.1.1.2). Cloning also lets the lock drop before the send.
+    let dial_template = match a_leg_invite {
+        Some(invite_arc) => match invite_arc.lock() {
+            Ok(invite) => {
+                let mut template = invite.clone();
+                template.headers.set("To", format!("<{target_uri}>"));
+                // A call that itself arrived as a transfer left the
+                // PREVIOUS referrer's `Referred-By` on this
+                // template. When the REFER in hand names someone it is
+                // overwritten by the injection below; when it names
+                // nobody the stale value has to go, or the target is
+                // told it was called on the authority of a party that
+                // has nothing to do with this referral.
+                if referred_by.is_none() {
+                    template.headers.remove("Referred-By");
+                }
+                // Offer the survivor's media (anchored or raw) instead of
+                // the replaced leg's; leave that body in place only when
+                // no survivor SDP was available.
+                if let Some(ref sdp) = target_offer_sdp {
+                    template.body = sdp.clone();
+                    template
+                        .headers
+                        .set("Content-Length", template.body.len().to_string());
+                } else {
+                    warn!(call_id = %call_id, "leg replacement: no survivor SDP — dialling the target with the replaced leg's SDP (media may be misaimed until re-negotiated)");
+                }
+                Some(template)
+            }
+            Err(_) => {
+                error!(call_id = %call_id, "leg replacement: a_leg_invite lock poisoned");
+                None
+            }
+        },
+        None => {
+            warn!(call_id = %call_id, "leg replacement: no stored A-leg INVITE to dial the target");
+            None
+        }
+    };
+    // Injected verbatim onto the triggered INVITE, after the header
+    // policy. Neither `Replaces` nor `Referred-By` is dialog-defining
+    // for the dialog this INVITE creates — both reference something
+    // outside it — so they are safe in this slot.
+    //
+    // After the policy rather than on the template because neither is a
+    // header of the A-leg dialog that the policy governs the crossing
+    // of: they are properties of the referral, and a default-strip
+    // preset dropping them would break the transfer rather than hide an
+    // identity. No shipped preset strips either.
+    let mut triggered_extra_headers: Vec<(String, String)> = replaces_header
+        .map(|replaces| vec![("Replaces".to_string(), replaces.to_string())])
+        .unwrap_or_default();
+    if let Some(value) = referred_by {
+        triggered_extra_headers.push(("Referred-By".to_string(), value));
+    }
+
+    // `dialed` decides whether the transfer proceeds, so it has to be
+    // what actually happened. It used to be hardcoded `true` next to a
+    // send whose result was discarded, so a target that would not
+    // resolve was treated as dialled and the replaced leg was BYE'd for
+    // a target that never existed.
+    let dialed = if let Some(template) = dial_template {
+        b2bua_send_b_leg_invite(
+            call_id,
+            target_uri,
+            next_hop,
+            None,
+            &[],
+            None,
+            forced_cid,
+            &template,
+            None,
+            None,
+            None,
+            None,
+            triggered_extra_headers.as_slice(),
+            state,
+        )
+    } else {
+        false
+    };
+
+    // The dialed target is the last b_leg; capture its Call-ID so the
+    // response path matches only THIS leg as the transfer target.
+    let target_leg_call_id = if dialed {
+        state
+            .call_actors
+            .get_call(call_id)
+            .and_then(|call| call.b_legs.last().map(|leg| leg.dialog.call_id.clone()))
+    } else {
+        None
+    };
+    // A target that answers is promoted; a target that never sends a final
+    // response at all is nobody's to sweep, because this call is `Answered`
+    // and the answer-timeout path deliberately looks only at un-answered
+    // calls. Hence a deadline of its own — see `LEG_REPLACEMENT_GUARD_SECS`.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(match timeout_secs {
+            0 => LEG_REPLACEMENT_GUARD_SECS,
+            secs => u64::from(secs).min(LEG_REPLACEMENT_GUARD_SECS),
+        });
+    state.call_actors.push_refer_subscription(
+        call_id,
+        crate::b2bua::actor::ReferSubscription {
+            on_a_leg: replaced_on_a_leg,
+            siphon_notifies: true,
+            origin,
+            event_id,
+            notify_cseq: event_id,
+            state: crate::b2bua::transfer::TransferState::Trying,
+            target_leg_call_id,
+            referrer_gone: false,
+            deadline: dialed.then_some(deadline),
+            media_profile: media_profile.map(|name| name.to_string()),
+        },
+    );
+    dialed
 }
 
 /// Complete a siphon-terminated transfer when the dialed transfer-target leg
@@ -28077,11 +28343,22 @@ fn b2bua_complete_terminated_transfer(
     // everything siphon sends the target from here on takes it from there.
     store_b_leg_route_set_from_2xx(&state.call_actors, call_id, target_idx, response);
 
-    // Snapshot the referrer side + the target (Z) leg before mutating.
-    // `referrer_gone` is set when the referrer already BYE'd this call while the
-    // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
-    // still completes, but there is no dialog left to NOTIFY or BYE.
-    let (referrer_on_a_leg, referrer_gone, event_id, transfer_profile, target_leg) =
+    // Snapshot the replaced side + the target (Z) leg before mutating.
+    //
+    // `referrer_gone` is set when the leg being replaced already BYE'd this
+    // call while the target was still ringing (see
+    // `mark_transfer_referrer_gone`): the replacement still completes, but
+    // there is no dialog left to BYE — nor, for a REFER, to NOTIFY.
+    //
+    // `origin` is the other half of that, and the two are independent. A
+    // `SiphonInitiated` replacement never had a subscription, so it owes no
+    // NOTIFY however alive the replaced leg is; it does still owe the BYE.
+    // Deriving both from `referrer_gone` alone is what made this path
+    // unreachable without a REFER: `true` dropped the BYE on the floor after
+    // `retire_promoted_referrer` had already blacklisted that Call-ID, and
+    // `false` sent a terminated-subscription NOTIFY, with a fabricated
+    // `event_id`, to a peer that never subscribed.
+    let (referrer_on_a_leg, referrer_gone, origin, event_id, transfer_profile, target_leg) =
         match state.call_actors.get_call(call_id) {
             Some(call) => {
                 let Some(subscription) = call
@@ -28094,6 +28371,7 @@ fn b2bua_complete_terminated_transfer(
                 (
                     subscription.on_a_leg,
                     subscription.referrer_gone,
+                    subscription.origin,
                     subscription.event_id,
                     subscription.media_profile.clone(),
                     call.b_legs.get(target_idx).cloned(),
@@ -28173,14 +28451,20 @@ fn b2bua_complete_terminated_transfer(
     // channel and each owns its own socket — so when both target the same flow
     // they travel as one unit (see `OutboundMessage::followups`).
     //
-    // Both are skipped entirely when the referrer already left: its dialog is
-    // gone, so the NOTIFY would draw a 481 and the BYE would be addressed to a
-    // dialog that no longer exists (RFC 3515 §2.4.4).
+    // Both are skipped entirely when the replaced leg already left: its dialog
+    // is gone, so the NOTIFY would draw a 481 and the BYE would be addressed to
+    // a dialog that no longer exists (RFC 3515 §2.4.4).
+    //
+    // The NOTIFY is skipped on a second, independent condition: a
+    // `SiphonInitiated` replacement has no subscription behind it, so there is
+    // no referrer to tell and the sipfrag would arrive at a peer that never
+    // asked for one. The BYE is unconditional on origin — that leg is being
+    // replaced either way.
     let mut referrer_messages: Vec<SipMessage> = Vec::new();
     let mut referrer_route: Option<(Transport, SocketAddr, ConnectionId, Option<SocketAddr>)> =
         None;
 
-    let notify_cseq = if referrer_gone {
+    let notify_cseq = if referrer_gone || !origin.notifies_referrer() {
         None
     } else {
         state
@@ -28369,11 +28653,34 @@ fn b2bua_complete_terminated_transfer(
         }
     }
 
+    // Tell a controlling app the replacement actually landed. The reply to
+    // `replace_peer` said only that the INVITE left the box; everything that
+    // decides whether the call still has two parties — the target answering,
+    // the promotion, the survivor's re-INVITE, the replaced leg's BYE —
+    // happened here. Emitted for a REFER-driven transfer too, which until now
+    // completed with nothing on the control rail at all.
+    if let Some(sip_call_id) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    {
+        control_notify_channel_event(
+            &sip_call_id,
+            "PeerReplaced",
+            serde_json::json!({
+                "target_sip_call_id": cid_new,
+                "replaced_leg_released": !referrer_gone,
+                "origin": if origin.notifies_referrer() { "refer" } else { "siphon" },
+            }),
+        );
+    }
+
     info!(
         call_id = %call_id,
         referrer_on_a_leg,
         referrer_gone,
-        "B2BUA REFER (terminate): transfer completed — target active, referrer released"
+        siphon_initiated = !origin.notifies_referrer(),
+        "B2BUA: leg replacement completed — target active, replaced leg released"
     );
 }
 
@@ -28393,15 +28700,29 @@ fn b2bua_fail_terminated_transfer(
     status_code: u16,
     state: &DispatcherState,
 ) {
-    let Some((referrer_on_a_leg, referrer_gone, event_id)) =
+    // Match the replacement that owns the leg which just failed, not merely the
+    // first notifier subscription on the call. The completion path has always
+    // keyed on `target_leg_call_id`; this one did not, which was survivable
+    // only because one replacement can be in flight at a time.
+    let failed_leg_call_id = state.call_actors.get_call(call_id).and_then(|call| {
+        call.b_legs
+            .get(target_idx)
+            .map(|leg| leg.dialog.call_id.clone())
+    });
+    let Some((referrer_on_a_leg, referrer_gone, origin, event_id)) =
         state.call_actors.get_call(call_id).and_then(|call| {
             call.refer_subscriptions
                 .iter()
-                .find(|subscription| subscription.siphon_notifies)
+                .find(|subscription| {
+                    subscription.siphon_notifies
+                        && (subscription.target_leg_call_id.is_none()
+                            || subscription.target_leg_call_id == failed_leg_call_id)
+                })
                 .map(|subscription| {
                     (
                         subscription.on_a_leg,
                         subscription.referrer_gone,
+                        subscription.origin,
                         subscription.event_id,
                     )
                 })
@@ -28449,9 +28770,18 @@ fn b2bua_fail_terminated_transfer(
         crate::b2bua::transfer::TransferState::Failed { code, reason } => (*code, reason.clone()),
         _ => (status_code, "Failure".to_string()),
     };
-    if let Some(cseq) = state
-        .call_actors
-        .reserve_leg_cseq(call_id, referrer_on_a_leg)
+    // Only a REFER is owed the failure sipfrag. A siphon-decided replacement
+    // has no subscriber, and the leg it was going to replace is still on the
+    // call, so telling it anything would be reporting on a transfer it never
+    // asked for.
+    if let Some(cseq) = origin
+        .notifies_referrer()
+        .then(|| {
+            state
+                .call_actors
+                .reserve_leg_cseq(call_id, referrer_on_a_leg)
+        })
+        .flatten()
     {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
@@ -28498,10 +28828,33 @@ fn b2bua_fail_terminated_transfer(
     state
         .call_actors
         .clear_refer_subscriptions_on_leg(call_id, referrer_on_a_leg);
+
+    // The counterpart of `PeerReplaced`: the original call is intact and still
+    // has both its parties, which is precisely what a controller cannot infer
+    // from the verb's reply. Without it, an app that asked for a replacement
+    // and heard nothing back has no way to distinguish "still ringing" from
+    // "refused" and either waits forever or hangs up a healthy call.
+    if let Some(sip_call_id) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    {
+        control_notify_channel_event(
+            &sip_call_id,
+            "ReplaceFailed",
+            serde_json::json!({
+                "status": status_code,
+                "call_kept": !referrer_gone,
+                "origin": if origin.notifies_referrer() { "refer" } else { "siphon" },
+            }),
+        );
+    }
+
     info!(
         call_id = %call_id,
         status = status_code,
-        "B2BUA REFER (terminate): transfer target failed — referrer call kept, subscription terminated"
+        siphon_initiated = !origin.notifies_referrer(),
+        "B2BUA: leg replacement target failed — original call kept, replacement cleared"
     );
 }
 

@@ -3,7 +3,9 @@
 A B2BUA sits between two dialogs, so when one party asks to transfer the call
 (a `REFER`, RFC 3515 / 3891 / 5589) siphon has to decide what that means for the
 *other* leg. SIPhon gives you three modes, picked per call from a single
-`@b2bua.on_refer` handler:
+`@b2bua.on_refer` handler — plus a fourth shape, `b2bua.replace_peer()`
+([scenario 6](#6-no-refer-at-all-siphon-decides-replace_peer)), for when siphon
+decides to swap a party with no `REFER` on the wire at all:
 
 | Mode | What siphon does | Use it for |
 |---|---|---|
@@ -480,7 +482,72 @@ Pass `replaces=` (a dict with `call_id` / `from_tag` / `to_tag`, optionally
 `early_only`) to originate an **attended** transfer that replaces a specific
 dialog.
 
-## 6. Proxy mode (passthrough)
+## 6. No REFER at all: siphon decides (`replace_peer`)
+
+Every scenario above starts with somebody asking. `replace_peer` is the case
+where nobody does: the IVR has worked out where the caller should go, a
+supervisor takes a call over, a controller moves the caller off an AI and onto a
+human. There is no REFER on the wire in either direction.
+
+It runs the *same* machinery as scenario 1 — dial the target as a new leg on the
+call, re-anchor the surviving party's media onto it, promote it into the pair
+when it answers, BYE the leg it replaced — minus the `202` and the sipfrag
+`NOTIFY`s, because there is no referrer to send them to.
+
+```python
+from siphon import b2bua, rtpengine
+
+@rtpengine.on_dtmf
+def zero_for_an_operator(call_id, from_tag, digit, duration_ms, volume):
+    if digit != "0":
+        return
+    # The caller stays connected to the IVR while the operator's phone rings.
+    b2bua.replace_peer(call_id, "sip:operator@pbx.example", timeout=45)
+```
+
+```
+  Alice (caller)              siphon (B2BUA)            IVR        Operator
+     |  ==== talking ========== |========================|            |
+     |  DTMF "0"                |                        |            |
+     |------------------------->|  replace_peer          |            |
+     |                          |  INVITE --------------------------->|
+     |     (still hears the IVR)|                        |    180     |
+     |                          |<-----------------------------------|
+     |                          |                        |    200 OK  |
+     |                          |<-----------------------------------|
+     |                          |  ACK ------------------------------>|
+     |                          |  BYE ----------------->|            |
+     |                          |  200 OK <--------------|            |
+     |  re-INVITE (new media)   |                        |            |
+     |<-------------------------|                        |            |
+     |  200 OK / ACK            |                        |            |
+     |========================> |==================================>  |
+```
+
+**Why not just hang up and re-INVITE?** That is the obvious hand-rolled version
+and it is worse in two ways that only show up in production. The caller hears
+dead air for the whole ring, because the IVR leg is gone before the operator has
+even been dialled. And the call's own state is left behind: no `@b2bua.on_bye`,
+no CDR, no charging stop, no media release, and a later `terminate` re-BYEs a
+dialog that is already dead. `replace_peer` keeps the replaced leg up until the
+target answers and releases it through the real teardown.
+
+A target that rejects, or never answers before `timeout`, leaves the call
+**exactly as it was** — the IVR is still there and the caller never knew. That is
+also why `timeout` matters: the target here is a human, and "nobody picked up" is
+an ordinary outcome, not an error case.
+
+`replace_a_leg=True` reverses the direction (replace the caller, keep the
+callee). Pass `profile=` when the call is anchored with a direction-bound media
+profile, for the same reason `accept_refer(profile=…)` needs it in scenario 1:
+the inherited profile describes the party that is leaving.
+
+Out of process, the control plane has the same verb — see
+[`replace_peer`](../reference/control-plane.md#swapping-a-party-replace_peer),
+whose outcome arrives as a `PeerReplaced` / `ReplaceFailed` event rather than in
+the reply.
+
+## 7. Proxy mode (passthrough)
 
 Everything above is B2BUA (`@b2bua.*`). In **proxy** mode there is nothing to do:
 a REFER is an ordinary in-dialog request, so as long as siphon record-routed the

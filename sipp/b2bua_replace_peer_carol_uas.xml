@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA replace_peer — Carol, the replacement:
+  Receive INVITE (siphon dials her because the script said so) → 180 → 200 → ACK
+  → (promoted into the pair; bob is BYE'd, alice is re-INVITEd)
+  → send BYE → 200
+
+  Carol is dialed directly by the target URI the script passed, with no REFER
+  behind it — she is an ordinary inbound call as far as she can tell. She then
+  hangs up, and siphon tears down the party she was bridged to, which is what
+  proves the promotion really happened: the BYE has to reach alice, not bob.
+-->
+<scenario name="B2BUA replace_peer Carol UAS">
+
+  <recv request="INVITE" crlf="true" timeout="20000">
+    <action>
+      <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="dialog_callid" />
+      <ereg regexp="tag=([^;>\r\n ]+)" search_in="hdr" header="From:" assign_to="junk,remote_tag" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="From:" assign_to="junk,remote_from_uri" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="Contact:" assign_to="junk,remote_contact" />
+      <!-- The replacement leg is built from the surviving party's own call, so
+           it carries alice's identity rather than a fresh one — this is one
+           call changing shape, not a second call placed alongside it. -->
+      <ereg regexp="alice" search_in="hdr" header="From:" check_it="true"
+            assign_to="from_is_survivor" />
+      <log message="replace_peer INVITE at carol: from_survivor=[$from_is_survivor]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag02[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag02[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=carol 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <pause milliseconds="500" />
+
+  <!-- Carol hangs up; siphon must tear down the party she was promoted onto. -->
+  <send retrans="500">
+    <![CDATA[
+BYE [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:carol@[local_ip]>;tag=[pid]SIPpTag02[call_number]
+To: <[$remote_from_uri]>;tag=[$remote_tag]
+Call-ID: [$dialog_callid]
+CSeq: 1 BYE
+Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-replace-peer-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

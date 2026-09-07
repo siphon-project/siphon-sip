@@ -18,9 +18,9 @@ use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
     BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload,
-    PlayFinishedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload,
-    TransferRequestedPayload, WsBridgeEndedPayload, WsBridgeStartedPayload, WsTeeEndedPayload,
-    WsTeeStartedPayload,
+    PeerReplacedPayload, PlayFinishedPayload, PlayStartedPayload, ReplaceFailedPayload, SipEvent,
+    SipVerb, TransferOutcomePayload, TransferRequestedPayload, WsBridgeEndedPayload,
+    WsBridgeStartedPayload, WsTeeEndedPayload, WsTeeStartedPayload,
 };
 // The `bridge` verb's teardown policy is an argument of this facade, so it is
 // re-exported here rather than reached for through the proto crate.
@@ -352,6 +352,36 @@ impl CallEvent {
     /// event arrives per `bridge`, so this is the signal to stop waiting.
     pub fn is_bridge_final(&self) -> bool {
         matches!(self.kind, SipEvent::ChannelBridged | SipEvent::BridgeFailed)
+    }
+
+    /// The typed [`PeerReplacedPayload`] when this is a
+    /// [`SipEvent::PeerReplaced`] event, else `None`.
+    ///
+    /// This — not the `replace_peer` reply — is when the call changed shape.
+    pub fn peer_replaced(&self) -> Option<PeerReplacedPayload> {
+        if self.kind != SipEvent::PeerReplaced {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`ReplaceFailedPayload`] when this is a
+    /// [`SipEvent::ReplaceFailed`] event, else `None`.
+    ///
+    /// Check `call_kept`: normally the original call is intact and still has
+    /// both parties, so another target can be tried on the same channel.
+    pub fn replace_failed(&self) -> Option<ReplaceFailedPayload> {
+        if self.kind != SipEvent::ReplaceFailed {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether this event ends a replacement this app asked for — exactly one
+    /// such event arrives per `replace_peer`, so this is the signal to stop
+    /// waiting.
+    pub fn is_replace_final(&self) -> bool {
+        matches!(self.kind, SipEvent::PeerReplaced | SipEvent::ReplaceFailed)
     }
 
     /// The typed [`PlayFinishedPayload`] when this is a
@@ -767,6 +797,61 @@ impl Call {
             args["reason"] = json!(reason);
         }
         self.sip(SipVerb::Unbridge, args).await
+    }
+
+    /// Replace one leg of this answered call with a freshly dialed target,
+    /// with no REFER involved.
+    ///
+    /// The transfer siphon already runs for a REFER it terminates, reachable
+    /// because *this app* decided: an IVR that has worked out where the caller
+    /// should go, a controller handing a call from an AI to a human, a
+    /// supervisor take-over. siphon dials `target` as a new leg on the same
+    /// call, re-anchors the surviving party's media onto it, and once the
+    /// target answers promotes it into the surviving pair and BYEs the leg it
+    /// replaced.
+    ///
+    /// **The replaced leg stays up while the target rings**, so the surviving
+    /// party hears ringback rather than silence, and a target that refuses or
+    /// never answers leaves the call exactly as it was.
+    ///
+    /// `replace_a_leg` picks the direction: `None`/`false` replaces the callee
+    /// and keeps the caller, `true` does the reverse. `profile` names the media
+    /// profile for the pair this creates — required when the call is anchored
+    /// with a direction-bound one, whose answer half describes the party that
+    /// is leaving. `timeout` bounds the ring in seconds (`0` = no ring policy,
+    /// only siphon's guard against a target that answers nothing).
+    ///
+    /// Returns as soon as the INVITE is on the wire — the reply is
+    /// `{channel, replacement: "dialing", target}` and says nothing about the
+    /// target. Wait for [`SipEvent::PeerReplaced`] or
+    /// [`SipEvent::ReplaceFailed`] for the outcome; acting on the reply alone
+    /// would tear down a call whose replacement is still ringing.
+    ///
+    /// Refusals are typed: `not_found` (no such call), `invalid_state` (not
+    /// answered, no peer leg, or a replacement already in flight — all worth
+    /// retrying later), `bad_request` (the target will not parse or route).
+    pub async fn replace_peer(
+        &self,
+        target: &str,
+        next_hop: Option<&str>,
+        replace_a_leg: Option<bool>,
+        profile: Option<&str>,
+        timeout: Option<u32>,
+    ) -> Result<serde_json::Value, ControlError> {
+        let mut args = json!({ "target": target });
+        if let Some(next_hop) = next_hop {
+            args["next_hop"] = json!(next_hop);
+        }
+        if let Some(replace_a_leg) = replace_a_leg {
+            args["replace_a_leg"] = json!(replace_a_leg);
+        }
+        if let Some(profile) = profile {
+            args["profile"] = json!(profile);
+        }
+        if let Some(timeout) = timeout {
+            args["timeout"] = json!(timeout);
+        }
+        self.sip(SipVerb::ReplacePeer, args).await
     }
 
     /// Un-park this controlled call and dial the B-leg via siphon's LCR

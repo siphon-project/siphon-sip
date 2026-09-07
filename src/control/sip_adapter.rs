@@ -64,6 +64,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
                 verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode)"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
+                verb("replace_peer", "Replace one leg of this answered call with a freshly dialed target, with no REFER involved: the replaced leg stays up while the target rings and is BYE'd only once it answers. The reply says the INVITE is on the wire, PeerReplaced says the new party is bridged and the old one released (args: target, next_hop, replace_a_leg, profile, timeout)"),
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
@@ -113,6 +114,15 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelBridged".to_string(),
                 "BridgeFailed".to_string(),
                 "ChannelUnbridged".to_string(),
+                // The verdict on a `replace_peer`, for the same reason: the
+                // reply says only that the INVITE to the target left the box.
+                // Whether the target answered, whether the survivor took the
+                // re-INVITE and whether the replaced leg was released all
+                // happen afterwards, so a controller that acts on the reply
+                // alone would tear down a call whose replacement is still
+                // ringing. Exactly one PeerReplaced / ReplaceFailed.
+                "PeerReplaced".to_string(),
+                "ReplaceFailed".to_string(),
                 // The lifecycle of a `stream_start` with `mode: bridge`. A
                 // *tee* dying costs a consumer its copy of the audio; a
                 // *bridge* dying costs the call its far side, so a controller
@@ -198,6 +208,7 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "refer" => refer(&channel, &command.args),
         "accept_refer" => accept_refer(&channel, &command.args),
         "reject_refer" => reject_refer(&channel, &command.args),
+        "replace_peer" => replace_peer(&channel, &command.args),
         "route" => route(&channel, &command.args),
         "set_header" => set_header(&channel, &command.args),
         "remove_header" => remove_header(&channel, &command.args),
@@ -1448,6 +1459,101 @@ fn refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
 /// steers egress, and `mode` (`"terminate"` / `"transparent"`) overrides the
 /// configured `b2bua.default_refer_mode`. No pending REFER (already decided,
 /// timed out, or the call is gone) → `not_found`.
+/// Map a `replace_peer` refusal onto its wire code.
+///
+/// Same discipline as [`bridge_error`]: one code per cause, so a controller can
+/// branch on it. `invalid_state` in particular means "retry later or fix the
+/// call", never "fix the frame" — a replacement refused because one is already
+/// in flight becomes possible again the moment that one settles.
+fn replace_error(error: crate::b2bua::transfer::ReplaceError) -> ControlResult {
+    use crate::b2bua::transfer::ReplaceError;
+    let message = error.to_string();
+    match error {
+        ReplaceError::UnknownCall { .. } => {
+            ControlResult::error(ControlErrorCode::NotFound, message)
+        }
+        ReplaceError::NotAnswered { .. }
+        | ReplaceError::NoPeerLeg { .. }
+        | ReplaceError::ReplacementInFlight { .. } => {
+            ControlResult::error(ControlErrorCode::InvalidState, message)
+        }
+        ReplaceError::Unroutable { .. } => {
+            ControlResult::error(ControlErrorCode::BadRequest, message)
+        }
+        ReplaceError::Unavailable(_) => {
+            ControlResult::error(ControlErrorCode::Unavailable, message)
+        }
+    }
+}
+
+/// `replace_peer` — swap one leg of an answered call for a freshly dialed
+/// target, with no REFER anywhere.
+///
+/// The controller-facing half of the same machinery a siphon-terminated REFER
+/// runs. The reply reports only that the INVITE to the target is on the wire;
+/// the outcome arrives as `PeerReplaced` / `ReplaceFailed`, because the
+/// promotion, the survivor's re-INVITE and the replaced leg's BYE all happen
+/// after the target answers.
+fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let Some(target) = args.get("target").and_then(|value| value.as_str()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "replace_peer requires a target URI",
+        );
+    };
+    if let Err(error) = crate::sip::parser::parse_uri_standalone(target) {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            format!("invalid replacement target: {error}"),
+        );
+    }
+    let next_hop = args.get("next_hop").and_then(|value| value.as_str());
+    if let Some(next_hop) = next_hop {
+        if let Err(error) = crate::sip::parser::parse_uri_standalone(next_hop) {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("invalid next_hop: {error}"),
+            );
+        }
+    }
+    let replace_a_leg = args
+        .get("replace_a_leg")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    // Same requirement as the in-process verb: a direction-bound profile
+    // describes the party that is leaving, so the caller names the one for the
+    // pair that remains.
+    let media_profile = args.get("profile").and_then(|value| value.as_str());
+    let timeout_secs = match args.get("timeout") {
+        None => 30,
+        Some(value) => match value.as_u64() {
+            Some(seconds) if seconds <= u64::from(u32::MAX) => seconds as u32,
+            _ => {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "replace_peer timeout must be a non-negative number of seconds",
+                );
+            }
+        },
+    };
+
+    match crate::dispatcher::b2bua_replace_peer(
+        &channel.sip_call_id,
+        target,
+        next_hop,
+        replace_a_leg,
+        media_profile,
+        timeout_secs,
+    ) {
+        Ok(()) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "replacement": "dialing",
+            "target": target,
+        })),
+        Err(error) => replace_error(error),
+    }
+}
+
 fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let target = args.get("target").and_then(|v| v.as_str());
     if let Some(target) = target {
@@ -2708,6 +2814,134 @@ mod tests {
                 Some(expected),
                 "{error:?}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_peer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replace_peer_without_a_target_is_a_bad_request() {
+        // There is no sensible default target, and guessing one would dial
+        // somebody. A missing argument is the caller's bug, not the call's.
+        let result = replace_peer(&channel(), &serde_json::json!({}));
+        assert_eq!(error_code(&result), Some(ControlErrorCode::BadRequest));
+    }
+
+    #[test]
+    fn replace_peer_validates_both_uris_before_touching_the_call() {
+        // Rejected on the frame, so an unparseable URI never reaches the dial
+        // path and can never be reported as a routing failure of the call.
+        let bad_target = replace_peer(
+            &channel(),
+            &serde_json::json!({ "target": "not a uri at all" }),
+        );
+        assert_eq!(error_code(&bad_target), Some(ControlErrorCode::BadRequest));
+
+        let bad_next_hop = replace_peer(
+            &channel(),
+            &serde_json::json!({
+                "target": "sip:agent@example.com",
+                "next_hop": "not a uri at all",
+            }),
+        );
+        assert_eq!(
+            error_code(&bad_next_hop),
+            Some(ControlErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn replace_peer_rejects_a_nonsense_timeout_rather_than_silently_defaulting() {
+        // A negative or absurd timeout means the caller believes something
+        // about the ring window that is not true; defaulting it would hide
+        // that until a call rang for the wrong length of time.
+        for timeout in [serde_json::json!(-5), serde_json::json!("soon")] {
+            let result = replace_peer(
+                &channel(),
+                &serde_json::json!({ "target": "sip:agent@example.com", "timeout": timeout }),
+            );
+            assert_eq!(
+                error_code(&result),
+                Some(ControlErrorCode::BadRequest),
+                "timeout {timeout} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_peer_without_a_dispatcher_is_unavailable_not_a_hang() {
+        let result = replace_peer(
+            &channel(),
+            &serde_json::json!({ "target": "sip:agent@example.com" }),
+        );
+        assert_eq!(error_code(&result), Some(ControlErrorCode::Unavailable));
+    }
+
+    #[test]
+    fn every_replace_refusal_has_its_own_wire_code_on_the_control_rail() {
+        use crate::b2bua::transfer::ReplaceError;
+        // The controller branches on these: `not_found` means the call is gone,
+        // `invalid_state` means try again later, `bad_request` means fix the
+        // frame. Collapsing any two of them makes a retry loop wrong.
+        let cases = [
+            (
+                ReplaceError::UnknownCall { id: "c".into() },
+                ControlErrorCode::NotFound,
+            ),
+            (
+                ReplaceError::NotAnswered {
+                    id: "c".into(),
+                    state: "ringing".into(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                ReplaceError::NoPeerLeg { id: "c".into() },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                ReplaceError::ReplacementInFlight { id: "c".into() },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                ReplaceError::Unroutable {
+                    target: "sip:nowhere".into(),
+                },
+                ControlErrorCode::BadRequest,
+            ),
+            (
+                ReplaceError::Unavailable("down".into()),
+                ControlErrorCode::Unavailable,
+            ),
+        ];
+        for (error, expected) in cases {
+            let described = error.to_string();
+            assert_eq!(
+                error_code(&replace_error(error)),
+                Some(expected),
+                "wrong wire code for: {described}"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_lists_replace_peer_and_both_of_its_outcomes() {
+        // The verb's reply says only that the INVITE left the box, so an app
+        // that cannot see the outcome events cannot tell a replacement that
+        // completed from one still ringing.
+        let schema = SipControlAdapter::new().describe();
+        assert!(
+            schema
+                .verbs
+                .iter()
+                .any(|entry| entry.verb == "replace_peer"),
+            "replace_peer missing from the verb schema"
+        );
+        let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
+        for expected in ["PeerReplaced", "ReplaceFailed"] {
+            assert!(events.contains(&expected), "missing event {expected}");
         }
     }
 

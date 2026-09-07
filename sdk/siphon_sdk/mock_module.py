@@ -643,6 +643,8 @@ class MockB2bua:
         self.bridges: list[dict] = []
         # Records b2bua.unbridge(...) calls for test assertions.
         self.unbridges: list[dict] = []
+        # Records b2bua.replace_peer(...) calls for test assertions.
+        self.replacements: list[dict] = []
         # Sequence counter for the mock's synthetic originated Call-IDs.
         self._originate_seq = 0
 
@@ -653,6 +655,7 @@ class MockB2bua:
         self.originates.clear()
         self.bridges.clear()
         self.unbridges.clear()
+        self.replacements.clear()
         self._originate_seq = 0
 
     def originate(
@@ -876,6 +879,84 @@ class MockB2bua:
                 await b2bua.unbridge(call.call_id, reason="supervisor split")
         """
         self.unbridges.append({"call_id": call_id, "reason": reason})
+        return True
+
+    def replace_peer(
+        self,
+        call_id: str,
+        target: str,
+        next_hop: Optional[str] = None,
+        replace_a_leg: bool = False,
+        profile: Optional[str] = None,
+        timeout: int = 30,
+    ) -> bool:
+        """Replace one leg of an answered call with a freshly dialed target.
+
+        The transfer siphon already knows how to run, reachable without a remote
+        party asking for it: it dials ``target`` as a new leg on the same call,
+        re-anchors the surviving party's media onto it, and when the target
+        answers promotes it into the surviving pair and BYEs the leg it
+        replaced. An IVR that has decided where a caller goes next, a controller
+        handing a call from an AI to a human, a supervisor take-over.
+
+        The replaced leg **stays up while the target rings** and is released
+        only once the target answers, so the surviving party hears ringback
+        rather than silence, and a target that rejects or never answers leaves
+        the original call exactly as it was.
+
+        Acts now, so it works from an out-of-band event callback
+        (``@rtpengine.on_dtmf``), a timer, or a normal handler.
+
+        Args:
+            call_id: SIP Call-ID of the call to act on.
+            target: URI to dial as the replacement.
+            next_hop: steer egress without reshaping the R-URI, as on
+                :meth:`siphon_sdk.call.Call.dial`.
+            replace_a_leg: False (default) replaces the callee and keeps the
+                caller; True does the reverse.
+            profile: media profile for the pair this creates. Required when the
+                call is anchored with a direction-bound profile — the inherited
+                one describes the party that is leaving.
+            timeout: seconds to wait for the target to answer. 0 means no ring
+                policy, only siphon's guard against a target that never answers.
+
+        Returns:
+            bool: True once the INVITE is on the wire. It does not wait for the
+            target — the replacement completes later, and ``@b2bua.on_bye``
+            fires for the leg that was replaced.
+
+        Raises:
+            ValueError: the call is unknown, has not answered, has no peer leg
+                to replace, already has a replacement in flight, or the target
+                will not route. The message is prefixed with the stable cause
+                token (``not_found``, ``invalid_state``, ``bad_request``,
+                ``unavailable``).
+
+        In the mock, records every argument on ``replacements`` and returns
+        True; an empty ``target`` raises ``ValueError`` the way live siphon
+        refuses one it cannot route. Inspect via
+        ``siphon.get_b2bua().replacements``.
+
+        Usage::
+
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "0":
+                    b2bua.replace_peer(call_id, "sip:operator@pbx.example",
+                                       timeout=45)
+        """
+        if not target or not str(target).strip():
+            raise ValueError("bad_request: cannot route to replacement target: ")
+        self.replacements.append(
+            {
+                "call_id": call_id,
+                "target": target,
+                "next_hop": next_hop,
+                "replace_a_leg": replace_a_leg,
+                "profile": profile,
+                "timeout": timeout,
+            }
+        )
         return True
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:

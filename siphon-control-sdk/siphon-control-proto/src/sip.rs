@@ -53,6 +53,12 @@ pub enum SipVerb {
     /// Break a bridge. Both legs stay answered, owned and held — neither is
     /// hung up.
     Unbridge,
+    /// Replace one leg of an answered call with a freshly dialed target, with
+    /// no REFER involved. The replaced leg stays up while the target rings and
+    /// is BYE'd only once it answers, so a refusal leaves the call untouched.
+    /// The reply says the INVITE is on the wire; the outcome arrives as
+    /// [`SipEvent::PeerReplaced`] / [`SipEvent::ReplaceFailed`].
+    ReplacePeer,
     /// Un-park the call and dial the B-leg via LCR sequential failover.
     Route,
     /// Set a header on the stored A-leg INVITE.
@@ -92,6 +98,7 @@ impl SipVerb {
             SipVerb::RejectRefer => "reject_refer",
             SipVerb::Bridge => "bridge",
             SipVerb::Unbridge => "unbridge",
+            SipVerb::ReplacePeer => "replace_peer",
             SipVerb::Route => "route",
             SipVerb::SetHeader => "set_header",
             SipVerb::RemoveHeader => "remove_header",
@@ -169,6 +176,15 @@ pub enum SipEvent {
     /// A bridge was broken ([`ChannelUnbridgedPayload`]). Both legs stay
     /// answered, owned and held — neither was hung up. Pushed on both channels.
     ChannelUnbridged,
+    /// A leg replacement completed ([`PeerReplacedPayload`]): the target
+    /// answered, was promoted into the surviving pair, and the leg it replaced
+    /// was released. The verb's reply reported only that the INVITE had left
+    /// the box, so this is when the call actually changed shape.
+    PeerReplaced,
+    /// A leg replacement did not happen ([`ReplaceFailedPayload`]) — the target
+    /// refused, or never answered. The original call is intact and still has
+    /// both its parties, unless the leg being replaced had already hung up.
+    ReplaceFailed,
     /// A playback on this channel ended ([`PlayFinishedPayload`]). Emitted for
     /// every accepted `play`, which over this rail is always fire-and-forget —
     /// so this, not the accept's estimated duration, is when the prompt is
@@ -212,6 +228,8 @@ impl SipEvent {
             SipEvent::ChannelBridged => "ChannelBridged",
             SipEvent::BridgeFailed => "BridgeFailed",
             SipEvent::ChannelUnbridged => "ChannelUnbridged",
+            SipEvent::PeerReplaced => "PeerReplaced",
+            SipEvent::ReplaceFailed => "ReplaceFailed",
             SipEvent::PlayFinished => "PlayFinished",
             SipEvent::WsTeeStarted => "WsTeeStarted",
             SipEvent::WsTeeEnded => "WsTeeEnded",
@@ -238,6 +256,8 @@ impl From<&str> for SipEvent {
             "ChannelBridged" => SipEvent::ChannelBridged,
             "BridgeFailed" => SipEvent::BridgeFailed,
             "ChannelUnbridged" => SipEvent::ChannelUnbridged,
+            "PeerReplaced" => SipEvent::PeerReplaced,
+            "ReplaceFailed" => SipEvent::ReplaceFailed,
             "PlayFinished" => SipEvent::PlayFinished,
             "WsTeeStarted" => SipEvent::WsTeeStarted,
             "WsTeeEnded" => SipEvent::WsTeeEnded,
@@ -683,6 +703,50 @@ pub struct ChannelUnbridgedPayload {
     pub reason: String,
 }
 
+/// The `payload` of a [`SipEvent::PeerReplaced`] event: a leg replacement
+/// completed.
+///
+/// The target answered, was promoted into the surviving pair, and the leg it
+/// replaced was released. The `replace_peer` reply reported only that the
+/// INVITE had left the box — this is when the call actually changed shape, so
+/// it is what a controller tracking who is on the call should act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReplacedPayload {
+    /// The SIP `Call-ID` of the leg that took the replaced party's place.
+    #[serde(default)]
+    pub target_sip_call_id: String,
+    /// Whether the replaced leg was actually BYE'd. `false` when it had already
+    /// hung up while the target was still ringing — the replacement completed
+    /// regardless, there was simply nothing left to release.
+    #[serde(default)]
+    pub replaced_leg_released: bool,
+    /// `"refer"` when a remote party asked for this (an inbound REFER siphon
+    /// terminated), `"siphon"` when a script or a controller decided.
+    #[serde(default)]
+    pub origin: String,
+}
+
+/// The `payload` of a [`SipEvent::ReplaceFailed`] event: a leg replacement did
+/// not happen.
+///
+/// Branch on `call_kept`: normally the original call is intact and still has
+/// both its parties, so the right response is to leave it alone or try another
+/// target. It is `false` only when the leg being replaced had already hung up,
+/// which leaves the survivor with nobody and the call released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceFailedPayload {
+    /// The SIP status the target refused with, or `408` when it never answered
+    /// at all and the replacement timed out.
+    #[serde(default)]
+    pub status: u16,
+    /// Whether the original call survives.
+    #[serde(default)]
+    pub call_kept: bool,
+    /// `"refer"` or `"siphon"`, as on [`PeerReplacedPayload`].
+    #[serde(default)]
+    pub origin: String,
+}
+
 /// Payload of [`SipEvent::PlayFinished`] — a playback ended.
 ///
 /// `completed` is the field to branch on: a stop, a supersede and an error all
@@ -819,6 +883,7 @@ mod tests {
         assert_eq!(SipVerb::Progress.as_str(), "progress");
         assert_eq!(SipVerb::Bridge.as_str(), "bridge");
         assert_eq!(SipVerb::Unbridge.to_string(), "unbridge");
+        assert_eq!(SipVerb::ReplacePeer.as_str(), "replace_peer");
         assert_eq!(SipVerb::Play.as_str(), "play");
         assert_eq!(SipVerb::Stop.as_str(), "stop");
         assert_eq!(SipVerb::Dtmf.as_str(), "dtmf");
@@ -1167,5 +1232,53 @@ mod tests {
         .expect("bridge end payload");
         assert!(!bridge.unexpected);
         assert_eq!(bridge.reason, "detached");
+    }
+
+    /// Both halves of the mapping, because an event whose name parses but does
+    /// not render (or vice versa) is invisible until a controller misses one.
+    #[test]
+    fn replacement_events_round_trip() {
+        for (event, name) in [
+            (SipEvent::PeerReplaced, "PeerReplaced"),
+            (SipEvent::ReplaceFailed, "ReplaceFailed"),
+        ] {
+            assert_eq!(event.as_str(), name);
+            assert_eq!(SipEvent::from(name), event);
+        }
+        // An unknown name must still fall through to Other rather than being
+        // silently mapped onto one of these.
+        assert_eq!(
+            SipEvent::from("PeerReplacedSomeday"),
+            SipEvent::Other("PeerReplacedSomeday".to_string())
+        );
+    }
+
+    #[test]
+    fn replacement_payloads_parse_from_the_wire_shape() {
+        let replaced: PeerReplacedPayload = serde_json::from_value(serde_json::json!({
+            "target_sip_call_id": "target@host",
+            "replaced_leg_released": true,
+            "origin": "siphon",
+        }))
+        .expect("PeerReplaced payload");
+        assert_eq!(replaced.target_sip_call_id, "target@host");
+        assert!(replaced.replaced_leg_released);
+        assert_eq!(replaced.origin, "siphon");
+
+        let failed: ReplaceFailedPayload = serde_json::from_value(serde_json::json!({
+            "status": 486,
+            "call_kept": true,
+            "origin": "refer",
+        }))
+        .expect("ReplaceFailed payload");
+        assert_eq!(failed.status, 486);
+        assert!(failed.call_kept);
+
+        // Every field defaults, so an older siphon that omits one does not make
+        // the whole event unreadable to a newer client.
+        let sparse: ReplaceFailedPayload =
+            serde_json::from_value(serde_json::json!({})).expect("sparse payload");
+        assert_eq!(sparse.status, 0);
+        assert!(!sparse.call_kept);
     }
 }

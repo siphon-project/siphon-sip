@@ -6,7 +6,7 @@ from an optional X-Refer-Mode header on the REFER (transparent | terminate |
 reject), defaulting to transparent. This lets the SIPp REFER acceptance
 scenarios exercise every inbound mode against a single running siphon.
 """
-from siphon import b2bua, proxy, registrar, auth, log
+from siphon import b2bua, proxy, registrar, auth, log, timer
 
 DOMAIN = "siphon.test"
 
@@ -42,6 +42,20 @@ def answered(call, reply):
     if target:
         log.info(f"Call {call.id} outbound REFER -> {target}")
         call.refer(target)
+
+    # Siphon-decided leg replacement: swap the callee for someone else with no
+    # REFER anywhere. Armed from a timer rather than run inline, because at
+    # on_answer the A-leg 2xx has not gone out yet — and because a callback
+    # holding only a Call-ID is the shape the verb is built for.
+    replace_target = call.get_header("X-Replace-Peer")
+    if replace_target:
+        sip_call_id = call.call_id
+
+        def replace(_key, sip_call_id=sip_call_id, replace_target=replace_target):
+            log.info(f"replace_peer {sip_call_id} -> {replace_target}")
+            b2bua.replace_peer(sip_call_id, replace_target, timeout=20)
+
+        timer.set(f"replace-{sip_call_id}", 500, replace)
 
 
 @b2bua.on_refer

@@ -64,6 +64,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RejectRefer).toBe("reject_refer");
     expect(SipVerb.Bridge).toBe("bridge");
     expect(SipVerb.Unbridge).toBe("unbridge");
+    expect(SipVerb.ReplacePeer).toBe("replace_peer");
     expect(SipVerb.Play).toBe("play");
     expect(SipVerb.Stop).toBe("stop");
     expect(SipVerb.Dtmf).toBe("dtmf");
@@ -83,6 +84,8 @@ describe("SipVerb wire tokens + event names", () => {
     expect(sipEventKind("ChannelBridged")).toBe("ChannelBridged");
     expect(sipEventKind("BridgeFailed")).toBe("BridgeFailed");
     expect(sipEventKind("ChannelUnbridged")).toBe("ChannelUnbridged");
+    expect(sipEventKind("PeerReplaced")).toBe("PeerReplaced");
+    expect(sipEventKind("ReplaceFailed")).toBe("ReplaceFailed");
     expect(sipEventKind("SomethingNew")).toBe("SomethingNew");
   });
 

@@ -7,6 +7,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`b2bua.replace_peer()` and the control plane's `replace_peer` verb** — swap
+  one party of an answered call for a freshly dialled target, with no REFER
+  anywhere. siphon has always been able to do this: it is what
+  `accept_refer(mode="terminate")` runs — dial the target as a new leg on the
+  same call, re-anchor the surviving party's media onto it, promote it into the
+  surviving pair when it answers, BYE the leg it replaced — but it was reachable
+  only when a remote endpoint asked, because the entry point opens by taking a
+  *pending inbound REFER* and bails when there is none. So an IVR that had
+  worked out where the caller should go, a supervisor take-over, or a controller
+  moving a caller off an AI and onto a human could only hand-roll it as a hangup
+  followed by a re-INVITE, which is worse in two ways that show up only in
+  production: the surviving party hears dead air for the whole ring, because the
+  replaced leg is gone before the target has even been dialled, and the call's
+  own state is left behind — no `@b2bua.on_bye`, no CDR, no Rf charging stop, no
+  media release, and a later `terminate` re-BYEs a dialog that is already dead.
+  `replace_peer` keeps the replaced leg up until the target answers and releases
+  it through the real teardown, so a target that refuses or never answers leaves
+  the call exactly as it was. `replace_a_leg` picks the direction, `profile`
+  names the media profile for the pair being created (required when the call is
+  anchored with a direction-bound one, whose answer half describes the party
+  that is leaving), and `timeout` bounds the ring. Every refusal is typed and
+  raised rather than returned as a hollow `False` — `not_found`,
+  `invalid_state` (not answered, no peer leg, or a replacement already in
+  flight), `bad_request`, `unavailable` — because a caller that cannot tell a
+  refused replacement from a started one will tear down a call that is still up.
+  On the control rail the reply says only that the INVITE is on the wire; the
+  outcome arrives as `PeerReplaced` / `ReplaceFailed`, which a REFER-driven
+  transfer now emits too, having previously completed with nothing on that rail
+  at all.
 - **`siphon_memory_metadata_bytes`** — jemalloc's `stats.metadata`, the last of
   the allocator's own numbers that siphon read but did not export. Without it
   `resident - allocated - retained` is unattributed, and it is the term that
@@ -118,6 +147,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **A transfer target that never answers no longer strands the call.** A
+  replacement — a siphon-terminated REFER transfer, and now `replace_peer` — dials
+  its target on a call that is already `Answered`, while the answer-timeout sweep
+  filters on `Calling`/`Ringing` precisely so that a long answered call is never
+  touched. Nothing else looked at it, so a target that sent a `180` and then
+  went silent left the transfer armed for the life of the call: the response
+  path kept matching its Call-ID, the subscription was never cleared, and the
+  surviving party stayed bridged to a leg that was never going to answer. There
+  is now a per-replacement deadline, swept on the same interval, that CANCELs
+  the target (RFC 3261 §9.1 — it still has an INVITE server transaction open)
+  and runs the ordinary failure path, so the original call survives with both
+  its parties. Bounded even when the caller sets no timeout, at three minutes,
+  for the reason RFC 3261 §16.6 gives Timer C the same shape.
+- **A transfer's failure path now matches the replacement that owns the failing
+  leg**, rather than the first notifier subscription on the call — the
+  completion path has always keyed on the target leg's Call-ID and this one had
+  not, which was survivable only because one replacement can be in flight at a
+  time.
 - **A method no script handler claims is no longer answered `500`, and OPTIONS
   is answered by the stack.** Every method without a matching
   `@proxy.on_request` handler got `500 Server Internal Error`, and OPTIONS is

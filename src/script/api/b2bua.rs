@@ -268,4 +268,74 @@ impl PyB2buaControl {
         };
         Ok(crate::dispatcher::b2bua_refer_call(call_id, refer_to))
     }
+
+    /// Replace one leg of an answered call with a freshly dialed target,
+    /// because *siphon* decided to — no REFER involved.
+    ///
+    /// This is the transfer siphon already knows how to run, reachable without
+    /// a remote party asking for it. It dials `target` as a new leg on the same
+    /// call, re-anchors the surviving party's media onto it, and when the target
+    /// answers promotes it into the surviving pair and BYEs the leg it replaced.
+    /// An IVR that has decided where a caller should go next, a controller
+    /// handing a call from an AI to a human, a supervisor take-over: all of them
+    /// were previously only expressible by hand-sequencing a hangup and a
+    /// re-INVITE, which leaves the call's own state behind.
+    ///
+    /// **The replaced leg stays up while the target rings.** It is released only
+    /// once the target answers, so the surviving party hears ringback instead of
+    /// silence, and a target that rejects or never answers leaves the original
+    /// call exactly as it was. `timeout` bounds the ring; `0` means no ring
+    /// policy, only siphon's own guard against a target that answers nothing at
+    /// all.
+    ///
+    /// Args:
+    ///     call_id: SIP Call-ID of the call to act on.
+    ///     target: URI to dial as the replacement.
+    ///     next_hop: Steer egress without reshaping the R-URI, as on
+    ///         ``call.dial()``.
+    ///     replace_a_leg: ``False`` (default) replaces the callee and keeps the
+    ///         caller; ``True`` does the reverse.
+    ///     profile: Media profile for the pair this creates. Required when the
+    ///         call is anchored with a direction-bound profile — the inherited
+    ///         one describes the party that is leaving.
+    ///     timeout: Seconds to wait for the target to answer.
+    ///
+    /// Returns True once the INVITE is on the wire. It does **not** wait for the
+    /// target: the replacement completes later, and `@b2bua.on_bye` fires for
+    /// the leg that was replaced.
+    ///
+    /// Raises `ValueError` — never a hollow success — when the call is unknown,
+    /// has not answered, has no peer leg to replace, already has a replacement
+    /// in flight, or the target will not route. The message is prefixed with the
+    /// stable cause token (`not_found`, `invalid_state`, `bad_request`,
+    /// `unavailable`).
+    ///
+    /// ```python
+    /// @rtpengine.on_dtmf
+    /// def digit(call_id, from_tag, digit, duration_ms, volume):
+    ///     if digit == "0":
+    ///         b2bua.replace_peer(call_id, "sip:operator@pbx.example", timeout=45)
+    /// ```
+    #[pyo3(signature = (call_id, target, next_hop=None, replace_a_leg=false, profile=None, timeout=30))]
+    fn replace_peer(
+        &self,
+        call_id: &str,
+        target: &str,
+        next_hop: Option<&str>,
+        replace_a_leg: bool,
+        profile: Option<&str>,
+        timeout: u32,
+    ) -> PyResult<bool> {
+        use pyo3::exceptions::PyValueError;
+        crate::dispatcher::b2bua_replace_peer(
+            call_id,
+            target,
+            next_hop,
+            replace_a_leg,
+            profile,
+            timeout,
+        )
+        .map(|()| true)
+        .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
+    }
 }

@@ -782,14 +782,23 @@ pub enum CallState {
 // CallActor — per-call supervisor
 // ---------------------------------------------------------------------------
 
-/// A REFER subscription (RFC 3515) that siphon owns for a transfer in progress
-/// on a B2BUA call.
+/// A leg replacement in flight on a B2BUA call — of which a REFER-driven one
+/// (RFC 3515) also carries the implicit subscription siphon owns for it.
 ///
-/// Two roles:
-/// - **notifier** (`siphon_notifies == true`) — the siphon-terminated inbound
-///   path: a UA sent siphon a REFER, siphon answered `202`, and now sends the
-///   `message/sipfrag` NOTIFY progress to that referrer as the new leg it dialed
-///   makes progress.
+/// Every replacement records one of these: a new leg has been dialed, and when
+/// it answers it is promoted into the surviving pair and the leg it replaces is
+/// BYE'd. `origin` says whether a referrer is owed sipfrag NOTIFYs along the
+/// way — see [`ReplacementOrigin`](super::transfer::ReplacementOrigin).
+///
+/// Three roles:
+/// - **notifier** (`siphon_notifies == true`, `origin == Refer`) — the
+///   siphon-terminated inbound path: a UA sent siphon a REFER, siphon answered
+///   `202`, and now sends the `message/sipfrag` NOTIFY progress to that referrer
+///   as the new leg it dialed makes progress.
+/// - **siphon-initiated** (`siphon_notifies == true`,
+///   `origin == SiphonInitiated`) — `b2bua.replace_peer()`: the same dial /
+///   promote / BYE round, decided by a script or a controller, with no REFER and
+///   therefore nobody to notify.
 /// - **subscriber** (`siphon_notifies == false`) — the siphon-originated path
 ///   (`call.refer()`): siphon sent a REFER to a connected UA and receives that
 ///   UA's sipfrag NOTIFYs, which it `200 OK`s and reads for teardown.
@@ -804,9 +813,15 @@ pub struct ReferSubscription {
     pub on_a_leg: bool,
     /// True when siphon is the notifier, false when siphon is the subscriber.
     pub siphon_notifies: bool,
+    /// What asked for this replacement, and therefore whether a referrer is
+    /// owed sipfrag NOTIFYs. Meaningful only in the notifier role; the
+    /// subscriber role (`call.refer()`) is always `Refer`.
+    pub origin: super::transfer::ReplacementOrigin,
     /// The subscription `id` token — the CSeq number of the REFER that created
     /// it (RFC 3515 §2.4.4) — surfaced as `Event: refer;id=<n>` to disambiguate
-    /// concurrent transfers on one dialog.
+    /// concurrent transfers on one dialog. Meaningless when `origin` is
+    /// `SiphonInitiated`: there is no REFER, so there is no CSeq to echo and no
+    /// subscription to disambiguate, and nothing reads it on that path.
     pub event_id: u32,
     /// Next CSeq for a siphon-originated NOTIFY on this subscription (notifier
     /// role only).
@@ -819,18 +834,34 @@ pub struct ReferSubscription {
     /// so an unrelated leg dialed while a transfer is pending can't be mistaken
     /// for the transfer target. `None` for the subscriber (outbound) role.
     pub target_leg_call_id: Option<String>,
-    /// True once the referrer's dialog ended while this transfer was still in
-    /// flight — the referrer sent a BYE after siphon accepted the REFER but
-    /// before the dialed target resolved.
+    /// True once the dialog of the leg being replaced ended while the
+    /// replacement was still in flight — for a REFER, the referrer sent a BYE
+    /// after siphon accepted it but before the dialed target resolved.
     ///
-    /// RFC 3515 §2.4.4: the implicit refer subscription lives in the dialog the
-    /// REFER arrived on, so once that dialog ends no further NOTIFY can be
-    /// delivered (a late one draws a 481) and the referrer needs no BYE at
-    /// completion — it already left. The transfer itself continues: RFC 5589 §7
-    /// has the transferor free to end its dialog as soon as the REFER is
-    /// accepted, and the surviving party ↔ target call is what the transfer
-    /// exists to create. Notifier (siphon-terminated) role only.
+    /// Two consequences, and they are separate:
+    /// - **No BYE at completion.** The leg being replaced already left, so
+    ///   there is nothing to release. This holds for both origins.
+    /// - **No NOTIFY.** RFC 3515 §2.4.4: the implicit refer subscription lives
+    ///   in the dialog the REFER arrived on, so once that dialog ends no
+    ///   further NOTIFY can be delivered (a late one draws a 481). This is
+    ///   about the *subscription*, and applies only when `origin == Refer` —
+    ///   a `SiphonInitiated` replacement has no subscription to end.
+    ///
+    /// The replacement itself continues either way: RFC 5589 §7 has the
+    /// transferor free to end its dialog as soon as the REFER is accepted, and
+    /// the surviving party ↔ target call is what the transfer exists to create.
+    /// Notifier role only.
     pub referrer_gone: bool,
+    /// When to give up on the dialed target, for a notifier-role replacement.
+    ///
+    /// The replacement runs on an **answered** call, and the answer-timeout
+    /// sweep ([`take_timed_out_calls`](CallActorStore::take_timed_out_calls))
+    /// deliberately looks only at `Calling`/`Ringing` calls — so without a
+    /// deadline of its own a target that never sends a final response leaves
+    /// this subscription armed forever, the response path still matching on
+    /// `target_leg_call_id`, and the surviving party bridged to nobody. `None`
+    /// keeps the pre-deadline behaviour (wait indefinitely).
+    pub deadline: Option<std::time::Instant>,
     /// Media profile chosen for the pairing this transfer creates
     /// (`accept_refer(profile=…)`). `None` inherits the profile the call was
     /// anchored with — correct only when that profile is symmetric, see
@@ -3059,6 +3090,43 @@ impl CallActorStore {
             .map(|entry| entry.id.clone())
             .collect()
     }
+
+    /// Leg replacements whose dialed target has blown its deadline, as
+    /// `(internal call id, target leg Call-ID)`.
+    ///
+    /// The counterpart of [`take_timed_out_calls`](Self::take_timed_out_calls)
+    /// for the *answered* calls that one skips. A replacement dials a new leg
+    /// on a call that is already `Answered`, so nothing in the answer-timeout
+    /// path can see it: a target that never sends a final response would leave
+    /// the subscription armed for the life of the call.
+    ///
+    /// Does NOT remove anything — the dispatcher runs the teardown (CANCEL the
+    /// target leg, drop it, clear the subscription), which needs to build and
+    /// send messages. Only notifier-role subscriptions that actually dialed a
+    /// target and carry a deadline are eligible.
+    pub fn take_timed_out_replacements(&self, now: std::time::Instant) -> Vec<(String, String)> {
+        self.calls
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .refer_subscriptions
+                    .iter()
+                    .filter(|subscription| {
+                        subscription.siphon_notifies
+                            && subscription
+                                .deadline
+                                .is_some_and(|deadline| now >= deadline)
+                    })
+                    .filter_map(|subscription| {
+                        subscription
+                            .target_leg_call_id
+                            .clone()
+                            .map(|target| (entry.id.clone(), target))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 }
 
 impl Default for CallActorStore {
@@ -3333,6 +3401,7 @@ fn request_uri_of(stashed: &Arc<Mutex<SipMessage>>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::b2bua::transfer::{ReplacementOrigin, TransferState};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn test_transport() -> TransportInfo {
@@ -4653,6 +4722,75 @@ mod tests {
         // Nothing was removed.
         assert_eq!(store.count(), 4);
         let _ = (waiting, answered, no_deadline);
+    }
+
+    fn replacement(
+        target_leg_call_id: Option<&str>,
+        deadline: Option<std::time::Instant>,
+        siphon_notifies: bool,
+    ) -> ReferSubscription {
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies,
+            origin: ReplacementOrigin::SiphonInitiated,
+            event_id: 0,
+            notify_cseq: 0,
+            state: TransferState::Trying,
+            target_leg_call_id: target_leg_call_id.map(str::to_string),
+            referrer_gone: false,
+            deadline,
+            media_profile: None,
+        }
+    }
+
+    #[test]
+    fn take_timed_out_replacements_selects_only_a_live_target_past_its_deadline() {
+        // A replacement runs on an ANSWERED call, which take_timed_out_calls
+        // filters out by design — so without this sweep a target that never
+        // sends a final response leaves the replacement armed for the life of
+        // the call and the survivor bridged to nobody. It must be as narrow as
+        // its sibling: only a notifier-role replacement, that actually dialed
+        // something, whose deadline has passed.
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+        let future = now + std::time::Duration::from_secs(60);
+
+        // Dialed a target, deadline passed → swept, even though the call is
+        // Answered (which is the whole point).
+        let stuck = store.create_call(make_a_leg());
+        store.set_state(&stuck, CallState::Answered);
+        store.push_refer_subscription(&stuck, replacement(Some("target-1@host"), Some(past), true));
+
+        // Deadline still in the future → not yet.
+        let ringing = store.create_call(make_a_leg());
+        store.push_refer_subscription(
+            &ringing,
+            replacement(Some("target-2@host"), Some(future), true),
+        );
+
+        // No deadline → waits indefinitely, as before this existed.
+        let unbounded = store.create_call(make_a_leg());
+        store.push_refer_subscription(&unbounded, replacement(Some("target-3@host"), None, true));
+
+        // Subscriber role (`call.refer()`): siphon dialed nothing and is
+        // waiting on the far end's NOTIFYs, so there is no leg to cancel.
+        let subscriber = store.create_call(make_a_leg());
+        store.push_refer_subscription(
+            &subscriber,
+            replacement(Some("target-4@host"), Some(past), false),
+        );
+
+        // Notifier whose dial never left the box: no target leg to cancel, and
+        // the subscription is already inert.
+        let undialed = store.create_call(make_a_leg());
+        store.push_refer_subscription(&undialed, replacement(None, Some(past), true));
+
+        let swept = store.take_timed_out_replacements(now);
+        assert_eq!(swept, vec![(stuck.clone(), "target-1@host".to_string())]);
+        // Nothing was removed — the dispatcher owns the teardown.
+        assert_eq!(store.count(), 5);
+        let _ = (ringing, unbounded, subscriber, undialed);
     }
 
     // --- LegRegistry tests ---
