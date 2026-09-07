@@ -36,6 +36,53 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   outcome arrives as `PeerReplaced` / `ReplaceFailed`, which a REFER-driven
   transfer now emits too, having previously completed with nothing on that rail
   at all.
+- **`call.local_tag` and `call.set_body()`** — the two things a B2BUA script
+  needed when the media for a call is negotiated by something outside siphon.
+  `call.local_tag` exposes the UAS To-tag siphon minted for the A-leg dialog: it
+  is generated with the dialog, so it reads from the first handler onwards,
+  before any response goes out, and it is the tag stamped on every response the
+  framework sends. It was reachable from nowhere in the script API — the To-tag
+  is a header *parameter*, so `call.to_uri` cannot carry it, and it never
+  appears in the inbound INVITE the script API holds because siphon generates
+  it — which left a controller keying an offer/answer on
+  `(call-id, from-tag, to-tag)` no way to agree with siphon about the dialog it
+  was answering for, and minting its own there desynchronises the media answer
+  from the dialog. `call.set_body(body, content_type=None)` replaces the body of
+  the captured A-leg INVITE, restating `Content-Length` (and `Content-Type` when
+  given), which is the `dial()`-time counterpart of `set_ruri_user()` /
+  `set_from_user()`: the B-leg INVITE is built from that message, so it is the
+  only place to put a rewritten offer. `request.set_body()` has always existed;
+  its `Call` twin did not, so a script that anchored media and then needed to
+  strip or rewrite an attribute before the offer went out had nowhere to put the
+  result. Omitting `content_type` leaves the existing one alone — the body
+  changed, the type did not — and an empty body clears it with
+  `Content-Length: 0` rather than being refused, since a delayed-offer INVITE is
+  a legitimate thing to build.
+- **`echo_delay_search_ms`, `echo_long_tail` and `echo_residual_suppression` on
+  a `media.profiles` entry** (`siphon-rtp` backend only, inert without
+  `echo_cancellation`), and the `siphon-rtp-proto` pin moves `0.4` → `0.5` to
+  reach them.
+
+  `echo_delay_search_ms` is the one to know about. The echo canceller searches
+  for the returning echo within that window of the reference, and the window has
+  to span the whole media path **twice** — it is not an acoustic
+  loudspeaker-to-microphone hop — so a carrier or mobile leg at 100–200 ms each
+  way can put the echo outside it on its own. An echo beyond the window is **not
+  cancelled and nothing reports it**: the estimator commits the tallest peak
+  inside the window whatever that peak is, so the filter adapts against a
+  reference that is not the echo, cancels nothing, and returns no error. On a
+  voice-AI bridge that surfaces two components away, as an agent that hears its
+  own voice on the uplink, correctly calls it speech, and interrupts itself on a
+  caller who said nothing.
+
+  The engine's default window widens from 128 ms to 256 ms with this pin, so a
+  leg whose echo was already inside 128 ms behaves as before, one lock later
+  (~0.8 s → ~1.5 s of far-end-active audio at 16 kHz before the first lock).
+  Range 16–1000 ms, **refused at config load** rather than per offer: the engine
+  rejects an out-of-range value on every offer, which is a node that starts
+  healthy and then fails every call. All three are native `siphon-rtp`
+  extensions with no NG/bencode or rtpproxy equivalent, so setting one on those
+  backends is refused at load the way the existing `echo_cancellation` is.
 - **`siphon_memory_metadata_bytes`** — jemalloc's `stats.metadata`, the last of
   the allocator's own numbers that siphon read but did not export. Without it
   `resident - allocated - retained` is unattributed, and it is the term that
@@ -165,6 +212,123 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   completion path has always keyed on the target leg's Call-ID and this one had
   not, which was survivable only because one replacement can be in flight at a
   time.
+- **B2BUA B-leg event receivers are now reaped with their call.** This was the
+  one call-lifetime store in the orphan sweep with no backstop: every teardown
+  path removes it, but a call whose teardown never reached the dispatcher — and
+  which the sweep beside it already reaped — left its receiver behind for the
+  life of the process, holding a whole 64-slot channel of pending call events.
+  It also matters for liveness rather than only memory: the leg actors send on
+  that channel with an unbounded wait, so a full channel parks the actor until
+  something drops the receiver, and dropping it here is what guarantees the
+  actor is released. Reaped by asking whether the call still exists rather than
+  by age, so it catches an orphan from any cause.
+- **One stuck script event handler could take media control down for the whole
+  process.** The background loops that deliver media and registration events to
+  `@rtpengine.*` and `@registrar.on_change` / `@registrant.on_change` handlers
+  awaited each handler inline, so a handler that never returned stopped the
+  loop. For media events that is not a lost DTMF digit: the event channel fills,
+  the media engine's control **read** task then parks trying to enqueue the next
+  event, no response is routed back to any pending request any more, and every
+  in-flight and future media command fails on its own timeout — with the control
+  connection still established. The wait is now bounded. Handlers are still
+  awaited rather than spawned, so events keep their order (out-of-order DTMF
+  digits would break any script reading them); only the wait is bounded, and the
+  handler itself runs on under the script executor's own watchdog.
+- **Media-engine event forwarding no longer parks its own read loop.** Both
+  event paths forwarded with an awaited send on a bounded channel under a
+  comment describing it as best-effort — but only a *closed* channel was
+  handled; a full one parked, stopping the loop that routes command responses.
+  They now shed with a warning, which is what the comment always claimed.
+- **The siphon-rtp control handshake bounds its write.** The existing timeout
+  started after the write and covered only the acknowledgement read, so an
+  engine that accepted the connection and then stopped draining it wedged the
+  reconnect task — and since that task is what re-establishes control, nothing
+  was left to recover from it.
+- **A collector that stopped reading its socket silently stopped delivery for
+  everything, not just itself.** Lawful-intercept X2, the HTTP CDR backend and
+  the HEP capture sender each run a *single* delivery task, and each wrote with
+  no timeout. A collector that accepts a connection and then stops draining it —
+  alive, still ACKing, receive window closed — parks that task for the life of
+  the process with the socket still showing as established. For X2 that is IRI
+  delivery stopping for every warrant; for CDR it is every subsequent record
+  being dropped at the producer's queue; for HEP it is capture going dead. All
+  three now time out and reconnect. The CDR HTTP exchange is bounded across
+  connect, write and read together, since the response read was unbounded too.
+- **SRS HTTP uploads now have a client timeout.** This was the only
+  `reqwest::Client` in the tree built without one, and with `upload_audio`
+  enabled it posts a multipart body of recorded audio, so a stalled endpoint held
+  the upload open indefinitely.
+- **Control-plane WebSocket writes are bounded.** A controller that stops reading
+  no longer pins its write task, connection and queue for the life of the
+  process; the connection is closed and the controller can reconnect.
+- **A Diameter peer that stopped reading its socket could park every script
+  handler that touched it, and abort the process.** The peer's writer task wrote
+  with no timeout, fed by a 64-slot channel whose producers enqueued with no
+  timeout. The request timeout on `send_request` covers waiting for the
+  *answer*, not waiting for a slot in front of a stalled writer, so it read as
+  guarded while being the opposite. Every scripting Diameter method — `cx_*`,
+  `sh_*`, `rx_*`, `rf_acr_*`, `s6a_*` and the generic `send_request` — reaches
+  that enqueue from a handler holding a script-executor worker, so a single
+  unresponsive HSS, PCRF or CDF could consume the pool until the executor
+  watchdog aborted the process.
+
+  Writes and enqueues are now bounded: a stalled connection is dropped so
+  callers fail fast instead of queueing behind it, and a request refused at the
+  enqueue no longer leaves its Hop-by-Hop entry behind in the correlation map.
+  The CER/CEA capabilities exchange is bounded on both legs too — it runs before
+  the reader and writer tasks exist, so nothing else covered it, and a peer that
+  connected and then went silent pinned the connect attempt and its reconnect
+  loop indefinitely.
+- **The Diameter reader task no longer parks on a full queue.** It is the only
+  thing that correlates answers to their requests, so an awaiting send of a
+  watchdog answer, a disconnect answer or an inbound request stopped every
+  in-flight request on that peer at once. These now shed with a warning: the
+  peer retries, which is recoverable, whereas a stalled reader is not.
+- **A peer that stopped reading its socket could park every handler thread and
+  abort the process.** The per-connection writer tasks wrote with no timeout,
+  fed by a 64-slot channel whose producers enqueued with no timeout. A peer that
+  accepts a connection and then stops draining it — alive, still ACKing, receive
+  window closed — makes the write block indefinitely, so the writer never
+  returns to its receive, the channel fills, and every producer parks. The
+  `is_closed()` guard in front of the enqueue does not catch it, because a full
+  channel is not a closed one, and `SO_KEEPALIVE` does not either, because
+  probes are suppressed while there is unacknowledged data or the socket is in
+  the persist state, which is exactly this case. On the SIP relay path the
+  producer runs inside a script handler job, so each parked send consumed a
+  script-executor worker until the executor watchdog aborted the process. The
+  bounded connect added earlier covered establishment only; a reused pooled
+  connection never goes near it, which is why the failure was completely silent.
+
+  Writes are now bounded and a stalled connection is dropped rather than kept as
+  something later callers queue behind; enqueues are bounded and shed, which the
+  caller already handles as a transport refusal (RFC 3261 §16.9). Applies to the
+  outbound TCP and TLS pool, accepted TCP/TLS/WS/WSS connections, and SCTP.
+  Sockets also now set `TCP_USER_TIMEOUT`, so the kernel gives up on a peer that
+  stops acknowledging instead of probing a zero window forever.
+- **The outbound pool no longer holds its per-destination establishment lock
+  while handing a message to a connection.** One slow peer stalled every other
+  caller for the same destination behind that lock. Nor does it hold a shard
+  guard of the connection map across the handoff, which blocked unrelated
+  inserts and removes.
+- **An idle SCTP association is now reaped.** Its read task had no idle timeout,
+  unlike every other connection-oriented transport, so a peer that stopped both
+  sending and reading left both tasks and the connection entry alive for the
+  life of the process.
+- **Three S6a scripting methods blocked while still attached to the
+  interpreter, risking an engine-wide deadlock.** `diameter.s6a_air()`,
+  `diameter.s6a_ulr()` and `diameter.s6a_purge_ue()` waited for the HSS answer
+  with a bare `block_in_place` + `block_on` instead of the wrapper every one of
+  their eighteen siblings uses, which releases the interpreter for the blocking
+  window. A handler parked in the bare form never reaches a garbage-collection
+  safe point, so the next thread to allocate cyclic garbage — which Python does
+  constantly — blocks behind the stop-the-world pause. That surfaces either as
+  intermittent handler stalls or, when the only thread that could complete the
+  Diameter call is itself caught in the pause, as a permanent deadlock across
+  every handler in the process. All three now release the interpreter while
+  they wait. A source-level test guards the whole scripting-API namespace
+  against the same drift, including files added later, since the two forms
+  compile and behave identically until the collector happens to run at the
+  wrong moment.
 - **A method no script handler claims is no longer answered `500`, and OPTIONS
   is answered by the stack.** Every method without a matching
   `@proxy.on_request` handler got `500 Server Internal Error`, and OPTIONS is

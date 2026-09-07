@@ -604,9 +604,22 @@ async fn read_event_stream(
                     match classify_event(&value) {
                         Ok(event) => {
                             debug!(?event, "rtpengine event decoded");
-                            if event_tx.send(event).await.is_err() {
-                                // Dispatcher dropped the receiver — shut down.
-                                return Ok(());
+                            // Never park here: this is the event connection's
+                            // read loop, so waiting on a slow consumer stops
+                            // reading the socket entirely. Dropping one event is
+                            // recoverable; a stalled reader is not.
+                            match event_tx.try_send(event) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(
+                                        "rtpengine event dropped: dispatcher event queue \
+                                         full (slow event consumer)"
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Dispatcher dropped the receiver — shut down.
+                                    return Ok(());
+                                }
                             }
                         }
                         Err(error) => {

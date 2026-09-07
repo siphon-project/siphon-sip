@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use super::listener::process_text;
 use super::protocol::{EventFrame, SUBPROTOCOL};
 use super::registry::{ControlBus, OutboundQueue};
+use super::CONTROL_WRITE_TIMEOUT;
 
 /// How long to wait for the controller to accept the per-call dial before giving
 /// up (the handoff deadline is the ultimate backstop, but a bounded connect
@@ -181,9 +182,30 @@ async fn outbound_write_task(
         }
         for frame in frames {
             if let Some(text) = super::listener::frame_to_text(&frame) {
-                if ws_sink.send(Message::Text(text.into())).await.is_err() {
-                    let _ = ws_sink.send(Message::Close(None)).await;
-                    return;
+                // Bounded — see `CONTROL_WRITE_TIMEOUT`.
+                match tokio::time::timeout(
+                    CONTROL_WRITE_TIMEOUT,
+                    ws_sink.send(Message::Text(text.into())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        let _ = tokio::time::timeout(
+                            CONTROL_WRITE_TIMEOUT,
+                            ws_sink.send(Message::Close(None)),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(
+                            timeout = ?CONTROL_WRITE_TIMEOUT,
+                            "control plane: outbound write stalled — controller is \
+                             not draining its socket; closing the connection"
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -191,7 +213,7 @@ async fn outbound_write_task(
             break;
         }
     }
-    let _ = ws_sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, ws_sink.send(Message::Close(None))).await;
 }
 
 #[cfg(test)]

@@ -2379,6 +2379,15 @@ impl CallActorStore {
         self.calls.get(call_id)
     }
 
+    /// Whether a call is still live, without taking a guard on it.
+    ///
+    /// Deliberately not `get_call(..).is_some()`: this is called from inside a
+    /// `retain` closure on a *different* map, and returning a `Ref` there would
+    /// hold a shard read guard on this map for the body of that closure.
+    pub fn contains_call(&self, call_id: &str) -> bool {
+        self.calls.contains_key(call_id)
+    }
+
     /// Get a mutable reference to a call.
     pub fn get_call_mut(
         &self,
@@ -4687,6 +4696,56 @@ mod tests {
         assert_eq!(store.sweep_stale(std::time::Duration::from_secs(60)), 0);
         assert_eq!(store.sweep_stale(std::time::Duration::ZERO), 1);
         assert_eq!(store.count(), 0);
+    }
+
+    /// The dispatcher parks its B-leg event receivers in a map keyed by call id
+    /// and reaps them by asking whether the call is still live. Two things ride
+    /// on that: a receiver for a reaped call holds a whole 64-slot channel of
+    /// `CallEvent`s forever, and — because the leg actors send on that channel
+    /// with an unbounded await — a full channel parks the actor until something
+    /// drops the receiver.
+    ///
+    /// So this asserts both halves: the reaped call is gone from the store, and
+    /// an actor already parked on a full channel is released once the receiver
+    /// the sweep would drop is dropped.
+    #[tokio::test]
+    async fn a_reaped_call_releases_an_actor_parked_on_its_event_channel() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        assert!(
+            store.contains_call(&call_id),
+            "a fresh call is live, so its receiver must be kept"
+        );
+
+        // One slot, already full: the next send parks, exactly as a leg actor
+        // does when the dispatcher has not drained the channel.
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<u8>(1);
+        event_tx.send(1).await.expect("first send fits");
+        let parked = tokio::spawn(async move { event_tx.send(2).await });
+        tokio::task::yield_now().await;
+        assert!(!parked.is_finished(), "the second send must be parked");
+
+        // The sweep's rule: no call, no receiver.
+        store.sweep_stale(std::time::Duration::ZERO);
+        assert!(!store.contains_call(&call_id), "the call was reaped");
+        let receivers = dashmap::DashMap::new();
+        receivers.insert(call_id.clone(), event_rx);
+        receivers.retain(|id: &String, _| store.contains_call(id));
+        assert!(
+            receivers.is_empty(),
+            "a receiver whose call is gone must be reaped — it holds a whole \
+             channel of events, and the actor parked on it, for the life of the \
+             process"
+        );
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("dropping the receiver must release the parked actor")
+            .expect("the sending task did not panic");
+        assert!(
+            outcome.is_err(),
+            "the parked send must complete as Closed once the receiver is gone"
+        );
     }
 
     #[test]
