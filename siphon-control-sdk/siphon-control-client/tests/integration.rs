@@ -101,7 +101,12 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
         match verb.as_str() {
             "resync" => {
                 let channels = stub.resync_channels.lock().unwrap().clone();
-                send_ok(&mut socket, &id, serde_json::json!({ "channels": channels })).await;
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({ "channels": channels }),
+                )
+                .await;
             }
             "describe" => {
                 send_ok(
@@ -120,7 +125,12 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
                 .await;
             }
             "get_header" | "get_var" => {
-                send_ok(&mut socket, &id, serde_json::json!({ "value": "203.0.113.7" })).await;
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({ "value": "203.0.113.7" }),
+                )
+                .await;
             }
             // A bridge reply reports the LOCAL action only — the media is
             // re-pointed and the first re-INVITE is on the wire. Whether the two
@@ -243,7 +253,12 @@ async fn generic_core_command_routes_any_module() {
     let addr = start_stub(Arc::new(Stub::default())).await;
     let client = ControlClient::connect(client_config(addr)).await.unwrap();
     let value = client
-        .command(Some("smpp"), "submit_sm", serde_json::Value::Null, serde_json::json!({ "short_message": "hi" }))
+        .command(
+            Some("smpp"),
+            "submit_sm",
+            serde_json::Value::Null,
+            serde_json::json!({ "short_message": "hi" }),
+        )
         .await
         .expect("generic command ok");
     assert!(value.is_object());
@@ -255,7 +270,12 @@ async fn error_reply_maps_to_typed_control_error() {
     let client = SipClient::connect(client_config(addr)).await.unwrap();
 
     match client
-        .command(Some("sip"), "boom", serde_json::json!({ "channel": "ch1" }), serde_json::json!({}))
+        .command(
+            Some("sip"),
+            "boom",
+            serde_json::json!({ "channel": "ch1" }),
+            serde_json::json!({}),
+        )
         .await
     {
         Err(ControlError::Command { code, message }) => {
@@ -275,7 +295,12 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
     // Trigger the stub to push a StasisStart (deterministic, after the stream is
     // registered so there is no dispatch race).
     client
-        .command(None, "test_push_stasis", serde_json::Value::Null, serde_json::Value::Null)
+        .command(
+            None,
+            "test_push_stasis",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
         .await
         .unwrap();
 
@@ -290,7 +315,13 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
 
     // The high-level verbs each send + await a correlated reply.
     call.answer().await.expect("answer ok");
-    assert_eq!(call.get_header("P-Asserted-Identity").await.unwrap().as_deref(), Some("203.0.113.7"));
+    assert_eq!(
+        call.get_header("P-Asserted-Identity")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("203.0.113.7")
+    );
     call.transfer("sip:agent@pbx").await.expect("refer ok");
 
     // Bridging this leg to another the app owns: the reply is the local action,
@@ -302,14 +333,20 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
     assert_eq!(bridged["with"], "ch2");
     assert_eq!(bridged["on_peer_hangup"], "hold");
     assert_eq!(bridged["state"], "bridging");
-    let unbridged = call.unbridge(Some("agent hung up")).await.expect("unbridge ok");
+    let unbridged = call
+        .unbridge(Some("agent hung up"))
+        .await
+        .expect("unbridge ok");
     assert_eq!(unbridged["state"], "unbridged");
     assert_eq!(unbridged["reason"], "agent hung up");
 
     // A backend-gated verb (ws_tee is siphon-rtp-only) surfaces the server's
     // unsupported_verb as a typed error.
     match call.stream_start("ws://ai:9000/stream", None, None).await {
-        Err(error) => assert!(error.is_unsupported_verb(), "expected unsupported_verb, got {error:?}"),
+        Err(error) => assert!(
+            error.is_unsupported_verb(),
+            "expected unsupported_verb, got {error:?}"
+        ),
         Ok(()) => panic!("stream_start should be unsupported on a non-siphon-rtp backend"),
     }
 }
@@ -333,7 +370,12 @@ async fn on_call_handler_fires_for_stasis_start() {
     });
 
     client
-        .command(None, "test_push_stasis", serde_json::Value::Null, serde_json::Value::Null)
+        .command(
+            None,
+            "test_push_stasis",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
         .await
         .unwrap();
 
@@ -374,8 +416,14 @@ async fn reconnect_resyncs_and_reattaches_owned_calls() {
         .expect("a reattached call should arrive")
         .expect("call present");
     assert_eq!(call.channel_id(), "ch-live");
-    assert!(call.is_reattached(), "resync-delivered calls are reattached");
-    assert!(stub.conn_count.load(Ordering::SeqCst) >= 2, "the client reconnected");
+    assert!(
+        call.is_reattached(),
+        "resync-delivered calls are reattached"
+    );
+    assert!(
+        stub.conn_count.load(Ordering::SeqCst) >= 2,
+        "the client reconnected"
+    );
 
     client.shutdown();
 }
@@ -391,9 +439,7 @@ async fn dial_as_siphon(
     addr: SocketAddr,
     token: &str,
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     tokio_tungstenite::tungstenite::Error,
 > {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -451,7 +497,9 @@ async fn per_call_connect_owns_the_dialed_call_and_verbs_round_trip() {
         "payload": { "from": "sip:alice@example.com" }
     });
     siphon
-        .send(tokio_tungstenite::tungstenite::Message::Text(stasis.to_string().into()))
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            stasis.to_string().into(),
+        ))
         .await
         .unwrap();
 
@@ -474,7 +522,9 @@ async fn per_call_connect_owns_the_dialed_call_and_verbs_round_trip() {
     let id = command["id"].as_str().unwrap();
     let reply = serde_json::json!({ "id": id, "type": "reply", "status": "ok", "result": { "state": "answered" } });
     siphon
-        .send(tokio_tungstenite::tungstenite::Message::Text(reply.to_string().into()))
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            reply.to_string().into(),
+        ))
         .await
         .unwrap();
 

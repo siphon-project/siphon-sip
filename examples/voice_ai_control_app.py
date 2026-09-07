@@ -65,7 +65,13 @@ async def handle_call(call: Call) -> None:
 
 async def main() -> None:
     print(f"[control] connecting to {CONTROL_URL} as {APP_NAME!r}")
-    await client.run()
+    # `async with` closes the client on the way out — on Ctrl-C, on an
+    # exception, on anything. Worth using rather than a bare `await
+    # client.run()`: run() is driven by a background task that outlives the
+    # asyncio loop, so an app that exits without closing leaves it delivering
+    # results into a loop, and then an interpreter, that are no longer there.
+    async with client:
+        await client.run()
 
 
 if __name__ == "__main__":

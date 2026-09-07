@@ -38,6 +38,7 @@ it nowhere, with nothing logged and silence on the line.
 | `ws_uri`, `ws_vad`, `ws_barge_in`, `ws_vad_threshold`, `ws_vad_hangover_ms` | yes | — | — |
 | `ws_tee`, `ws_tee_direction`, `ws_tee_channels` | yes | — | — |
 | `noise_suppression`, `echo_cancellation` | yes | — | — |
+| `echo_delay_search_ms`, `echo_long_tail`, `echo_residual_suppression` | yes | — | — |
 | `received_from`, `rtcp_mux` | yes | yes | — |
 | `address_family` | yes | yes | — [^af] |
 

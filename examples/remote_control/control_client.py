@@ -81,20 +81,30 @@ async def run_inbound() -> None:
     client = ControlClient(app=APP_NAME, token=TOKEN, url=CONTROL_URL)
     client.on_call(handle_call)
     print(f"[control] connecting (inbound) to {CONTROL_URL} as {APP_NAME!r}")
-    # run() connects + hello, then drives the supervised reconnect + resync loop,
-    # dispatching each handed-over call to handle_call.
-    await client.run()
+    # `async with` closes the client on the way out — on Ctrl-C, on an
+    # exception, on anything. run() is driven by a background task that outlives
+    # the asyncio loop, so an app that exits without closing leaves it
+    # delivering results into a loop, and then an interpreter, that are no
+    # longer there.
+    async with client:
+        # run() connects + hello, then drives the supervised reconnect + resync
+        # loop, dispatching each handed-over call to handle_call.
+        await client.run()
 
 
 async def run_outbound() -> None:
     """Outbound per-call-connect: siphon dials this server once per handed-over call."""
     server = ControlServer(app=APP_NAME, token=TOKEN, bind=BIND)
     server.on_call(handle_call)
-    # bind() resolves to the bound address (bind to `…:0` to learn an ephemeral
-    # port before siphon dials in); serve() then accepts one call per dial forever.
-    await server.bind()
-    print(f"[control] listening (outbound per-call-connect) on ws://{server.local_addr}")
-    await server.serve()
+    # Same reason as the inbound half above: close on the way out rather than
+    # leaving accepted calls dispatching into a loop that has gone.
+    async with server:
+        # bind() resolves to the bound address (bind to `…:0` to learn an
+        # ephemeral port before siphon dials in); serve() then accepts one call
+        # per dial forever.
+        await server.bind()
+        print(f"[control] listening (outbound per-call-connect) on ws://{server.local_addr}")
+        await server.serve()
 
 
 async def main() -> None:

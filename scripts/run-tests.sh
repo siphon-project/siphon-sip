@@ -46,6 +46,7 @@ RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
 RUN_WEDGE=false
+RUN_NOHANDLER=false
 RUN_BANSCAN=false
 RUN_SECURITY=false
 RUN_RFC4475=false
@@ -78,6 +79,7 @@ for arg in "$@"; do
     --auto100)    RUN_AUTO100=true;    SELECTED_MODES+=("$arg") ;;
     --http-auth)  RUN_HTTP_AUTH=true;  SELECTED_MODES+=("$arg") ;;
     --wedge)      RUN_WEDGE=true;      SELECTED_MODES+=("$arg") ;;
+    --nohandler)  RUN_NOHANDLER=true;  SELECTED_MODES+=("$arg") ;;
     --banscan)    RUN_BANSCAN=true;    SELECTED_MODES+=("$arg") ;;
     --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
     --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
@@ -91,7 +93,7 @@ for arg in "$@"; do
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai --refer-single-leg --reoffer --control --bridge"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
-      echo "  --wedge --banscan"
+      echo "  --wedge --nohandler --banscan"
       echo "  --security --rfc4475 --webrtc"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
@@ -663,6 +665,17 @@ fi
 if [[ "$RUN_WEDGE" == true ]]; then
   echo "=== outbound-drain wedge regression (non-reading peer @ cpus 0.5) ==="
   run_sipp bash scripts/wedge_test.sh
+fi
+
+# ── No-script-handler fallback regression (optional) ─────────────────────────
+# A method no @proxy.on_request handler claims must get the right answer: 200 +
+# Allow + Contact for OPTIONS (RFC 3261 §11.2, so a registrar's qualify probe
+# is answered without every deployment writing the same handler), 405 + Allow
+# for everything else (§8.2.1). Both were 500 before. Runs the real binary
+# against loopback — no docker, no SIPp. Hard exit 1 on a wrong answer.
+if [[ "$RUN_NOHANDLER" == true ]]; then
+  echo "=== no-script-handler fallback regression (OPTIONS 200 / others 405) ==="
+  bash scripts/options_fallback_test.sh || exit 1
 fi
 
 # ── failed_auth_ban auto-ban regression (optional) ───────────────────────────
