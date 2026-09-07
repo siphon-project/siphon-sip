@@ -19,6 +19,14 @@ use crate::config::{HepConfig, HepTransport};
 use crate::transport::Transport;
 use encoder::{encode_hep3, extract_call_id, CaptureInfo};
 
+/// Bound on one HEP packet write.
+///
+/// A capture server that accepts the connection and then stops reading it
+/// stalls this single sender task, and every packet after that is dropped at the
+/// producer's `try_send` — capture goes silently dead with the connection still
+/// showing as established. Bounding it turns that into a reconnect.
+const HEP_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Asynchronous HEP sender — captures SIP messages and ships them to a collector.
 ///
 /// Capture calls are non-blocking: they encode HEP packets and enqueue them on a
@@ -225,9 +233,21 @@ async fn tcp_sender_loop(endpoint: SocketAddr, receiver: &flume::Receiver<Bytes>
 
         // Drain the channel, writing each packet to the TCP stream.
         while let Ok(packet) = receiver.recv_async().await {
-            if let Err(error) = stream.write_all(&packet).await {
-                warn!(endpoint = %endpoint, "HEP TCP write failed: {error}, reconnecting");
-                break;
+            match tokio::time::timeout(HEP_WRITE_TIMEOUT, stream.write_all(&packet)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(endpoint = %endpoint, "HEP TCP write failed: {error}, reconnecting");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        timeout = ?HEP_WRITE_TIMEOUT,
+                        "HEP TCP write stalled — capture server is not draining its \
+                         socket; reconnecting"
+                    );
+                    break;
+                }
             }
         }
 
@@ -299,9 +319,21 @@ async fn tls_sender_loop(
         };
 
         while let Ok(packet) = receiver.recv_async().await {
-            if let Err(error) = tls_stream.write_all(&packet).await {
-                warn!(endpoint = %endpoint, "HEP TLS write failed: {error}, reconnecting");
-                break;
+            match tokio::time::timeout(HEP_WRITE_TIMEOUT, tls_stream.write_all(&packet)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(endpoint = %endpoint, "HEP TLS write failed: {error}, reconnecting");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        timeout = ?HEP_WRITE_TIMEOUT,
+                        "HEP TLS write stalled — capture server is not draining its \
+                         socket; reconnecting"
+                    );
+                    break;
+                }
             }
         }
 

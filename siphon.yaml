@@ -983,6 +983,26 @@ auth:
 #                       against the audio played toward that party. On a
 #                       WebSocket bridge this cancels the phone uplink toward the
 #                       AI using the AI downlink as the reference.
+#   echo_delay_search_ms
+#                       How far from the reference the canceller looks for the
+#                       returning echo, 16-1000 ms (default 256). The window
+#                       spans the media path twice, not an acoustic hop, so a
+#                       carrier or mobile leg can sit past 200 ms on its own.
+#                       An echo outside the window is NOT cancelled and nothing
+#                       reports it: the estimator commits the tallest peak it
+#                       can see and adapts against a reference that is not the
+#                       echo. Widen it for a leg reached through a carrier;
+#                       narrow it for a LAN softphone, which should not pay for
+#                       the larger estimator state. Refused at config load
+#                       outside the range, not per call.
+#   echo_long_tail      Span the echo path with the adaptive filter instead of
+#                       estimating a bulk delay first, which turns
+#                       echo_delay_search_ms into a tail length rather than a
+#                       search window.
+#   echo_residual_suppression
+#                       Chain the residual-echo suppressor after the linear
+#                       canceller.
+#                       All three are inert without echo_cancellation.
 #
 # Voice-AI bridge — plain RTP toward the caller, audio to a WebSocket backend:
 # media:
@@ -1006,6 +1026,7 @@ auth:
 #         ws_sample_rate: 16000         # multiple of 1000, 8000-48000
 #         noise_suppression: true
 #         echo_cancellation: true
+#         echo_delay_search_ms: 400     # 16-1000; widen for a carrier leg
 #       answer: *voice_ai_flags
 #
 # Answering-machine detection — arm the record-tone detector on the leg toward

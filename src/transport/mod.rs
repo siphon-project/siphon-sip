@@ -116,6 +116,25 @@ pub fn detect_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
 /// zombie connections from accumulating (especially behind NAT).
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Bound on a single write to a connection-oriented peer (TCP/TLS/WS/WSS/SCTP).
+///
+/// A peer that stops reading — alive, still ACKing, simply not draining, so its
+/// receive window closes — makes a write block for as long as it likes.
+/// `SO_KEEPALIVE` does not rescue it: probes are suppressed while there is
+/// unacknowledged data or the socket sits in the persist state, which is exactly
+/// this case, so the kernel probes a zero window indefinitely.
+///
+/// Unbounded, that pins the writer task, the connection and its
+/// `connection_map` entry for the life of the process, and on the outbound pool
+/// it also fills the bounded channel in front of the writer until every
+/// producer parks on a channel that `is_closed()` still reports as healthy —
+/// full is not closed. Breaking out on expiry closes the channel and lets the
+/// normal cleanup path run.
+///
+/// 5 s is orders of magnitude past any legitimate write: a healthy `write_all`
+/// is a memcpy into the socket buffer, not a round trip.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Apply the DSCP mark to a socket, selecting the knob by address family.
 ///
 /// `tos` is the full 8-bit TOS byte (DSCP << 2).  Use [`crate::config::dscp_to_tos`]
@@ -198,6 +217,26 @@ pub fn configure_tcp_socket(socket: &tokio::net::TcpStream, tos: Option<u32>) {
                 .with_retries(3),
         ) {
             warn!("failed to set TCP keepalive params: {}", error);
+        }
+    }
+
+    // Bound how long the kernel will keep trying to deliver data the peer is not
+    // acknowledging, or keep probing a receive window the peer has closed.
+    //
+    // Keepalive above does NOT cover this: probes are suppressed while there is
+    // unacknowledged data in flight or the socket is in the persist state, which
+    // is exactly what a peer that stops reading produces.  Without
+    // `TCP_USER_TIMEOUT` such a socket stays "established" indefinitely (Linux
+    // will probe a zero window forever), so the connection never errors and
+    // nothing above the socket ever learns the peer is gone.
+    //
+    // Matched to the keepalive budget already set here (60 s idle + 10 s × 3) so
+    // both mechanisms give up at the same point rather than one silently
+    // overriding the other.
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(error) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(90))) {
+            warn!("failed to set TCP_USER_TIMEOUT: {}", error);
         }
     }
 

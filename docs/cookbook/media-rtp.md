@@ -255,6 +255,7 @@ media:
         ws_vad_hangover_ms: 300
         noise_suppression: true
         echo_cancellation: true
+        echo_delay_search_ms: 400
       answer: *voice_ai_flags
 ```
 
@@ -283,7 +284,7 @@ The built-in `voice_ai` profile sets the DSP and VAD flags but deliberately
 leaves `ws_uri` unset — there is no sensible default endpoint, so supply it in
 YAML or per call as above.
 
-`ws_uri`, the `ws_*` knobs, `noise_suppression` and `echo_cancellation` are
+`ws_uri`, the `ws_*` knobs, `noise_suppression` and the `echo_*` knobs are
 **`siphon-rtp` only**. siphon refuses to start if a `media.profiles` entry sets
 one on another backend, and a script naming such a profile gets a `ValueError`
 naming the field — see [media engines](../media-engines.md) for the full

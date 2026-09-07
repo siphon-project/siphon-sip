@@ -2325,6 +2325,15 @@ impl MediaBackendKind {
             if flags.echo_cancellation {
                 unsupported.push("echo_cancellation");
             }
+            if flags.echo_delay_search_ms.is_some() {
+                unsupported.push("echo_delay_search_ms");
+            }
+            if flags.echo_long_tail {
+                unsupported.push("echo_long_tail");
+            }
+            if flags.echo_residual_suppression {
+                unsupported.push("echo_residual_suppression");
+            }
             if flags.ws_tee.is_some() {
                 unsupported.push("ws_tee");
             }
@@ -2919,6 +2928,29 @@ pub struct NgFlagsConfig {
     /// against the audio played toward that party.  `siphon-rtp` backend only.
     #[serde(default)]
     pub echo_cancellation: bool,
+    /// How far from the reference the echo canceller searches for the returning
+    /// echo, in milliseconds (16–1000, default 256).  `siphon-rtp` backend only,
+    /// and inert without `echo_cancellation`.
+    ///
+    /// The window has to span the whole media path twice, not an acoustic
+    /// loudspeaker-to-microphone hop, so a carrier or mobile leg can sit past
+    /// 200 ms on its own.  **An echo outside the window is not cancelled and
+    /// nothing says so** — the estimator commits the tallest peak it can see and
+    /// then adapts against a reference that is not the echo — so widen it for a
+    /// leg reached through a carrier, and narrow it for a LAN softphone that
+    /// should not pay for the larger estimator state.
+    #[serde(default)]
+    pub echo_delay_search_ms: Option<u32>,
+    /// Span the echo path with the adaptive filter itself instead of estimating
+    /// a bulk delay first, which makes `echo_delay_search_ms` a tail length
+    /// rather than a search window.  `siphon-rtp` backend only, and inert
+    /// without `echo_cancellation`.
+    #[serde(default)]
+    pub echo_long_tail: bool,
+    /// Chain the residual-echo suppressor after the linear canceller.
+    /// `siphon-rtp` backend only, and inert without `echo_cancellation`.
+    #[serde(default)]
+    pub echo_residual_suppression: bool,
     /// Bridge this leg's audio to an external WebSocket media server: the engine
     /// dials this URI and relays the leg's RTP to it as L16.  `siphon-rtp`
     /// backend only.
@@ -4395,6 +4427,22 @@ impl Config {
                         },
                         if unsupported.len() == 1 { "it" } else { "them" },
                     )));
+                }
+
+                // 16..=1000 ms is the engine's own accepted range, and it
+                // refuses an out-of-range value at the control plane — that is,
+                // on every media offer, at call time, on a node that came up
+                // reporting perfectly healthy. Catching it here turns "every
+                // call fails" into a boot failure that names the profile.
+                if let Some(window) = flags.echo_delay_search_ms {
+                    if !(16..=1000).contains(&window) {
+                        return Err(SiphonError::Config(format!(
+                            "media profile {name:?} sets echo_delay_search_ms to {window} on its \
+                             {direction} flags, outside the 16-1000 ms the engine accepts — it \
+                             refuses the value on every offer, so a node carrying this config \
+                             starts healthy and then fails every call"
+                        )));
+                    }
                 }
             }
         }
@@ -6706,6 +6754,104 @@ media:
             error.to_string().contains("ws_uri"),
             "error should name the field: {error}"
         );
+    }
+
+    /// The three echo-tuning knobs reach the config, and the search window is
+    /// carried as a number rather than being flattened into the `flags` list.
+    #[test]
+    fn parses_media_profile_echo_tuning() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        echo_cancellation: true\n        \
+             echo_delay_search_ms: 600\n        echo_long_tail: true\n        \
+             echo_residual_suppression: true\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.echo_cancellation);
+        assert_eq!(offer.echo_delay_search_ms, Some(600));
+        assert!(offer.echo_long_tail);
+        assert!(offer.echo_residual_suppression);
+    }
+
+    /// Absent means "engine default" for all three, so upgrading the pin does
+    /// not change what an existing profile asks for.
+    #[test]
+    fn media_profile_echo_tuning_defaults_off() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        echo_cancellation: true\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.echo_delay_search_ms.is_none());
+        assert!(!offer.echo_long_tail);
+        assert!(!offer.echo_residual_suppression);
+    }
+
+    /// Out of range is refused at load. The engine refuses it too, but only per
+    /// offer — which is a node that boots healthy and then fails every call, so
+    /// the boot failure is the one worth having.
+    #[test]
+    fn rejects_media_profile_echo_delay_search_out_of_range() {
+        for window in ["15", "1001"] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!(
+                    "      offer:\n        echo_cancellation: true\n        \
+                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                ),
+            );
+            let error = Config::from_str(&yaml)
+                .expect_err("a window outside 16-1000 ms must be refused at load");
+            assert!(
+                error.to_string().contains("echo_delay_search_ms"),
+                "error should name the field: {error}"
+            );
+        }
+    }
+
+    /// The bounds themselves are accepted — the check is inclusive, so a config
+    /// sitting exactly on 16 or 1000 is not refused by an off-by-one.
+    #[test]
+    fn accepts_media_profile_echo_delay_search_at_the_bounds() {
+        for window in ["16", "1000"] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!(
+                    "      offer:\n        echo_cancellation: true\n        \
+                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                ),
+            );
+            Config::from_str(&yaml).expect("the range bounds must be accepted");
+        }
+    }
+
+    /// All three are native siphon-rtp extensions with no NG or rtpproxy
+    /// equivalent, so a profile that sets them on those backends is refused
+    /// rather than silently ignored by an engine that never sees them.
+    #[test]
+    fn rejects_echo_tuning_on_backends_that_cannot_express_it() {
+        for backend in [RTPENGINE_BACKEND, RTPPROXY_BACKEND] {
+            for (field, value) in [
+                ("echo_delay_search_ms", "600"),
+                ("echo_long_tail", "true"),
+                ("echo_residual_suppression", "true"),
+            ] {
+                let yaml = ws_profile_yaml(
+                    backend,
+                    &format!("      offer:\n        {field}: {value}\n      answer: {{}}\n"),
+                );
+                let error = Config::from_str(&yaml)
+                    .expect_err("a native-only field must be refused on this backend");
+                assert!(
+                    error.to_string().contains(field),
+                    "error should name {field}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

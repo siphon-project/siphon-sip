@@ -11,6 +11,10 @@ use tracing::{error, info};
 use super::RecordingRecord;
 use crate::config::SrsConfig;
 
+/// Bound on one metadata (or metadata + audio) upload. Generous, because the
+/// multipart body can carry a whole recording, but finite.
+const HTTP_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Store a completed recording using the configured backend.
 pub async fn store_recording(config: &SrsConfig, record: &RecordingRecord) {
     match config.backend.as_str() {
@@ -101,7 +105,24 @@ async fn store_http(config: &SrsConfig, record: &RecordingRecord) {
         }
     };
 
-    let client = reqwest::Client::new();
+    // Every other reqwest client in the tree sets a timeout; this one did not,
+    // and with `upload_audio` on it posts a multipart body of recorded audio, so
+    // an endpoint that accepts and then stalls held the upload open with no
+    // bound at all.
+    let client = match reqwest::Client::builder()
+        .timeout(HTTP_UPLOAD_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            error!(
+                session_id = %record.session_id,
+                error = %error,
+                "SRS: failed to build HTTP client"
+            );
+            return;
+        }
+    };
 
     let should_upload_audio = http_config.upload_audio && record.recording_dir.is_some();
 
