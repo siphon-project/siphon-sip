@@ -143,6 +143,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **A peer that stopped reading its socket could park every handler thread and
+  abort the process.** The per-connection writer tasks wrote with no timeout,
+  fed by a 64-slot channel whose producers enqueued with no timeout. A peer that
+  accepts a connection and then stops draining it — alive, still ACKing, receive
+  window closed — makes the write block indefinitely, so the writer never
+  returns to its receive, the channel fills, and every producer parks. The
+  `is_closed()` guard in front of the enqueue does not catch it, because a full
+  channel is not a closed one, and `SO_KEEPALIVE` does not either, because
+  probes are suppressed while there is unacknowledged data or the socket is in
+  the persist state, which is exactly this case. On the SIP relay path the
+  producer runs inside a script handler job, so each parked send consumed a
+  script-executor worker until the executor watchdog aborted the process. The
+  bounded connect added earlier covered establishment only; a reused pooled
+  connection never goes near it, which is why the failure was completely silent.
+
+  Writes are now bounded and a stalled connection is dropped rather than kept as
+  something later callers queue behind; enqueues are bounded and shed, which the
+  caller already handles as a transport refusal (RFC 3261 §16.9). Applies to the
+  outbound TCP and TLS pool, accepted TCP/TLS/WS/WSS connections, and SCTP.
+  Sockets also now set `TCP_USER_TIMEOUT`, so the kernel gives up on a peer that
+  stops acknowledging instead of probing a zero window forever.
+- **The outbound pool no longer holds its per-destination establishment lock
+  while handing a message to a connection.** One slow peer stalled every other
+  caller for the same destination behind that lock. Nor does it hold a shard
+  guard of the connection map across the handoff, which blocked unrelated
+  inserts and removes.
+- **An idle SCTP association is now reaped.** Its read task had no idle timeout,
+  unlike every other connection-oriented transport, so a peer that stopped both
+  sending and reading left both tasks and the connection entry alive for the
+  life of the process.
 - **Three S6a scripting methods blocked while still attached to the
   interpreter, risking an engine-wide deadlock.** `diameter.s6a_air()`,
   `diameter.s6a_ulr()` and `diameter.s6a_purge_ue()` waited for the HSS answer

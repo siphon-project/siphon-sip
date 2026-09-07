@@ -32,7 +32,7 @@ use crate::transport::pool::ConnectionPool;
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
-    CONNECTION_IDLE_TIMEOUT,
+    CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
 };
 
 /// Create a listening TCP socket with `SO_REUSEADDR`/`SO_REUSEPORT` and the
@@ -339,9 +339,20 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // Write task.
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
-            if let Err(error) = writer.write_all(&data).await {
-                warn!("{transport} write error on {connection_id:?}: {error}");
-                break;
+            match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&data)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!("{transport} write error on {connection_id:?}: {error}");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "{transport} write stalled on {connection_id:?} after \
+                         {WRITE_TIMEOUT:?} — peer is not draining the connection \
+                         (zero receive window); closing it"
+                    );
+                    break;
+                }
             }
         }
     });
@@ -675,6 +686,110 @@ mod tests {
             local_addr: "127.0.0.1:5060".parse().unwrap(),
             remote_addr: "127.0.0.1:41234".parse().unwrap(),
         }
+    }
+
+    // --- a peer that stops reading ------------------------------------------
+
+    /// A write half that never completes a write — what a peer whose receive
+    /// window has closed looks like from up here. Not an error, not a close:
+    /// simply no progress, ever.
+    struct NeverDrains;
+
+    impl tokio::io::AsyncWrite for NeverDrains {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A read half that never delivers anything, so the *write* half is the only
+    /// thing that can end the connection.
+    struct NeverSpeaks;
+
+    impl tokio::io::AsyncRead for NeverSpeaks {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// An unbounded write to a peer that has stopped reading pins the writer
+    /// task, the connection and its `connection_map` entry for the life of the
+    /// process — the peer never errors and never closes, so nothing else ever
+    /// ends it.
+    ///
+    /// Time is paused, so this asserts the *write* timeout fired: it completes
+    /// long before `CONNECTION_IDLE_TIMEOUT` would have reaped the connection
+    /// from the read side, which would otherwise let the test pass for the wrong
+    /// reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_is_disconnected_rather_than_pinned_forever() {
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+
+        let served = tokio::spawn(serve_sip_stream(
+            NeverSpeaks,
+            NeverDrains,
+            context(),
+            BytesMut::new(),
+            inbound_tx,
+            Arc::clone(&connection_map),
+            None,
+            None,
+            None,
+        ));
+
+        // Queue one response for the peer that will never read it.
+        let sender = loop {
+            if let Some(entry) = connection_map.get(&ConnectionId(42)) {
+                break entry.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .expect("the writer task is live");
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(CONNECTION_IDLE_TIMEOUT * 2, served)
+            .await
+            .expect(
+                "serve_sip_stream never returned — an unbounded write to a peer \
+                 that stopped reading pins the writer task, the connection and \
+                 its connection_map entry for the life of the process",
+            )
+            .expect("the connection task did not panic");
+
+        assert!(
+            started.elapsed() < CONNECTION_IDLE_TIMEOUT,
+            "the connection outlived the write timeout and was reaped by the \
+             read-side idle timer instead — the write half is not bounded"
+        );
+        assert!(
+            connection_map.is_empty(),
+            "cleanup must drop the connection_map entry so nothing routes to a \
+             connection that is gone"
+        );
     }
 
     // --- sniff_first_line ---------------------------------------------------
