@@ -222,7 +222,11 @@ fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
     })?;
     let uri: String = match dict.get_item("uri")? {
         Some(value) => value.extract()?,
-        None => return Err(PyValueError::new_err("route target dict requires a string 'uri'")),
+        None => {
+            return Err(PyValueError::new_err(
+                "route target dict requires a string 'uri'",
+            ))
+        }
     };
     let next_hop = match dict.get_item("next_hop")? {
         Some(value) if !value.is_none() => Some(value.extract::<String>()?),
@@ -346,9 +350,14 @@ impl Call {
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.answer_with(code, reason.as_deref(), body.as_deref(), content_type.as_deref())
-                .await
-                .map_err(to_pyerr)
+            call.answer_with(
+                code,
+                reason.as_deref(),
+                body.as_deref(),
+                content_type.as_deref(),
+            )
+            .await
+            .map_err(to_pyerr)
         })
     }
 
@@ -459,7 +468,9 @@ impl Call {
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.reject_refer(code, reason.as_deref()).await.map_err(to_pyerr)
+            call.reject_refer(code, reason.as_deref())
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -502,10 +513,7 @@ impl Call {
         let policy = parse_peer_hangup(on_peer_hangup)?;
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let value = call
-                .bridge(&with_channel, policy)
-                .await
-                .map_err(to_pyerr)?;
+            let value = call.bridge(&with_channel, policy).await.map_err(to_pyerr)?;
             attach_if_running(|py| json_to_py(py, &value))
                 .unwrap_or_else(|| Err(interpreter_gone()))
         })
@@ -939,7 +947,9 @@ impl ControlClient {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Connect the underlying [`SipClient`] once, caching it.
@@ -948,7 +958,11 @@ async fn ensure_client(inner: &Arc<ClientInner>) -> PyResult<Arc<SipClient>> {
     if let Some(client) = guard.as_ref() {
         return Ok(Arc::clone(client));
     }
-    let client = Arc::new(SipClient::connect(inner.config.clone()).await.map_err(to_pyerr)?);
+    let client = Arc::new(
+        SipClient::connect(inner.config.clone())
+            .await
+            .map_err(to_pyerr)?,
+    );
     *guard = Some(Arc::clone(&client));
     Ok(client)
 }
@@ -1064,11 +1078,16 @@ struct ControlServer {
 impl ControlServer {
     #[new]
     #[pyo3(signature = (app, token, bind=None, reply_timeout_ms=10_000))]
-    fn new(app: String, token: String, bind: Option<String>, reply_timeout_ms: u64) -> PyResult<Self> {
+    fn new(
+        app: String,
+        token: String,
+        bind: Option<String>,
+        reply_timeout_ms: u64,
+    ) -> PyResult<Self> {
         let bind = bind.unwrap_or_else(|| "0.0.0.0:8790".to_string());
-        let listen: SocketAddr = bind
-            .parse()
-            .map_err(|error| PyValueError::new_err(format!("invalid bind address {bind:?}: {error}")))?;
+        let listen: SocketAddr = bind.parse().map_err(|error| {
+            PyValueError::new_err(format!("invalid bind address {bind:?}: {error}"))
+        })?;
         let mut config = ServerConfig::new(listen, app, token);
         config.reply_timeout = Duration::from_millis(reply_timeout_ms);
         Ok(Self {
@@ -1168,7 +1187,11 @@ async fn ensure_server(inner: &Arc<ServerInner>) -> PyResult<Arc<SipServer>> {
     if let Some(server) = guard.as_ref() {
         return Ok(Arc::clone(server));
     }
-    let server = Arc::new(SipServer::bind(inner.config.clone()).await.map_err(to_pyerr)?);
+    let server = Arc::new(
+        SipServer::bind(inner.config.clone())
+            .await
+            .map_err(to_pyerr)?,
+    );
     let bound = server.local_addr().map_err(to_pyerr)?;
     *lock(&inner.local_addr) = Some(bound.to_string());
     *guard = Some(Arc::clone(&server));

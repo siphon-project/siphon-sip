@@ -44,7 +44,9 @@ pub(crate) trait CommandTransport: Send + Sync {
 
 /// Lock a `Mutex` without ever panicking on poison.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The shared, transport-agnostic state of one connection.
@@ -191,7 +193,12 @@ where
     let (sink, stream) = websocket.split();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let close_signal = Arc::new(Notify::new());
-    let core = SessionCore::new(next_id, outbound_tx, reply_timeout, Arc::clone(&close_signal));
+    let core = SessionCore::new(
+        next_id,
+        outbound_tx,
+        reply_timeout,
+        Arc::clone(&close_signal),
+    );
     tokio::spawn(write_loop(sink, outbound_rx, close_signal));
     tokio::spawn(read_loop(stream, Arc::clone(&core), event_sink));
     core
