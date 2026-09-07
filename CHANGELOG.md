@@ -143,6 +143,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **Three S6a scripting methods blocked while still attached to the
+  interpreter, risking an engine-wide deadlock.** `diameter.s6a_air()`,
+  `diameter.s6a_ulr()` and `diameter.s6a_purge_ue()` waited for the HSS answer
+  with a bare `block_in_place` + `block_on` instead of the wrapper every one of
+  their eighteen siblings uses, which releases the interpreter for the blocking
+  window. A handler parked in the bare form never reaches a garbage-collection
+  safe point, so the next thread to allocate cyclic garbage — which Python does
+  constantly — blocks behind the stop-the-world pause. That surfaces either as
+  intermittent handler stalls or, when the only thread that could complete the
+  Diameter call is itself caught in the pause, as a permanent deadlock across
+  every handler in the process. All three now release the interpreter while
+  they wait. A source-level test guards the whole scripting-API namespace
+  against the same drift, including files added later, since the two forms
+  compile and behave identically until the collector happens to run at the
+  wrong moment.
 - **A method no script handler claims is no longer answered `500`, and OPTIONS
   is answered by the stack.** Every method without a matching
   `@proxy.on_request` handler got `500 Server Internal Error`, and OPTIONS is
