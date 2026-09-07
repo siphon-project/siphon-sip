@@ -104,6 +104,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   threads per arena lock and the throughput ceiling has not been re-validated
   under it.
 
+### Fixed
+- **One stuck script event handler could take media control down for the whole
+  process.** The background loops that deliver media and registration events to
+  `@rtpengine.*` and `@registrar.on_change` / `@registrant.on_change` handlers
+  awaited each handler inline, so a handler that never returned stopped the
+  loop. For media events that is not a lost DTMF digit: the event channel fills,
+  the media engine's control **read** task then parks trying to enqueue the next
+  event, no response is routed back to any pending request any more, and every
+  in-flight and future media command fails on its own timeout — with the control
+  connection still established. The wait is now bounded. Handlers are still
+  awaited rather than spawned, so events keep their order (out-of-order DTMF
+  digits would break any script reading them); only the wait is bounded, and the
+  handler itself runs on under the script executor's own watchdog.
+- **Media-engine event forwarding no longer parks its own read loop.** Both
+  event paths forwarded with an awaited send on a bounded channel under a
+  comment describing it as best-effort — but only a *closed* channel was
+  handled; a full one parked, stopping the loop that routes command responses.
+  They now shed with a warning, which is what the comment always claimed.
+- **The siphon-rtp control handshake bounds its write.** The existing timeout
+  started after the write and covered only the acknowledgement read, so an
+  engine that accepted the connection and then stopped draining it wedged the
+  reconnect task — and since that task is what re-establishes control, nothing
+  was left to recover from it.
+
 ## [1.8.3] — 2026-09-05
 
 ### Fixed

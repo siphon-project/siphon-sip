@@ -539,6 +539,58 @@ impl DispatcherState {
     }
 }
 
+/// Bound on one event-handler invocation from a background drain loop.
+///
+/// Generous — a media or registrar handler may legitimately do a Diameter round
+/// trip — but well under the script executor's own stall window, so the drain
+/// loop always gives up before the watchdog would.
+#[cfg(not(test))]
+const EVENT_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shortened under test only. The regression asserts *relative* to this value
+/// ("it waited out its own window"), never against an absolute number, so the
+/// shorter value tests the same property without costing the suite ten seconds
+/// per run. A stuck handler blocks a real thread, so paused time cannot be used
+/// here — the runtime never goes idle enough to auto-advance.
+#[cfg(test)]
+const EVENT_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Invoke a script handler from a background event loop without letting one
+/// stuck handler stop the loop.
+///
+/// These loops `recv` from a bounded channel and previously `.await`ed the
+/// handler inline, so a handler that never returned stopped the whole drain.
+/// For media events that is not a lost DTMF digit: the channel fills, the media
+/// engine's control **read** task parks trying to enqueue the next event, no
+/// response is routed back to its pending request any more, and every in-flight
+/// and future media command fails on its own timeout — media control dead
+/// process-wide, connection still established.
+///
+/// The handler is still awaited rather than spawned, so events keep their
+/// order (DTMF digits arriving out of order would break any IVR reading them);
+/// only the wait is bounded. The result was already discarded, so abandoning it
+/// costs nothing — the job itself runs on, and the executor's own watchdog is
+/// what covers a handler that never finishes.
+async fn run_event_handler<F>(kind: &'static str, handler: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if tokio::time::timeout(
+        EVENT_HANDLER_TIMEOUT,
+        crate::script::py_executor::try_run(handler),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            handler = kind,
+            timeout = ?EVENT_HANDLER_TIMEOUT,
+            "script event handler did not return within the window — continuing to \
+             drain events rather than letting one handler stop the loop (the \
+             handler itself is still running; the executor watchdog covers it)"
+        );
+    }
+}
+
 /// Run the core dispatcher loop.
 ///
 /// Reads inbound messages from transport, parses, invokes Python handlers,
@@ -1013,7 +1065,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                let _ = crate::script::py_executor::try_run(move || {
+                run_event_handler("registrar.on_change", move || {
                     let engine_state = state_ref.engine.state();
                     let handlers = engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
 
@@ -1107,7 +1159,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                let _ = crate::script::py_executor::try_run(move || {
+                run_event_handler("registrant.on_change", move || {
                     let engine_state = state_ref.engine.state();
                     let handlers = engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
 
@@ -1221,7 +1273,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let dtmf_clone = dtmf.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_dtmf", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .dtmf_handlers(&dtmf_clone.call_id, &dtmf_clone.from_tag);
@@ -1291,7 +1343,7 @@ pub async fn run(
                         let state_ref = Arc::clone(&state_for_events);
                         let call_id_clone = call_id.clone();
                         let from_tag_clone = from_tag.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_media_timeout", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .media_timeout_handlers(&call_id_clone, &from_tag_clone);
@@ -1359,7 +1411,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let text_clone = text_event.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_text", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .text_handlers(&text_clone.call_id, &text_clone.from_tag);
@@ -1430,7 +1482,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let tee_clone = tee.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_ws_tee_started", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .ws_tee_started_handlers(&tee_clone.call_id, &tee_clone.from_tag);
@@ -1504,7 +1556,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let play_clone = play.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_play_finished", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state.play_finished_handlers(
                                 &play_clone.call_id,
@@ -1572,7 +1624,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let bridge_clone = bridge.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_ws_bridge_started", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state.ws_bridge_started_handlers(
                                 &bridge_clone.call_id,
@@ -1656,7 +1708,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let bridge_clone = bridge.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_ws_bridge_ended", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state.ws_bridge_ended_handlers(
                                 &bridge_clone.call_id,
@@ -1749,7 +1801,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let tee_clone = tee.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_ws_tee_ended", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .ws_tee_ended_handlers(&tee_clone.call_id, &tee_clone.from_tag);
@@ -1803,7 +1855,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let beep_clone = beep.clone();
-                        let _ = crate::script::py_executor::try_run(move || {
+                        run_event_handler("rtpengine.on_beep", move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .beep_handlers(&beep_clone.call_id, &beep_clone.from_tag);
@@ -29387,6 +29439,48 @@ fn handle_srs_bye(
 
 #[cfg(test)]
 mod tests {
+    /// A script handler that never returns must not stop the event drain loop.
+    ///
+    /// These loops `recv` media and registrar events from a bounded channel and
+    /// invoke the handler inline. Before the bound, one stuck handler stopped
+    /// the loop, the channel filled, and the media engine's control **read**
+    /// task then parked trying to enqueue the next event — at which point no
+    /// response was routed back to any pending request and every in-flight and
+    /// future media command failed on its own timeout. Media control dead
+    /// process-wide, connection still established, from one handler.
+    ///
+    /// The handler is still awaited rather than spawned, so events keep their
+    /// order; only the wait is bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_event_handler_does_not_stop_the_drain_loop() {
+        // Released at the end so the blocked handler thread can exit and not
+        // hold up runtime shutdown.
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_in_handler = std::sync::Arc::clone(&release);
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            super::EVENT_HANDLER_TIMEOUT * 30,
+            super::run_event_handler("test.stuck", move || {
+                while !release_in_handler.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }),
+        )
+        .await
+        .expect(
+            "run_event_handler never returned — one stuck script handler stops the \
+             whole event drain, and for media events that takes the engine's \
+             control read loop down with it",
+        );
+
+        assert!(
+            started.elapsed() >= super::EVENT_HANDLER_TIMEOUT,
+            "it must have waited out its own window, not returned early"
+        );
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The timer wheel stores a *pointer* to the entry, not the entry.
     ///
     /// Same shape as the transaction map: `hashbrown` sizes its bucket array
