@@ -574,15 +574,13 @@ mod tests {
     async fn a_mediation_function_that_stops_reading_times_out_rather_than_stalling_delivery() {
         let mut stalled = NeverDrains;
 
-        let outcome = tokio::time::timeout(
-            X2_WRITE_TIMEOUT * 10,
-            write_and_flush(&mut stalled, b"pdu"),
-        )
-        .await
-        .expect(
-            "write_and_flush parked on a mediation function that stopped reading \
+        let outcome =
+            tokio::time::timeout(X2_WRITE_TIMEOUT * 10, write_and_flush(&mut stalled, b"pdu"))
+                .await
+                .expect(
+                    "write_and_flush parked on a mediation function that stopped reading \
              — every warrant's IRI delivery stops with it",
-        );
+                );
 
         let error = outcome.expect_err("a write to a stalled peer cannot succeed");
         assert_eq!(

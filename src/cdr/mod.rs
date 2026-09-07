@@ -812,7 +812,10 @@ async fn write_http_cdr(cdr: &Cdr, state: &HttpState) {
         }
     };
 
-    if tokio::time::timeout(HTTP_CDR_TIMEOUT, exchange).await.is_err() {
+    if tokio::time::timeout(HTTP_CDR_TIMEOUT, exchange)
+        .await
+        .is_err()
+    {
         error!(
             call_id = %cdr.call_id,
             address = %address,
