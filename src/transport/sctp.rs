@@ -168,10 +168,7 @@ pub async fn listen(
                                 {
                                     Ok(Ok(_)) => {}
                                     Ok(Err(error)) => {
-                                        warn!(
-                                            "SCTP write error on {:?}: {}",
-                                            connection_id, error
-                                        );
+                                        warn!("SCTP write error on {:?}: {}", connection_id, error);
                                         break;
                                     }
                                     Err(_) => {
