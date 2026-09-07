@@ -1343,6 +1343,63 @@ impl PyCall {
         }
     }
 
+    /// Replace the body of the captured A-leg INVITE.
+    ///
+    /// Updates ``Content-Type`` and ``Content-Length`` to match.  ``body``
+    /// accepts ``str`` or ``bytes``.
+    ///
+    /// The B-leg INVITE is built from this message, so a body set here is the
+    /// body the callee receives — this is the ``dial()``-time counterpart of
+    /// ``set_ruri_user()`` / ``set_from_user()`` and must be called *before*
+    /// ``dial()`` / ``fork()``.  The typical use is sanitising the SDP an
+    /// anchoring step left behind: ``rtpengine.offer(call)`` rewrites the
+    /// captured INVITE in place, and a script that needs to strip or rewrite
+    /// attributes before the offer goes out has nowhere else to put the result.
+    ///
+    /// ```python
+    /// await rtpengine.offer(call, profile="trunk_to_ims")
+    /// cleaned = strip_unwanted_attributes(call.body)
+    /// call.set_body(cleaned, "application/sdp")
+    /// call.dial("sip:bob@example.com")
+    /// ```
+    #[pyo3(signature = (body, content_type=None))]
+    fn set_body(&self, body: &Bound<'_, PyAny>, content_type: Option<&str>) -> PyResult<()> {
+        let bytes = super::request::extract_body_bytes(body)?;
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if let Some(content_type) = content_type {
+            message
+                .headers
+                .set("Content-Type", content_type.to_string());
+        }
+        message
+            .headers
+            .set("Content-Length", bytes.len().to_string());
+        message.body = bytes;
+        Ok(())
+    }
+
+    /// The UAS To-tag siphon minted for this call's A-leg.
+    ///
+    /// siphon owns this tag: it is generated with the A-leg dialog, so it is
+    /// readable from the first handler onwards — before any response goes out —
+    /// and it is the tag stamped on every response the framework sends, from
+    /// the ``progress()`` 18x through the ``answer()`` 2xx and on into the
+    /// in-dialog requests.  It does not change for the life of the dialog.
+    /// ``None`` only when the call is no longer live (or the B2BUA is not
+    /// running).
+    ///
+    /// Read it when something outside siphon has to agree with siphon about
+    /// the dialog's identity — an external media controller keying an
+    /// offer/answer on ``(call-id, from-tag, to-tag)`` needs the same to-tag
+    /// siphon put on the wire, and minting its own there desynchronises the
+    /// media answer from the dialog.
+    #[getter]
+    fn local_tag(&self) -> Option<String> {
+        crate::dispatcher::b2bua_local_tag(&self.id)
+    }
+
     /// Reject the call with a status code.
     fn reject(&mut self, code: u16, reason: &str) {
         self.action = CallAction::Reject {
@@ -4189,5 +4246,101 @@ mod tests {
             call.cdr_session_key_candidates(),
             vec!["test-id".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // call.set_body / call.local_tag
+    // -----------------------------------------------------------------------
+
+    const SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n";
+
+    fn plain_call() -> PyCall {
+        PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "192.0.2.10".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    /// The B-leg INVITE is built from this message, so a wrong Content-Length
+    /// here is a malformed INVITE on the wire, not a local inconsistency.
+    #[test]
+    fn set_body_replaces_the_body_and_restates_content_length() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let call = plain_call();
+            let body = pyo3::types::PyString::new(py, SDP).into_any();
+
+            call.set_body(&body, Some("application/sdp")).unwrap();
+
+            assert_eq!(call.body().unwrap().as_deref(), Some(SDP.as_bytes()));
+            let message = call.message.lock().unwrap();
+            assert_eq!(
+                message.headers.get("Content-Length").map(String::as_str),
+                Some(SDP.len().to_string().as_str())
+            );
+            assert_eq!(
+                message.headers.get("Content-Type").map(String::as_str),
+                Some("application/sdp")
+            );
+        });
+    }
+
+    /// `bytes` is the shape `call.body` hands back, so a read-modify-write
+    /// round trip must not have to decode to `str` first.
+    #[test]
+    fn set_body_accepts_bytes_and_keeps_the_content_type_when_omitted() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let call = plain_call();
+            let first = pyo3::types::PyString::new(py, SDP).into_any();
+            call.set_body(&first, Some("application/sdp")).unwrap();
+
+            let rewritten = SDP.replace("40000", "40002");
+            let second = pyo3::types::PyBytes::new(py, rewritten.as_bytes()).into_any();
+            call.set_body(&second, None).unwrap();
+
+            assert_eq!(call.body().unwrap().as_deref(), Some(rewritten.as_bytes()));
+            let message = call.message.lock().unwrap();
+            // Omitting content_type leaves the one already negotiated in place
+            // rather than clearing it — the body changed, the type did not.
+            assert_eq!(
+                message.headers.get("Content-Type").map(String::as_str),
+                Some("application/sdp")
+            );
+            assert_eq!(
+                message.headers.get("Content-Length").map(String::as_str),
+                Some(rewritten.len().to_string().as_str())
+            );
+        });
+    }
+
+    /// An empty body is a legitimate state (a delayed-offer INVITE), so it must
+    /// clear the body and say `Content-Length: 0` rather than being refused.
+    #[test]
+    fn set_body_empty_clears_the_body() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let call = plain_call();
+            let body = pyo3::types::PyString::new(py, "").into_any();
+
+            call.set_body(&body, None).unwrap();
+
+            assert!(call.body().unwrap().is_none());
+            let message = call.message.lock().unwrap();
+            assert_eq!(
+                message.headers.get("Content-Length").map(String::as_str),
+                Some("0")
+            );
+        });
+    }
+
+    /// No B2BUA is running in the test binary, so this exercises the
+    /// dispatcher-down arm: a script reading the tag on a call that has gone
+    /// away gets `None`, never a panic on a script thread.
+    #[test]
+    fn local_tag_is_none_when_the_call_is_not_live() {
+        assert!(plain_call().local_tag().is_none());
     }
 }

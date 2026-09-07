@@ -23324,6 +23324,24 @@ pub fn b2bua_answer_call(
     )
 }
 
+/// The A-leg's local (UAS) To-tag for a live B2BUA call (`call.local_tag`).
+///
+/// siphon mints this tag with the A-leg dialog (`Dialog::from_inbound`), so it
+/// exists before any response is sent, and stamps it on everything
+/// `b2bua_send_uas_response` puts on the wire — it is the tag the far end sees.
+/// It lives on the actor and never appears in the inbound INVITE the script API
+/// holds, which is why reading it needs a door through the control handle
+/// rather than a lookup on `PyCall`'s own message. Keyed on the internal call
+/// id, like the other UAS-side entry points (`b2bua_answer_call`,
+/// `b2bua_progress_call`).
+///
+/// `None` when the dispatcher is down or the call is gone.
+pub fn b2bua_local_tag(internal_call_id: &str) -> Option<String> {
+    let control = B2BUA_CONTROL.get()?;
+    let call = control.state.call_actors.get_call(internal_call_id)?;
+    Some(call.a_leg.dialog.local_tag.clone())
+}
+
 /// Imperatively send a provisional (1xx) for a UAS-mode B2BUA call
 /// (`call.progress()`) — e.g. a 183 with early-media SDP. Does not answer the
 /// call. Returns `false` if the call is gone / dispatcher down.
@@ -30753,6 +30771,16 @@ mod tests {
             None,
             None
         ));
+    }
+
+    #[test]
+    fn b2bua_local_tag_unknown_id_is_none_no_panic() {
+        // `call.local_tag` is read from script threads, including after the
+        // call it names has been torn down (an async handler resuming late, a
+        // timer firing on a hung-up call). Unknown id — and no running
+        // dispatcher in the test binary — must be None, never a panic.
+        assert!(b2bua_local_tag("nope").is_none());
+        assert!(b2bua_local_tag("").is_none());
     }
 
     // -----------------------------------------------------------------------
