@@ -194,6 +194,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   under it.
 
 ### Fixed
+- **A prepaid call that never dialled anything no longer leaves its Ro session
+  open.** `call.ro_authorize()` reserves credit *before* the B-leg is connected,
+  so from the reservation until the first leg there is a live credit-control
+  session with no dialogue behind it, and every path that can end a call in that
+  window owes it a `CCR-TERMINATION`. Two did not, and they are exactly the two
+  where nothing was ever dialled: a fork whose branches could none of them be
+  sent, and an LCR answer naming only carriers that turn out to be unroutable
+  (every gateway group unresolved or down — a group name that does not match is
+  enough, and it is matched exactly, including case). Both answered the caller
+  `503` and dropped the call while the reservation stayed live: no
+  `CCR-TERMINATION` was ever sent, reserved credit was never released, and the
+  session's re-authorisation timer kept sending `CCR-UPDATE` for a call that no
+  longer existed and never had a leg, until the charging layer's own 24-hour
+  backstop fired. It does not present as a routing problem either — what an
+  operator sees is repeated credit-control updates carrying zero used units and
+  no chosen carrier, so the investigation starts at the charging interface and
+  not at the route that could not be dialled. Both now release, as does the
+  control plane's own pre-answer teardown (a parked call the app declined, a
+  handoff deadline, an unanswered hangup, and the `route` verb finding no
+  routable carrier), carrying the status the caller was actually sent as the
+  IMS-Information `Cause-Code` — from the same mapping Rf's ACR-STOP uses, so
+  the two interfaces cannot disagree about why a call ended. Rf was never
+  affected, and the reason is the diagnosis rather than a second bug: its
+  ACR-START fires only on a successful answer, so no Rf session exists on any of
+  the paths Ro needs one released on. Backing all of it, a reservation whose
+  call is gone is now released within half a second whatever removed the call,
+  and logs a warning naming the session — so the next teardown path that forgets
+  says so instead of quietly billing against nobody.
 - **A transfer target that never answers no longer strands the call.** A
   replacement — a siphon-terminated REFER transfer, and now `replace_peer` — dials
   its target on a call that is already `Answered`, while the answer-timeout sweep
