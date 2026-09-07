@@ -1,0 +1,20 @@
+# Config for the unhandled-method regression test (scripts/options_fallback_test.sh).
+#
+# The script it loads registers ONE method-filtered handler and nothing else, so
+# every other method reaches the framework's no-handler fallback: OPTIONS is
+# answered 200 (RFC 3261 §11.2) and everything else 405 + Allow (§8.2.1).
+#
+# `auto_options` is driven from the environment so the runner can exercise both
+# the default and the opt-out against one config.
+listen:
+  udp:
+    - "127.0.0.1:15080"
+domain:
+  local: ["127.0.0.1"]
+script:
+  path: "sipp/nohandler/nohandler.py"
+server:
+  auto_options: ${SIPHON_AUTO_OPTIONS:-true}
+log:
+  level: warn
+  format: pretty

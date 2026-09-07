@@ -1084,6 +1084,33 @@ auth:
 #                                     # many seconds for in-flight transactions and
 #                                     # B2BUA calls to finish before exiting. Default
 #                                     # 30s. Set to 0 to exit immediately on signal.
+#   auto_options: true                # Answer an OPTIONS that NO script handler
+#                                     # claims with 200 OK + Contact + Allow
+#                                     # (RFC 3261 §11.2). Default true.
+#                                     #
+#                                     # Every registrar qualifies its bindings —
+#                                     # Asterisk's qualify_frequency and its
+#                                     # equivalents probe the registered contact on a
+#                                     # timer for the life of the registration — so a
+#                                     # siphon that registers to a provider answers
+#                                     # one of these forever.
+#                                     #
+#                                     # This governs ONLY the case where no
+#                                     # @proxy.on_request handler matches. A script
+#                                     # that registers one — including a catch-all
+#                                     # @proxy.on_request — owns OPTIONS entirely and
+#                                     # is unaffected either way, so relaying the
+#                                     # probe to the UE, or dropping it, stays a
+#                                     # script decision.
+#                                     #
+#                                     # false drops an unclaimed OPTIONS silently
+#                                     # (no response at all, not a 405) so siphon does
+#                                     # not confirm its own existence to a probe
+#                                     # nobody asked it to answer — the same policy
+#                                     # the scripting API uses for scanner traffic.
+#                                     # Every OTHER unhandled method still gets
+#                                     # 405 Method Not Allowed + Allow; the knob does
+#                                     # not silence those.
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics

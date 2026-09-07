@@ -2126,10 +2126,34 @@ pub struct ServerIdentityConfig {
     /// deployments.  When unset, siphon falls back to the ``HOSTNAME``
     /// environment variable, then to ``"siphon"`` as a last resort.
     pub instance_id: Option<String>,
+    /// Answer an OPTIONS that **no** script handler claims with `200 OK` plus
+    /// `Contact` and `Allow` (RFC 3261 §11.2). Default: true.
+    ///
+    /// Every registrar qualifies its bindings — Asterisk's `qualify_frequency`
+    /// and its equivalents probe the registered contact on a timer for the life
+    /// of the registration — so a siphon that registers to a provider answers
+    /// one of these forever, and making each deployment hand-write the same
+    /// handler meant nobody did.
+    ///
+    /// This only governs the case where no `@proxy.on_request` handler matches:
+    /// a script that registers one (including a catch-all `@proxy.on_request`)
+    /// owns OPTIONS entirely and is unaffected either way.
+    ///
+    /// Set to false and an unclaimed OPTIONS is dropped silently rather than
+    /// answered — no response at all, the same policy the scripting API uses for
+    /// scanner traffic, so siphon does not confirm its own existence to a probe
+    /// nobody asked it to answer. Turning it off without registering a handler
+    /// means OPTIONS goes unanswered; that is the point of turning it off.
+    #[serde(default = "default_auto_options")]
+    pub auto_options: bool,
 }
 
 fn default_drain_secs() -> u64 {
     30
+}
+
+fn default_auto_options() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -4730,6 +4754,73 @@ fn default_lcr_cache_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `server.auto_options` defaults ON, and it has to default ON from *both*
+    /// directions: an absent `server:` block (the common case — nobody adds one
+    /// to get an OPTIONS answered) and a present block that simply does not
+    /// mention the key. A `#[serde(default)]` covers the second; only the
+    /// dispatcher's own `map_or(true, …)` on the absent block covers the first,
+    /// which is why the no-block case is asserted through that same shape
+    /// rather than against the struct alone. (`map_or` and not `is_none_or`
+    /// there and here: the latter is stable since 1.82 and the crate's MSRV is
+    /// 1.80.)
+    #[test]
+    fn auto_options_defaults_on() {
+        let with_block = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+            "server:\n",
+            "  drain_secs: 5\n",
+        ))
+        .expect("config must parse");
+        assert!(
+            with_block
+                .server
+                .as_ref()
+                .map_or(true, |server| server.auto_options),
+            "a server: block that omits auto_options must still answer OPTIONS"
+        );
+
+        let without_block = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+        ))
+        .expect("config must parse");
+        assert!(
+            without_block
+                .server
+                .as_ref()
+                .map_or(true, |server| server.auto_options),
+            "no server: block at all must still answer OPTIONS"
+        );
+    }
+
+    #[test]
+    fn auto_options_can_be_turned_off() {
+        let config = Config::from_str(concat!(
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "script:\n",
+            "  path: \"/dev/null\"\n",
+            "server:\n",
+            "  auto_options: false\n",
+        ))
+        .expect("config must parse");
+        assert!(!config
+            .server
+            .as_ref()
+            .map_or(true, |server| server.auto_options));
+    }
 
     /// Codec manipulation is an rtpengine NG capability. The native engine's
     /// `ProfileFlags` has no codec fields and rtpproxy is a plain relay, so a
