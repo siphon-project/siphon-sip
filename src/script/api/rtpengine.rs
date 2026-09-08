@@ -1125,8 +1125,23 @@ impl PyRtpEngine {
                 Ok(()) => {
                     debug!(call_id = %call_id, "RTPEngine session deleted");
                 }
+                Err(error) if error.is_call_not_found() => {
+                    // Not a failure: the engine had already released the
+                    // session.  A script's teardown legitimately reaches this
+                    // on both paths that release the media before the handler
+                    // runs — the media-timeout reaper drops the call before it
+                    // emits the event `@rtpengine.on_media_timeout` fires on,
+                    // and the `on_answer`-failure path releases it before
+                    // `@b2bua.on_failure` runs.  Warning on the ordinary race
+                    // trains operators to skim teardown warnings, which buries
+                    // the delete failures that do mean something (engine
+                    // unreachable, a leaked session).  Same rule the dispatcher
+                    // already applies at its own safety-net deletes.
+                    debug!(call_id = %call_id, "RTPEngine session already released");
+                }
                 Err(error) => {
-                    // Log but don't fail — the session may already be gone.
+                    // Log but don't fail — teardown is best-effort here, but
+                    // this one is worth an operator's attention.
                     warn!(call_id = %call_id, error = %error, "RTPEngine delete failed");
                 }
             }
