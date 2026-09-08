@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.6] — 2026-09-08
+
 ### Added
 > The embedded dashboard and everything below that feeds it stay
 > **EXPERIMENTAL and a work in progress**: the views, the admin JSON shapes and
