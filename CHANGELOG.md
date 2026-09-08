@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.4] — 2026-09-08
+
 ### Added
 - **A maximum call duration — `max_duration=` on `call.dial()` / `call.fork()` /
   `call.route()`, `call.set_max_duration()`, and `b2bua.max_call_duration_secs`.**
