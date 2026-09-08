@@ -305,6 +305,10 @@ impl PyB2buaControl {
     ///         ``b2bua.default_number_policy``, else no reshaping. A replacement
     ///         leg does not re-enter ``@b2bua.on_invite``, so this is where a
     ///         carrier's number format gets applied to it.
+    ///     format: The inline form of the same thing, as on
+    ///         ``rewrite_identities(format=…)``: ``"e164"``, ``"plain"``,
+    ///         ``"international"`` or ``"national"``. Pass one or the other,
+    ///         never both.
     ///
     /// Returns True once the INVITE is on the wire. It does **not** wait for the
     /// target: the replacement completes later, and `@b2bua.on_bye` fires for
@@ -322,7 +326,7 @@ impl PyB2buaControl {
     ///     if digit == "0":
     ///         b2bua.replace_peer(call_id, "sip:operator@pbx.example", timeout=45)
     /// ```
-    #[pyo3(signature = (call_id, target, next_hop=None, replace_a_leg=false, profile=None, timeout=30, number_policy=None))]
+    #[pyo3(signature = (call_id, target, next_hop=None, replace_a_leg=false, profile=None, timeout=30, number_policy=None, format=None))]
     #[allow(clippy::too_many_arguments)]
     fn replace_peer(
         &self,
@@ -333,19 +337,21 @@ impl PyB2buaControl {
         profile: Option<&str>,
         timeout: u32,
         number_policy: Option<&str>,
+        format: Option<&str>,
     ) -> PyResult<bool> {
         use pyo3::exceptions::PyValueError;
-        // Validate the name here so a typo raises on the spot, the way
-        // `dial(number_policy=…)` and `accept_refer(number_policy=…)` do,
-        // instead of silently dialling the target unreshaped.
-        crate::script::api::numbers::resolve_dial_policy(number_policy)?;
+        // Validate here so a typo raises on the spot, the way
+        // `dial(number_policy=…)` and `accept_refer(…)` do, instead of silently
+        // dialling the target unreshaped.
+        let shape = crate::script::api::numbers::NumberShape::from_args(number_policy, format)?;
+        crate::script::api::numbers::resolve_dial_shape(shape.as_ref())?;
         crate::dispatcher::b2bua_replace_peer(
             call_id,
             target,
             next_hop,
             replace_a_leg,
             profile,
-            number_policy,
+            shape.as_ref(),
             timeout,
         )
         .map(|()| true)

@@ -119,10 +119,13 @@ def on_refer(call):
         assert action.next_hop == "sip:trunk.example.com:5060"
 
     def test_number_policy_recorded_for_the_transferred_leg(self, harness):
-        # A Teams Refer-To names +E.164; a trunk that takes bare digits sees
-        # every ordinary call as 32... and every transferred one as +32...
-        # unless the transfer asks for the same shaping a dial gets. The
-        # replacement leg never re-enters @b2bua.on_invite.
+        # A referrer names its target in +E.164; a trunk that takes bare digits
+        # sees every ordinary call without the plus and every transferred one
+        # with it, unless the transfer asks for the same shaping a dial gets.
+        # The replacement leg never re-enters @b2bua.on_invite.
+        from siphon_sdk import mock_module
+
+        mock_module.get_numbers().register_policy("carrier-plain@2026", default="plain")
         harness.load_source(
             """
 from siphon import b2bua
@@ -141,6 +144,53 @@ def on_refer(call):
         assert action.kind == "accept_refer"
         assert action.extras["number_policy"] == "carrier-plain@2026"
         assert action.extras["profile"] == "rtp_passthrough"
+
+    def test_inline_format_needs_no_configured_policy(self, harness):
+        # The complaint that produced format=: a script that shapes numbers with
+        # rewrite_identities(format="plain") has no number_policies: block at
+        # all, so number_policy="plain" failed as an unknown policy name.
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(target="sip:+15550142@carrier.example",
+                      mode="terminate", format="plain")
+"""
+        )
+
+        action = harness.send_refer().call.last_action
+        assert action.extras["format"] == "plain"
+        assert action.extras["number_policy"] is None
+
+    def test_number_policy_and_format_together_raise(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(number_policy="carrier-plain@2026", format="plain")
+"""
+        )
+
+        with pytest.raises(ValueError):
+            harness.send_refer()
+
+    def test_unknown_format_raises(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(format="e165")
+"""
+        )
+
+        with pytest.raises(ValueError):
+            harness.send_refer()
 
     def test_number_policy_defaults_to_none(self, harness):
         # None means "the configured b2bua.default_number_policy", the same

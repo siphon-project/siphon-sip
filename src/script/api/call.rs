@@ -95,12 +95,12 @@ pub enum CallAction {
         /// correct when that profile is symmetric — see
         /// `ProfileEntry::is_direction_bound`.
         profile: Option<String>,
-        /// Number policy for the leg the transfer dials, resolved the way
-        /// `dial()` resolves it: this name, else `b2bua.default_number_policy`,
-        /// else none. Carried as a name rather than a resolved policy because
+        /// How the leg the transfer dials should have its numbers shaped,
+        /// resolved the way `dial()` resolves it: this selector, else
+        /// `b2bua.default_number_policy`, else none. Carried unresolved because
         /// the reshape happens on the dispatcher side, where the triggered
         /// INVITE is built.
-        number_policy: Option<String>,
+        number_shape: Option<super::numbers::NumberShape>,
     },
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
@@ -1692,7 +1692,7 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, max_duration=None, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
+    #[pyo3(signature = (uri, timeout=30, max_duration=None, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None, format=None))]
     #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
@@ -1709,14 +1709,16 @@ impl PyCall {
         send_socket: Option<String>,
         auth_passthrough: bool,
         number_policy: Option<&str>,
+        format: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
         self.max_duration_secs = max_duration.or(self.max_duration_secs);
-        // Number normalization (explicit `number_policy=`, else the configured
-        // `b2bua.default_number_policy`): reformat the A-leg identity headers
-        // that flow to the B-leg, plus the dial target itself.
+        // Number normalization (a named `number_policy=`, an inline `format=`,
+        // else the configured `b2bua.default_number_policy`): reformat the A-leg
+        // identity headers that flow to the B-leg, plus the dial target itself.
+        let shape = super::numbers::NumberShape::from_args(number_policy, format)?;
         let target = {
-            if let Some(policy) = super::numbers::resolve_dial_policy(number_policy)? {
+            if let Some(policy) = super::numbers::resolve_dial_shape(shape.as_ref())? {
                 let mut message = self.message.lock().map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
                 })?;
@@ -1762,7 +1764,7 @@ impl PyCall {
     /// `strategy="sequential"` carries the same route set per carrier (as an
     /// explicit next-hop plus a `Route` header), so serial failover across an
     /// AoR's bindings reaches each binding's own proxy chain.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30, max_duration=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, max_duration=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None, format=None))]
     #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
@@ -1777,8 +1779,10 @@ impl PyCall {
         send_socket: Option<String>,
         auth_passthrough: bool,
         number_policy: Option<&str>,
+        format: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        let shape = super::numbers::NumberShape::from_args(number_policy, format)?;
         self.max_duration_secs = max_duration.or(self.max_duration_secs);
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
@@ -1796,8 +1800,9 @@ impl PyCall {
             }
         }
         // Number normalization applies to every branch target plus the A-leg
-        // identity headers (explicit `number_policy=`, else the b2bua default).
-        if let Some(policy) = super::numbers::resolve_dial_policy(number_policy)? {
+        // identity headers (a named `number_policy=`, an inline `format=`, else
+        // the b2bua default).
+        if let Some(policy) = super::numbers::resolve_dial_shape(shape.as_ref())? {
             let mut message = self.message.lock().map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
             })?;
@@ -2480,14 +2485,24 @@ impl PyCall {
     ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
     ///                     profile="rtp_passthrough",
     ///                     number_policy="carrier-plain@2026")
-    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None, number_policy=None))]
+    ///
+    /// `format` is the inline form of the same thing, exactly as on
+    /// `rewrite_identities(format=…)`: `"e164"`, `"plain"`, `"international"` or
+    /// `"national"`, applied over the default identity header set on the
+    /// configured home locale. Pass one or the other, never both.
+    ///
+    ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+    ///                     profile="rtp_passthrough", format="plain")
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None))]
+    #[allow(clippy::too_many_arguments)]
     fn accept_refer(
         &mut self,
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<&str>,
         profile: Option<String>,
-        number_policy: Option<String>,
+        number_policy: Option<&str>,
+        format: Option<&str>,
     ) -> PyResult<()> {
         let mode = match mode {
             None => None,
@@ -2499,18 +2514,19 @@ impl PyCall {
                 )));
             }
         };
-        // Resolve eagerly for the error only: a typo'd policy name has to raise
-        // here, in the handler, the way `dial()` raises — not silently skip the
-        // reshape at dial time where nothing is watching. The resolved policy
-        // itself is discarded; the dispatcher re-resolves by name once it has
-        // the triggered INVITE to apply it to.
-        let _ = super::numbers::resolve_dial_policy(number_policy.as_deref())?;
+        // Resolve eagerly for the error only: a typo'd policy name or an
+        // unknown format has to raise here, in the handler, the way `dial()`
+        // raises — not silently skip the reshape at dial time where nothing is
+        // watching. The resolved policy itself is discarded; the dispatcher
+        // re-resolves once it has the triggered INVITE to apply it to.
+        let number_shape = super::numbers::NumberShape::from_args(number_policy, format)?;
+        let _ = super::numbers::resolve_dial_shape(number_shape.as_ref())?;
         self.action = CallAction::AcceptRefer {
             target,
             next_hop,
             mode,
             profile,
-            number_policy,
+            number_shape,
         };
         Ok(())
     }
@@ -2978,6 +2994,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3018,6 +3035,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         match call.action() {
@@ -3053,6 +3071,7 @@ mod tests {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -3091,6 +3110,7 @@ mod tests {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -3131,6 +3151,7 @@ mod tests {
             vec![],
             Some("udp:10.0.0.1:5060".to_string()),
             false,
+            None,
             None,
         )
         .unwrap();
@@ -3174,6 +3195,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(call.max_duration_secs(), Some(3600));
@@ -3197,6 +3219,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3223,6 +3246,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(call.max_duration_secs(), Some(0));
@@ -3248,6 +3272,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3305,6 +3330,7 @@ mod tests {
             vec![],
             Some("not-a-socket".to_string()),
             false,
+            None,
             None,
         );
         assert!(result.is_err());
@@ -3376,6 +3402,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3435,6 +3462,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3489,6 +3517,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -3535,6 +3564,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
             let input = call
@@ -3567,6 +3597,7 @@ mod tests {
             vec![],
             None,
             true,
+            None,
             None,
         )
         .unwrap();
@@ -3612,6 +3643,7 @@ mod tests {
             None,
             true,
             None,
+            None,
         )
         .unwrap();
         let input = call.header_policy_input().expect("policy input captured");
@@ -3656,6 +3688,7 @@ mod tests {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -3737,7 +3770,8 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, None, None, None).unwrap();
+        call.accept_refer(None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
@@ -3745,7 +3779,7 @@ mod tests {
                 next_hop: None,
                 mode: None,
                 profile: None,
-                number_policy: None,
+                number_shape: None,
             }
         );
     }
@@ -3765,6 +3799,7 @@ mod tests {
             Some("transparent"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3774,7 +3809,7 @@ mod tests {
                 next_hop: Some("sip:198.51.100.1:5060".to_string()),
                 mode: Some(ReferMode::Transparent),
                 profile: None,
-                number_policy: None,
+                number_shape: None,
             }
         );
     }
@@ -3788,7 +3823,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, Some("terminate"), None, None)
+        call.accept_refer(None, None, Some("terminate"), None, None, None)
             .unwrap();
         assert_eq!(
             call.action(),
@@ -3797,7 +3832,7 @@ mod tests {
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
                 profile: None,
-                number_policy: None,
+                number_shape: None,
             }
         );
     }
@@ -3845,6 +3880,7 @@ mod tests {
             Some("terminate"),
             Some("rtp_passthrough".to_string()),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3854,7 +3890,7 @@ mod tests {
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
                 profile: Some("rtp_passthrough".to_string()),
-                number_policy: None,
+                number_shape: None,
             }
         );
     }
@@ -3868,7 +3904,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        let result = call.accept_refer(None, None, Some("bridge"), None, None);
+        let result = call.accept_refer(None, None, Some("bridge"), None, None, None);
         assert!(result.is_err());
         // The invalid call must not have mutated the action.
         assert_eq!(call.action(), &CallAction::None);
@@ -3887,7 +3923,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        let result = call.accept_refer(None, None, None, None, Some("nope@2026".to_string()));
+        let result = call.accept_refer(None, None, None, None, Some("nope@2026"), None);
         assert!(result.is_err());
         assert_eq!(call.action(), &CallAction::None);
     }
@@ -3912,6 +3948,7 @@ mod tests {
             Some("terminate"),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3921,7 +3958,7 @@ mod tests {
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
                 profile: None,
-                number_policy: None,
+                number_shape: None,
             }
         );
     }

@@ -330,9 +330,31 @@ class MockNumbersNamespace:
             locale = Locale(**{**self._locale_kwargs(), "country_code": home})
         return _Policy(locale, fmt, {}, walk, "keep", [])
 
-    def _resolve_dial(self, name: Optional[str]) -> Optional[_Policy]:
-        """Resolve the B2BUA dial/fork policy: explicit name, else the
-        configured default, else ``None`` (no normalization)."""
+    def _resolve_dial(
+        self, name: Optional[str], format: Optional[str] = None
+    ) -> Optional[_Policy]:
+        """Resolve the B2BUA dial/fork/transfer policy: a named policy, else an
+        inline format, else the configured default, else ``None`` (no
+        normalization).
+
+        The inline branch is the half ``rewrite_identities`` always had and the
+        dial family never did, which is why ``number_policy="plain"`` used to
+        fail with "unknown number policy" for a perfectly good format."""
+        if name is not None and format is not None:
+            raise ValueError(
+                "pass either number_policy= (a named policy) or format= "
+                "(an inline format), not both"
+            )
+        if format is not None:
+            fmt = format.strip().lower()
+            if fmt not in _FORMATS:
+                raise ValueError(f"unknown number format {format!r}")
+            walk: List[str] = []
+            for token in _DEFAULT_HEADERS:
+                canonical = _IDENTITY_TOKENS.get(token.strip().lower())
+                if canonical is not None and canonical not in walk:
+                    walk.append(canonical)
+            return _Policy(self._locale, fmt, {}, walk, "keep", [])
         resolved_name = name or self._default_b2bua_policy
         if resolved_name is None:
             return None

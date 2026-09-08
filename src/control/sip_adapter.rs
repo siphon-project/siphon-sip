@@ -62,9 +62,9 @@ impl ControlAdapter for SipControlAdapter {
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
-                verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode, profile, number_policy)"),
+                verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode, profile, number_policy, format)"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
-                verb("replace_peer", "Replace one leg of this answered call with a freshly dialed target, with no REFER involved: the replaced leg stays up while the target rings and is BYE'd only once it answers. The reply says the INVITE is on the wire, PeerReplaced says the new party is bridged and the old one released (args: target, next_hop, replace_a_leg, profile, number_policy, timeout)"),
+                verb("replace_peer", "Replace one leg of this answered call with a freshly dialed target, with no REFER involved: the replaced leg stays up while the target rings and is BYE'd only once it answers. The reply says the INVITE is on the wire, PeerReplaced says the new party is bridged and the old one released (args: target, next_hop, replace_a_leg, profile, number_policy, format, timeout)"),
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
@@ -1527,27 +1527,24 @@ fn refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
 /// steers egress, and `mode` (`"terminate"` / `"transparent"`) overrides the
 /// configured `b2bua.default_refer_mode`. No pending REFER (already decided,
 /// timed out, or the call is gone) → `not_found`.
-/// Validate a `number_policy` verb argument against the installed registry.
+/// Validate the mutually-exclusive `number_policy` / `format` verb arguments.
 ///
-/// Resolved by name here so an unknown one is a synchronous `bad_request` to the
+/// Resolved here so an unusable one is a synchronous `bad_request` to the
 /// controller rather than a warn-and-skip deep in the send path — the control
 /// plane can report it, where the script paths raise on the spot for the same
 /// reason.
-fn validate_number_policy(args: &serde_json::Value) -> Result<Option<&str>, ControlResult> {
+fn validate_number_shape(
+    args: &serde_json::Value,
+) -> Result<Option<crate::script::api::numbers::NumberShape>, ControlResult> {
+    use crate::script::api::numbers::{resolve_dial_shape, NumberShape};
+
     let name = args.get("number_policy").and_then(|value| value.as_str());
-    if let Some(name) = name {
-        if crate::script::api::numbers::number_runtime()
-            .registry
-            .get(name)
-            .is_none()
-        {
-            return Err(ControlResult::error(
-                ControlErrorCode::BadRequest,
-                format!("unknown number policy {name:?}"),
-            ));
-        }
-    }
-    Ok(name)
+    let format = args.get("format").and_then(|value| value.as_str());
+    let shape = NumberShape::from_args(name, format)
+        .map_err(|error| ControlResult::error(ControlErrorCode::BadRequest, format!("{error}")))?;
+    resolve_dial_shape(shape.as_ref())
+        .map_err(|error| ControlResult::error(ControlErrorCode::BadRequest, format!("{error}")))?;
+    Ok(shape)
 }
 
 /// Map a `replace_peer` refusal onto its wire code.
@@ -1615,8 +1612,8 @@ fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
     // describes the party that is leaving, so the caller names the one for the
     // pair that remains.
     let media_profile = args.get("profile").and_then(|value| value.as_str());
-    let number_policy = match validate_number_policy(args) {
-        Ok(name) => name,
+    let number_shape = match validate_number_shape(args) {
+        Ok(shape) => shape,
         Err(result) => return result,
     };
     let timeout_secs = match args.get("timeout") {
@@ -1638,7 +1635,7 @@ fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
         next_hop,
         replace_a_leg,
         media_profile,
-        number_policy,
+        number_shape.as_ref(),
         timeout_secs,
     ) {
         Ok(()) => ControlResult::Ok(serde_json::json!({
@@ -1683,8 +1680,8 @@ fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
     // A transfer target is named by the referrer, in the referrer's number
     // format; the carrier the new leg is dialled at expects the trunk's. Same
     // knob, same resolution order, as `call.accept_refer(number_policy=…)`.
-    let number_policy = match validate_number_policy(args) {
-        Ok(name) => name,
+    let number_shape = match validate_number_shape(args) {
+        Ok(shape) => shape,
         Err(result) => return result,
     };
 
@@ -1694,7 +1691,7 @@ fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
         next_hop.map(|s| s.to_string()),
         mode,
         media_profile.map(|s| s.to_string()),
-        number_policy.map(|s| s.to_string()),
+        number_shape,
     ) {
         ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),

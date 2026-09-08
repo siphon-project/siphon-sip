@@ -890,6 +890,7 @@ class MockB2bua:
         profile: Optional[str] = None,
         timeout: int = 30,
         number_policy: Optional[str] = None,
+        format: Optional[str] = None,
     ) -> bool:
         """Replace one leg of an answered call with a freshly dialed target.
 
@@ -926,6 +927,10 @@ class MockB2bua:
                 else ``b2bua.default_number_policy``, else no reshaping. A
                 replacement leg does not re-enter ``@b2bua.on_invite``, so this
                 is where a carrier's number format gets applied to it.
+            format: the inline form of the same thing, as on
+                ``rewrite_identities(format=...)``: ``"e164"``, ``"plain"``,
+                ``"international"`` or ``"national"``. Pass this or
+                ``number_policy``, never both.
 
         Returns:
             bool: True once the INVITE is on the wire. It does not wait for the
@@ -954,6 +959,7 @@ class MockB2bua:
         """
         if not target or not str(target).strip():
             raise ValueError("bad_request: cannot route to replacement target: ")
+        get_numbers()._resolve_dial(number_policy, format)
         self.replacements.append(
             {
                 "call_id": call_id,
@@ -963,6 +969,7 @@ class MockB2bua:
                 "profile": profile,
                 "timeout": timeout,
                 "number_policy": number_policy,
+                "format": format,
             }
         )
         return True
