@@ -40,8 +40,19 @@ class TestRecording:
                 "replace_a_leg": True,
                 "profile": "ims_to_trunk",
                 "timeout": 45,
+                "number_policy": None,
             }
         ]
+
+    def test_records_the_number_policy_for_the_replacement_leg(self, b2bua):
+        # A replacement leg never re-enters @b2bua.on_invite, so the carrier's
+        # number format has to be asked for on the verb itself.
+        b2bua.replace_peer(
+            "call-1@example.com",
+            "sip:+15550142@carrier.example",
+            number_policy="carrier-plain@2026",
+        )
+        assert b2bua.replacements[-1]["number_policy"] == "carrier-plain@2026"
 
     def test_defaults_replace_the_callee_and_ring_for_thirty(self, b2bua):
         b2bua.replace_peer("call-2@example.com", "sip:bob@example.com")
@@ -111,6 +122,7 @@ def on_digit(call_id, from_tag, digit, duration_ms, volume):
                 "replace_a_leg": False,
                 "profile": None,
                 "timeout": 45,
+                "number_policy": None,
             }
         ]
 

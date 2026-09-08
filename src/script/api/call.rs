@@ -95,6 +95,12 @@ pub enum CallAction {
         /// correct when that profile is symmetric — see
         /// `ProfileEntry::is_direction_bound`.
         profile: Option<String>,
+        /// Number policy for the leg the transfer dials, resolved the way
+        /// `dial()` resolves it: this name, else `b2bua.default_number_policy`,
+        /// else none. Carried as a name rather than a resolved policy because
+        /// the reshape happens on the dispatcher side, where the triggered
+        /// INVITE is built.
+        number_policy: Option<String>,
     },
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
@@ -161,10 +167,11 @@ pub enum CallAction {
 /// configured `b2bua.default_refer_mode` fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferMode {
-    /// siphon terminates the transfer: answer 202 locally, re-resolve the
-    /// Refer-To through the dial plan as a new leg, re-bridge the media, and BYE
+    /// siphon terminates the transfer: answer 202 locally, dial the Refer-To
+    /// (or the handler's `target=`) as a new leg, re-bridge the media, and BYE
     /// the referred-away leg. Correct for trunk-facing SBCs (the far end need not
-    /// support REFER) and keeps media anchored.
+    /// support REFER) and keeps media anchored. The new leg is dialled directly:
+    /// `@b2bua.on_invite` does not run again for it.
     Terminate,
     /// siphon forwards the REFER transparently on the far leg's own dialog and
     /// relays the far end's 202 + `message/sipfrag` NOTIFYs back to the referrer.
@@ -2403,9 +2410,12 @@ impl PyCall {
     ///
     /// `mode` selects how siphon honors the transfer:
     ///   - `"terminate"`   — siphon terminates the transfer: answer 202 locally,
-    ///     re-resolve the Refer-To through the dial plan as a new leg, re-bridge
-    ///     the media, and BYE the referred-away leg. Works even when the far end
-    ///     cannot handle REFER; keeps media anchored.
+    ///     dial the Refer-To (or `target`) as a new leg, re-bridge the media,
+    ///     and BYE the referred-away leg. Works even when the far end cannot
+    ///     handle REFER; keeps media anchored. Note this dials the target
+    ///     directly — `@b2bua.on_invite` does NOT run again for the new leg, so
+    ///     any routing the dial plan does there is this handler's to repeat
+    ///     (`number_policy` below covers the number shaping half of it).
     ///   - `"transparent"` — siphon re-emits the REFER on the far leg's own
     ///     dialog and relays the far end's 202 + sipfrag NOTIFYs back.
     ///   - `None` (default) — use the configured `b2bua.default_refer_mode`.
@@ -2432,13 +2442,31 @@ impl PyCall {
     ///   # both remaining parties are on the carrier side
     ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
     ///                     profile="rtp_passthrough")
-    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
+    ///
+    /// `number_policy` reshapes the transferred leg's number the way
+    /// `call.dial(number_policy=…)` reshapes a dialled one: an explicit named
+    /// policy, else `b2bua.default_number_policy`, else no reshaping. It applies
+    /// to the target URI (and so to the R-URI and To of the triggered INVITE)
+    /// and to that INVITE's identity headers. Without it the target goes out in
+    /// whatever shape the referrer named it in — a `Refer-To` naming `+E.164`
+    /// reaches a bare-digit carrier with the `+` still on, while every dialled
+    /// leg on the same trunk gets the carrier's shape.
+    ///
+    /// Terminate mode only: in `"transparent"` mode siphon dials nothing, it
+    /// re-emits the REFER and the far end resolves the target under its own
+    /// numbering. Setting it there has no effect.
+    ///
+    ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+    ///                     profile="rtp_passthrough",
+    ///                     number_policy="carrier-plain@2026")
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None, number_policy=None))]
     fn accept_refer(
         &mut self,
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<&str>,
         profile: Option<String>,
+        number_policy: Option<String>,
     ) -> PyResult<()> {
         let mode = match mode {
             None => None,
@@ -2450,11 +2478,18 @@ impl PyCall {
                 )));
             }
         };
+        // Resolve eagerly for the error only: a typo'd policy name has to raise
+        // here, in the handler, the way `dial()` raises — not silently skip the
+        // reshape at dial time where nothing is watching. The resolved policy
+        // itself is discarded; the dispatcher re-resolves by name once it has
+        // the triggered INVITE to apply it to.
+        let _ = super::numbers::resolve_dial_policy(number_policy.as_deref())?;
         self.action = CallAction::AcceptRefer {
             target,
             next_hop,
             mode,
             profile,
+            number_policy,
         };
         Ok(())
     }
@@ -3681,7 +3716,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, None, None).unwrap();
+        call.accept_refer(None, None, None, None, None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
@@ -3689,6 +3724,7 @@ mod tests {
                 next_hop: None,
                 mode: None,
                 profile: None,
+                number_policy: None,
             }
         );
     }
@@ -3707,6 +3743,7 @@ mod tests {
             Some("sip:198.51.100.1:5060".to_string()),
             Some("transparent"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3716,6 +3753,7 @@ mod tests {
                 next_hop: Some("sip:198.51.100.1:5060".to_string()),
                 mode: Some(ReferMode::Transparent),
                 profile: None,
+                number_policy: None,
             }
         );
     }
@@ -3729,7 +3767,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, Some("terminate"), None)
+        call.accept_refer(None, None, Some("terminate"), None, None)
             .unwrap();
         assert_eq!(
             call.action(),
@@ -3738,6 +3776,7 @@ mod tests {
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
                 profile: None,
+                number_policy: None,
             }
         );
     }
@@ -3784,6 +3823,7 @@ mod tests {
             None,
             Some("terminate"),
             Some("rtp_passthrough".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3793,6 +3833,7 @@ mod tests {
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
                 profile: Some("rtp_passthrough".to_string()),
+                number_policy: None,
             }
         );
     }
@@ -3806,10 +3847,62 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        let result = call.accept_refer(None, None, Some("bridge"), None);
+        let result = call.accept_refer(None, None, Some("bridge"), None, None);
         assert!(result.is_err());
         // The invalid call must not have mutated the action.
         assert_eq!(call.action(), &CallAction::None);
+    }
+
+    #[test]
+    fn call_accept_refer_rejects_an_unknown_number_policy() {
+        // Same contract as `dial(number_policy=…)`: a typo raises in the
+        // handler rather than silently skipping the reshape at dial time, where
+        // the only symptom would be a transferred leg going out in the wrong
+        // shape. No registry is installed here, so every name is unknown.
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        let result = call.accept_refer(None, None, None, None, Some("nope@2026".to_string()));
+        assert!(result.is_err());
+        assert_eq!(call.action(), &CallAction::None);
+    }
+
+    #[test]
+    fn call_accept_refer_carries_the_number_policy_name() {
+        // The name rides on the action; the dispatcher re-resolves it once it
+        // has the triggered INVITE to apply it to.
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        // `None` resolves to `b2bua.default_number_policy`, which is unset in
+        // this binary — so it validates, and stays `None` for the dispatcher to
+        // resolve the same way.
+        call.accept_refer(
+            Some("sip:+15550142@carrier.example".to_string()),
+            None,
+            Some("terminate"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: Some("sip:+15550142@carrier.example".to_string()),
+                next_hop: None,
+                mode: Some(ReferMode::Terminate),
+                profile: None,
+                number_policy: None,
+            }
+        );
     }
 
     #[test]

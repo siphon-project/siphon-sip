@@ -1056,7 +1056,8 @@ class Call:
     def accept_refer(self, target: Optional[str] = None,
                      next_hop: Optional[str] = None,
                      mode: Optional[str] = None,
-                     profile: Optional[str] = None) -> None:
+                     profile: Optional[str] = None,
+                     number_policy: Optional[str] = None) -> None:
         """Accept an incoming REFER and honour the transfer.
 
         Call this from a ``@b2bua.on_refer`` handler to proceed with the
@@ -1073,11 +1074,16 @@ class Call:
             mode: How siphon honours the REFER:
 
                 - ``"terminate"`` — siphon **terminates** the transfer: it
-                  answers ``202 Accepted`` locally, re-resolves ``target``
-                  (the Refer-To) through the dial plan as a brand-new leg,
-                  re-bridges the surviving leg to it, and sends BYE to the
-                  referred-away leg.  The transferor drops out; siphon owns
-                  both new legs.  The transferee never sees the REFER.
+                  answers ``202 Accepted`` locally, dials ``target`` (the
+                  Refer-To) as a brand-new leg, re-bridges the surviving leg to
+                  it, and sends BYE to the referred-away leg.  The transferor
+                  drops out; siphon owns both new legs.  The transferee never
+                  sees the REFER.
+
+                  The new leg is dialled **directly**: ``@b2bua.on_invite``
+                  does not run again for it, so any routing that handler does
+                  is this handler's to repeat.  ``number_policy`` below covers
+                  the number-shaping half of that.
                 - ``"transparent"`` — siphon **re-emits** the REFER on the far
                   leg and relays the far leg's ``202 Accepted`` plus the
                   sipfrag ``NOTIFY`` progress reports back to the transferor,
@@ -1102,10 +1108,27 @@ class Call:
                 symmetric and re-pairs safely.  ``None`` inherits the call's
                 profile, which is correct only when it is symmetric; siphon
                 logs a WARN when it is not.
+            number_policy: Reshape the transferred leg's number, exactly as
+                ``dial(number_policy=...)`` reshapes a dialled one: this named
+                policy, else ``b2bua.default_number_policy``, else no
+                reshaping.  It applies to ``target`` (and so to the R-URI and
+                To of the triggered INVITE) and to that INVITE's identity
+                headers.
+
+                Without it the target goes out in whatever shape the
+                *referrer* named it in.  A Teams ``Refer-To`` names
+                ``+E.164``, so a trunk that takes bare digits sees every
+                ordinary call arrive as ``32...`` and every transferred one as
+                ``+32...``.
+
+                Terminate mode only: in ``"transparent"`` mode siphon dials
+                nothing — it re-emits the REFER and the far end resolves the
+                target under its own numbering — so this has no effect there.
 
         Raises:
             ValueError: if ``mode`` is not one of ``None``, ``"terminate"``,
-                or ``"transparent"``.
+                or ``"transparent"``, or if ``number_policy`` names a policy
+                that is not configured.
 
         Example::
 
@@ -1126,6 +1149,13 @@ class Call:
                 # that remains is plain RTP on both sides.
                 call.accept_refer(target=call.refer_to, mode="terminate",
                                   profile="rtp_passthrough")
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                # Trunk takes bare digits; the Refer-To names +E.164.
+                call.accept_refer(target=target, next_hop=gw.uri,
+                                  mode="terminate", profile="rtp_passthrough",
+                                  number_policy="carrier-plain@2026")
         """
         if mode not in (None, "terminate", "transparent"):
             raise ValueError(
@@ -1136,7 +1166,8 @@ class Call:
             kind="accept_refer",
             targets=[target] if target else None,
             next_hop=next_hop,
-            extras={"mode": mode, "profile": profile},
+            extras={"mode": mode, "profile": profile,
+                    "number_policy": number_policy},
         ))
 
     def reject_refer(self, code: int, reason: str) -> None:

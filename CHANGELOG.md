@@ -6,6 +6,53 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.5] — 2026-09-08
+
+### Fixed
+- **A transferred leg is dialled in the carrier's number format, not the
+  referrer's — `number_policy=` on `call.accept_refer()` and
+  `b2bua.replace_peer()`.** A siphon-terminated REFER dials its target directly:
+  `@b2bua.on_invite` does not run again for the replacement leg, so nothing that
+  handler does to shape a call was repeated for it, and the number policy every
+  dialled leg gets (`call.dial(number_policy=…)`, or
+  `b2bua.default_number_policy`) was skipped outright. The two ends disagree
+  about number format by default — a referrer names its target in its own
+  (a Microsoft Teams `Refer-To` names `+E.164`), the carrier the leg is dialled
+  at expects the trunk's — so on a bare-digit trunk every ordinary call went out
+  as `15550142` and every transferred one arrived as `+15550142`, from the
+  same node, on the same trunk, in the same call. Whether that is a rejection or
+  a silently different route is the carrier's business, and either way it looks
+  like the transfer is broken rather than the numbering.
+
+  `number_policy=` resolves the way `dial()` resolves it — the named policy,
+  else `b2bua.default_number_policy`, else no reshaping — and applies to the
+  target URI (and so to the R-URI and To of the triggered INVITE) and to that
+  INVITE's identity headers, which the dial path already reshapes together. A
+  deployment that already sets `b2bua.default_number_policy` gets its transfers
+  fixed with no script change. An unknown policy name raises in the handler
+  rather than dialling unreshaped; from the control plane it is a synchronous
+  `bad_request`, and from the send path a warning that keeps the transfer rather
+  than dropping a call over a formatting policy.
+
+  The **routing** half of the dial plan is still the handler's own — a transfer
+  that must leave via a particular carrier needs `next_hop=` — and the docs now
+  say so. `accept_refer`'s own documentation had claimed terminate mode
+  "re-resolves the Refer-To through the dial plan as a new leg", which is
+  exactly the expectation that made the gap invisible.
+
+- **`@b2bua.on_refer` now warns when a B-leg shaping setter is called in it and
+  silently ignored.** `set_contact_uri()`, `set_contact_user()`,
+  `set_from_host()` and `set_to_host()` are read off the `PyCall` the
+  `on_invite` path builds, on its way into `call.dial()`. The one a REFER
+  handler gets is a throwaway whose only surviving output is the accept/reject
+  decision, so those calls did nothing at all — and did it quietly, which is the
+  expensive way: the script reads as though it steered the transferred leg and
+  the wire says otherwise. Message mutations (`set_header()`,
+  `rewrite_identities()`) are the same shape and harder to spot, because they
+  land on that handler's own clone of the REFER while the new leg is built from
+  a clone of the stored A-leg INVITE. `accept_refer()`'s arguments — `target`,
+  `next_hop`, `profile`, `number_policy` — are what reach the dialled leg.
+
 ## [1.8.4] — 2026-09-08
 
 ### Added
