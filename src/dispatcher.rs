@@ -16272,7 +16272,16 @@ fn control_handover(
     // engine error) reject visibly — a script asking for answer-first on a
     // backend that can't must fail, never fake a 200.
     if answer {
-        match answer_first_anchor(call_id, invite, inbound, profile, ws_uri, state) {
+        match answer_first_anchor(
+            call_id,
+            invite,
+            inbound.remote_addr.ip(),
+            200,
+            "OK",
+            profile,
+            ws_uri,
+            state,
+        ) {
             Ok(()) => {
                 // b2bua_answer_call set the A-leg to Answered + stamped the CDR
                 // answer time; the media now flows to the voice_ai bridge.
@@ -16349,14 +16358,23 @@ fn control_handover(
 /// Answer-first media anchor: resolve the profile (`voice_ai` by default),
 /// template the per-call `ws_uri`, `answer_local` the A-leg offer to synthesize
 /// the RFC 3264 answer with the media engine as the far side, record the media
-/// session, and send the `200 OK` with that SDP. Returns `Err(reason)` (a short
-/// human string) on any failure so the caller rejects the handover visibly
-/// instead of faking a 200. Reuses #131's `expand_ws_uri` + the profile registry
-/// — no duplicated media logic.
+/// session, and send the 2xx with that SDP. Returns `Err(reason)` (a short
+/// human string) on any failure so the caller rejects visibly instead of faking
+/// a 200. Reuses #131's `expand_ws_uri` + the profile registry — no duplicated
+/// media logic.
+///
+/// `source_ip` rather than the `InboundMessage` it used to take: the only thing
+/// read off it is the A-leg's source address (the `received_from` gate), and the
+/// control plane's `answer` verb reaches this the same way but has no inbound
+/// message in hand — the address lives on the stored leg by then. Everything
+/// else comes off the INVITE, and the response leaves through
+/// [`b2bua_answer_call`], which routes on the leg's own transport.
 fn answer_first_anchor(
     call_id: &str,
     invite: &SipMessage,
-    inbound: &InboundMessage,
+    source_ip: std::net::IpAddr,
+    code: u16,
+    reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
     state: &DispatcherState,
@@ -16372,14 +16390,7 @@ fn answer_first_anchor(
 
     // Resolve + validate the media plan (backend gate, profile, ws_uri template,
     // capability check) — pure, unit-tested. No I/O here.
-    let plan = answer_first_prepare(
-        invite,
-        inbound.remote_addr.ip(),
-        backend,
-        registry,
-        profile,
-        ws_uri,
-    )?;
+    let plan = answer_first_prepare(invite, source_ip, backend, registry, profile, ws_uri)?;
 
     // Media round-trip on the SIP-processing path (block_in_place is consistent
     // with the existing B2BUA answer paths — NOT the control-command path).
@@ -16409,17 +16420,19 @@ fn answer_first_anchor(
         });
     }
 
-    // Send the 200 OK with the synthesized answer SDP (marks the A-leg Answered +
+    // Send the 2xx with the synthesized answer SDP (marks the A-leg Answered +
     // stamps the CDR answer time).
     if !b2bua_answer_call(
         call_id,
         invite,
-        200,
-        "OK",
+        code,
+        reason,
         Some(answer_sdp.into_bytes()),
         Some("application/sdp"),
     ) {
-        return Err("failed to send 200 OK (call gone / dispatcher down)".to_string());
+        return Err(format!(
+            "failed to send {code} {reason} (call gone / dispatcher down)"
+        ));
     }
     Ok(())
 }
@@ -23893,6 +23906,76 @@ pub fn b2bua_answer_call(
         body,
         content_type,
         true,
+    )
+}
+
+/// Answer a parked B2BUA call and anchor its media in one step — the control
+/// plane's `answer(profile=…, ws_uri=…)`.
+///
+/// The same act `call.handover(answer=True, profile=…, ws_uri=…)` performs from
+/// a routing script, reachable by an application that took the call **un**
+/// -answered. Without it a controller could hold a call open (`ring`) and then
+/// had no way to connect it: plain `answer` sends a 2xx with whatever body it
+/// was given and anchors nothing, and answering first and attaching a bridge
+/// afterwards is not the same thing — `received_from`, echo cancellation and
+/// the VAD engine are properties of the answer, not of a bridge bolted on
+/// after it.
+///
+/// Refuses a call that is already answered rather than putting a second final
+/// response on one INVITE server transaction (RFC 3261 §17.2.1). On any media
+/// failure the 2xx is never sent — [`answer_first_anchor`] only reaches
+/// [`b2bua_answer_call`] once `answer_local` has returned an SDP — so the call
+/// stays parked and the application can retry or reject it. Never a fake 200.
+///
+/// `Err` carries a short human reason for the control reply. Safe from any
+/// thread: it enters the dispatcher runtime, like the other control-rail entry
+/// points.
+pub fn b2bua_answer_call_anchored(
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+) -> Result<(), String> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err("B2BUA is not running".to_string());
+    };
+    let state = &control.state;
+
+    // The A-leg's source address (for the `received_from` gate) and its INVITE,
+    // captured together so neither is read from a call the other outlived.
+    let Some((source_ip, invite_arc)) =
+        state
+            .call_actors
+            .get_call(internal_call_id)
+            .and_then(|call| match (&call.state, call.a_leg_invite.as_ref()) {
+                (CallState::Answered, _) | (_, None) => None,
+                (_, Some(invite)) => {
+                    Some((call.a_leg.transport.remote_addr.ip(), Arc::clone(invite)))
+                }
+            })
+    else {
+        // Answered, gone, or no stored INVITE — all three mean this verb has
+        // nothing to answer, and the caller maps that to `not_found`.
+        return Err("call is gone or already answered".to_string());
+    };
+    let Ok(invite) = invite_arc.lock() else {
+        return Err("call invite lock poisoned".to_string());
+    };
+
+    // `answer_first_anchor` does a media round-trip under `block_in_place`; the
+    // control apply task is on the runtime already, but an event callback or a
+    // timer reaching this is not.
+    let _enter = control.runtime.enter();
+    answer_first_anchor(
+        internal_call_id,
+        &invite,
+        source_ip,
+        code,
+        reason,
+        profile,
+        ws_uri,
+        state,
     )
 }
 

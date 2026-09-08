@@ -85,6 +85,21 @@ function responseArgs(options: ResponseOptions): Record<string, unknown> {
   return args;
 }
 
+/** Options for an anchored answer ({@link Call.answerAnchored}). */
+export interface AnchoredAnswerOptions {
+  /** UAS 2xx code (default `200`). */
+  code?: number;
+  /** Reason phrase (default `OK`). */
+  reason?: string;
+  /** Media profile to anchor with (default `voice_ai`). */
+  profile?: string;
+  /**
+   * Per-call WebSocket bridge URI, overriding the profile's own. Supports
+   * `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` templating.
+   */
+  wsUri?: string;
+}
+
 /** The RFC 3891 `Replaces` triple for an attended transfer. */
 export interface ReferReplaces {
   callId: string;
@@ -298,6 +313,45 @@ export class Call {
   /** Send a UAS 2xx to the parked A-leg (default `200 OK`). */
   async answer(options?: ResponseOptions): Promise<void> {
     await this.sip(SipVerb.Answer, options ? responseArgs(options) : {});
+  }
+
+  /**
+   * Answer the parked A-leg **and** anchor its media to the media engine in one
+   * act — the verb form of the routing script's
+   * `call.handover(answer=True, profile=…, ws_uri=…)`.
+   *
+   * This is how an application that accepted an **un-answered** handover
+   * connects the call. It can already hold the call open for as long as its own
+   * policy says with {@link Call.ring}; what it could not do is connect the
+   * caller to anything, because a plain {@link Call.answer} sends a 2xx and
+   * anchors nothing. Answering first and attaching a stream afterwards is not
+   * the same thing: `received_from`, echo cancellation and the VAD engine are
+   * properties of the answer, not of a bridge attached after it.
+   *
+   * Synthesizing the RFC 3264 answer against the media engine is a siphon-rtp
+   * capability, so on rtpengine / rtpproxy this rejects with
+   * `code === "unavailable"` rather than sending a 200 with nothing behind it.
+   * On any media failure the 2xx is never sent and the call stays parked —
+   * retry with another profile, or reject it.
+   */
+  async answerAnchored(options?: AnchoredAnswerOptions): Promise<void> {
+    // `anchor` explicitly, rather than inferring it from `profile` being
+    // present: with no options at all this still has to mean "answer through
+    // the media engine on its default profile".
+    const args: Record<string, unknown> = { anchor: true };
+    if (options?.code !== undefined) {
+      args.code = options.code;
+    }
+    if (options?.reason !== undefined) {
+      args.reason = options.reason;
+    }
+    if (options?.profile !== undefined) {
+      args.profile = options.profile;
+    }
+    if (options?.wsUri !== undefined) {
+      args.ws_uri = options.wsUri;
+    }
+    await this.sip(SipVerb.Answer, args);
   }
 
   /**

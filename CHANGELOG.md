@@ -6,6 +6,37 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **The control plane's `answer` can anchor media — `answer(anchor|profile|
+  ws_uri)`, and `answer_anchored()` in all three SDKs.** An application that
+  accepted an **un-answered** `call.handover()` could hold the call open for as
+  long as it liked (`ring`) and then had no way to connect the caller to
+  anything: `originate` took `profile` / `ws_uri`, `answer` did not, and plain
+  `answer` sends a 2xx and anchors nothing. So a routing script could wait but
+  only a routing script could decide, and a controller could decide but not
+  connect — which pushed anything whose wait depends on what only the
+  application knows (a lookup, a queue position, an agent becoming free, a model
+  finishing its load) back into the routing script, or gave it up.
+
+  `answer` now takes the same media arguments `call.handover(answer=True, …)`
+  does, and performs the same act: siphon synthesizes the RFC 3264 answer
+  against the media engine and anchors the leg's audio to it, in one step.
+  Answering plainly and attaching a stream afterwards is *not* equivalent —
+  `received_from`, echo cancellation and the VAD engine are properties of the
+  answer, not of a bridge attached after it. Synthesizing the answer locally is
+  a `siphon-rtp` capability, so on rtpengine / rtpproxy this answers
+  `unavailable` and says so rather than sending a 200 with nothing behind it,
+  and on any media failure the 2xx is never sent — the call stays parked and the
+  application can retry with another profile or reject it. Never a fake 200.
+
+- **`is_transfer_final` / `transfer_outcome` in the Python control SDK**, the
+  module-level twins of the Rust client's `CallEvent::is_transfer_final` /
+  `CallEvent::transfer_outcome` and TypeScript's `isTransferFinal`. `refer()` /
+  `transfer()` resolve as soon as siphon has sent the REFER — RFC 3515 §2.4.4
+  delivers the outcome afterwards, on the implicit subscription — and Python was
+  the one SDK with no way to read that verdict except by matching the wire
+  strings by hand, which rots in silence when the event set grows. TypeScript
+  gains `transferOutcome` for the same reason.
 ### Fixed
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
   of dropped.** A call with one leg is not an error state: a UAS-mode answer, a
