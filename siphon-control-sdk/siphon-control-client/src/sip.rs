@@ -588,6 +588,46 @@ impl Call {
         .map(drop)
     }
 
+    /// Answer the parked A-leg **and** anchor its media to the media engine in
+    /// one act — the verb form of the routing script's
+    /// `call.handover(answer=True, profile=…, ws_uri=…)`.
+    ///
+    /// This is how an application that accepted an **un-answered** handover
+    /// connects the call. It can already hold the call open for as long as its
+    /// own policy says with [`Call::ring`]; what it could not do is connect the
+    /// caller to anything, because a plain [`Call::answer`] sends a 2xx and
+    /// anchors nothing. Answering first and attaching a stream afterwards is not
+    /// the same thing: `received_from`, echo cancellation and the VAD engine are
+    /// properties of the answer, not of a bridge attached after it.
+    ///
+    /// `profile` names a media profile (default `voice_ai`) and `ws_uri`
+    /// overrides that profile's WebSocket bridge URI for this call, with
+    /// `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` templating.
+    ///
+    /// Synthesizing the RFC 3264 answer against the media engine is a
+    /// siphon-rtp capability, so on rtpengine / rtpproxy this answers
+    /// `unavailable` and says so rather than sending a 200 with nothing behind
+    /// it. On any media failure the 2xx is never sent and the call stays parked
+    /// — retry with another profile, or reject it.
+    pub async fn answer_anchored(
+        &self,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
+    ) -> Result<(), ControlError> {
+        // `anchor` explicitly, rather than inferring it from `profile` being
+        // present: with neither argument this still has to mean "answer through
+        // the media engine on its default profile", and an empty arg object
+        // would otherwise be indistinguishable from a plain `answer`.
+        let mut args = json!({ "anchor": true });
+        if let Some(profile) = profile {
+            args["profile"] = json!(profile);
+        }
+        if let Some(ws_uri) = ws_uri {
+            args["ws_uri"] = json!(ws_uri);
+        }
+        self.sip(SipVerb::Answer, args).await.map(drop)
+    }
+
     /// Send `180 Ringing`: alerting only, no early media.
     ///
     /// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
@@ -1436,6 +1476,58 @@ mod tests {
             vars: HashMap::new(),
         };
         Call::from_snapshot(transport, snapshot, event_rx)
+    }
+
+    #[tokio::test]
+    async fn answer_anchored_always_carries_anchor() {
+        // With neither argument this still has to mean "answer through the media
+        // engine on its default profile" — an empty arg object would be
+        // indistinguishable from a plain `answer`, which anchors nothing, and
+        // the app would end up connected to silence believing otherwise.
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "answered", "code": 200, "media": "anchored" }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.answer_anchored(None, None).await.expect("answer ok");
+        call.answer_anchored(Some("voice_ai"), Some("wss://ai.test/{call_id}"))
+            .await
+            .expect("answer ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].verb, "answer");
+        assert_eq!(recorded[0].args, json!({ "anchor": true }));
+        assert_eq!(
+            recorded[1].args,
+            json!({
+                "anchor": true,
+                "profile": "voice_ai",
+                "ws_uri": "wss://ai.test/{call_id}",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_answer_carries_no_anchor() {
+        // The anchored path is opt-in: an ordinary answer must stay ordinary,
+        // or every controller that already answers would start demanding a
+        // siphon-rtp backend.
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "answered", "code": 200 }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.answer().await.expect("answer ok");
+        call.answer_with(200, Some("OK"), None, None)
+            .await
+            .expect("answer ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].args, json!({}));
+        assert!(recorded[1].args.get("anchor").is_none());
     }
 
     #[tokio::test]

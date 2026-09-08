@@ -161,6 +161,29 @@ Design accordingly:
 - **Size for your backends and your memory.** Raise `sync_pool_max` for many
   slow blocking backends; lower it on memory-constrained NFs (peak memory ≈
   `sync_pool_max × ~2 MB`).
+- **Never `time.sleep()` in a sync handler.** Ringing before answering is a real
+  thing to want — alert the caller, then decide — but a `time.sleep()` in a
+  `def` handler pins a pool worker for the whole ring, on every inbound call,
+  which is a worse problem than the one it solves. Use an `async def` handler
+  and `await asyncio.sleep(...)`: awaiting mid-handler is the supported shape,
+  and it is what the same handler already does between `rtpengine.offer` and the
+  200. `call.progress()` and `call.answer()` are **imperative** — the response
+  goes out where you call them — so the wait sits between them:
+
+  ```python
+  @b2bua.on_invite
+  async def route(call):
+      call.progress(180, "Ringing")     # on the wire here
+      await asyncio.sleep(2)            # ring, without holding a worker
+      call.handover("ai-app", answer=True, profile="voice_ai")
+  ```
+
+  `handover`, `dial` and `reject` are the deferred ones: they are applied when
+  the handler returns. If the wait depends on something only an out-of-process
+  application knows — a queue position, an agent becoming free, a model
+  finishing its load — hand the call over **un-answered** and let the controller
+  ring with the control plane's `ring` verb and then connect it with an anchored
+  `answer` (see [the control-plane reference](reference/control-plane.md)).
 
 ### Blocking calls must release the interpreter (free-threaded GC safety)
 

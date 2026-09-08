@@ -15,6 +15,7 @@ import {
   isTransferFinal,
   sipEventKind,
   SipVerb,
+  transferOutcome,
   MODULE_SIP,
 } from "../src/index";
 import type {
@@ -99,6 +100,25 @@ describe("SipVerb wire tokens + event names", () => {
     expect(isTransferFinal("StasisEnd")).toBe(false);
   });
 
+  it("narrows a transfer verdict off an event and nothing else", () => {
+    // TransferRequested is an *inbound* REFER somebody else asked for, not a
+    // verdict on one of ours — reading it as an outcome would report a transfer
+    // this app never started.
+    const completed = transferOutcome({
+      kind: "TransferCompleted",
+      payload: JSON.parse('{"stage":"transferred","code":200,"reason":"OK"}'),
+    });
+    expect(completed?.stage).toBe("transferred");
+    expect(completed?.code).toBe(200);
+
+    expect(
+      transferOutcome({ kind: "TransferProgress", payload: { stage: "accepted" } })?.stage,
+    ).toBe("accepted");
+    expect(transferOutcome({ kind: "TransferRequested", payload: {} })).toBeNull();
+    expect(transferOutcome({ kind: "StasisEnd", payload: {} })).toBeNull();
+    expect(transferOutcome({ kind: "TransferFailed", payload: null })).toBeNull();
+  });
+
   it("marks exactly the terminal bridge verdicts as final", () => {
     // A bridge is two RFC 3261 §14 re-INVITEs, so the command reply is only the
     // local action; exactly one of these two ends the wait. An unbridge ends a
@@ -178,6 +198,25 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "answer", target: { channel: "ch1" }, args: { code: 200, reason: "OK" } },
       { module: MODULE_SIP, verb: "progress", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "reject", target: { channel: "ch1" }, args: { code: 486, reason: "Busy Here" } },
+    ]);
+  });
+
+  it("answerAnchored always carries anchor, so no options still anchors", async () => {
+    // With no options this has to mean "answer through the media engine on its
+    // default profile" — an empty arg object would be indistinguishable from a
+    // plain `answer`, which anchors nothing.
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.answerAnchored();
+    await call.answerAnchored({ profile: "voice_ai", wsUri: "wss://ai.test/{call_id}" });
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "answer", target: { channel: "ch1" }, args: { anchor: true } },
+      {
+        module: MODULE_SIP,
+        verb: "answer",
+        target: { channel: "ch1" },
+        args: { anchor: true, profile: "voice_ai", ws_uri: "wss://ai.test/{call_id}" },
+      },
     ]);
   });
 

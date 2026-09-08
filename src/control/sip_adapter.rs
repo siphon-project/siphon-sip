@@ -56,7 +56,7 @@ impl ControlAdapter for SipControlAdapter {
             module: "sip".to_string(),
             verbs: vec![
                 verb("originate", "Place an outbound call under a caller-supplied channel id and return as soon as the INVITE is on the wire (args: channel, to, from, from_display, to_display, next_hop, p_asserted_identity, privacy, headers, sdp | media, profile, ws_uri, timeout, on_lost, vars)"),
-                verb("answer", "Send a UAS 2xx to the parked A-leg (args: code, reason, body, content_type)"),
+                verb("answer", "Send a UAS 2xx to the parked A-leg; with anchor (or a profile / ws_uri, which imply it) the SDP answer is synthesized and the media anchored to the media engine in the same act — the verb form of call.handover(answer=True) (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
                 verb("ring", "Send 180 Ringing to the parked A-leg — alerting only, no early media (RFC 3261 §13.2.1); a body is refused, use progress for that (args: reason)"),
                 verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress (args: code, reason, body, content_type)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
@@ -1281,6 +1281,19 @@ fn send_uas_response(
     }
 }
 
+/// `answer` (`final_response`) and `progress` — the two UAS responses an
+/// application sends on a parked A-leg.
+///
+/// `answer` additionally takes `anchor` (or a `profile` / `ws_uri`, which imply
+/// it), which turns it into the verb
+/// form of `call.handover(answer=True, profile=…, ws_uri=…)`: siphon synthesizes
+/// the RFC 3264 answer against the media engine and anchors the leg's audio to
+/// it in the same act. That is the only way an application that accepted an
+/// **un-answered** handover can connect the call — it can ring for as long as
+/// its own policy says (`ring`), but a plain `answer` anchors nothing, and
+/// answering first and attaching a stream afterwards is a different thing:
+/// `received_from`, echo cancellation and the VAD engine belong to the answer,
+/// not to a bridge bolted on after it.
 fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) -> ControlResult {
     let (default_code, default_reason) = if final_response {
         (200, "OK")
@@ -1294,6 +1307,61 @@ fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) 
     }
     if !final_response && !(100..200).contains(&code) {
         return ControlResult::error(ControlErrorCode::BadRequest, "progress requires a 1xx code");
+    }
+
+    // Answer + anchor in one act, the verb form of
+    // `call.handover(answer=True, profile=…, ws_uri=…)`. Without it an app that
+    // took the call un-answered could hold it open with `ring` and then had no
+    // way to connect it — answering first and bridging afterwards is not the
+    // same thing, because `received_from`, echo cancellation and the VAD engine
+    // are properties of the answer.
+    let profile = args.get("profile").and_then(|value| value.as_str());
+    let ws_uri = args.get("ws_uri").and_then(|value| value.as_str());
+    // `anchor` on its own means "answer through the media engine on its default
+    // profile" — without it, naming neither argument would be indistinguishable
+    // from a plain `answer`. Either named argument implies it.
+    let anchor = args
+        .get("anchor")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || profile.is_some()
+        || ws_uri.is_some();
+    if anchor {
+        if !final_response {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "progress(anchor/profile/ws_uri) is not a thing — those anchor the media the \
+                 answer establishes; use answer for that, or attach a stream to an \
+                 already-answered call",
+            );
+        }
+        if arg_present(args, "body") {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "an anchored answer synthesizes the SDP answer itself (RFC 3264) — a body \
+                 passed alongside it would be discarded, so pass one or the other",
+            );
+        }
+        return match crate::dispatcher::b2bua_answer_call_anchored(
+            &channel.call_actor_id,
+            code,
+            &reason,
+            profile,
+            ws_uri,
+        ) {
+            Ok(()) => ControlResult::Ok(serde_json::json!({
+                "channel": channel.channel_id,
+                "state": "answered",
+                "code": code,
+                "media": "anchored",
+            })),
+            // Not `not_found`: the media plan is what failed, and the call is
+            // still parked and answerable — the app can retry with another
+            // profile or reject. `answer_local` is a siphon-rtp verb, so this
+            // is also where an rtpengine / rtpproxy deployment is told so
+            // rather than handed a 200 with nothing behind it.
+            Err(reason) => ControlResult::error(ControlErrorCode::Unavailable, reason),
+        };
     }
 
     let has_body = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
@@ -3365,6 +3433,115 @@ mod tests {
             result,
             ControlResult::Error {
                 code: ControlErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn progress_refuses_the_answer_only_media_args() {
+        // `anchor` / `profile` / `ws_uri` anchor the media the *answer*
+        // establishes. On a 1xx there is nothing to anchor, and silently
+        // ignoring them would leave an app believing its call is on the AI
+        // bridge when it is not — the same rule
+        // `call.handover(profile=…/ws_uri=…) requires answer=True` enforces on
+        // the script side.
+        for args in [
+            serde_json::json!({ "anchor": true }),
+            serde_json::json!({ "profile": "voice_ai" }),
+            serde_json::json!({ "ws_uri": "wss://ai.example.test/{call_id}" }),
+        ] {
+            assert!(
+                matches!(
+                    answer(&channel(), &args, /*final_response=*/ false),
+                    ControlResult::Error {
+                        code: ControlErrorCode::BadRequest,
+                        ..
+                    }
+                ),
+                "progress must refuse {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_answer_refuses_a_caller_supplied_body() {
+        // The anchored answer synthesizes the SDP itself (RFC 3264 against the
+        // media engine), so a body passed with it would be discarded. Refusing
+        // says which of the two the caller meant instead of picking one.
+        let result = answer(
+            &channel(),
+            &serde_json::json!({
+                "profile": "voice_ai",
+                "body": "v=0\r\n",
+                "content_type": "application/sdp",
+            }),
+            true,
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anchored_answer_on_a_dead_call_is_unavailable_not_not_found() {
+        // No dispatcher in a unit context, so b2bua_answer_call_anchored can
+        // only fail. The distinction matters to an application: `not_found`
+        // means the call is gone, `unavailable` means the media plan failed and
+        // the call is still parked and answerable — retry with another profile
+        // or reject it, but do not assume the caller hung up.
+        let result = answer(
+            &channel(),
+            &serde_json::json!({ "profile": "voice_ai" }),
+            true,
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plain_answer_is_unchanged_by_the_media_args() {
+        // No anchor argument → the original path, which needs a stored INVITE
+        // and so answers not_found in a unit context. Proves the new branch is
+        // opt-in and does not intercept an ordinary answer, including when
+        // `anchor` is present and explicitly false.
+        for args in [
+            serde_json::json!({ "code": 200 }),
+            serde_json::json!({ "code": 200, "anchor": false }),
+        ] {
+            assert!(
+                matches!(
+                    answer(&channel(), &args, true),
+                    ControlResult::Error {
+                        code: ControlErrorCode::NotFound,
+                        ..
+                    }
+                ),
+                "plain answer must stay on the original path for {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_alone_takes_the_anchored_path() {
+        // `answer_anchored(None, None)` sends `{"anchor": true}` and nothing
+        // else — it has to mean "answer through the media engine on its default
+        // profile", not "plain answer", or naming neither argument would be
+        // indistinguishable from one.
+        let result = answer(&channel(), &serde_json::json!({ "anchor": true }), true);
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
                 ..
             }
         ));

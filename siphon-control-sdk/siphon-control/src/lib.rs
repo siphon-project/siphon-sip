@@ -361,6 +361,51 @@ impl Call {
         })
     }
 
+    /// Answer the parked A-leg **and** anchor its media to the media engine in
+    /// one act — the verb form of the routing script's
+    /// ``call.handover(answer=True, profile=..., ws_uri=...)``.
+    ///
+    /// This is how an application that accepted an **un-answered** handover
+    /// connects the call. It can already hold the call open for as long as its
+    /// own policy says with ``ring()``; what it could not do is connect the
+    /// caller to anything, because a plain ``answer()`` sends a 2xx and anchors
+    /// nothing. Answering first and attaching a stream afterwards is not the
+    /// same thing: ``received_from``, echo cancellation and the VAD engine are
+    /// properties of the answer, not of a bridge attached after it.
+    ///
+    /// ``profile`` names a media profile (default ``voice_ai``) and ``ws_uri``
+    /// overrides that profile's WebSocket bridge URI for this call, with
+    /// ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` / ``{to_user}``
+    /// templating.
+    ///
+    /// Synthesizing the RFC 3264 answer against the media engine is a
+    /// siphon-rtp capability, so on rtpengine / rtpproxy this raises with
+    /// ``code == "unavailable"`` rather than sending a 200 with nothing behind
+    /// it. On any media failure the 2xx is never sent and the call stays parked
+    /// — retry with another profile, or reject it.
+    ///
+    /// ```python
+    /// @client.on_call
+    /// async def handle(call):
+    ///     await call.ring()
+    ///     agent = await pick_an_agent(call)      # only the app knows when
+    ///     await call.answer_anchored(profile="voice_ai")
+    /// ```
+    #[pyo3(signature = (profile=None, ws_uri=None))]
+    fn answer_anchored<'py>(
+        &self,
+        py: Python<'py>,
+        profile: Option<String>,
+        ws_uri: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.answer_anchored(profile.as_deref(), ws_uri.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
     /// Send ``180 Ringing``: alerting only, no early media.
     ///
     /// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
@@ -1275,6 +1320,63 @@ fn install_server_handler_bridge(server: &SipServer, handler: Py<PyAny>, locals:
 }
 
 // ---------------------------------------------------------------------------
+// Transfer-outcome helpers
+// ---------------------------------------------------------------------------
+//
+// `next_event()` hands back a plain ``{"kind": ..., "payload": ...}`` dict, so
+// unlike the Rust client there is no `CallEvent` to hang methods off. These are
+// the module-level twins of `CallEvent::is_transfer_final` /
+// `CallEvent::transfer_outcome` and of TypeScript's `isTransferFinal`, and they
+// exist so an application does not have to hardcode the wire strings — which is
+// exactly the thing that rots in silence when the event set grows.
+
+/// Whether an event kind ends a transfer this app asked for.
+///
+/// Exactly one such event arrives per ``refer()`` / ``transfer()``, so this is
+/// the signal to stop waiting. The verb's own reply says only that the REFER
+/// went on the wire: RFC 3515 §2.4.4 delivers the outcome afterwards, on the
+/// implicit subscription, as zero or more ``TransferProgress`` and then one
+/// ``TransferCompleted`` / ``TransferFailed``.
+///
+/// ```python
+/// await call.transfer("sip:agent@example.test")
+/// async for event in call.events():
+///     if siphon_control.is_transfer_final(event["kind"]):
+///         outcome = siphon_control.transfer_outcome(event)
+///         break
+/// ```
+#[pyfunction]
+fn is_transfer_final(kind: &str) -> bool {
+    matches!(kind, "TransferCompleted" | "TransferFailed")
+}
+
+/// The transfer verdict carried by an event, or ``None`` if it is not one.
+///
+/// Accepts an event dict as ``next_event()`` returns it and yields its
+/// ``payload`` for ``TransferProgress`` / ``TransferCompleted`` /
+/// ``TransferFailed`` — ``stage``, ``refer_to``, ``status``, ``reason``,
+/// ``attempt``. Anything else, including a `TransferRequested` (an *inbound*
+/// REFER somebody else asked for, not a verdict on one of ours), gives ``None``.
+#[pyfunction]
+fn transfer_outcome(py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let kind: Option<String> = event
+        .get_item("kind")
+        .ok()
+        .and_then(|value| value.extract().ok());
+    let is_outcome = matches!(
+        kind.as_deref(),
+        Some("TransferProgress" | "TransferCompleted" | "TransferFailed")
+    );
+    if !is_outcome {
+        return Ok(py.None());
+    }
+    match event.get_item("payload") {
+        Ok(payload) => Ok(payload.unbind()),
+        Err(_) => Ok(py.None()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module init
 // ---------------------------------------------------------------------------
 
@@ -1285,6 +1387,8 @@ fn siphon_control(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ControlServer>()?;
     module.add_class::<Call>()?;
     module.add("ControlError", module.py().get_type::<ControlError>())?;
+    module.add_function(wrap_pyfunction!(is_transfer_final, module)?)?;
+    module.add_function(wrap_pyfunction!(transfer_outcome, module)?)?;
 
     // Stop driving Python from the tokio runtime once shutdown begins. The
     // runtime outlives the interpreter and nothing joins its tasks, so without
@@ -1302,7 +1406,14 @@ fn siphon_control(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "__all__",
         PyList::new(
             module.py(),
-            ["ControlClient", "ControlServer", "Call", "ControlError"],
+            [
+                "ControlClient",
+                "ControlServer",
+                "Call",
+                "ControlError",
+                "is_transfer_final",
+                "transfer_outcome",
+            ],
         )?,
     )?;
     Ok(())

@@ -360,6 +360,29 @@ export function isTransferFinal(name: string): boolean {
 }
 
 /**
+ * The transfer verdict carried by an event, or `null` if it is not one.
+ *
+ * Takes an event as {@link import("./sip").CallEvent} shapes it and narrows its
+ * `payload` to {@link TransferOutcomePayload} for `TransferProgress` /
+ * `TransferCompleted` / `TransferFailed`. Anything else — including
+ * `TransferRequested`, which is an *inbound* REFER somebody else asked for
+ * rather than a verdict on one of ours — gives `null`.
+ */
+export function transferOutcome(event: {
+  kind: string;
+  payload: unknown;
+}): TransferOutcomePayload | null {
+  if (
+    event.kind !== "TransferProgress" &&
+    event.kind !== "TransferCompleted" &&
+    event.kind !== "TransferFailed"
+  ) {
+    return null;
+  }
+  return (event.payload ?? null) as TransferOutcomePayload | null;
+}
+
+/**
  * What happens to the surviving leg when its bridge partner hangs up — the
  * `onPeerHangup` option of {@link import("./sip").Call.bridge}.
  *

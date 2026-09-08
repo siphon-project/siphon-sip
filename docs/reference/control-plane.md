@@ -61,12 +61,20 @@ that exits without closing leaves them delivering results into a loop, and then
 an interpreter, that is no longer there. The SDK drops those late callbacks
 rather than crashing on them, but closing means there is nothing to drop.
 
-`Call` verbs: `answer()` / `answer_with(code, …)`, `ring(reason=None)`, `progress()`,
+`Call` verbs: `answer()` / `answer_with(code, …)` /
+`answer_anchored(profile=None, ws_uri=None)`, `ring(reason=None)`, `progress()`,
 `reject(code, reason)`, `hangup(reason=None)`, `refer(to)` / `transfer(to)`,
 `set_header(name, value)` / `get_header(name)`, `set_var(key, value)` /
 `get_var(key)`, plus the generic `command(verb, args=None)` escape hatch and
 `next_event()`. A rejected command raises `ControlError` carrying a stable
-`.code`. Media verbs (`play_file` / `dtmf`) raise with `code ==
+`.code`.
+
+`refer()` / `transfer()` resolve as soon as siphon has sent the REFER — RFC 3515
+§2.4.4 delivers the outcome afterwards, on the implicit subscription. Read it off
+the event stream with the module-level `is_transfer_final(kind)` and
+`transfer_outcome(event)` rather than matching the wire strings by hand
+(`isTransferFinal` / `transferOutcome` in TypeScript, `CallEvent::is_transfer_final`
+/ `CallEvent::transfer_outcome` in Rust). Media verbs (`play_file` / `dtmf`) raise with `code ==
 "unsupported_verb"` until the server implements them.
 
 ## Rust — `siphon-control-client`
@@ -170,6 +178,32 @@ async def route(call):
 a WebSocket bridge before handing over, so the controller drives an
 already-connected channel; it requires the `siphon-rtp` media backend.
 
+A **synchronous** `@b2bua.on_invite` must not `time.sleep()` to hold the call —
+that pins a script-executor worker for the whole wait, on every inbound call.
+Use an `async def` handler and `await asyncio.sleep(...)`, which is the supported
+shape (the same handler already awaits `rtpengine.offer` / `answer_local` between
+the offer and the 200), or hand the call over un-answered and let the controller
+do the waiting with `ring` — see below.
+
+### Waiting in the controller instead
+
+A routing script can wait, but only a routing script can *decide*; an
+application that took the call **un-answered** (`handover()` without
+`answer=True`) can ring for as long as its own policy says with `ring`, and then
+connect the caller with an anchored `answer`:
+
+```python
+@client.on_call
+async def handle(call):
+    await call.ring()                             # 180, for as long as we like
+    agent = await pick_an_agent(call)             # only the app knows when
+    await call.answer_anchored(profile="voice_ai")
+```
+
+Answering plainly and attaching a stream afterwards is not the same thing:
+`received_from`, echo cancellation and the VAD engine are properties of the
+answer, not of a bridge attached after it.
+
 ## siphon configuration
 
 ```yaml
@@ -218,7 +252,7 @@ chunk, so logs join Homer and billing with no mapping table.
 | verb | module | args | notes |
 |---|---|---|---|
 | `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
-| `answer` | sip | `{code, reason?, body?, content_type?}` | UAS 2xx to the parked A-leg |
+| `answer` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
 | `ring` | sip | `{reason?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
 | `progress` | sip | `{code, reason?, body?, content_type?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress` |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |

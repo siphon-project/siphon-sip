@@ -22,7 +22,14 @@ import time
 import pytest
 import websockets
 
-from siphon_control import Call, ControlClient, ControlError, ControlServer
+from siphon_control import (
+    Call,
+    ControlClient,
+    ControlError,
+    ControlServer,
+    is_transfer_final,
+    transfer_outcome,
+)
 
 APP = "ivr-app"
 TOKEN = "s3cr3t"
@@ -137,6 +144,7 @@ def test_module_surface():
         "reject_refer",
         "bridge",
         "unbridge",
+        "answer_anchored",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
@@ -380,6 +388,13 @@ def test_media_header_refer_verbs_roundtrip():
                     timeout=45,
                 )
                 await call.replace_peer("sip:agent@pbx")
+                # answer_anchored: `anchor` is always on the wire, so calling
+                # it with no arguments still means "answer through the media
+                # engine on its default profile" rather than a plain answer.
+                await call.answer_anchored()
+                await call.answer_anchored(
+                    profile="voice_ai", ws_uri="wss://ai.test/{call_id}"
+                )
                 # A policy the server would refuse is refused locally instead,
                 # before anything touches the two live calls.
                 with pytest.raises(ValueError):
@@ -435,6 +450,13 @@ def test_media_header_refer_verbs_roundtrip():
                 "timeout": 45,
             }
             assert replace_args[1] == {"target": "sip:agent@pbx"}
+            answer_args = [f["args"] for f in recorded if f["verb"] == "answer"]
+            assert answer_args[0] == {"anchor": True}
+            assert answer_args[1] == {
+                "anchor": True,
+                "profile": "voice_ai",
+                "ws_uri": "wss://ai.test/{call_id}",
+            }
             for frame in recorded:
                 assert frame["module"] == "sip"
                 assert frame["target"]["channel"] == "ch1"
@@ -802,3 +824,38 @@ def test_shutdown_teardown_is_quiet(capfd):
     assert "CancelledError" not in err, err
     assert "Event loop is closed" not in err, err
     assert "panicked" not in err, err
+
+
+def test_transfer_outcome_helpers():
+    """The module-level twins of the Rust client's `CallEvent` helpers.
+
+    `next_event()` hands back a plain dict, so there is no event object to hang
+    methods off — but an application still should not have to hardcode the wire
+    strings, which is exactly what rots in silence when the event set grows.
+    """
+    # Exactly one terminal verdict arrives per refer (RFC 3515 §2.4.4), so this
+    # is the signal to stop waiting; a 2xx to the REFER is only "accepted for
+    # processing" and reaches the app as TransferProgress.
+    assert is_transfer_final("TransferCompleted") is True
+    assert is_transfer_final("TransferFailed") is True
+    assert is_transfer_final("TransferProgress") is False
+    assert is_transfer_final("TransferRequested") is False
+    assert is_transfer_final("StasisEnd") is False
+
+    completed = transfer_outcome(
+        {
+            "kind": "TransferCompleted",
+            "payload": {"stage": "transferred", "code": 200, "reason": "OK"},
+        }
+    )
+    assert completed == {"stage": "transferred", "code": 200, "reason": "OK"}
+    assert transfer_outcome({"kind": "TransferProgress", "payload": {"stage": "accepted"}}) == {
+        "stage": "accepted"
+    }
+
+    # TransferRequested is an *inbound* REFER somebody else asked for, not a
+    # verdict on one of ours — reading it as an outcome would report a transfer
+    # this app never started.
+    assert transfer_outcome({"kind": "TransferRequested", "payload": {}}) is None
+    assert transfer_outcome({"kind": "StasisEnd", "payload": {}}) is None
+    assert transfer_outcome({"kind": "TransferFailed"}) is None
