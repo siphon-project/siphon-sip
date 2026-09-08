@@ -6,6 +6,54 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
+  of dropped.** A call with one leg is not an error state: a UAS-mode answer, a
+  `call.handover()`, an IVR and a WebSocket-takeover leg all have exactly one
+  party by construction — the media engine or the control app *is* the far side
+  — so there is never a second leg to bridge onto. The B2BUA's generic
+  in-dialog forwarder logged that and returned, sending nothing. A non-INVITE
+  server transaction with no response retransmits on Timer E (T1 doubling to
+  T2) for the full 32 s of Timer F, and a peer that receives nothing cannot
+  tell "refused" from "unreachable" — so every such call spent 32 s answering
+  a request it had already decided it could not serve. It now answers: `481`
+  for a NOTIFY (RFC 6665 §8.2.1 — no matching subscription on this side),
+  `500` for anything else, because the dialog it arrived on is alive and a 481
+  there would be a lie (RFC 3261 §21.5.1).
+
+  The case that reaches this in practice is a blind transfer off a
+  media-anchored leg: RFC 3515 §2.4.4 puts a transfer's outcome on the
+  `message/sipfrag` NOTIFYs of the REFER's implicit subscription, and a NOTIFY
+  that no longer matches a subscription siphon owns has nowhere else to go.
+  That happens for a retransmitted *terminating* NOTIFY without any race — the
+  first one is absorbed and clears the subscription, and a NOTIFY has no server
+  transaction here to absorb the retransmission.
+
+- **A siphon-originated REFER records its subscription before the REFER goes
+  out, not after.** `call.refer()` / `b2bua.refer()` / the control plane's
+  `refer` verb wrote the subscription record after `send_message_from`, and the
+  send and the answer are not on the same thread — the REFER leaves on a
+  control-plane task, a timer or an event callback, while the referee's `202`
+  and first NOTIFY come back on the dispatcher's consumer pool. A referee quick
+  enough to answer inside that window had its first NOTIFY treated as somebody
+  else's to bridge rather than siphon's to absorb, so the sipfrag carrying the
+  transfer's verdict was lost and (before the fix above) dropped in silence.
+  The record now goes in ahead of the wire, next to the transaction
+  registration that was already ordered that way for the same reason.
+
+- **An `@b2bua.on_invite` action is no longer applied to a call that ended while
+  the handler ran.** An async handler may `await` — a lookup, a queue position,
+  an agent becoming free, `asyncio.sleep` to ring — and the caller is free to
+  give up while it does. The CANCEL is processed on the dispatcher's own pool
+  rather than behind the handler, so by the time the handler returns the A-leg
+  has already been answered `487`, `@b2bua.on_cancel` has fired and the call
+  actor is gone. The returned action was applied anyway: an answer-first
+  `call.handover(answer=True, …)` built its `200 OK` from the stored INVITE and
+  put it on the wire behind the `487` the caller had already seen — two final
+  responses on one INVITE server transaction (RFC 3261 §17.2.1) — and
+  registered a control channel for a call nobody was on. `dial` / `fork` /
+  `route` had the same shape, dialling a B-leg for an abandoned call.
+
 ## [1.8.5] — 2026-09-08
 
 ### Fixed

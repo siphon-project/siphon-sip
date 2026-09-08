@@ -4061,6 +4061,54 @@ fn terminated_dialog_needs_481(
     calls.find_by_sip_call_id(call_id).is_none()
 }
 
+/// The final response an in-dialog request gets when the B2BUA has no far leg to
+/// forward it to.
+///
+/// A call with one leg is not an error state: a UAS-mode answer, a `handover()`,
+/// an IVR and a WebSocket-takeover leg all have exactly one party by
+/// construction — the media engine or the control app *is* the far side — so
+/// `winner` is never set and there is nothing to bridge to. Whatever the routing
+/// decides, the request still has to be answered: a non-INVITE server
+/// transaction with no response retransmits on Timer E (T1 doubling to T2) for
+/// the full 32 s of Timer F, and a peer that receives nothing cannot tell
+/// "refused" from "unreachable".
+fn no_far_leg_final_response(method: &Method) -> (u16, &'static str) {
+    match method {
+        // RFC 6665 §8.2.1 — a NOTIFY that matches no subscription on this side
+        // is answered 481, which is exactly the case here: siphon owns no REFER
+        // subscription for it (that arm absorbed it already) and has no peer
+        // dialog to bridge it onto.
+        Method::Notify => (481, "Call/Transaction Does Not Exist"),
+        // The dialog this arrived on is alive, so 481 would be a lie. siphon
+        // simply cannot fulfil the request — RFC 3261 §21.5.1.
+        _ => (500, "Server Internal Error"),
+    }
+}
+
+/// True when an `@b2bua.on_invite` action must not be applied because the call
+/// it targets is gone.
+///
+/// An async handler can `await` (a lookup, a queue position, a model loading,
+/// `asyncio.sleep` to ring), and the caller is free to give up while it does.
+/// The CANCEL is processed on the dispatcher's own pool, not behind the handler:
+/// [`handle_b2bua_cancel`] answers `487`, fires `@b2bua.on_cancel` and
+/// `remove_call_after_cancel` deletes the actor. Applying the returned action
+/// afterwards puts a second final response on one INVITE server transaction
+/// (RFC 3261 §17.2.1) — an answer-first `handover` sends a `200 OK` behind the
+/// `487` the caller already saw — and registers a control channel, a B-leg or an
+/// LCR sequence for a call nobody is on.
+///
+/// `Terminated` counts as gone as well as absent: the CANCEL path sets the state
+/// before it removes the call, and a teardown from any other direction (script
+/// `terminate()`, max-duration, session timer) leaves the same marker.
+fn invite_action_target_gone(call_id: &str, calls: &crate::b2bua::actor::CallActorStore) -> bool {
+    // `map_or(true, …)` not `is_none_or` — MSRV 1.80, see the note in `run`.
+    #[allow(clippy::unnecessary_map_or)]
+    calls
+        .get_call(call_id)
+        .map_or(true, |call| call.state == CallState::Terminated)
+}
+
 /// Handle an inbound SIP request — run through Python handlers.
 fn handle_request(
     inbound: InboundMessage,
@@ -15597,6 +15645,26 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
         }
     });
 
+    // The handler may have awaited — and the caller is free to give up while it
+    // does. A CANCEL that landed in that window has already answered the A-leg
+    // `487`, fired `@b2bua.on_cancel` and removed the actor, so every action
+    // below is now addressed at a call nobody is on. Applying one anyway puts a
+    // second final response on the same INVITE server transaction (RFC 3261
+    // §17.2.1) — most visibly an answer-first `handover`, which sends its
+    // `200 OK` off the stored INVITE and would land behind the 487. One guard
+    // here rather than per arm, because it covers the `script_error` reject too.
+    // Nothing is left to clean up: the CANCEL path removed the call, its
+    // registry entries and its event receiver.
+    if invite_action_target_gone(&call_id, &state.call_actors) {
+        info!(
+            call_id = %call_id,
+            action = action.name(),
+            "B2BUA: @b2bua.on_invite returned for a call that ended while the handler ran \
+             (CANCELled / torn down) — action not applied"
+        );
+        return;
+    }
+
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
     state
         .call_actors
@@ -23162,15 +23230,16 @@ fn b2bua_send_outbound_refer(
         );
     }
 
-    send_message_from(
-        refer,
-        transport,
-        destination,
-        leg.transport.connection_id,
-        leg.transport.local_addr,
-        state,
-    );
-
+    // Recorded BEFORE the REFER goes out, for the same reason the branch above
+    // is: this is what tells `handle_b2bua_notify` the referee's sipfrag NOTIFYs
+    // are siphon's own to absorb rather than somebody else's to bridge. The send
+    // and the NOTIFY that answers it are not on the same thread — an imperative
+    // `b2bua.refer()` runs on a control-plane task, a timer or an event
+    // callback, while the referee's 202 + first NOTIFY come back on the
+    // dispatcher's consumer pool — so recording this after the send leaves a
+    // window in which the first NOTIFY finds no subscription, takes the
+    // bridge path, and on a one-legged call gets a 481 instead of the 200 +
+    // sipfrag that carries the transfer's verdict (RFC 3515 §2.4.4).
     state.call_actors.push_refer_subscription(
         internal_call_id,
         crate::b2bua::actor::ReferSubscription {
@@ -23193,6 +23262,16 @@ fn b2bua_send_outbound_refer(
             media_profile: None,
         },
     );
+
+    send_message_from(
+        refer,
+        transport,
+        destination,
+        leg.transport.connection_id,
+        leg.transport.local_addr,
+        state,
+    );
+
     info!(
         call_id = %internal_call_id,
         target = %refer_to.uri,
@@ -29529,7 +29608,27 @@ fn b2bua_forward_indialog_request(
                 b_leg.dialog.local_tag.clone(),
             ))
         } else {
-            warn!(call_id = %call_id, "B2BUA {method_str}: no winning B-leg to forward to");
+            // One-legged call (UAS-mode answer, handover, IVR, WebSocket
+            // takeover): there is no second party to bridge onto, and dropping
+            // the request leaves the peer retransmitting to Timer F — 32 s of
+            // silence for a request siphon has already decided it cannot serve.
+            // Answer instead. See `no_far_leg_final_response`.
+            let (code, reason) = no_far_leg_final_response(&method);
+            warn!(
+                call_id = %call_id,
+                code,
+                "B2BUA {method_str}: no far leg to forward to — answering {code} {reason}"
+            );
+            let response =
+                build_response(message, code, reason, state.server_header.as_deref(), &[]);
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     } else {
@@ -36306,6 +36405,116 @@ a=rtpmap:8 PCMA/8000\r\n";
         let store = store_after_teardown("ue-call-id@10.0.0.1");
         let ack = in_dialog_request(Method::Ack, "ue-call-id@10.0.0.1", Some("bob-tag"));
         assert!(!terminated_dialog_needs_481("ACK", &ack, &store));
+    }
+
+    // -----------------------------------------------------------------------
+    // In-dialog request on a call with no far leg → answered, never dropped
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_notify_with_no_far_leg_is_answered_481() {
+        // RFC 6665 §8.2.1: siphon owns no subscription for it (the absorb arm
+        // took the ones it does own) and has no peer dialog to bridge it onto.
+        assert_eq!(
+            no_far_leg_final_response(&Method::Notify),
+            (481, "Call/Transaction Does Not Exist")
+        );
+    }
+
+    #[test]
+    fn a_refer_with_no_far_leg_is_answered_500_not_481() {
+        // A transparent-mode REFER that cannot be forwarded is siphon's own
+        // inability (RFC 3261 §21.5.1). 481 would be a lie — the dialog the
+        // REFER arrived on is alive.
+        assert_eq!(
+            no_far_leg_final_response(&Method::Refer),
+            (500, "Server Internal Error")
+        );
+    }
+
+    #[test]
+    fn a_one_legged_call_has_no_far_leg_to_forward_to() {
+        // The shape the fix keys on: a UAS-mode / handover / WebSocket-takeover
+        // call answers with no B-leg, so `winner` is never set and the bridge
+        // path is unreachable for every in-dialog request it ever receives.
+        // Before the fix that meant a silent drop and 32s of Timer F.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg("takeover@10.0.0.1"));
+        let call = store.get_call(&call_id).expect("call");
+        assert!(call.winner.is_none());
+        assert!(call.b_legs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // @b2bua.on_invite action applied to a call that ended mid-handler
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invite_action_applies_to_a_live_call() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg("live@10.0.0.1"));
+        assert!(!invite_action_target_gone(&call_id, &store));
+    }
+
+    #[test]
+    fn invite_action_is_dropped_after_a_cancel_removed_the_call() {
+        // The field case: an async handler awaits (a lookup, an agent becoming
+        // free, `asyncio.sleep` to ring) and the caller gives up. The CANCEL
+        // path answered 487 and removed the actor; applying the returned action
+        // would put a second final response on the same server transaction.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg("cancelled@10.0.0.1"));
+        store.remove_call_after_cancel(&call_id);
+        assert!(invite_action_target_gone(&call_id, &store));
+    }
+
+    #[test]
+    fn invite_action_is_dropped_for_a_terminated_call() {
+        // The CANCEL path sets the state before it removes the call, and every
+        // other teardown (script terminate, max-duration, session timer) leaves
+        // the same marker — so a call that is still in the map but Terminated
+        // must be treated as gone too.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg("terminated@10.0.0.1"));
+        store.set_state(&call_id, CallState::Terminated);
+        assert!(invite_action_target_gone(&call_id, &store));
+    }
+
+    #[test]
+    fn invite_action_is_dropped_for_an_unknown_call() {
+        let store = CallActorStore::new();
+        assert!(invite_action_target_gone("never-existed", &store));
+    }
+
+    #[test]
+    fn call_action_names_every_variant() {
+        // The guard logs which decision the handler reached; `Debug` would print
+        // a whole carrier list or vars map instead.
+        use crate::script::api::call::CallAction;
+        assert_eq!(CallAction::None.name(), "none");
+        assert_eq!(
+            CallAction::Reject {
+                code: 486,
+                reason: "Busy Here".to_string(),
+            }
+            .name(),
+            "reject"
+        );
+        assert_eq!(CallAction::Answered.name(), "answered");
+        assert_eq!(CallAction::Terminate.name(), "terminate");
+        assert_eq!(
+            CallAction::Handover {
+                app: "voice-ai".to_string(),
+                on_lost: None,
+                deadline_ms: None,
+                vars: std::collections::HashMap::new(),
+                answer: true,
+                profile: None,
+                ws_uri: None,
+            }
+            .name(),
+            "handover"
+        );
     }
 
     // -----------------------------------------------------------------------

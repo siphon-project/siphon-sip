@@ -2776,6 +2776,46 @@ fn refer_notifier_subscription_is_not_a_subscriber_one() {
     assert!(!store.has_subscriber_refer_subscription(&call_id, true));
 }
 
+#[test]
+fn a_notify_after_the_terminating_one_finds_no_subscription_and_no_far_leg() {
+    // The second route into the drop this fixes, and the one that needs no race
+    // to reproduce: the terminating NOTIFY clears the subscription, so a
+    // *retransmission* of it — the peer's copy of our 200 was lost, and a
+    // NOTIFY has no server transaction here to absorb it — no longer matches
+    // the absorb arm. On a one-legged call (UAS-mode answer, handover,
+    // WebSocket takeover) there is also no far leg to bridge it onto, so
+    // `handle_b2bua_notify` reaches the forwarder with nothing to forward to.
+    // It must answer 481 (RFC 6665 §8.2.1) rather than drop, which left the
+    // peer retransmitting on Timer E for the full 32s of Timer F.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("takeover@test"));
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: false, // subscriber role: siphon sent the REFER
+            origin: ReplacementOrigin::Refer,
+            event_id: 7,
+            notify_cseq: 7,
+            state: TransferState::Trying,
+            target_leg_call_id: None,
+            referrer_gone: false,
+            deadline: None,
+            media_profile: None,
+        },
+    );
+    assert!(store.has_subscriber_refer_subscription(&call_id, true));
+
+    // The terminating NOTIFY is absorbed and clears the subscription.
+    store.clear_refer_subscriptions_on_leg(&call_id, true);
+    assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+
+    // Its retransmission now has neither a subscription nor a peer leg.
+    let call = store.get_call(&call_id).expect("call");
+    assert!(call.winner.is_none());
+    assert!(call.b_legs.is_empty());
+}
+
 fn siphon_initiated(target: &str, deadline: Option<std::time::Instant>) -> ReferSubscription {
     ReferSubscription {
         on_a_leg: false,
