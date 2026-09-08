@@ -311,6 +311,25 @@ impl ProfileRegistry {
         // let the bridge cut playout locally on the caller's speech edge without
         // a server round-trip.
         //
+        // Barge-in is shipped whole or not at all.  `ws_barge_in` on its own
+        // runs the energy detector with no leading-speech requirement, so the
+        // speech-start edge fires on the first frame that reads as loud and a
+        // cough, a door, a keyboard or one burst of uncancelled echo cuts the
+        // prompt — the bot interrupts itself and the caller's transcript comes
+        // back as what the bot just said.  The neural detector answers "is this
+        // speech" rather than "is this loud", and the 100 ms leading run is
+        // inside the 60–120 ms band that stays under the turn-start latency a
+        // caller notices.  An operator wanting the cheap detector still says so
+        // on a `media.profiles` override; this is the default, not a ceiling.
+        //
+        // `carry_received_from` is policy, not an address: the script API
+        // injects the real post-NAT source per call and the flag is inert where
+        // there is none.  It is asserted here because this profile exists for
+        // app clients answering to an AI, which are exactly the clients behind
+        // NAT — without it their media is gated out on the private address in
+        // their own `c=`, and the failure presents as a bot that never speaks
+        // on a call whose signalling is clean.
+        //
         // `siphon-rtp` backend only; the rtpengine and rtpproxy backends have no
         // equivalent for any of these and reject the profile at config load.
         ProfileEntry {
@@ -323,6 +342,9 @@ impl ProfileRegistry {
                 echo_cancellation: true,
                 ws_vad: true,
                 ws_barge_in: true,
+                ws_vad_engine: Some(WsVadEngine::Neural),
+                ws_vad_min_speech_ms: Some(100),
+                carry_received_from: true,
                 ..NgFlags::default()
             },
             answer: NgFlags {
@@ -334,6 +356,9 @@ impl ProfileRegistry {
                 echo_cancellation: true,
                 ws_vad: true,
                 ws_barge_in: true,
+                ws_vad_engine: Some(WsVadEngine::Neural),
+                ws_vad_min_speech_ms: Some(100),
+                carry_received_from: true,
                 ..NgFlags::default()
             },
         }
@@ -1149,6 +1174,39 @@ mod tests {
         assert!(registry.get("srs_recording").is_some());
         assert!(registry.get("siprec_src").is_some());
         assert!(registry.get("voice_ai").is_some());
+    }
+
+    #[test]
+    fn builtin_voice_ai_ships_barge_in_whole() {
+        // `ws_barge_in` without a detector and a leading-speech run is the
+        // combination the voice-AI cookbook tells operators not to use: the
+        // energy detector fires the speech-start edge on the first loud frame,
+        // so the bot interrupts itself on its own echo.  A built-in named for
+        // the use case must not ship a third of the feature.
+        let registry = ProfileRegistry::new();
+        let profile = registry.get("voice_ai").expect("voice_ai built-in");
+        for (half, flags) in [("offer", &profile.offer), ("answer", &profile.answer)] {
+            assert!(flags.ws_barge_in, "{half}: barge-in");
+            assert_eq!(
+                flags.ws_vad_engine,
+                Some(WsVadEngine::Neural),
+                "{half}: barge-in needs the speech classifier, not the energy detector"
+            );
+            assert_eq!(
+                flags.ws_vad_min_speech_ms,
+                Some(100),
+                "{half}: barge-in needs a leading-speech run, or one loud frame cuts the prompt"
+            );
+            // Policy only — the per-call address is injected by the script API,
+            // so this is inert where the proxy has none.  Without it a NATed app
+            // client is gated out on the private address in its own c= and the
+            // bot is never heard.
+            assert!(flags.carry_received_from, "{half}: received-from policy");
+            assert!(
+                flags.received_from.is_none(),
+                "{half}: a built-in must never carry a per-call address"
+            );
+        }
     }
 
     #[test]

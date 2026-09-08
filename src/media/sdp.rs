@@ -24,7 +24,9 @@ pub struct MediaLine {
     pub rtpmap: Vec<(u16, String)>,
     /// fmtp attributes keyed by payload type.
     pub fmtp: Vec<(u16, String)>,
-    /// Other attributes (not rtpmap/fmtp) for this media section.
+    /// Other lines of this media section (everything but rtpmap/fmtp), kept in
+    /// arrival order.  The serializer, not this vector, is what puts them into
+    /// RFC 4566 §5 order — see [`PRE_ATTRIBUTE_PREFIXES`].
     pub other_attrs: Vec<String>,
 }
 
@@ -433,6 +435,19 @@ impl SdpBody {
     }
 }
 
+/// The media-description lines RFC 4566 §5 places between `m=` and the
+/// attribute region, in the order it fixes for them.  `k=` is deprecated by
+/// RFC 8866 but still has a defined slot, and a body that carries one has to be
+/// re-emitted somewhere legal.
+const PRE_ATTRIBUTE_PREFIXES: [&str; 4] = ["i=", "c=", "b=", "k="];
+
+/// Whether `line` belongs ahead of the `a=` region rather than in it.
+fn is_pre_attribute_line(line: &str) -> bool {
+    PRE_ATTRIBUTE_PREFIXES
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
 impl std::fmt::Display for SdpBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for line in &self.session_lines {
@@ -459,9 +474,39 @@ impl std::fmt::Display for SdpBody {
                 )?;
             }
 
-            // Other attributes first (c=, b=, etc.)
-            for attr in &media.other_attrs {
-                write!(f, "{attr}\r\n")?;
+            // RFC 4566 §5 fixes the order inside a media description: m=,
+            // i=, c=, b=, k=, then a=.  The parser buckets every line that is
+            // not an rtpmap/fmtp into `other_attrs` in arrival order, so a body
+            // that arrived with its c= behind an attribute would otherwise be
+            // re-emitted in that same illegal order.  A strict parser (several
+            // vendor SBCs) then reads the section as carrying no connection
+            // address at all and answers 400 Bad Request on a body every
+            // lenient parser accepts, which makes it a per-carrier mystery
+            // rather than an obvious defect.  Partition on the way out instead.
+            //
+            // Relative order is preserved *within* each group: §5 fixes where
+            // the groups go, not what the sender puts inside one, and the order
+            // of repeated b= lines and of the attribute sequence carries
+            // meaning.
+            for prefix in PRE_ATTRIBUTE_PREFIXES {
+                for line in media
+                    .other_attrs
+                    .iter()
+                    .filter(|line| line.starts_with(prefix))
+                {
+                    write!(f, "{line}\r\n")?;
+                }
+            }
+
+            // The attribute region.  A line legal nowhere in a media
+            // description rides here rather than being dropped — this is a
+            // serializer, not a validator.
+            for line in media
+                .other_attrs
+                .iter()
+                .filter(|line| !is_pre_attribute_line(line))
+            {
+                write!(f, "{line}\r\n")?;
             }
 
             // rtpmap attributes
@@ -683,6 +728,139 @@ mod tests {
             .rtpmap
             .iter()
             .any(|(_, c)| c.contains("telephone-event")));
+    }
+
+    /// The media block of `sdp`, as emitted lines, from its `m=` onward.
+    fn emitted_media_lines(sdp: &str) -> Vec<String> {
+        let output = SdpBody::parse(sdp).to_string();
+        let lines: Vec<&str> = output.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with("m="))
+            .expect("no media section in the emitted body");
+        lines[start..].iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn serialize_repairs_a_connection_line_behind_an_attribute() {
+        // RFC 4566 §5 fixes m=, i=, c=, b=, k=, then a= inside a media
+        // description.  This offer carries its c= behind an attribute, which
+        // several vendor SBCs reject with 400 Bad Request because they read the
+        // section as having no connection address.  A parse/apply round-trip
+        // has to repair that, not reproduce it.
+        let raw = concat!(
+            "v=0\r\n",
+            "o=- 1 0 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30168 RTP/AVP 8 101\r\n",
+            "a=rtcp:30169\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "a=mid:audio\r\n",
+            "a=sendrecv\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+        );
+
+        // Asserted as an exact line sequence: a `contains` check passes just as
+        // happily on the broken order, which is why the ordering bug survived
+        // the serializer tests that were already here.
+        assert_eq!(
+            emitted_media_lines(raw),
+            vec![
+                "m=audio 30168 RTP/AVP 8 101",
+                "c=IN IP4 192.0.2.10",
+                "a=rtcp:30169",
+                "a=mid:audio",
+                "a=sendrecv",
+                "a=rtpmap:8 PCMA/8000",
+                "a=rtpmap:101 telephone-event/8000",
+            ],
+        );
+    }
+
+    #[test]
+    fn serialize_orders_information_bandwidth_and_key_ahead_of_attributes() {
+        // i=, b= and k= are displaced by the same arm as c= and need the same
+        // repair.  Repeated b= lines keep their relative order — §5 fixes where
+        // the group sits, not what the sender puts inside it.
+        let raw = concat!(
+            "v=0\r\n",
+            "o=- 1 0 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30168 RTP/AVP 8\r\n",
+            "a=sendrecv\r\n",
+            "b=TIAS:64000\r\n",
+            "k=prompt\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "b=AS:64\r\n",
+            "i=voice\r\n",
+            "a=ptime:20\r\n",
+        );
+
+        assert_eq!(
+            emitted_media_lines(raw),
+            vec![
+                "m=audio 30168 RTP/AVP 8",
+                "i=voice",
+                "c=IN IP4 192.0.2.10",
+                "b=TIAS:64000",
+                "b=AS:64",
+                "k=prompt",
+                "a=sendrecv",
+                "a=ptime:20",
+            ],
+        );
+    }
+
+    #[test]
+    fn serialize_leaves_a_conformant_media_section_untouched() {
+        // The reorder is a repair, not a reshuffle: a section already in §5
+        // order comes back byte-identical, so nothing that was on the wire
+        // before this changes shape.
+        let raw = concat!(
+            "v=0\r\n",
+            "o=- 1 0 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30168 RTP/AVP 8 101\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "a=sendrecv\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=fmtp:101 0-15\r\n",
+        );
+        assert_eq!(SdpBody::parse(raw).to_string(), raw);
+    }
+
+    #[test]
+    fn serialize_orders_every_media_section_independently() {
+        // A second section is partitioned on its own lines, not against the
+        // first one's — the audio c= must not migrate into the video block.
+        let raw = concat!(
+            "v=0\r\n",
+            "o=- 1 0 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30168 RTP/AVP 8\r\n",
+            "a=sendrecv\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "m=video 30170 RTP/AVP 96\r\n",
+            "a=recvonly\r\n",
+            "c=IN IP4 192.0.2.11\r\n",
+        );
+
+        assert_eq!(
+            emitted_media_lines(raw),
+            vec![
+                "m=audio 30168 RTP/AVP 8",
+                "c=IN IP4 192.0.2.10",
+                "a=sendrecv",
+                "m=video 30170 RTP/AVP 96",
+                "c=IN IP4 192.0.2.11",
+                "a=recvonly",
+            ],
+        );
     }
 
     #[test]

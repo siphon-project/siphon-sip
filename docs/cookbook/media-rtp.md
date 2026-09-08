@@ -251,11 +251,14 @@ media:
         ws_uri: "wss://ai.example.com/stream/{call_id}"
         ws_vad: true           # emit speech_started / speech_stopped edges
         ws_barge_in: true      # cut playout locally on the caller's speech
+        ws_vad_engine: neural  # "is this speech", not "is this loud"
+        ws_vad_min_speech_ms: 100  # leading run before the speech-start edge
         ws_vad_threshold: 2000000
         ws_vad_hangover_ms: 300
         noise_suppression: true
         echo_cancellation: true
         echo_delay_search_ms: 400
+        received_from: true    # gate on the real post-NAT source
       answer: *voice_ai_flags
 ```
 
@@ -280,9 +283,12 @@ async def on_invite(call):
         call.answer(200, "OK", body=sdp, content_type="application/sdp")
 ```
 
-The built-in `voice_ai` profile sets the DSP and VAD flags but deliberately
-leaves `ws_uri` unset — there is no sensible default endpoint, so supply it in
-YAML or per call as above.
+The built-in `voice_ai` profile sets the DSP and VAD flags (including
+`ws_vad_engine: neural`, `ws_vad_min_speech_ms: 100` and `received_from`) but
+deliberately leaves `ws_uri` unset — there is no sensible default endpoint, so
+supply it in YAML or per call as above. An entry of the same name under
+`media.profiles` **replaces** the built-in rather than merging with it, so
+restate every flag the override still wants.
 
 `ws_uri`, the `ws_*` knobs, `noise_suppression` and the `echo_*` knobs are
 **`siphon-rtp` only**. siphon refuses to start if a `media.profiles` entry sets

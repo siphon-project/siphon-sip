@@ -791,9 +791,17 @@ auth:
 #   srs_recording   — Recording sink: plain RTP, media handover + port latching
 #   siprec_src      — SIPREC SRC subscription leg toward the recorder
 #   voice_ai        — Plain RTP toward the caller, audio bridged to a WebSocket
-#                     media server. NS + AEC + VAD + barge-in on; ws_uri is left
-#                     unset (no sensible default endpoint) — set it here or pass
-#                     ws_uri= per call. siphon-rtp backend only.
+#                     media server. NS + AEC on; barge-in on with the neural
+#                     detector and a 100 ms leading-speech run (the energy
+#                     detector with no leading run turn-starts on one loud frame,
+#                     so the bot cuts itself off on its own echo); received_from
+#                     on, so a NATed app client is gated on its real post-NAT
+#                     source and not on the private address in its own c=.
+#                     ws_uri is left unset (no sensible default endpoint) — set
+#                     it here or pass ws_uri= per call. siphon-rtp backend only.
+#                     NOTE: a media.profiles entry named voice_ai REPLACES this
+#                     built-in outright, it does not merge — so an override has
+#                     to restate every flag above that it still wants.
 #
 # Define custom profiles under media.profiles:
 # media:
@@ -1024,6 +1032,7 @@ auth:
 #         ws_vad_engine: neural         # energy (default) | neural
 #         ws_vad_min_speech_ms: 80      # leading: continuous speech before barge-in
 #         ws_sample_rate: 16000         # multiple of 1000, 8000-48000
+#         received_from: true           # gate ingress on the real post-NAT source
 #         noise_suppression: true
 #         echo_cancellation: true
 #         echo_delay_search_ms: 400     # 16-1000; widen for a carrier leg

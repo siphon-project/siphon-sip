@@ -140,8 +140,21 @@ pub struct Dialog {
 }
 
 /// Generate a fresh SDP `o=` session-id (RFC 4566 §5.2 — a numeric identifier).
+///
+/// Masked into the non-negative signed range: RFC 3264 §5 requires the `o=`
+/// session-id and version to be "representable with a 64 bit signed integer",
+/// and a full-range `u64` puts about half of all dialogs above [`i64::MAX`],
+/// where a peer parsing the field with `strtoll` / `ParseInt` overflows on a
+/// body that is otherwise fine.  Because the value is random per call, that
+/// fails intermittently — the same route works, then does not, with nothing in
+/// any log to separate the two calls.
+///
+/// 63 bits of a v4 UUID is far more collision resistance than the field needs;
+/// it only has to be unique among the sessions one peer holds at once.  The
+/// companion version starts at 0 and is only ever incremented, so it stays in
+/// range without help.
 pub fn generate_sdp_session_id() -> u64 {
-    uuid::Uuid::new_v4().as_u128() as u64
+    (uuid::Uuid::new_v4().as_u128() as u64) & (i64::MAX as u64)
 }
 
 impl Dialog {
@@ -3808,6 +3821,33 @@ mod tests {
         // Distinct dialogs get distinct session-ids (overwhelmingly — u64 from a
         // v4 UUID).
         assert_ne!(a.sdp_session_id, b.sdp_session_id);
+    }
+
+    #[test]
+    fn generated_sdp_session_id_fits_a_signed_64_bit_integer() {
+        // RFC 3264 §5: the o= session-id MUST be representable in a signed
+        // 64-bit integer.  The generator drew from the whole unsigned range, so
+        // roughly every second dialog emitted one a peer parsing it as i64
+        // overflows on.  Sample enough that the old behaviour cannot pass by
+        // luck (2^-4096), and keep the range assertion rather than a bit-mask
+        // one so it still holds if the generator is ever re-implemented.
+        for _ in 0..4096 {
+            let id = generate_sdp_session_id();
+            assert!(
+                id <= i64::MAX as u64,
+                "session-id {id} exceeds i64::MAX and overflows a peer parsing o= as a signed 64-bit integer"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_sdp_session_ids_are_distinct() {
+        // Masking the top bit must not have collapsed the space: the id has to
+        // stay unique across the sessions one peer holds at once (RFC 4566
+        // §5.2).
+        let ids: std::collections::HashSet<u64> =
+            (0..1024).map(|_| generate_sdp_session_id()).collect();
+        assert_eq!(ids.len(), 1024);
     }
 
     #[test]
