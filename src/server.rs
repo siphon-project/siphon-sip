@@ -2362,6 +2362,52 @@ impl SiphonServer {
                             .as_ref()
                             .and_then(|server| server.instance_id.clone())
                             .or_else(|| std::env::var("HOSTNAME").ok());
+
+                        // The log tail publishes signalling-adjacent content
+                        // (call-ids, numbers, peer addresses), so it is gated on
+                        // the bearer token regardless of `protect_reads`. With
+                        // no token there is nothing to gate it with, and
+                        // enabling it anyway would publish the node's log stream
+                        // to anyone who can reach the port — so refuse, loudly,
+                        // rather than silently serving it or silently ignoring
+                        // the setting.
+                        let has_token = auth.token.as_ref().is_some_and(|token| !token.is_empty());
+                        if let Some(ref log_tail) = admin_config.log_tail {
+                            if log_tail.enabled && has_token {
+                                crate::log_tail::enable(log_tail.max_streams);
+                                info!(max_streams = log_tail.max_streams, "admin log tail enabled");
+                            } else if log_tail.enabled {
+                                error!(
+                                    "admin.log_tail.enabled is set but admin.auth.token is not; \
+                                     refusing to expose the log stream unauthenticated"
+                                );
+                            }
+                        }
+
+                        if let Some(ref capture) = admin_config.capture {
+                            if capture.enabled && has_token {
+                                crate::capture::enable(crate::capture::CaptureLimits {
+                                    max_bytes: capture.max_bytes,
+                                    max_calls: capture.max_calls,
+                                    max_messages_per_call: capture.max_messages_per_call,
+                                    redact_bodies: capture.redact_bodies,
+                                });
+                                warn!(
+                                    max_bytes = capture.max_bytes,
+                                    max_calls = capture.max_calls,
+                                    redact_bodies = capture.redact_bodies,
+                                    "SIP message capture enabled — signalling is retained in \
+                                     memory and readable over the admin API; this is a debugging \
+                                     facility, not lawful intercept"
+                                );
+                            } else if capture.enabled {
+                                error!(
+                                    "admin.capture.enabled is set but admin.auth.token is not; \
+                                     refusing to expose captured signalling unauthenticated"
+                                );
+                            }
+                        }
+
                         let admin_state = crate::admin::AdminState {
                             registrar: Arc::clone(registrar),
                             start_time: std::time::Instant::now(),
@@ -2372,6 +2418,8 @@ impl SiphonServer {
                                 .map(|token| std::sync::Arc::from(token.as_str())),
                             protect_reads: auth.protect_reads,
                             instance_id,
+                            features: crate::admin::AdminFeatures::from_config(&config),
+                            script_engine: Some(Arc::clone(&engine)),
                         };
                         tokio::spawn(crate::admin::serve(
                             listen_addr,
@@ -2626,9 +2674,17 @@ fn init_logging(
     // EventClock precedes both `fmt` layers deliberately: `Layered` dispatches
     // an event to the layer added first, so this is what makes the console and
     // the file render the same instant instead of timing the event twice.
+    //
+    // The tail layer is installed unconditionally but is inert until
+    // `log_tail::enable()` runs (admin config, later in startup): its
+    // `on_event` is one relaxed atomic load in that state. Installing it here
+    // rather than conditionally keeps the subscriber a single static shape —
+    // and `EnvFilter` above it means the tail can only ever see what
+    // `log.level` already admits.
     tracing_subscriber::registry()
         .with(env_filter)
         .with(EventClock)
+        .with(crate::log_tail::LogTailLayer)
         .with(console_layer)
         .with(file_layer)
         .init();

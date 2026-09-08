@@ -7,6 +7,74 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+> The embedded dashboard and everything below that feeds it stay
+> **EXPERIMENTAL and a work in progress**: the views, the admin JSON shapes and
+> the new `admin.log_tail` / `admin.capture` config blocks may change or be
+> removed without a deprecation cycle. Both new subsystems are **off by
+> default** and refuse to start without `admin.auth.token`. The Prometheus
+> metrics added here are the stable half — `/metrics` remains the interface to
+> build alerting on.
+
+- **A live log tail on the admin API and in the dashboard** —
+  `GET /admin/logs/stream` (Server-Sent Events) and a Logs view, so debugging a
+  call no longer means leaving the dashboard for `journalctl` on the box.
+  Filtering (level, substring, Call-ID) is applied **server-side**: a busy node
+  emits far more than a browser should receive and discard.
+
+  Capture is **on-demand**. The Rust datapath logs nothing per message at INFO,
+  but a logging Python script emits roughly five lines per call — ~150k lines a
+  second at 30k cps — so retaining all of that for a feature nobody is watching
+  would be a permanent cost on the hot path. With no tail attached the layer is
+  one relaxed atomic load; formatting happens only past that gate. WARN and
+  above are always retained in a small ring, because they are rare and they are
+  the context you want *already collected* when you open the tail after
+  something has gone wrong.
+
+  Delivered as SSE over `fetch` rather than `EventSource` or a WebSocket:
+  neither can carry an `Authorization` header from a browser, which would force
+  the bearer token into the query string. A slow reader drops lines under a
+  bounded drop-oldest queue — the discipline the control plane already applies
+  to a slow application — and is told how many, in line, where the gap
+  happened. Off by default (`admin.log_tail.enabled`), and refused at startup
+  without `admin.auth.token`.
+
+- **Per-call SIP ladder and a search box.** `admin.capture.enabled` records the
+  wire messages into a bounded ring indexed by Call-ID, `GET /admin/capture/
+  {call_id}` returns them, and the Calls drawer renders the exchange with the
+  raw text one click away. `GET /admin/search?q=` finds a call by whatever the
+  operator actually has — a number, a Call-ID, a fragment of either — across
+  the capture ring and the live call list.
+
+  Capture rides the same two chokepoints as the traffic counters, and both
+  already hold the wire `Bytes`, so recording is a refcount bump: nothing is
+  re-serialized and nothing is parsed on the send path (the Call-ID comes from
+  a header scan that stops at the first match). Bounded by bytes, calls and
+  messages-per-call; eviction is oldest-call-first and whole calls only,
+  because half a ladder answers nothing. **Off by default**, refused without an
+  auth token, and a debugging facility rather than a lawful-intercept one —
+  `lawful_intercept:` remains that, with its own warrants, delivery and
+  retention.
+
+- **Operator actions: hang up a call, drain the node, reload the script.**
+  `POST /admin/calls/{call_id}/hangup` routes through the control plane's own
+  teardown funnel, so the Rf/Ro stop records, the CDR and the media release all
+  happen — a hand-rolled BYE would answer the peer and silently skip them.
+  B2BUA-only, and the UI says so rather than offering a button a proxy cannot
+  honour. `POST`/`DELETE /admin/drain` flips the drain flag `/admin/ready`
+  already reports, so an orchestrator removes the node from rotation — and,
+  unlike SIGTERM, it is reversible. `POST /admin/script/reload` recompiles now
+  and returns the traceback on failure, with the previous script left running.
+
+- **Estimated call cost from the LCR carrier rate.** `/admin/calls` reports the
+  winning carrier, its rate, the billed duration (applying `billing_increment`
+  and `min_duration`, so a 1-second call on a 60-second increment bills a full
+  minute) and the running cost; a Cost view adds the live burn rate and spend
+  per carrier. Exported as `siphon_call_cost_total{carrier,currency}` and
+  `siphon_call_spend_rate{currency}`, so Grafana and alerting see the same
+  numbers. Never summed across currencies. An **estimate** — the carrier's own
+  rating is authoritative and will differ — and an unrated call renders "not
+  rated" rather than a zero.
+
 - **The control plane's `answer` can anchor media — `answer(anchor|profile|
   ws_uri)`, and `answer_anchored()` in all three SDKs.** An application that
   accepted an **un-answered** `call.handover()` could hold the call open for as
@@ -58,6 +126,66 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   now resolves once and hands the send path a resolved policy — the target URI
   and the identity headers can no longer be shaped by different policies.
 
+- **`/admin/metrics.json` reports `null` for a subsystem this node has not
+  configured**, instead of a zero indistinguishable from "configured and idle".
+  Applies to `diameter`, `rtpengine`, `control`, `sbi`, `ipsec` and the Rf / Ro /
+  lawful-intercept session counts.
+- **`/admin/metrics.json` surfaces signal that was already collected and never
+  exposed**: per-method and per-class traffic breakdowns, Diameter per-command
+  and per-error-kind totals, per-instance media health, control-plane
+  connections / controlled calls / commands / dropped events, TLS handshake
+  failures, connections refused by reason, and the Rf / Ro / LI session counts.
+- **`/admin/calls` reports what it already had in hand**: ring and talk duration,
+  per-branch status including the failure code, which branch won, per-leg
+  transport and remote address, session-timer state, transfer state, controlling
+  app, recording flag, and per-carrier LCR attempts (including whether siphon
+  actually dialled a carrier, so a local gateway fault is not read as a carrier
+  fault).
+- **`/admin/registrations` reports transport, source address, a derived NAT
+  flag, GRUU `+sip.instance`, `reg-id`, Path depth, IMS pending state, and which
+  instance accepted the binding** — the fields that answer "why can't I reach
+  this subscriber".
+- **Two tests that prevent this class of defect recurring**: one asserts every
+  metric declared on `SiphonMetrics` has a write site outside `src/metrics/`, the
+  other that it reaches `/admin/metrics.json`. Both fail with the offending
+  metric names rather than a bare assertion.
+
+### Changed
+- **The embedded operator dashboard (experimental) is restructured.** Nine views
+  — Overview, Calls, Registrations, Gateways, Signalling, Media, Control,
+  Security, System — replacing seven, with the new ones covering subsystems that
+  were entirely invisible before. Throughout, a metric belonging to an
+  unconfigured subsystem renders as "not configured" and never as a zero, and its
+  nav entry is greyed; conflating the two is what let the dead counters sit
+  unnoticed. The Calls view gains live duration, per-branch outcomes and a
+  detail drawer; Registrations gains transport, source and NAT columns.
+
+  IPsec SA pairs are no longer filed under a "5GC · SBI" card: sec-agree is Gm
+  access security (3GPP TS 33.203, RFC 3329 over SIP) and N5/Npcf is
+  service-based policy control to the PCF — unrelated reference points, and a 4G
+  IMS P-CSCF has the first and none of the second.
+
+  Chart history now survives a page reload, only the visible view is polled, and
+  polling backs off while the tab is hidden. `ui/` is split into stylesheet and
+  ES modules; there is still no build step.
+
+### Removed
+- `siphon_request_duration_seconds`, `siphon_transaction_duration_seconds` and
+  `siphon_script_executions_total`, which were registered, never observed, and
+  emitted nothing. Removing a metric that never produced a series breaks no
+  scrape contract. Handler volume is already covered by
+  `siphon_pyexec_jobs_completed_total`.
+
+### Security
+- **The admin API's sensitive routes ignore `protect_reads`.** `/admin/logs*`,
+  `/admin/capture*` and `/admin/search` always require the bearer token, and
+  return `403` when no token is configured at all. `protect_reads` defaults to
+  false, so every `GET` under `/admin` is open on a node that set a token only
+  to gate its `DELETE`s — a defensible default for a gauge, not for a live log
+  stream or captured signalling. A failed admin token now also feeds
+  `record_handshake_failure`, so credential guessing against the admin port
+  reaches the auto-ban the way it already does on the control plane.
+
 ### Fixed
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
   of dropped.** A call with one leg is not an error state: a UAS-mode answer, a
@@ -105,6 +233,58 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   responses on one INVITE server transaction (RFC 3261 §17.2.1) — and
   registered a control channel for a call nobody was on. `dial` / `fork` /
   `route` had the same shape, dialling a B-leg for an abandoned call.
+
+- **Seven metrics were registered but never written, so they exported a flat
+  zero — or no series at all — for the life of the process.** Anything built on
+  them was silently dead: a Grafana panel on `siphon_requests_total` drew a flat
+  line, and an alert rule on it could never fire. An `IntCounterVec` that is
+  never incremented collects nothing, so `siphon_requests_total`,
+  `siphon_responses_total` and `siphon_connections_active` were absent from
+  `/metrics` entirely rather than reading zero; `siphon_dialogs_active`,
+  `siphon_transactions_active`, `siphon_uptime_seconds` and
+  `siphon_script_errors_total` published a hardcoded zero. Verified on a node
+  with 16 h uptime carrying live calls. All are now wired:
+
+  - `siphon_requests_total{method,direction}` and
+    `siphon_responses_total{class,direction}` count every SIP message in both
+    directions. The labels changed shape (`direction` added, responses keyed on
+    class rather than exact code) — safe to change, because neither metric had
+    ever emitted a single series. Unknown methods collapse into one `OTHER`
+    bucket: the method token comes off an attacker-controlled request line, so
+    labelling by it would let a peer mint unbounded series through the scrape
+    endpoint. These count **wire events**, so a retransmission counts each time.
+  - `siphon_dialogs_active` is now the documented sum of the proxy and B2BUA
+    halves, and both are exported separately — `siphon_proxy_dialog_sessions`
+    already existed, `siphon_b2bua_calls_active` is new. Which side carries the
+    load is the question a single conflated number could not answer.
+  - `siphon_transactions_active` tracks the transaction manager.
+  - `siphon_connections_active{transport}` counts live inbound connections per
+    stream transport, released by an RAII guard so a cancelled connection task
+    cannot leak the gauge upward. UDP is deliberately absent rather than pinned
+    at zero: it is connectionless, so there is no connection to count.
+  - `siphon_uptime_seconds` is published by the dispatcher sweep, so a
+    Prometheus-only deployment sees it without opening the dashboard.
+  - `siphon_script_errors_total` is incremented alongside every Python
+    handler-error log, through one helper, so the counter and the logs cannot
+    disagree.
+  - `siphon_control_events_dropped_total{app}` — a slow control-plane consumer
+    lost events with nothing recorded outside the per-connection counter that
+    died with the connection.
+
+  The per-message counters resolve their Prometheus children into dense arrays
+  at startup rather than looking up labels per call: measured at 4.2 ns against
+  22.5 ns for `with_label_values`, which at 30k cps is the difference between a
+  rounding error and 60k lock-and-hash operations a second. A criterion bench
+  (`traffic_counters`) locks this in.
+
+- **`siphon_pyexec_pool_max` always read 0**, so the dashboard showed a pool of
+  "4 / 0". The executor is installed before `metrics::init()` runs, so the
+  one-shot publish at construction found no registry and was dropped. It is now
+  republished on each sampling tick, independent of startup order.
+- **`/admin/registrations/{aor}` walked `siphon_registrations_active` away from
+  the truth.** It decremented by one, but the gauge is set absolutely everywhere
+  else and the removed AoR may hold any number of contacts. It now re-reads the
+  count.
 
 ## [1.8.5] — 2026-09-08
 

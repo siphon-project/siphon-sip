@@ -235,23 +235,22 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
 | Prometheus endpoint | **Production** | `metrics.prometheus` | |
-| Request/response counters | **Production** | `siphon_requests_total` / `siphon_responses_total` | |
+| Request/response counters | **Production** | `siphon_requests_total{method,direction}` / `siphon_responses_total{class,direction}` | Both directions, counted at the single inbound dispatch point and the single outbound send point. Counts **wire events**, so a retransmission counts each time — not a transaction count. Unknown methods bucket into `OTHER` (the token is attacker-controlled, so a series per token is a scrape-side cardinality DoS) |
 | Active registrations gauge | **Production** | `siphon_registrations_active` | |
 | Active transactions gauge | **Production** | `siphon_transactions_active` | |
-| Active dialogs gauge | **Production** | `siphon_dialogs_active` | |
-| Active connections (by transport) | **Production** | `siphon_connections_active` | |
-| Request duration histogram | **Production** | `siphon_request_duration_seconds` | |
-| Script execution counters | **Production** | `siphon_script_executions_total` | |
-| Uptime gauge | **Production** | `siphon_uptime_seconds` | |
+| Active dialogs gauge | **Production** | `siphon_dialogs_active` | Sum of `siphon_proxy_dialog_sessions` + `siphon_b2bua_calls_active`, both also exported separately — which side carries the load is what the roll-up cannot say |
+| Active connections (by transport) | **Production** | `siphon_connections_active{transport}` | Live inbound stream connections, released by an RAII guard so a cancelled task cannot leak the gauge upward. **UDP is deliberately absent** rather than zero — it is connectionless, so there is no connection to count |
+| Script error counter | **Production** | `siphon_script_errors_total` | Incremented alongside every Python handler-error log, through one helper, so counter and logs cannot disagree |
+| Uptime gauge | **Production** | `siphon_uptime_seconds` | Published by the dispatcher sweep, so a Prometheus-only deployment sees it without opening the dashboard |
 | Admin API — health | Implemented | `GET /admin/health` | Liveness/readiness probe |
 | Admin API — stats | Implemented | `GET /admin/stats` | Aggregate counters |
 | Admin API — registrations | Implemented | `GET/DELETE /admin/registrations` | List, detail, force-unregister |
-| Admin API — metrics snapshot | Implemented | `GET /admin/metrics.json` | Curated JSON of live gauges/counters (SIP, memory, pyexec, Diameter, rtpengine, SBI, security) for the dashboard + custom tooling; browser diffs cumulative counters for rates |
+| Admin API — metrics snapshot | Implemented | `GET /admin/metrics.json` | Curated JSON of live gauges/counters (SIP, traffic by method/class, memory, pyexec, Diameter per-command, per-instance media, control plane, charging sessions, SBI, IPsec, security) for the dashboard + custom tooling; browser diffs cumulative counters for rates. A subsystem this node has **not configured** reports `null`, never a zero — so "absent" and "idle" are distinguishable |
 | Admin API — bearer auth | Implemented | `admin.auth.token` / `admin.auth.protect_reads` | Constant-time bearer check; gates `DELETE` (and, with `protect_reads`, reads + `/metrics`). Unset = open (unchanged) |
 | Admin API — gateways | Implemented | `GET /admin/gateways` | Per-group dispatcher status: each destination's health/weight/priority/address/transport/attrs plus its consecutive missed health-checks (`checks_missed`) and the group's `failure_threshold`, read from the shared dispatcher (no new state or probing) |
 | Admin API — gateway control | Implemented | `POST /admin/gateways/{group}/{dest}/{up\|down}` | Manual mark-up/down of a destination (drain a bad carrier, then restore it); mutating, so it sits behind the bearer gate |
-| Admin API — calls | Implemented | `GET /admin/calls` | Active B2BUA calls (SIP Call-ID, state, caller `a_party`, dialed callee `b_party`, and real B-leg count — re-INVITE/UPDATE tracking pseudo-legs excluded), read from the dispatcher-owned call store. Empty on a proxy-only node |
-| Web dashboard (embedded) | **Experimental** | `ui` cargo feature + `admin.ui.enabled` | Single-page operator UI baked into the binary, served same-origin on the admin listener: Overview / Calls / Registrations / Security / Gateways / System / Integrations. Compiled into the release Docker image by default; off for the plain `cargo build`, library consumers unaffected. Serving it logs an EXPERIMENTAL warning; feature-off + `enabled: true` warns and serves nothing |
+| Admin API — calls | Implemented | `GET /admin/calls` | Active B2BUA calls, read from the dispatcher-owned call store: Call-ID, state, ring/talk duration, caller and dialed callee, per-branch status **including the failure code** and which branch won, per-leg transport and remote address, session-timer state, transfer state, controlling app, recording flag, and per-carrier LCR attempts (with `dialed`, so a local gateway/DNS fault is not misread as a carrier fault). Re-INVITE/UPDATE tracking pseudo-legs excluded. Empty on a proxy-only node |
+| Web dashboard (embedded) | **Experimental** | `ui` cargo feature + `admin.ui.enabled` | Operator UI baked into the binary, served same-origin on the admin listener: Overview / Calls / Registrations / Gateways / Signalling / Media / Control / Security / System. A metric whose subsystem is not configured renders as "not configured", never as a zero. Chart history survives a reload; only the visible view polls, and polling backs off while the tab is hidden. Compiled into the release Docker image by default; off for the plain `cargo build`, library consumers unaffected. Serving it logs an EXPERIMENTAL warning; feature-off + `enabled: true` warns and serves nothing |
 
 ## Logging
 

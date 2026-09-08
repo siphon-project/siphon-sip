@@ -392,6 +392,43 @@ pub struct ReliableProvisional {
     pub cseq_num: u32,
 }
 
+/// Log a Python handler failure and count it in `siphon_script_errors_total`.
+///
+/// Every handler-invocation site routes its error through here so the counter
+/// cannot drift from the log. It previously did not exist and the counter was
+/// declared but never incremented — which is what happens when thirty-odd call
+/// sites each have to remember to bump it. `context` names the handler, e.g.
+/// `"B2BUA on_invite"`.
+fn record_script_error(context: &str, error: &dyn std::fmt::Display) {
+    error!("{context} handler error: {error}");
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.script_errors_total.inc();
+    }
+}
+
+/// Publish the live-store gauges: active transactions, active B2BUA calls, and
+/// the `dialogs_active` roll-up.
+///
+/// Shared by the 30 s dispatcher sweep (which drives the Prometheus scrape) and
+/// by `/admin/metrics.json` (which needs them fresh per poll), so the two can't
+/// drift apart. All three inputs must be O(1) `len()` reads — this runs on every
+/// dashboard poll, so nothing here may iterate a store.
+pub fn publish_store_gauges(
+    metrics: &crate::metrics::SiphonMetrics,
+    transactions: usize,
+    b2bua_calls: usize,
+    proxy_dialog_sessions: usize,
+) {
+    metrics.transactions_active.set(transactions as i64);
+    metrics.b2bua_calls_active.set(b2bua_calls as i64);
+    // `dialogs_active` is the documented sum of the proxy and B2BUA halves;
+    // the two components are also exported separately because which side is
+    // carrying the load is the actually useful question.
+    metrics
+        .dialogs_active
+        .set((proxy_dialog_sessions + b2bua_calls) as i64);
+}
+
 /// Shared drain state — server flips `is_draining` on signal; dispatcher fills
 /// in `transaction_manager` and `call_actors` at startup so the server can poll
 /// counts during the drain wait.
@@ -408,6 +445,20 @@ impl DrainState {
             transaction_manager: std::sync::OnceLock::new(),
             call_actors: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Active transaction count, or 0 before the dispatcher registers its
+    /// manager.
+    ///
+    /// Unlike [`active_counts`](Self::active_counts) this is an O(1) `len()`,
+    /// so it is safe on the `/admin/metrics.json` poll path — the call half of
+    /// `active_counts` sorts and de-duplicates the leg registry, which is fine
+    /// once per drain iteration but not once every two seconds.
+    pub fn transaction_count(&self) -> usize {
+        self.transaction_manager
+            .get()
+            .map(|manager| manager.count())
+            .unwrap_or(0)
     }
 
     /// Number of (transactions, b2bua_calls) currently active. Returns
@@ -2612,7 +2663,30 @@ async fn sweep_stale_entries(state: &DispatcherState) {
                 .li_remembered_sessions
                 .set(li.remembered_session_count() as i64);
         }
+
+        // Store sizes that are a cheap `len()`. These were declared but never
+        // published, so `siphon_transactions_active` reported 0 for the life of
+        // the process no matter the load. `/admin/metrics.json` republishes the
+        // same three on every poll — a 30 s-stale gauge reads as broken on a
+        // dashboard that refreshes every 2 s.
+        publish_store_gauges(
+            metrics,
+            state.transaction_manager.count(),
+            state.call_actors.count(),
+            dialog_sessions,
+        );
+
+        // Carrier burn rate. Iterates the answered calls, so it sits on this
+        // 30 s sweep rather than in `publish_store_gauges`, whose contract is
+        // O(1) because the admin poll calls it every two seconds.
+        crate::metrics::publish_spend_rate(&crate::b2bua::actor::spend_rate_by_currency(
+            &state.call_actors,
+        ));
     }
+    // Published here as well as on the admin poll: a deployment that scrapes
+    // Prometheus without ever opening the dashboard was otherwise reading a
+    // process uptime of zero.
+    crate::metrics::update_uptime();
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
     // precise, RSS-noise-free leak signal.  Also refresh the Python-side block
@@ -3511,12 +3585,45 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     // is recoverable at the mediation function and a missing one is not.
     intercept_message(&message, &inbound, state);
 
+    // Count the message on the way past. This is the one point every transport
+    // funnels through where the start line is still typed, so it is where the
+    // `direction="in"` half of `siphon_requests_total` / `siphon_responses_total`
+    // is taken. It sits *above* transaction matching, so retransmissions count
+    // each time — these are wire-event counters, not transaction counters (the
+    // metric help text says so).
+    let recorded_metrics = crate::metrics::try_metrics();
+
+    // Debug capture rides the same chokepoint as the inbound counters, for the
+    // same reason: it is the one place every transport funnels through. Off by
+    // default, so the steady-state cost is one relaxed atomic load; when on,
+    // the Call-ID is already parsed here and the wire bytes are already in
+    // hand, so recording is a refcount bump rather than a re-serialization.
+    if crate::capture::is_enabled() {
+        crate::capture::capture().record(
+            message
+                .headers
+                .call_id()
+                .map(String::as_str)
+                .unwrap_or_default(),
+            crate::capture::Direction::In,
+            inbound.remote_addr.to_string(),
+            inbound.transport.label(),
+            inbound.data.clone(),
+        );
+    }
+
     match &message.start_line {
         StartLine::Request(request_line) => {
+            if let Some(metrics) = recorded_metrics {
+                metrics.record_request(&request_line.method, crate::metrics::Direction::In);
+            }
             let method = request_line.method.as_str().to_string();
             handle_request(inbound, message, method, state);
         }
         StartLine::Response(status_line) => {
+            if let Some(metrics) = recorded_metrics {
+                metrics.record_response(status_line.status_code, crate::metrics::Direction::In);
+            }
             let status_code = status_line.status_code;
             handle_response(inbound, message, status_code, state);
         }
@@ -4843,7 +4950,7 @@ fn handle_request(
                     // If the handler is async, the return value is a coroutine — await it.
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async Python handler error: {error}");
+                            record_script_error("async Python", &error);
                             return (
                                 RequestAction::Reply {
                                     code: 500,
@@ -4863,7 +4970,7 @@ fn handle_request(
                     }
                 }
                 Err(error) => {
-                    error!("Python handler error: {error}");
+                    record_script_error("Python", &error);
                     return (
                         RequestAction::Reply {
                             code: 500,
@@ -6535,13 +6642,13 @@ fn run_proxy_failure_handlers(
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async on_failure handler error: {error}");
+                            record_script_error("async on_failure", &error);
                             return (true, RequestAction::None, None, None, None, None);
                         }
                     }
                 }
                 Err(error) => {
-                    error!("on_failure handler error: {error}");
+                    record_script_error("on_failure", &error);
                     return (true, RequestAction::None, None, None, None, None);
                 }
             }
@@ -8137,13 +8244,13 @@ fn run_reply_handlers(
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async Python reply handler error: {error}");
+                            record_script_error("async Python reply", &error);
                             return (true, None);
                         }
                     }
                 }
                 Err(error) => {
-                    error!("Python reply handler error: {error}");
+                    record_script_error("Python reply", &error);
                     return (true, None); // forward on error to avoid silent drops
                 }
             }
@@ -8246,12 +8353,12 @@ fn run_proxy_cancel_handlers(
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async Python on_cancel handler error: {error}");
+                            record_script_error("async Python on_cancel", &error);
                         }
                     }
                 }
                 Err(error) => {
-                    error!("Python on_cancel handler error: {error}");
+                    record_script_error("Python on_cancel", &error);
                 }
             }
         }
@@ -14321,12 +14428,12 @@ fn run_b2bua_cancel_handlers(
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async B2BUA on_cancel handler error: {error}");
+                            record_script_error("async B2BUA on_cancel", &error);
                         }
                     }
                 }
                 Err(error) => {
-                    error!("B2BUA on_cancel handler error: {error}");
+                    record_script_error("B2BUA on_cancel", &error);
                 }
             }
         }
@@ -15101,12 +15208,12 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                         Ok(ret) => {
                             if handler.is_async {
                                 if let Err(error) = run_coroutine(python, &ret) {
-                                    error!("async B2BUA timeout on_failure handler error: {error}");
+                                    record_script_error("async B2BUA timeout on_failure", &error);
                                 }
                             }
                         }
                         Err(error) => {
-                            error!("B2BUA timeout on_failure handler error: {error}");
+                            record_script_error("B2BUA timeout on_failure", &error);
                         }
                     }
                 }
@@ -15632,13 +15739,13 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async B2BUA on_invite handler error: {error}");
+                            record_script_error("async B2BUA on_invite", &error);
                             return InviteHandlerOutcome::script_error();
                         }
                     }
                 }
                 Err(error) => {
-                    error!("B2BUA on_invite handler error: {error}");
+                    record_script_error("B2BUA on_invite", &error);
                     return InviteHandlerOutcome::script_error();
                 }
             }
@@ -19611,7 +19718,7 @@ fn handle_b2bua_response(
                                             }
                                         }
                                         Err(error) => {
-                                            error!("B2BUA on_answer handler error: {error}");
+                                            record_script_error("B2BUA on_answer", &error);
                                             raised = true;
                                         }
                                     }
@@ -20289,12 +20396,15 @@ fn handle_b2bua_response(
                                         Ok(ret) => {
                                             if handler.is_async {
                                                 if let Err(error) = run_coroutine(python, &ret) {
-                                                    error!("async B2BUA on_early_media handler error: {error}");
+                                                    record_script_error(
+                                                        "async B2BUA on_early_media",
+                                                        &error,
+                                                    );
                                                 }
                                             }
                                         }
                                         Err(error) => {
-                                            error!("B2BUA on_early_media handler error: {error}");
+                                            record_script_error("B2BUA on_early_media", &error);
                                         }
                                     }
                                 }
@@ -21080,7 +21190,7 @@ fn handle_b2bua_response(
                                         }
                                     }
                                     Err(error) => {
-                                        error!("B2BUA on_failure handler error: {error}");
+                                        record_script_error("B2BUA on_failure", &error);
                                     }
                                 }
                             }
@@ -21268,11 +21378,11 @@ fn b2bua_dispatch_route_failure(
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async B2BUA on_route_failure handler error: {error}");
+                            record_script_error("async B2BUA on_route_failure", &error);
                         }
                     }
                 }
-                Err(error) => error!("B2BUA on_route_failure handler error: {error}"),
+                Err(error) => record_script_error("B2BUA on_route_failure", &error),
             }
         }
     });
@@ -21643,11 +21753,11 @@ fn b2bua_fail_after_answer(
                             Ok(ret) => {
                                 if handler.is_async {
                                     if let Err(error) = run_coroutine(python, &ret) {
-                                        error!("async B2BUA on_failure handler error: {error}");
+                                        record_script_error("async B2BUA on_failure", &error);
                                     }
                                 }
                             }
-                            Err(error) => error!("B2BUA on_failure handler error: {error}"),
+                            Err(error) => record_script_error("B2BUA on_failure", &error),
                         }
                     }
                 });
@@ -21942,12 +22052,12 @@ fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Dispat
                         Ok(ret) => {
                             if handler.is_async {
                                 if let Err(error) = run_coroutine(python, &ret) {
-                                    error!("async B2BUA on_bye handler error: {error}");
+                                    record_script_error("async B2BUA on_bye", &error);
                                 }
                             }
                         }
                         Err(error) => {
-                            error!("B2BUA on_bye handler error: {error}");
+                            record_script_error("B2BUA on_bye", &error);
                         }
                     }
                 }
@@ -24964,11 +25074,11 @@ fn originate_fire_answer_handlers(
                 Ok(returned) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &returned) {
-                            error!("async originate on_answer handler error: {error}");
+                            record_script_error("async originate on_answer", &error);
                         }
                     }
                 }
-                Err(error) => error!("originate on_answer handler error: {error}"),
+                Err(error) => record_script_error("originate on_answer", &error),
             }
         }
     });
@@ -25019,11 +25129,11 @@ fn b2bua_fire_failure_handlers(
                 Ok(returned) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &returned) {
-                            error!("async originate on_failure handler error: {error}");
+                            record_script_error("async originate on_failure", &error);
                         }
                     }
                 }
-                Err(error) => error!("originate on_failure handler error: {error}"),
+                Err(error) => record_script_error("originate on_failure", &error),
             }
         }
     });
@@ -28072,7 +28182,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                 Ok(ret) => {
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
-                            error!("async B2BUA on_refer handler error: {error}");
+                            record_script_error("async B2BUA on_refer", &error);
                             return (
                                 CallAction::RejectRefer {
                                     code: 500,
@@ -28084,7 +28194,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                     }
                 }
                 Err(error) => {
-                    error!("B2BUA on_refer handler error: {error}");
+                    record_script_error("B2BUA on_refer", &error);
                     return (
                         CallAction::RejectRefer {
                             code: 500,

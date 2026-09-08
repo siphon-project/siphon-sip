@@ -290,6 +290,36 @@ impl Route {
     pub fn is_routable(&self) -> bool {
         self.gateway_group.is_some() || self.next_hop.is_some() || self.ruri.is_some()
     }
+
+    /// Billable seconds for `talk_seconds` of conversation on this carrier:
+    /// at least `min_duration`, rounded up to `billing_increment`.
+    ///
+    /// This is how a wholesale carrier rates, and it is why raw talk time is
+    /// the wrong number to show an operator: a 1-second call on a 60-second
+    /// increment costs a full minute.
+    pub fn billed_seconds(&self, talk_seconds: u64) -> u64 {
+        let billable = talk_seconds.max(self.min_duration.unwrap_or(0) as u64);
+        match self.billing_increment {
+            Some(step) if step > 1 => {
+                let step = step as u64;
+                billable.div_ceil(step) * step
+            }
+            _ => billable,
+        }
+    }
+
+    /// Estimated cost of `talk_seconds` on this carrier, or `None` when the
+    /// routing API returned no rate for it.
+    ///
+    /// **An estimate.** The carrier's own rating is authoritative and will
+    /// differ — connection fees, mid-call rate changes and their own rounding
+    /// are not modelled. Good enough to trend, to alarm on, and to spot a
+    /// carrier that is quietly ten times the price of its neighbour; not good
+    /// enough to bill from.
+    pub fn cost_for(&self, talk_seconds: u64) -> Option<f64> {
+        self.rate
+            .map(|rate| rate * (self.billed_seconds(talk_seconds) as f64) / 60.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +463,71 @@ impl LcrClient {
                 .store(name, &Self::cache_key(request), &json, Some(ttl))
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    fn route(rate: Option<f64>, increment: Option<u32>, minimum: Option<u32>) -> Route {
+        Route {
+            carrier_id: "carrier-a".to_string(),
+            rate,
+            billing_increment: increment,
+            min_duration: minimum,
+            currency: Some("EUR".to_string()),
+            ..Route::default()
+        }
+    }
+
+    #[test]
+    fn per_second_billing_bills_what_was_talked() {
+        let route = route(Some(0.60), Some(1), None);
+        assert_eq!(route.billed_seconds(37), 37);
+        // 0.60/min for 37s.
+        assert!((route.cost_for(37).unwrap() - 0.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_minute_billing_rounds_up_to_the_increment() {
+        let route = route(Some(0.60), Some(60), None);
+        assert_eq!(route.billed_seconds(1), 60);
+        assert_eq!(route.billed_seconds(60), 60);
+        assert_eq!(route.billed_seconds(61), 120);
+        // A one-second call still costs a full minute — the reason raw talk
+        // time is the wrong number to show.
+        assert!((route.cost_for(1).unwrap() - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn minimum_duration_applies_before_the_increment() {
+        // 30s minimum, then rounded up to a 6s increment.
+        let route = route(Some(1.20), Some(6), Some(30));
+        assert_eq!(route.billed_seconds(5), 30);
+        assert_eq!(route.billed_seconds(31), 36);
+    }
+
+    #[test]
+    fn a_zero_length_call_still_bills_its_minimum() {
+        let route = route(Some(0.60), Some(60), Some(60));
+        assert_eq!(route.billed_seconds(0), 60);
+    }
+
+    #[test]
+    fn an_unrated_route_costs_nothing_rather_than_zero() {
+        // The distinction the dashboard renders as "not rated": a route the
+        // API returned without a rate is unknown, not free.
+        let route = route(None, Some(60), None);
+        assert!(route.cost_for(120).is_none());
+        // Billing seconds are still well-defined without a rate.
+        assert_eq!(route.billed_seconds(61), 120);
+    }
+
+    #[test]
+    fn absent_increment_is_treated_as_per_second() {
+        let route = route(Some(0.60), None, None);
+        assert_eq!(route.billed_seconds(45), 45);
     }
 }
 

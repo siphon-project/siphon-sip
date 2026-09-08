@@ -655,8 +655,9 @@ impl Drop for PyExecutor {
 
 /// Tuning for [`run_watchdog`].
 struct WatchdogParams {
-    /// Configured thread ceiling — used only for the diagnostic abort log, not
-    /// for the trigger condition.
+    /// Configured thread ceiling. Published as `siphon_pyexec_pool_max` on each
+    /// sample and included in the diagnostic abort log; not part of the stall
+    /// trigger condition.
     max_threads: usize,
     /// Stall threshold; `None` = sample metrics only, never abort.
     stall_abort: Option<Duration>,
@@ -712,6 +713,12 @@ fn run_watchdog(
             registry.pyexec_inflight.set(inflight as i64);
             registry.pyexec_pool_size.set(total as i64);
             registry.pyexec_queue_depth.set(queue_depth as i64);
+            // Republished rather than only set at construction: the executor is
+            // installed before `metrics::init()` runs, so the one-shot set there
+            // finds no registry and is dropped — leaving the ceiling reading 0
+            // for the life of the process and the dashboard showing "4 / 0".
+            // Publishing it here makes the gauge independent of startup order.
+            registry.pyexec_pool_max.set(params.max_threads as i64);
             let delta = completed.saturating_sub(last_published);
             if delta > 0 {
                 registry.pyexec_jobs_completed_total.inc_by(delta);

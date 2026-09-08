@@ -274,15 +274,63 @@ pub enum Transport {
     Sctp,
 }
 
+impl Transport {
+    /// Stable, allocation-free name — the `transport` label value on
+    /// `siphon_connections_active` and the text [`Display`](std::fmt::Display)
+    /// renders. Changing one of these renames a Prometheus series, so they are
+    /// deliberately defined once, here.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Transport::Udp => "UDP",
+            Transport::Tcp => "TCP",
+            Transport::Tls => "TLS",
+            Transport::WebSocket => "WS",
+            Transport::WebSocketSecure => "WSS",
+            Transport::Sctp => "SCTP",
+        }
+    }
+}
+
 impl std::fmt::Display for Transport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Transport::Udp => write!(formatter, "UDP"),
-            Transport::Tcp => write!(formatter, "TCP"),
-            Transport::Tls => write!(formatter, "TLS"),
-            Transport::WebSocket => write!(formatter, "WS"),
-            Transport::WebSocketSecure => write!(formatter, "WSS"),
-            Transport::Sctp => write!(formatter, "SCTP"),
+        formatter.write_str(self.label())
+    }
+}
+
+/// Holds `siphon_connections_active{transport}` up by one for its lifetime.
+///
+/// A guard rather than a matched `inc()`/`dec()` pair because this is a gauge
+/// that can only ever drift *upward*: a connection task can leave through a
+/// cancellation as well as its normal exit, and a single missed decrement would
+/// climb for the life of the process with nothing to correct it. `Drop` runs on
+/// both paths.
+///
+/// UDP never takes one of these — it is connectionless, so the series is absent
+/// rather than pinned at zero.
+pub struct ConnectionGauge {
+    transport: Transport,
+}
+
+impl ConnectionGauge {
+    /// Register a live inbound connection. Returns `None` before metrics are
+    /// initialised, in which case nothing is counted and nothing is released.
+    pub fn register(transport: Transport) -> Option<Self> {
+        let metrics = crate::metrics::try_metrics()?;
+        metrics
+            .connections_active
+            .with_label_values(&[transport.label()])
+            .inc();
+        Some(Self { transport })
+    }
+}
+
+impl Drop for ConnectionGauge {
+    fn drop(&mut self) {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .connections_active
+                .with_label_values(&[self.transport.label()])
+                .dec();
         }
     }
 }
@@ -581,6 +629,45 @@ impl OutboundRouter {
     // rewrapping every caller. Allow the size lint here.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
+        // The `direction="out"` half of siphon_requests_total / siphon_responses_total.
+        //
+        // Counted here rather than at the typed reply helpers because this is the
+        // only point *everything* siphon emits passes through: relayed proxy
+        // requests are serialized well before `send_message_from`, and UAC
+        // keepalives and outbound REGISTERs never enter the dispatcher's send
+        // path at all. Counting upstream of those missed exactly the traffic a
+        // proxy carries.
+        //
+        // Cost is a start-line byte comparison per frame — no parse, no
+        // allocation. Deliberately kept lighter than the `udp_by_local` lookup
+        // below, which the comment there measures at 15–20% CPU when it was
+        // unconditional.
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            for frame in message.frames() {
+                metrics.record_frame(frame, crate::metrics::Direction::Out);
+            }
+        }
+
+        // Debug capture, off by default — one relaxed atomic load otherwise.
+        // Unlike the inbound side there is no parsed message here (frames are
+        // serialized well upstream), so the Call-ID comes from a header scan
+        // that stops at the first match rather than from a full parse. The
+        // bytes themselves are shared, not copied.
+        if crate::capture::is_enabled() {
+            let store = crate::capture::capture();
+            for frame in message.frames() {
+                if let Some(call_id) = crate::capture::call_id_from_bytes(frame) {
+                    store.record(
+                        &call_id,
+                        crate::capture::Direction::Out,
+                        message.destination.to_string(),
+                        message.transport.label(),
+                        frame.clone(),
+                    );
+                }
+            }
+        }
+
         match message.transport {
             Transport::Udp => {
                 // Fast path for the common (non-P-CSCF) case: when the
@@ -724,6 +811,71 @@ impl StreamConnections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connections_gauge(transport: Transport) -> f64 {
+        crate::metrics::try_metrics()
+            .map(|metrics| {
+                metrics
+                    .connections_active
+                    .with_label_values(&[transport.label()])
+                    .get()
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[test]
+    fn connection_gauge_releases_on_drop() {
+        crate::metrics::init().unwrap();
+        let before = connections_gauge(Transport::Tcp);
+
+        {
+            let _first = ConnectionGauge::register(Transport::Tcp);
+            assert_eq!(connections_gauge(Transport::Tcp) - before, 1.0);
+            let _second = ConnectionGauge::register(Transport::Tcp);
+            assert_eq!(connections_gauge(Transport::Tcp) - before, 2.0);
+        }
+
+        assert_eq!(
+            connections_gauge(Transport::Tcp),
+            before,
+            "the gauge must return to its starting value — it can only drift \
+             upward, so a missed release climbs for the life of the process"
+        );
+    }
+
+    #[test]
+    fn connection_gauge_separates_transports() {
+        crate::metrics::init().unwrap();
+        let before_tls = connections_gauge(Transport::Tls);
+        let before_wss = connections_gauge(Transport::WebSocketSecure);
+
+        let _tls = ConnectionGauge::register(Transport::Tls);
+
+        assert_eq!(connections_gauge(Transport::Tls) - before_tls, 1.0);
+        assert_eq!(
+            connections_gauge(Transport::WebSocketSecure),
+            before_wss,
+            "TLS and WSS must not share a series"
+        );
+    }
+
+    #[test]
+    fn transport_labels_match_display() {
+        // The label is the Prometheus series name; Display renders it too, and
+        // the two must not diverge.
+        for transport in [
+            Transport::Udp,
+            Transport::Tcp,
+            Transport::Tls,
+            Transport::WebSocket,
+            Transport::WebSocketSecure,
+            Transport::Sctp,
+        ] {
+            assert_eq!(transport.label(), transport.to_string());
+        }
+        assert_eq!(Transport::WebSocket.label(), "WS");
+        assert_eq!(Transport::WebSocketSecure.label(), "WSS");
+    }
 
     #[test]
     fn detect_routable_local_ip_never_loopback_or_unspecified() {

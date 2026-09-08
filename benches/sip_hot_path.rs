@@ -283,6 +283,68 @@ fn bench_framing(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Traffic counting — `siphon_requests_total` / `siphon_responses_total`.
+///
+/// These run on *every* SIP message in both directions, which is why the
+/// children are pre-resolved into dense arrays at startup rather than looked up
+/// per call: `IntCounterVec::with_label_values` takes an `RwLock` read and
+/// hashes the label slice, and at 30k cps that would be 60k lock+hash per
+/// second to increment a counter.
+///
+/// `record_request` / `record_response` are the inbound path (typed, so the
+/// index is computed directly). `record_frame` is the outbound path, which sits
+/// below serialization and has to recover the kind from the start line — the
+/// `with_label_values` case is benched alongside it to keep the reason for the
+/// pre-resolved arrays measurable rather than assumed.
+fn bench_traffic_counters(criterion: &mut Criterion) {
+    use siphon::metrics::Direction;
+    use siphon::sip::message::Method;
+
+    // `init` is idempotent and returns Err only if metrics were already built.
+    let _ = siphon::metrics::init();
+    let Some(metrics) = siphon::metrics::try_metrics() else {
+        return;
+    };
+
+    let invite_sdp = invite_with_sdp();
+    let invite_bytes = invite_sdp.as_bytes();
+    let response_bytes = RESPONSE_200.as_bytes();
+
+    let mut group = criterion.benchmark_group("traffic_counters");
+
+    group.bench_function("record_request", |bencher| {
+        bencher
+            .iter(|| metrics.record_request(black_box(&Method::Invite), black_box(Direction::In)));
+    });
+    group.bench_function("record_response", |bencher| {
+        bencher.iter(|| metrics.record_response(black_box(200), black_box(Direction::In)));
+    });
+    // Outbound: classify a serialized frame, then increment.
+    group.bench_function("record_frame_request", |bencher| {
+        bencher.iter(|| metrics.record_frame(black_box(invite_bytes), black_box(Direction::Out)));
+    });
+    group.bench_function("record_frame_response", |bencher| {
+        bencher.iter(|| metrics.record_frame(black_box(response_bytes), black_box(Direction::Out)));
+    });
+    // The CRLF keepalive shares the outbound path and must fall out cheaply
+    // without touching a counter.
+    group.bench_function("record_frame_keepalive", |bencher| {
+        bencher.iter(|| metrics.record_frame(black_box(b"\r\n\r\n"), black_box(Direction::Out)));
+    });
+    // The label-map lookup the pre-resolved arrays exist to avoid. Kept as a
+    // reference point: if this ever stops being materially slower, the arrays
+    // are no longer earning their complexity.
+    group.bench_function("with_label_values_reference", |bencher| {
+        bencher.iter(|| {
+            metrics
+                .requests_total
+                .with_label_values(black_box(&["INVITE", "in"]))
+                .inc()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -290,6 +352,7 @@ criterion_group!(
     bench_roundtrip,
     bench_headers,
     bench_txn_key,
-    bench_framing
+    bench_framing,
+    bench_traffic_counters
 );
 criterion_main!(benches);

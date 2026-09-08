@@ -96,6 +96,13 @@ pub async fn listen(
                         let local = sctp_stream.local_addr().unwrap_or(local_addr);
                         let (mut reader, mut writer) = sctp_stream.into_split();
 
+                        // Counts this connection in
+                        // `siphon_connections_active{transport}` until the guard
+                        // drops at the end of this task (cancellation included).
+                        let _connection_gauge = crate::transport::ConnectionGauge::register(
+                            crate::transport::Transport::Sctp,
+                        );
+
                         // Per-connection outbound channel
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx);
