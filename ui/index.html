@@ -74,6 +74,14 @@
         <svg viewBox="0 0 24 24" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>
         System
       </a>
+      <a class="navitem" data-view="cost">
+        <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M14.5 9.5a2.5 2.5 0 00-2.5-1.5c-1.4 0-2.5.7-2.5 2s1.1 1.7 2.5 2 2.5.7 2.5 2-1.1 2-2.5 2a2.5 2.5 0 01-2.5-1.5M12 6.5v11"/></svg>
+        Cost <span class="count"></span>
+      </a>
+      <a class="navitem" data-view="logs">
+        <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 4h9l5 5v11a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M14 4v5h5M8 13h8M8 17h5"/></svg>
+        Logs <span class="count"></span>
+      </a>
     </nav>
 
     <div class="sidefoot">
@@ -84,9 +92,15 @@
 
   <div class="main">
     <header class="topbar">
+      <button class="iconbtn navtoggle" id="navtoggle" title="Menu" aria-label="Open navigation" aria-expanded="false">
+        <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
       <div class="crumb" id="crumb">Overview</div>
       <span class="badge warn" title="The web dashboard is an experimental feature and may change">experimental</span>
       <div class="spacer"></div>
+      <span class="topsearch">
+        <input id="topsearch" type="search" placeholder="Find a call: number, call-id…" autocomplete="off">
+      </span>
       <div class="badges">
         <span class="badge" id="b-live"><span class="led"></span>LIVE</span>
         <span class="badge" id="b-ready"><span class="led"></span>READY</span>
@@ -106,6 +120,7 @@
   </div>
 </div>
 
+<div class="navbackdrop" id="navbackdrop"></div>
 <div class="drawer-backdrop" id="drawer-backdrop"></div>
 <aside class="drawer" id="drawer" aria-live="polite">
   <header>

@@ -2675,6 +2675,13 @@ async fn sweep_stale_entries(state: &DispatcherState) {
             state.call_actors.count(),
             dialog_sessions,
         );
+
+        // Carrier burn rate. Iterates the answered calls, so it sits on this
+        // 30 s sweep rather than in `publish_store_gauges`, whose contract is
+        // O(1) because the admin poll calls it every two seconds.
+        crate::metrics::publish_spend_rate(&crate::b2bua::actor::spend_rate_by_currency(
+            &state.call_actors,
+        ));
     }
     // Published here as well as on the admin poll: a deployment that scrapes
     // Prometheus without ever opening the dashboard was otherwise reading a
@@ -3585,6 +3592,26 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     // each time — these are wire-event counters, not transaction counters (the
     // metric help text says so).
     let recorded_metrics = crate::metrics::try_metrics();
+
+    // Debug capture rides the same chokepoint as the inbound counters, for the
+    // same reason: it is the one place every transport funnels through. Off by
+    // default, so the steady-state cost is one relaxed atomic load; when on,
+    // the Call-ID is already parsed here and the wire bytes are already in
+    // hand, so recording is a refcount bump rather than a re-serialization.
+    if crate::capture::is_enabled() {
+        crate::capture::capture().record(
+            message
+                .headers
+                .call_id()
+                .map(String::as_str)
+                .unwrap_or_default(),
+            crate::capture::Direction::In,
+            inbound.remote_addr.to_string(),
+            inbound.transport.label(),
+            inbound.data.clone(),
+        );
+    }
+
     match &message.start_line {
         StartLine::Request(request_line) => {
             if let Some(metrics) = recorded_metrics {

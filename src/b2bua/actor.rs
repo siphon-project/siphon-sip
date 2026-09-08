@@ -2888,6 +2888,14 @@ impl CallActorStore {
     /// peer can be the one whose BYE loses the race.
     pub fn remove_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
+            // Bill the call out on the way down. This is the one funnel every
+            // ended call passes through — a normal BYE, an admin hangup, a
+            // failure teardown — so counting here cannot miss a disposition the
+            // way hooking the BYE path alone would.
+            crate::metrics::record_call_cost(
+                call.active_route(),
+                call.answered_at.map(|at| at.elapsed().as_secs()),
+            );
             // Shutdown any active B-leg actors
             call.shutdown_actors();
             // Any REFER siphon originated on this call is now moot — the call it
@@ -3244,6 +3252,30 @@ pub fn set_global_call_store(store: std::sync::Arc<CallActorStore>) {
 
 /// The process-wide B2BUA call store, or `None` in headless / unit-test
 /// contexts that never constructed a dispatcher.
+/// Per-minute spend of the answered calls in progress, keyed by ISO 4217
+/// currency.
+///
+/// Iterates the live calls, so it is for the 30 s sweep and the dashboard poll
+/// — never the per-message path. Unanswered calls are excluded: a ringing call
+/// costs nothing yet, and counting it would make the burn rate jump on every
+/// attempt including the ones that never connect.
+pub fn spend_rate_by_currency(store: &CallActorStore) -> std::collections::HashMap<String, f64> {
+    let mut rates: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for entry in store.iter_calls() {
+        let call = entry.value();
+        if call.answered_at.is_none() {
+            continue;
+        }
+        if let Some(route) = call.active_route() {
+            if let Some(rate) = route.rate {
+                let currency = route.currency.as_deref().unwrap_or("unknown").to_string();
+                *rates.entry(currency).or_insert(0.0) += rate;
+            }
+        }
+    }
+    rates
+}
+
 pub fn global_call_store() -> Option<&'static std::sync::Arc<CallActorStore>> {
     GLOBAL_CALL_STORE.get()
 }

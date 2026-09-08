@@ -437,6 +437,21 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .tbl .q { color: var(--faint); }
 .tbl td.num, .tbl th.num { text-align: right; }
 .tblscroll { overflow-x: auto; }
+/* The log tail is the one table that scrolls vertically: it is unbounded in
+   length by nature, where every other list is a snapshot of live state. */
+.logscroll { overflow-y: auto; max-height: min(62vh, 720px); }
+.logscroll thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.logline td { vertical-align: top; white-space: pre-wrap; word-break: break-word; }
+/* Raw SIP under a ladder row: the bytes as they crossed the wire, so it must
+   not be reflowed. */
+.msgraw pre { margin: 0; padding: 10px 12px; background: var(--panel-2); border-radius: 6px;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+.topsearch { position: relative; }
+.topsearch input { width: 240px; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: var(--font-mono); font-size: 12px;
+  padding: 7px 10px; }
+.topsearch input:focus { outline: none; border-color: var(--sky); }
 .empty { color: var(--faint); font-family: var(--font-mono); font-size: 12.5px; padding: 24px 12px; text-align: center; }
 
 /* A clickable row that opens the detail drawer. */
@@ -679,9 +694,64 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   .charts, .charts.two { grid-template-columns: 1fr; }
   .lower, .grid2, .cardgrid { grid-template-columns: 1fr; }
 }
+/* The nav toggle only exists on narrow screens; above that the sidebar is
+   permanent and a hamburger would be noise. */
+.navtoggle { display: none; }
+
 @media (max-width: 780px) {
   .app { grid-template-columns: 1fr; }
-  .sidebar { display: none; }
+
+  /* The sidebar becomes an overlay rather than disappearing. It used to be
+     `display: none` with nothing to bring it back, which left a phone on the
+     Overview view with no way to reach any other — the dashboard was
+     effectively single-page on mobile. */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 258px;
+    max-width: 82vw;
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: 0 0 40px -8px rgba(0, 0, 0, 0.45);
+  }
+  .sidebar.open { transform: translateX(0); }
+
+  .navtoggle { display: inline-flex; }
+
+  .navbackdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(2, 6, 23, 0.5);
+    z-index: 39;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+  }
+  .navbackdrop.show { opacity: 1; pointer-events: auto; }
+
   .kpis, .kpis.wide { grid-template-columns: repeat(2, 1fr); }
   .content { padding: 14px; }
+
+  /* A phone has no room for the full topbar. Keep the crumb, the search and
+     the unlock button — the three things you act on — and let the status
+     badges go; they are all readable on the Overview and System views. */
+  .topbar { padding: 10px 12px; gap: 8px; }
+  .badges { display: none; }
+  .topsearch { flex: 1; min-width: 0; }
+  .topsearch input { width: 100%; }
+  .crumb { font-size: 14px; }
+
+  /* Tables are the main content on a phone and must scroll rather than force
+     the page sideways. */
+  .tbl { font-size: 12px; }
+  .logscroll { max-height: 70vh; }
+  .drawer { width: 100vw; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar { transition: none; }
+  .navbackdrop { transition: none; }
 }

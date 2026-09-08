@@ -45,6 +45,10 @@ pub struct AdminState {
     pub instance_id: Option<String>,
     /// Which optional subsystems this node has configured.
     pub features: AdminFeatures,
+    /// The live script engine, when one is running, so the admin API can force
+    /// a recompile and report the error. `None` in tests and on a node with no
+    /// script.
+    pub script_engine: Option<Arc<crate::script::engine::ScriptEngine>>,
 }
 
 /// Which optional subsystems are configured on this node.
@@ -125,7 +129,15 @@ pub async fn serve(
         }
     };
 
-    if let Err(error) = axum::serve(listener, app).await {
+    // `into_make_service_with_connect_info` so the auth layer can attribute a
+    // failed token to a source address and feed the auto-ban, the way the
+    // control listener does.
+    if let Err(error) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         error!("Admin API server error: {}", error);
     }
 }
@@ -160,7 +172,15 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
             "/admin/gateways/{group}/{destination}/{action}",
             post(gateway_action_handler),
         )
-        .route("/admin/calls", get(calls_handler));
+        .route("/admin/calls", get(calls_handler))
+        .route("/admin/calls/{call_id}/hangup", post(call_hangup_handler))
+        .route("/admin/drain", post(drain_handler))
+        .route("/admin/drain", delete(drain_handler))
+        .route("/admin/script/reload", post(script_reload_handler))
+        .route("/admin/capture/{call_id}", get(capture_handler))
+        .route("/admin/search", get(search_handler))
+        .route("/admin/logs", get(logs_handler))
+        .route("/admin/logs/stream", get(logs_stream_handler));
 
     // Everything not matched by an API route falls through to the embedded
     // dashboard (single-page app), so `/` and any client route serve it.
@@ -186,12 +206,31 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
     }
 }
 
+/// Whether a path serves subscriber-identifying content that must never be
+/// readable without the bearer token.
+///
+/// `protect_reads` defaults to false, so every `GET` under `/admin` is open on a
+/// node that configured a token to gate its `DELETE`s. That is a defensible
+/// default for a registration count or a gauge; it is not one for a live log
+/// stream or captured SIP signalling, which carry call-ids, numbers and peer
+/// addresses in the clear. These routes therefore ignore `protect_reads` and are
+/// always gated — and, because a token that does not exist cannot gate anything,
+/// they refuse to serve at all when no token is configured (see
+/// [`require_admin_auth`]) rather than quietly handing the data to anyone who
+/// can reach the port.
+fn is_sensitive_path(path: &str) -> bool {
+    path.starts_with("/admin/logs")
+        || path.starts_with("/admin/capture")
+        || path.starts_with("/admin/search")
+}
+
 /// Bearer-token gate for the admin API (RFC 6750). No-op when no token is
-/// configured. Always lets CORS preflight (`OPTIONS`) through so the browser
-/// can complete a preflight before it holds the token. Otherwise requires
-/// `Authorization: Bearer <token>` on every mutating method (`POST`, `PUT`,
-/// `PATCH`, `DELETE`) — and, when `protect_reads`, on the read methods too —
-/// comparing in constant time.
+/// configured, except on the sensitive routes (see [`is_sensitive_path`]) which
+/// are refused outright in that case. Always lets CORS preflight (`OPTIONS`)
+/// through so the browser can complete a preflight before it holds the token.
+/// Otherwise requires `Authorization: Bearer <token>` on every mutating method
+/// (`POST`, `PUT`, `PATCH`, `DELETE`) — and, when `protect_reads` or on a
+/// sensitive route, on the read methods too — comparing in constant time.
 async fn require_admin_auth(
     State(state): State<AdminState>,
     request: Request,
@@ -199,9 +238,26 @@ async fn require_admin_auth(
 ) -> Response {
     let method = request.method();
     let is_read = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
+    let sensitive = is_sensitive_path(request.uri().path());
+
+    // A sensitive route on a node with no token has nothing to authenticate
+    // against. Serving it would publish call-ids and signalling to anyone who
+    // can reach the port; 404-ing it would hide a real capability. Say why.
+    if sensitive && method != Method::OPTIONS && state.auth_token.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "admin auth token required",
+                "detail": "this endpoint exposes signalling and log content; set \
+                           admin.auth.token in siphon.yaml to enable it",
+            })),
+        )
+            .into_response();
+    }
+
     let needs_auth = state.auth_token.is_some()
         && method != Method::OPTIONS
-        && (state.protect_reads || !is_read);
+        && (state.protect_reads || !is_read || sensitive);
 
     if needs_auth {
         let presented = request
@@ -216,6 +272,17 @@ async fn require_admin_auth(
             _ => false,
         };
         if !authorized {
+            // Feed the same auto-ban signal the control listener raises on a
+            // failed upgrade (src/control/listener.rs). The admin port is a
+            // credential-guessing target like any other, and it had no such
+            // signal at all. `ConnectInfo` is absent when the router is driven
+            // directly (tests), which is not a reachable client.
+            if let Some(peer) = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            {
+                crate::security::record_handshake_failure(peer.0.ip(), "admin");
+            }
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -254,6 +321,368 @@ async fn metrics_handler() -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+/// `POST /admin/calls/{call_id}/hangup` — tear down one live call.
+///
+/// Routes through the same funnel the control plane's `hangup` verb uses
+/// (`crate::control::sip_adapter`), rather than composing a BYE here: that
+/// funnel is what carries Rf/Ro stop records, the CDR and the media release,
+/// and a hand-rolled BYE would answer the peer while silently skipping all
+/// three. Which arm applies depends on how far the call got — an unanswered
+/// call siphon placed is CANCELled (RFC 3261 §9.1), not answered with a final
+/// response it has no business sending.
+///
+/// B2BUA only. A proxy has no call object to terminate: it forwarded the
+/// dialog and holds no leg it could BYE, so a "drop call" button on a
+/// proxy-mode node would be a lie.
+async fn call_hangup_handler(Path(call_id): Path<String>) -> Response {
+    let Some(store) = crate::b2bua::actor::global_call_store() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "no B2BUA on this node",
+                "detail": "call teardown is a B2BUA operation; a proxy holds no leg to terminate",
+            })),
+        )
+            .into_response();
+    };
+
+    let Some(internal_id) = store.find_by_sip_call_id(&call_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such call" })),
+        )
+            .into_response();
+    };
+
+    let (answered, originated) = store
+        .get_call(&internal_id)
+        .map(|call| {
+            (
+                matches!(call.state, crate::b2bua::actor::CallState::Answered),
+                call.originated,
+            )
+        })
+        .unwrap_or((false, false));
+
+    let terminated = if answered {
+        crate::dispatcher::b2bua_terminate_call(&call_id, Some("admin"))
+    } else if originated {
+        crate::dispatcher::b2bua_cancel_originated_call(&call_id, Some("admin"))
+    } else {
+        crate::dispatcher::b2bua_reject_call(&internal_id, 603, "Decline")
+    };
+
+    if terminated {
+        info!(call_id = %call_id, answered, originated, "admin: call terminated");
+        Json(serde_json::json!({ "call_id": call_id, "state": "terminated" })).into_response()
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "call is gone" })),
+        )
+            .into_response()
+    }
+}
+
+/// `POST /admin/drain` / `DELETE /admin/drain` — enter or leave drain.
+///
+/// Drain is what an orchestrator already reads through `/admin/ready` (503
+/// while draining), so flipping it here takes the node out of rotation with no
+/// further wiring — and, unlike SIGTERM, it is reversible: an operator who
+/// drained the wrong node can put it back without a restart.
+async fn drain_handler(State(state): State<AdminState>, method: Method) -> Response {
+    let Some(ref drain) = state.draining else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({ "error": "no drain signal wired on this node" })),
+        )
+            .into_response();
+    };
+
+    let draining = method != Method::DELETE;
+    drain
+        .is_draining
+        .store(draining, std::sync::atomic::Ordering::SeqCst);
+    let (transactions, calls) = drain.active_counts();
+    if draining {
+        info!(transactions, calls, "admin: node entering drain");
+    } else {
+        info!("admin: node leaving drain, ready for traffic again");
+    }
+
+    Json(serde_json::json!({
+        "draining": draining,
+        "active_transactions": transactions,
+        "active_calls": calls,
+    }))
+    .into_response()
+}
+
+/// `POST /admin/script/reload` — recompile the Python script now.
+///
+/// The inotify watcher already reloads on write; this is for the case where an
+/// operator cannot rely on it (a config-map mount whose events do not fire, an
+/// editor writing through a rename) and, more usefully, gives them the compile
+/// error rather than leaving them to find it in the log. A failed reload keeps
+/// the previous script live, which is the behaviour the watcher has, so this
+/// reports the failure without changing what is running.
+async fn script_reload_handler(State(state): State<AdminState>) -> Response {
+    let Some(ref engine) = state.script_engine else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({ "error": "no script engine on this node" })),
+        )
+            .into_response();
+    };
+
+    match engine.reload() {
+        Ok(()) => {
+            info!("admin: script reloaded");
+            Json(serde_json::json!({ "reloaded": true })).into_response()
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            error!(%detail, "admin: script reload failed; previous script stays live");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "reloaded": false,
+                    "error": detail,
+                    "detail": "the previously loaded script is still running",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /admin/capture/{call_id}` — the captured messages for one call.
+async fn capture_handler(Path(call_id): Path<String>) -> Response {
+    let store = crate::capture::capture();
+    if !store.is_enabled() {
+        return capture_disabled();
+    }
+    match store.get(&call_id) {
+        Some(captured) => Json(captured).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "nothing captured for that call",
+                "detail": "the call may have been evicted, or it predates capture being enabled",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /admin/search?q=` — find a call by anything an operator actually has.
+///
+/// Searches the capture ring (Call-ID and message content, so a dialled number
+/// works) and the live call list. The question this exists for is "the call
+/// from +31… at 14:02 failed", where the operator has a number and a time and
+/// no Call-ID at all.
+async fn search_handler(
+    axum::extract::Query(params): axum::extract::Query<SearchParams>,
+) -> Response {
+    let needle = params.q.trim();
+    if needle.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "q is required" })),
+        )
+            .into_response();
+    }
+
+    let store = crate::capture::capture();
+    let captured = if store.is_enabled() {
+        serde_json::Value::Array(store.search(needle, params.limit.unwrap_or(50)))
+    } else {
+        // `null`, not an empty array: "capture is off" and "capture is on and
+        // found nothing" are different answers, and only one of them means the
+        // call was not there.
+        serde_json::Value::Null
+    };
+
+    let live = crate::b2bua::actor::global_call_store()
+        .map(|store| {
+            let needle = needle.to_lowercase();
+            let matches: Vec<serde_json::Value> = calls_json(store)
+                .as_array()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter(|call| call.to_string().to_lowercase().contains(&needle))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::Value::Array(matches)
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    Json(serde_json::json!({
+        "query": needle,
+        "captured": captured,
+        "live_calls": live,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SearchParams {
+    q: String,
+    limit: Option<usize>,
+}
+
+fn capture_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "message capture is not enabled",
+            "detail": "set admin.capture.enabled (and admin.auth.token) in siphon.yaml",
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /admin/logs` — the retained WARN+ ring, newest last.
+///
+/// The non-streaming half of the tail: it answers "what has already gone wrong
+/// on this node" without opening a stream, and it is what the log view renders
+/// before its stream produces a first line.
+async fn logs_handler() -> Response {
+    let tail = crate::log_tail::log_tail();
+    if !tail.is_enabled() {
+        return log_tail_disabled();
+    }
+    let retained = tail.recent_warnings();
+    // `Arc<T>` only serializes under serde's `rc` feature, which is not enabled
+    // (and should not be, for one endpoint) — borrow through instead.
+    let records: Vec<&crate::log_tail::LogRecord> =
+        retained.iter().map(|record| record.as_ref()).collect();
+    Json(serde_json::json!({
+        "retained": records.len(),
+        "streams": tail.attached(),
+        "records": records,
+    }))
+    .into_response()
+}
+
+/// `GET /admin/logs/stream` — live tail as Server-Sent Events.
+///
+/// SSE rather than a WebSocket because a browser cannot set an `Authorization`
+/// header on either `EventSource` or the `WebSocket` constructor: a WS tail
+/// would have to carry the bearer token in the query string (logged, kept in
+/// history, leaked by referrer) or smuggle it through a subprotocol. Read with
+/// `fetch` + a stream reader instead, the token travels in the header like
+/// every other admin call, and this endpoint needs no auth special-casing.
+///
+/// The body is a `futures_util` stream over the attached queue, so no new
+/// dependency is pulled in for it.
+async fn logs_stream_handler(
+    axum::extract::Query(params): axum::extract::Query<LogStreamParams>,
+) -> Response {
+    let tail = crate::log_tail::log_tail();
+    if !tail.is_enabled() {
+        return log_tail_disabled();
+    }
+
+    let filter = crate::log_tail::TailFilter::new(
+        params.level.as_deref(),
+        params.contains.as_deref(),
+        params.call_id.as_deref(),
+    );
+
+    let Some(stream) = tail.attach(filter) else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "too many log tail streams",
+                "detail": "raise admin.log_tail.max_streams or close another tail",
+            })),
+        )
+            .into_response();
+    };
+
+    // The guard is what makes detach happen exactly once whether the client
+    // closes cleanly, vanishes mid-write, or the task is dropped: axum drops
+    // the body when the connection goes, and the queue must not outlive it.
+    struct StreamGuard(Arc<crate::log_tail::TailStream>);
+    impl Drop for StreamGuard {
+        fn drop(&mut self) {
+            crate::log_tail::log_tail().detach(&self.0);
+        }
+    }
+
+    let guard = StreamGuard(Arc::clone(&stream));
+    let body = futures_util::stream::unfold(guard, |guard| async move {
+        let (records, dropped) = guard.0.recv_many().await;
+        if records.is_empty() && dropped == 0 {
+            return None; // closed
+        }
+        let mut chunk = String::new();
+        // Report the gap before the lines that follow it, so the operator can
+        // see where the view is incomplete rather than reading a continuous
+        // stream that silently skipped a burst.
+        if dropped > 0 {
+            chunk.push_str("event: dropped\ndata: ");
+            chunk.push_str(&dropped.to_string());
+            chunk.push_str("\n\n");
+        }
+        for record in records {
+            match serde_json::to_string(&*record) {
+                Ok(json) => {
+                    chunk.push_str("data: ");
+                    chunk.push_str(&json);
+                    chunk.push_str("\n\n");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "log tail: failed to serialize a record");
+                }
+            }
+        }
+        Some((Ok::<_, std::convert::Infallible>(chunk), guard))
+    });
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            // Long-lived responses through a reverse proxy get buffered into
+            // uselessness without this; nginx honours it.
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
+}
+
+/// Query parameters for the log stream, all optional.
+#[derive(Debug, serde::Deserialize)]
+struct LogStreamParams {
+    /// Minimum severity: `error` / `warn` / `info` / `debug` / `trace`.
+    level: Option<String>,
+    /// Case-insensitive substring over message, target and field values.
+    contains: Option<String>,
+    /// Exact Call-ID.
+    call_id: Option<String>,
+}
+
+fn log_tail_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "log tail is not enabled",
+            "detail": "set admin.log_tail.enabled (and admin.auth.token) in siphon.yaml",
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /admin/health` — liveness probe. 200 for as long as the process is
@@ -361,6 +790,23 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
     let gateways =
         crate::script::api::gateway_manager().map(|manager| gateways_summary_json(manager));
 
+    // What the traffic on this node is costing right now. `None` on a node with
+    // no B2BUA, since rating rides on the LCR route a B2BUA call carries — a
+    // proxy has no carrier decision to price. Refreshing the gauge here as well
+    // as on the sweep keeps a dashboard poll from reading a 30 s stale burn.
+    let spend = crate::b2bua::actor::global_call_store().map(|store| {
+        let rates = crate::b2bua::actor::spend_rate_by_currency(store);
+        crate::metrics::publish_spend_rate(&rates);
+        serde_json::json!({
+            "per_minute": rates,
+            "rated_calls": rates.len(),
+            "cost_total": crate::metrics::counter_vec_rows(
+                &metrics.call_cost_total,
+                &["carrier", "currency"],
+            ),
+        })
+    });
+
     Json(serde_json::json!({
         "version": version,
         "instance_id": state.instance_id,
@@ -467,6 +913,21 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         })),
         "sbi": state.features.sbi.then(|| serde_json::json!({
             "npcf_sessions_active": metrics.sbi_npcf_app_sessions_active.get(),
+        })),
+        // `null` when the tail is switched off, which is not the same statement
+        // as "enabled with nobody watching" (that is a zero).
+        "spend": spend,
+        // `null` when capture is off — a zero would read as "on and empty".
+        "capture": crate::capture::capture().is_enabled().then(|| serde_json::json!({
+            "messages_total": metrics.capture_messages_total.get(),
+            "bytes": metrics.capture_bytes.get(),
+            "calls": metrics.capture_calls.get(),
+            "dropped_total": metrics.capture_dropped_total.get(),
+        })),
+        "log_tail": crate::log_tail::log_tail().is_enabled().then(|| serde_json::json!({
+            "streams": metrics.log_tail_streams.get(),
+            "dropped_total": metrics.log_tail_dropped_total.get(),
+            "retained_warnings": crate::log_tail::log_tail().recent_warnings().len(),
         })),
         // Gm access security (3GPP TS 33.203) — an IPsec sec-agree concern, and
         // unrelated to the service-based `sbi` block above. They were previously
@@ -938,6 +1399,18 @@ fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value 
             // Carrier attempts on an LCR/route-sequence call — which carrier was
             // tried, what it answered, and whether siphon actually dialled it.
             "route_attempts": route_attempts_json(call),
+            // What this call is costing, from the winning carrier's rate. `null`
+            // on an unrated call — a call with no LCR route, or one whose route
+            // carried no rate — because a zero there would read as "free".
+            "rating": call.active_route().map(|route| serde_json::json!({
+                "carrier": route.carrier_id,
+                "rate_per_minute": route.rate,
+                "currency": route.currency,
+                "billing_increment": route.billing_increment,
+                "min_duration": route.min_duration,
+                "billed_secs": talk_secs.map(|seconds| route.billed_seconds(seconds)),
+                "cost": talk_secs.and_then(|seconds| route.cost_for(seconds)),
+            })),
         }));
     }
     // Stable order for the dashboard (DashMap iteration order is arbitrary).
@@ -1077,6 +1550,7 @@ mod tests {
             protect_reads: false,
             instance_id: None,
             features: AdminFeatures::default(),
+            script_engine: None,
         }
     }
 
@@ -1090,6 +1564,99 @@ mod tests {
 
     fn test_app() -> Router {
         router(test_state(), None, false)
+    }
+
+    #[test]
+    fn sensitive_paths_are_the_signalling_and_log_routes() {
+        assert!(is_sensitive_path("/admin/logs"));
+        assert!(is_sensitive_path("/admin/logs/stream"));
+        assert!(is_sensitive_path("/admin/capture/abc%40host"));
+        assert!(is_sensitive_path("/admin/search"));
+
+        // Everything that was already open stays open — this classification
+        // must not quietly gate the probes an orchestrator depends on.
+        assert!(!is_sensitive_path("/admin/health"));
+        assert!(!is_sensitive_path("/admin/ready"));
+        assert!(!is_sensitive_path("/metrics"));
+        assert!(!is_sensitive_path("/admin/metrics.json"));
+        assert!(!is_sensitive_path("/admin/registrations"));
+    }
+
+    #[tokio::test]
+    async fn sensitive_route_is_refused_when_no_token_is_configured() {
+        crate::metrics::init().ok();
+        let app = test_app();
+
+        let response = app
+            .oneshot(Request::get("/admin/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // 403, not 401: there is no credential that would work, so asking for
+        // one would be a lie. And not 200 — that would publish the log stream
+        // to anyone who can reach the port.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sensitive_route_needs_the_token_even_when_reads_are_open() {
+        crate::metrics::init().ok();
+
+        // protect_reads: false — every other GET is open on this node.
+        let open = router(authed_state("s3cret", false), None, false);
+        let response = open
+            .oneshot(
+                Request::get("/admin/registrations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let app = router(authed_state("s3cret", false), None, false);
+        let response = app
+            .oneshot(Request::get("/admin/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sensitive_route_accepts_the_right_token() {
+        crate::metrics::init().ok();
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/logs")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Authorized, and the tail is not enabled in a unit test — 404 with an
+        // explanation is the correct answer, and proves the auth layer passed.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn log_stream_is_gated_by_the_same_rule() {
+        crate::metrics::init().ok();
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/logs/stream?level=warn")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1143,6 +1710,7 @@ mod tests {
             protect_reads: false,
             instance_id: None,
             features: AdminFeatures::default(),
+            script_engine: None,
         };
         let app = router(state, None, false);
 

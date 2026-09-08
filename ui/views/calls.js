@@ -103,6 +103,18 @@ function detail(call) {
     fact("B-legs", call.b_legs),
     fact("controlled by", call.control_app || "—"),
     fact("recording", call.recording ? "requested" : "no"),
+    // Cost is an estimate from the routing API's rate — "not rated" rather than
+    // a zero when no carrier rate is in play.
+    fact(
+      "carrier",
+      call.rating ? call.rating.carrier + " (" + (call.rating.currency || "?") + ")" : "not rated",
+    ),
+    fact(
+      "cost so far",
+      call.rating && call.rating.cost !== null && call.rating.cost !== undefined
+        ? "~" + call.rating.cost.toFixed(4) + " " + (call.rating.currency || "")
+        : "—",
+    ),
   ];
 
   let body = '<div class="facts">' + rows.join("") + "</div>";
@@ -211,6 +223,65 @@ function draw() {
   );
 }
 
+/**
+ * Render the captured SIP exchange for one call as a ladder.
+ *
+ * Drawn from the capture ring rather than reconstructed from state, so what is
+ * shown is what actually crossed the wire — including the retransmissions and
+ * the branch that failed, which a reconstruction would smooth over.
+ */
+function ladderMarkup(captured) {
+  if (!captured || !captured.messages || !captured.messages.length) {
+    return '<div class="empty">nothing captured for this call</div>';
+  }
+  const first = captured.messages[0].timestamp_ms;
+  const rows = captured.messages
+    .map((message, index) => {
+      const offset = ((message.timestamp_ms - first) / 1000).toFixed(3);
+      const inbound = message.direction === "in";
+      const arrow = inbound ? "&#8594;" : "&#8592;";
+      return (
+        '<tr class="rowlink" data-msg="' + index + '">' +
+        '<td class="q">+' + esc(offset) + "s</td>" +
+        '<td class="' + (inbound ? "aor" : "contact") + '" title="' + esc(message.peer) + '">' +
+        arrow + " " + esc(message.transport) + "</td>" +
+        '<td class="aor">' + esc(message.start_line) + "</td>" +
+        '<td class="num q">' + esc(message.bytes) + "</td>" +
+        "</tr>" +
+        '<tr class="msgraw" id="msgraw-' + index + '" hidden><td colspan="4">' +
+        "<pre>" + esc(message.raw) + "</pre></td></tr>"
+      );
+    })
+    .join("");
+  return (
+    '<div class="subhead" style="margin-top:14px">Signalling (' +
+    captured.messages.length +
+    " messages)</div>" +
+    table(["Offset", "Dir", "Message", { label: "Bytes" }], [rows], "nothing captured")
+  );
+}
+
+/** Fetch and append the ladder after the drawer is already showing. */
+async function appendLadder(callId) {
+  let captured = null;
+  try {
+    captured = await api.get("/admin/capture/" + encodeURIComponent(callId));
+  } catch (error) {
+    const container = $("call-ladder");
+    if (container) {
+      container.innerHTML =
+        '<div class="empty">' +
+        (error instanceof api.Unauthorized
+          ? "capture is protected — unlock first"
+          : "message capture is not enabled on this node") +
+        "</div>";
+    }
+    return;
+  }
+  const container = $("call-ladder");
+  if (container) container.innerHTML = ladderMarkup(captured);
+}
+
 export function bind() {
   $("call-q").addEventListener("input", (event) => {
     query = event.target.value.toLowerCase().trim();
@@ -221,7 +292,20 @@ export function bind() {
     const tr = event.target.closest("[data-call]");
     if (!tr) return;
     const call = cache.find((entry) => entry.id === tr.getAttribute("data-call"));
-    if (call) openDrawer("Call " + call.call_id, detail(call));
+    if (!call) return;
+    openDrawer(
+      "Call " + call.call_id,
+      detail(call) + '<div id="call-ladder"><div class="empty">loading signalling…</div></div>',
+    );
+    appendLadder(call.call_id);
+  });
+
+  // Expanding one message shows the raw text it was rendered from.
+  document.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-msg]");
+    if (!row) return;
+    const raw = $("msgraw-" + row.getAttribute("data-msg"));
+    if (raw) raw.hidden = !raw.hidden;
   });
 }
 

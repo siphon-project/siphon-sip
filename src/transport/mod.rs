@@ -648,6 +648,26 @@ impl OutboundRouter {
             }
         }
 
+        // Debug capture, off by default — one relaxed atomic load otherwise.
+        // Unlike the inbound side there is no parsed message here (frames are
+        // serialized well upstream), so the Call-ID comes from a header scan
+        // that stops at the first match rather than from a full parse. The
+        // bytes themselves are shared, not copied.
+        if crate::capture::is_enabled() {
+            let store = crate::capture::capture();
+            for frame in message.frames() {
+                if let Some(call_id) = crate::capture::call_id_from_bytes(frame) {
+                    store.record(
+                        &call_id,
+                        crate::capture::Direction::Out,
+                        message.destination.to_string(),
+                        message.transport.label(),
+                        frame.clone(),
+                    );
+                }
+            }
+        }
+
         match message.transport {
             Transport::Udp => {
                 // Fast path for the common (non-P-CSCF) case: when the

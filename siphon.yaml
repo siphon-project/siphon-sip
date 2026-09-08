@@ -1187,6 +1187,33 @@ auth:
 #   # `listen` to an internal/loopback address and set auth.token.
 #   ui:
 #     enabled: true
+#   # Live log tail (GET /admin/logs/stream, Server-Sent Events), for the
+#   # dashboard's Logs view. Off by default, and REFUSED at startup unless
+#   # auth.token is set: a log stream carries call-ids, numbers and peer
+#   # addresses, so it is gated on the token regardless of protect_reads.
+#   #
+#   # Only shows what this node's `log.level` already admits — tailing debug
+#   # means running the node at debug. Capture is on-demand: with nobody
+#   # tailing, the cost is one atomic load per log event, so this is safe to
+#   # leave enabled on a busy node.
+#   log_tail:
+#     enabled: true
+#     max_streams: 4            # concurrent tails; each holds a bounded queue
+#   # Bounded SIP message capture, for the dashboard's per-call ladder and the
+#   # search box (find a call by the number dialled, not just by Call-ID).
+#   # Off by default, and REFUSED without auth.token — the captured messages
+#   # are the signalling itself.
+#   #
+#   # This is a DEBUGGING facility, not lawful intercept: see the
+#   # `lawful_intercept:` block for that, which has its own warrant handling,
+#   # delivery and retention. Retention here is a memory ring, evicted
+#   # oldest-call-first, and it does not survive a restart.
+#   capture:
+#     enabled: false
+#     max_bytes: 33554432       # 32 MiB retained, then evict oldest call
+#     max_calls: 500
+#     max_messages_per_call: 256
+#     redact_bodies: false      # true = keep headers, drop SDP/message bodies
 
 # ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)

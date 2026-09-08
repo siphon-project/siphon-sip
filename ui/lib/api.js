@@ -45,7 +45,21 @@ export async function post(path) {
   return request(path, { method: "POST" });
 }
 
+/**
+ * Open a Server-Sent Events stream with the bearer token attached.
+ *
+ * `EventSource` cannot carry an Authorization header, which would force the
+ * token into the query string; `fetch` can, so the stream authenticates exactly
+ * like every other admin call. Returns the raw Response — the caller reads
+ * `response.body` and does its own framing.
+ */
+export async function stream(path, signal) {
+  const headers = { Accept: "text/event-stream" };
+  return request(path, { headers, signal });
+}
+
 export const snapshot = () => get("/admin/metrics.json");
+export const logs = () => get("/admin/logs");
 export const registrations = () => get("/admin/registrations");
 export const calls = () => get("/admin/calls");
 export const bans = () => get("/admin/bans");

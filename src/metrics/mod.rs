@@ -10,8 +10,8 @@ pub mod glibc;
 use std::sync::{Arc, OnceLock};
 
 use prometheus::{
-    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry, TextEncoder,
+    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tracing::error;
 
@@ -499,6 +499,35 @@ pub struct SiphonMetrics {
     /// Handoff deadlines that fired (no controller accepted + acted in time),
     /// by app.
     pub control_handoff_timeouts_total: IntCounterVec,
+
+    // --- SIP message capture (debug ladder) ---
+    /// Messages retained by the capture ring.
+    pub capture_messages_total: IntCounter,
+    /// Bytes currently retained.
+    pub capture_bytes: IntGauge,
+    /// Calls currently retained.
+    pub capture_calls: IntGauge,
+    /// Messages refused because their call hit the per-call cap.
+    pub capture_dropped_total: IntCounter,
+
+    // --- Call rating (LCR carrier cost) ---
+    /// Estimated carrier spend, by carrier and ISO 4217 currency, accumulated
+    /// as calls end. Derived from the rate the routing API returned — the
+    /// carrier's own rating is authoritative and will differ, so this is a
+    /// trend and a budget alarm, never an invoice. Never summed across
+    /// currencies; the label is what keeps them apart.
+    pub call_cost_total: CounterVec,
+    /// Current burn: the per-minute rate of every answered call in progress,
+    /// summed by currency. Answers "what is this box costing me right now".
+    pub call_spend_rate: GaugeVec,
+
+    // --- Live log tail ---
+    /// Admin log-tail streams currently attached (drains to 0 on disconnect).
+    pub log_tail_streams: IntGauge,
+    /// Log lines dropped because a tail consumer could not keep up. Non-zero
+    /// means the operator's view has gaps, not that the node lost anything:
+    /// the tail drops rather than let a slow reader reach the logging thread.
+    pub log_tail_dropped_total: IntCounter,
 }
 
 impl SiphonMetrics {
@@ -887,7 +916,57 @@ impl SiphonMetrics {
             &["app"],
         )?;
 
+        let capture_messages_total = IntCounter::new(
+            "siphon_capture_messages_total",
+            "SIP messages recorded into the debug capture ring",
+        )?;
+        let capture_bytes = IntGauge::new(
+            "siphon_capture_bytes",
+            "Bytes currently retained by the debug capture ring",
+        )?;
+        let capture_calls = IntGauge::new(
+            "siphon_capture_calls",
+            "Calls currently retained by the debug capture ring",
+        )?;
+        let capture_dropped_total = IntCounter::new(
+            "siphon_capture_dropped_total",
+            "Messages refused because their call hit the per-call capture cap",
+        )?;
+
+        let call_cost_total = CounterVec::new(
+            Opts::new(
+                "siphon_call_cost_total",
+                "Estimated carrier spend as calls end, from the routing API's rate \
+                 (an estimate — the carrier's own rating is authoritative)",
+            ),
+            &["carrier", "currency"],
+        )?;
+        let call_spend_rate = GaugeVec::new(
+            Opts::new(
+                "siphon_call_spend_rate",
+                "Per-minute rate of the answered calls currently in progress",
+            ),
+            &["currency"],
+        )?;
+
+        let log_tail_streams = IntGauge::new(
+            "siphon_log_tail_streams",
+            "Admin log-tail streams currently attached",
+        )?;
+        let log_tail_dropped_total = IntCounter::new(
+            "siphon_log_tail_dropped_total",
+            "Log lines dropped because a tail consumer could not keep up",
+        )?;
+
         // Register all metrics
+        registry.register(Box::new(capture_messages_total.clone()))?;
+        registry.register(Box::new(capture_bytes.clone()))?;
+        registry.register(Box::new(capture_calls.clone()))?;
+        registry.register(Box::new(capture_dropped_total.clone()))?;
+        registry.register(Box::new(call_cost_total.clone()))?;
+        registry.register(Box::new(call_spend_rate.clone()))?;
+        registry.register(Box::new(log_tail_streams.clone()))?;
+        registry.register(Box::new(log_tail_dropped_total.clone()))?;
         registry.register(Box::new(control_connections.clone()))?;
         registry.register(Box::new(control_controlled_calls.clone()))?;
         registry.register(Box::new(control_commands_total.clone()))?;
@@ -1025,6 +1104,14 @@ impl SiphonMetrics {
             control_events_dropped_total,
             control_auth_failures_total,
             control_handoff_timeouts_total,
+            capture_messages_total,
+            capture_bytes,
+            capture_calls,
+            capture_dropped_total,
+            call_cost_total,
+            call_spend_rate,
+            log_tail_streams,
+            log_tail_dropped_total,
         })
     }
 
@@ -1137,6 +1224,49 @@ pub fn update_uptime() {
     }
 }
 
+/// Bill an ended call out to `siphon_call_cost_total`.
+///
+/// Called from the B2BUA's single call-removal funnel, so every disposition is
+/// counted once: a normal BYE, an admin hangup and a failure teardown all pass
+/// through it. An unanswered or unrated call contributes nothing — there is no
+/// zero-cost series to emit, because "this call cost nothing" and "this call
+/// was never rated" are different statements and only the second is true.
+pub fn record_call_cost(route: Option<&crate::lcr::Route>, talk_seconds: Option<u64>) {
+    let (Some(metrics), Some(route), Some(talk)) = (try_metrics(), route, talk_seconds) else {
+        return;
+    };
+    let Some(cost) = route.cost_for(talk) else {
+        return;
+    };
+    let currency = route.currency.as_deref().unwrap_or("unknown");
+    metrics
+        .call_cost_total
+        .with_label_values(&[&route.carrier_id, currency])
+        .inc_by(cost);
+}
+
+/// Publish the current per-minute burn, one series per currency.
+///
+/// Deliberately *not* part of `publish_store_gauges`, which documents an O(1)
+/// contract: this iterates the answered calls, so it belongs on the 30 s sweep
+/// and the dashboard poll, not on anything hotter. Rates are never summed
+/// across currencies — a total of "0.31" over EUR and USD would be a number
+/// that means nothing.
+pub fn publish_spend_rate(rates: &std::collections::HashMap<String, f64>) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    // Zero the series that no longer have calls, so a currency whose last call
+    // ended reads 0 rather than holding its final value forever.
+    metrics.call_spend_rate.reset();
+    for (currency, rate) in rates {
+        metrics
+            .call_spend_rate
+            .with_label_values(&[currency.as_str()])
+            .set(*rate);
+    }
+}
+
 /// [`gauge_vec_by_label`] for an `IntGaugeVec` — e.g. per-instance media health
 /// (`siphon_rtpengine_instance_up` keyed on `"address"`) or per-app control
 /// connections.
@@ -1182,6 +1312,39 @@ pub fn int_counter_vec_by_label(
         }
     }
     out
+}
+
+/// Float-counter totals as one row per label combination, in label order.
+///
+/// The two-label twin of [`int_counter_vec_by_label`], for carrier spend: a
+/// single map keyed on carrier would silently add EUR to USD, so the currency
+/// travels with the value rather than being collapsed away.
+pub fn counter_vec_rows(
+    vector: &CounterVec,
+    labels: &[&str],
+) -> Vec<std::collections::BTreeMap<String, serde_json::Value>> {
+    use prometheus::core::Collector;
+    let mut rows = Vec::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let mut row = std::collections::BTreeMap::new();
+            for label in labels {
+                let value = metric
+                    .get_label()
+                    .iter()
+                    .find(|pair| pair.name() == *label)
+                    .map(|pair| pair.value().to_owned())
+                    .unwrap_or_default();
+                row.insert((*label).to_string(), serde_json::Value::from(value));
+            }
+            row.insert(
+                "value".to_string(),
+                serde_json::Value::from(metric.get_counter().value()),
+            );
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 /// Per-label totals for one value of a second label — e.g. `requests_total`
@@ -1605,6 +1768,12 @@ mod tests {
         "glibc_free_bytes",
         "glibc_mmap_bytes",
         "glibc_arena_count",
+        // Written by `record_call_cost` / `publish_spend_rate` below, from the
+        // B2BUA teardown funnel and the dispatcher sweep respectively — by
+        // label, never by field name, so the heuristic cannot see them.
+        // `recorders_are_called_from_the_datapath` pins those call sites.
+        "call_cost_total",
+        "call_spend_rate",
     ];
 
     fn crate_source_files() -> Vec<std::path::PathBuf> {
@@ -1698,7 +1867,15 @@ mod tests {
             .filter_map(|path| std::fs::read_to_string(path).ok())
             .collect();
 
-        for recorder in ["record_request(", "record_response(", "record_frame("] {
+        for recorder in [
+            "record_request(",
+            "record_response(",
+            "record_frame(",
+            // Same reasoning for the rating metrics: allow-listed above, so
+            // pin where they are actually driven from.
+            "record_call_cost(",
+            "publish_spend_rate(",
+        ] {
             assert!(
                 sources.iter().any(|body| body.contains(recorder)),
                 "{recorder} has no call site outside src/metrics/ — \
@@ -1729,6 +1906,10 @@ mod tests {
             "auth_ha1_cache_hits_total",
             "registrations_active",
             "uptime_seconds",
+            // Surfaced as `spend.per_minute`, computed fresh from the call
+            // store on the same poll that republishes the gauge — reading it
+            // back out of Prometheus to render it would be the long way round.
+            "call_spend_rate",
         ];
 
         let missing: Vec<String> = declared_metric_fields()

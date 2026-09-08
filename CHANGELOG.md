@@ -7,6 +7,74 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+> The embedded dashboard and everything below that feeds it stay
+> **EXPERIMENTAL and a work in progress**: the views, the admin JSON shapes and
+> the new `admin.log_tail` / `admin.capture` config blocks may change or be
+> removed without a deprecation cycle. Both new subsystems are **off by
+> default** and refuse to start without `admin.auth.token`. The Prometheus
+> metrics added here are the stable half — `/metrics` remains the interface to
+> build alerting on.
+
+- **A live log tail on the admin API and in the dashboard** —
+  `GET /admin/logs/stream` (Server-Sent Events) and a Logs view, so debugging a
+  call no longer means leaving the dashboard for `journalctl` on the box.
+  Filtering (level, substring, Call-ID) is applied **server-side**: a busy node
+  emits far more than a browser should receive and discard.
+
+  Capture is **on-demand**. The Rust datapath logs nothing per message at INFO,
+  but a logging Python script emits roughly five lines per call — ~150k lines a
+  second at 30k cps — so retaining all of that for a feature nobody is watching
+  would be a permanent cost on the hot path. With no tail attached the layer is
+  one relaxed atomic load; formatting happens only past that gate. WARN and
+  above are always retained in a small ring, because they are rare and they are
+  the context you want *already collected* when you open the tail after
+  something has gone wrong.
+
+  Delivered as SSE over `fetch` rather than `EventSource` or a WebSocket:
+  neither can carry an `Authorization` header from a browser, which would force
+  the bearer token into the query string. A slow reader drops lines under a
+  bounded drop-oldest queue — the discipline the control plane already applies
+  to a slow application — and is told how many, in line, where the gap
+  happened. Off by default (`admin.log_tail.enabled`), and refused at startup
+  without `admin.auth.token`.
+
+- **Per-call SIP ladder and a search box.** `admin.capture.enabled` records the
+  wire messages into a bounded ring indexed by Call-ID, `GET /admin/capture/
+  {call_id}` returns them, and the Calls drawer renders the exchange with the
+  raw text one click away. `GET /admin/search?q=` finds a call by whatever the
+  operator actually has — a number, a Call-ID, a fragment of either — across
+  the capture ring and the live call list.
+
+  Capture rides the same two chokepoints as the traffic counters, and both
+  already hold the wire `Bytes`, so recording is a refcount bump: nothing is
+  re-serialized and nothing is parsed on the send path (the Call-ID comes from
+  a header scan that stops at the first match). Bounded by bytes, calls and
+  messages-per-call; eviction is oldest-call-first and whole calls only,
+  because half a ladder answers nothing. **Off by default**, refused without an
+  auth token, and a debugging facility rather than a lawful-intercept one —
+  `lawful_intercept:` remains that, with its own warrants, delivery and
+  retention.
+
+- **Operator actions: hang up a call, drain the node, reload the script.**
+  `POST /admin/calls/{call_id}/hangup` routes through the control plane's own
+  teardown funnel, so the Rf/Ro stop records, the CDR and the media release all
+  happen — a hand-rolled BYE would answer the peer and silently skip them.
+  B2BUA-only, and the UI says so rather than offering a button a proxy cannot
+  honour. `POST`/`DELETE /admin/drain` flips the drain flag `/admin/ready`
+  already reports, so an orchestrator removes the node from rotation — and,
+  unlike SIGTERM, it is reversible. `POST /admin/script/reload` recompiles now
+  and returns the traceback on failure, with the previous script left running.
+
+- **Estimated call cost from the LCR carrier rate.** `/admin/calls` reports the
+  winning carrier, its rate, the billed duration (applying `billing_increment`
+  and `min_duration`, so a 1-second call on a 60-second increment bills a full
+  minute) and the running cost; a Cost view adds the live burn rate and spend
+  per carrier. Exported as `siphon_call_cost_total{carrier,currency}` and
+  `siphon_call_spend_rate{currency}`, so Grafana and alerting see the same
+  numbers. Never summed across currencies. An **estimate** — the carrier's own
+  rating is authoritative and will differ — and an unrated call renders "not
+  rated" rather than a zero.
+
 - **The control plane's `answer` can anchor media — `answer(anchor|profile|
   ws_uri)`, and `answer_anchored()` in all three SDKs.** An application that
   accepted an **un-answered** `call.handover()` could hold the call open for as
@@ -107,6 +175,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   emitted nothing. Removing a metric that never produced a series breaks no
   scrape contract. Handler volume is already covered by
   `siphon_pyexec_jobs_completed_total`.
+
+### Security
+- **The admin API's sensitive routes ignore `protect_reads`.** `/admin/logs*`,
+  `/admin/capture*` and `/admin/search` always require the bearer token, and
+  return `403` when no token is configured at all. `protect_reads` defaults to
+  false, so every `GET` under `/admin` is open on a node that set a token only
+  to gate its `DELETE`s — a defensible default for a gauge, not for a live log
+  stream or captured signalling. A failed admin token now also feeds
+  `record_handshake_failure`, so credential guessing against the admin port
+  reaches the auto-ban the way it already does on the control plane.
 
 ### Fixed
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead

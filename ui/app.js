@@ -8,7 +8,7 @@
 import { $, html, text } from "./lib/dom.js";
 import { count, duration } from "./lib/format.js";
 import * as api from "./lib/api.js";
-import { bindDrawer } from "./drawer.js";
+import { bindDrawer, openDrawer } from "./drawer.js";
 
 import * as overview from "./views/overview.js";
 import * as calls from "./views/calls.js";
@@ -19,6 +19,8 @@ import * as signalling from "./views/signalling.js";
 import * as media from "./views/media.js";
 import * as control from "./views/control.js";
 import * as system from "./views/system.js";
+import * as logs from "./views/logs.js";
+import * as cost from "./views/cost.js";
 
 const SNAPSHOT_INTERVAL = 2000;
 const LIST_INTERVAL = 4000;
@@ -33,6 +35,8 @@ const VIEWS = {
   media: { title: "Media", module: media },
   control: { title: "Control", module: control },
   system: { title: "System", module: system },
+  cost: { title: "Cost", module: cost },
+  logs: { title: "Logs", module: logs },
 };
 
 let current = "overview";
@@ -99,6 +103,10 @@ function buildViews() {
 
 function go(name) {
   if (!VIEWS[name]) name = "overview";
+  // Navigating away from the log view releases its stream: the server caps
+  // concurrent tails, so a background tab holding one open would spend a slot
+  // for a panel nobody is looking at.
+  if (current === "logs" && name !== "logs") logs.suspend();
   current = name;
   document.querySelectorAll(".navitem").forEach((item) => {
     item.classList.toggle("active", item.getAttribute("data-view") === name);
@@ -120,6 +128,10 @@ function refreshCurrentView() {
   else if (current === "registrations") registrations.load();
   else if (current === "security") security.load();
   else if (current === "gateways") gateways.load();
+  // The log view holds a live stream rather than polling, so it is loaded once
+  // on open and left alone by the list timer.
+  else if (current === "logs") logs.load();
+  else if (current === "cost") cost.load();
 }
 
 // ------------------------------------------------------------------- poll --
@@ -133,6 +145,7 @@ function renderSnapshotViews(snapshot) {
   else if (current === "media") media.render(snapshot);
   else if (current === "control") control.render(snapshot);
   else if (current === "system") system.render(snapshot);
+  else if (current === "cost") cost.render(snapshot);
 }
 
 function setBadge(id, cls, label) {
@@ -241,6 +254,133 @@ function bindActions() {
   });
 
   calls.bind();
+  logs.bind();
+  bindSearch();
+  bindNavToggle();
+}
+
+/**
+ * Mobile navigation.
+ *
+ * Under 780px the sidebar is an overlay: without this it was `display: none`
+ * with nothing to reopen it, so a phone could only ever see the view it landed
+ * on. Selecting a destination closes it again, which is what a drawer nav is
+ * expected to do.
+ */
+function bindNavToggle() {
+  const toggle = $("navtoggle");
+  const backdrop = $("navbackdrop");
+  const sidebar = document.querySelector(".sidebar");
+  if (!toggle || !backdrop || !sidebar) return;
+
+  const setOpen = (open) => {
+    sidebar.classList.toggle("open", open);
+    backdrop.classList.toggle("show", open);
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+
+  toggle.addEventListener("click", () => setOpen(!sidebar.classList.contains("open")));
+  backdrop.addEventListener("click", () => setOpen(false));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setOpen(false);
+  });
+  // Any nav choice closes the overlay; on a wide screen this is a no-op.
+  $("nav").addEventListener("click", () => setOpen(false));
+}
+
+/**
+ * One box that finds a call by whatever the operator actually has — a number,
+ * a Call-ID, a fragment of either. Searches the capture ring (message content,
+ * so a dialled number matches) and the live call list.
+ */
+function bindSearch() {
+  const box = $("topsearch");
+  if (!box) return;
+  box.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    const query = box.value.trim();
+    if (!query) return;
+
+    let result;
+    try {
+      result = await api.get("/admin/search?q=" + encodeURIComponent(query));
+    } catch (error) {
+      say(
+        error instanceof api.Unauthorized
+          ? "Search is protected — press Unlock and enter an admin token"
+          : "Search failed",
+        true,
+      );
+      return;
+    }
+
+    const live = result.live_calls || [];
+    // `null` means capture is switched off, which is a different answer from
+    // "capture is on and found nothing" — say which.
+    const captured = result.captured;
+
+    let body =
+      '<div class="subhead">Live calls (' + live.length + ")</div>" +
+      (live.length
+        ? '<div class="tblscroll"><table class="tbl"><tbody>' +
+          live
+            .map(
+              (call) =>
+                '<tr class="rowlink" data-goto-call="' +
+                encodeURIComponent(call.call_id) +
+                '"><td class="aor">' +
+                call.call_id +
+                '</td><td class="q">' +
+                (call.a_party || "") +
+                " &#8594; " +
+                (call.b_party || "") +
+                "</td><td>" +
+                call.state +
+                "</td></tr>",
+            )
+            .join("") +
+          "</tbody></table></div>"
+        : '<div class="empty">no live call matches</div>');
+
+    body += '<div class="subhead" style="margin-top:14px">Captured signalling</div>';
+    if (captured === null || captured === undefined) {
+      body +=
+        '<div class="notconfigured"><b>Message capture is off on this node</b>' +
+        "set <code>admin.capture.enabled</code> to search past calls by number.</div>";
+    } else if (!captured.length) {
+      body += '<div class="empty">nothing captured matches</div>';
+    } else {
+      body +=
+        '<div class="tblscroll"><table class="tbl"><tbody>' +
+        captured
+          .map(
+            (hit) =>
+              '<tr class="rowlink" data-goto-call="' +
+              encodeURIComponent(hit.call_id) +
+              '"><td class="aor">' +
+              hit.call_id +
+              '</td><td class="q">' +
+              (hit.first_line || "") +
+              '</td><td class="num q">' +
+              hit.messages +
+              "</td></tr>",
+          )
+          .join("") +
+        "</tbody></table></div>";
+    }
+
+    openDrawer('Search "' + query + '"', body);
+  });
+
+  // A search hit opens that call's log view, filtered — the one deep link that
+  // makes having both the ladder and the tail in one place pay off.
+  document.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-goto-call]");
+    if (!row) return;
+    const callId = decodeURIComponent(row.getAttribute("data-goto-call"));
+    go("logs");
+    logs.focusCall(callId);
+  });
 }
 
 function boot() {

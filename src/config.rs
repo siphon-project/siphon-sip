@@ -2007,6 +2007,75 @@ pub struct AdminConfig {
     /// `enabled: true` warns and no UI is served.
     #[serde(default)]
     pub ui: Option<AdminUiConfig>,
+    /// Optional live log tail over the admin API (`GET /admin/logs/stream`).
+    /// Unset = off.
+    #[serde(default)]
+    pub log_tail: Option<AdminLogTailConfig>,
+    /// Optional bounded SIP message capture, for the dashboard's per-call
+    /// ladder and search. Unset = off.
+    #[serde(default)]
+    pub capture: Option<AdminCaptureConfig>,
+}
+
+/// Bounded SIP message capture exposed over the admin API.
+///
+/// Off by default, and refused at startup without `admin.auth.token` — the
+/// captured messages are the signalling itself, complete with numbers and peer
+/// addresses. This is a debugging facility and never a lawful-intercept one:
+/// `lawful_intercept:` is that, with its own warrants, delivery and retention.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminCaptureConfig {
+    /// Enable `GET /admin/capture/{call_id}` and `GET /admin/search`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Total bytes retained before the oldest call is evicted. Default 32 MiB.
+    #[serde(default = "default_capture_max_bytes")]
+    pub max_bytes: usize,
+    /// Calls retained before the oldest is evicted. Default 500.
+    #[serde(default = "default_capture_max_calls")]
+    pub max_calls: usize,
+    /// Messages kept per call. Default 256 — enough for a ladder, bounded
+    /// against a retransmission storm.
+    #[serde(default = "default_capture_max_messages")]
+    pub max_messages_per_call: usize,
+    /// Keep headers but drop message bodies (SDP, MESSAGE content). Default
+    /// false.
+    #[serde(default)]
+    pub redact_bodies: bool,
+}
+
+fn default_capture_max_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_capture_max_calls() -> usize {
+    500
+}
+
+fn default_capture_max_messages() -> usize {
+    256
+}
+
+/// Live log tail exposed over the admin API.
+///
+/// Off by default, and refused at startup when `admin.auth.token` is unset: a
+/// log stream carries call-ids, numbers and peer addresses, so it is gated on
+/// the token regardless of `protect_reads` and there is nothing to gate it with
+/// when no token exists.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminLogTailConfig {
+    /// Enable `GET /admin/logs` and `GET /admin/logs/stream`. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Concurrent tail streams allowed. Each holds a bounded queue, so this
+    /// caps the memory one client can pin on a server that has no connection
+    /// limiting of its own. Default 4.
+    #[serde(default = "default_log_tail_max_streams")]
+    pub max_streams: usize,
+}
+
+fn default_log_tail_max_streams() -> usize {
+    4
 }
 
 /// Bearer-token auth for the admin API (RFC 6750). When `token` is set, the
