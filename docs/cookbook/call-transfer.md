@@ -9,7 +9,7 @@ decides to swap a party with no `REFER` on the wire at all:
 
 | Mode | What siphon does | Use it for |
 |---|---|---|
-| **siphon-terminated** *(default)* | Answers `202` + sends the sipfrag `NOTIFY`s itself, re-resolves `Refer-To` through the dial plan as a **new** leg, re-bridges the surviving party, and BYEs the referred-away leg. | Trunk-facing SBCs and media-anchored calls — the endpoints never see the transfer, media stays anchored on siphon. |
+| **siphon-terminated** *(default)* | Answers `202` + sends the sipfrag `NOTIFY`s itself, dials `Refer-To` (or `target=`) as a **new** leg, re-bridges the surviving party, and BYEs the referred-away leg. | Trunk-facing SBCs and media-anchored calls — the endpoints never see the transfer, media stays anchored on siphon. |
 | **transparent** | Re-emits the `REFER` on the far leg's own dialog and relays the far end's `202` + `message/sipfrag` `NOTIFY`s back to the referrer. | UA-to-UA / PBX transfers where you want the endpoints to run the transfer themselves. |
 | **siphon-originated** | siphon *sends* a `REFER` to a leg — `call.refer(target)` (deferred, from a handler) or `b2bua.refer(call_id, target)` (imperative, from an event callback). | IVR / TAS offload — answer, play a prompt, then hand the caller off. |
 
@@ -148,6 +148,49 @@ def on_refer(call):
     call.accept_refer(target="sip:+15550142@example.com",
                       next_hop="sip:trunk.example.com:5060")
 ```
+
+### Number shape across a transfer — read this before deploying on a trunk
+
+A siphon-terminated transfer dials the target **directly**. `@b2bua.on_invite`
+does not run again for the replacement leg, so nothing that handler does to
+shape a call is repeated: not the number formatting, not the route selection.
+
+That matters because the two ends disagree about number format by default. The
+*referrer* names the target in its own format — a Microsoft Teams `Refer-To`
+names `+E.164` — while the carrier the new leg is dialled at expects whatever
+the trunk speaks. Left alone, every ordinary call on that trunk goes out as
+`15550142` and every transferred one arrives as `+15550142`, from the same
+siphon, on the same trunk, in the same call.
+
+`number_policy=` closes it, resolving exactly as `call.dial(number_policy=…)`
+does — the named policy, else `b2bua.default_number_policy`, else no reshaping —
+and applying to the target URI (so to the triggered INVITE's R-URI and To) and
+to that INVITE's identity headers:
+
+```python
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(
+        target=f"sip:{user}@{carrier_domain}",
+        next_hop=gateway.select("carriers").uri,
+        mode="terminate",
+        profile="rtp_passthrough",
+        number_policy="carrier-plain@2026",   # same shape every dialled leg gets
+    )
+```
+
+Set `b2bua.default_number_policy` in `siphon.yaml` and transfers pick it up with
+no argument at all. An unknown policy name raises `ValueError` in the handler
+rather than silently dialling the target unreshaped. `b2bua.replace_peer()`
+takes the same argument, for the same reason.
+
+The **routing** half is still the handler's own: a transfer that must leave via
+a particular carrier needs `next_hop=` (or a `target=` naming the right host),
+because no gateway selection runs for it either.
+
+All of this is terminate mode. In `"transparent"` mode siphon dials nothing —
+it re-emits the `REFER` and the far end resolves the target under its own
+numbering — so `number_policy` has no effect there.
 
 ### Media profiles across a transfer — read this before deploying an SRTP edge
 

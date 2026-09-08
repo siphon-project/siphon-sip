@@ -889,6 +889,7 @@ class MockB2bua:
         replace_a_leg: bool = False,
         profile: Optional[str] = None,
         timeout: int = 30,
+        number_policy: Optional[str] = None,
     ) -> bool:
         """Replace one leg of an answered call with a freshly dialed target.
 
@@ -919,6 +920,12 @@ class MockB2bua:
                 one describes the party that is leaving.
             timeout: seconds to wait for the target to answer. 0 means no ring
                 policy, only siphon's guard against a target that never answers.
+            number_policy: reshape the target's number (and the triggered
+                INVITE's identity headers) the way
+                :meth:`siphon_sdk.call.Call.dial` does — this named policy,
+                else ``b2bua.default_number_policy``, else no reshaping. A
+                replacement leg does not re-enter ``@b2bua.on_invite``, so this
+                is where a carrier's number format gets applied to it.
 
         Returns:
             bool: True once the INVITE is on the wire. It does not wait for the
@@ -955,6 +962,7 @@ class MockB2bua:
                 "replace_a_leg": replace_a_leg,
                 "profile": profile,
                 "timeout": timeout,
+                "number_policy": number_policy,
             }
         )
         return True

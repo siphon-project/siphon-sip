@@ -17017,7 +17017,7 @@ fn b2bua_send_b_leg_invite(
             Err(_) => warn!(
                 call_id = %call_id,
                 policy = %policy_name,
-                "LCR: unknown number_policy on route, skipping identity reshape"
+                "unknown number_policy, skipping identity reshape"
             ),
         }
     }
@@ -23247,6 +23247,7 @@ pub fn b2bua_accept_refer_call(
     next_hop: Option<String>,
     mode: Option<crate::script::api::call::ReferMode>,
     media_profile: Option<String>,
+    number_policy: Option<String>,
 ) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -23279,6 +23280,7 @@ pub fn b2bua_accept_refer_call(
         pending.refer_to.replaces.clone(),
         mode,
         media_profile.as_deref(),
+        number_policy.as_deref(),
         state,
     );
     true
@@ -23311,6 +23313,7 @@ pub fn b2bua_replace_peer(
     next_hop: Option<&str>,
     replace_a_leg: bool,
     media_profile: Option<&str>,
+    number_policy: Option<&str>,
     timeout_secs: u32,
 ) -> Result<(), crate::b2bua::transfer::ReplaceError> {
     use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
@@ -23386,6 +23389,7 @@ pub fn b2bua_replace_peer(
         None,
         None,
         media_profile,
+        number_policy,
         0,
         ReplacementOrigin::SiphonInitiated,
         timeout_secs,
@@ -27877,15 +27881,18 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
     // surviving pair's media profile has to be (see `accept_refer(profile=…)`).
     py_call.set_refer_from_a_leg(from_a_leg);
 
-    let action = Python::attach(|python| {
+    let (action, ignored_overrides) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall for on_refer: {error}");
-                return CallAction::RejectRefer {
-                    code: 500,
-                    reason: "Script Error".to_string(),
-                };
+                return (
+                    CallAction::RejectRefer {
+                        code: 500,
+                        reason: "Script Error".to_string(),
+                    },
+                    false,
+                );
             }
         };
         for handler in &handlers {
@@ -27895,25 +27902,52 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             error!("async B2BUA on_refer handler error: {error}");
-                            return CallAction::RejectRefer {
-                                code: 500,
-                                reason: "Script Error".to_string(),
-                            };
+                            return (
+                                CallAction::RejectRefer {
+                                    code: 500,
+                                    reason: "Script Error".to_string(),
+                                },
+                                false,
+                            );
                         }
                     }
                 }
                 Err(error) => {
                     error!("B2BUA on_refer handler error: {error}");
-                    return CallAction::RejectRefer {
-                        code: 500,
-                        reason: "Script Error".to_string(),
-                    };
+                    return (
+                        CallAction::RejectRefer {
+                            code: 500,
+                            reason: "Script Error".to_string(),
+                        },
+                        false,
+                    );
                 }
             }
         }
         let borrowed = call_obj.borrow(python);
-        borrowed.action().clone()
+        // The B-leg shaping setters belong to the `on_invite` → `dial()` path:
+        // they are read off the PyCall built there, and this one is a throwaway
+        // whose only surviving output is the action below. Silently doing
+        // nothing is the expensive failure — the script looks like it steered
+        // the transferred leg and the wire says otherwise — so say so.
+        //
+        // Message mutations (`set_header`, `rewrite_identities`) are the same
+        // shape and worse to detect: they land on this call's own clone of the
+        // REFER, while the leg is dialled from a clone of the *stored* A-leg
+        // INVITE. `accept_refer`'s own arguments are what reach the new leg.
+        let ignored_overrides = borrowed.contact_override().is_some()
+            || borrowed.contact_user_override().is_some()
+            || borrowed.from_host_override().is_some()
+            || borrowed.to_host_override().is_some();
+        (borrowed.action().clone(), ignored_overrides)
     });
+
+    if ignored_overrides {
+        warn!(
+            call_id = %call_id,
+            "B2BUA on_refer: set_contact_uri / set_contact_user / set_from_host / set_to_host have no effect in this handler — they shape a leg dialled by call.dial(), and a transfer leg is dialled from the stored A-leg INVITE. Use accept_refer(target=…, next_hop=…, number_policy=…) instead"
+        );
+    }
 
     match action {
         CallAction::RejectRefer { code, reason } => {
@@ -27925,6 +27959,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
             next_hop,
             mode,
             profile,
+            number_policy,
         } => {
             let mode = mode.unwrap_or(state.default_refer_mode);
             let target_uri = target.unwrap_or_else(|| refer_to.uri.clone());
@@ -27938,6 +27973,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                 refer_to.replaces.clone(),
                 mode,
                 profile.as_deref(),
+                number_policy.as_deref(),
                 state,
             );
         }
@@ -28319,9 +28355,15 @@ fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, from_
 
 /// Siphon-terminated (default): answer `202 Accepted` to the referrer, open the
 /// implicit REFER subscription, and start feeding it `message/sipfrag` NOTIFY
-/// progress (RFC 3515 §2.4.4). Siphon re-resolves the Refer-To through the dial
-/// plan as a new leg, re-bridges the surviving party to it, then BYEs the
+/// progress (RFC 3515 §2.4.4). Siphon dials the Refer-To (or the script's
+/// `target=`) as a new leg, re-bridges the surviving party to it, then BYEs the
 /// referred-away leg and sends the terminating `NOTIFY 200`.
+///
+/// The new leg is dialled *directly* — `@b2bua.on_invite` does not run again for
+/// it, so nothing the dial plan does there is repeated here. `number_policy` is
+/// the one piece of that shaping the transfer path applies itself, because a
+/// referrer names its target in its own number format and the carrier the leg is
+/// dialled at expects the trunk's.
 ///
 /// The `202 + NOTIFY 100 Trying + subscription` opening is done here; the
 /// new-leg dial and the transfer-aware bridge/BYE completion are driven off the
@@ -28337,6 +28379,7 @@ fn b2bua_refer_accept(
     replaces: Option<crate::sip::headers::refer::Replaces>,
     mode: crate::script::api::call::ReferMode,
     media_profile: Option<&str>,
+    number_policy: Option<&str>,
     state: &DispatcherState,
 ) {
     use crate::script::api::call::ReferMode;
@@ -28525,6 +28568,7 @@ fn b2bua_refer_accept(
                 replaces_header,
                 referred_by,
                 media_profile,
+                number_policy,
                 refer_cseq,
                 crate::b2bua::transfer::ReplacementOrigin::Refer,
                 0,
@@ -28573,11 +28617,56 @@ fn b2bua_start_leg_replacement(
     replaces_header: Option<crate::sip::headers::refer::Replaces>,
     referred_by: Option<String>,
     media_profile: Option<&str>,
+    number_policy: Option<&str>,
     event_id: u32,
     origin: crate::b2bua::transfer::ReplacementOrigin,
     timeout_secs: u32,
     state: &DispatcherState,
 ) -> bool {
+    // Reshape the target to the carrier's number format before anything reads
+    // it — the R-URI, the To, and the wire destination all derive from this one
+    // string.
+    //
+    // A transfer target is named by the *referrer*, in whatever shape the
+    // referrer speaks (a Teams `Refer-To` names `+E.164`), while a dialled leg
+    // is shaped by `dial(number_policy=…)` / `b2bua.default_number_policy` on
+    // the way out. Without this the two disagree on the same trunk: every
+    // normal call reaches the carrier as bare digits and every transferred one
+    // arrives with the `+` still attached. `@b2bua.on_invite` does not run again
+    // for a replacement leg, so this is the only place the shaping can happen.
+    //
+    // Resolution matches `dial()` exactly — the named policy, else
+    // `b2bua.default_number_policy`, else no reshaping. An unknown name is
+    // warned about and skipped rather than failing the transfer: the script path
+    // already rejects a typo eagerly in `accept_refer`, so a name reaching here
+    // unknown came from the control plane, and dropping a transfer over a
+    // formatting policy would be the worse failure.
+    let reshaped_target;
+    let target_uri = match crate::script::api::numbers::resolve_dial_policy(number_policy) {
+        Ok(Some(policy)) => {
+            reshaped_target =
+                crate::script::api::numbers::reformat_dial_target(target_uri, &policy);
+            if reshaped_target != target_uri {
+                debug!(
+                    call_id = %call_id,
+                    from = %target_uri,
+                    to = %reshaped_target,
+                    "leg replacement: number policy reshaped the transfer target"
+                );
+            }
+            reshaped_target.as_str()
+        }
+        Ok(None) => target_uri,
+        Err(_) => {
+            warn!(
+                call_id = %call_id,
+                policy = ?number_policy,
+                "leg replacement: unknown number_policy — dialling the target unreshaped"
+            );
+            target_uri
+        }
+    };
+
     // Dial the target as a new leg, then record the replacement tagged with
     // that leg's Call-ID. The leg's 2xx is intercepted in the response path
     // (b2bua_complete_terminated_transfer) to promote it into the surviving
@@ -28741,7 +28830,11 @@ fn b2bua_start_leg_replacement(
             None,
             forced_cid,
             &template,
-            None,
+            // Identity headers of the triggered INVITE get the same policy the
+            // target just did — the dial path reshapes both together
+            // (`apply_for_dial`), and a From in one shape next to an R-URI in
+            // another is what an SBC reads as inconsistent.
+            number_policy,
             None,
             None,
             None,

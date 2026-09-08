@@ -266,10 +266,12 @@ pub struct B2buaConfig {
     /// calls `accept_refer()` without an explicit `mode=`.
     ///
     /// - `"terminate"` (default) — siphon terminates the transfer: answer 202
-    ///   locally, re-resolve the Refer-To through the dial plan as a new leg,
+    ///   locally, dial the Refer-To (or the handler's `target=`) as a new leg,
     ///   re-bridge the media, and BYE the referred-away leg. Correct for
     ///   trunk-facing SBCs (the far end need not support REFER) and keeps media
-    ///   anchored.
+    ///   anchored. The new leg is dialled directly — `@b2bua.on_invite` does not
+    ///   run again for it — so `accept_refer(number_policy=…, next_hop=…)` is
+    ///   where the dial plan's shaping and steering are reapplied.
     /// - `"transparent"` — siphon re-emits the REFER on the far leg's own dialog
     ///   and relays the far end's 202 + `message/sipfrag` NOTIFYs back. Correct
     ///   for UA-to-UA (PBX / softphone) topologies.

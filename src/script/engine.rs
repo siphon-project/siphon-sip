@@ -2588,6 +2588,118 @@ def on_invite(call):
     }
 
     #[test]
+    fn b2bua_accept_refer_carries_a_number_policy_for_the_transferred_leg() {
+        // A transfer target is named by the referrer, in the referrer's format
+        // (a Teams `Refer-To` names `+E.164`), and dialled at a carrier that
+        // wants the trunk's. `@b2bua.on_invite` does not run again for the
+        // replacement leg, so `accept_refer(number_policy=…)` is where that
+        // shaping has to be asked for — this proves the name survives onto the
+        // action the dispatcher acts on, and that a typo raises instead.
+        //
+        // The runtime install below is idempotent (`OnceLock`, first writer
+        // wins) and deliberately identical to the sibling dial test's, so the
+        // policy is present whichever of the two runs first.
+        use crate::numbers::policy::{NumberPolicyConfig, NumberRegistry, NumberingConfig};
+        use crate::script::api::call::{CallAction, PyCall, ReferMode};
+        use crate::script::api::numbers::{set_number_runtime, NumberRuntime};
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::uri::SipUri;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let numbering = NumberingConfig {
+            country_code: "31".to_string(),
+            ..Default::default()
+        };
+        let mut policies = HashMap::new();
+        policies.insert(
+            "test-e164@2026".to_string(),
+            serde_yaml_ng::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
+        );
+        let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
+        assert!(warnings.is_empty(), "policy warnings: {warnings:?}");
+        set_number_runtime(Arc::new(NumberRuntime {
+            registry,
+            default_b2bua_policy: None,
+        }));
+
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_refer
+def refered(call):
+    if call.refer_to.endswith("@bogus.example"):
+        # A typo'd policy name must raise in the handler, not silently skip the
+        # reshape at dial time.
+        try:
+            call.accept_refer(number_policy="nope@2026")
+        except ValueError:
+            call.reject_refer(500, "Bad Policy")
+        return
+    call.accept_refer(
+        target="sip:0201234567@carrier.example",
+        mode="terminate",
+        number_policy="test-e164@2026",
+    )
+"#;
+        let state = compile_temp_script(source).unwrap();
+
+        let refer = SipMessageBuilder::new()
+            .request(
+                Method::Refer,
+                SipUri::new("siphon.example".to_string()).with_user("alice".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-refnp".to_string())
+            .from("<sip:0612345678@example.com>;tag=ref-np".to_string())
+            .to("<sip:0201234567@example.com>;tag=ref-uas".to_string())
+            .call_id("refer-policy@test".to_string())
+            .cseq("2 REFER".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let message_arc = Arc::new(Mutex::new(refer));
+
+        let invoke = |refer_to: &str| -> CallAction {
+            let mut py_call = PyCall::new(
+                "refer-np-001".to_string(),
+                Arc::clone(&message_arc),
+                "10.0.0.1".to_string(),
+                "udp".to_string(),
+            );
+            py_call.set_refer_to(refer_to.to_string(), None);
+            Python::attach(|python| {
+                let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+                let callable = state.handlers[0].callable.bind(python);
+                callable
+                    .call1((call_obj.bind(python),))
+                    .expect("handler invocation failed");
+                let action = call_obj.borrow(python).action().clone();
+                action
+            })
+        };
+
+        match invoke("sip:+31201234567@teams.example") {
+            CallAction::AcceptRefer {
+                target,
+                mode,
+                number_policy,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("sip:0201234567@carrier.example"));
+                assert_eq!(mode, Some(ReferMode::Terminate));
+                assert_eq!(number_policy.as_deref(), Some("test-e164@2026"));
+            }
+            other => panic!("expected AcceptRefer, got {other:?}"),
+        }
+
+        match invoke("sip:+31201234567@bogus.example") {
+            CallAction::RejectRefer { code, .. } => assert_eq!(code, 500),
+            other => panic!("expected the unknown policy to raise, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn b2bua_dial_next_hop_decouples_ruri_from_routing() {
         // IMS BGCF use case: stamp the canonical home-domain IMPU on the
         // R-URI of the B-leg INVITE (so the receiving S-CSCF's alias-chain

@@ -118,6 +118,45 @@ def on_refer(call):
         assert action.targets == ["sip:+15550142@example.com"]
         assert action.next_hop == "sip:trunk.example.com:5060"
 
+    def test_number_policy_recorded_for_the_transferred_leg(self, harness):
+        # A Teams Refer-To names +E.164; a trunk that takes bare digits sees
+        # every ordinary call as 32... and every transferred one as +32...
+        # unless the transfer asks for the same shaping a dial gets. The
+        # replacement leg never re-enters @b2bua.on_invite.
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(target="sip:+15550142@carrier.example",
+                      mode="terminate",
+                      profile="rtp_passthrough",
+                      number_policy="carrier-plain@2026")
+"""
+        )
+
+        result = harness.send_refer()
+        action = result.call.last_action
+        assert action.kind == "accept_refer"
+        assert action.extras["number_policy"] == "carrier-plain@2026"
+        assert action.extras["profile"] == "rtp_passthrough"
+
+    def test_number_policy_defaults_to_none(self, harness):
+        # None means "the configured b2bua.default_number_policy", the same
+        # thing it means on dial() — not "never reshape".
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer()
+"""
+        )
+
+        assert harness.send_refer().call.last_action.extras["number_policy"] is None
+
     def test_invalid_mode_raises_value_error(self, harness):
         harness.load_source(
             """

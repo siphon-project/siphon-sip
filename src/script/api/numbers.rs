@@ -158,6 +158,20 @@ pub fn apply_for_fork(message: &mut SipMessage, policy: &NumberPolicy, targets: 
     }
 }
 
+/// B2BUA transfer path: reshape a REFER / leg-replacement target URI to the
+/// policy's Request-URI format.
+///
+/// Split out from [`apply_for_dial`] because a transfer decides its target
+/// without an A-leg message in hand: the triggered INVITE is built later, from
+/// a clone of the stored A-leg INVITE, and its identity headers are reshaped
+/// there by [`apply_identity_headers`]. Only the target needs doing here — but
+/// it does need doing, or the transferred leg goes out in whatever shape the
+/// referrer named while every dialled leg gets the carrier's.
+pub fn reformat_dial_target(target: &str, policy: &NumberPolicy) -> String {
+    let format = policy.format_for(IdentityHeader::RequestUri);
+    reformat_target(target, format, policy)
+}
+
 /// Resolve a `number_policy=` argument for the B2BUA dial/fork path: an explicit
 /// named policy, else the `b2bua.default_number_policy`, else `None`.
 pub fn resolve_dial_policy(name: Option<&str>) -> PyResult<Option<Arc<NumberPolicy>>> {
@@ -325,5 +339,91 @@ mod tests {
     fn resolve_unknown_named_policy_errors() {
         // With no runtime installed the registry is empty.
         assert!(resolve_rewrite_policy(Some("nope@2026"), None, None, None).is_err());
+    }
+
+    /// A uniform policy over the default identity set, built without touching
+    /// the process-wide runtime (a `OnceLock` — the first installer in the test
+    /// binary wins, so these stay independent of it).
+    ///
+    /// The locale mirrors a real trunk's `numbering:` block: an
+    /// `assume: international` plan, where bare digits are already
+    /// country-code-first. Under the `National` default the same input would
+    /// pick up a second country code, which is correct for that plan and not
+    /// what a transfer target off a Refer-To looks like.
+    fn policy(format: &str) -> NumberPolicy {
+        use crate::numbers::{AssumeForm, Locale};
+        let locale = Locale {
+            country_code: "1".to_string(),
+            assume: AssumeForm::International,
+            ..Locale::default()
+        };
+        NumberPolicy::uniform(
+            locale,
+            format.parse().unwrap(),
+            DEFAULT_IDENTITY_HEADERS.to_vec(),
+        )
+    }
+
+    #[test]
+    fn transfer_target_loses_the_plus_for_a_plain_carrier() {
+        // The bug this exists for: a REFER names its target in +E.164 and the
+        // carrier the transferred leg is dialled at takes bare digits, exactly
+        // as every dialled leg on that trunk already does.
+        assert_eq!(
+            reformat_dial_target("sip:+15550142@carrier.example", &policy("plain")),
+            "sip:15550142@carrier.example"
+        );
+    }
+
+    #[test]
+    fn transfer_target_gains_the_plus_for_an_e164_carrier() {
+        // The other direction of the same trunk pair — a transfer back out
+        // towards a peer that wants +E.164.
+        assert_eq!(
+            reformat_dial_target("sip:15550142@peer.example", &policy("e164")),
+            "sip:+15550142@peer.example"
+        );
+    }
+
+    #[test]
+    fn transfer_target_keeps_uri_parameters_and_port() {
+        // Only the userpart is the policy's business — the host, port and
+        // params of a Refer-To carry routing meaning.
+        assert_eq!(
+            reformat_dial_target(
+                "sip:+15550142@carrier.example:5060;transport=tls",
+                &policy("plain")
+            ),
+            "sip:15550142@carrier.example:5060;transport=tls"
+        );
+    }
+
+    #[test]
+    fn transfer_target_with_a_non_numeric_user_is_left_alone() {
+        // A transfer to a SIP AoR is not a number and must not be mangled into
+        // one.
+        assert_eq!(
+            reformat_dial_target("sip:alice@example.com", &policy("plain")),
+            "sip:alice@example.com"
+        );
+    }
+
+    #[test]
+    fn transfer_target_without_a_userpart_is_left_alone() {
+        assert_eq!(
+            reformat_dial_target("sip:pbx.example.com", &policy("plain")),
+            "sip:pbx.example.com"
+        );
+    }
+
+    #[test]
+    fn unparseable_transfer_target_is_returned_verbatim() {
+        // Never swallow a target: an unroutable one has to reach the send path
+        // and fail there, where the transfer is refused, rather than be turned
+        // into something else here.
+        assert_eq!(
+            reformat_dial_target("not a uri", &policy("plain")),
+            "not a uri"
+        );
     }
 }
