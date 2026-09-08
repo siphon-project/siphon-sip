@@ -724,6 +724,7 @@ class Call:
         send_socket: Optional[str] = None,
         auth_passthrough: bool = False,
         number_policy: Optional[str] = None,
+        format: Optional[str] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -848,7 +849,7 @@ class Call:
         _validate_send_socket(send_socket)
         if max_duration is not None:
             self._max_duration_secs = max_duration
-        uri = self._normalize_dial_targets([uri], number_policy)[0]
+        uri = self._normalize_dial_targets([uri], number_policy, format)[0]
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
@@ -880,6 +881,7 @@ class Call:
         send_socket: Optional[str] = None,
         auth_passthrough: bool = False,
         number_policy: Optional[str] = None,
+        format: Optional[str] = None,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -930,7 +932,7 @@ class Call:
         if max_duration is not None:
             self._max_duration_secs = max_duration
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
-        uris = self._normalize_dial_targets(uris, number_policy)
+        uris = self._normalize_dial_targets(uris, number_policy, format)
         self._actions.append(Action(
             kind="fork",
             targets=uris,
@@ -1057,7 +1059,8 @@ class Call:
                      next_hop: Optional[str] = None,
                      mode: Optional[str] = None,
                      profile: Optional[str] = None,
-                     number_policy: Optional[str] = None) -> None:
+                     number_policy: Optional[str] = None,
+                     format: Optional[str] = None) -> None:
         """Accept an incoming REFER and honour the transfer.
 
         Call this from a ``@b2bua.on_refer`` handler to proceed with the
@@ -1124,11 +1127,18 @@ class Call:
                 Terminate mode only: in ``"transparent"`` mode siphon dials
                 nothing — it re-emits the REFER and the far end resolves the
                 target under its own numbering — so this has no effect there.
+            format: The inline form of the same thing, exactly as on
+                :meth:`rewrite_identities`: ``"e164"``, ``"plain"``,
+                ``"international"`` or ``"national"``, applied over the default
+                identity header set on the configured home locale.  Use this
+                when you shape numbers inline and have no ``number_policies:``
+                block to name.  Pass this or ``number_policy``, never both.
 
         Raises:
             ValueError: if ``mode`` is not one of ``None``, ``"terminate"``,
-                or ``"transparent"``, or if ``number_policy`` names a policy
-                that is not configured.
+                or ``"transparent"``; if ``number_policy`` names a policy that
+                is not configured; if ``format`` is not a known format; or if
+                both ``number_policy`` and ``format`` are given.
 
         Example::
 
@@ -1156,18 +1166,27 @@ class Call:
                 call.accept_refer(target=target, next_hop=gw.uri,
                                   mode="terminate", profile="rtp_passthrough",
                                   number_policy="carrier-plain@2026")
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                # Same thing inline, with no number_policies: block to name.
+                call.accept_refer(target=target, next_hop=gw.uri,
+                                  mode="terminate", profile="rtp_passthrough",
+                                  format="plain")
         """
         if mode not in (None, "terminate", "transparent"):
             raise ValueError(
                 f"accept_refer(mode=...) must be None, 'terminate', or "
                 f"'transparent' (got {mode!r})"
             )
+        from siphon_sdk import mock_module
+        mock_module.get_numbers()._resolve_dial(number_policy, format)
         self._actions.append(Action(
             kind="accept_refer",
             targets=[target] if target else None,
             next_hop=next_hop,
             extras={"mode": mode, "profile": profile,
-                    "number_policy": number_policy},
+                    "number_policy": number_policy, "format": format},
         ))
 
     def reject_refer(self, code: int, reason: str) -> None:
@@ -1494,14 +1513,16 @@ class Call:
                         changed += 1
         return changed
 
-    def _normalize_dial_targets(self, targets: list, number_policy: Optional[str]) -> list:
+    def _normalize_dial_targets(
+        self, targets: list, number_policy: Optional[str], format: Optional[str] = None
+    ) -> list:
         """Apply a B2BUA dial/fork number policy: normalize the A-leg header
         identities plus each branch target. Returns the (possibly rewritten)
         targets."""
         from siphon_sdk import mock_module
         from siphon_sdk.numbers import rewrite_nameaddr_userpart
 
-        resolved = mock_module.get_numbers()._resolve_dial(number_policy)
+        resolved = mock_module.get_numbers()._resolve_dial(number_policy, format)
         if resolved is None:
             return targets
         self._apply_number_policy(resolved, include_request_uri=False)

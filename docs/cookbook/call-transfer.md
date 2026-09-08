@@ -179,10 +179,20 @@ def on_refer(call):
     )
 ```
 
-Set `b2bua.default_number_policy` in `siphon.yaml` and transfers pick it up with
-no argument at all. An unknown policy name raises `ValueError` in the handler
-rather than silently dialling the target unreshaped. `b2bua.replace_peer()`
-takes the same argument, for the same reason.
+If you shape numbers inline rather than through named policies, `format=` is the
+same thing without the config block, exactly as on `rewrite_identities()`:
+
+```python
+call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+                  profile="rtp_passthrough", format="plain")
+```
+
+`"e164"`, `"plain"`, `"international"` and `"national"` are *formats*;
+`number_policy=` wants a name from `number_policies:`. Pass one or the other,
+never both. Set `b2bua.default_number_policy` and transfers pick it up with no
+argument at all. An unknown name or format raises `ValueError` in the handler
+rather than silently dialling the target unreshaped. `call.dial()`,
+`call.fork()` and `b2bua.replace_peer()` all take the same pair.
 
 The **routing** half is still the handler's own: a transfer that must leave via
 a particular carrier needs `next_hop=` (or a `target=` naming the right host),

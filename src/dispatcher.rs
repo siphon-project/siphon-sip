@@ -14812,6 +14812,25 @@ fn b2bua_advance_route(
             next_hop = ?next_hop,
             "LCR: dialing carrier",
         );
+        // The carrier's identity format, resolved here rather than inside the
+        // send path: that path now takes a policy, not a name, so the two
+        // callers that shape a B-leg (this one and the leg replacement) cannot
+        // disagree about how a selector turns into a policy.
+        let carrier_number_policy = match route.number_policy.as_deref() {
+            None => None,
+            Some(name) => match crate::script::api::numbers::resolve_dial_policy(Some(name)) {
+                Ok(policy) => policy,
+                Err(_) => {
+                    warn!(
+                        call_id = %call_id,
+                        carrier = %route.carrier_id,
+                        policy = %name,
+                        "LCR: unknown number_policy on route, skipping identity reshape"
+                    );
+                    None
+                }
+            },
+        };
         let sent = b2bua_send_b_leg_invite(
             call_id,
             &target,
@@ -14821,7 +14840,7 @@ fn b2bua_advance_route(
             send_socket.as_ref(),
             None,
             original_request,
-            route.number_policy.as_deref(),
+            carrier_number_policy.as_deref(),
             retarget.as_deref(),
             route.caller_id.as_deref(),
             caller_id_presentation,
@@ -16690,7 +16709,7 @@ fn b2bua_send_b_leg_invite(
     // caller pre-generated. `None` → the normal preserve/generate logic.
     forced_call_id: Option<&str>,
     original_request: &SipMessage,
-    number_policy: Option<&str>,
+    number_policy: Option<&crate::numbers::policy::NumberPolicy>,
     // Retargeted destination number (LCR `destination`), when the call was
     // re-aimed. The To userpart follows it so the dialled-in access number
     // never reaches the carrier. Named apart from the local `destination`
@@ -17089,18 +17108,8 @@ fn b2bua_send_b_leg_invite(
     // Per-carrier (LCR) number policy: reshape this B-leg's identity headers
     // (From / To / P-Asserted-Identity / P-Preferred-Identity) to the carrier's
     // format. The R-URI is owned by tech_prefix / ruri, so it is left untouched.
-    if let Some(policy_name) = number_policy {
-        match crate::script::api::numbers::resolve_dial_policy(Some(policy_name)) {
-            Ok(Some(policy)) => {
-                crate::script::api::numbers::apply_identity_headers(&mut b_leg_invite, &policy);
-            }
-            Ok(None) => {}
-            Err(_) => warn!(
-                call_id = %call_id,
-                policy = %policy_name,
-                "unknown number_policy, skipping identity reshape"
-            ),
-        }
+    if let Some(policy) = number_policy {
+        crate::script::api::numbers::apply_identity_headers(&mut b_leg_invite, policy);
     }
 
     // Per-carrier (LCR) CLIR: withhold the calling identity from this carrier
@@ -23339,7 +23348,7 @@ pub fn b2bua_accept_refer_call(
     next_hop: Option<String>,
     mode: Option<crate::script::api::call::ReferMode>,
     media_profile: Option<String>,
-    number_policy: Option<String>,
+    number_shape: Option<crate::script::api::numbers::NumberShape>,
 ) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -23372,7 +23381,7 @@ pub fn b2bua_accept_refer_call(
         pending.refer_to.replaces.clone(),
         mode,
         media_profile.as_deref(),
-        number_policy.as_deref(),
+        number_shape.as_ref(),
         state,
     );
     true
@@ -23405,7 +23414,7 @@ pub fn b2bua_replace_peer(
     next_hop: Option<&str>,
     replace_a_leg: bool,
     media_profile: Option<&str>,
-    number_policy: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
     timeout_secs: u32,
 ) -> Result<(), crate::b2bua::transfer::ReplaceError> {
     use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
@@ -23481,7 +23490,7 @@ pub fn b2bua_replace_peer(
         None,
         None,
         media_profile,
-        number_policy,
+        number_shape,
         0,
         ReplacementOrigin::SiphonInitiated,
         timeout_secs,
@@ -28121,7 +28130,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
             next_hop,
             mode,
             profile,
-            number_policy,
+            number_shape,
         } => {
             let mode = mode.unwrap_or(state.default_refer_mode);
             let target_uri = target.unwrap_or_else(|| refer_to.uri.clone());
@@ -28135,7 +28144,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                 refer_to.replaces.clone(),
                 mode,
                 profile.as_deref(),
-                number_policy.as_deref(),
+                number_shape.as_ref(),
                 state,
             );
         }
@@ -28541,7 +28550,7 @@ fn b2bua_refer_accept(
     replaces: Option<crate::sip::headers::refer::Replaces>,
     mode: crate::script::api::call::ReferMode,
     media_profile: Option<&str>,
-    number_policy: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
     state: &DispatcherState,
 ) {
     use crate::script::api::call::ReferMode;
@@ -28730,7 +28739,7 @@ fn b2bua_refer_accept(
                 replaces_header,
                 referred_by,
                 media_profile,
-                number_policy,
+                number_shape,
                 refer_cseq,
                 crate::b2bua::transfer::ReplacementOrigin::Refer,
                 0,
@@ -28779,7 +28788,7 @@ fn b2bua_start_leg_replacement(
     replaces_header: Option<crate::sip::headers::refer::Replaces>,
     referred_by: Option<String>,
     media_profile: Option<&str>,
-    number_policy: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
     event_id: u32,
     origin: crate::b2bua::transfer::ReplacementOrigin,
     timeout_secs: u32,
@@ -28797,17 +28806,31 @@ fn b2bua_start_leg_replacement(
     // arrives with the `+` still attached. `@b2bua.on_invite` does not run again
     // for a replacement leg, so this is the only place the shaping can happen.
     //
-    // Resolution matches `dial()` exactly — the named policy, else
-    // `b2bua.default_number_policy`, else no reshaping. An unknown name is
-    // warned about and skipped rather than failing the transfer: the script path
-    // already rejects a typo eagerly in `accept_refer`, so a name reaching here
-    // unknown came from the control plane, and dropping a transfer over a
-    // formatting policy would be the worse failure.
+    // Resolution matches `dial()` exactly — the named policy or inline format,
+    // else `b2bua.default_number_policy`, else no reshaping. An unresolvable one
+    // is warned about and skipped rather than failing the transfer: every script
+    // path rejects a typo eagerly at the call, so one reaching here came from
+    // the control plane, and dropping a transfer over a formatting policy would
+    // be the worse failure.
+    //
+    // Resolved once, here, and handed to the send path already resolved — the
+    // target and the identity headers must not be able to disagree about which
+    // policy they were shaped by.
+    let number_policy = match crate::script::api::numbers::resolve_dial_shape(number_shape) {
+        Ok(policy) => policy,
+        Err(_) => {
+            warn!(
+                call_id = %call_id,
+                shape = ?number_shape,
+                "leg replacement: unresolvable number policy — dialling the target unreshaped"
+            );
+            None
+        }
+    };
     let reshaped_target;
-    let target_uri = match crate::script::api::numbers::resolve_dial_policy(number_policy) {
-        Ok(Some(policy)) => {
-            reshaped_target =
-                crate::script::api::numbers::reformat_dial_target(target_uri, &policy);
+    let target_uri = match number_policy.as_deref() {
+        Some(policy) => {
+            reshaped_target = crate::script::api::numbers::reformat_dial_target(target_uri, policy);
             if reshaped_target != target_uri {
                 debug!(
                     call_id = %call_id,
@@ -28818,15 +28841,7 @@ fn b2bua_start_leg_replacement(
             }
             reshaped_target.as_str()
         }
-        Ok(None) => target_uri,
-        Err(_) => {
-            warn!(
-                call_id = %call_id,
-                policy = ?number_policy,
-                "leg replacement: unknown number_policy — dialling the target unreshaped"
-            );
-            target_uri
-        }
+        None => target_uri,
     };
 
     // Dial the target as a new leg, then record the replacement tagged with
@@ -28996,7 +29011,7 @@ fn b2bua_start_leg_replacement(
             // target just did — the dial path reshapes both together
             // (`apply_for_dial`), and a From in one shape next to an R-URI in
             // another is what an SBC reads as inconsistent.
-            number_policy,
+            number_policy.as_deref(),
             None,
             None,
             None,

@@ -2601,7 +2601,7 @@ def on_invite(call):
         // policy is present whichever of the two runs first.
         use crate::numbers::policy::{NumberPolicyConfig, NumberRegistry, NumberingConfig};
         use crate::script::api::call::{CallAction, PyCall, ReferMode};
-        use crate::script::api::numbers::{set_number_runtime, NumberRuntime};
+        use crate::script::api::numbers::{set_number_runtime, NumberRuntime, NumberShape};
         use crate::sip::builder::SipMessageBuilder;
         use crate::sip::message::Method;
         use crate::sip::uri::SipUri;
@@ -2683,12 +2683,15 @@ def refered(call):
             CallAction::AcceptRefer {
                 target,
                 mode,
-                number_policy,
+                number_shape,
                 ..
             } => {
                 assert_eq!(target.as_deref(), Some("sip:0201234567@carrier.example"));
                 assert_eq!(mode, Some(ReferMode::Terminate));
-                assert_eq!(number_policy.as_deref(), Some("test-e164@2026"));
+                assert_eq!(
+                    number_shape,
+                    Some(NumberShape::Named("test-e164@2026".to_string()))
+                );
             }
             other => panic!("expected AcceptRefer, got {other:?}"),
         }
@@ -2696,6 +2699,104 @@ def refered(call):
         match invoke("sip:+31201234567@bogus.example") {
             CallAction::RejectRefer { code, .. } => assert_eq!(code, 500),
             other => panic!("expected the unknown policy to raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b2bua_accept_refer_takes_an_inline_format_with_no_policy_configured() {
+        // The complaint this exists for, verbatim: a script that shapes numbers
+        // with `rewrite_identities(format="plain")` everywhere has no
+        // `number_policies:` block at all, so `number_policy="plain"` failed
+        // with `unknown number policy "plain"` — a format is not a policy name.
+        // `format=` is the inline half `rewrite_identities` always had and the
+        // dial family never did.
+        use crate::script::api::call::{CallAction, PyCall, ReferMode};
+        use crate::script::api::numbers::NumberShape;
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::uri::SipUri;
+        use std::sync::{Arc, Mutex};
+
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_refer
+def refered(call):
+    if call.refer_to.endswith("@both.example"):
+        try:
+            call.accept_refer(number_policy="carrier@2026", format="plain")
+        except ValueError:
+            call.reject_refer(400, "Both")
+        return
+    if call.refer_to.endswith("@bogus.example"):
+        try:
+            call.accept_refer(format="e165")
+        except ValueError:
+            call.reject_refer(400, "Bad Format")
+        return
+    call.accept_refer(target="sip:+15550142@carrier.example",
+                      mode="terminate", format="plain")
+"#;
+        let state = compile_temp_script(source).unwrap();
+
+        let refer = SipMessageBuilder::new()
+            .request(
+                Method::Refer,
+                SipUri::new("siphon.example".to_string()).with_user("alice".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reffmt".to_string())
+            .from("<sip:alice@example.com>;tag=ref-fmt".to_string())
+            .to("<sip:bob@example.com>;tag=ref-uas".to_string())
+            .call_id("refer-format@test".to_string())
+            .cseq("2 REFER".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let message_arc = Arc::new(Mutex::new(refer));
+
+        let invoke = |refer_to: &str| -> CallAction {
+            let mut py_call = PyCall::new(
+                "refer-fmt-001".to_string(),
+                Arc::clone(&message_arc),
+                "10.0.0.1".to_string(),
+                "udp".to_string(),
+            );
+            py_call.set_refer_to(refer_to.to_string(), None);
+            Python::attach(|python| {
+                let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+                let callable = state.handlers[0].callable.bind(python);
+                callable
+                    .call1((call_obj.bind(python),))
+                    .expect("handler invocation failed");
+                let action = call_obj.borrow(python).action().clone();
+                action
+            })
+        };
+
+        // The inline format resolves with no `number_policies:` configured.
+        match invoke("sip:+15550142@teams.example") {
+            CallAction::AcceptRefer {
+                mode, number_shape, ..
+            } => {
+                assert_eq!(mode, Some(ReferMode::Terminate));
+                assert_eq!(
+                    number_shape,
+                    Some(NumberShape::Format(crate::numbers::NumberFormat::Plain))
+                );
+            }
+            other => panic!("expected AcceptRefer, got {other:?}"),
+        }
+
+        // Both at once is a ValueError, not a silent precedence rule.
+        match invoke("sip:+15550142@both.example") {
+            CallAction::RejectRefer { code, .. } => assert_eq!(code, 400),
+            other => panic!("expected both-at-once to raise, got {other:?}"),
+        }
+
+        // A bad format raises as a format error rather than as a policy lookup.
+        match invoke("sip:+15550142@bogus.example") {
+            CallAction::RejectRefer { code, .. } => assert_eq!(code, 400),
+            other => panic!("expected a bad format to raise, got {other:?}"),
         }
     }
 

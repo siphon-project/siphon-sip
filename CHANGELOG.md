@@ -37,6 +37,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the one SDK with no way to read that verdict except by matching the wire
   strings by hand, which rots in silence when the event set grows. TypeScript
   gains `transferOutcome` for the same reason.
+
+- **`format=` on `call.dial()`, `call.fork()`, `call.accept_refer()` and
+  `b2bua.replace_peer()`** — the inline half of number shaping that
+  `rewrite_identities()` always had and the dial family never did. `"e164"`,
+  `"plain"`, `"international"` and `"national"` are *formats*, while
+  `number_policy=` does a registry lookup, so `number_policy="plain"` failed with
+  `unknown number policy "plain"` for a perfectly good format. Two arguments that
+  grew apart rather than a design line, and it bites hardest where it is least
+  expected: a deployment that shapes numbers inline
+  (`rewrite_identities(format="plain")`) has no `number_policies:` block at all,
+  so *every* named lookup fails and `number_policy=` was unusable to it without
+  first inventing config for something it already expresses in one word.
+
+  Resolution order is unchanged and now covers both: the named policy, else the
+  inline format, else `b2bua.default_number_policy`, else no reshaping. Passing
+  both raises, as it does on `rewrite_identities()`. The two are carried as a
+  single selector rather than two `Option`s, so "both at once" is
+  unrepresentable below the constructor that rejects it, and the transfer path
+  now resolves once and hands the send path a resolved policy — the target URI
+  and the identity headers can no longer be shaped by different policies.
+
 ### Fixed
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
   of dropped.** A call with one leg is not an error state: a UAS-mode answer, a

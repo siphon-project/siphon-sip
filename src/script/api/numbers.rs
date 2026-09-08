@@ -172,6 +172,59 @@ pub fn reformat_dial_target(target: &str, policy: &NumberPolicy) -> String {
     reformat_target(target, format, policy)
 }
 
+/// How a caller asked for a dialled leg's numbers to be shaped.
+///
+/// `rewrite_identities()` has always taken both forms — `policy=` for a named
+/// registry entry, `format=` for an inline one — while the dial family took only
+/// the named one, so `dial(number_policy="plain")` failed with "unknown number
+/// policy" for a value that is a perfectly good *format*. Two arguments that
+/// grew apart rather than a design line. This is the shared selector that closes
+/// it, and being one enum rather than two `Option`s is what makes "both at once"
+/// unrepresentable below the constructor that rejects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumberShape {
+    /// A named entry from `number_policies:`.
+    Named(String),
+    /// An inline format, over the default identity header set.
+    Format(NumberFormat),
+}
+
+impl NumberShape {
+    /// Build from the mutually-exclusive `number_policy=` / `format=` pair a
+    /// caller supplied. `None` for both means "whatever the config defaults to".
+    pub fn from_args(policy: Option<&str>, format: Option<&str>) -> PyResult<Option<Self>> {
+        match (policy, format) {
+            (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(
+                "pass either number_policy= (a named policy) or format= (an inline format), not both",
+            )),
+            (Some(name), None) => Ok(Some(NumberShape::Named(name.to_string()))),
+            (None, Some(format)) => {
+                let parsed: NumberFormat = format.parse().map_err(|error| {
+                    pyo3::exceptions::PyValueError::new_err(format!("{error}"))
+                })?;
+                Ok(Some(NumberShape::Format(parsed)))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// Resolve a dial/fork/transfer number shape: the named policy, else the inline
+/// format, else the `b2bua.default_number_policy`, else `None`.
+pub fn resolve_dial_shape(shape: Option<&NumberShape>) -> PyResult<Option<Arc<NumberPolicy>>> {
+    match shape {
+        Some(NumberShape::Named(name)) => resolve_dial_policy(Some(name)),
+        // Same construction `rewrite_identities(format=…)` uses: a uniform
+        // policy over the default identity set, on the configured home locale.
+        Some(NumberShape::Format(format)) => Ok(Some(Arc::new(NumberPolicy::uniform(
+            number_runtime().registry.default_locale.clone(),
+            *format,
+            DEFAULT_IDENTITY_HEADERS.to_vec(),
+        )))),
+        None => Ok(default_b2bua_policy()),
+    }
+}
+
 /// Resolve a `number_policy=` argument for the B2BUA dial/fork path: an explicit
 /// named policy, else the `b2bua.default_number_policy`, else `None`.
 pub fn resolve_dial_policy(name: Option<&str>) -> PyResult<Option<Arc<NumberPolicy>>> {
@@ -414,6 +467,54 @@ mod tests {
             reformat_dial_target("sip:pbx.example.com", &policy("plain")),
             "sip:pbx.example.com"
         );
+    }
+
+    #[test]
+    fn shape_from_args_rejects_both_at_once() {
+        // The whole point of one enum instead of two Options: "both" is
+        // rejected at the constructor and unrepresentable after it.
+        assert!(NumberShape::from_args(Some("carrier@2026"), Some("plain")).is_err());
+    }
+
+    #[test]
+    fn shape_from_args_reads_a_named_policy_and_an_inline_format() {
+        assert_eq!(
+            NumberShape::from_args(Some("carrier@2026"), None).unwrap(),
+            Some(NumberShape::Named("carrier@2026".to_string()))
+        );
+        assert_eq!(
+            NumberShape::from_args(None, Some("plain")).unwrap(),
+            Some(NumberShape::Format(NumberFormat::Plain))
+        );
+        // Neither means "whatever b2bua.default_number_policy says".
+        assert_eq!(NumberShape::from_args(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn shape_from_args_rejects_an_unknown_format() {
+        // The complaint that produced this: `number_policy="plain"` failed with
+        // "unknown number policy" because a format is not a policy name. The
+        // inverse has to fail cleanly too, and say so as a format error.
+        assert!(NumberShape::from_args(None, Some("e165")).is_err());
+    }
+
+    #[test]
+    fn inline_format_resolves_without_any_configured_policy() {
+        // The gap this closes: a deployment that only ever used
+        // `rewrite_identities(format=…)` has no `number_policies:` block at all,
+        // so every named lookup fails. An inline format must not need one.
+        let policy = resolve_dial_shape(Some(&NumberShape::Format(NumberFormat::Plain)))
+            .unwrap()
+            .expect("an inline format always resolves");
+        assert_eq!(
+            reformat_dial_target("sip:+15550142@carrier.example", &policy),
+            "sip:15550142@carrier.example"
+        );
+    }
+
+    #[test]
+    fn unresolvable_named_policy_still_errors_through_the_shape() {
+        assert!(resolve_dial_shape(Some(&NumberShape::Named("nope@2026".to_string()))).is_err());
     }
 
     #[test]
