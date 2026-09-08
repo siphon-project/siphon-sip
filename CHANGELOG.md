@@ -222,6 +222,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   call is gone is now released within half a second whatever removed the call,
   and logs a warning naming the session — so the next teardown path that forgets
   says so instead of quietly billing against nobody.
+- **The terminating REFER `NOTIFY` no longer loses a race to its own `BYE`, so
+  a referrer actually learns the transfer completed.** On a siphon-terminated
+  transfer, the final `message/sipfrag` `NOTIFY` and the `BYE` for the replaced
+  leg were emitted as one ordered send unit. Ordering them on the wire is not
+  enough, because the `BYE` ends the very dialog the `NOTIFY` is carried on and
+  a referrer dispatches the two to different places — the `NOTIFY` to the
+  subscription, the `BYE` to the dialog — so the teardown wins even though the
+  `NOTIFY` arrived first. The referrer then answered the `BYE` `200` and
+  rejected the `NOTIFY` `481 Call Leg/Transaction Does Not Exist` on a dialog
+  that no longer existed. RFC 3515 §2.4.4 makes that `NOTIFY` the only thing
+  that tells a referrer how the transfer ended, so the referrer was left
+  believing it never did, and went on holding whatever it had set aside for the
+  transfer until its own idle timer fired minutes later — in the attended case
+  the consultation call, which sat up on the transferor's screen for the best
+  part of seven minutes while the transferred party was connected and correct.
+  The `NOTIFY` now goes out alone and the `BYE` is held on that `NOTIFY`'s
+  branch until the referrer answers it, released by any final response (a
+  rejection ends the transaction too, and holding the leg open after one would
+  be strictly worse), with RFC 3261 §17.1.2.2 Timer F as the backstop for a
+  referrer that never answers at all — the point past which its own transaction
+  would have given up, so the leg is torn down no later than it was before.
+  Observed against Microsoft Teams Direct Routing with the two messages 19 µs
+  apart. A `replace_peer` replacement is unaffected: nobody subscribed, so there
+  is no `NOTIFY` and the `BYE` still leaves immediately.
 - **A transfer target that never answers no longer strands the call.** A
   replacement — a siphon-terminated REFER transfer, and now `replace_peer` — dials
   its target on a call that is already `Answered`, while the answer-timeout sweep

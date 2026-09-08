@@ -335,6 +335,10 @@ struct DispatcherState {
     /// / reject / the decision-deadline sweep. Empty and cheaply skipped when no
     /// control plane is configured (no call is ever controlled).
     pending_inbound_refer: Arc<PendingInboundReferStore>,
+    /// `BYE`s owed to a transfer referrer, held until the terminating `NOTIFY`
+    /// sharing their dialog has been answered — see [`DeferredReferrerByeStore`].
+    /// Empty except while a siphon-terminated transfer is completing.
+    deferred_referrer_bye: Arc<DeferredReferrerByeStore>,
     /// Lawful interception. `None` when `lawful_intercept.enabled` is false.
     ///
     /// The dispatcher consults this on every message, so interception does not
@@ -874,6 +878,7 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         // Interception is enforced here, not in the script. `LI_MANAGER` is
         // set by `init_li` before the dispatcher is built when
         // `lawful_intercept.enabled` is true.
@@ -1001,6 +1006,7 @@ pub async fn run(
                         check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);
                         check_orphaned_ro_sessions(&state);
+                        check_deferred_referrer_byes(&state);
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
@@ -6816,6 +6822,14 @@ fn handle_response(
     // Keyed on the CSeq method so a CANCEL's own response does not stop the
     // INVITE it shares a branch with (§9.1). Non-B2BUA responses simply miss.
     disarm_b2bua_retransmit_for_response(&message, state);
+
+    // A referrer that just answered the terminating sipfrag NOTIFY has learned
+    // the transfer completed, so the BYE that ends the dialog underneath it is
+    // now safe to send (RFC 3515 §2.4.4). Ahead of every other match: the
+    // NOTIFY is siphon's own request on the referrer's dialog and belongs to no
+    // leg, so nothing below would claim it, and the response itself still falls
+    // through to the paths that absorb it.
+    release_deferred_referrer_bye(&message, status_code, state);
 
     // Check if this response matches a UAC request (keepalive, health probe)
     if state.uac_sender.match_response(&message) {
@@ -27453,6 +27467,163 @@ impl PendingInboundReferStore {
     }
 }
 
+/// A `BYE` for a replaced referrer leg, held back until the terminating
+/// `NOTIFY` that shares its dialog has been answered.
+///
+/// Serialized at registration rather than rebuilt at send time: the leg it is
+/// addressed to has already been promoted out of the call by then, so there is
+/// nothing left to build it from. The frame is byte-identical to the one the
+/// immediate send produced.
+struct DeferredReferrerBye {
+    /// The fully built `BYE`, ready to serialize.
+    message: SipMessage,
+    /// The flow the terminating `NOTIFY` went out on — the `BYE` follows it.
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    local_addr: Option<SocketAddr>,
+    /// When the sweep gives up waiting for the `NOTIFY` to be answered.
+    deadline: std::time::Instant,
+    /// For the log line on either path.
+    call_id: String,
+}
+
+/// Store of `BYE`s owed to a transfer referrer, keyed by the `Via` branch of
+/// the terminating `NOTIFY` whose answer releases them.
+///
+/// New per-transfer state: every entry leaves on the `NOTIFY`'s final response
+/// or on the deadline, so the store drains back to baseline under a completed
+/// workload (the classic never-evicted-per-call-entry leak). Covered by the
+/// co-located steady-state leak test
+/// `deferred_referrer_bye_store_drains_to_baseline`.
+#[derive(Default)]
+struct DeferredReferrerByeStore {
+    entries: DashMap<String, DeferredReferrerBye>,
+}
+
+impl DeferredReferrerByeStore {
+    /// Hold a `BYE` until the `NOTIFY` on `branch` is answered.
+    fn insert(&self, branch: &str, deferred: DeferredReferrerBye) {
+        self.entries.insert(branch.to_string(), deferred);
+    }
+
+    /// Release the `BYE` waiting on this branch, if any. Called from the
+    /// response path for every inbound response, so it must stay cheap when
+    /// nothing is in flight — which is the steady state.
+    fn take(&self, branch: &str) -> Option<DeferredReferrerBye> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.entries.remove(branch).map(|(_, deferred)| deferred)
+    }
+
+    /// The `BYE` this response releases, if it is the one the parked `BYE` was
+    /// waiting for.
+    ///
+    /// Any final response releases it, not just a `2xx`: a `481` means the
+    /// referrer has already dropped the dialog, so the `BYE` is moot but
+    /// harmless, and every other failure still ends the `NOTIFY` transaction
+    /// and with it any reason to keep waiting. A provisional does not — the
+    /// transaction is still running and the referrer has not read the sipfrag
+    /// yet.
+    fn take_for_response(
+        &self,
+        message: &SipMessage,
+        status_code: u16,
+    ) -> Option<DeferredReferrerBye> {
+        if status_code < 200 {
+            return None;
+        }
+        self.take(top_via_branch(message)?)
+    }
+
+    /// Drain every `BYE` whose referrer never answered its `NOTIFY`.
+    fn take_expired(&self, now: std::time::Instant) -> Vec<DeferredReferrerBye> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.value().deadline <= now)
+            .map(|entry| entry.key().clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|(_, deferred)| deferred))
+            .collect()
+    }
+
+    /// The number of `BYE`s in flight (leak-test accessor).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// How long a deferred referrer `BYE` waits for its `NOTIFY` to be answered.
+///
+/// RFC 3261 §17.1.2.2 Timer F (`64*T1`) is the bound on the `NOTIFY`'s own
+/// non-INVITE client transaction, so a referrer that has not answered by then
+/// is never going to: releasing the `BYE` at exactly that point means the leg
+/// is torn down no later than it would have been, and the wait costs nothing
+/// against a referrer that answers — which a live one does in milliseconds.
+const DEFERRED_REFERRER_BYE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(64 * 500);
+
+/// Send a `BYE` that was held back for its terminating `NOTIFY`.
+fn send_deferred_referrer_bye(deferred: DeferredReferrerBye, state: &DispatcherState) {
+    let DeferredReferrerBye {
+        message,
+        transport,
+        destination,
+        connection_id,
+        local_addr,
+        call_id,
+        ..
+    } = deferred;
+    debug!(
+        call_id = %call_id,
+        "B2BUA REFER (terminate): terminating NOTIFY settled — releasing the referrer BYE"
+    );
+    send_message_from(
+        message,
+        transport,
+        destination,
+        connection_id,
+        local_addr,
+        state,
+    );
+}
+
+/// Release the referrer `BYE` waiting on this response's branch, if there is
+/// one — see [`DeferredReferrerByeStore::take_for_response`] for which
+/// responses qualify. Driven from [`handle_response`] for every inbound
+/// response.
+fn release_deferred_referrer_bye(message: &SipMessage, status_code: u16, state: &DispatcherState) {
+    if let Some(deferred) = state
+        .deferred_referrer_bye
+        .take_for_response(message, status_code)
+    {
+        send_deferred_referrer_bye(deferred, state);
+    }
+}
+
+/// Release every referrer `BYE` whose `NOTIFY` was never answered. Driven from
+/// the 500 ms maintenance tick.
+fn check_deferred_referrer_byes(state: &DispatcherState) {
+    for deferred in state
+        .deferred_referrer_bye
+        .take_expired(std::time::Instant::now())
+    {
+        warn!(
+            call_id = %deferred.call_id,
+            "B2BUA REFER (terminate): referrer never answered the terminating NOTIFY — sending the BYE anyway"
+        );
+        send_deferred_referrer_bye(deferred, state);
+    }
+}
+
 /// Send the final SIP response to an inbound REFER on the flow it arrived on.
 ///
 /// The single builder every "answer the REFER now" path funnels through — the
@@ -28691,13 +28862,16 @@ fn b2bua_complete_terminated_transfer(
 
     // Terminating NOTIFY (sipfrag 200 OK) and then BYE, both to the referrer.
     //
-    // The order is load-bearing: the BYE ends the very dialog the NOTIFY is
-    // sent on. A referrer that sees the BYE first tears the dialog down and
-    // answers the late NOTIFY with 481, never learning the transfer succeeded
-    // (RFC 3515 §2.4.4; RFC 5589 §6 shows the result NOTIFY ahead of the BYE).
-    // Two separate sends do NOT order on UDP — the workers share the outbound
-    // channel and each owns its own socket — so when both target the same flow
-    // they travel as one unit (see `OutboundMessage::followups`).
+    // The order is load-bearing, and arrival order is not enough to secure it:
+    // the BYE ends the very dialog the NOTIFY is sent on, and a referrer
+    // dispatches the two to different places — the NOTIFY to the subscription,
+    // the BYE to the dialog — so the teardown can win even when the NOTIFY
+    // arrived first. It then answers the BYE and rejects the NOTIFY 481 on a
+    // dialog that is already gone, never learning the transfer succeeded (RFC
+    // 3515 §2.4.4; RFC 5589 §6 shows the result NOTIFY ahead of the BYE). So
+    // the NOTIFY goes out alone and the BYE is parked on its branch until the
+    // referrer answers it — see [`DeferredReferrerByeStore`], which also owns
+    // the Timer F backstop for a referrer that never does.
     //
     // Both are skipped entirely when the replaced leg already left: its dialog
     // is gone, so the NOTIFY would draw a 481 and the BYE would be addressed to
@@ -28711,6 +28885,9 @@ fn b2bua_complete_terminated_transfer(
     let mut referrer_messages: Vec<SipMessage> = Vec::new();
     let mut referrer_route: Option<(Transport, SocketAddr, ConnectionId, Option<SocketAddr>)> =
         None;
+    // The terminating NOTIFY's own branch, once one is built — the key the BYE
+    // is parked under until the referrer answers it.
+    let mut notify_branch: Option<String> = None;
 
     let notify_cseq = if referrer_gone || !origin.notifies_referrer() {
         None
@@ -28757,6 +28934,7 @@ fn b2bua_complete_terminated_transfer(
                     referrer_leg.transport.connection_id,
                     referrer_leg.transport.local_addr,
                 ));
+                notify_branch = top_via_branch(&notify).map(str::to_string);
                 referrer_messages.push(notify);
             }
         }
@@ -28778,30 +28956,40 @@ fn b2bua_complete_terminated_transfer(
                 referrer_leg.transport.remote_addr,
                 referrer_leg.transport.transport,
             );
-            let route = (
-                transport,
-                dest,
-                referrer_leg.transport.connection_id,
-                referrer_leg.transport.local_addr,
-            );
-            if referrer_route == Some(route) {
-                referrer_messages.push(bye);
-            } else {
-                // Different flow than the NOTIFY took (or no NOTIFY was built):
-                // nothing to order against, so flush the NOTIFY on its own route
-                // first and send the BYE on this one.
-                if let Some((transport, dest, connection_id, local_addr)) = referrer_route.take() {
-                    send_messages_in_order_from(
-                        std::mem::take(&mut referrer_messages),
-                        transport,
-                        dest,
-                        connection_id,
-                        local_addr,
-                        state,
+            let connection_id = referrer_leg.transport.connection_id;
+            let local_addr = referrer_leg.transport.local_addr;
+            match notify_branch.take() {
+                // A NOTIFY is going out on this dialog, so the BYE waits for it
+                // to be answered. Ordering the two sends is NOT enough: the
+                // referrer routes them to different places — the NOTIFY to the
+                // subscription, the BYE to the dialog — and the dialog teardown
+                // wins, so it answers the BYE and then rejects the NOTIFY 481
+                // on a dialog that no longer exists. It therefore never learns
+                // the transfer completed (RFC 3515 §2.4.4 makes that NOTIFY the
+                // only thing that tells it), and sits on whatever it was
+                // holding for the transfer — a consultation call, in the
+                // attended case — until its own idle timer fires minutes later.
+                // Observed against Microsoft Teams Direct Routing with the two
+                // 19 µs apart: BYE answered `200`, NOTIFY answered `481`.
+                Some(branch) => {
+                    state.deferred_referrer_bye.insert(
+                        &branch,
+                        DeferredReferrerBye {
+                            message: bye,
+                            transport,
+                            destination: dest,
+                            connection_id,
+                            local_addr,
+                            deadline: std::time::Instant::now() + DEFERRED_REFERRER_BYE_TIMEOUT,
+                            call_id: call_id.to_string(),
+                        },
                     );
                 }
-                referrer_route = Some(route);
-                referrer_messages.push(bye);
+                // No NOTIFY was built (a `SiphonInitiated` replacement, which
+                // nobody subscribed to): nothing to wait for, send it now.
+                None => {
+                    send_message_from(bye, transport, dest, connection_id, local_addr, state);
+                }
             }
         }
     }
@@ -36589,6 +36777,151 @@ a=rtpmap:8 PCMA/8000\r\n";
             );
         }
         assert_eq!(store.len(), baseline);
+    }
+
+    /// Build a `DeferredReferrerBye` with the given backstop deadline.
+    fn sample_deferred_bye(deadline: std::time::Instant) -> DeferredReferrerBye {
+        DeferredReferrerBye {
+            message: sample_refer(),
+            transport: Transport::Udp,
+            destination: "192.0.2.1:5060".parse().expect("destination must parse"),
+            connection_id: ConnectionId::default(),
+            local_addr: None,
+            deadline,
+            call_id: "transfer-call@example.com".to_string(),
+        }
+    }
+
+    #[test]
+    fn deferred_referrer_bye_store_drains_to_baseline() {
+        // THE leak gate: N transfers each park a BYE, then each leaves by one of
+        // the two exit paths (the NOTIFY is answered → take, or the referrer
+        // never answers → take_expired). The store MUST return to baseline — a
+        // per-transfer entry that is never evicted is the exact leak this
+        // catches, and this one holds a whole SipMessage.
+        let store = DeferredReferrerByeStore::default();
+        let baseline = store.len();
+        assert_eq!(baseline, 0);
+
+        let now = std::time::Instant::now();
+        let future = now + std::time::Duration::from_secs(32);
+        let past = now - std::time::Duration::from_secs(1);
+
+        for cycle in 0..64 {
+            let answered = format!("z9hG4bK-answered-{cycle}");
+            let abandoned = format!("z9hG4bK-abandoned-{cycle}");
+
+            store.insert(&answered, sample_deferred_bye(future));
+            store.insert(&abandoned, sample_deferred_bye(past));
+            assert_eq!(store.len(), baseline + 2);
+
+            // The referrer answered the NOTIFY: the response path releases it.
+            assert!(store.take(&answered).is_some());
+            // The referrer never answered: the Timer F sweep releases it.
+            let expired = store.take_expired(now);
+            assert_eq!(expired.len(), 1);
+
+            assert_eq!(
+                store.len(),
+                baseline,
+                "store must drain to baseline after cycle {cycle}"
+            );
+        }
+        assert_eq!(store.len(), baseline);
+    }
+
+    #[test]
+    fn deferred_referrer_bye_is_released_once_and_only_for_its_own_branch() {
+        // The BYE is keyed on the terminating NOTIFY's branch, so an unrelated
+        // response must not release it — the referrer's dialog would be torn
+        // down while it is still waiting to hear the transfer completed.
+        let store = DeferredReferrerByeStore::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(32);
+        store.insert("z9hG4bK-notify", sample_deferred_bye(deadline));
+
+        assert!(
+            store.take("z9hG4bK-someone-else").is_none(),
+            "a response on another branch must not release the BYE"
+        );
+        assert_eq!(store.len(), 1);
+
+        assert!(store.take("z9hG4bK-notify").is_some());
+        assert!(
+            store.take("z9hG4bK-notify").is_none(),
+            "a NOTIFY retransmission's second response must not send a second BYE"
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    /// A response on `branch` carrying `status_code`, as the response path sees it.
+    fn sample_response_on_branch(branch: &str, status_code: u16) -> SipMessage {
+        let raw = format!(
+            "SIP/2.0 {status_code} Whatever\r\n\
+             Via: SIP/2.0/UDP 192.0.2.100:5060;branch={branch}\r\n\
+             From: <sip:proxy@example.com>;tag=proxytag\r\n\
+             To: <sip:alice@example.com>;tag=alicetag\r\n\
+             Call-ID: refer-call@example.com\r\n\
+             CSeq: 3 NOTIFY\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        parse_sip_message(&raw)
+            .expect("response fixture must parse")
+            .1
+    }
+
+    #[test]
+    fn deferred_referrer_bye_waits_for_a_final_response() {
+        // The BYE is released by the response that ENDS the NOTIFY transaction.
+        // A provisional must not release it — the referrer has not read the
+        // sipfrag yet, and tearing the dialog down now reproduces the very race
+        // the deferral exists to close.
+        let store = DeferredReferrerByeStore::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(32);
+        store.insert("z9hG4bK-notify", sample_deferred_bye(deadline));
+
+        let provisional = sample_response_on_branch("z9hG4bK-notify", 100);
+        assert!(
+            store.take_for_response(&provisional, 100).is_none(),
+            "a provisional must not release the BYE"
+        );
+        assert_eq!(store.len(), 1);
+
+        let final_response = sample_response_on_branch("z9hG4bK-notify", 200);
+        assert!(
+            store.take_for_response(&final_response, 200).is_some(),
+            "the NOTIFY's 200 releases the BYE"
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn deferred_referrer_bye_is_released_by_a_notify_rejection_too() {
+        // A referrer that rejects the NOTIFY (481 — it already dropped the
+        // dialog, or 489 — it does not know the event package) has still ended
+        // the transaction. Holding the BYE for the full Timer F backstop there
+        // would keep a replaced leg alive for 32s for nothing.
+        for status in [481u16, 489, 500] {
+            let store = DeferredReferrerByeStore::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(32);
+            store.insert("z9hG4bK-notify", sample_deferred_bye(deadline));
+            let response = sample_response_on_branch("z9hG4bK-notify", status);
+            assert!(
+                store.take_for_response(&response, status).is_some(),
+                "a {status} on the NOTIFY must still release the BYE"
+            );
+            assert_eq!(store.len(), 0);
+        }
+    }
+
+    #[test]
+    fn deferred_referrer_bye_take_is_cheap_when_idle() {
+        // `take` runs for every inbound response siphon handles, and the store
+        // is empty in the steady state. The empty short-circuit is what keeps
+        // that off the hot path, so assert the empty case answers None.
+        let store = DeferredReferrerByeStore::default();
+        assert!(store.take("z9hG4bK-anything").is_none());
+        assert!(store.take_expired(std::time::Instant::now()).is_empty());
     }
 
     #[test]
