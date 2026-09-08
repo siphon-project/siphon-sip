@@ -333,6 +333,34 @@ pub struct B2buaConfig {
     ///   log_dial: true
     /// ```
     pub log_dial: Option<bool>,
+
+    /// Ceiling on how long an answered B2BUA call may run, in seconds, for
+    /// every call that does not set its own `call.dial(max_duration=…)`.
+    ///
+    /// **Unset by default** — an answered call is otherwise bounded by nothing
+    /// except a peer BYE, a script `terminate()`, or the RFC 4028 session timer
+    /// where that is configured *and* the far end honours it. This is the
+    /// backstop for the rest: a carrier leg that goes silent with the dialog
+    /// still up holds a call actor, a media anchor, a charging session and an
+    /// RTP port pair until the process restarts.
+    ///
+    /// Measured from the answer, not from the dial — the ring is already
+    /// bounded by `call.dial(timeout=…)`, and a cap that counted ring time
+    /// would give a call that rang for 25 s less talk time than one that was
+    /// picked up instantly.
+    ///
+    /// On expiry siphon BYEs both legs through the ordinary teardown: RFC 3326
+    /// `Reason: Q.850;cause=102`, a CDR with `disconnect_initiator="timeout"`,
+    /// Rf/Ro `ACR-STOP`, media released. No Python handler fires, the same as
+    /// for a session-timer expiry.
+    ///
+    /// A call opts out with `call.dial(max_duration=0)`.
+    ///
+    /// ```yaml
+    /// b2bua:
+    ///   max_call_duration_secs: 14400    # 4h
+    /// ```
+    pub max_call_duration_secs: Option<u32>,
 }
 
 impl B2buaConfig {
@@ -359,6 +387,16 @@ impl B2buaConfig {
     /// `false` — see [`log_dial`](Self::log_dial).
     pub fn log_dial_enabled(&self) -> bool {
         self.log_dial.unwrap_or(false)
+    }
+
+    /// The default maximum answered call duration, or `None` for uncapped —
+    /// see [`max_call_duration_secs`](Self::max_call_duration_secs).
+    ///
+    /// An explicit `0` normalises to `None` so that writing the knob down as
+    /// "no limit" means the same thing as leaving it out, and matches the
+    /// per-call `max_duration=0` opt-out.
+    pub fn resolved_max_call_duration_secs(&self) -> Option<u32> {
+        self.max_call_duration_secs.filter(|seconds| *seconds > 0)
     }
 
     /// Resolve the configured default REFER mode. `None`, empty, or an
@@ -7363,6 +7401,50 @@ gateway:
         assert_eq!(group2.algorithm, "hash");
         assert_eq!(group2.destinations[0].weight, 1); // default
         assert_eq!(group2.destinations[0].priority, 1); // default
+    }
+
+    #[test]
+    fn parses_b2bua_max_call_duration() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+b2bua:
+  max_call_duration_secs: 14400
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.b2bua.max_call_duration_secs, Some(14400));
+        assert_eq!(config.b2bua.resolved_max_call_duration_secs(), Some(14400));
+    }
+
+    #[test]
+    fn max_call_duration_absent_or_zero_is_uncapped() {
+        // Absent is the historical behaviour (an answered call is bounded only
+        // by a peer BYE or the session timer). An explicit 0 is how an operator
+        // writes "no limit" down, and must mean the same thing as leaving it
+        // out — it is also the per-call `max_duration=0` opt-out's value.
+        let base = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let absent = Config::from_str(base).unwrap();
+        assert_eq!(absent.b2bua.max_call_duration_secs, None);
+        assert_eq!(absent.b2bua.resolved_max_call_duration_secs(), None);
+
+        let zero =
+            Config::from_str(&format!("{base}b2bua:\n  max_call_duration_secs: 0\n")).unwrap();
+        assert_eq!(zero.b2bua.resolved_max_call_duration_secs(), None);
     }
 
     #[test]

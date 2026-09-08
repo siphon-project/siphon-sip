@@ -1923,6 +1923,38 @@ jobs:
       - name: A raised handler and call.terminate() must both fail the call
         run: MODE=both PYO3_PYTHON=python3.14 scripts/b2bua_answer_fail_test.sh
 
+  # An answered call has to be able to end on siphon's own clock. `timeout=`
+  # bounds the ring and stops mattering at the 200 OK, so before max_duration an
+  # answered call was bounded by nothing but a peer BYE or a session timer —
+  # a carrier leg that went quiet with its dialog up held a call actor, a media
+  # anchor and a charging session until the process restarted. Deterministic and
+  # needs no capability: neither SIPp peer ever hangs up in the capped arms, so
+  # the BYE they both wait for can only be the cap, and each asserts it carries
+  # RFC 3326 Q.850;cause=102. The opt-out arm is the one that keeps the other two
+  # honest — a cap applied unconditionally would pass them both.
+  sipp-b2bua-max-duration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SIPp
+        run: sudo apt-get update && sudo apt-get install -y sip-tester
+
+      - name: Build siphon
+        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+
+      - name: A call must be cut at its maximum duration, and only then
+        run: PYO3_PYTHON=python3.14 scripts/b2bua_max_duration_test.sh
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest

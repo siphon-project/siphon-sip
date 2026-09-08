@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA maximum-call-duration UAC:
+  INVITE -> 180 -> 200 OK -> ACK -> (wait) -> receive siphon's BYE -> 200
+
+  The caller never sends a BYE of its own. Once the call is answered nothing in
+  the test config can end it: the ring timeout no longer applies, no session
+  timer is configured, and the callee sits still too. So the BYE this scenario
+  waits for can only be the maximum-duration teardown, and the assertion that
+  it carries Reason: Q.850;cause=102 is what separates it from any other
+  teardown siphon might run.
+-->
+<scenario name="B2BUA maximum call duration UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-max-duration-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Sit on the answered call. siphon must hang it up, not us. -->
+  <recv request="BYE" crlf="true">
+    <action>
+      <!-- RFC 3326: the cause is what says WHY the framework hung up, and it
+           is the only thing on the wire that does. A BYE with no Reason would
+           still pass a "did the call end" check. -->
+      <ereg regexp="Q\.850;cause=102" search_in="hdr" header="Reason:"
+            check_it="true" assign_to="1" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- $1 exists only to carry check_it; SIPp refuses a scenario with an
+       assigned variable nothing references. -->
+  <Reference variables="1" />
+
+</scenario>

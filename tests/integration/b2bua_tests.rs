@@ -3275,3 +3275,85 @@ fn flow_pinned_bye_retransmits_on_the_non_invite_schedule() {
     assert_eq!(retransmitted.source_local_addr, Some(ue_port_uc()));
     assert!(plain.try_recv().is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Maximum call duration (call.dial(max_duration=…) / b2bua.max_call_duration_secs)
+// ---------------------------------------------------------------------------
+
+/// The ring and the talk are bounded by two different clocks, and only the
+/// first one existed. `call.dial(timeout=…)` arms `answer_deadline`, which the
+/// answer-timeout sweep reads and which stops mattering the moment a 2xx lands;
+/// after that a call was bounded by nothing but a peer BYE. So the two sweeps
+/// have to partition the call population between them: neither may claim a call
+/// the other owns, or an un-answered call gets BYE'd instead of CANCELled and
+/// an answered one gets a 408 instead of a teardown.
+#[test]
+fn answer_timeout_and_max_duration_sweeps_never_claim_the_same_call() {
+    let store = CallActorStore::new();
+    let now = std::time::Instant::now();
+
+    // Still ringing, past its answer deadline, and carrying a max duration
+    // that is nominally exceeded — but it never answered, so the duration
+    // clock has not started and only the answer sweep may have it.
+    let ringing = store.create_call(make_a_leg("ringing@test"));
+    store.set_answer_deadline(&ringing, now - std::time::Duration::from_secs(1));
+    store
+        .get_call_mut(&ringing)
+        .expect("call exists")
+        .max_duration_secs = Some(1);
+
+    // Answered, and up for longer than its cap. Its answer deadline is long
+    // past too — the answer sweep must still leave it alone.
+    let answered = store.create_call(make_a_leg("answered@test"));
+    store.set_answer_deadline(&answered, now - std::time::Duration::from_secs(1));
+    store.add_b_leg(&answered, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&answered, 0);
+    {
+        let mut call = store.get_call_mut(&answered).expect("call exists");
+        call.max_duration_secs = Some(60);
+        let answered_at = call.answered_at.expect("winning 2xx stamps the answer");
+        call.answered_at = Some(answered_at - std::time::Duration::from_secs(61));
+    }
+
+    assert_eq!(store.take_timed_out_calls(now), vec![ringing.clone()]);
+    assert_eq!(
+        store.take_calls_over_max_duration(now, None),
+        vec![answered.clone()]
+    );
+
+    // Neither sweep removes anything: the dispatcher runs the teardown, which
+    // needs the call state to build the CANCEL / BYE it sends.
+    assert_eq!(store.count(), 2);
+}
+
+/// An answered call inside its cap must survive every sweep, whether the cap is
+/// its own or the operator's `b2bua.max_call_duration_secs`. This is the
+/// regression that matters most: the sweep runs twice a second against every
+/// call on the box, so an off-by-one here cuts live calls.
+#[test]
+fn an_answered_call_inside_its_cap_is_left_alone() {
+    let store = CallActorStore::new();
+    let now = std::time::Instant::now();
+
+    let call_id = store.create_call(make_a_leg("talking@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    {
+        let mut call = store.get_call_mut(&call_id).expect("call exists");
+        let answered_at = call.answered_at.expect("winning 2xx stamps the answer");
+        call.answered_at = Some(answered_at - std::time::Duration::from_secs(600));
+    }
+
+    // No cap anywhere: the behaviour every deployment had before this existed.
+    assert!(store.take_calls_over_max_duration(now, None).is_empty());
+    // Under the operator default.
+    assert!(store
+        .take_calls_over_max_duration(now, Some(3600))
+        .is_empty());
+    // Its own cap, tighter than the default but not yet reached.
+    store
+        .get_call_mut(&call_id)
+        .expect("call exists")
+        .max_duration_secs = Some(900);
+    assert!(store.take_calls_over_max_duration(now, Some(60)).is_empty());
+}

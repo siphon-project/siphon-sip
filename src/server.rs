@@ -3508,6 +3508,11 @@ async fn spawn_li_tasks(li_state: Option<LiState>, config: &Config) {
                     entry.detail,
                 );
                 let _ = file.write_all(line.as_bytes()).await;
+                // Flush per entry. Tokio buffers the write, and this handle is
+                // held open for the life of the process, so an unflushed audit
+                // record would sit in the buffer indefinitely rather than
+                // being readable the moment the operation it records happened.
+                let _ = file.flush().await;
             }
         }
     });
