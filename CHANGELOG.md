@@ -151,6 +151,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   metric names rather than a bare assertion.
 
 ### Changed
+- **The built-in `voice_ai` media profile ships barge-in whole.** It set
+  `ws_barge_in` while leaving `ws_vad_engine` and `ws_vad_min_speech_ms` unset,
+  which is the energy detector with no leading-speech requirement — the exact
+  combination the voice-AI cookbook tells operators not to use. The speech-start
+  edge then fires on the first frame that reads as loud, so a cough, a door, a
+  keyboard or one burst of uncancelled echo cuts the prompt: the agent
+  interrupts itself and the caller's transcript comes back as what the agent
+  just said. The built-in now sets `ws_vad_engine: neural` (which answers "is
+  this speech" rather than "is this loud") and `ws_vad_min_speech_ms: 100`,
+  inside the 60–120 ms band that stays under the turn-start latency a caller
+  notices. It also now asserts `received_from`, which is *policy* — the per-call
+  address is injected from the message source and the flag is inert where there
+  is none — because this profile exists for app clients answering to an AI, and
+  those are the clients behind NAT: without it their media is gated out on the
+  private address in their own `c=`, and the failure presents as an agent that
+  never speaks on a call whose signalling is clean. An operator wanting the
+  cheap detector still says so on a `media.profiles` override. **Note that such
+  an override replaces the built-in outright rather than merging into it**, so
+  it has to restate every flag it still wants; the cookbook and `siphon.yaml`
+  examples now show the full set and say so.
 - **The embedded operator dashboard (experimental) is restructured.** Nine views
   — Overview, Calls, Registrations, Gateways, Signalling, Media, Control,
   Security, System — replacing seven, with the new ones covering subsystems that
@@ -187,6 +207,47 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   reaches the auto-ban the way it already does on the control plane.
 
 ### Fixed
+- **`SdpBody` emits a media section in RFC 4566 §5 line order.** §5 fixes the
+  order inside a media description — `m=`, `i=`, `c=`, `b=`, `k=`, then `a=` —
+  and the parser bucketed every line that is not an `a=rtpmap` / `a=fmtp` into
+  one arrival-ordered vector that the serializer replayed as it stood. So a body
+  whose `c=` arrived behind an attribute was re-emitted in that same illegal
+  order, and a script written specifically to normalise a carrier-facing body
+  could not: `sdp.parse(request)` then `s.apply(request)` reproduced the
+  violation exactly. Line-oriented parsers shrug this off, which is why it can
+  sit in production for a long time; strict grammar-driven ones answer `400 Bad
+  Request`, having read the section as carrying no connection address at all,
+  and a body every other carrier accepts then fails against one. The serializer
+  now partitions on the way out, preserving relative order *within* each group
+  because §5 fixes where the groups sit and not what the sender puts inside one
+  — the order of repeated `b=` lines and of the attribute sequence carries
+  meaning. A section already in §5 order comes back byte-identical, so nothing
+  that was on the wire before this changes shape. Session-level lines are still
+  emitted as they arrived; only media sections are repaired.
+- **The SDP `o=` session-id fits a signed 64-bit integer.** RFC 3264 §5 requires
+  the `o=` session-id and version to be "representable with a 64 bit signed
+  integer". The generator drew a full-range `u64` from a v4 UUID, so roughly
+  every second dialog emitted an id above `i64::MAX` — and it is stamped onto
+  every SDP siphon emits toward a leg, so this was the common path and not an
+  edge case. A peer parsing the field with `strtoll` / `ParseInt` overflows on a
+  body that is otherwise fine, and because the value is random per call the
+  symptom is intermittent: the same route works, then does not, with nothing in
+  any log to separate the two calls. Now masked into the non-negative signed
+  range; 63 bits of a v4 UUID is far more collision resistance than a field that
+  only has to be unique among one peer's live sessions. The companion version
+  starts at 0 and only ever increments, so it was never at risk.
+- **`rtpengine.delete()` on a session the engine has already released logs at
+  debug, not warn.** Deleting an already-released call is not a script bug: the
+  engine releases the media session itself on two paths a script also runs
+  teardown on — the media-timeout reaper drops the call *before* emitting the
+  event `@rtpengine.on_media_timeout` fires on, and the `on_answer`-failure path
+  releases it before `@b2bua.on_failure` runs. On both, the script's `delete` is
+  correct, ordinary, and warned. The cost was not the line but what it taught:
+  teardown warnings become noise to skim, and a delete that fails for a reason
+  worth acting on — engine unreachable, a leaked session — was indistinguishable
+  from the ordinary race. Every other failure still warns. This brings the
+  script-facing verb in line with the rule the dispatcher already applied at its
+  own safety-net deletes.
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
   of dropped.** A call with one leg is not an error state: a UAS-mode answer, a
   `call.handover()`, an IVR and a WebSocket-takeover leg all have exactly one

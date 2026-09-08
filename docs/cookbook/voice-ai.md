@@ -54,7 +54,12 @@ the most common mistake here:
 
 ## The profile
 
-The built-in `voice_ai` profile sets everything except the endpoint:
+The built-in `voice_ai` profile sets everything except the endpoint. A
+`media.profiles` entry of the same name **replaces** it outright rather than
+merging into it, so an override has to restate every flag below that it still
+wants — dropping `ws_vad_engine` or `ws_vad_min_speech_ms` puts barge-in back on
+the energy detector with no leading run, which is the self-interrupting agent
+described further down:
 
 ```yaml
 media:
@@ -73,7 +78,10 @@ media:
         echo_delay_search_ms: 400         # widen past a carrier/mobile leg
         ws_vad: true                      # turn boundaries without server-side VAD
         ws_barge_in: true                 # cut playout on the caller's speech edge
+        ws_vad_engine: neural             # "is this speech", not "is this loud"
+        ws_vad_min_speech_ms: 100         # leading run before the speech-start edge
         ws_vad_hangover_ms: 300
+        received_from: true               # gate on the real post-NAT source
       answer: *voice_ai_flags
 ```
 
