@@ -58,6 +58,56 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   now resolves once and hands the send path a resolved policy — the target URI
   and the identity headers can no longer be shaped by different policies.
 
+- **`/admin/metrics.json` reports `null` for a subsystem this node has not
+  configured**, instead of a zero indistinguishable from "configured and idle".
+  Applies to `diameter`, `rtpengine`, `control`, `sbi`, `ipsec` and the Rf / Ro /
+  lawful-intercept session counts.
+- **`/admin/metrics.json` surfaces signal that was already collected and never
+  exposed**: per-method and per-class traffic breakdowns, Diameter per-command
+  and per-error-kind totals, per-instance media health, control-plane
+  connections / controlled calls / commands / dropped events, TLS handshake
+  failures, connections refused by reason, and the Rf / Ro / LI session counts.
+- **`/admin/calls` reports what it already had in hand**: ring and talk duration,
+  per-branch status including the failure code, which branch won, per-leg
+  transport and remote address, session-timer state, transfer state, controlling
+  app, recording flag, and per-carrier LCR attempts (including whether siphon
+  actually dialled a carrier, so a local gateway fault is not read as a carrier
+  fault).
+- **`/admin/registrations` reports transport, source address, a derived NAT
+  flag, GRUU `+sip.instance`, `reg-id`, Path depth, IMS pending state, and which
+  instance accepted the binding** — the fields that answer "why can't I reach
+  this subscriber".
+- **Two tests that prevent this class of defect recurring**: one asserts every
+  metric declared on `SiphonMetrics` has a write site outside `src/metrics/`, the
+  other that it reaches `/admin/metrics.json`. Both fail with the offending
+  metric names rather than a bare assertion.
+
+### Changed
+- **The embedded operator dashboard (experimental) is restructured.** Nine views
+  — Overview, Calls, Registrations, Gateways, Signalling, Media, Control,
+  Security, System — replacing seven, with the new ones covering subsystems that
+  were entirely invisible before. Throughout, a metric belonging to an
+  unconfigured subsystem renders as "not configured" and never as a zero, and its
+  nav entry is greyed; conflating the two is what let the dead counters sit
+  unnoticed. The Calls view gains live duration, per-branch outcomes and a
+  detail drawer; Registrations gains transport, source and NAT columns.
+
+  IPsec SA pairs are no longer filed under a "5GC · SBI" card: sec-agree is Gm
+  access security (3GPP TS 33.203, RFC 3329 over SIP) and N5/Npcf is
+  service-based policy control to the PCF — unrelated reference points, and a 4G
+  IMS P-CSCF has the first and none of the second.
+
+  Chart history now survives a page reload, only the visible view is polled, and
+  polling backs off while the tab is hidden. `ui/` is split into stylesheet and
+  ES modules; there is still no build step.
+
+### Removed
+- `siphon_request_duration_seconds`, `siphon_transaction_duration_seconds` and
+  `siphon_script_executions_total`, which were registered, never observed, and
+  emitted nothing. Removing a metric that never produced a series breaks no
+  scrape contract. Handler volume is already covered by
+  `siphon_pyexec_jobs_completed_total`.
+
 ### Fixed
 - **An in-dialog REFER or NOTIFY on a call with no far leg is answered instead
   of dropped.** A call with one leg is not an error state: a UAS-mode answer, a
@@ -105,6 +155,58 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   responses on one INVITE server transaction (RFC 3261 §17.2.1) — and
   registered a control channel for a call nobody was on. `dial` / `fork` /
   `route` had the same shape, dialling a B-leg for an abandoned call.
+
+- **Seven metrics were registered but never written, so they exported a flat
+  zero — or no series at all — for the life of the process.** Anything built on
+  them was silently dead: a Grafana panel on `siphon_requests_total` drew a flat
+  line, and an alert rule on it could never fire. An `IntCounterVec` that is
+  never incremented collects nothing, so `siphon_requests_total`,
+  `siphon_responses_total` and `siphon_connections_active` were absent from
+  `/metrics` entirely rather than reading zero; `siphon_dialogs_active`,
+  `siphon_transactions_active`, `siphon_uptime_seconds` and
+  `siphon_script_errors_total` published a hardcoded zero. Verified on a node
+  with 16 h uptime carrying live calls. All are now wired:
+
+  - `siphon_requests_total{method,direction}` and
+    `siphon_responses_total{class,direction}` count every SIP message in both
+    directions. The labels changed shape (`direction` added, responses keyed on
+    class rather than exact code) — safe to change, because neither metric had
+    ever emitted a single series. Unknown methods collapse into one `OTHER`
+    bucket: the method token comes off an attacker-controlled request line, so
+    labelling by it would let a peer mint unbounded series through the scrape
+    endpoint. These count **wire events**, so a retransmission counts each time.
+  - `siphon_dialogs_active` is now the documented sum of the proxy and B2BUA
+    halves, and both are exported separately — `siphon_proxy_dialog_sessions`
+    already existed, `siphon_b2bua_calls_active` is new. Which side carries the
+    load is the question a single conflated number could not answer.
+  - `siphon_transactions_active` tracks the transaction manager.
+  - `siphon_connections_active{transport}` counts live inbound connections per
+    stream transport, released by an RAII guard so a cancelled connection task
+    cannot leak the gauge upward. UDP is deliberately absent rather than pinned
+    at zero: it is connectionless, so there is no connection to count.
+  - `siphon_uptime_seconds` is published by the dispatcher sweep, so a
+    Prometheus-only deployment sees it without opening the dashboard.
+  - `siphon_script_errors_total` is incremented alongside every Python
+    handler-error log, through one helper, so the counter and the logs cannot
+    disagree.
+  - `siphon_control_events_dropped_total{app}` — a slow control-plane consumer
+    lost events with nothing recorded outside the per-connection counter that
+    died with the connection.
+
+  The per-message counters resolve their Prometheus children into dense arrays
+  at startup rather than looking up labels per call: measured at 4.2 ns against
+  22.5 ns for `with_label_values`, which at 30k cps is the difference between a
+  rounding error and 60k lock-and-hash operations a second. A criterion bench
+  (`traffic_counters`) locks this in.
+
+- **`siphon_pyexec_pool_max` always read 0**, so the dashboard showed a pool of
+  "4 / 0". The executor is installed before `metrics::init()` runs, so the
+  one-shot publish at construction found no registry and was dropped. It is now
+  republished on each sampling tick, independent of startup order.
+- **`/admin/registrations/{aor}` walked `siphon_registrations_active` away from
+  the truth.** It decremented by one, but the gauge is set absolutely everywhere
+  else and the removed AoR may hold any number of contacts. It now re-reads the
+  count.
 
 ## [1.8.5] — 2026-09-08
 

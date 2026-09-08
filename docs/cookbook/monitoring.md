@@ -103,11 +103,46 @@ admin:
 A plain `cargo build` leaves the `ui` feature off, so any project embedding
 siphon as a library carries none of it; a binary built without `--features ui`
 logs a warning and serves nothing when `enabled` is set. Serving the dashboard
-logs an EXPERIMENTAL warning. The dashboard reads `/admin/metrics.json` (Overview,
-System), `/admin/registrations`, and `/admin/bans`, and performs
-force-unregister / lift-ban through the same token — click **Unlock** and paste
-the `admin.auth.token`. Bind the listener internally and put it behind your own
-ingress auth for anything beyond a trusted network.
+logs an EXPERIMENTAL warning.
+
+The views are Overview, Calls, Registrations, Gateways, Signalling, Media,
+Control, Security and System, reading `/admin/metrics.json`,
+`/admin/registrations`, `/admin/calls`, `/admin/gateways` and `/admin/bans`.
+Force-unregister, lift-ban and gateway mark-up/down go through the same bearer
+token — click **Unlock** and paste the `admin.auth.token`. Bind the listener
+internally and put it behind your own ingress auth for anything beyond a trusted
+network.
+
+The dashboard is deliberately **not** a Grafana replacement. Rates and history
+belong in Prometheus; what the dashboard shows is the live, listable state
+Prometheus cannot hold — which calls are up, which AoR is bound where, which
+gateway is down, which control app owns which channel. You cannot put a Call-ID
+in a Prometheus label.
+
+A subsystem this node has not configured shows as **"not configured"** rather
+than a zero, and its nav entry is greyed. That distinction matters: a permanent
+zero reads exactly like an idle subsystem, which is how a set of never-written
+metrics went unnoticed on this dashboard for a long time.
+
+### Reading the traffic counters
+
+`siphon_requests_total{method,direction}` and
+`siphon_responses_total{class,direction}` count **wire events**, not
+transactions. Retransmit detection happens well downstream of the point they are
+taken, so a UDP INVITE retransmitted by Timer A counts once per datagram, and a
+non-2xx INVITE response retransmitted until ACK counts once per send. That is
+the right meaning for a receive/send counter, but it means `requests_total` is
+not a call count and not a transaction count — use `siphon_dialogs_active` (or
+its `siphon_proxy_dialog_sessions` / `siphon_b2bua_calls_active` halves) for
+concurrency, and CDRs for completed calls.
+
+A method siphon does not recognise is counted under `OTHER` rather than by its
+own name. The method is read straight off the request line, so labelling by it
+would let any peer mint unbounded Prometheus series through the scrape endpoint.
+
+`siphon_connections_active{transport}` has **no UDP series**. UDP is
+connectionless, so there is no connection to count; a zero there would read as
+"no UDP traffic", which is a different and wrong statement.
 
 ## Call Detail Records
 

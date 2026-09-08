@@ -23,6 +23,13 @@ static METRICS: OnceLock<SiphonMetrics> = OnceLock::new();
 /// Custom metrics registered by Python scripts.
 static CUSTOM_METRICS: OnceLock<Arc<CustomMetrics>> = OnceLock::new();
 
+/// When metrics were initialised, i.e. process start for uptime purposes.
+///
+/// Kept here rather than threaded through the dispatcher because both the 30 s
+/// sweep and the admin snapshot publish uptime, and a second source of truth is
+/// how the gauge ended up reading zero forever in the first place.
+static STARTED_AT: OnceLock<std::time::Instant> = OnceLock::new();
+
 /// Access the global metrics instance. Returns `None` if not initialized.
 pub fn metrics() -> Option<&'static SiphonMetrics> {
     METRICS.get()
@@ -41,6 +48,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     if METRICS.get().is_some() {
         return Ok(());
     }
+    let _ = STARTED_AT.set(std::time::Instant::now());
     let metrics = SiphonMetrics::new()?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
@@ -54,6 +62,137 @@ pub fn custom_metrics() -> Option<&'static Arc<CustomMetrics>> {
     CUSTOM_METRICS.get()
 }
 
+/// Which way a SIP message crossed the wire, as the `direction` label on
+/// [`SiphonMetrics::record_request`] / [`SiphonMetrics::record_response`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Received from a peer.
+    In,
+    /// Sent to a peer.
+    Out,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Direction::In => 0,
+            Direction::Out => 1,
+        }
+    }
+}
+
+/// Label values for the `method` dimension of `siphon_requests_total`, in the
+/// order [`method_index`] maps to.
+///
+/// `Method::Extension(_)` collapses into the single `OTHER` bucket rather than
+/// passing the token through. The method is read straight off the request line,
+/// so a peer that sends `FOO1 sip:… SIP/2.0`, `FOO2 …`, … would otherwise mint
+/// an unbounded number of Prometheus series through the scrape endpoint — a
+/// cardinality DoS on the monitoring stack rather than on siphon itself.
+pub const METHOD_LABELS: [&str; 15] = [
+    "INVITE",
+    "ACK",
+    "BYE",
+    "CANCEL",
+    "OPTIONS",
+    "REGISTER",
+    "INFO",
+    "UPDATE",
+    "PRACK",
+    "SUBSCRIBE",
+    "NOTIFY",
+    "REFER",
+    "MESSAGE",
+    "PUBLISH",
+    "OTHER",
+];
+
+/// Label values for the `class` dimension of `siphon_responses_total`.
+pub const CLASS_LABELS: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "6xx"];
+
+/// Index into [`METHOD_LABELS`] for a parsed method.
+fn method_index(method: &crate::sip::message::Method) -> usize {
+    use crate::sip::message::Method;
+    match method {
+        Method::Invite => 0,
+        Method::Ack => 1,
+        Method::Bye => 2,
+        Method::Cancel => 3,
+        Method::Options => 4,
+        Method::Register => 5,
+        Method::Info => 6,
+        Method::Update => 7,
+        Method::Prack => 8,
+        Method::Subscribe => 9,
+        Method::Notify => 10,
+        Method::Refer => 11,
+        Method::Message => 12,
+        Method::Publish => 13,
+        Method::Extension(_) => 14,
+    }
+}
+
+/// Index into [`CLASS_LABELS`] for a status code. Anything outside 100–699 is
+/// clamped into the nearest real class rather than dropped, so a malformed
+/// status line still lands somewhere countable.
+fn class_index(status_code: u16) -> usize {
+    ((status_code / 100).clamp(1, 6) - 1) as usize
+}
+
+/// What an already-serialized SIP frame turned out to be.
+enum Frame {
+    /// Index into [`METHOD_LABELS`].
+    Request(usize),
+    Response(u16),
+}
+
+/// Classify a serialized SIP frame from its start line alone.
+///
+/// The outbound counting point sits below serialization (it is the only place
+/// *everything* siphon emits passes through — relayed requests, UAC keepalives
+/// and outbound REGISTERs never touch the typed reply helpers), so the kind has
+/// to be recovered from the bytes. This reads the start line only: no parse, no
+/// allocation, no copy.
+///
+/// Returns `None` for anything that is not a SIP start line, which is how
+/// double-CRLF keepalives stay out of the counters.
+fn classify_frame(data: &[u8]) -> Option<Frame> {
+    // Response: "SIP/2.0 <code> <reason>". Only siphon's own serializer feeds
+    // this path, so the version token is always canonical.
+    if let Some(rest) = data.strip_prefix(b"SIP/2.0 ") {
+        let digits = rest.get(..3)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let code = u16::from(digits[0] - b'0') * 100
+            + u16::from(digits[1] - b'0') * 10
+            + u16::from(digits[2] - b'0');
+        return Some(Frame::Response(code));
+    }
+
+    // Request: "<METHOD> <request-uri> SIP/2.0". Method names are case-sensitive
+    // (RFC 3261 §7.1) and we emit them canonically, so an exact byte match is
+    // correct. Anything unrecognised (including a genuinely empty token) lands
+    // in OTHER rather than minting a series.
+    let end = data.iter().position(|&byte| byte == b' ')?;
+    let token = data.get(..end)?;
+    if token.is_empty() {
+        return None;
+    }
+    let index = METHOD_LABELS
+        .iter()
+        .position(|label| label.as_bytes() == token)
+        .unwrap_or(METHOD_LABELS.len() - 1);
+    Some(Frame::Request(index))
+}
+
 /// All SIPhon metrics in one struct for easy access.
 pub struct SiphonMetrics {
     pub registry: Registry,
@@ -61,6 +200,23 @@ pub struct SiphonMetrics {
     // --- Request counters ---
     pub requests_total: IntCounterVec,
     pub responses_total: IntCounterVec,
+
+    /// Pre-resolved children of `requests_total`, indexed by
+    /// `method_index(m) * 2 + direction.index()`.
+    ///
+    /// These exist because this is the only per-SIP-message counter in the
+    /// process. `IntCounterVec::with_label_values` takes an `RwLock` read and
+    /// hashes the label slice on every call; at 30k cps that is 60k lock+hash
+    /// per second on the hot path for a value that can be an array index. Every
+    /// child is materialised at startup, so each series is also present (as a
+    /// zero) from the first scrape — `rate()` works immediately instead of
+    /// returning "no data" until the first message of that kind arrives.
+    requests_by_method: [IntCounter; METHOD_LABELS.len() * 2],
+
+    /// Pre-resolved children of `responses_total`, indexed by
+    /// `class_index(code) * 2 + direction.index()`. Same rationale as
+    /// [`Self::requests_by_method`].
+    responses_by_class: [IntCounter; CLASS_LABELS.len() * 2],
 
     // --- Transaction gauges ---
     pub transactions_active: IntGauge,
@@ -118,14 +274,25 @@ pub struct SiphonMetrics {
     pub registrations_active: IntGauge,
 
     // --- Dialog gauges ---
+    /// Active SIP dialogs, defined as `proxy_dialog_sessions + b2bua_calls_active`.
+    ///
+    /// A single number here conflates two unrelated things — a proxy retains a
+    /// dialog-key entry per answered call it routed, while a B2BUA owns a
+    /// `CallActor` per bridged call — so prefer the two component gauges when
+    /// you care which side the load is on. This stays as the rolled-up total.
     pub dialogs_active: IntGauge,
 
-    // --- Connection gauges ---
-    pub connections_active: GaugeVec,
+    /// Active B2BUA calls (`CallActorStore::count()`) — the B2BUA half of
+    /// `dialogs_active`.
+    pub b2bua_calls_active: IntGauge,
 
-    // --- Duration histograms ---
-    pub request_duration_seconds: HistogramVec,
-    pub transaction_duration_seconds: HistogramVec,
+    // --- Connection gauges ---
+    /// Live inbound connections per stream transport (`TCP`/`TLS`/`WS`/`WSS`/`SCTP`).
+    ///
+    /// UDP is deliberately absent rather than reported as zero: it is
+    /// connectionless, so there is no connection to count, and a zero here would
+    /// read as "no UDP traffic" instead of "not a meaningful question".
+    pub connections_active: GaugeVec,
 
     // --- Uptime ---
     pub uptime_seconds: Gauge,
@@ -158,7 +325,14 @@ pub struct SiphonMetrics {
     pub python_allocated_blocks: IntGauge,
 
     // --- Script execution ---
-    pub script_executions_total: IntCounterVec,
+    /// Python handler invocations that raised. Incremented by
+    /// `dispatcher::record_script_error` alongside the `error!` log, so the
+    /// counter and the logs cannot disagree.
+    ///
+    /// There is deliberately no matching `script_executions_total`: handler
+    /// volume is already covered by `pyexec_jobs_completed_total`, and a
+    /// per-handler labelled counter would put a label-map lookup on the
+    /// request path to say the same thing.
     pub script_errors_total: IntCounter,
 
     // --- Synchronous Python executor pool (handler dispatch) ---
@@ -331,15 +505,53 @@ impl SiphonMetrics {
     fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
+        // Both counters count *wire events*, not transactions: a retransmitted
+        // INVITE increments once per datagram, because retransmit detection
+        // happens well downstream of the dispatch point these are taken at.
+        // That is the right meaning for a receive/send counter, but it does
+        // mean `requests_total` is not a call or transaction count.
         let requests_total = IntCounterVec::new(
-            Opts::new("siphon_requests_total", "Total SIP requests received"),
-            &["method"],
+            Opts::new(
+                "siphon_requests_total",
+                "SIP requests crossing the wire, including retransmissions (unknown methods bucket into OTHER)",
+            ),
+            &["method", "direction"],
         )?;
 
         let responses_total = IntCounterVec::new(
-            Opts::new("siphon_responses_total", "Total SIP responses sent"),
-            &["code"],
+            Opts::new(
+                "siphon_responses_total",
+                "SIP responses crossing the wire, including retransmissions",
+            ),
+            &["class", "direction"],
         )?;
+
+        // Materialise every child up front so the hot path is an array index
+        // (see the field docs). Label-major, direction-minor — must match
+        // `method_index(m) * 2 + direction.index()`.
+        let mut request_children = Vec::with_capacity(METHOD_LABELS.len() * 2);
+        for method in METHOD_LABELS {
+            for direction in [Direction::In, Direction::Out] {
+                request_children.push(
+                    requests_total.get_metric_with_label_values(&[method, direction.as_str()])?,
+                );
+            }
+        }
+        let requests_by_method: [IntCounter; METHOD_LABELS.len() * 2] = request_children
+            .try_into()
+            .map_err(|_| prometheus::Error::Msg("requests_total child count mismatch".into()))?;
+
+        let mut response_children = Vec::with_capacity(CLASS_LABELS.len() * 2);
+        for class in CLASS_LABELS {
+            for direction in [Direction::In, Direction::Out] {
+                response_children.push(
+                    responses_total.get_metric_with_label_values(&[class, direction.as_str()])?,
+                );
+            }
+        }
+        let responses_by_class: [IntCounter; CLASS_LABELS.len() * 2] = response_children
+            .try_into()
+            .map_err(|_| prometheus::Error::Msg("responses_total child count mismatch".into()))?;
 
         let transactions_active = IntGauge::new(
             "siphon_transactions_active",
@@ -391,32 +603,22 @@ impl SiphonMetrics {
             "Number of active registrations (AoR bindings)",
         )?;
 
-        let dialogs_active =
-            IntGauge::new("siphon_dialogs_active", "Number of active SIP dialogs")?;
+        let dialogs_active = IntGauge::new(
+            "siphon_dialogs_active",
+            "Active SIP dialogs (proxy dialog sessions + active B2BUA calls)",
+        )?;
+
+        let b2bua_calls_active = IntGauge::new(
+            "siphon_b2bua_calls_active",
+            "Number of active B2BUA calls (bridged call actors)",
+        )?;
 
         let connections_active = GaugeVec::new(
-            Opts::new("siphon_connections_active", "Active transport connections"),
+            Opts::new(
+                "siphon_connections_active",
+                "Live inbound connections per stream transport (UDP is connectionless and not reported)",
+            ),
             &["transport"],
-        )?;
-
-        let request_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "siphon_request_duration_seconds",
-                "Request processing duration in seconds",
-            )
-            .buckets(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-            ]),
-            &["method"],
-        )?;
-
-        let transaction_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "siphon_transaction_duration_seconds",
-                "SIP transaction duration from creation to completion",
-            )
-            .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 16.0, 32.0]),
-            &["method", "type"],
         )?;
 
         let uptime_seconds =
@@ -449,14 +651,6 @@ impl SiphonMetrics {
         let python_allocated_blocks = IntGauge::new(
             "siphon_python_allocated_blocks",
             "Currently-allocated CPython memory blocks (sys.getallocatedblocks) — the Python-side leak signal",
-        )?;
-
-        let script_executions_total = IntCounterVec::new(
-            Opts::new(
-                "siphon_script_executions_total",
-                "Total Python script handler executions",
-            ),
-            &["handler"],
         )?;
 
         let script_errors_total = IntCounter::new(
@@ -713,9 +907,8 @@ impl SiphonMetrics {
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
+        registry.register(Box::new(b2bua_calls_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
-        registry.register(Box::new(request_duration_seconds.clone()))?;
-        registry.register(Box::new(transaction_duration_seconds.clone()))?;
         registry.register(Box::new(uptime_seconds.clone()))?;
         registry.register(Box::new(memory_allocated_bytes.clone()))?;
         registry.register(Box::new(memory_resident_bytes.clone()))?;
@@ -724,7 +917,6 @@ impl SiphonMetrics {
         registry.register(Box::new(memory_mapped_bytes.clone()))?;
         registry.register(Box::new(memory_metadata_bytes.clone()))?;
         registry.register(Box::new(python_allocated_blocks.clone()))?;
-        registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
         registry.register(Box::new(pyexec_pool_size.clone()))?;
         registry.register(Box::new(pyexec_pool_max.clone()))?;
@@ -767,6 +959,8 @@ impl SiphonMetrics {
             registry,
             requests_total,
             responses_total,
+            requests_by_method,
+            responses_by_class,
             transactions_active,
             uac_pending_requests,
             proxy_dialog_sessions,
@@ -778,9 +972,8 @@ impl SiphonMetrics {
             ipsec_sa_pairs,
             registrations_active,
             dialogs_active,
+            b2bua_calls_active,
             connections_active,
-            request_duration_seconds,
-            transaction_duration_seconds,
             uptime_seconds,
             memory_allocated_bytes,
             memory_resident_bytes,
@@ -789,7 +982,6 @@ impl SiphonMetrics {
             memory_mapped_bytes,
             memory_metadata_bytes,
             python_allocated_blocks,
-            script_executions_total,
             script_errors_total,
             pyexec_pool_size,
             pyexec_pool_max,
@@ -834,6 +1026,52 @@ impl SiphonMetrics {
             control_auth_failures_total,
             control_handoff_timeouts_total,
         })
+    }
+
+    /// Count one SIP request crossing the wire.
+    ///
+    /// Hot path — one array index plus one relaxed atomic add, no label-map
+    /// lookup. Counts wire events, so a retransmission counts each time.
+    #[inline]
+    pub fn record_request(&self, method: &crate::sip::message::Method, direction: Direction) {
+        // Indices come from `method_index` / `Direction::index`, both of which
+        // are total over their input types, so this cannot be out of range.
+        // `get` rather than `[]` keeps a future label-set edit from panicking
+        // on the datapath.
+        if let Some(counter) = self
+            .requests_by_method
+            .get(method_index(method) * 2 + direction.index())
+        {
+            counter.inc();
+        }
+    }
+
+    /// Count one SIP response crossing the wire. See [`Self::record_request`].
+    #[inline]
+    pub fn record_response(&self, status_code: u16, direction: Direction) {
+        if let Some(counter) = self
+            .responses_by_class
+            .get(class_index(status_code) * 2 + direction.index())
+        {
+            counter.inc();
+        }
+    }
+
+    /// Count one already-serialized SIP frame, classifying it from its start
+    /// line. Used on the outbound path, which sits below serialization.
+    ///
+    /// Non-SIP frames (the double-CRLF keepalive) are ignored.
+    #[inline]
+    pub fn record_frame(&self, data: &[u8], direction: Direction) {
+        match classify_frame(data) {
+            Some(Frame::Request(index)) => {
+                if let Some(counter) = self.requests_by_method.get(index * 2 + direction.index()) {
+                    counter.inc();
+                }
+            }
+            Some(Frame::Response(code)) => self.record_response(code, direction),
+            None => {}
+        }
     }
 }
 
@@ -885,6 +1123,96 @@ pub fn gauge_vec_by_label(
                 .map(|pair| pair.value().to_owned())
                 .unwrap_or_default();
             *out.entry(key).or_insert(0.0) += metric.get_gauge().value();
+        }
+    }
+    out
+}
+
+/// Refresh `siphon_uptime_seconds`. Called from the dispatcher sweep (so a
+/// Prometheus-only deployment sees it) and from the admin snapshot (so a
+/// dashboard poll between sweeps is not 30 s stale).
+pub fn update_uptime() {
+    if let (Some(metrics), Some(started)) = (try_metrics(), STARTED_AT.get()) {
+        metrics.uptime_seconds.set(started.elapsed().as_secs_f64());
+    }
+}
+
+/// [`gauge_vec_by_label`] for an `IntGaugeVec` — e.g. per-instance media health
+/// (`siphon_rtpengine_instance_up` keyed on `"address"`) or per-app control
+/// connections.
+pub fn int_gauge_vec_by_label(
+    vector: &IntGaugeVec,
+    label: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let key = metric
+                .get_label()
+                .iter()
+                .find(|pair| pair.name() == label)
+                .map(|pair| pair.value().to_owned())
+                .unwrap_or_default();
+            *out.entry(key).or_insert(0) += metric.get_gauge().value() as i64;
+        }
+    }
+    out
+}
+
+/// [`gauge_vec_by_label`] for an `IntCounterVec` — the per-label breakdown that
+/// [`sum_int_counter_vec`] collapses away. The dashboard needs both: the total
+/// to derive an overall rate, and the breakdown to say *which* method, command
+/// or refusal reason is moving.
+pub fn int_counter_vec_by_label(
+    vector: &IntCounterVec,
+    label: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let key = metric
+                .get_label()
+                .iter()
+                .find(|pair| pair.name() == label)
+                .map(|pair| pair.value().to_owned())
+                .unwrap_or_default();
+            *out.entry(key).or_insert(0) += metric.get_counter().value() as u64;
+        }
+    }
+    out
+}
+
+/// Per-label totals for one value of a second label — e.g. `requests_total`
+/// broken down by `method`, restricted to `direction="in"`.
+///
+/// Kept separate from [`int_counter_vec_by_label`] rather than generalised into
+/// a filter argument, because these two label sets are the only ones the
+/// dashboard slices this way.
+pub fn int_counter_vec_by_label_where(
+    vector: &IntCounterVec,
+    label: &str,
+    filter_label: &str,
+    filter_value: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let labels = metric.get_label();
+            let matches = labels
+                .iter()
+                .any(|pair| pair.name() == filter_label && pair.value() == filter_value);
+            if !matches {
+                continue;
+            }
+            let key = labels
+                .iter()
+                .find(|pair| pair.name() == label)
+                .map(|pair| pair.value().to_owned())
+                .unwrap_or_default();
+            *out.entry(key).or_insert(0) += metric.get_counter().value() as u64;
         }
     }
     out
@@ -1070,41 +1398,419 @@ mod tests {
         verify_global_allocator();
     }
 
+    /// Read one `requests_total` child directly off the vector, so the test
+    /// asserts against the *registered* series rather than the pre-resolved
+    /// array it is meant to be checking.
+    fn request_count(method: &str, direction: &str) -> u64 {
+        metrics()
+            .unwrap()
+            .requests_total
+            .with_label_values(&[method, direction])
+            .get()
+    }
+
     #[test]
-    fn metrics_init_and_access() {
+    fn record_request_increments_the_matching_series() {
+        use crate::sip::message::Method;
         init().unwrap();
         let metrics = metrics().unwrap();
 
-        // Increment a counter
-        metrics.requests_total.with_label_values(&["INVITE"]).inc();
-        metrics
-            .requests_total
-            .with_label_values(&["REGISTER"])
-            .inc();
-        metrics.requests_total.with_label_values(&["INVITE"]).inc();
+        // The global registry is shared across tests in this binary, so assert
+        // on deltas rather than absolute values.
+        let invite_in_before = request_count("INVITE", "in");
+        let invite_out_before = request_count("INVITE", "out");
+        let register_in_before = request_count("REGISTER", "in");
+
+        metrics.record_request(&Method::Invite, Direction::In);
+        metrics.record_request(&Method::Invite, Direction::In);
+        metrics.record_request(&Method::Register, Direction::In);
+        metrics.record_request(&Method::Invite, Direction::Out);
+
+        assert_eq!(request_count("INVITE", "in") - invite_in_before, 2);
+        assert_eq!(request_count("REGISTER", "in") - register_in_before, 1);
+        assert_eq!(
+            request_count("INVITE", "out") - invite_out_before,
+            1,
+            "direction must select a distinct series"
+        );
+    }
+
+    #[test]
+    fn unknown_methods_bucket_into_other() {
+        use crate::sip::message::Method;
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        let before = request_count("OTHER", "in");
+        metrics.record_request(&Method::Extension("FOO1".into()), Direction::In);
+        metrics.record_request(&Method::Extension("FOO2".into()), Direction::In);
 
         assert_eq!(
-            metrics.requests_total.with_label_values(&["INVITE"]).get(),
-            2
+            request_count("OTHER", "in") - before,
+            2,
+            "extension methods must share one series — the method token is \
+             attacker-controlled, so a series per token is a cardinality DoS"
         );
-        assert_eq!(
+        assert!(
+            !encode_metrics().contains("FOO1"),
+            "an extension method token must never reach a label value"
+        );
+    }
+
+    #[test]
+    fn record_response_buckets_by_class() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        let read = |class: &str| {
             metrics
-                .requests_total
-                .with_label_values(&["REGISTER"])
-                .get(),
-            1
+                .responses_total
+                .with_label_values(&[class, "out"])
+                .get()
+        };
+        let (before_2xx, before_4xx) = (read("2xx"), read("4xx"));
+
+        metrics.record_response(200, Direction::Out);
+        metrics.record_response(202, Direction::Out);
+        metrics.record_response(404, Direction::Out);
+
+        assert_eq!(read("2xx") - before_2xx, 2);
+        assert_eq!(read("4xx") - before_4xx, 1);
+    }
+
+    #[test]
+    fn classify_frame_reads_the_start_line() {
+        let request = |data: &[u8]| match classify_frame(data) {
+            Some(Frame::Request(index)) => METHOD_LABELS[index],
+            other => panic!(
+                "expected a request, got {}",
+                match other {
+                    Some(Frame::Response(code)) => format!("response {code}"),
+                    _ => "nothing".to_string(),
+                }
+            ),
+        };
+
+        assert_eq!(
+            request(b"INVITE sip:bob@biloxi.com SIP/2.0\r\nVia: x\r\n\r\n"),
+            "INVITE"
         );
+        assert_eq!(request(b"ACK sip:bob@biloxi.com SIP/2.0\r\n\r\n"), "ACK");
+        assert_eq!(
+            request(b"REGISTER sip:biloxi.com SIP/2.0\r\n\r\n"),
+            "REGISTER"
+        );
+        // A method siphon does not know is a label-cardinality hazard, so it
+        // must collapse rather than pass through.
+        assert_eq!(request(b"FROBNICATE sip:x@y SIP/2.0\r\n\r\n"), "OTHER");
+
+        match classify_frame(b"SIP/2.0 200 OK\r\nVia: x\r\n\r\n") {
+            Some(Frame::Response(code)) => assert_eq!(code, 200),
+            _ => panic!("expected a 200 response"),
+        }
+        match classify_frame(b"SIP/2.0 486 Busy Here\r\n\r\n") {
+            Some(Frame::Response(code)) => assert_eq!(code, 486),
+            _ => panic!("expected a 486 response"),
+        }
+    }
+
+    #[test]
+    fn classify_frame_ignores_non_sip_frames() {
+        // The CRLF keepalive (RFC 5626 §4.4.1) shares the outbound path and
+        // must not inflate the request counter.
+        assert!(classify_frame(b"\r\n\r\n").is_none());
+        assert!(classify_frame(b"").is_none());
+        assert!(classify_frame(b" ").is_none());
+        // A truncated or non-numeric status line is not a countable response.
+        assert!(classify_frame(b"SIP/2.0 2").is_none());
+        assert!(classify_frame(b"SIP/2.0 OK Fine\r\n").is_none());
+    }
+
+    #[test]
+    fn record_frame_counts_the_outbound_direction() {
+        init().unwrap();
+        let metrics = metrics().unwrap();
+
+        let before_in = request_count("BYE", "in");
+        let before_out = request_count("BYE", "out");
+        metrics.record_frame(b"BYE sip:bob@biloxi.com SIP/2.0\r\n\r\n", Direction::Out);
+
+        assert_eq!(request_count("BYE", "out") - before_out, 1);
+        assert_eq!(
+            request_count("BYE", "in"),
+            before_in,
+            "an outbound frame must not touch the inbound series"
+        );
+    }
+
+    /// Field names declared on `SiphonMetrics`, read back out of this file.
+    ///
+    /// Rust has no reflection over struct fields, and the alternative — a
+    /// hand-maintained list — would rot in exactly the way the tests below
+    /// exist to prevent.
+    fn declared_metric_fields() -> Vec<String> {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub struct SiphonMetrics {")
+            .expect("SiphonMetrics struct not found — did it get renamed?");
+        let body = &source[start..];
+        let end = body.find("\n}").expect("unterminated SiphonMetrics struct");
+
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                // `pub name: Type,` and the two private pre-resolved arrays.
+                let declaration = line.strip_prefix("pub ").unwrap_or(line);
+                let (name, rest) = declaration.split_once(':')?;
+                // Skip doc comments, attributes and anything that isn't a plain
+                // field declaration.
+                if !rest.trim_end().ends_with(',')
+                    || name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return None;
+                }
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    /// Metrics whose only writer is `src/metrics/` itself — the allocator and
+    /// interpreter gauges refreshed by `update_*_stats`. Everything else must be
+    /// written by the subsystem it measures.
+    const WRITTEN_BY_THE_METRICS_MODULE: &[&str] = &[
+        "registry",
+        // Written through the pre-resolved child arrays by `record_request` /
+        // `record_response` / `record_frame`, never by field name, so the
+        // name-appearance heuristic cannot see them.
+        // `recorders_are_called_from_the_datapath` covers these instead.
+        "requests_total",
+        "responses_total",
+        "requests_by_method",
+        "responses_by_class",
+        // Published by `update_uptime`, called from the dispatcher sweep.
+        "uptime_seconds",
+        "memory_allocated_bytes",
+        "memory_resident_bytes",
+        "memory_active_bytes",
+        "memory_retained_bytes",
+        "memory_mapped_bytes",
+        "memory_metadata_bytes",
+        "python_allocated_blocks",
+        "glibc_system_bytes",
+        "glibc_in_use_bytes",
+        "glibc_free_bytes",
+        "glibc_mmap_bytes",
+        "glibc_arena_count",
+    ];
+
+    fn crate_source_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        files
+    }
+
+    #[test]
+    fn every_declared_metric_has_a_production_write_site() {
+        // The check that would have caught siphon_requests_total,
+        // siphon_responses_total, siphon_connections_active,
+        // siphon_dialogs_active, siphon_transactions_active,
+        // siphon_uptime_seconds and siphon_script_errors_total all shipping
+        // registered-but-never-incremented — every one of them exported a flat
+        // zero (or no series at all) for the life of the process, so every
+        // dashboard and alert built on them was silently dead.
+        //
+        // "Write site" is approximated by the field name appearing in a file
+        // outside src/metrics/ and src/admin/ — admin only ever *reads* for the
+        // JSON snapshot, so a mention there does not prove anything is
+        // publishing the metric.
+        let fields = declared_metric_fields();
+        assert!(
+            fields.len() > 40,
+            "parsed only {} fields — the struct-scraping heuristic has broken, \
+             which would make this test silently vacuous",
+            fields.len()
+        );
+
+        let sources: Vec<(std::path::PathBuf, String)> = crate_source_files()
+            .into_iter()
+            .filter(|path| {
+                let text = path.to_string_lossy().replace('\\', "/");
+                !text.contains("/src/metrics/") && !text.contains("/src/admin/")
+            })
+            .filter_map(|path| std::fs::read_to_string(&path).ok().map(|body| (path, body)))
+            .collect();
+        assert!(!sources.is_empty(), "no source files found to scan");
+
+        let mut unwired = Vec::new();
+        for field in &fields {
+            if WRITTEN_BY_THE_METRICS_MODULE.contains(&field.as_str()) {
+                continue;
+            }
+            let needle = format!(".{field}");
+            if !sources.iter().any(|(_, body)| body.contains(&needle)) {
+                unwired.push(field.clone());
+            }
+        }
+
+        assert!(
+            unwired.is_empty(),
+            "these metrics are registered but never written outside src/metrics/ \
+             — they will export a flat zero forever, so either wire them up or \
+             delete them: {unwired:?}"
+        );
+    }
+
+    #[test]
+    fn recorders_are_called_from_the_datapath() {
+        // `requests_total` / `responses_total` are allow-listed above because
+        // they are written through pre-resolved children rather than by field
+        // name. That allow-list would happily hide them going dead again, so
+        // pin the actual call sites instead: one inbound classification point
+        // and one outbound, each outside src/metrics/.
+        let sources: Vec<String> = crate_source_files()
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .contains("/src/metrics/")
+            })
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect();
+
+        for recorder in ["record_request(", "record_response(", "record_frame("] {
+            assert!(
+                sources.iter().any(|body| body.contains(recorder)),
+                "{recorder} has no call site outside src/metrics/ — \
+                 siphon_requests_total / siphon_responses_total are dead again"
+            );
+        }
+    }
+
+    #[test]
+    fn every_declared_metric_is_surfaced_in_the_admin_snapshot() {
+        // `/admin/metrics.json` is hand-written, so it drifts behind the
+        // registry — which is how the control plane, per-instance media health,
+        // Diameter per-command counters and the handshake-failure counter all
+        // ended up collected but unreachable from the dashboard.
+        let admin = include_str!("../admin/mod.rs");
+        let allowed: &[&str] = &[
+            "registry",
+            "requests_by_method",
+            "responses_by_class",
+            // Exported for Prometheus scrape only — the JSON has no consumer for
+            // a bare latency histogram, and the dashboard reads the per-command
+            // request/error counters beside it instead.
+            "diameter_request_duration_seconds",
+            "control_handoff_timeouts_total",
+            "memory_metadata_bytes",
+            "glibc_free_bytes",
+            "glibc_mmap_bytes",
+            "auth_ha1_cache_hits_total",
+            "registrations_active",
+            "uptime_seconds",
+        ];
+
+        let missing: Vec<String> = declared_metric_fields()
+            .into_iter()
+            .filter(|field| !allowed.contains(&field.as_str()))
+            .filter(|field| !admin.contains(&format!(".{field}")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these metrics exist but never reach /admin/metrics.json, so the \
+             dashboard cannot show them — add them to the snapshot or to the \
+             allow-list with a reason: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn class_index_clamps_out_of_range_status_codes() {
+        // A malformed status line should still land in a real bucket rather
+        // than panic or silently vanish.
+        assert_eq!(class_index(100), 0);
+        assert_eq!(class_index(699), 5);
+        assert_eq!(class_index(0), 0);
+        assert_eq!(class_index(999), 5);
+    }
+
+    #[test]
+    fn every_method_and_class_series_exists_before_any_traffic() {
+        init().unwrap();
+        let output = encode_metrics();
+        // Pre-resolving every child means `rate()` works from the first scrape
+        // instead of returning "no data" until that method is first seen.
+        for method in METHOD_LABELS {
+            assert!(
+                output.contains(&format!(r#"method="{method}""#)),
+                "missing requests_total series for {method}"
+            );
+        }
+        for class in CLASS_LABELS {
+            assert!(
+                output.contains(&format!(r#"class="{class}""#)),
+                "missing responses_total series for {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn method_index_is_unique_and_in_range() {
+        use crate::sip::message::Method;
+        let methods = [
+            Method::Invite,
+            Method::Ack,
+            Method::Bye,
+            Method::Cancel,
+            Method::Options,
+            Method::Register,
+            Method::Info,
+            Method::Update,
+            Method::Prack,
+            Method::Subscribe,
+            Method::Notify,
+            Method::Refer,
+            Method::Message,
+            Method::Publish,
+            Method::Extension("X".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for method in &methods {
+            let index = method_index(method);
+            assert!(index < METHOD_LABELS.len(), "{method:?} out of range");
+            assert!(seen.insert(index), "duplicate index for {method:?}");
+            // The label must describe the method it is filed under.
+            if !matches!(method, Method::Extension(_)) {
+                assert_eq!(METHOD_LABELS[index], method.as_str());
+            }
+        }
+        assert_eq!(seen.len(), METHOD_LABELS.len(), "a label has no method");
     }
 
     #[test]
     fn metrics_encode_produces_text() {
         init().unwrap();
-        // Ensure at least one label is observed so the counter appears in output
-        metrics()
-            .unwrap()
-            .requests_total
-            .with_label_values(&["OPTIONS"])
-            .inc();
         let output = encode_metrics();
         // Gauges always appear (even at zero), counters appear after first observation
         assert!(
@@ -1194,24 +1900,6 @@ mod tests {
         assert_eq!(map.get("udp"), Some(&6.0));
         assert_eq!(map.get("tcp"), Some(&2.0));
         assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn histogram_observation() {
-        init().unwrap();
-        let metrics = metrics().unwrap();
-
-        metrics
-            .request_duration_seconds
-            .with_label_values(&["INVITE"])
-            .observe(0.042);
-        metrics
-            .request_duration_seconds
-            .with_label_values(&["REGISTER"])
-            .observe(0.001);
-
-        let output = encode_metrics();
-        assert!(output.contains("siphon_request_duration_seconds"));
     }
 
     #[test]

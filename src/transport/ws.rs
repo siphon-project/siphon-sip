@@ -93,6 +93,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
 
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
+    // Counts this connection in `siphon_connections_active{transport}` until the
+    // guard drops at the end of this function (cancellation included).
+    let _connection_gauge = crate::transport::ConnectionGauge::register(transport_variant);
+
     // Per-connection outbound channel
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
     connection_map.insert(connection_id, outbound_tx);

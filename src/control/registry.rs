@@ -93,6 +93,27 @@ pub enum PushOutcome {
     OverflowDisconnect,
 }
 
+/// Count a dropped control event against `siphon_control_events_dropped_total{app}`.
+///
+/// The queue already tracks its own drop count, but that is per-connection and
+/// dies with the connection, so a slow consumer that lost events left nothing
+/// behind once it reconnected. Both overflow outcomes lose an event: under
+/// `DropOldest` the oldest queued event is discarded, and under `Disconnect` the
+/// incoming one is.
+fn record_push_outcome(app: &str, outcome: PushOutcome) {
+    if matches!(
+        outcome,
+        PushOutcome::DroppedOldest | PushOutcome::OverflowDisconnect
+    ) {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .control_events_dropped_total
+                .with_label_values(&[app])
+                .inc();
+        }
+    }
+}
+
 /// A bounded, non-blocking outbound queue for one connection.
 ///
 /// Producers (dispatcher / leg actor for events; the read task for replies)
@@ -978,6 +999,9 @@ impl ControlBus {
 
     /// Publish an event to a channel's owning connection (non-blocking).
     /// Returns `false` if the channel is unknown or currently orphaned.
+    ///
+    /// A slow consumer loses events here rather than blocking the call path, so
+    /// the drop is counted — see [`record_push_outcome`].
     pub fn publish_to_channel(&self, channel_id: &str, frame: EventFrame) -> bool {
         let (app, conn_id) = match self.channels.get(channel_id) {
             Some(entry) => (entry.app.clone(), entry.conn_id.load(Ordering::SeqCst)),
@@ -988,7 +1012,7 @@ impl ControlBus {
         }
         match self.connection(&app, conn_id) {
             Some(conn) => {
-                conn.events.try_push_event(frame);
+                record_push_outcome(&app, conn.events.try_push_event(frame));
                 true
             }
             None => false,
@@ -1329,14 +1353,17 @@ impl ControlBus {
         match self.pick_connection(app) {
             Some(conn) => {
                 self.register_channel(channel_id, &conn, call_actor_id, sip_call_id, on_lost, vars);
-                conn.events.try_push_event(EventFrame::new(
-                    "StasisStart",
-                    channel_id,
+                record_push_outcome(
                     app,
-                    call_actor_id,
-                    sip_call_id,
-                    stasis_payload,
-                ));
+                    conn.events.try_push_event(EventFrame::new(
+                        "StasisStart",
+                        channel_id,
+                        app,
+                        call_actor_id,
+                        sip_call_id,
+                        stasis_payload,
+                    )),
+                );
                 OfferOutcome::Assigned
             }
             None => OfferOutcome::NoController,

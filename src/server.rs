@@ -2372,6 +2372,7 @@ impl SiphonServer {
                                 .map(|token| std::sync::Arc::from(token.as_str())),
                             protect_reads: auth.protect_reads,
                             instance_id,
+                            features: crate::admin::AdminFeatures::from_config(&config),
                         };
                         tokio::spawn(crate::admin::serve(
                             listen_addr,

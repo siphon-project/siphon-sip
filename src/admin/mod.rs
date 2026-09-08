@@ -43,6 +43,42 @@ pub struct AdminState {
     /// This node's instance id, surfaced in `/admin/metrics.json`. `None` when
     /// `server.instance_id` is unset and `$HOSTNAME` is absent.
     pub instance_id: Option<String>,
+    /// Which optional subsystems this node has configured.
+    pub features: AdminFeatures,
+}
+
+/// Which optional subsystems are configured on this node.
+///
+/// Read from the config at startup so `/admin/metrics.json` can emit `null` for
+/// a subsystem that is not part of this deployment, instead of a zero that is
+/// indistinguishable from "configured and idle". A permanent zero is what let a
+/// dead counter sit unnoticed on the dashboard for a year, and it is why the
+/// dashboard once showed a "5GC · SBI" card carrying an IPsec SA count on nodes
+/// that had neither.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct AdminFeatures {
+    pub diameter: bool,
+    pub media: bool,
+    pub control: bool,
+    pub sbi: bool,
+    pub ipsec: bool,
+    pub lawful_intercept: bool,
+    pub rf: bool,
+}
+
+impl AdminFeatures {
+    /// Derive the flags from the loaded configuration.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            diameter: config.diameter.is_some(),
+            media: config.media.is_some(),
+            control: config.control.is_some(),
+            sbi: config.sbi.is_some(),
+            ipsec: config.ipsec.is_some(),
+            lawful_intercept: config.lawful_intercept.is_some(),
+            rf: config.rf.is_some(),
+        }
+    }
 }
 
 /// Start the HTTP admin API server.
@@ -283,6 +319,30 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
     let registrations = state.registrar.aor_count();
     let version = env!("CARGO_PKG_VERSION");
 
+    // The store gauges are otherwise only published by the 30 s dispatcher
+    // sweep, which is far too coarse for a dashboard polling every 2 s — a live
+    // transaction count that updates twice a minute reads as broken. Both
+    // inputs are O(1) `len()` reads. Also refreshes the Prometheus side, so a
+    // scrape landing between sweeps sees the same numbers the dashboard does.
+    crate::metrics::update_uptime();
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics
+            .registrations_active
+            .set(state.registrar.aor_count() as i64);
+        crate::dispatcher::publish_store_gauges(
+            metrics,
+            state
+                .draining
+                .as_ref()
+                .map(|drain| drain.transaction_count())
+                .unwrap_or(0),
+            crate::b2bua::actor::global_call_store()
+                .map(|store| store.count())
+                .unwrap_or(0),
+            metrics.proxy_dialog_sessions.get().max(0) as usize,
+        );
+    }
+
     let Some(metrics) = crate::metrics::try_metrics() else {
         return Json(serde_json::json!({
             "version": version,
@@ -310,11 +370,29 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         "gateways": gateways,
         "sip": {
             "dialogs_active": metrics.dialogs_active.get(),
+            // The two halves of `dialogs_active`. Which side carries the load is
+            // the question the roll-up cannot answer.
+            "proxy_dialog_sessions": metrics.proxy_dialog_sessions.get(),
+            "b2bua_calls_active": metrics.b2bua_calls_active.get(),
             "transactions_active": metrics.transactions_active.get(),
             "uac_pending": metrics.uac_pending_requests.get(),
             "subscribe_dialogs": metrics.subscribe_dialogs.get(),
             "cdr_sessions": metrics.cdr_sessions.get(),
             "connections": connections,
+            "stream_connections": metrics.stream_connections_active.get(),
+            "handshakes_in_flight": metrics.handshakes_in_flight.get(),
+        },
+        // Per-method / per-class request and response rates. The client turns
+        // these into rates itself; the totals are what Prometheus scrapes.
+        "traffic": {
+            "requests_in": crate::metrics::int_counter_vec_by_label_where(
+                &metrics.requests_total, "method", "direction", "in"),
+            "requests_out": crate::metrics::int_counter_vec_by_label_where(
+                &metrics.requests_total, "method", "direction", "out"),
+            "responses_in": crate::metrics::int_counter_vec_by_label_where(
+                &metrics.responses_total, "class", "direction", "in"),
+            "responses_out": crate::metrics::int_counter_vec_by_label_where(
+                &metrics.responses_total, "class", "direction", "out"),
         },
         "counters": {
             "requests_total": crate::metrics::sum_int_counter_vec(&metrics.requests_total),
@@ -346,14 +424,70 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "jobs_completed": metrics.pyexec_jobs_completed_total.get(),
             "jobs_shed": metrics.pyexec_jobs_shed_total.get(),
         },
-        "diameter": { "peers_connected": metrics.diameter_peers_connected.get() },
-        "rtpengine": {
+        // Every optional subsystem below is `null` when it is not configured on
+        // this node, so the dashboard can render "not configured" rather than a
+        // row of zeros that reads as "configured and broken".
+        "diameter": state.features.diameter.then(|| serde_json::json!({
+            "peers_connected": metrics.diameter_peers_connected.get(),
+            // Per-command totals and latency were already collected and never
+            // shown; "1 peer connected" was the entire Diameter story on the
+            // dashboard while this sat in the registry.
+            "requests_by_command":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_requests_total, "command"),
+            "errors_by_kind":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_request_errors_total, "error"),
+            "watchdog_failures": metrics.diameter_watchdog_failures_total.get(),
+        })),
+        "rtpengine": state.features.media.then(|| serde_json::json!({
             "up": metrics.rtpengine_instances_up.get(),
             "total": metrics.rtpengine_instances_total.get(),
+            // Per-instance health, so a partially-degraded set is visible rather
+            // than reading as "3 / 4 up" with no way to tell which one is down.
+            "instances": crate::metrics::int_gauge_vec_by_label(&metrics.rtpengine_instance_up, "address"),
+        })),
+        // Charging and interception session counts — all live gauges that the
+        // dashboard never read.
+        "sessions": {
+            "rf": state.features.rf.then(|| metrics.rf_sessions.get()),
+            "ro": state.features.rf.then(|| metrics.ro_sessions.get()),
+            "li_remembered": state.features.lawful_intercept
+                .then(|| metrics.li_remembered_sessions.get()),
         },
-        "sbi": { "npcf_sessions_active": metrics.sbi_npcf_app_sessions_active.get() },
-        "ipsec": { "sa_pairs": metrics.ipsec_sa_pairs.get() },
-        "security": { "banned_ips": metrics.banned_ips.get() },
+        // The external control plane (ARI/ESL-class). Keyed by app, and entirely
+        // absent from the dashboard until now even while apps were connected.
+        "control": state.features.control.then(|| serde_json::json!({
+            "connections": crate::metrics::int_gauge_vec_by_label(&metrics.control_connections, "app"),
+            "controlled_calls":
+                crate::metrics::int_gauge_vec_by_label(&metrics.control_controlled_calls, "app"),
+            "commands_total":
+                crate::metrics::int_counter_vec_by_label(&metrics.control_commands_total, "app"),
+            "events_dropped_total":
+                crate::metrics::int_counter_vec_by_label(&metrics.control_events_dropped_total, "app"),
+            "auth_failures": metrics.control_auth_failures_total.get(),
+        })),
+        "sbi": state.features.sbi.then(|| serde_json::json!({
+            "npcf_sessions_active": metrics.sbi_npcf_app_sessions_active.get(),
+        })),
+        // Gm access security (3GPP TS 33.203) — an IPsec sec-agree concern, and
+        // unrelated to the service-based `sbi` block above. They were previously
+        // rendered in one "5GC · SBI" card, which is two different reference
+        // points and, on a 4G IMS P-CSCF, one that does not exist.
+        "ipsec": state.features.ipsec.then(|| serde_json::json!({
+            "sa_pairs": metrics.ipsec_sa_pairs.get(),
+        })),
+        "security": {
+            "banned_ips": metrics.banned_ips.get(),
+            // TLS/WS handshakes that failed outright, and connections refused by
+            // the per-source ceilings. Both were live and both were invisible.
+            "handshake_failures": metrics.handshake_failures_total.get(),
+            "connections_refused":
+                crate::metrics::int_counter_vec_by_label(&metrics.connections_refused_total, "reason"),
+            "auth_backend_errors": metrics.auth_backend_errors_total.get(),
+            "requests_without_branch": metrics.requests_without_branch_total.get(),
+            "udp_at_buffer_limit": metrics.udp_datagrams_at_buffer_limit_total.get(),
+            "firewall_commands_dropped": metrics.firewall_commands_dropped_total.get(),
+            "firewall_command_failures": metrics.firewall_command_failures_total.get(),
+        },
     }))
 }
 
@@ -362,16 +496,56 @@ async fn registrations_handler(State(state): State<AdminState>) -> impl IntoResp
     let all = state.registrar.all_contacts();
     let entries: Vec<serde_json::Value> = all
         .iter()
-        .map(|(aor, contact)| {
-            serde_json::json!({
-                "aor": aor,
-                "uri": contact.uri.to_string(),
-                "q": contact.q,
-                "expires_remaining": contact.remaining_seconds(),
-            })
-        })
+        .map(|(aor, contact)| contact_json(aor, contact, &state.registrar))
         .collect();
     Json(entries)
+}
+
+/// Serialize one registration binding.
+///
+/// Beyond the AoR and contact URI this carries what an operator actually needs
+/// to answer "why can't I reach this subscriber": which transport and source the
+/// REGISTER arrived on (a NAT'd contact whose URI host differs from its source
+/// is the usual answer), which node accepted it in a multi-instance deployment,
+/// and whether it is a fully-active binding or an IMS one still awaiting its SAR.
+fn contact_json(
+    aor: &str,
+    contact: &crate::registrar::Contact,
+    registrar: &Registrar,
+) -> serde_json::Value {
+    let source_addr = contact.source_addr.map(|addr| addr.to_string());
+    // A contact URI whose host is not the address the REGISTER came from is
+    // behind NAT — the single most useful derived flag on this table, and the
+    // client should not have to re-derive it from two string fields.
+    let nated = contact.source_addr.is_some_and(|source| {
+        contact.uri.host != source.ip().to_string()
+            || contact.uri.port.is_some_and(|port| port != source.port())
+    });
+
+    serde_json::json!({
+        "aor": aor,
+        "uri": contact.uri.to_string(),
+        "q": contact.q,
+        "expires_remaining": contact.remaining_seconds(),
+        "expires_secs": contact.expires_secs,
+        "transport": contact.source_transport.map(|transport| transport.label()),
+        "source_addr": source_addr,
+        "nated": nated,
+        // RFC 5626 outbound / RFC 5627 GRUU — a UE with several bindings for one
+        // AoR is distinguished by these, not by the contact URI.
+        "instance_id": contact.sip_instance.as_deref(),
+        "reg_id": contact.reg_id,
+        // RFC 3327: a binding reached through a Path set is routed via those
+        // proxies, so its presence changes how an MT request gets there.
+        "path_depth": contact.path.len(),
+        // IMS: saved but not yet confirmed by a Cx SAR.
+        "pending": contact.pending,
+        // Which siphon accepted the REGISTER, and whether that was this process.
+        "node": contact.instance_id(),
+        "is_local": registrar.is_local_contact(contact),
+        "call_id": contact.call_id,
+        "cseq": contact.cseq,
+    })
 }
 
 /// `GET /admin/registrations/:aor` — detail for a single AoR.
@@ -393,13 +567,7 @@ async fn registration_detail_handler(
 
     let contact_list: Vec<serde_json::Value> = contacts
         .iter()
-        .map(|contact| {
-            serde_json::json!({
-                "uri": contact.uri.to_string(),
-                "q": contact.q,
-                "expires_remaining": contact.remaining_seconds(),
-            })
-        })
+        .map(|contact| contact_json(&aor, contact, &state.registrar))
         .collect();
 
     (
@@ -429,8 +597,14 @@ async fn registration_delete_handler(
 
     state.registrar.remove_all(&aor);
 
+    // Re-read the count rather than decrementing by one. This gauge is set
+    // absolutely everywhere else (the registrar's own change hook), and the AoR
+    // just removed may have held any number of contacts, so a fixed `dec()` here
+    // walked the gauge away from the truth on every force-unregister.
     if let Some(metrics) = crate::metrics::try_metrics() {
-        metrics.registrations_active.dec();
+        metrics
+            .registrations_active
+            .set(state.registrar.aor_count() as i64);
     }
 
     (
@@ -693,6 +867,37 @@ fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value 
             .first()
             .and_then(|leg| leg.dialog.target_uri.as_deref())
             .map(display_party);
+
+        // Durations are derived from monotonic `Instant`s — the call actor keeps
+        // no wall-clock stamp — so these are elapsed seconds and the client
+        // renders "started N ago" rather than an absolute time it would have to
+        // invent.
+        let ringing_secs = call.created_at.elapsed().as_secs();
+        let talk_secs = call.answered_at.map(|at| at.elapsed().as_secs());
+
+        // Per-branch outcome. The failure code lives in `BLegStatus::Failed`, so
+        // a fork that lost 3 of 4 branches can say *why* each lost instead of
+        // collapsing to a single winner.
+        let branches: Vec<serde_json::Value> = real_b_legs
+            .iter()
+            .enumerate()
+            .map(|(index, leg)| {
+                let (status, code) = call
+                    .b_leg_status
+                    .get(index)
+                    .map(branch_status)
+                    .unwrap_or(("unknown", None));
+                serde_json::json!({
+                    "target": leg.dialog.target_uri.as_deref().map(display_party),
+                    "status": status,
+                    "code": code,
+                    "transport": leg.transport.transport.label(),
+                    "remote_addr": leg.transport.remote_addr.to_string(),
+                    "winner": call.winner == Some(index),
+                })
+            })
+            .collect();
+
         calls.push(serde_json::json!({
             "id": call.id,
             "call_id": call.a_leg.dialog.call_id,
@@ -700,11 +905,83 @@ fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value 
             "a_party": a_party,
             "b_party": b_party,
             "b_legs": real_b_legs.len(),
+            // Direction: siphon placed this call itself rather than bridging an
+            // inbound INVITE.
+            "originated": call.originated,
+            "ringing_secs": ringing_secs,
+            "talk_secs": talk_secs,
+            "a_transport": call.a_leg.transport.transport.label(),
+            "a_remote_addr": call.a_leg.transport.remote_addr.to_string(),
+            "branches": branches,
+            // `null` rather than `false` where the feature is not in play, so the
+            // dashboard can tell "not configured" from "configured and off".
+            "control_app": call.control_app,
+            "recording": call.li_record,
+            "transfer": call.transfer.as_ref().map(|transfer| {
+                serde_json::json!({
+                    "state": transfer.state.to_string(),
+                    "refer_to": transfer.refer_to.uri,
+                    // Present only on an attended transfer (RFC 3891) — its
+                    // absence is what distinguishes blind from attended.
+                    "replaces_call_id": transfer.refer_to.replaces
+                        .as_ref()
+                        .map(|replaces| replaces.call_id.clone()),
+                })
+            }),
+            "session_timer": call.session_timer.as_ref().map(|timer| {
+                serde_json::json!({
+                    "expires": timer.session_expires,
+                    "refresher": timer.refresher,
+                    "last_refresh_secs": timer.last_refresh.elapsed().as_secs(),
+                })
+            }),
+            // Carrier attempts on an LCR/route-sequence call — which carrier was
+            // tried, what it answered, and whether siphon actually dialled it.
+            "route_attempts": route_attempts_json(call),
         }));
     }
     // Stable order for the dashboard (DashMap iteration order is arbitrary).
     calls.sort_by(|a, b| a["call_id"].as_str().cmp(&b["call_id"].as_str()));
     serde_json::Value::Array(calls)
+}
+
+/// Render one B-leg's status as `(name, code)`. The code is `Some` only for a
+/// branch that actually received a final failure response.
+fn branch_status(status: &crate::b2bua::actor::BLegStatus) -> (&'static str, Option<u16>) {
+    use crate::b2bua::actor::BLegStatus;
+    match status {
+        BLegStatus::Trying => ("trying", None),
+        BLegStatus::Ringing => ("ringing", None),
+        BLegStatus::Answered => ("answered", None),
+        BLegStatus::Failed(code) => ("failed", Some(*code)),
+        BLegStatus::Cancelled => ("cancelled", None),
+    }
+}
+
+/// Per-carrier attempts for an LCR / route-sequence call, or `null` when this
+/// call is not routed by a sequence at all — an empty array would read as "the
+/// sequence tried nothing", which is a different thing.
+fn route_attempts_json(call: &crate::b2bua::actor::CallActor) -> serde_json::Value {
+    if !call.is_route_sequence() {
+        return serde_json::Value::Null;
+    }
+    serde_json::Value::Array(
+        call.route_attempts()
+            .iter()
+            .map(|attempt| {
+                serde_json::json!({
+                    "carrier": attempt.carrier_id,
+                    "status": attempt.status,
+                    "elapsed_ms": attempt.elapsed_ms,
+                    // False means siphon never got the INVITE onto the wire, so
+                    // `status` is siphon's own verdict and not the carrier's —
+                    // without this a local DNS or gateway fault reads as a
+                    // carrier fault.
+                    "dialed": attempt.dialed,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -736,15 +1013,29 @@ async fn ui_handler(uri: axum::http::Uri) -> Response {
 
     let (name, asset) = match embedded::Assets::get(requested) {
         Some(asset) => (requested, asset),
-        None => match embedded::Assets::get("index.html") {
+        // Only a path that looks like a client route falls back to the shell. An
+        // unmatched *asset* path must 404: serving index.html in place of a
+        // missing `.js` hands the browser HTML with a JavaScript content type,
+        // which fails as an opaque module parse error rather than a 404.
+        None if !requested.contains('.') => match embedded::Assets::get("index.html") {
             Some(asset) => ("index.html", asset),
             None => return (StatusCode::NOT_FOUND, "not found").into_response(),
         },
+        None => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
 
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     (
-        [(header::CONTENT_TYPE, mime.as_ref())],
+        [
+            (header::CONTENT_TYPE, mime.as_ref()),
+            // The assets are baked into the binary and have no content hash in
+            // their names, so a cached copy survives an upgrade: without this a
+            // browser keeps serving the previous release's stylesheet and
+            // modules against the new API, which looks like the new version
+            // simply not working. They are a few KB served off localhost, so
+            // revalidating every load costs nothing worth measuring.
+            (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+        ],
         asset.data.into_owned(),
     )
         .into_response()
@@ -785,6 +1076,7 @@ mod tests {
             auth_token: None,
             protect_reads: false,
             instance_id: None,
+            features: AdminFeatures::default(),
         }
     }
 
@@ -850,6 +1142,7 @@ mod tests {
             auth_token: None,
             protect_reads: false,
             instance_id: None,
+            features: AdminFeatures::default(),
         };
         let app = router(state, None, false);
 
@@ -1111,6 +1404,53 @@ mod tests {
         assert!(json["sip"]["dialogs_active"].as_i64().is_some());
         assert!(json["counters"]["requests_total"].as_u64().is_some());
         assert!(json["memory"]["allocated"].as_i64().is_some());
+        // The two halves of the dialog roll-up, and the per-method traffic
+        // breakdown, must both be present.
+        assert!(json["sip"]["proxy_dialog_sessions"].as_i64().is_some());
+        assert!(json["sip"]["b2bua_calls_active"].as_i64().is_some());
+        assert!(json["traffic"]["requests_in"]["INVITE"].as_u64().is_some());
+        assert!(json["traffic"]["responses_out"]["2xx"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_subsystems_report_null_not_zero() {
+        // The whole point of the feature flags: an operator must be able to tell
+        // "this node has no Diameter" from "Diameter is configured and every
+        // peer is down". Rendering both as 0 is what let a card of permanent
+        // zeros sit on the dashboard unnoticed.
+        crate::metrics::init().unwrap();
+        let app = test_app(); // built with AdminFeatures::default() — nothing configured
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/metrics.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for subsystem in ["diameter", "rtpengine", "control", "sbi", "ipsec"] {
+            assert!(
+                json[subsystem].is_null(),
+                "{subsystem} is not configured, so it must be null rather than a \
+                 zeroed object: {:?}",
+                json[subsystem]
+            );
+        }
+        for session in ["rf", "ro", "li_remembered"] {
+            assert!(
+                json["sessions"][session].is_null(),
+                "sessions.{session} must be null when its subsystem is unconfigured"
+            );
+        }
+
+        // Core SIP state is never optional, so it stays a real number.
+        assert!(json["sip"]["transactions_active"].as_i64().is_some());
     }
 
     #[tokio::test]

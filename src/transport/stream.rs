@@ -206,6 +206,15 @@ pub(crate) async fn serve_sip_stream<R, W>(
         remote_addr,
     } = context;
 
+    // Counts this connection in `siphon_connections_active{transport}` until the
+    // guard drops at the end of this function — which covers the cancellation
+    // path too, unlike a decrement written next to the cleanup below.
+    //
+    // Taken here rather than off `connection_map`/`StreamConnections`: the TCP
+    // and TLS maps are shared with the outbound pool so their length mixes both
+    // directions, and the registry deliberately omits TCP entirely.
+    let _connection_gauge = crate::transport::ConnectionGauge::register(transport);
+
     // Per-connection outbound channel. Cloned for the read task so it can write
     // RFC 5626 §4.4.1 pong (`\r\n`) responses back over the same connection.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
