@@ -163,6 +163,27 @@ pub enum CallAction {
     },
 }
 
+impl CallAction {
+    /// The variant's name, for logging. `Debug` would print the whole payload —
+    /// a `RouteSequence`'s entire carrier list, a `Handover`'s vars map — where
+    /// the only thing a log line wants is which decision the handler reached.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CallAction::None => "none",
+            CallAction::Reject { .. } => "reject",
+            CallAction::Dial { .. } => "dial",
+            CallAction::Fork { .. } => "fork",
+            CallAction::AcceptRefer { .. } => "accept_refer",
+            CallAction::RejectRefer { .. } => "reject_refer",
+            CallAction::SendRefer { .. } => "refer",
+            CallAction::Terminate => "terminate",
+            CallAction::Answered => "answered",
+            CallAction::Handover { .. } => "handover",
+            CallAction::RouteSequence { .. } => "route",
+        }
+    }
+}
+
 /// REFER transfer mode selected by `call.accept_refer(mode=...)` (and the
 /// configured `b2bua.default_refer_mode` fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
