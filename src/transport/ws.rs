@@ -49,6 +49,14 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
+    // The ACL cleared this source at accept; for WSS the TLS handshake has run
+    // since, which is long enough for a sibling connection from the same burst
+    // to have banned it. Re-check before spending an upgrade on the peer.
+    if crate::security::is_source_banned(remote_addr.ip()) {
+        debug!("{transport_variant} dropping {remote_addr}: source banned during its handshake");
+        return;
+    }
+
     // RFC 7118 §4: a SIP-over-WebSocket server MUST confirm the "sip"
     // subprotocol the UA offers in `Sec-WebSocket-Protocol`.  Without it,
     // browser / JS WebSocket clients (sip.js, JsSIP) abort the connection
@@ -80,7 +88,11 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
         Ok(stream) => stream,
         Err(error) => {
             warn!("WebSocket upgrade failed from {}: {}", remote_addr, error);
-            crate::security::record_handshake_failure(
+            // Strong signal, unlike a failed *transport* handshake: the peer got
+            // this far, so it completed TLS/TCP on a SIP-over-WebSocket port and
+            // then sent something that is not an upgrade. RFC 7118 §5 leaves a
+            // conforming client no way to do that.
+            crate::security::record_upgrade_failure(
                 remote_addr.ip(),
                 &transport_variant.to_string(),
             );
@@ -348,11 +360,24 @@ pub async fn listen_secure(
                     configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
-                        // TLS handshake first
-                        let tls_stream = match acceptor.accept(tcp_stream).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
+                        // TLS handshake first, bounded the same way the TLS and
+                        // mux listeners bound theirs — a peer that connects and
+                        // then stalls mid-handshake (slowloris) must not be able
+                        // to pin a task and a socket with nothing to reap it.
+                        let tls_stream = match tokio::time::timeout(
+                            crate::transport::tls::TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
                                 warn!("WSS TLS handshake failed from {}: {}", remote_addr, error);
+                                crate::security::record_handshake_failure(remote_addr.ip(), "WSS");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("WSS TLS handshake timed out from {remote_addr}");
                                 crate::security::record_handshake_failure(remote_addr.ip(), "WSS");
                                 return;
                             }

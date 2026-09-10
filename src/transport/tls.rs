@@ -593,6 +593,17 @@ pub async fn listen(
                             }
                         };
 
+                        // The ACL cleared this source at accept, but the
+                        // handshake takes long enough for a sibling connection
+                        // from the same burst to have banned it since. Re-check
+                        // before spending anything else on the peer.
+                        if crate::security::is_source_banned(remote_addr.ip()) {
+                            debug!(
+                                "TLS dropping {remote_addr}: source banned during its handshake"
+                            );
+                            return;
+                        }
+
                         let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
