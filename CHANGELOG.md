@@ -131,6 +131,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   negative half is the point, since a gate wired to a neighbouring flag passes
   any test that checks only its own key.
 
+- **A vendor-flagged `Experimental-Result` no longer reads as no result at all**
+  — the AVP dictionary knows `Experimental-Result` only in its conformant
+  vendor-0 form (RFC 6733 §7.6 defines 297 as a base AVP), so a peer that sets
+  the V-bit on it left the code unreachable from the decoded view. Answer
+  labelling now falls back to the lossless tree, which matches on AVP code
+  alone, and parses a raw grouped payload rather than reading its first four
+  bytes as an integer — those bytes are the nested `Vendor-Id` AVP *header*, so
+  the naive read produces a plausible-looking wrong code. Affects Cx, Sh and Rx,
+  which report their outcomes through the experimental namespace and would
+  otherwise have had their entire 3GPP failure space collapse into one bucket.
+  The fallback runs only when the fast path finds neither code, so a conformant
+  answer never pays for the parse.
+
 ### Added
 
 - **`request.get_headers(name)` / `reply.get_headers(name)` — every value of a
@@ -164,6 +177,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   SIP error fired, and the only trace was an `info!` line. The
   `reason="no_teardown_hook"` series is the one to alert on — credit ran out,
   nothing was wired to enforce it, and the call is still up and unpaid.
+- **Inbound Diameter traffic is counted at all** —
+  `siphon_diameter_inbound_requests_total{command}`,
+  `siphon_diameter_inbound_answers_total{command,result_code}` and
+  `siphon_diameter_inbound_duration_seconds{command}`, written at the one point
+  every inbound connection type dispatches through (the `diameter.listen` DRA,
+  outbound serving connections, and the legacy `diameter.peers` inbound path).
+  Every other Diameter metric siphon has is client-side — requests it *sends*
+  and answers it *receives* — so a node in a server or DRA role carried none of
+  the traffic it serves in any metric whatsoever. The `result_code="3002"`
+  series is the one to alert on: that is siphon's own fallback for "no
+  `@diameter.on_request` handler matched, or the handler returned `None`", which
+  is a gap in the script rather than a problem at the peer, and nothing recorded
+  that siphon was the one rejecting.
 - **Per-peer Diameter connection state** — `siphon_diameter_peer_up{peer}`, 0/1
   keyed on the peer's configured name, mirroring the per-instance media health
   gauge. `siphon_diameter_peers_connected` is a bare count and cannot say
@@ -180,11 +206,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   definition worse than the last bucket.
 - **The experimental Signalling view answers four questions instead of one** —
   which peer, which reference point, which Result-Code, and how slow. New cards
-  for per-peer state, answers by Result-Code (coloured by class) and round-trip
-  latency; the Charging card gains refused-credit and credit-teardown
-  breakdowns; and the existing errors card is retitled *Transport errors*, since
-  reading it as covering answer failures is exactly the mistake that hid a
-  refusing peer.
+  for per-peer state, answers by Result-Code (coloured by class), round-trip
+  latency and inbound served traffic (hidden until the node has actually served
+  a request, so a pure client carries no empty card); the Charging card gains
+  refused-credit and credit-teardown breakdowns; and the existing errors card is
+  retitled *Transport errors*, since reading it as covering answer failures is
+  exactly the mistake that hid a refusing peer.
 
 ### Changed
 

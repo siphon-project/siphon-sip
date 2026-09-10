@@ -582,6 +582,8 @@ pub(crate) async fn dispatch_request(
     local_origin_realm: String,
 ) {
     let start = Instant::now();
+    // Captured before `incoming` moves into the handler closure below.
+    let command_code = incoming.command_code;
 
     // Build the answer (and keep the Py request/answer for the completed hook)
     // inside spawn_blocking — Python work must hold the GIL on a blocking
@@ -628,9 +630,20 @@ pub(crate) async fn dispatch_request(
         }
     };
 
+    // Read the label off the final wire before it moves into the send. Counted
+    // whether or not the write succeeds: the request was received, dispatched
+    // and answered, and a send failure is a transport problem recorded
+    // separately rather than a reason to lose the transaction.
+    let result_label = emitted_answer_result_label(&outcome.wire);
+
     if let Err(error) = inbound_peer.send_response(outcome.wire).await {
         warn!(%error, "Diameter server: failed to send answer upstream");
     }
+
+    // The server-side twin of the client-side request/answer/latency trio. A
+    // node in a DRA or HSS role carried none of its inbound load in any metric
+    // before this — `diameter_requests_total` counts only what siphon sends.
+    crate::metrics::record_diameter_inbound(command_code, result_label, start.elapsed());
 
     // Post-answer hook (best-effort).
     let latency_us = start.elapsed().as_micros() as u64;
@@ -659,6 +672,28 @@ pub(crate) async fn dispatch_request(
         })
         .await;
     }
+}
+
+/// Bounded metric label for the Result-Code of an answer siphon is *emitting*.
+///
+/// The lossless-tree extractor. The precedence rule itself is shared with the
+/// client side in [`dictionary::answer_result_label`], so an answer siphon sends
+/// and an answer siphon receives can never be labelled by two different rules.
+///
+/// Read from the final wire rather than from the answer tree earlier in the
+/// build, because `@diameter.on_reply` is explicitly allowed to rewrite the
+/// Result-Code on its way upstream — labelling before that would report what
+/// siphon decided rather than what the peer was told.
+///
+/// AVPs are matched on code alone, not `(code, vendor)`: `Experimental-Result`
+/// is a base-protocol grouped AVP whose *contents* are vendor-specific, and
+/// peers differ on whether they set the V-bit on the group itself.
+fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
+    let Ok(answer) = DiameterMsg::from_wire(wire) else {
+        return "none";
+    };
+    let (base, experimental) = answer.answer_result_codes();
+    dictionary::answer_result_label(base, experimental)
 }
 
 /// The answer bytes plus optional Py handles for the completed hook.
@@ -920,6 +955,73 @@ fn stub_message(incoming: &IncomingRequest) -> DiameterMsg {
         hop_by_hop: incoming.hop_by_hop,
         end_to_end: incoming.end_to_end,
         avps: vec![Avp::utf8(dictionary::avp::SESSION_ID, 0, "")],
+    }
+}
+
+#[cfg(test)]
+mod emitted_label_tests {
+    use super::*;
+    use crate::diameter::codec::encode_avp_u32;
+
+    /// A minimal well-formed CCA carrying the given top-level AVPs.
+    fn answer_wire(avps: Vec<u8>) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(20 + avps.len());
+        wire.push(1); // version
+        wire.extend_from_slice(&((20 + avps.len()) as u32).to_be_bytes()[1..]);
+        wire.push(0); // flags: answer (R-bit clear)
+        wire.extend_from_slice(&272u32.to_be_bytes()[1..]); // CCA
+        wire.extend_from_slice(&4u32.to_be_bytes()); // application id
+        wire.extend_from_slice(&7u32.to_be_bytes()); // hop-by-hop
+        wire.extend_from_slice(&8u32.to_be_bytes()); // end-to-end
+        wire.extend_from_slice(&avps);
+        wire
+    }
+
+    #[test]
+    fn a_base_result_code_labels_itself() {
+        let wire = answer_wire(encode_avp_u32(dictionary::avp::RESULT_CODE, 4012));
+        assert_eq!(emitted_answer_result_label(&wire), "4012");
+    }
+
+    #[test]
+    fn a_nested_experimental_result_keeps_its_namespace() {
+        // Cx/Sh/Rx answers report through Experimental-Result instead of the
+        // base code, so without this the whole 3GPP failure space would be
+        // labelled "none" on the server side.
+        let mut children = encode_avp_u32(dictionary::avp::VENDOR_ID, dictionary::VENDOR_3GPP);
+        children.extend_from_slice(&encode_avp_u32(
+            dictionary::avp::EXPERIMENTAL_RESULT_CODE,
+            5001,
+        ));
+        // The vendor-flagged encoding, which is what a 3GPP peer actually
+        // sends — and the case a `(code, vendor)` match would have missed,
+        // since the group is a base AVP whose contents are vendor-specific.
+        let group = crate::diameter::codec::encode_avp_grouped_3gpp(
+            dictionary::avp::EXPERIMENTAL_RESULT,
+            &children,
+        );
+        let wire = answer_wire(group);
+        assert_eq!(emitted_answer_result_label(&wire), "exp:5001");
+    }
+
+    #[test]
+    fn an_answer_with_no_result_code_is_labelled_none() {
+        let wire = answer_wire(Vec::new());
+        assert_eq!(emitted_answer_result_label(&wire), "none");
+        // And garbage never panics or mints a label.
+        assert_eq!(emitted_answer_result_label(&[0u8; 4]), "none");
+    }
+
+    #[test]
+    fn the_no_handler_fallback_is_labelled_3002() {
+        // siphon's own "no on_request handler matched" answer. This is the
+        // series that says the gap is in the script rather than at the peer,
+        // and nothing else records it.
+        let wire = answer_wire(encode_avp_u32(
+            dictionary::avp::RESULT_CODE,
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        ));
+        assert_eq!(emitted_answer_result_label(&wire), "3002");
     }
 }
 

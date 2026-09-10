@@ -151,6 +151,13 @@ export function render(snapshot) {
   ];
   dependent.forEach((card) => card && (card.hidden = isAbsent(diameter)));
 
+  // The inbound (server / DRA role) card is hidden unless this node has
+  // actually served a request. On a pure client — a P-CSCF talking to an HSS
+  // and nothing else — an empty inbound card is noise, not information.
+  const servedAny = !isAbsent(diameter) && sum(diameter.inbound_requests_by_command) > 0;
+  const inboundCard = $("sig-inbound-card");
+  if (inboundCard) inboundCard.hidden = !servedAny;
+
   if (isAbsent(diameter)) {
     html("sig-diameter", notConfigured("Diameter", "diameter"));
   } else {
@@ -191,6 +198,35 @@ export function render(snapshot) {
       barList(diameter.errors_by_kind, { color: "var(--crit)", empty: "no transport errors" }),
     );
     html("sig-latency", latencyRows(diameter.latency_by_command));
+
+    if (servedAny) {
+      const servedRefused = failedAnswers(diameter.inbound_answers_by_result_code);
+      // 3002 here is siphon's own "no on_request handler matched" fallback, so
+      // it points at a gap in the script rather than at the peer. Worth its own
+      // line: the peer sees a rejection either way and nothing else records
+      // that we are the one rejecting.
+      const noHandler = (diameter.inbound_answers_by_result_code || {})["3002"] || 0;
+      html(
+        "sig-inbound",
+        [
+          metaLine("Requests served", count(sum(diameter.inbound_requests_by_command))),
+          metaLine("Refused answers sent (3xxx–5xxx)", count(servedRefused), {
+            color: servedRefused > 0 ? "var(--warn)" : undefined,
+          }),
+          noHandler > 0
+            ? metaLine("Rejected — no handler matched (3002)", count(noHandler), {
+                color: "var(--crit)",
+              })
+            : "",
+          '<div class="subhead" style="margin-top:12px">By command</div>',
+          barList(diameter.inbound_requests_by_command, { color: "var(--cyan)" }),
+          '<div class="subhead" style="margin-top:12px">Answers sent</div>',
+          resultCodeBars(diameter.inbound_answers_by_result_code),
+          '<div class="subhead" style="margin-top:12px">Time to answer</div>',
+          latencyRows(diameter.inbound_latency_by_command),
+        ].join(""),
+      );
+    }
   }
 
   // SIP transport. UDP is stated as not-applicable rather than shown as zero.
@@ -324,6 +360,13 @@ export function markup() {
       <div class="card" id="sig-latency-card">
         <div class="panelhead"><span class="t">Round-trip latency</span><span class="count-pill">mean · p95</span></div>
         <div class="panelbody" id="sig-latency"></div>
+      </div>
+      <!-- Server / DRA role. Everything above is what this node SENDS and what
+           came back; this is what it SERVES. Hidden until the node has actually
+           answered something, so a pure client carries no empty card. -->
+      <div class="card" id="sig-inbound-card">
+        <div class="panelhead"><span class="t">Inbound (served)</span><span class="count-pill">server role</span></div>
+        <div class="panelbody" id="sig-inbound"></div>
       </div>
       <div class="card">
         <div class="panelhead"><span class="t">Charging</span><span class="count-pill">Rf / Ro · TS 32.299</span></div>

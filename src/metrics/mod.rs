@@ -474,6 +474,29 @@ pub struct SiphonMetrics {
     pub diameter_request_duration_seconds: HistogramVec,
     pub diameter_watchdog_failures_total: IntCounter,
 
+    // --- Diameter, inbound (server / DRA role) ---
+    //
+    // The four metrics above are all client-side: requests siphon *sends* and
+    // answers it *receives*. A node in a server role — the `diameter.listen`
+    // DRA, an outbound serving connection, an `@diameter.on_request` handler
+    // answering an HSS-initiated RTR — carried none of its traffic in any
+    // metric at all, so its entire inbound load was invisible.
+    /// Total Diameter requests received and dispatched, by command.
+    pub diameter_inbound_requests_total: IntCounterVec,
+    /// Total Diameter answers siphon *emitted* as a server, by command and
+    /// Result-Code.
+    ///
+    /// **Alert on the 3002 rate.** `DIAMETER_UNABLE_TO_DELIVER` here is siphon's
+    /// own fallback for "no `@diameter.on_request` handler matched, or the
+    /// handler returned `None`", which is a script gap rather than a peer
+    /// problem — the peer sees a rejection either way, and nothing else records
+    /// that siphon is the one rejecting.
+    pub diameter_inbound_answers_total: IntCounterVec,
+    /// Time from an inbound request being dispatched to its answer being
+    /// written back, by command — script handler time included, since that is
+    /// what the peer is waiting on.
+    pub diameter_inbound_duration_seconds: HistogramVec,
+
     // --- Ro online charging (TS 32.299) ---
     /// Total calls refused credit by the OCS, by Result-Code.
     ///
@@ -897,6 +920,33 @@ impl SiphonMetrics {
             "Total Diameter watchdog (DWR/DWA) failures indicating dead peers",
         )?;
 
+        let diameter_inbound_requests_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_inbound_requests_total",
+                "Total Diameter requests received and dispatched, by command",
+            ),
+            &["command"],
+        )?;
+
+        let diameter_inbound_answers_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_inbound_answers_total",
+                "Total Diameter answers emitted as a server, by command and Result-Code",
+            ),
+            &["command", "result_code"],
+        )?;
+
+        let diameter_inbound_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "siphon_diameter_inbound_duration_seconds",
+                "Time to answer an inbound Diameter request, in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0,
+            ]),
+            &["command"],
+        )?;
+
         let rtpengine_instances_up = IntGauge::new(
             "siphon_rtpengine_instances_up",
             "Number of RTPEngine instances responding to ping",
@@ -1093,6 +1143,9 @@ impl SiphonMetrics {
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
         registry.register(Box::new(diameter_request_duration_seconds.clone()))?;
         registry.register(Box::new(diameter_watchdog_failures_total.clone()))?;
+        registry.register(Box::new(diameter_inbound_requests_total.clone()))?;
+        registry.register(Box::new(diameter_inbound_answers_total.clone()))?;
+        registry.register(Box::new(diameter_inbound_duration_seconds.clone()))?;
         registry.register(Box::new(rtpengine_instances_up.clone()))?;
         registry.register(Box::new(rtpengine_instances_total.clone()))?;
         registry.register(Box::new(rtpengine_instance_up.clone()))?;
@@ -1162,6 +1215,9 @@ impl SiphonMetrics {
             diameter_request_errors_total,
             diameter_request_duration_seconds,
             diameter_watchdog_failures_total,
+            diameter_inbound_requests_total,
+            diameter_inbound_answers_total,
+            diameter_inbound_duration_seconds,
             rtpengine_instances_up,
             rtpengine_instances_total,
             rtpengine_instance_up,
@@ -1332,6 +1388,38 @@ pub fn set_diameter_peer_up(peer: &str, up: bool) {
         .diameter_peer_up
         .with_label_values(&[peer])
         .set(if up { 1 } else { 0 });
+}
+
+/// Record one inbound Diameter transaction siphon served as a server.
+///
+/// Takes the raw `command_code` and derives both names here rather than at the
+/// call site, so the request series is labelled `CCR` and the answer series
+/// `CCA` exactly as on the client side — a counter of answers labelled with the
+/// request name would be a lie about which half of the exchange it counted, and
+/// the two directions must not be able to drift apart on that.
+///
+/// Called once per dispatched request, at the single point every inbound
+/// connection type funnels through.
+pub fn record_diameter_inbound(command_code: u32, result_code: &str, elapsed: std::time::Duration) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    let request_name = crate::diameter::codec::command_name(command_code, true);
+    metrics
+        .diameter_inbound_requests_total
+        .with_label_values(&[request_name])
+        .inc();
+    metrics
+        .diameter_inbound_answers_total
+        .with_label_values(&[
+            crate::diameter::codec::command_name(command_code, false),
+            result_code,
+        ])
+        .inc();
+    metrics
+        .diameter_inbound_duration_seconds
+        .with_label_values(&[request_name])
+        .observe(elapsed.as_secs_f64());
 }
 
 /// Count a call refused credit by the OCS (Ro, TS 32.299).
@@ -1979,6 +2067,11 @@ mod tests {
         "diameter_peer_up",
         "ro_denials_total",
         "ro_credit_teardowns_total",
+        // Written by `record_diameter_inbound` below, from the one point every
+        // inbound Diameter connection type dispatches through.
+        "diameter_inbound_requests_total",
+        "diameter_inbound_answers_total",
+        "diameter_inbound_duration_seconds",
     ];
 
     fn crate_source_files() -> Vec<std::path::PathBuf> {
@@ -2080,10 +2173,11 @@ mod tests {
             // pin where they are actually driven from.
             "record_call_cost(",
             "publish_spend_rate(",
-            // And the Diameter/Ro trio, for the same reason.
+            // And the Diameter/Ro recorders, for the same reason.
             "set_diameter_peer_up(",
             "record_ro_denial(",
             "record_ro_credit_teardown(",
+            "record_diameter_inbound(",
         ] {
             assert!(
                 sources.iter().any(|body| body.contains(recorder)),

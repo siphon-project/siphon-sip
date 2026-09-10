@@ -825,6 +825,39 @@ impl DiameterMsg {
             .filter(move |avp| avp.code == code && avp.vendor == vendor)
     }
 
+    /// The two Result-Code values an answer can carry: `(Result-Code,
+    /// Experimental-Result-Code)`.
+    ///
+    /// Both are extracted, and the *precedence* between them is decided by
+    /// `dictionary::answer_result_label` — one rule, so an answer siphon emits
+    /// and an answer siphon receives can never be read two different ways.
+    ///
+    /// Matched on AVP code alone rather than `(code, vendor)`:
+    /// `Experimental-Result` is defined as a base AVP (RFC 6733 §7.6, vendor 0)
+    /// but peers do send it with the V-bit set, and the dictionary only knows
+    /// the conformant form. A vendor-flagged copy therefore never decodes as
+    /// grouped, so its payload is re-parsed here rather than being read as an
+    /// integer — those first four bytes are the nested `Vendor-Id` AVP *header*,
+    /// which would silently produce a plausible-looking wrong code.
+    pub fn answer_result_codes(&self) -> (Option<u32>, Option<u32>) {
+        let by_code = |code: u32| self.avps.iter().find(move |avp| avp.code == code);
+        let base = by_code(dictionary::avp::RESULT_CODE).and_then(|avp| avp.as_u32());
+        let child_code = dictionary::avp::EXPERIMENTAL_RESULT_CODE;
+        let experimental =
+            by_code(dictionary::avp::EXPERIMENTAL_RESULT).and_then(|group| match &group.value {
+                AvpData::Grouped(children) => children
+                    .iter()
+                    .find(|child| child.code == child_code)
+                    .and_then(|child| child.as_u32()),
+                AvpData::Raw(bytes) => parse_avps(bytes)
+                    .ok()?
+                    .iter()
+                    .find(|child| child.code == child_code)
+                    .and_then(|child| child.as_u32()),
+            });
+        (base, experimental)
+    }
+
     /// Convenience: a base (vendor 0) AVP's value as a UTF-8 string.
     pub fn get_str(&self, code: u32) -> Option<String> {
         self.find(code, 0).and_then(|avp| avp.as_str())

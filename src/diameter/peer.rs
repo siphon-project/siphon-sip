@@ -145,18 +145,13 @@ fn session_high_seed() -> u32 {
         .unwrap_or(0)
 }
 
-/// Bounded metric label for the Result-Code an answer carries.
+/// Bounded metric label for the Result-Code a *received* answer carries.
 ///
-/// Prefers the base `Result-Code`, falling back to the 3GPP
-/// `Experimental-Result-Code` — which Cx/Sh/Rx answers carry *instead of*, not
-/// alongside, the base code (TS 29.229 §6.2), nested inside the
-/// `Experimental-Result` grouped AVP. An answer with neither is labelled `none`
-/// rather than being dropped: a peer answering without a Result-Code at all is
-/// itself worth seeing.
-fn answer_result_label(answer: &DiameterMessage) -> &'static str {
-    if let Some(code) = answer.avps.get("Result-Code").and_then(|v| v.as_u64()) {
-        return dictionary::result_code_label(code as u32, false);
-    }
+/// The extractor for the decoded JSON view; the precedence rule itself lives in
+/// [`dictionary::answer_result_label`], shared with the server-side extractor
+/// that reads the same two values off the lossless tree.
+fn decoded_answer_result_label(answer: &DiameterMessage) -> &'static str {
+    let base = answer.avps.get("Result-Code").and_then(|v| v.as_u64());
     let experimental = answer
         .avps
         .get("Experimental-Result")
@@ -164,10 +159,25 @@ fn answer_result_label(answer: &DiameterMessage) -> &'static str {
         // Tolerate a decoder that hoists the code to the top level.
         .or_else(|| answer.avps.get("Experimental-Result-Code"))
         .and_then(|v| v.as_u64());
-    match experimental {
-        Some(code) => dictionary::result_code_label(code as u32, true),
-        None => "none",
+
+    if base.is_none() && experimental.is_none() && !answer.raw.is_empty() {
+        // The JSON view is keyed by dictionary name, and the dictionary knows
+        // `Experimental-Result` only in its conformant vendor-0 form (RFC 6733
+        // §7.6). A peer that sets the V-bit on it therefore lands in this view
+        // as an unnamed hex string, and the answer would be labelled `none`
+        // even though it carried a perfectly readable 3GPP result. Fall back to
+        // the lossless tree, which matches on AVP code alone.
+        //
+        // Deliberately only on the miss: a conformant answer never pays for the
+        // parse, so the common path is unchanged and the cost lands on exactly
+        // the answers that would otherwise have been mislabelled.
+        if let Ok(tree) = codec::DiameterMsg::from_wire(&answer.raw) {
+            let (base, experimental) = tree.answer_result_codes();
+            return dictionary::answer_result_label(base, experimental);
+        }
     }
+
+    dictionary::answer_result_label(base.map(|c| c as u32), experimental.map(|c| c as u32))
 }
 
 pub struct DiameterPeer {
@@ -310,7 +320,7 @@ impl DiameterPeer {
                         .diameter_answers_total
                         .with_label_values(&[
                             codec::command_name(command_code, false),
-                            answer_result_label(&answer),
+                            decoded_answer_result_label(&answer),
                         ])
                         .inc();
                 }
@@ -1226,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_result_label_prefers_base_then_experimental_then_none() {
+    fn decoded_answer_result_label_prefers_base_then_experimental_then_none() {
         fn answer(avps: serde_json::Value) -> DiameterMessage {
             DiameterMessage {
                 version: 1,
@@ -1243,14 +1253,14 @@ mod tests {
         }
 
         assert_eq!(
-            answer_result_label(&answer(serde_json::json!({"Result-Code": 2001}))),
+            decoded_answer_result_label(&answer(serde_json::json!({"Result-Code": 2001}))),
             "2001"
         );
 
         // Cx/Sh/Rx answers carry Experimental-Result *instead of* Result-Code
         // (TS 29.229 §6.2), nested in the grouped AVP.
         assert_eq!(
-            answer_result_label(&answer(serde_json::json!({
+            decoded_answer_result_label(&answer(serde_json::json!({
                 "Experimental-Result": {"Experimental-Result-Code": 5001}
             }))),
             "exp:5001"
@@ -1259,7 +1269,7 @@ mod tests {
         // The base code wins when a peer sends both, so one answer is never
         // counted twice or under the wrong namespace.
         assert_eq!(
-            answer_result_label(&answer(serde_json::json!({
+            decoded_answer_result_label(&answer(serde_json::json!({
                 "Result-Code": 2001,
                 "Experimental-Result": {"Experimental-Result-Code": 5001}
             }))),
@@ -1267,7 +1277,43 @@ mod tests {
         );
 
         // A peer answering with no Result-Code at all is itself worth seeing.
-        assert_eq!(answer_result_label(&answer(serde_json::json!({}))), "none");
+        assert_eq!(
+            decoded_answer_result_label(&answer(serde_json::json!({}))),
+            "none"
+        );
+    }
+
+    /// A peer that sets the V-bit on `Experimental-Result` is non-conformant
+    /// (RFC 6733 §7.6 defines 297 as a base AVP) but real. The dictionary knows
+    /// only the vendor-0 form, so such an answer reaches the JSON view as an
+    /// unnamed hex string and would be labelled `none` — the whole 3GPP failure
+    /// space of a Cx/Sh/Rx peer silently collapsing into one meaningless
+    /// bucket. The tree fallback reads it correctly.
+    #[test]
+    fn a_vendor_flagged_experimental_result_still_resolves() {
+        let mut children =
+            codec::encode_avp_u32(dictionary::avp::VENDOR_ID, dictionary::VENDOR_3GPP);
+        children.extend_from_slice(&codec::encode_avp_u32(
+            dictionary::avp::EXPERIMENTAL_RESULT_CODE,
+            5001,
+        ));
+        let group = codec::encode_avp_grouped_3gpp(dictionary::avp::EXPERIMENTAL_RESULT, &children);
+
+        let mut wire = Vec::new();
+        wire.push(1);
+        wire.extend_from_slice(&((20 + group.len()) as u32).to_be_bytes()[1..]);
+        wire.push(0); // answer
+        wire.extend_from_slice(&300u32.to_be_bytes()[1..]); // UAA (Cx)
+        wire.extend_from_slice(&dictionary::CX_APP_ID.to_be_bytes());
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        wire.extend_from_slice(&group);
+
+        let decoded = codec::decode_diameter(&wire).expect("answer decodes");
+        // The JSON view really has lost it — this is the condition being covered,
+        // not an assumption about it.
+        assert!(decoded.avps.get("Experimental-Result").is_none());
+        assert_eq!(decoded_answer_result_label(&decoded), "exp:5001");
     }
 
     /// Leak guard for the Diameter request/answer correlation map shared by every

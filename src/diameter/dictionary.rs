@@ -2112,6 +2112,27 @@ pub fn result_code_label(code: u32, experimental: bool) -> &'static str {
     result_code_class(code)
 }
 
+/// The Result-Code precedence rule for an answer, as one function.
+///
+/// An answer carries the base `Result-Code` **or** the 3GPP
+/// `Experimental-Result-Code`, not both (TS 29.229 §6.2) — Cx, Sh and Rx report
+/// their interface-specific outcomes through the experimental namespace, so for
+/// those it is the only code present. When a peer sends both anyway, the base
+/// code wins, so one answer is never counted twice or under the wrong namespace.
+///
+/// Both directions share this: the client side extracts the two values from the
+/// decoded JSON view of a received answer, the server side from the lossless
+/// tree of an answer it is about to emit. Two extractors, one rule — the two
+/// must not be able to disagree about what an answer said.
+pub fn answer_result_label(base: Option<u32>, experimental: Option<u32>) -> &'static str {
+    match (base, experimental) {
+        (Some(code), _) => result_code_label(code, false),
+        (None, Some(code)) => result_code_label(code, true),
+        // A peer answering with no Result-Code at all is itself worth seeing.
+        (None, None) => "none",
+    }
+}
+
 /// Whether a Result-Code denotes success (RFC 6733 §7.1.2 — the 2xxx class).
 pub fn result_code_is_success(code: u32) -> bool {
     (2000..3000).contains(&code)

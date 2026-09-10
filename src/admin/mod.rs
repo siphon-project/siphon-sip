@@ -901,6 +901,15 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "latency_by_command":
                 crate::metrics::histogram_vec_summary_by_label(&metrics.diameter_request_duration_seconds, "command"),
             "watchdog_failures": metrics.diameter_watchdog_failures_total.get(),
+            // The server-side half. Everything above is what siphon *sends* and
+            // what came back; a node in a DRA or HSS role carried none of the
+            // traffic it *serves* in any metric at all.
+            "inbound_requests_by_command":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_inbound_requests_total, "command"),
+            "inbound_answers_by_result_code":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_inbound_answers_total, "result_code"),
+            "inbound_latency_by_command":
+                crate::metrics::histogram_vec_summary_by_label(&metrics.diameter_inbound_duration_seconds, "command"),
         })),
         "rtpengine": state.features.media.then(|| serde_json::json!({
             "up": metrics.rtpengine_instances_up.get(),
