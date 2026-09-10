@@ -3038,8 +3038,10 @@ pub struct NgFlagsConfig {
     #[serde(default)]
     pub echo_cancellation: bool,
     /// How far from the reference the echo canceller searches for the returning
-    /// echo, in milliseconds (16–1000, default 256).  `siphon-rtp` backend only,
-    /// and inert without `echo_cancellation`.
+    /// echo, in milliseconds (16–1000, default 256).  With `echo_long_tail` set
+    /// this is a **tail length** instead, checked against its own bound — both
+    /// are read from `siphon-rtp-proto` rather than restated here.
+    /// `siphon-rtp` backend only, and inert without `echo_cancellation`.
     ///
     /// The window has to span the whole media path twice, not an acoustic
     /// loudspeaker-to-microphone hop, so a carrier or mobile leg can sit past
@@ -3052,8 +3054,16 @@ pub struct NgFlagsConfig {
     pub echo_delay_search_ms: Option<u32>,
     /// Span the echo path with the adaptive filter itself instead of estimating
     /// a bulk delay first, which makes `echo_delay_search_ms` a tail length
-    /// rather than a search window.  `siphon-rtp` backend only, and inert
-    /// without `echo_cancellation`.
+    /// rather than a search window (16–1000 ms in that reading).  `siphon-rtp`
+    /// backend only, and inert without `echo_cancellation`.
+    ///
+    /// The two postures differ in **how they fail**.  Estimation is cheap and
+    /// exact when it works, but commits the tallest correlation peak inside its
+    /// window whatever that peak is, so an echo beyond the window leaves the
+    /// filter adapting against a reference that is not the echo.  A long tail
+    /// makes no alignment decision, so it has nothing to get wrong; it is
+    /// slower to converge and materially more expensive per frame, so ask for
+    /// the tail the path needs rather than the ceiling.
     #[serde(default)]
     pub echo_long_tail: bool,
     /// Chain the residual-echo suppressor after the linear canceller.
@@ -4538,18 +4548,43 @@ impl Config {
                     )));
                 }
 
-                // 16..=1000 ms is the engine's own accepted range, and it
-                // refuses an out-of-range value at the control plane — that is,
-                // on every media offer, at call time, on a node that came up
-                // reporting perfectly healthy. Catching it here turns "every
-                // call fails" into a boot failure that names the profile.
+                // The engine refuses an out-of-range value at the control
+                // plane — that is, on every media offer, at call time, on a
+                // node that came up reporting perfectly healthy. Catching it
+                // here turns "every call fails" into a boot failure that names
+                // the profile.
+                //
+                // Which range applies depends on echo_long_tail: with it set
+                // the field is a tail length rather than a search window, and
+                // the engine checks it against a different bound. This used to
+                // check one hardcoded 16..=1000 for both, which was the engine's
+                // window range and not its tail range — so a long-tail profile
+                // asking for 513-1000 passed here, loaded, registered, reported
+                // healthy, and then failed every call with a 503, while the
+                // error text named a range the engine did not accept. The
+                // bounds now come from the proto crate both sides already
+                // depend on: the two happen to coincide today, and restating
+                // the digits is exactly how they came to disagree before.
                 if let Some(window) = flags.echo_delay_search_ms {
-                    if !(16..=1000).contains(&window) {
+                    let (low, high, meaning) = if flags.echo_long_tail {
+                        (
+                            siphon_rtp_proto::ECHO_LONG_TAIL_MS_MIN,
+                            siphon_rtp_proto::ECHO_LONG_TAIL_MS_MAX,
+                            "a tail length, because echo_long_tail is set",
+                        )
+                    } else {
+                        (
+                            siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MIN,
+                            siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MAX,
+                            "a search window",
+                        )
+                    };
+                    if !(low..=high).contains(&window) {
                         return Err(SiphonError::Config(format!(
                             "media profile {name:?} sets echo_delay_search_ms to {window} on its \
-                             {direction} flags, outside the 16-1000 ms the engine accepts — it \
-                             refuses the value on every offer, so a node carrying this config \
-                             starts healthy and then fails every call"
+                             {direction} flags, outside the {low}-{high} ms the engine accepts \
+                             for {meaning} — it refuses the value on every offer, so a node \
+                             carrying this config starts healthy and then fails every call"
                         )));
                     }
                 }
@@ -6867,6 +6902,11 @@ media:
 
     /// The three echo-tuning knobs reach the config, and the search window is
     /// carried as a number rather than being flattened into the `flags` list.
+    ///
+    /// The 600 ms here is deliberately a *long-tail* value above the old 512 ms
+    /// tail ceiling.  This fixture used to assert that a profile the engine
+    /// refused on every offer loaded cleanly, which is precisely the mismatch
+    /// the mode-dependent bounds close.
     #[test]
     fn parses_media_profile_echo_tuning() {
         let yaml = ws_profile_yaml(
@@ -6900,42 +6940,85 @@ media:
         assert!(!offer.echo_residual_suppression);
     }
 
-    /// Out of range is refused at load. The engine refuses it too, but only per
-    /// offer — which is a node that boots healthy and then fails every call, so
-    /// the boot failure is the one worth having.
+    /// Out of range is refused at load, in **both** readings of the field. The
+    /// engine refuses it too, but only per offer — which is a node that boots
+    /// healthy and then fails every call, so the boot failure is the one worth
+    /// having.
     #[test]
     fn rejects_media_profile_echo_delay_search_out_of_range() {
-        for window in ["15", "1001"] {
-            let yaml = ws_profile_yaml(
-                SIPHON_RTP_BACKEND,
-                &format!(
-                    "      offer:\n        echo_cancellation: true\n        \
-                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
-                ),
-            );
-            let error = Config::from_str(&yaml)
-                .expect_err("a window outside 16-1000 ms must be refused at load");
-            assert!(
-                error.to_string().contains("echo_delay_search_ms"),
-                "error should name the field: {error}"
-            );
+        for long_tail in [false, true] {
+            for window in ["15", "1001"] {
+                let yaml = ws_profile_yaml(
+                    SIPHON_RTP_BACKEND,
+                    &format!(
+                        "      offer:\n        echo_cancellation: true\n        \
+                         echo_long_tail: {long_tail}\n        \
+                         echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                    ),
+                );
+                let error = Config::from_str(&yaml)
+                    .expect_err("a value outside the accepted range must be refused at load");
+                assert!(
+                    error.to_string().contains("echo_delay_search_ms"),
+                    "error should name the field: {error}"
+                );
+            }
         }
     }
 
-    /// The bounds themselves are accepted — the check is inclusive, so a config
-    /// sitting exactly on 16 or 1000 is not refused by an off-by-one.
+    /// The refusal names which reading it applied, because the two bounds are
+    /// separate and an operator otherwise cannot tell why their value was
+    /// rejected — the failure this whole check exists to make legible.
     #[test]
-    fn accepts_media_profile_echo_delay_search_at_the_bounds() {
-        for window in ["16", "1000"] {
+    fn the_echo_delay_search_refusal_names_the_reading_it_applied() {
+        let refuse = |long_tail: bool| {
             let yaml = ws_profile_yaml(
                 SIPHON_RTP_BACKEND,
                 &format!(
                     "      offer:\n        echo_cancellation: true\n        \
-                     echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                     echo_long_tail: {long_tail}\n        \
+                     echo_delay_search_ms: 1001\n      answer: {{}}\n"
                 ),
             );
-            Config::from_str(&yaml).expect("the range bounds must be accepted");
+            Config::from_str(&yaml)
+                .expect_err("out of range")
+                .to_string()
+        };
+        assert!(refuse(true).contains("tail length"), "{}", refuse(true));
+        assert!(refuse(false).contains("search window"), "{}", refuse(false));
+    }
+
+    /// The bounds themselves are accepted — the check is inclusive, so a config
+    /// sitting exactly on 16 or 1000 is not refused by an off-by-one — and that
+    /// holds for the tail reading too, which is the one that used to be checked
+    /// against the wrong number.
+    #[test]
+    fn accepts_media_profile_echo_delay_search_at_the_bounds() {
+        for long_tail in [false, true] {
+            for window in ["16", "1000"] {
+                let yaml = ws_profile_yaml(
+                    SIPHON_RTP_BACKEND,
+                    &format!(
+                        "      offer:\n        echo_cancellation: true\n        \
+                         echo_long_tail: {long_tail}\n        \
+                         echo_delay_search_ms: {window}\n      answer: {{}}\n"
+                    ),
+                );
+                Config::from_str(&yaml).expect("the range bounds must be accepted");
+            }
         }
+    }
+
+    /// The validator checks against the engine's own published constants rather
+    /// than a copy of the digits. Restating them is what let a long-tail profile
+    /// load, register and report healthy while the engine refused it on every
+    /// offer, so this pins the source rather than the value.
+    #[test]
+    fn the_echo_bounds_come_from_the_engine_contract() {
+        assert_eq!(siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MIN, 16);
+        assert_eq!(siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MAX, 1_000);
+        assert_eq!(siphon_rtp_proto::ECHO_LONG_TAIL_MS_MIN, 16);
+        assert_eq!(siphon_rtp_proto::ECHO_LONG_TAIL_MS_MAX, 1_000);
     }
 
     /// All three are native siphon-rtp extensions with no NG or rtpproxy
