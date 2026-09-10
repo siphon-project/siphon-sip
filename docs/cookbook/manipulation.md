@@ -20,6 +20,9 @@ def edit(request):
     ua = request.get_header("User-Agent")        # str | None
     has_pai = request.has_header("P-Asserted-Identity")
 
+    # every value, for a header the peer may spread over several lines
+    vias = request.get_headers("Via")            # list[str]
+
     # strip inbound internal headers by name prefix (case-insensitive), e.g. X-*
     request.remove_headers_matching("X-")
 
@@ -36,7 +39,8 @@ def edit(request):
 
 | Call | What it does |
 |---|---|
-| `get_header(name)` / `header(name)` | Read a header value (`None` if absent). |
+| `get_header(name)` / `header(name)` | Read the **first** value (`None` if absent). |
+| `get_headers(name)` | Read **every** value, in order (`[]` if absent). |
 | `has_header(name)` | Presence check. |
 | `set_header(name, value)` | Replace the header, or add it if absent. |
 | `ensure_header(name, value)` | Set only if not already present. |
@@ -166,3 +170,46 @@ ordering). What to rewrite, and why, is your policy.
 - Real script: [`examples/teams_sbc.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/teams_sbc.py) (B2BUA header hygiene at a Teams boundary).
 - [Request reference](../reference/request.md) · [SDP reference](../reference/sdp.md).
 - [Number normalization](number-normalization.md) for policy-driven E.164 identity rewriting.
+
+## Multi-value headers
+
+RFC 3261 §7.3.1 lets a peer spread one header over several lines, and the ones
+a script reaches for most often arrive that way: `Via`, `Record-Route`, `Route`,
+`Contact`, `Supported`, `Path`, the `P-*` family. `get_header` returns the first
+value, so reading a multi-line header through it truncates silently — the script
+sees a well-formed value and never learns there were more.
+
+```python
+# every entry, in arrival order
+for record_route in request.get_headers("Record-Route"):
+    log.info(record_route)
+
+# the first one only — fine for User-Agent, wrong for Via
+top_via = request.get_header("Via")
+```
+
+One entry per header *line*. A single line carrying several comma-separated URIs
+stays one entry; split it yourself if you need them apart.
+
+`reply.get_headers(name)` reads a response the same way.
+
+### The route set on a dialog-forming response
+
+siphon copies `Record-Route` into a dialog-forming 2xx (and an early-dialog
+provisional) by itself — RFC 3261 §12.1.1 requires a UAS to echo every value, in
+order, with all parameters intact, and the UAC reverses that list to build its
+route set. You do not need to write it, and you should not: dropping one entry
+hands the peer a route set short by a hop, which strands every in-dialog request
+it sends.
+
+It applies to an initial `INVITE`, `SUBSCRIBE` or `REFER` your script answers
+with `request.reply()`, and to a B2BUA `call.answer()`. A re-INVITE, an
+in-dialog request, a non-dialog-forming method, `100 Trying` and any failure
+response are all left alone.
+
+Override it only if you mean to reshape the route set — `set_reply_header`
+replaces what the framework copied:
+
+```python
+request.set_reply_header("Record-Route", "<sip:203.0.113.9:5060;lr>")
+```

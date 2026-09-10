@@ -6,6 +6,54 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A UAS answering a dialog-forming request now echoes the full `Record-Route`
+  into its response, and scripts can finally read a multi-value header at all
+  (`get_headers`).**
+
+  RFC 3261 §12.1.1 requires a UAS to copy *every* `Record-Route` value from the
+  request into the response that establishes the dialog, in order and with all
+  parameters intact "whether they are known or unknown to the UAS". siphon
+  copied none of them, leaving the rule to the script — and the script could not
+  satisfy it, because `get_header()` returns the first value only and no
+  multi-value getter was bound. The second `Record-Route` was simply unreadable
+  from Python.
+
+  That was latent for as long as no peer sent more than one line. It stopped
+  being latent when siphon itself began Record-Routing once per *socket* a
+  dialog crosses (#307): a proxy bridging a protected access port to a core port
+  now inserts two entries, and the UAS echoed back only the first. Since the UAC
+  builds its route set from that echo reversed (§12.1.2), the peer was left
+  addressing the core-facing port for everything in-dialog — and on an
+  IPsec-protected access leg no SA covers that port, so nothing it sent could
+  leave the handset. The symptom was a subscription or call that answers `200 OK`
+  and then never advances, the peer retransmitting its initial request until the
+  dialog is re-created from scratch.
+
+  The echo now happens in the response builder, so it covers `request.reply()`
+  on the proxy and `call.answer()` on the B2BUA without either script knowing
+  the rule exists. It is scoped to responses that actually establish a dialog:
+  an initial `INVITE`, `SUBSCRIBE` or `REFER` (RFC 6665 §4.1.2, RFC 3515 §2.4.4)
+  answered `101`–`299`. A re-INVITE or in-dialog request is excluded — §12.2.1.2
+  forbids the UAC refreshing its route set mid-dialog — as are `100 Trying`,
+  every failure response, and every dialogless method. Lines are copied
+  verbatim rather than parsed and re-emitted, which is the only way an unknown
+  parameter survives. A script that wants a different route set still wins:
+  `set_reply_header("Record-Route", …)` replaces the copy.
+
+### Added
+
+- **`request.get_headers(name)` / `reply.get_headers(name)` — every value of a
+  header, in order, as a `list[str]` (empty when absent).**
+
+  `get_header` returns the first value, which silently truncates any header the
+  peer spread over several lines (RFC 3261 §7.3.1) — `Via`, `Record-Route`,
+  `Route`, `Contact`, `Supported`, `Path`, the `P-*` family. There was no way to
+  read the rest from a script. One entry per header line; a line holding several
+  comma-separated URIs stays one entry. Mirrored in the `siphon-sip` SDK mock,
+  where a test can pass a list for a header name to model a multi-line arrival.
+
 ### Changed
 
 - **A rejected WebSocket upgrade now scores as a strong auto-ban signal instead

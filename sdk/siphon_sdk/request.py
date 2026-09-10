@@ -120,7 +120,7 @@ class Request:
         auth_user: Optional[str] = None,
         contact_expires: Optional[int] = None,
         event: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
+        headers: Optional[dict[str, Union[str, list[str]]]] = None,
     ) -> None:
         self._method = method
         self._ruri = _parse_uri(ruri) or SipUri()
@@ -140,7 +140,9 @@ class Request:
         self._auth_user = auth_user
         self._contact_expires = contact_expires
         self._event = event
-        self._headers: dict[str, str] = dict(headers) if headers else {}
+        self._headers: dict[str, Union[str, list[str]]] = (
+            dict(headers) if headers else {}
+        )
         self._actions: list[Action] = []
         # Route URIs popped by ``loose_route()``.  Mirrors the production
         # ``PyRequest.consumed_routes`` field — used so scripts that read
@@ -583,10 +585,14 @@ class Request:
             name: Header name (e.g. ``"Via"``, ``"Contact"``).
 
         Returns:
-            Header value string or ``None`` if not present.
+            Header value string or ``None`` if not present.  When the header
+            has several values, this is the first — use :meth:`get_headers`
+            for all of them.
         """
         for key, value in self._headers.items():
             if key.lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    return str(value[0]) if value else None
                 return value
         return None
 
@@ -598,6 +604,40 @@ class Request:
             ua = request.header("User-Agent")
         """
         return self.get_header(name)
+
+    def get_headers(self, name: str) -> list[str]:
+        """Every value of a header, in order — ``[]`` when it is absent.
+
+        :meth:`get_header` returns only the *first* value, which silently
+        truncates a header the peer spread over several lines.  Record-Route,
+        Via, Route, Contact, Supported, Path and the P-* family are all
+        routinely multi-value (RFC 3261 §7.3.1), so read those with this.
+
+        Values come back one entry per header line.  A single line holding
+        several comma-separated URIs stays one entry — split it yourself if you
+        need the individual URIs.
+
+        To exercise a multi-line header in a test, pass a list for that name
+        when constructing the mock::
+
+            request = Request(headers={"Record-Route": [
+                "<sip:198.51.100.1:5060;lr>",
+                "<sip:198.51.100.1:5066;lr>",
+            ]})
+            assert len(request.get_headers("Record-Route")) == 2
+
+        Args:
+            name: Header name (case-insensitive).
+
+        Returns:
+            All values for the header, in order.
+        """
+        for key, value in self._headers.items():
+            if key.lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    return [str(item) for item in value]
+                return [value]
+        return []
 
     def set_header(self, name: str, value: str) -> None:
         """Set (replace) a header value.
