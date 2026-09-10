@@ -30,7 +30,9 @@ security:
   failed_auth_ban:              # auto-ban at accept (UDP/TCP/TLS/WS/SCTP)
     threshold: 10               # weighted failures in window_secs → ban
     window_secs: 600
-    ban_duration_secs: 3600
+    ban_duration_secs: 3600     # expiry slides on continued abuse
+    max_ban_duration_secs: 86400    # cap on the slide (default 24 ×
+                                    # ban_duration_secs)
     strong_signal_weight: 3     # weight of a high-confidence abuse signal
     missing_credentials_weight: 0   # default: a credential-less request is the
                                     # RFC-mandated first leg, not evidence
@@ -59,9 +61,10 @@ how hard they are to fake:
 | Signal | Score |
 |--------|-------|
 | INVITE server-transaction timeout (never ACKed) | 1 |
-| Failed or timed-out TLS/WSS/WS handshake | 1 |
+| Failed or timed-out TLS handshake | 1 |
 | Wrong password, a username the auth backend denied, or a forged/stale/replayed digest nonce | `strong_signal_weight` (default 3) |
 | Non-SIP bytes on a TCP/TLS stream | `strong_signal_weight` |
+| Rejected WebSocket upgrade on a WS/WSS port | `strong_signal_weight` |
 | Scanner User-Agent (`scanner_block`) | `strong_signal_weight` |
 | 401/407 challenge because the request carried **no** credentials | `missing_credentials_weight` (default **0** — not counted) |
 | A credential check the auth backend could not answer | **never counted** |
@@ -73,8 +76,37 @@ authentication resets the score to zero**, so a subscriber who mistypes a passwo
 twice then logs in is never banned, while an IP spraying garbage is banned 3× faster
 than one just rattling doorknobs.
 
-The last two rows are the ones worth understanding, because both were once counted
-and both banned real subscribers:
+**The two handshake rows are not the same signal**, and the split is deliberate. A
+failed TLS handshake can come from a benign peer — a client that doesn't trust your
+chain, an old cipher suite, an L4 probe — so it scores 1, and a certificate rollover
+doesn't become a ban wave. A *rejected WebSocket upgrade* is a different animal: the
+peer already completed TLS on a SIP-over-WebSocket port and then sent something that
+isn't an upgrade at all. RFC 7118 §5 leaves a conforming client no way to do that,
+so it scores as strong and bans in a couple of probes. The practical consequence: an
+external HTTP uptime monitor pointed at a WS/WSS port will ban itself. Put its source
+in `trusted_cidrs`.
+
+### A ban that slides
+
+An active ban's expiry is not fixed. Every further abuse signal from an
+already-banned source pushes it out to a full `ban_duration_secs` from that
+signal. Without this, a scanner that trips the threshold and then keeps hammering
+gets the rest of its run for free and walks out on the original schedule no matter
+how hard it leaned on the box in between.
+
+`max_ban_duration_secs` caps how far the slide can go, measured from the moment the
+ban was raised, and it is the part that matters. Uncapped, a source stuck in a retry
+loop is banned forever — and behind CGNAT that address speaks for every other
+subscriber on the NAT, none of whom did anything. The default of 24 ×
+`ban_duration_secs` holds a real scanner across a working day while letting a wrong
+verdict age out on its own. Set it equal to `ban_duration_secs` for a fixed TTL.
+
+The rate-limit ban (`rate_limit`) deliberately does **not** slide. Being over a rate
+limit is a capacity verdict, not evidence of intent, so a client that keeps retrying
+through its ban still serves it out on schedule.
+
+The last two rows of the table are the ones worth understanding, because both were
+once counted and both banned real subscribers:
 
 - **A request with no credentials is not evidence.** RFC 3261 §22.2 makes it the
   opening leg of challenge-response — every client sends one before it has a nonce.
@@ -121,6 +153,12 @@ after a network flap looks exactly like a flood.
 Bans are enforced at `recv()`/`accept()` — before any SIP parsing — and expire on
 their own. `trusted_cidrs` are exempt from scoring entirely, so put your load
 balancers and health checks there.
+
+They are also re-checked once a TLS or WebSocket handshake completes, which closes a
+window the accept-time check cannot: a scanner opens a burst of connections at once,
+one of them trips the threshold, and every sibling already past `accept()` would
+otherwise be served to completion because nothing looks at the ban again. The
+re-check drops the rest of the burst with the connection that earned the ban.
 
 !!! tip "Drop bans in the kernel"
     With [`security.firewall`](../kernel-firewall.md), every ban is also pushed to a

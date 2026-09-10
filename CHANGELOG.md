@@ -6,7 +6,48 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+
+- **A rejected WebSocket upgrade now scores as a strong auto-ban signal instead
+  of a weak one, so a scanner probing a WS/WSS port is banned in a couple of
+  probes rather than a handful.**
+
+  A failed *transport* handshake and a rejected *WebSocket upgrade* used to carry
+  the same weight of 1, and they are not the same evidence. A TLS handshake
+  fails for benign reasons all the time — a client that doesn't trust the chain,
+  an old cipher suite, an L4 probe — which is exactly why it scores 1 and why it
+  still does. But a rejected upgrade happens only after the peer has completed
+  TLS on a SIP-over-WebSocket port and then sent something that isn't an upgrade
+  at all. RFC 7118 §5 gives a conforming client no way to produce that, which
+  puts it in the same class as non-SIP bytes on a stream, already weighted
+  `strong_signal_weight`. Observed against an edge running `threshold: 5`: one
+  TLS failure plus four rejected upgrades, five weight-1 signals, before the ban
+  landed — with the source opening connections the whole time.
+
+  Practical consequence worth checking before upgrading: an external HTTP uptime
+  monitor pointed at a WS/WSS port will now ban itself in two probes instead of
+  five. Put its source in `security.trusted_cidrs`.
+
+- **An active ban's expiry now slides on continued abuse, capped by the new
+  `security.failed_auth_ban.max_ban_duration_secs`.**
+
+  A signal from an already-banned source used to be discarded outright, so a
+  scanner that tripped the threshold and then kept hammering got the rest of its
+  run for free and walked out at exactly the original TTL. Now each further
+  signal pushes the deadline out to a full `ban_duration_secs` from that signal,
+  and the kernel nf_tables element is re-armed to match so both expire in
+  lockstep.
+
+  `max_ban_duration_secs` bounds the slide, measured from the instant the ban was
+  raised, and defaults to 24 × `ban_duration_secs` (clamped up to at least
+  `ban_duration_secs`). It is the part that matters: uncapped, one source stuck
+  in a retry loop is banned forever, and behind CGNAT that address speaks for
+  every other subscriber on the NAT. Set it equal to `ban_duration_secs` to keep
+  a fixed TTL. The `security.rate_limit` ban deliberately does not slide — being
+  over a rate limit is a capacity verdict, not evidence of intent.
+
 ### Fixed
+
 - **A record-routing proxy emits one `Record-Route` per *socket* the dialog
   crosses, not per transport.** The double-`Record-Route` decision keyed on
   inbound transport vs outbound transport, so a proxy bridging two listeners of
@@ -61,6 +102,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   that transport when, and only when, the socket is wildcard-bound. A listener
   bound to a concrete address is unaffected, which is why deployments that pin
   their bind IP never saw this.
+
+- **A source banned while its other connections were mid-handshake no longer
+  gets those connections served to completion.** The auto-ban was enforced only
+  at `accept()`, which left a window: a scanner opens a burst at once, one
+  connection trips the threshold, and every sibling already past `accept()` runs
+  to completion because nothing consults the ban again. Seen in production as
+  eighteen connections finishing their TLS handshake *after* the ban line was
+  logged. The ban is now re-checked once a TLS or WebSocket handshake completes,
+  before any further work for the peer, so the rest of the burst dies with the
+  connection that earned the ban.
+
+- **The dedicated WSS listener now bounds its TLS handshake.** It awaited
+  `acceptor.accept()` with no timeout, where the TLS and `tls+wss` mux listeners
+  both bound theirs — so a peer that connected and then stalled mid-handshake
+  pinned a task and a socket with nothing to reap it. It now uses the same
+  handshake timeout as the other two.
+
+- WebSocket connection accepts on a `tls+wss` mux listener are logged at debug
+  rather than info, matching the SIP arm of the same listener. At info a scanning
+  burst buried everything else in the log.
 
 ## [1.8.6] — 2026-09-08
 
