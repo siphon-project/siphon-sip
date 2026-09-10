@@ -24,6 +24,11 @@ SIPhon exports built-in gauges/counters; the ones worth alerting on:
 | `siphon_pyexec_pool_size` vs `_pool_max` | pinned equal + all busy for minutes | Pool fully grown and saturated |
 | `siphon_proxy_dialog_sessions` | grows under flat completed-call load | Dialog state not draining |
 | `siphon_rtpengine_instances_up` | drops below your engine count | An RTPEngine is unhealthy |
+| `siphon_diameter_peer_up{peer}` | `== 0` | That named peer is down. The bare `siphon_diameter_peers_connected` count cannot say which one |
+| `siphon_diameter_answers_total{result_code!~"2.*"}` | `rate() > 0` | A peer is reachable and refusing. `siphon_diameter_request_errors_total` counts transport failures only, so this reads zero there |
+| `siphon_ro_denials_total` | `rate() > 0` | Calls being refused credit by the OCS |
+| `siphon_ro_credit_teardowns_total{reason="no_teardown_hook"}` | `increase() > 0` | Credit ran out with nothing wired to enforce it — the call is still up, and unpaid |
+| `siphon_diameter_inbound_answers_total{result_code="3002"}` | `rate() > 0` | Server role only: siphon is rejecting inbound requests because no `@diameter.on_request` handler matched — a script gap, not a peer problem |
 
 See [Handler execution model](../handler-execution-model.md) for the pool internals.
 

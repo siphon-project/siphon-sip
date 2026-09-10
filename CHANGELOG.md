@@ -42,60 +42,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   parameter survives. A script that wants a different route set still wins:
   `set_reply_header("Record-Route", …)` replaces the copy.
 
-### Added
-
-- **`request.get_headers(name)` / `reply.get_headers(name)` — every value of a
-  header, in order, as a `list[str]` (empty when absent).**
-
-  `get_header` returns the first value, which silently truncates any header the
-  peer spread over several lines (RFC 3261 §7.3.1) — `Via`, `Record-Route`,
-  `Route`, `Contact`, `Supported`, `Path`, the `P-*` family. There was no way to
-  read the rest from a script. One entry per header line; a line holding several
-  comma-separated URIs stays one entry. Mirrored in the `siphon-sip` SDK mock,
-  where a test can pass a list for a header name to model a multi-line arrival.
-
-### Changed
-
-- **A rejected WebSocket upgrade now scores as a strong auto-ban signal instead
-  of a weak one, so a scanner probing a WS/WSS port is banned in a couple of
-  probes rather than a handful.**
-
-  A failed *transport* handshake and a rejected *WebSocket upgrade* used to carry
-  the same weight of 1, and they are not the same evidence. A TLS handshake
-  fails for benign reasons all the time — a client that doesn't trust the chain,
-  an old cipher suite, an L4 probe — which is exactly why it scores 1 and why it
-  still does. But a rejected upgrade happens only after the peer has completed
-  TLS on a SIP-over-WebSocket port and then sent something that isn't an upgrade
-  at all. RFC 7118 §5 gives a conforming client no way to produce that, which
-  puts it in the same class as non-SIP bytes on a stream, already weighted
-  `strong_signal_weight`. Observed against an edge running `threshold: 5`: one
-  TLS failure plus four rejected upgrades, five weight-1 signals, before the ban
-  landed — with the source opening connections the whole time.
-
-  Practical consequence worth checking before upgrading: an external HTTP uptime
-  monitor pointed at a WS/WSS port will now ban itself in two probes instead of
-  five. Put its source in `security.trusted_cidrs`.
-
-- **An active ban's expiry now slides on continued abuse, capped by the new
-  `security.failed_auth_ban.max_ban_duration_secs`.**
-
-  A signal from an already-banned source used to be discarded outright, so a
-  scanner that tripped the threshold and then kept hammering got the rest of its
-  run for free and walked out at exactly the original TTL. Now each further
-  signal pushes the deadline out to a full `ban_duration_secs` from that signal,
-  and the kernel nf_tables element is re-armed to match so both expire in
-  lockstep.
-
-  `max_ban_duration_secs` bounds the slide, measured from the instant the ban was
-  raised, and defaults to 24 × `ban_duration_secs` (clamped up to at least
-  `ban_duration_secs`). It is the part that matters: uncapped, one source stuck
-  in a retry loop is banned forever, and behind CGNAT that address speaks for
-  every other subscriber on the NAT. Set it equal to `ban_duration_secs` to keep
-  a fixed TTL. The `security.rate_limit` ban deliberately does not slide — being
-  over a rate limit is a capacity verdict, not evidence of intent.
-
-### Fixed
-
 - **A record-routing proxy emits one `Record-Route` per *socket* the dialog
   crosses, not per transport.** The double-`Record-Route` decision keyed on
   inbound transport vs outbound transport, so a proxy bridging two listeners of
@@ -170,6 +116,142 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - WebSocket connection accepts on a `tls+wss` mux listener are logged at debug
   rather than info, matching the SIP arm of the same listener. At info a scanning
   burst buried everything else in the log.
+
+- **Online charging reported "not configured" on every node that runs `ro:`
+  without `rf:`** — `/admin/metrics.json` gated its Ro session count on the
+  **Rf** feature flag, and there was no Ro flag at all, so `sessions.ro` came
+  back `null` on any node with online charging and no offline charging. The
+  dashboard renders `null` as "not configured" (deliberately, to keep it
+  distinct from a zero), so the Charging card denied that online charging
+  existed while the Diameter card beside it counted the CCRs going out. Offline
+  and online charging are independent reference points and one without the other
+  is an ordinary deployment, not an edge case. The snapshot now carries its own
+  `ro` flag derived from `config.ro`, and a table-driven test asserts every
+  optional subsystem surfaces its own keys **and only** its own keys — the
+  negative half is the point, since a gate wired to a neighbouring flag passes
+  any test that checks only its own key.
+
+- **A vendor-flagged `Experimental-Result` no longer reads as no result at all**
+  — the AVP dictionary knows `Experimental-Result` only in its conformant
+  vendor-0 form (RFC 6733 §7.6 defines 297 as a base AVP), so a peer that sets
+  the V-bit on it left the code unreachable from the decoded view. Answer
+  labelling now falls back to the lossless tree, which matches on AVP code
+  alone, and parses a raw grouped payload rather than reading its first four
+  bytes as an integer — those bytes are the nested `Vendor-Id` AVP *header*, so
+  the naive read produces a plausible-looking wrong code. Affects Cx, Sh and Rx,
+  which report their outcomes through the experimental namespace and would
+  otherwise have had their entire 3GPP failure space collapse into one bucket.
+  The fallback runs only when the fast path finds neither code, so a conformant
+  answer never pays for the parse.
+
+### Added
+
+- **`request.get_headers(name)` / `reply.get_headers(name)` — every value of a
+  header, in order, as a `list[str]` (empty when absent).**
+
+  `get_header` returns the first value, which silently truncates any header the
+  peer spread over several lines (RFC 3261 §7.3.1) — `Via`, `Record-Route`,
+  `Route`, `Contact`, `Supported`, `Path`, the `P-*` family. There was no way to
+  read the rest from a script. One entry per header line; a line holding several
+  comma-separated URIs stays one entry. Mirrored in the `siphon-sip` SDK mock,
+  where a test can pass a list for a header name to model a multi-line arrival.
+
+- **Diameter answers are counted by Result-Code** —
+  `siphon_diameter_answers_total{command,result_code}`, written at the single
+  request/answer round trip every reference point funnels through, so Cx, Rx,
+  Ro, Rf and Sh are all covered by one write site.
+  `siphon_diameter_request_errors_total` only ever counted **transport**
+  failures (a blocked write, a dropped channel, a timeout); an answer that
+  arrives is a successful round trip by that measure whatever it says, so an OCS
+  refusing every single CCR with 4012 CREDIT_LIMIT_REACHED displayed as "errors:
+  0". This is the counter that separates "the peer is unreachable" from "the
+  peer is answering, and saying no". Labels are bounded at compile time rather
+  than by what a peer sends: known codes appear as themselves, anything else
+  collapses to its RFC 6733 §7.1 class (`4xxx_other`), and 3GPP
+  Experimental-Result-Codes carry an `exp:` prefix so a vendor 5001 is never
+  conflated with a base 5001.
+- **Ro denials and credit teardowns are counted** —
+  `siphon_ro_denials_total{result_code}` for a call refused credit at setup, and
+  `siphon_ro_credit_teardowns_total{reason}` for one cut off mid-call when
+  credit ran out. Neither moved any counter before: the round trip succeeded, no
+  SIP error fired, and the only trace was an `info!` line. The
+  `reason="no_teardown_hook"` series is the one to alert on — credit ran out,
+  nothing was wired to enforce it, and the call is still up and unpaid.
+- **Inbound Diameter traffic is counted at all** —
+  `siphon_diameter_inbound_requests_total{command}`,
+  `siphon_diameter_inbound_answers_total{command,result_code}` and
+  `siphon_diameter_inbound_duration_seconds{command}`, written at the one point
+  every inbound connection type dispatches through (the `diameter.listen` DRA,
+  outbound serving connections, and the legacy `diameter.peers` inbound path).
+  Every other Diameter metric siphon has is client-side — requests it *sends*
+  and answers it *receives* — so a node in a server or DRA role carried none of
+  the traffic it serves in any metric whatsoever. The `result_code="3002"`
+  series is the one to alert on: that is siphon's own fallback for "no
+  `@diameter.on_request` handler matched, or the handler returned `None`", which
+  is a gap in the script rather than a problem at the peer, and nothing recorded
+  that siphon was the one rejecting.
+- **Per-peer Diameter connection state** — `siphon_diameter_peer_up{peer}`, 0/1
+  keyed on the peer's configured name, mirroring the per-instance media health
+  gauge. `siphon_diameter_peers_connected` is a bare count and cannot say
+  whether it is the HSS or the OCS that went away. Every configured peer is
+  published at 0 before its first connect attempt, so a peer that has never come
+  up reads as down rather than being absent from the metric.
+- **Diameter round-trip latency reaches the admin snapshot and the dashboard** —
+  `siphon_diameter_request_duration_seconds` had been collected since it was
+  added and never rendered, previously allow-listed out of the JSON on the
+  grounds that nothing consumed a bare histogram. It is now reduced to count,
+  mean and an interpolated p95 per command. A p95 landing in the `+Inf` bucket
+  is reported as absent rather than guessed — there is no upper edge to
+  interpolate against there, and any number would understate a tail that is by
+  definition worse than the last bucket.
+- **The experimental Signalling view answers four questions instead of one** —
+  which peer, which reference point, which Result-Code, and how slow. New cards
+  for per-peer state, answers by Result-Code (coloured by class), round-trip
+  latency and inbound served traffic (hidden until the node has actually served
+  a request, so a pure client carries no empty card); the Charging card gains
+  refused-credit and credit-teardown breakdowns; and the existing errors card is
+  retitled *Transport errors*, since reading it as covering answer failures is
+  exactly the mistake that hid a refusing peer.
+
+### Changed
+
+- **A rejected WebSocket upgrade now scores as a strong auto-ban signal instead
+  of a weak one, so a scanner probing a WS/WSS port is banned in a couple of
+  probes rather than a handful.**
+
+  A failed *transport* handshake and a rejected *WebSocket upgrade* used to carry
+  the same weight of 1, and they are not the same evidence. A TLS handshake
+  fails for benign reasons all the time — a client that doesn't trust the chain,
+  an old cipher suite, an L4 probe — which is exactly why it scores 1 and why it
+  still does. But a rejected upgrade happens only after the peer has completed
+  TLS on a SIP-over-WebSocket port and then sent something that isn't an upgrade
+  at all. RFC 7118 §5 gives a conforming client no way to produce that, which
+  puts it in the same class as non-SIP bytes on a stream, already weighted
+  `strong_signal_weight`. Observed against an edge running `threshold: 5`: one
+  TLS failure plus four rejected upgrades, five weight-1 signals, before the ban
+  landed — with the source opening connections the whole time.
+
+  Practical consequence worth checking before upgrading: an external HTTP uptime
+  monitor pointed at a WS/WSS port will now ban itself in two probes instead of
+  five. Put its source in `security.trusted_cidrs`.
+
+- **An active ban's expiry now slides on continued abuse, capped by the new
+  `security.failed_auth_ban.max_ban_duration_secs`.**
+
+  A signal from an already-banned source used to be discarded outright, so a
+  scanner that tripped the threshold and then kept hammering got the rest of its
+  run for free and walked out at exactly the original TTL. Now each further
+  signal pushes the deadline out to a full `ban_duration_secs` from that signal,
+  and the kernel nf_tables element is re-armed to match so both expire in
+  lockstep.
+
+  `max_ban_duration_secs` bounds the slide, measured from the instant the ban was
+  raised, and defaults to 24 × `ban_duration_secs` (clamped up to at least
+  `ban_duration_secs`). It is the part that matters: uncapped, one source stuck
+  in a retry loop is banned forever, and behind CGNAT that address speaks for
+  every other subscriber on the NAT. Set it equal to `ban_duration_secs` to keep
+  a fixed TTL. The `security.rate_limit` ban deliberately does not slide — being
+  over a rate limit is a capacity verdict, not evidence of intent.
 
 ## [1.8.6] — 2026-09-08
 

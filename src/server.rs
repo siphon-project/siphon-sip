@@ -2027,6 +2027,13 @@ impl SiphonServer {
                     let tx = diameter_incoming_tx.clone();
                     let reconnect_delay = peer_config.reconnect_delay;
 
+                    // Publish the peer as down before the first connect attempt.
+                    // The reconnect task below only registers a client *after* a
+                    // successful connect, so without this a peer that has never
+                    // come up would be absent from the gauge rather than
+                    // reported down — the failure most worth seeing.
+                    crate::metrics::set_diameter_peer_up(&peer_name, false);
+
                     // Spawn a persistent reconnect task per peer — reconnects
                     // when the connection drops (watchdog failure, TCP reset, etc.)
                     // and re-registers the client in the DiameterManager.
@@ -2038,6 +2045,7 @@ impl SiphonServer {
                                         Arc::clone(&peer),
                                     ));
                                     manager_for_task.register(peer_name.clone(), client);
+                                    crate::metrics::set_diameter_peer_up(&peer_name, true);
                                     info!(peer = %peer_name, "Diameter peer connected");
 
                                     // Forward incoming requests until the peer disconnects.
@@ -2070,9 +2078,11 @@ impl SiphonServer {
                                     }
 
                                     // incoming_rx closed — peer disconnected
+                                    crate::metrics::set_diameter_peer_up(&peer_name, false);
                                     warn!(peer = %peer_name, "Diameter peer disconnected, reconnecting");
                                 }
                                 Err(error) => {
+                                    crate::metrics::set_diameter_peer_up(&peer_name, false);
                                     warn!(
                                         peer = %peer_name, %error,
                                         "Diameter connection failed, retrying in {reconnect_delay}s",

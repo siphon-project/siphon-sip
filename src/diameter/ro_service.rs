@@ -41,6 +41,24 @@ const DIAMETER_CREDIT_LIMIT_REACHED: u32 = 4012;
 /// Final-Unit-Action TERMINATE (RFC 8506 §8.35).
 const FINAL_UNIT_ACTION_TERMINATE: u32 = 0;
 
+/// Bounded metric label for a teardown reason.
+///
+/// The reason strings themselves are human-readable and reach the teardown hook
+/// (and from there scripts and any SIP `Reason` header), so they are left alone;
+/// this maps them to stable snake_case series names. An unmapped reason falls to
+/// `other` rather than minting a series, so adding a reason string later cannot
+/// quietly grow the label set.
+fn teardown_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "credit limit reached" => "credit_limit_reached",
+        "credit denied" => "credit_denied",
+        "credit exhausted (final unit)" => "final_unit",
+        "session lifetime exceeded" => "session_lifetime_exceeded",
+        "ocs unreachable" => "ocs_unreachable",
+        _ => "other",
+    }
+}
+
 /// When the chargeable clock starts (`ro.charge_from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargeFrom {
@@ -384,11 +402,21 @@ impl RoChargingService {
     fn fire_teardown(&self, sip_call_id: &str, reason: &str) {
         let hook = self.teardown_hook.lock().ok().and_then(|g| g.clone());
         match hook {
-            Some(hook) => hook(sip_call_id, reason),
-            None => warn!(
-                call_id = %sip_call_id,
-                "ro: credit exhausted but no teardown hook installed; call not disconnected"
-            ),
+            Some(hook) => {
+                crate::metrics::record_ro_credit_teardown(teardown_reason_label(reason));
+                hook(sip_call_id, reason)
+            }
+            None => {
+                // Distinct label: credit ran out, nothing was wired to enforce
+                // it, and the call is still up and unpaid. That is a different
+                // and worse outcome than a teardown that fired, so it must not
+                // share a series with one.
+                crate::metrics::record_ro_credit_teardown("no_teardown_hook");
+                warn!(
+                    call_id = %sip_call_id,
+                    "ro: credit exhausted but no teardown hook installed; call not disconnected"
+                )
+            }
         }
     }
 
@@ -430,6 +458,7 @@ impl RoChargingService {
         }
         let Some(peer) = self.pick_peer() else {
             return if self.fail_closed() {
+                crate::metrics::record_ro_denial(dictionary::DIAMETER_UNABLE_TO_DELIVER);
                 ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_DELIVER)
             } else {
                 ChargeDecision::AllowUncharged
@@ -461,6 +490,7 @@ impl RoChargingService {
             Err(error) => {
                 warn!(error = %error, "ro: CCR-INITIAL failed");
                 return if self.fail_closed() {
+                    crate::metrics::record_ro_denial(dictionary::DIAMETER_UNABLE_TO_DELIVER);
                     ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_DELIVER)
                 } else {
                     ChargeDecision::AllowUncharged
@@ -476,6 +506,7 @@ impl RoChargingService {
             return ChargeDecision::AllowUncharged;
         }
         if !answer.is_success() {
+            crate::metrics::record_ro_denial(answer.result_code);
             info!(result_code = answer.result_code, "ro: CCR-INITIAL denied");
             return ChargeDecision::Denied(answer.result_code);
         }
@@ -542,6 +573,7 @@ impl RoChargingService {
         }
         let Some(peer) = self.pick_peer() else {
             return if self.fail_closed() {
+                crate::metrics::record_ro_denial(dictionary::DIAMETER_UNABLE_TO_DELIVER);
                 ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_DELIVER)
             } else {
                 ChargeDecision::AllowUncharged
@@ -568,6 +600,7 @@ impl RoChargingService {
                 ChargeDecision::Granted(None)
             }
             Ok(answer) => {
+                crate::metrics::record_ro_denial(answer.result_code);
                 info!(
                     result_code = answer.result_code,
                     "ro: CCR-EVENT (IEC) denied"
@@ -577,6 +610,7 @@ impl RoChargingService {
             Err(error) => {
                 warn!(error = %error, "ro: CCR-EVENT (IEC) failed");
                 if self.fail_closed() {
+                    crate::metrics::record_ro_denial(dictionary::DIAMETER_UNABLE_TO_DELIVER);
                     ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_DELIVER)
                 } else {
                     ChargeDecision::AllowUncharged
@@ -1229,6 +1263,129 @@ mod tests {
             1,
             "teardown hook must fire exactly once"
         );
+    }
+
+    fn denials_counter(result_code: &str) -> u64 {
+        crate::metrics::metrics()
+            .map(|metrics| {
+                metrics
+                    .ro_denials_total
+                    .with_label_values(&[result_code])
+                    .get()
+            })
+            .unwrap_or(0)
+    }
+
+    fn teardowns_counter(reason: &str) -> u64 {
+        crate::metrics::metrics()
+            .map(|metrics| {
+                metrics
+                    .ro_credit_teardowns_total
+                    .with_label_values(&[reason])
+                    .get()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A refused call is a call that never happened, and until this counter
+    /// existed it moved nothing: the CCR/CCA round trip succeeded, no SIP error
+    /// counter fired, and the only trace was one `info!` line.
+    /// 4010 END_USER_SERVICE_DENIED rather than the 4012 the tests above use:
+    /// the metric registry is process-wide and these run in parallel, so a
+    /// series another test also writes cannot carry an exact-delta assertion.
+    const DIAMETER_END_USER_SERVICE_DENIED: u32 = 4010;
+
+    #[tokio::test]
+    async fn a_denied_setup_is_counted_under_its_result_code() {
+        crate::metrics::init().ok();
+        let before = denials_counter("4010");
+
+        let (manager, _rx, _cap) =
+            mock_ocs_manager(DIAMETER_END_USER_SERVICE_DENIED, None, 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let decision = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                ImsChargingData::default(),
+                "c1".to_string(),
+            )
+            .await;
+
+        assert!(matches!(decision, ChargeDecision::Denied(4010)));
+        assert_eq!(
+            denials_counter("4010") - before,
+            1,
+            "a credit denial must be counted under the Result-Code that caused it"
+        );
+        // The denial opened no session, so the leak gate stays green.
+        assert_eq!(service.active_session_count(), 0);
+    }
+
+    /// The teardown half: a call that was granted, ran, and was cut off mid-way
+    /// when credit ran out. Distinct from a denial — one is a call that never
+    /// started, the other a call the subscriber was already in.
+    #[tokio::test(start_paused = true)]
+    async fn a_credit_teardown_is_counted_under_its_reason() {
+        crate::metrics::init().ok();
+        // 4010 maps to the "credit denied" reason, which no other test emits —
+        // 4012's "credit limit reached" is shared with the teardown test above.
+        let before = teardowns_counter("credit_denied");
+
+        let (manager, _rx, _cap) = mock_ocs_manager(
+            2001,
+            Some(MIN_REAUTH_SECS),
+            DIAMETER_END_USER_SERVICE_DENIED,
+            None,
+        )
+        .await;
+        let service = RoChargingService::new(manager, enabled_config());
+        service.set_teardown_hook(Arc::new(move |_call_id, _reason| {}));
+
+        let decision = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                ImsChargingData::default(),
+                "c1".to_string(),
+            )
+            .await;
+        assert!(matches!(decision, ChargeDecision::Granted(Some(_))));
+
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_secs(MIN_REAUTH_SECS as u64 + 1)).await;
+            tokio::task::yield_now().await;
+            if service.active_session_count() == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(service.active_session_count(), 0, "session must drain");
+        assert_eq!(
+            teardowns_counter("credit_denied") - before,
+            1,
+            "a mid-call credit teardown must be counted under its reason"
+        );
+    }
+
+    #[test]
+    fn teardown_reasons_map_to_bounded_labels() {
+        // Every reason string the enforcement paths actually pass.
+        assert_eq!(
+            teardown_reason_label("credit limit reached"),
+            "credit_limit_reached"
+        );
+        assert_eq!(teardown_reason_label("credit denied"), "credit_denied");
+        assert_eq!(
+            teardown_reason_label("credit exhausted (final unit)"),
+            "final_unit"
+        );
+        assert_eq!(
+            teardown_reason_label("session lifetime exceeded"),
+            "session_lifetime_exceeded"
+        );
+        assert_eq!(teardown_reason_label("ocs unreachable"), "ocs_unreachable");
+        // Anything else collapses rather than minting a series, so adding a
+        // reason string later cannot quietly grow the label set.
+        assert_eq!(teardown_reason_label("something new"), "other");
     }
 
     fn decision_label(decision: &ChargeDecision) -> &'static str {

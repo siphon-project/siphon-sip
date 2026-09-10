@@ -2002,6 +2002,142 @@ pub const DIAMETER_SERVER_NAME_NOT_STORED: u32 = 2003;
 /// Cx: identity not registered
 pub const DIAMETER_ERROR_IDENTITY_NOT_REGISTERED: u32 = 5003;
 
+// ── Result-Code metric labels ────────────────────────────────────────────
+
+/// Base Result-Codes (RFC 6733 §7.1, RFC 4006 §9) that get a label of their own.
+///
+/// Deliberately a fixed table rather than `code.to_string()`: the value arrives
+/// on the wire from a peer, and one Prometheus series per distinct integer a
+/// broken or hostile peer chooses to emit is a cardinality attack on the scrape
+/// endpoint. Anything outside this table buckets to its class, so an unlisted
+/// code degrades to `5xxx_other` — still useful, never unbounded.
+///
+/// An incomplete table is therefore safe by construction; extend it when a code
+/// turns out to be worth watching on its own.
+const KNOWN_RESULT_CODES: &[(u32, &str)] = &[
+    (1001, "1001"), // MULTI_ROUND_AUTH
+    (2001, "2001"), // SUCCESS
+    (2002, "2002"), // LIMITED_SUCCESS
+    (3001, "3001"), // COMMAND_UNSUPPORTED
+    (3002, "3002"), // UNABLE_TO_DELIVER
+    (3003, "3003"), // REALM_NOT_SERVED
+    (3004, "3004"), // TOO_BUSY
+    (3005, "3005"), // LOOP_DETECTED
+    (3007, "3007"), // APPLICATION_UNSUPPORTED
+    (3010, "3010"), // UNKNOWN_PEER
+    (4001, "4001"), // AUTHENTICATION_REJECTED
+    (4002, "4002"), // OUT_OF_SPACE
+    (4010, "4010"), // END_USER_SERVICE_DENIED
+    (4011, "4011"), // CREDIT_CONTROL_NOT_APPLICABLE
+    (4012, "4012"), // CREDIT_LIMIT_REACHED
+    (4181, "4181"), // AUTHENTICATION_DATA_UNAVAILABLE (3GPP)
+    (4201, "4201"), // ERROR_ABSENT_USER (3GPP)
+    (5001, "5001"), // AVP_UNSUPPORTED
+    (5002, "5002"), // UNKNOWN_SESSION_ID
+    (5003, "5003"), // AUTHORIZATION_REJECTED
+    (5004, "5004"), // INVALID_AVP_VALUE
+    (5005, "5005"), // MISSING_AVP
+    (5009, "5009"), // AVP_OCCURS_TOO_MANY_TIMES
+    (5011, "5011"), // UNSUPPORTED_VERSION
+    (5012, "5012"), // UNABLE_TO_COMPLY
+    (5014, "5014"), // INVALID_AVP_LENGTH
+    (5030, "5030"), // USER_UNKNOWN
+    (5031, "5031"), // RATING_FAILED
+];
+
+/// 3GPP Experimental-Result-Codes worth a label of their own (TS 29.229 Cx,
+/// TS 29.329 Sh, TS 29.214 Rx). Labelled `exp:*` so a vendor 5001 is never
+/// conflated with base 5001 — they are different failures in different
+/// namespaces, and reading one as the other sends you to the wrong subsystem.
+const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
+    (2001, "exp:2001"), // FIRST_REGISTRATION
+    (2002, "exp:2002"), // SUBSEQUENT_REGISTRATION
+    (2003, "exp:2003"), // UNREGISTERED_SERVICE
+    (2004, "exp:2004"), // SUCCESS_SERVER_NAME_NOT_STORED
+    (5001, "exp:5001"), // ERROR_USER_UNKNOWN
+    (5002, "exp:5002"), // ERROR_IDENTITIES_DONT_MATCH
+    (5003, "exp:5003"), // ERROR_IDENTITY_NOT_REGISTERED
+    (5004, "exp:5004"), // ERROR_ROAMING_NOT_ALLOWED
+    (5005, "exp:5005"), // ERROR_IDENTITY_ALREADY_REGISTERED
+    (5006, "exp:5006"), // ERROR_AUTH_SCHEME_NOT_SUPPORTED
+    (5007, "exp:5007"), // ERROR_IN_ASSIGNMENT_TYPE
+    (5008, "exp:5008"), // ERROR_TOO_MUCH_DATA
+    (5061, "exp:5061"), // INVALID_SERVICE_INFORMATION (Rx)
+    (5063, "exp:5063"), // REQUESTED_SERVICE_NOT_AUTHORIZED (Rx)
+];
+
+/// The class bucket an unlisted Result-Code falls into (RFC 6733 §7.1:
+/// 1xxx informational, 2xxx success, 3xxx protocol error, 4xxx transient
+/// failure, 5xxx permanent failure).
+fn result_code_class(code: u32) -> &'static str {
+    match code / 1000 {
+        1 => "1xxx_other",
+        2 => "2xxx_other",
+        3 => "3xxx_other",
+        4 => "4xxx_other",
+        5 => "5xxx_other",
+        _ => "other",
+    }
+}
+
+/// Bounded metric label for a Result-Code seen on an answer.
+///
+/// `experimental` selects the 3GPP Experimental-Result-Code namespace, which is
+/// labelled `exp:*` and bucketed separately.
+///
+/// Returns `&'static str`, so labelling an answer allocates nothing and the
+/// series set is bounded by these tables at compile time rather than by what a
+/// peer chooses to send.
+pub fn result_code_label(code: u32, experimental: bool) -> &'static str {
+    let table = if experimental {
+        KNOWN_EXPERIMENTAL_RESULT_CODES
+    } else {
+        KNOWN_RESULT_CODES
+    };
+    if let Some((_, label)) = table.iter().find(|(known, _)| *known == code) {
+        return label;
+    }
+    if experimental {
+        // Keep the namespaces distinct in the bucket too, for the same reason
+        // the known codes carry the prefix.
+        return match code / 1000 {
+            1 => "exp:1xxx_other",
+            2 => "exp:2xxx_other",
+            3 => "exp:3xxx_other",
+            4 => "exp:4xxx_other",
+            5 => "exp:5xxx_other",
+            _ => "exp:other",
+        };
+    }
+    result_code_class(code)
+}
+
+/// The Result-Code precedence rule for an answer, as one function.
+///
+/// An answer carries the base `Result-Code` **or** the 3GPP
+/// `Experimental-Result-Code`, not both (TS 29.229 §6.2) — Cx, Sh and Rx report
+/// their interface-specific outcomes through the experimental namespace, so for
+/// those it is the only code present. When a peer sends both anyway, the base
+/// code wins, so one answer is never counted twice or under the wrong namespace.
+///
+/// Both directions share this: the client side extracts the two values from the
+/// decoded JSON view of a received answer, the server side from the lossless
+/// tree of an answer it is about to emit. Two extractors, one rule — the two
+/// must not be able to disagree about what an answer said.
+pub fn answer_result_label(base: Option<u32>, experimental: Option<u32>) -> &'static str {
+    match (base, experimental) {
+        (Some(code), _) => result_code_label(code, false),
+        (None, Some(code)) => result_code_label(code, true),
+        // A peer answering with no Result-Code at all is itself worth seeing.
+        (None, None) => "none",
+    }
+}
+
+/// Whether a Result-Code denotes success (RFC 6733 §7.1.2 — the 2xxx class).
+pub fn result_code_is_success(code: u32) -> bool {
+    (2000..3000).contains(&code)
+}
+
 // ── AVP Codes (for encoding) ─────────────────────────────────────────────
 
 pub mod avp {
@@ -2257,6 +2393,75 @@ pub mod avp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_result_codes_label_as_themselves() {
+        assert_eq!(result_code_label(2001, false), "2001");
+        assert_eq!(result_code_label(4012, false), "4012");
+        assert_eq!(result_code_label(5012, false), "5012");
+    }
+
+    #[test]
+    fn unknown_result_codes_bucket_to_their_class() {
+        // The cardinality bound: a code siphon does not know must never mint a
+        // series of its own, because the value comes off the wire from a peer.
+        assert_eq!(result_code_label(4999, false), "4xxx_other");
+        assert_eq!(result_code_label(5099, false), "5xxx_other");
+        assert_eq!(result_code_label(3999, false), "3xxx_other");
+        assert_eq!(result_code_label(2999, false), "2xxx_other");
+        assert_eq!(result_code_label(1999, false), "1xxx_other");
+        // Outside every defined class — still one fixed label, not a new series.
+        assert_eq!(result_code_label(9999, false), "other");
+        assert_eq!(result_code_label(0, false), "other");
+    }
+
+    #[test]
+    fn experimental_codes_keep_their_own_namespace() {
+        // A 3GPP Experimental-Result-Code 5001 (ERROR_USER_UNKNOWN) and a base
+        // Result-Code 5001 (AVP_UNSUPPORTED) are different failures in
+        // different subsystems. Sharing a series would send an operator to the
+        // wrong one.
+        assert_eq!(result_code_label(5001, true), "exp:5001");
+        assert_eq!(result_code_label(5001, false), "5001");
+        assert_ne!(
+            result_code_label(5001, true),
+            result_code_label(5001, false)
+        );
+
+        assert_eq!(result_code_label(2001, true), "exp:2001");
+        assert_eq!(result_code_label(5099, true), "exp:5xxx_other");
+        assert_eq!(result_code_label(9999, true), "exp:other");
+    }
+
+    #[test]
+    fn every_label_is_bounded_across_the_whole_u32_range() {
+        // The property that actually protects the scrape endpoint: whatever a
+        // peer sends, the label set stays finite. Sampled rather than
+        // exhaustive over 2^32, but dense across the ranges peers use.
+        use std::collections::HashSet;
+        let mut labels = HashSet::new();
+        for code in (0..70_000).chain(4_294_967_000..=u32::MAX) {
+            labels.insert(result_code_label(code, false));
+            labels.insert(result_code_label(code, true));
+        }
+        let ceiling = KNOWN_RESULT_CODES.len() + KNOWN_EXPERIMENTAL_RESULT_CODES.len() + 12;
+        assert!(
+            labels.len() <= ceiling,
+            "result-code labels are unbounded: {} distinct labels from a range \
+             a peer controls (ceiling {ceiling})",
+            labels.len()
+        );
+    }
+
+    #[test]
+    fn success_is_the_2xxx_class() {
+        assert!(result_code_is_success(2001));
+        assert!(result_code_is_success(2002));
+        assert!(!result_code_is_success(1001));
+        assert!(!result_code_is_success(3002));
+        assert!(!result_code_is_success(4012));
+        assert!(!result_code_is_success(5012));
+    }
 
     #[test]
     fn table_ordering_is_valid() {

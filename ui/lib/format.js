@@ -61,6 +61,24 @@ export function rate(current, previous, seconds) {
   return Math.max(0, (current - previous) / seconds);
 }
 
+/**
+ * Seconds as a latency reading, in whichever of µs / ms / s keeps it readable.
+ *
+ * Diameter round trips to a co-located HSS run in the tens of microseconds, to
+ * a remote OCS in the tens of milliseconds, and a timing-out one sits at the
+ * request timeout in whole seconds. A fixed unit renders one of those three as
+ * "0" and another as a wall of digits.
+ */
+export function latency(seconds) {
+  if (isAbsent(seconds)) return ABSENT;
+  if (seconds < 0.001) return Math.round(seconds * 1e6) + " µs";
+  if (seconds < 1) {
+    const ms = seconds * 1000;
+    return (ms < 10 ? ms.toFixed(1) : Math.round(ms)) + " ms";
+  }
+  return (seconds < 10 ? seconds.toFixed(1) : Math.round(seconds).toLocaleString("en-US")) + " s";
+}
+
 /** Sum the values of a `{label: count}` map. */
 export function sum(map) {
   if (!map) return 0;
