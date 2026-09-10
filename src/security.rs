@@ -7,9 +7,11 @@
 //!     forged/stale/replayed nonce ([`crate::script::api`] auth path): weight
 //!     `strong_signal_weight` over a transport whose handshake validates the
 //!     source, weight 1 over UDP where it does not;
-//!   * non-SIP bytes on a stream transport, and a scanner `User-Agent`: weight
-//!     `strong_signal_weight`;
-//!   * a failed or timed-out TLS/WS handshake: weight 1;
+//!   * non-SIP bytes on a stream transport, a rejected WebSocket upgrade, and a
+//!     scanner `User-Agent`: weight `strong_signal_weight`;
+//!   * a failed or timed-out TLS handshake: weight 1 — a peer that does not
+//!     trust the chain is benign, and weighting it like abuse turns a cipher or
+//!     certificate mismatch into an instant ban;
 //!   * a non-ACK INVITE **server**-transaction timeout (dispatcher) — the peer
 //!     sent an INVITE, got a final response, and never ACKed it: weight 1;
 //!   * a challenge issued because the request carried *no* credentials: weight
@@ -25,6 +27,13 @@
 //! challenges-then-succeeds never accumulates. Sources matching `trusted_cidrs`
 //! are never counted and never banned (own infrastructure: BGCF, trunks,
 //! monitoring).
+//!
+//! An active ban's expiry **slides**: a further signal from an already-banned
+//! source pushes it out to a full `ban_duration` from that signal, so a scanner
+//! that keeps hammering does not walk out at the original TTL regardless of what
+//! it did in between. `max_ban_duration_secs` caps how far that can go from the
+//! instant the ban was raised — see [`BanEntry`] for why an uncapped slide is
+//! unsafe behind CGNAT.
 //!
 //! The whole feature is opt-in: it is only constructed when
 //! `security.failed_auth_ban` is configured.
@@ -127,6 +136,55 @@ pub fn record_handshake_failure(source: IpAddr, transport: &str) {
                 source = %source,
                 transport,
                 "auto-ban: source banned (repeated handshake failures)"
+            );
+        }
+    }
+}
+
+/// Whether `source` is currently auto-banned, for a re-check on an
+/// already-accepted connection. `false` when the feature is not configured.
+///
+/// The transport ACL ([`crate::transport::acl::TransportAcl::is_allowed`]) runs
+/// at accept, which leaves a window: a scanner opens a burst of connections, one
+/// of them trips the ban, and every sibling already past `accept()` is served to
+/// completion because nothing looks at the ban again. Observed in production as
+/// eighteen connections finishing their TLS handshake *after* the ban line was
+/// logged. Call this once a handshake completes, before doing any more work for
+/// the peer, so the sibling connections in that burst die with it.
+///
+/// Cheap enough to sit on a per-connection path (one `OnceLock` read plus an
+/// O(1) DashMap lookup) — but it is per *connection*, not per message, and does
+/// not belong on the message path, where the ACL has already had its say.
+pub fn is_source_banned(source: IpAddr) -> bool {
+    auto_ban().is_some_and(|ban| ban.is_banned(source))
+}
+
+/// Record one *rejected WebSocket upgrade* from `source` as a high-confidence
+/// auto-ban signal, and bump the handshake-failure metric.
+///
+/// Distinct from [`record_handshake_failure`] in weight, and the distinction is
+/// the point. A failed TLS handshake can come from a benign peer — a client that
+/// does not trust the chain, an old cipher suite, a load-balancer probe — so it
+/// stays weight 1. By the time *this* is called the peer has already completed
+/// its transport handshake on a SIP-over-WebSocket port and then sent an HTTP
+/// request that is not an upgrade at all. RFC 7118 §5 gives a conforming client
+/// no way to produce that, which puts it in the same confidence class as non-SIP
+/// bytes on a stream ([`record_malformed_message`]) — so it carries the same
+/// `strong_signal_weight` and bans in a couple of probes rather than a handful.
+///
+/// The metric is the shared handshake-failure counter (this *is* the WebSocket
+/// handshake), so volume stays comparable across the weighting change. The ban
+/// log names the signal so an operator can tell which one fired.
+pub fn record_upgrade_failure(source: IpAddr, transport: &str) {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.handshake_failures_total.inc();
+    }
+    if let Some(ban) = auto_ban() {
+        if ban.record_strong_failure(source) {
+            tracing::warn!(
+                source = %source,
+                transport,
+                "auto-ban: source banned (rejected WebSocket upgrade)"
             );
         }
     }
@@ -554,18 +612,42 @@ struct FailureWindow {
     window_start: Instant,
 }
 
+/// One active ban: when it currently lapses, and the latest it may ever lapse.
+///
+/// `expiry` slides — every further abuse signal from an already-banned source
+/// pushes it out to a full `ban_duration` from that signal, so a source that
+/// keeps hammering stays banned for as long as it keeps hammering instead of
+/// being handed a fresh start the moment the original TTL runs out.
+///
+/// `hard_deadline` is fixed at the ban transition and is what makes that safe.
+/// Without it, one source stuck in a retry loop is banned forever: a handset
+/// with a stale password re-REGISTERs on a timer, and behind CGNAT the address
+/// it would hold is shared with every other subscriber on that NAT. The cap
+/// bounds the blast radius of a wrong verdict while leaving a genuine scanner
+/// pinned for as long as an operator is willing to hold anyone.
+#[derive(Debug, Clone, Copy)]
+struct BanEntry {
+    /// When the ban currently lapses. Slides forward on continued abuse.
+    expiry: Instant,
+    /// The latest `expiry` may ever be pushed to — `banned_at + max_ban_duration`.
+    hard_deadline: Instant,
+}
+
 /// Per-source-IP auto-ban store. Cheap, lock-free reads (DashMap), `Send + Sync`,
 /// shared as an `Arc` between the transport ACL, the auth path, and the dispatcher.
 pub struct AutoBanStore {
     /// IP → current failure window.
     failures: DashMap<IpAddr, FailureWindow>,
-    /// IP → ban expiry instant.
-    bans: DashMap<IpAddr, Instant>,
+    /// IP → active ban (sliding expiry + fixed hard deadline).
+    bans: DashMap<IpAddr, BanEntry>,
     /// Sources that are never counted and never banned.
     trusted: Vec<IpNet>,
     threshold: u32,
     window: Duration,
     ban_duration: Duration,
+    /// Ceiling on how far continued abuse may push a single ban's expiry,
+    /// measured from the instant the ban was first raised. See [`BanEntry`].
+    max_ban_duration: Duration,
     /// Failure weight applied by [`Self::record_strong_failure`] — how many
     /// counts a single high-confidence abuse signal (present-but-invalid
     /// credentials, forged/stale/replayed nonce, non-SIP garbage on a stream,
@@ -602,12 +684,14 @@ impl AutoBanStore {
         trusted_cidrs: &[String],
         strong_weight: u32,
         missing_credentials_weight: u32,
+        max_ban_duration_secs: u32,
     ) -> Self {
         let trusted = trusted_cidrs
             .iter()
             .filter_map(|cidr| cidr.parse::<IpNet>().ok())
             .collect();
         let threshold = threshold.max(1);
+        let ban_duration = Duration::from_secs(u64::from(ban_duration_secs.max(1)));
         Self {
             failures: DashMap::new(),
             bans: DashMap::new(),
@@ -615,7 +699,11 @@ impl AutoBanStore {
             // Guard against a zero policy disabling the feature by accident.
             threshold,
             window: Duration::from_secs(u64::from(window_secs.max(1))),
-            ban_duration: Duration::from_secs(u64::from(ban_duration_secs.max(1))),
+            ban_duration,
+            // Never below one ban_duration: a cap under the base duration would
+            // shorten the very first ban, which is not what a *max* means.
+            max_ban_duration: Duration::from_secs(u64::from(max_ban_duration_secs))
+                .max(ban_duration),
             strong_weight: strong_weight.max(1),
             // Zero is a meaningful value here (do not count it at all) and is
             // the default, so unlike the others this one is not clamped up.
@@ -680,8 +768,10 @@ impl AutoBanStore {
         if self.is_trusted(source) {
             return false;
         }
-        if self.is_banned_at(source, now) {
-            // Already banned — nothing to escalate.
+        if self.extend_ban_at(source, now) {
+            // Already banned. The expiry was just pushed out (up to the hard
+            // deadline); the source stays banned and this is not a *new* ban, so
+            // the caller must not log a second ban transition for it.
             return false;
         }
 
@@ -704,7 +794,13 @@ impl AutoBanStore {
 
         if newly_banned {
             self.failures.remove(&source);
-            self.bans.insert(source, now + self.ban_duration);
+            self.bans.insert(
+                source,
+                BanEntry {
+                    expiry: now + self.ban_duration,
+                    hard_deadline: now + self.max_ban_duration,
+                },
+            );
             // Mirror the ban into the kernel firewall (nf_tables) if wired, so
             // the source is dropped before it reaches siphon's socket. The
             // kernel element carries the same TTL as the in-memory ban, so both
@@ -717,10 +813,95 @@ impl AutoBanStore {
         newly_banned
     }
 
+    /// If `source` is currently banned, push its expiry out to a full
+    /// `ban_duration` from `now` (never past its hard deadline) and return
+    /// `true`. Returns `false` when the source is not banned, so the caller
+    /// falls through to normal failure counting.
+    ///
+    /// This is what stops a banned source getting its remaining abuse for free.
+    /// A scanner that trips the threshold and then keeps hammering used to have
+    /// every subsequent signal discarded, so it walked out at exactly the
+    /// original TTL no matter how hard it leaned on the box in between.
+    fn extend_ban_at(&self, source: IpAddr, now: Instant) -> bool {
+        if self.is_trusted(source) {
+            return false;
+        }
+
+        enum BanState {
+            /// Ban is live and its expiry was just pushed to this remaining time.
+            Extended(Duration),
+            /// A row is present but its expiry has passed — reap it, as the
+            /// `is_banned_at` this replaced used to.
+            Lapsed,
+            /// Not banned. The caller counts this failure normally.
+            Absent,
+        }
+
+        // Decide inside this scope and act after the guard drops — never hold a
+        // DashMap shard guard across another operation on the same map.
+        let state = {
+            match self.bans.get_mut(&source) {
+                Some(mut entry) if entry.expiry > now => {
+                    let extended = (now + self.ban_duration).min(entry.hard_deadline);
+                    // Only ever forward. At the hard deadline this is a no-op
+                    // rather than a rollback of an expiry already further out.
+                    if extended > entry.expiry {
+                        entry.expiry = extended;
+                    }
+                    BanState::Extended(entry.expiry.saturating_duration_since(now))
+                }
+                Some(_) => BanState::Lapsed,
+                None => BanState::Absent,
+            }
+        };
+
+        match state {
+            BanState::Extended(remaining) => {
+                // Re-arm the kernel element to the new deadline. `add_banned`
+                // re-adds the element with the fresh timeout, which refreshes it
+                // in place. The userspace store stays authoritative either way,
+                // so a kernel that declines the update only means the element
+                // lapses early while the ACL keeps enforcing.
+                if let Some(firewall) = self.firewall.get() {
+                    firewall.ban(source, remaining);
+                }
+                true
+            }
+            BanState::Lapsed => {
+                self.bans.remove(&source);
+                false
+            }
+            BanState::Absent => false,
+        }
+    }
+
     /// Test-only weight-1 shim preserving the pre-weighting call shape.
     #[cfg(test)]
     fn record_failure_at(&self, source: IpAddr, now: Instant) -> bool {
         self.record_failure_weighted_at(source, 1, now)
+    }
+
+    /// Test-only shim preserving the pre-cap constructor shape, defaulting the
+    /// sliding-expiry cap to the same 24 × `ban_duration` that startup does.
+    /// Tests that are *about* the cap call [`Self::new`] directly.
+    #[cfg(test)]
+    fn for_test(
+        threshold: u32,
+        window_secs: u32,
+        ban_duration_secs: u32,
+        trusted_cidrs: &[String],
+        strong_weight: u32,
+        missing_credentials_weight: u32,
+    ) -> Self {
+        Self::new(
+            threshold,
+            window_secs,
+            ban_duration_secs,
+            trusted_cidrs,
+            strong_weight,
+            missing_credentials_weight,
+            ban_duration_secs.saturating_mul(24),
+        )
     }
 
     /// A successful authentication from `source` clears its failure count.
@@ -740,7 +921,7 @@ impl AutoBanStore {
         }
         // Copy the expiry out so we never hold the shard read guard across the
         // `remove()` below (would deadlock on the same shard).
-        let expiry = self.bans.get(&source).map(|entry| *entry.value());
+        let expiry = self.bans.get(&source).map(|entry| entry.value().expiry);
         match expiry {
             Some(exp) if exp > now => true,
             Some(_) => {
@@ -765,7 +946,7 @@ impl AutoBanStore {
         self.bans
             .iter()
             .filter_map(|entry| {
-                let remaining = entry.value().saturating_duration_since(now);
+                let remaining = entry.value().expiry.saturating_duration_since(now);
                 if remaining.is_zero() {
                     None
                 } else {
@@ -799,7 +980,7 @@ impl AutoBanStore {
     }
 
     fn prune_at(&self, now: Instant) {
-        self.bans.retain(|_, expiry| *expiry > now);
+        self.bans.retain(|_, ban| ban.expiry > now);
         self.failures
             .retain(|_, window| now.duration_since(window.window_start) <= self.window);
     }
@@ -839,6 +1020,15 @@ impl RateLimitState {
     fn check_at(&self, source: IpAddr, now: Instant) -> bool {
         // Active ban? (Copy the expiry out before any mutation so we never hold
         // a DashMap shard guard across a second op on the same map.)
+        //
+        // Deliberately NOT the sliding expiry [`AutoBanStore`] uses, and the
+        // asymmetry is the design, not an oversight. A rate-limit ban is a
+        // capacity verdict — "this source is asking for more than its share" —
+        // where the auto-ban's is an abuse verdict. Extending on every request
+        // during the ban would mean a legitimate client that retries on a timer
+        // (and behind CGNAT, one client speaking for a whole NAT) could never
+        // serve out its ban. Fixed duration here; sliding only where the signal
+        // is evidence of intent.
         let ban_expiry = self.bans.get(&source).map(|entry| *entry.value());
         match ban_expiry {
             Some(expiry) if expiry > now => return false,
@@ -1015,7 +1205,7 @@ mod tests {
 
     #[test]
     fn bans_after_threshold_failures() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.7");
         assert!(!store.record_failure(source)); // 1
         assert!(!store.record_failure(source)); // 2
@@ -1027,7 +1217,7 @@ mod tests {
 
     #[test]
     fn success_resets_the_counter() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.8");
         store.record_failure(source);
         store.record_failure(source);
@@ -1040,7 +1230,7 @@ mod tests {
 
     #[test]
     fn trusted_cidr_never_banned() {
-        let store = AutoBanStore::new(2, 600, 3600, &["10.0.0.0/8".to_string()], 1, 0);
+        let store = AutoBanStore::for_test(2, 600, 3600, &["10.0.0.0/8".to_string()], 1, 0);
         let source = ip("10.1.2.3");
         for _ in 0..10 {
             assert!(!store.record_failure(source));
@@ -1051,7 +1241,7 @@ mod tests {
 
     #[test]
     fn window_rolls_so_slow_failures_do_not_ban() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.9");
         let t0 = Instant::now();
         assert!(!store.record_failure_at(source, t0));
@@ -1063,7 +1253,7 @@ mod tests {
 
     #[test]
     fn ban_expires_after_ttl() {
-        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0);
+        let store = AutoBanStore::for_test(1, 600, 60, &[], 1, 0);
         let source = ip("203.0.113.10");
         let t0 = Instant::now();
         assert!(store.record_failure_at(source, t0)); // threshold 1 -> immediate ban
@@ -1073,7 +1263,7 @@ mod tests {
 
     #[test]
     fn prune_drops_expired_entries() {
-        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0);
+        let store = AutoBanStore::for_test(1, 600, 60, &[], 1, 0);
         let source = ip("203.0.113.11");
         let t0 = Instant::now();
         store.record_failure_at(source, t0);
@@ -1084,7 +1274,7 @@ mod tests {
 
     #[test]
     fn already_banned_failure_is_noop() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(1, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.12");
         assert!(store.record_failure(source)); // ban
         assert!(!store.record_failure(source)); // already banned -> not "newly banned"
@@ -1093,7 +1283,7 @@ mod tests {
 
     #[test]
     fn unban_lifts_an_active_ban() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(1, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.40");
         assert!(store.record_failure(source)); // threshold 1 -> banned
         assert!(store.is_banned(source));
@@ -1104,7 +1294,7 @@ mod tests {
 
     #[test]
     fn unban_of_an_unbanned_source_is_false() {
-        let store = AutoBanStore::new(3, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 1, 0);
         let source = ip("203.0.113.41");
         // Never banned -> nothing to lift.
         assert!(!store.unban(source));
@@ -1115,7 +1305,7 @@ mod tests {
 
     #[test]
     fn banned_sources_lists_active_bans_with_remaining() {
-        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0);
+        let store = AutoBanStore::for_test(1, 600, 3600, &[], 1, 0);
         let one = ip("203.0.113.42");
         let two = ip("2001:db8::42");
         store.record_failure(one);
@@ -1135,7 +1325,7 @@ mod tests {
     fn strong_failures_ban_faster_than_plain_probes() {
         // threshold 6, strong weight 3: two high-confidence signals (3+3=6) ban,
         // while a plain probe (weight 1) needs the full six hits.
-        let store = AutoBanStore::new(6, 600, 3600, &[], 3, 0);
+        let store = AutoBanStore::for_test(6, 600, 3600, &[], 3, 0);
 
         let abuser = ip("203.0.113.30");
         assert!(!store.record_strong_failure(abuser)); // 3 < 6
@@ -1153,10 +1343,172 @@ mod tests {
     #[test]
     fn strong_weight_is_clamped_to_at_least_one() {
         // A misconfigured weight of 0 must not make strong signals free.
-        let store = AutoBanStore::new(2, 600, 3600, &[], 0, 0);
+        let store = AutoBanStore::for_test(2, 600, 3600, &[], 0, 0);
         let source = ip("203.0.113.32");
         assert!(!store.record_strong_failure(source)); // 1
         assert!(store.record_strong_failure(source)); // 2 -> ban
+    }
+
+    /// A rejected WebSocket upgrade is a strong signal while a failed transport
+    /// handshake stays weak, so the two must not ban at the same rate. This is
+    /// the weighting the incident turned on: the scanner spent one TLS failure
+    /// plus four rejected upgrades — five weight-1 signals — before tripping a
+    /// threshold of 5.
+    #[test]
+    fn rejected_upgrades_ban_faster_than_failed_handshakes() {
+        // threshold 5, strong weight 3.
+        let store = AutoBanStore::for_test(5, 600, 3600, &[], 3, 0);
+
+        let scanner = ip("203.0.113.70");
+        assert!(!store.record_strong_failure(scanner)); // upgrade rejected: 3 < 5
+        assert!(store.record_strong_failure(scanner)); // 6 -> ban on the 2nd probe
+        assert!(store.is_banned(scanner));
+
+        // The same two events as plain handshake failures leave a peer alone —
+        // a client that does not trust our chain is not a scanner.
+        let mistrustful_client = ip("203.0.113.71");
+        assert!(!store.record_failure(mistrustful_client)); // 1
+        assert!(!store.record_failure(mistrustful_client)); // 2 < 5
+        assert!(!store.is_banned(mistrustful_client));
+    }
+
+    /// The hole the incident exposed: eighteen connections failed their upgrade
+    /// *after* the ban was raised and every one of those signals was discarded,
+    /// so the source walked out at exactly the original TTL.
+    #[test]
+    fn continued_abuse_extends_an_active_ban() {
+        let store = AutoBanStore::for_test(1, 600, 60, &[], 1, 0);
+        let source = ip("203.0.113.72");
+        let t0 = Instant::now();
+
+        assert!(store.record_failure_at(source, t0)); // threshold 1 -> ban, expires t0+60
+
+        // Keep hammering just before the original expiry.
+        assert!(!store.record_failure_at(source, t0 + Duration::from_secs(50)));
+
+        // Past the original deadline, still banned: the expiry slid to t0+110.
+        assert!(store.is_banned_at(source, t0 + Duration::from_secs(61)));
+        assert!(store.is_banned_at(source, t0 + Duration::from_secs(109)));
+        assert!(!store.is_banned_at(source, t0 + Duration::from_secs(111)));
+    }
+
+    /// An extension is not a new ban: the caller must not log a second
+    /// transition, and the failure window must not be re-entered.
+    #[test]
+    fn extension_does_not_read_as_a_new_ban() {
+        let store = AutoBanStore::for_test(1, 600, 60, &[], 1, 0);
+        let source = ip("203.0.113.73");
+        let t0 = Instant::now();
+
+        assert!(store.record_failure_at(source, t0));
+        assert!(!store.record_failure_at(source, t0 + Duration::from_secs(10)));
+        // No failure row: the source is banned, not accumulating toward a ban.
+        assert_eq!(store.failures.len(), 0);
+        assert_eq!(store.active_bans(), 1);
+    }
+
+    /// The safety valve. Without it a source in a retry loop is banned forever,
+    /// and behind CGNAT that address is shared with every other subscriber on
+    /// the NAT.
+    #[test]
+    fn ban_extension_is_capped_at_the_hard_deadline() {
+        // 60 s bans, capped at 180 s total from the moment the ban was raised.
+        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0, 180);
+        let source = ip("203.0.113.74");
+        let t0 = Instant::now();
+
+        assert!(store.record_failure_at(source, t0));
+        // Hammer well past the cap; the expiry must stop at t0+180.
+        for second in [50, 100, 150, 170] {
+            assert!(!store.record_failure_at(source, t0 + Duration::from_secs(second)));
+        }
+        assert!(store.is_banned_at(source, t0 + Duration::from_secs(179)));
+        assert!(!store.is_banned_at(source, t0 + Duration::from_secs(181)));
+    }
+
+    /// A source that served its ban starts clean: the lapsed row is reaped (as
+    /// the `is_banned_at` this path replaced used to do), and the next ban gets
+    /// its own hard deadline rather than inheriting the exhausted one.
+    #[test]
+    fn a_lapsed_ban_is_reaped_and_the_next_one_starts_fresh() {
+        // 60 s bans, capped at 120 s of sliding.
+        let store = AutoBanStore::new(1, 600, 60, &[], 1, 0, 120);
+        let source = ip("203.0.113.80");
+        let t0 = Instant::now();
+
+        assert!(store.record_failure_at(source, t0)); // ban to t0+60, cap t0+120
+
+        // Offend again long after both the expiry and the old hard deadline.
+        let t1 = t0 + Duration::from_secs(300);
+        assert!(store.record_failure_at(source, t1)); // a *new* ban, not an extension
+        assert_eq!(store.active_bans(), 1);
+        // The new ban runs its own full duration; the first ban's spent cap has
+        // no say in it.
+        assert!(store.is_banned_at(source, t1 + Duration::from_secs(59)));
+        assert!(!store.is_banned_at(source, t1 + Duration::from_secs(61)));
+    }
+
+    /// A cap below the base duration is an operator typo, not a request to
+    /// shorten the first ban.
+    #[test]
+    fn max_ban_duration_is_clamped_up_to_the_ban_duration() {
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1, 0, 60);
+        let source = ip("203.0.113.75");
+        let t0 = Instant::now();
+        assert!(store.record_failure_at(source, t0));
+        // Still banned well past the bogus 60 s cap — the full hour holds.
+        assert!(store.is_banned_at(source, t0 + Duration::from_secs(3599)));
+    }
+
+    /// The admin API reads remaining time through the ban entry, so it has to
+    /// report the slid expiry rather than the original one.
+    #[test]
+    fn banned_sources_reports_the_extended_remaining() {
+        let store = AutoBanStore::for_test(1, 600, 60, &[], 1, 0);
+        let source = ip("203.0.113.76");
+
+        assert!(store.record_failure(source));
+        let before = store
+            .banned_sources()
+            .into_iter()
+            .find(|(address, _)| *address == source)
+            .map(|(_, remaining)| remaining);
+        assert!(before.is_some());
+
+        // Extend, then confirm the source is still listed with time remaining.
+        assert!(!store.record_failure(source));
+        let after = store
+            .banned_sources()
+            .into_iter()
+            .find(|(address, _)| *address == source)
+            .map(|(_, remaining)| remaining);
+        assert!(after.is_some_and(|remaining| remaining > 0));
+    }
+
+    /// An operator clearing a false positive must clear an extended ban too —
+    /// the sliding expiry must not outlive an explicit unban.
+    #[test]
+    fn unban_lifts_an_extended_ban() {
+        let store = AutoBanStore::for_test(1, 600, 3600, &[], 1, 0);
+        let source = ip("203.0.113.77");
+
+        assert!(store.record_failure(source));
+        assert!(!store.record_failure(source)); // extend
+        assert!(store.unban(source));
+        assert!(!store.is_banned(source));
+        assert_eq!(store.active_bans(), 0);
+    }
+
+    /// A trusted source is never banned, so there is never an entry to extend —
+    /// the extension path must not become a back door into the ban map.
+    #[test]
+    fn trusted_sources_are_never_extended_into_a_ban() {
+        let store = AutoBanStore::for_test(1, 600, 3600, &["203.0.113.0/24".to_string()], 1, 0);
+        let source = ip("203.0.113.78");
+        assert!(!store.record_failure(source));
+        assert!(!store.record_failure(source));
+        assert!(!store.is_banned(source));
+        assert_eq!(store.active_bans(), 0);
     }
 
     /// The regression this default exists for. A client that keeps sending
@@ -1166,7 +1518,7 @@ mod tests {
     /// shared, so the ban lands on every subscriber behind it.
     #[test]
     fn missing_credentials_do_not_ban_at_the_default_weight() {
-        let store = AutoBanStore::new(5, 600, 3600, &[], 3, 0);
+        let store = AutoBanStore::for_test(5, 600, 3600, &[], 3, 0);
         let subscriber = ip("203.0.113.40");
 
         for _ in 0..50 {
@@ -1188,7 +1540,7 @@ mod tests {
     #[test]
     fn missing_credentials_weight_is_configurable_back_on() {
         // weight 1 restores the pre-1.7 behaviour: five in the window, ban.
-        let store = AutoBanStore::new(5, 600, 3600, &[], 3, 1);
+        let store = AutoBanStore::for_test(5, 600, 3600, &[], 3, 1);
         let prober = ip("203.0.113.41");
         for _ in 0..4 {
             assert!(!store.record_missing_credentials(prober));
@@ -1203,7 +1555,7 @@ mod tests {
         // than saturating the counter in ways the window logic cannot reason
         // about. At exactly the threshold, one request bans — a policy an
         // operator can legitimately ask for.
-        let store = AutoBanStore::new(3, 600, 3600, &[], 3, 99);
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 3, 99);
         let source = ip("203.0.113.42");
         assert!(store.record_missing_credentials(source));
         assert!(store.is_banned(source));
@@ -1211,7 +1563,7 @@ mod tests {
 
     #[test]
     fn trusted_sources_are_exempt_from_missing_credential_counting() {
-        let store = AutoBanStore::new(1, 600, 3600, &["203.0.113.0/24".to_string()], 3, 1);
+        let store = AutoBanStore::for_test(1, 600, 3600, &["203.0.113.0/24".to_string()], 3, 1);
         let trusted = ip("203.0.113.43");
         assert!(!store.record_missing_credentials(trusted));
         assert!(!store.is_banned(trusted));
@@ -1242,7 +1594,7 @@ mod tests {
         // this, one such test bans loopback and every socket test that runs
         // after it is refused at accept.
         let loopback = ["127.0.0.0/8".to_string(), "::1/128".to_string()];
-        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &loopback, 3, 0));
+        let store = Arc::new(AutoBanStore::for_test(3, 600, 3600, &loopback, 3, 0));
         set_auto_ban(Arc::clone(&store));
 
         // Handshake failures accumulate per-IP across transports and ban at the
@@ -1265,12 +1617,27 @@ mod tests {
         crate::security::record_malformed_message(prober, "TLS");
         assert!(store.is_banned(prober));
 
+        // A rejected WebSocket upgrade carries the same strong weight: the peer
+        // completed its transport handshake on a SIP-over-WebSocket port and
+        // then sent something that is not an upgrade at all.
+        let upgrader = ip("198.51.100.80");
+        crate::security::record_upgrade_failure(upgrader, "WSS");
+        assert!(store.is_banned(upgrader));
+
         // End-to-end: the banned scanner is now dropped at transport accept by
         // the ACL (which consults the same global store), while an IP that never
         // failed a handshake still passes.
         let acl = crate::transport::acl::TransportAcl::new(vec![], vec![]);
         assert!(!acl.is_allowed(scanner));
         assert!(acl.is_allowed(never));
+
+        // And the post-handshake re-check reads the same store, so a connection
+        // already past accept when a sibling tripped the ban is dropped too.
+        assert!(crate::security::is_source_banned(scanner));
+        assert!(!crate::security::is_source_banned(never));
+        // Trusted sources are exempt there as everywhere else — the transport
+        // tests that follow drive real loopback sockets through this path.
+        assert!(!crate::security::is_source_banned(ip("127.0.0.1")));
     }
 
     // --- SecurityFilter (rate_limit + scanner_block) -----------------------
@@ -1413,6 +1780,46 @@ mod tests {
             SecurityVerdict::RateLimited
         );
         // After the ban TTL the source is allowed again.
+        assert_eq!(
+            filter.evaluate_at(source, None, t0 + Duration::from_secs(61)),
+            SecurityVerdict::Allow
+        );
+    }
+
+    /// Pins the deliberate asymmetry with [`AutoBanStore`]: an auto-ban's expiry
+    /// slides on continued abuse, a rate-limit ban's does not. A rate limit is a
+    /// capacity verdict, so a client that keeps retrying through its ban — one
+    /// CGNAT address speaking for a whole NAT — must still serve it out on
+    /// schedule. If this ever fails because someone "fixed" the inconsistency,
+    /// that is the regression.
+    #[test]
+    fn rate_limit_ban_does_not_extend_on_continued_requests() {
+        let config = security_config(
+            Some(RateLimitConfig {
+                window_secs: 10,
+                max_requests: 1,
+                ban_duration_secs: 60,
+            }),
+            vec![],
+            vec![],
+        );
+        let filter = SecurityFilter::from_config(&config).unwrap();
+        let source = ip("203.0.113.79");
+        let t0 = Instant::now();
+
+        assert_eq!(filter.evaluate_at(source, None, t0), SecurityVerdict::Allow);
+        assert_eq!(
+            filter.evaluate_at(source, None, t0),
+            SecurityVerdict::RateLimited
+        );
+        // Keep asking all the way through the ban.
+        for second in [10, 30, 50, 59] {
+            assert_eq!(
+                filter.evaluate_at(source, None, t0 + Duration::from_secs(second)),
+                SecurityVerdict::RateLimited
+            );
+        }
+        // Still released at the original deadline, not pushed out.
         assert_eq!(
             filter.evaluate_at(source, None, t0 + Duration::from_secs(61)),
             SecurityVerdict::Allow

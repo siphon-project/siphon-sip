@@ -1172,6 +1172,13 @@ impl SiphonServer {
         // transport ACL (is_allowed) all reach it via crate::security::auto_ban().
         if let Some(ref sec) = config.security {
             if let Some(ref fab) = sec.failed_auth_ban {
+                // Default the sliding-expiry cap to a day's worth of bans at the
+                // configured duration. Long enough that a scanner leaning on the
+                // box stays pinned across a working day, short enough that a
+                // wrong verdict on a CGNAT address ages out on its own.
+                let max_ban_duration_secs = fab
+                    .max_ban_duration_secs
+                    .unwrap_or_else(|| fab.ban_duration_secs.saturating_mul(24));
                 let store = Arc::new(crate::security::AutoBanStore::new(
                     fab.threshold,
                     fab.window_secs,
@@ -1179,6 +1186,7 @@ impl SiphonServer {
                     &sec.trusted_cidrs,
                     fab.strong_signal_weight,
                     fab.missing_credentials_weight,
+                    max_ban_duration_secs,
                 ));
                 crate::security::set_auto_ban(Arc::clone(&store));
                 if let Some(ref firewall) = kernel_firewall {
@@ -1188,6 +1196,7 @@ impl SiphonServer {
                     threshold = fab.threshold,
                     window_secs = fab.window_secs,
                     ban_duration_secs = fab.ban_duration_secs,
+                    max_ban_duration_secs,
                     strong_signal_weight = fab.strong_signal_weight,
                     missing_credentials_weight = fab.missing_credentials_weight,
                     trusted_cidrs = sec.trusted_cidrs.len(),
