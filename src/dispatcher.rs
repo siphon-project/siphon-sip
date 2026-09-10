@@ -5715,16 +5715,18 @@ fn relay_request(
         // server port (e.g. 5066) is non-default — using the per-
         // transport via_host would emit a Via with the wrong port and
         // the UE's response would land on the wrong listener
-        // (3GPP TS 33.203 §7.4).  Bracket a v6 literal — a raw
-        // `local.ip().to_string()` would emit a malformed unbracketed
-        // `SIP/2.0/UDP 2001:db8::10:5066` sent-by.
-        (format_sip_host(&local.ip().to_string()), Some(local.port()))
+        // (3GPP TS 33.203 §7.4).  A wildcard-bound listener keeps the
+        // pinned port and borrows the advertised host, and a v6 literal
+        // is bracketed — see `pinned_sent_by`.
+        let (host, port) = pinned_sent_by(local, || state.via_host(&outbound_transport));
+        (host, Some(port))
     } else if let Some(local) = ipsec_source {
         // IPsec auto-source: same correctness invariant as the flow
         // path — the UE's response on SA #4 (UE → port_pc) must land
         // on the Via we advertise, otherwise the kernel selector
         // doesn't match and the response is silently dropped.
-        (format_sip_host(&local.ip().to_string()), Some(local.port()))
+        let (host, port) = pinned_sent_by(local, || state.via_host(&outbound_transport));
+        (host, Some(port))
     } else if let Some(pin) = send_socket {
         // Script send_socket= egress pin: advertise the selected listener's
         // sent-by (its configured advertise host, else the bound IP) with the
@@ -5746,66 +5748,28 @@ fn relay_request(
     };
     let branch = core::add_via(&mut relayed.headers, &transport_str, &via_host, via_port);
 
-    // Add Record-Route if the script requested it.
-    // When bridging transports (e.g. TLS↔TCP), insert *two* Record-Route
-    // headers (r2) so each leg's in-dialog requests use the correct transport.
+    // Add Record-Route if the script requested it — one entry per *socket* the
+    // dialog crosses, so each peer is handed the socket facing it.  See
+    // [`record_route_uris`].  The outbound leg reuses the Via sent-by computed
+    // above, so the two can never disagree about which listener this relay
+    // used; the Gm port pair is the one place they are allowed to differ,
+    // because a Record-Route advertises where requests *arrive* and a Via where
+    // the response comes back (see `record_route_port_for`).
     if record_routed {
-        let internal_host = format_sip_host(&state.local_addr.ip().to_string());
-        let inbound_transport_str = format!("{}", inbound.transport).to_lowercase();
-        if inbound_transport_str != transport_str.to_lowercase() {
-            // Double Record-Route: outbound transport first (topmost after prepend order).
-            // Each RR must use the port of the respective transport listener so that
-            // in-dialog requests from each leg reach the correct listener.
-            // The TLS-facing RR uses the advertised address when set, since
-            // external peers may not be able to reach the internal bind IP.
-            let outbound_port = state
-                .listen_addrs
-                .get(&outbound_transport)
-                .map(|a| a.port())
-                .unwrap_or(state.local_addr.port());
-            let inbound_port = state
-                .listen_addrs
-                .get(&inbound.transport)
-                .map(|a| a.port())
-                .unwrap_or(state.local_addr.port());
-            let outbound_host = state
-                .advertised_addrs
-                .get(&outbound_transport)
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let inbound_host = state
-                .advertised_addrs
-                .get(&inbound.transport)
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!(
-                "sip:{}:{};transport={}",
-                outbound_host,
-                outbound_port,
-                transport_str.to_lowercase()
-            );
-            let rr_inbound = format!(
-                "sip:{}:{};transport={}",
-                inbound_host, inbound_port, inbound_transport_str
-            );
-            core::add_record_route(&mut relayed.headers, &rr_inbound);
-            core::add_record_route(&mut relayed.headers, &rr_outbound);
-        } else {
-            // Single Record-Route (inbound == outbound transport). Reuse the same
-            // sent-by as our Via — the advertised host in the normal case, or the
-            // pinned listener for IPsec/flow/send_socket egress — instead of the
-            // raw bind IP. An external peer must route in-dialog requests back
-            // through the exact host:port we advertised: Teams rejects an IP in
-            // Record-Route outright, and a P-CSCF's protected port must match or
-            // the kernel SA selector drops the in-dialog request.
-            let rr_port = via_port.unwrap_or_else(|| state.via_port(&outbound_transport));
-            let rr_uri = format!(
-                "sip:{}:{};transport={}",
-                via_host,
-                rr_port,
-                transport_str.to_lowercase()
-            );
-            core::add_record_route(&mut relayed.headers, &rr_uri);
+        let outbound_rr_port = crate::script::api::ipsec::record_route_port_for(
+            via_port.unwrap_or_else(|| state.via_port(&outbound_transport)),
+        );
+        let (first, second) = record_route_uris(
+            inbound.transport,
+            crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
+            || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+            outbound_transport,
+            outbound_rr_port,
+            &via_host,
+        );
+        core::add_record_route(&mut relayed.headers, &first);
+        if let Some(ref second) = second {
+            core::add_record_route(&mut relayed.headers, second);
         }
     }
 
@@ -6301,16 +6265,21 @@ fn relay_fork_branch(
     };
 
     let transport_str = format!("{}", outbound_transport);
-    let (via_host, via_port) = match send_socket {
-        Some(pin) => {
-            let (host, port) = pin.via_sent_by();
-            (format_sip_host(&host), port)
-        }
-        None => (
-            state.via_host(&outbound_transport),
-            state.via_port(&outbound_transport),
-        ),
-    };
+    // Same egress-pin precedence as every other request siphon originates: a
+    // captured flow writes this branch to its own socket (see the flow arm of
+    // the send below), so the sent-by has to name *that* socket or the peer
+    // answers somewhere we are not — on an IPsec-protected MT branch, to a port
+    // with no SA covering it (3GPP TS 33.203 §7.4).
+    let (via_host, via_port) = egress_sent_by(
+        flow.map(|flow| flow.local_addr),
+        send_socket.map(|pin| pin.via_sent_by()),
+        || {
+            (
+                state.via_host(&outbound_transport),
+                state.via_port(&outbound_transport),
+            )
+        },
+    );
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
@@ -6318,55 +6287,20 @@ fn relay_fork_branch(
         Some(via_port),
     );
 
+    // One Record-Route entry per socket the dialog crosses — see the same block
+    // in [`relay_request`] and [`record_route_uris`].
     if record_routed {
-        let internal_host = format_sip_host(&state.local_addr.ip().to_string());
-        let inbound_transport_str = format!("{}", inbound.transport).to_lowercase();
-        if inbound_transport_str != transport_str.to_lowercase() {
-            let outbound_port = state
-                .listen_addrs
-                .get(&outbound_transport)
-                .map(|a| a.port())
-                .unwrap_or(state.local_addr.port());
-            let inbound_port = state
-                .listen_addrs
-                .get(&inbound.transport)
-                .map(|a| a.port())
-                .unwrap_or(state.local_addr.port());
-            let outbound_host = state
-                .advertised_addrs
-                .get(&outbound_transport)
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let inbound_host = state
-                .advertised_addrs
-                .get(&inbound.transport)
-                .map(|h| format_sip_host(h))
-                .unwrap_or_else(|| internal_host.clone());
-            let rr_outbound = format!(
-                "sip:{}:{};transport={}",
-                outbound_host,
-                outbound_port,
-                transport_str.to_lowercase()
-            );
-            let rr_inbound = format!(
-                "sip:{}:{};transport={}",
-                inbound_host, inbound_port, inbound_transport_str
-            );
-            core::add_record_route(&mut relayed.headers, &rr_inbound);
-            core::add_record_route(&mut relayed.headers, &rr_outbound);
-        } else {
-            // Single Record-Route (inbound == outbound transport). Reuse the same
-            // sent-by as our Via — the advertised host, or the pinned send_socket
-            // listener — instead of the raw bind IP, so an external peer can route
-            // in-dialog requests back through the exact host:port we advertised
-            // (Teams rejects an IP in Record-Route).
-            let rr_uri = format!(
-                "sip:{}:{};transport={}",
-                via_host,
-                via_port,
-                transport_str.to_lowercase()
-            );
-            core::add_record_route(&mut relayed.headers, &rr_uri);
+        let (first, second) = record_route_uris(
+            inbound.transport,
+            crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
+            || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+            outbound_transport,
+            crate::script::api::ipsec::record_route_port_for(via_port),
+            &via_host,
+        );
+        core::add_record_route(&mut relayed.headers, &first);
+        if let Some(ref second) = second {
+            core::add_record_route(&mut relayed.headers, second);
         }
     }
 
@@ -10112,7 +10046,7 @@ fn b_leg_sent_by(
     transport: &Transport,
 ) -> (String, u16) {
     match b_leg_local_addr {
-        Some(local) => pinned_sent_by(local),
+        Some(local) => pinned_sent_by(local, || state.via_host(transport)),
         None => (state.via_host(transport), state.via_port(transport)),
     }
 }
@@ -10122,32 +10056,102 @@ fn b_leg_sent_by(
 /// Pure half of [`b_leg_sent_by`], split out so the invariant that actually
 /// matters — *advertise the socket you send from* — is unit-testable without a
 /// `DispatcherState` fixture.
-fn pinned_sent_by(local: SocketAddr) -> (String, u16) {
+///
+/// The **port** is the whole point of a pin and is always the socket's own. The
+/// **host** is the socket's own only when it is concrete: `listen: 0.0.0.0:5060`
+/// is the ordinary production shape, and `InboundMessage::local_addr` carries
+/// the bind address, so a captured flow on such a listener would otherwise put
+/// `0.0.0.0` in a Via — an address no peer can answer to and that no
+/// self-identity recognises, which turns the dialog's own in-dialog requests
+/// into `482 Loop Detected` on arrival. On a wildcard socket the host falls back
+/// to the advertised identity for that transport, keeping the pinned port.
+fn pinned_sent_by(local: SocketAddr, advertised_host: impl FnOnce() -> String) -> (String, u16) {
+    if local.ip().is_unspecified() {
+        return (advertised_host(), local.port());
+    }
     // Bracket a v6 literal — a raw `ip().to_string()` would emit a malformed
     // unbracketed `SIP/2.0/UDP 2001:db8::10:6100` sent-by.
     (format_sip_host(&local.ip().to_string()), local.port())
 }
 
-/// Sent-by for a B-leg INVITE, by precedence:
+/// The `Record-Route` entries a record-routing relay stamps — one per **socket**
+/// the dialog crosses, returned in the order the caller adds them.
+///
+/// The discriminator is the socket, not the transport. A proxy that bridges two
+/// listeners of the *same* transport crosses two sockets just as surely as one
+/// bridging TLS↔TCP, and the peer on each side has to be told the socket facing
+/// *it*: RFC 3261 §12.1.1 gives the UAS the Record-Route list in order, §12.1.2
+/// gives the UAC the reverse, so a single entry can only ever be right for one
+/// of them. The shape that made this urgent is a P-CSCF bridging its protected
+/// Gm port to its core port over UDP — keying on transport alone saw one socket,
+/// stamped the egress port, and handed every UE a route set pointing at a port
+/// with no IPsec SA covering it, so no in-dialog request it ever sent could
+/// leave the handset (3GPP TS 33.203 §6.3).
+///
+/// `inbound_host` is a closure because the single-socket case — every ordinary
+/// single-listener proxy, on every relayed request — does not need it, and
+/// resolving it costs a listener-registry lookup plus a `String`.
+///
+/// Returns `(added_first, added_second)`. [`core::add_record_route`] prepends,
+/// so the *second* entry ends up topmost, which is what the downstream peer
+/// reads as its next hop.
+///
+/// Known limitation, unchanged from the transport-keyed version it replaces: two
+/// listeners sharing a transport and port but bound to different IPs still get
+/// one entry (the outbound host). Separating them needs the inbound host
+/// resolved on every relay, and that address shape has not shown up in the
+/// field the way the port one has.
+fn record_route_uris(
+    inbound_transport: Transport,
+    inbound_port: u16,
+    inbound_host: impl FnOnce() -> String,
+    outbound_transport: Transport,
+    outbound_port: u16,
+    outbound_host: &str,
+) -> (String, Option<String>) {
+    let outbound = record_route_uri(outbound_host, outbound_port, outbound_transport);
+    if inbound_transport == outbound_transport && inbound_port == outbound_port {
+        return (outbound, None);
+    }
+    let inbound = record_route_uri(&inbound_host(), inbound_port, inbound_transport);
+    (inbound, Some(outbound))
+}
+
+/// One `Record-Route` URI. `host` is already SIP-formatted (a v6 literal
+/// arrives bracketed from [`pinned_sent_by`] / [`resolve_advertised_host`]).
+fn record_route_uri(host: &str, port: u16, transport: Transport) -> String {
+    format!(
+        "sip:{}:{};transport={}",
+        host,
+        port,
+        transport.label().to_ascii_lowercase()
+    )
+}
+
+/// Sent-by for a request siphon is about to send out — a B2BUA B-leg INVITE or
+/// a proxy fork branch — by egress-pin precedence:
 ///
 /// 1. **The captured flow's socket.** A flow pins the egress absolutely — the
-///    INVITE is written to that socket — so nothing may override it. This is
+///    request is written to that socket — so nothing may override it. This is
 ///    also why a `send_socket=` pin is dropped upstream for a flow-dialled leg.
 /// 2. **The script's `send_socket=` listener**, when it applies.
 /// 3. **The per-transport advertised identity** (`fallback`) — every ordinary
-///    B-leg, byte-for-byte unchanged. Taken lazily so the pinned paths don't pay
-///    for the lookup.
+///    egress, byte-for-byte unchanged. Taken lazily so the pinned paths don't
+///    pay for the lookup.
 ///
 /// Pure so the precedence — the part the flow-egress bug got wrong, by using
 /// `fallback` even when a flow was attached — is testable without a
 /// `DispatcherState` fixture.
-fn b_leg_invite_sent_by(
+///
+/// A flow on a wildcard-bound listener keeps its port but borrows `fallback`'s
+/// host; see [`pinned_sent_by`] for why `0.0.0.0` in a sent-by is fatal.
+fn egress_sent_by(
     flow_local_addr: Option<SocketAddr>,
     send_socket_sent_by: Option<(String, u16)>,
     fallback: impl FnOnce() -> (String, u16),
 ) -> (String, u16) {
     match (flow_local_addr, send_socket_sent_by) {
-        (Some(local), _) => pinned_sent_by(local),
+        (Some(local), _) => pinned_sent_by(local, || fallback().0),
         (None, Some((host, port))) => (format_sip_host(&host), port),
         (None, None) => fallback(),
     }
@@ -16956,7 +16960,7 @@ fn b2bua_send_b_leg_invite(
     // The one identity this B-leg advertises — Via sent-by AND Contact.  Both
     // have to name the socket the INVITE actually leaves from, or the far end
     // answers somewhere we are not listening on this flow.
-    let (via_host, via_port) = b_leg_invite_sent_by(
+    let (via_host, via_port) = egress_sent_by(
         flow_local_addr,
         send_socket.map(|pin| pin.via_sent_by()),
         || {
@@ -31713,7 +31717,8 @@ mod tests {
     fn pinned_sent_by_names_the_flow_socket_not_the_default_listener() {
         // Soft-UE shape: plain SIP on :5060, protected client port :6100.
         let protected_client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-        let (host, port) = pinned_sent_by(protected_client);
+        let (host, port) =
+            pinned_sent_by(protected_client, || "advertised.example.net".to_string());
         assert_eq!(host, "192.0.2.10");
         assert_eq!(
             port, 6100,
@@ -31727,8 +31732,12 @@ mod tests {
     fn pinned_sent_by_distinguishes_the_two_protected_ports() {
         let client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
         let server: SocketAddr = "192.0.2.10:6101".parse().unwrap();
-        assert_ne!(pinned_sent_by(client), pinned_sent_by(server));
-        assert_eq!(pinned_sent_by(server).1, 6101);
+        let advertised = || "192.0.2.10".to_string();
+        assert_ne!(
+            pinned_sent_by(client, advertised),
+            pinned_sent_by(server, advertised)
+        );
+        assert_eq!(pinned_sent_by(server, advertised).1, 6101);
     }
 
     /// A v6 flow socket has to come out bracketed, or the Via is malformed
@@ -31736,9 +31745,38 @@ mod tests {
     #[test]
     fn pinned_sent_by_brackets_an_ipv6_flow_socket() {
         let v6: SocketAddr = "[2001:db8::10]:6100".parse().unwrap();
-        let (host, port) = pinned_sent_by(v6);
+        let (host, port) = pinned_sent_by(v6, || "192.0.2.10".to_string());
         assert_eq!(host, "[2001:db8::10]");
         assert_eq!(port, 6100);
+    }
+
+    /// `listen: 0.0.0.0:5060` is the ordinary production shape and
+    /// `InboundMessage::local_addr` carries the bind address, so a flow captured
+    /// on such a listener pins to a wildcard.  Stamping `0.0.0.0` into a
+    /// sent-by names an address no peer can answer to and that no self-identity
+    /// recognises — the dialog's own in-dialog requests come back to us and are
+    /// refused `482 Loop Detected`.  Keep the pinned port, take the advertised
+    /// host.
+    #[test]
+    fn pinned_sent_by_never_advertises_a_wildcard_bind() {
+        let wildcard: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let (host, port) = pinned_sent_by(wildcard, || "192.0.2.10".to_string());
+        assert_eq!(host, "192.0.2.10");
+        assert_eq!(port, 5060, "the pinned port is the whole point of the pin");
+
+        let wildcard_v6: SocketAddr = "[::]:5066".parse().unwrap();
+        let (host, port) = pinned_sent_by(wildcard_v6, || "[2001:db8::10]".to_string());
+        assert_eq!(host, "[2001:db8::10]");
+        assert_eq!(port, 5066);
+    }
+
+    /// Same rule through the precedence wrapper: the flow still wins, it just
+    /// borrows the fallback's host rather than its port.
+    #[test]
+    fn egress_sent_by_keeps_a_wildcard_flows_port_but_not_its_host() {
+        let wildcard: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let sent_by = egress_sent_by(Some(wildcard), None, || ("192.0.2.10".to_string(), 5070));
+        assert_eq!(sent_by, ("192.0.2.10".to_string(), 5060));
     }
 
     /// The B-leg INVITE's own precedence. The bug this guards: a flow-dialled
@@ -31746,9 +31784,9 @@ mod tests {
     /// socket while advertising the default listener — the far end then answered
     /// to a port outside the flow and the call never got a final response.
     #[test]
-    fn b_leg_invite_sent_by_prefers_the_flow_over_the_default_listener() {
+    fn egress_sent_by_prefers_the_flow_over_the_default_listener() {
         let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-        let sent_by = b_leg_invite_sent_by(Some(flow), None, || ("192.0.2.10".to_string(), 5060));
+        let sent_by = egress_sent_by(Some(flow), None, || ("192.0.2.10".to_string(), 5060));
         assert_eq!(
             sent_by,
             ("192.0.2.10".to_string(), 6100),
@@ -31759,9 +31797,9 @@ mod tests {
     /// A flow beats a `send_socket=` pin: the flow already wrote the INVITE to
     /// its own socket, so advertising the script's listener would be a lie.
     #[test]
-    fn b_leg_invite_sent_by_flow_beats_a_send_socket_pin() {
+    fn egress_sent_by_flow_beats_a_send_socket_pin() {
         let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-        let sent_by = b_leg_invite_sent_by(
+        let sent_by = egress_sent_by(
             Some(flow),
             Some(("sip.example.com".to_string(), 5080)),
             || ("192.0.2.10".to_string(), 5060),
@@ -31772,25 +31810,151 @@ mod tests {
     /// Without a flow the pre-existing behaviour is untouched: a `send_socket=`
     /// pin wins over the default, and with neither, the default stands.
     #[test]
-    fn b_leg_invite_sent_by_without_a_flow_is_unchanged() {
-        let pinned =
-            b_leg_invite_sent_by(None, Some(("sip.example.com".to_string(), 5080)), || {
-                ("192.0.2.10".to_string(), 5060)
-            });
+    fn egress_sent_by_without_a_flow_is_unchanged() {
+        let pinned = egress_sent_by(None, Some(("sip.example.com".to_string(), 5080)), || {
+            ("192.0.2.10".to_string(), 5060)
+        });
         assert_eq!(pinned, ("sip.example.com".to_string(), 5080));
 
-        let plain = b_leg_invite_sent_by(None, None, || ("192.0.2.10".to_string(), 5060));
+        let plain = egress_sent_by(None, None, || ("192.0.2.10".to_string(), 5060));
         assert_eq!(plain, ("192.0.2.10".to_string(), 5060));
     }
 
     /// A v6 `send_socket=` advertise host is bracketed on the way out, same as
     /// the flow path — the sent-by is a URI host, not a bare address.
     #[test]
-    fn b_leg_invite_sent_by_brackets_an_ipv6_send_socket_host() {
-        let sent_by = b_leg_invite_sent_by(None, Some(("2001:db8::20".to_string(), 5080)), || {
+    fn egress_sent_by_brackets_an_ipv6_send_socket_host() {
+        let sent_by = egress_sent_by(None, Some(("2001:db8::20".to_string(), 5080)), || {
             ("192.0.2.10".to_string(), 5060)
         });
         assert_eq!(sent_by, ("[2001:db8::20]".to_string(), 5080));
+    }
+
+    // -----------------------------------------------------------------------
+    // Record-Route entries (one per socket the dialog crosses)
+    // -----------------------------------------------------------------------
+
+    /// The ordinary proxy: one listener, in and out the same socket. One entry,
+    /// and the inbound host is never resolved — this is the relay hot path.
+    #[test]
+    fn record_route_uris_single_entry_when_both_legs_are_one_socket() {
+        let resolved = std::cell::Cell::new(false);
+        let entries = record_route_uris(
+            Transport::Udp,
+            5060,
+            || {
+                resolved.set(true);
+                "192.0.2.10".to_string()
+            },
+            Transport::Udp,
+            5060,
+            "192.0.2.10",
+        );
+        assert_eq!(
+            entries,
+            ("sip:192.0.2.10:5060;transport=udp".to_string(), None)
+        );
+        assert!(
+            !resolved.get(),
+            "the single-socket path must not pay for an inbound host resolution"
+        );
+    }
+
+    /// The P-CSCF: Gm `:5066` in, core `:5060` out, both UDP. The old
+    /// transport-only discriminator saw one socket here and stamped the egress
+    /// port, handing the UE a route set naming a port no IPsec SA covers.
+    #[test]
+    fn record_route_uris_two_entries_when_only_the_port_differs() {
+        let entries = record_route_uris(
+            Transport::Udp,
+            5066,
+            || "192.0.2.10".to_string(),
+            Transport::Udp,
+            5060,
+            "192.0.2.10",
+        );
+        assert_eq!(
+            entries,
+            (
+                "sip:192.0.2.10:5066;transport=udp".to_string(),
+                Some("sip:192.0.2.10:5060;transport=udp".to_string()),
+            ),
+            "same transport, different listener is still two sockets"
+        );
+    }
+
+    /// Transport bridging keeps emitting two entries, unchanged.
+    #[test]
+    fn record_route_uris_two_entries_when_the_transport_differs() {
+        let entries = record_route_uris(
+            Transport::Tls,
+            5061,
+            || "sip.example.com".to_string(),
+            Transport::Tcp,
+            5060,
+            "sip.example.com",
+        );
+        assert_eq!(
+            entries,
+            (
+                "sip:sip.example.com:5061;transport=tls".to_string(),
+                Some("sip:sip.example.com:5060;transport=tcp".to_string()),
+            )
+        );
+    }
+
+    /// Order is load-bearing: `add_record_route` prepends, so the second entry
+    /// ends up topmost. RFC 3261 §12.1.1 gives the UAS the list in order (it
+    /// must read the outbound-facing entry first) and §12.1.2 gives the UAC the
+    /// reverse (it must read the inbound-facing entry first).
+    #[test]
+    fn record_route_uris_returns_the_outbound_entry_second() {
+        let (first, second) = record_route_uris(
+            Transport::Udp,
+            5066,
+            || "192.0.2.10".to_string(),
+            Transport::Udp,
+            5060,
+            "192.0.2.10",
+        );
+        let mut headers = SipHeaders::new();
+        core::add_record_route(&mut headers, &first);
+        if let Some(ref second) = second {
+            core::add_record_route(&mut headers, second);
+        }
+        let all = headers.get_all("Record-Route").unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all[0].contains(":5060"),
+            "the outbound-facing entry must end up topmost: {}",
+            all[0]
+        );
+        assert!(
+            all[1].contains(":5066"),
+            "the inbound-facing entry must end up second: {}",
+            all[1]
+        );
+    }
+
+    /// A v6 host arrives already bracketed from `resolve_advertised_host` /
+    /// `pinned_sent_by` and is stamped verbatim — no second round of brackets.
+    #[test]
+    fn record_route_uris_stamps_a_bracketed_ipv6_host_verbatim() {
+        let entries = record_route_uris(
+            Transport::Udp,
+            5066,
+            || "[2001:db8::10]".to_string(),
+            Transport::Udp,
+            5060,
+            "[2001:db8::10]",
+        );
+        assert_eq!(
+            entries,
+            (
+                "sip:[2001:db8::10]:5066;transport=udp".to_string(),
+                Some("sip:[2001:db8::10]:5060;transport=udp".to_string()),
+            )
+        );
     }
 
     // -----------------------------------------------------------------------

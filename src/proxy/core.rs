@@ -692,6 +692,31 @@ mod tests {
     }
 
     #[test]
+    fn pop_local_routes_consumes_double_record_route_across_protected_ports() {
+        // The in-dialog half of the double Record-Route a P-CSCF now stamps:
+        // the UE's BYE arrives carrying both of our sockets, one after the
+        // other, and both have to go.  Consuming only the top would leave our
+        // own core-facing Route looking like the next hop — a loop.  No code
+        // change was needed for this; `SelfIdentity` already carries both
+        // protected ports alongside the listen ports.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[5060, 5064, 5066]);
+        let mut headers = route_headers(
+            "<sip:192.0.2.40:5066;transport=udp;lr>, \
+             <sip:192.0.2.40:5060;transport=udp;lr>, \
+             <sip:scscf.example.net;lr>",
+        );
+        let popped = pop_local_routes(&mut headers, &identity);
+        assert_eq!(popped.len(), 2);
+        assert_eq!(popped[0].uri.port, Some(5066));
+        assert_eq!(popped[1].uri.port, Some(5060));
+        assert_eq!(
+            next_hop_from_route(&headers).as_deref(),
+            Some("sip:scscf.example.net;lr")
+        );
+    }
+
+    #[test]
     fn pop_local_routes_consumes_ipsec_protected_port_route() {
         // A P-CSCF Record-Routes with its protected port (TS 33.203 §7.1),
         // not its plain listen port.
@@ -1117,6 +1142,36 @@ mod tests {
         assert!(
             all_rr[1].contains("transport=tls"),
             "second RR should be inbound transport: {}",
+            all_rr[1]
+        );
+    }
+
+    #[test]
+    fn double_record_route_for_protected_port_bridging() {
+        // A P-CSCF bridging its protected Gm port to its core port crosses two
+        // sockets on one transport.  Same two-entry shape as transport
+        // bridging, and the same ordering contract: the dispatcher adds the
+        // inbound-facing entry first, `add_record_route` prepends, so the
+        // core-facing entry ends up topmost (RFC 3261 §12.1.1 — the S-CSCF
+        // reads it in order) and the Gm-facing one second (§12.1.2 — the UE
+        // reverses the set and reads it first).
+        let mut headers = SipHeaders::new();
+
+        let rr_inbound = "sip:192.0.2.10:5066;transport=udp";
+        let rr_outbound = "sip:192.0.2.10:5060;transport=udp";
+        add_record_route(&mut headers, rr_inbound);
+        add_record_route(&mut headers, rr_outbound);
+
+        let all_rr = headers.get_all("Record-Route").unwrap();
+        assert_eq!(all_rr.len(), 2);
+        assert!(
+            all_rr[0].contains(":5060"),
+            "topmost RR is the core-facing socket: {}",
+            all_rr[0]
+        );
+        assert!(
+            all_rr[1].contains(":5066"),
+            "the UE's route set must resolve to the protected server port: {}",
             all_rr[1]
         );
     }
