@@ -6,6 +6,62 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **A record-routing proxy emits one `Record-Route` per *socket* the dialog
+  crosses, not per transport.** The double-`Record-Route` decision keyed on
+  inbound transport vs outbound transport, so a proxy bridging two listeners of
+  the *same* transport looked like a single socket and got the single-entry
+  fallback, which stamps the **egress** listener. The peer on the other side
+  then builds its dialog route set (RFC 3261 §12.1.2) from a URI naming a
+  socket it was never meant to send to. It bites hardest on a P-CSCF, where the
+  two Gm listeners and the core listener are all UDP: every dialog a UE
+  originates over sec-agree came back record-routed to the unprotected core
+  port, which no IPsec SA covers, so the kernel selector dropped every in-dialog
+  request the handset tried to send — for the whole life of the dialog, in a
+  shape that looks healthy on the wire because the initial transaction completes
+  normally. What is actually visible is a UE re-driving its dialog-forming
+  request until it gives up and mints a new Call-ID, and a registrar re-creating
+  the subscription each time; in-dialog refresh (RFC 6665 §4.4.1) never happens
+  at all. Fixing the trigger alone was not enough: both arms resolved ports
+  through a first-listener-per-transport map, so with three UDP listeners the
+  two entries would have come out identical. Each entry is now built from its
+  own leg's socket — the arrival socket inbound, the Via sent-by outbound, which
+  also picks up the flow / IPsec / `send_socket=` / `force_send_via` egress pins
+  the old two-entry arm silently ignored. A single-listener proxy is unchanged
+  byte-for-byte, transport bridging keeps the output it had, and the in-dialog
+  side needed no change — the Route self-identity already carried every listener
+  and both protected ports, so both entries are consumed and the foreign Route
+  is still what becomes the next hop.
+- **A P-CSCF record-routes its protected *server* port even when the relay left
+  the protected *client* port.** 3GPP TS 33.203 §6.3 makes the Gm port pair
+  asymmetric: the P-CSCF sends requests from `pcscf_port_c` but receives them on
+  `pcscf_port_s`. A `Via` names where the response comes back, so it correctly
+  names the sending socket; a `Record-Route` names where future *requests* go,
+  so on a Gm leg it must always name `pcscf_port_s`. On the terminating
+  direction the egress socket is `pcscf_port_c`, and stamping that reads as a
+  protected port under a casual look while still being one the UE has no SA to
+  transmit into. The two headers are now allowed to differ, which is what the
+  spec has always required.
+- **A proxy fork branch dialled over a captured flow advertises the flow's
+  socket in its `Via`.** The branch already *sent* from that socket, and pinned
+  its retransmits to it, but stamped the default per-transport listener as its
+  sent-by — so the far end answered to a socket the branch was not on, and on an
+  IPsec-protected terminating branch to a port outside the SA. Same
+  "advertise the socket you send from" rule the single-target relay path and the
+  B2BUA B-leg already enforce; the three now share one helper.
+- **A leg pinned to a wildcard-bound listener no longer advertises `0.0.0.0`.**
+  `listen: 0.0.0.0:5060` is the ordinary production shape and the inbound
+  message carries the *bind* address, so any path that pins a leg to a captured
+  flow — `request.relay(flow=…)`, `call.dial(flow=…)`, and now a fork branch —
+  stamped the wildcard straight into `Via` and `Record-Route`. That names an
+  address no peer can answer to and that the Route self-identity does not
+  recognise, so the dialog's own in-dialog requests come back to us and are
+  refused `482 Loop Detected`. The pinned **port** is what a flow exists to
+  carry, and it is kept; the host now falls back to the advertised identity for
+  that transport when, and only when, the socket is wildcard-bound. A listener
+  bound to a concrete address is unaffected, which is why deployments that pin
+  their bind IP never saw this.
+
 ## [1.8.6] — 2026-09-08
 
 ### Added

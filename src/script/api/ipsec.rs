@@ -84,6 +84,41 @@ pub fn is_protected_local_port(local_port: u16) -> bool {
     }
 }
 
+/// The Gm port a `Record-Route` entry must name, given the local socket a leg
+/// actually uses.  Returns `local_port` unchanged when it isn't `pcscf_port_c`,
+/// and always when no IPsec config is wired (siphon not running as P-CSCF).
+///
+/// The Gm port pair is asymmetric (3GPP TS 33.203 §6.3, the four SAs laid out
+/// on [`outbound_local_addr_for`]): the P-CSCF **sends** requests from
+/// `port_pc` (SA #3) but **receives** them on `port_ps` (SA #1).  That splits
+/// two things a proxy normally stamps with the same value:
+///
+/// - a `Via` names where the *response* comes back, so it names the sending
+///   socket — `port_pc` on an MT relay, which is what SA #4 covers;
+/// - a `Record-Route` names where future *requests* go, so on a Gm leg it is
+///   always `port_ps`, whichever direction this particular relay ran.
+///
+/// Stamping the egress port into the Record-Route instead hands the UE a route
+/// target it has no SA to transmit into — the kernel selector drops every
+/// in-dialog request it tries to send, and the dialog is one-way for its whole
+/// life.  Do not "simplify" this back to the sending socket.
+pub fn record_route_port_for(local_port: u16) -> u16 {
+    match IPSEC_CONFIG_REF.get() {
+        Some(config) => record_route_port(local_port, config.pcscf_port_c, config.pcscf_port_s),
+        None => local_port,
+    }
+}
+
+/// Pure half of [`record_route_port_for`], split out so the mapping is
+/// unit-testable without installing the process-wide `IpsecConfig`.
+fn record_route_port(local_port: u16, port_c: u16, port_s: u16) -> u16 {
+    if local_port == port_c {
+        port_s
+    } else {
+        local_port
+    }
+}
+
 /// Configured `ipsec.path_host` — the host part siphon writes into the
 /// Path URI advertised by `request.add_pcscf_path(token)` (RFC 3327 §5
 /// / TS 24.229 §5.2.7.2).  Returns `None` when not configured (siphon
@@ -2297,6 +2332,35 @@ mod tests {
         // Best-effort: only assert when no manager is present.
         if IPSEC_MANAGER_REF.get().is_none() {
             assert!(outbound_local_addr_for(dst).is_none());
+        }
+    }
+
+    #[test]
+    fn record_route_port_maps_the_client_port_to_the_server_port() {
+        // TS 33.203 §6.3: the P-CSCF sends requests from port_pc but receives
+        // them on port_ps.  A Record-Route names where future requests go, so
+        // an MT relay leaving port_pc must still advertise port_ps — otherwise
+        // the UE's in-dialog request would have to leave an SA that does not
+        // exist, and the dialog is unusable in that direction.
+        assert_eq!(record_route_port(5064, 5064, 5066), 5066);
+    }
+
+    #[test]
+    fn record_route_port_leaves_every_other_socket_alone() {
+        // port_ps is already the request-facing socket, and the core-facing
+        // listener is not a Gm socket at all.
+        assert_eq!(record_route_port(5066, 5064, 5066), 5066);
+        assert_eq!(record_route_port(5060, 5064, 5066), 5060);
+    }
+
+    #[test]
+    fn record_route_port_for_is_identity_without_config() {
+        // No IpsecConfig wired (every non-P-CSCF deployment) — the port passes
+        // through untouched.  Order-dependent on IPSEC_CONFIG_REF being unset,
+        // same caveat as the manager test above.
+        if IPSEC_CONFIG_REF.get().is_none() {
+            assert_eq!(record_route_port_for(5060), 5060);
+            assert_eq!(record_route_port_for(5064), 5064);
         }
     }
 }
