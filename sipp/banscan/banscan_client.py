@@ -12,7 +12,7 @@ import socket
 import sys
 import time
 
-HOST, PORT = "127.0.0.1", 5060
+HOST, PORT = "127.0.0.1", 5560
 
 
 def register(conn, index):

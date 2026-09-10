@@ -3,7 +3,9 @@
 # trusted_cidrs so the loopback test client CAN be banned.
 listen:
   tcp:
-    - "0.0.0.0:5060"
+    - "0.0.0.0:5560"
+  ws:
+    - "0.0.0.0:5562"
 domain:
   local: ["127.0.0.1", "0.0.0.0"]
 script:
@@ -13,6 +15,15 @@ security:
     threshold: 3
     window_secs: 600
     ban_duration_secs: 60
+    # A credential-less request scores 0 by default, deliberately: it is the
+    # RFC 3261 §22.2 opening leg of challenge-response, so counting it bans
+    # clients for behaving correctly. This test is about the ban *mechanism*
+    # (does a threshold crossing enforce at accept?), not about that scoring
+    # policy, and phase 1 drives it with unauthenticated REGISTERs — so it has
+    # to opt the signal back on explicitly. Without this line the phase cannot
+    # trip a ban at all and the whole harness passes over the code it exists
+    # to guard.
+    missing_credentials_weight: 1
 log:
   level: warn
   format: pretty
