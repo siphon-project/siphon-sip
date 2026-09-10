@@ -41,7 +41,7 @@ class Reply:
         call_id: Optional[str] = None,
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
-        headers: Optional[dict[str, str]] = None,
+        headers: Optional[dict[str, Union[str, list[str]]]] = None,
         source_ip: Optional[str] = None,
         source_port: Optional[int] = None,
     ) -> None:
@@ -52,7 +52,9 @@ class Reply:
         self._call_id = call_id
         self._body = body
         self._content_type = content_type
-        self._headers: dict[str, str] = dict(headers) if headers else {}
+        self._headers: dict[str, Union[str, list[str]]] = (
+            dict(headers) if headers else {}
+        )
         self._source_ip = source_ip
         self._source_port = source_port
         self._actions: list[Action] = []
@@ -159,15 +161,55 @@ class Reply:
     # -- Header access ---------------------------------------------------------
 
     def get_header(self, name: str) -> Optional[str]:
-        """Get the first value of a header (case-insensitive)."""
+        """Get the first value of a header (case-insensitive).
+
+        When the header has several values this is the first — use
+        :meth:`get_headers` for all of them.
+        """
         for key, value in self._headers.items():
             if key.lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    return str(value[0]) if value else None
                 return value
         return None
 
     def header(self, name: str) -> Optional[str]:
         """Alias for :meth:`get_header`."""
         return self.get_header(name)
+
+    def get_headers(self, name: str) -> list[str]:
+        """Every value of a header, in order — ``[]`` when it is absent.
+
+        :meth:`get_header` returns only the *first* value, which silently
+        truncates a header the peer spread over several lines.  Record-Route,
+        Via, Route, Contact, Supported, Path and the P-* family are all
+        routinely multi-value (RFC 3261 §7.3.1), so read those with this.
+
+        Values come back one entry per header line.  A single line holding
+        several comma-separated URIs stays one entry — split it yourself if you
+        need the individual URIs.
+
+        To exercise a multi-line header in a test, pass a list for that name
+        when constructing the mock::
+
+            request = Request(headers={"Record-Route": [
+                "<sip:198.51.100.1:5060;lr>",
+                "<sip:198.51.100.1:5066;lr>",
+            ]})
+            assert len(request.get_headers("Record-Route")) == 2
+
+        Args:
+            name: Header name (case-insensitive).
+
+        Returns:
+            All values for the header, in order.
+        """
+        for key, value in self._headers.items():
+            if key.lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    return [str(item) for item in value]
+                return [value]
+        return []
 
     def set_header(self, name: str, value: str) -> None:
         """Set (replace) a header value."""

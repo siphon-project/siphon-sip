@@ -9325,6 +9325,38 @@ fn stamp_uas_echo(
     }
 }
 
+/// Whether a response to `request` with this status establishes a dialog (or
+/// opens an early one), and so owes the Record-Route echo of RFC 3261 §12.1.1.
+///
+/// Three conditions, all of them necessary:
+///
+/// - **The method can form a dialog.** INVITE (§12.1.1), SUBSCRIBE (RFC 6665
+///   §4.1.2) and REFER (RFC 3515 §2.4.4 — its implicit subscription). Nothing
+///   else a UAS answers creates one. RFC 3265's dialog-forming NOTIFY is
+///   deliberately absent: RFC 6665 §4.4.1 moved dialog creation onto the
+///   SUBSCRIBE 2xx, and an out-of-dialog NOTIFY is answered 481 now.
+/// - **The request is an initial one** — its To carries no tag. A re-INVITE or
+///   an in-dialog REFER targets a dialog that already exists, and §12.2.1.2
+///   forbids the UAC updating its route set from a mid-dialog response, so an
+///   echo there is noise at best.
+/// - **The status can establish one.** A 2xx does. A provisional above 100 does
+///   when it carries a To tag (§12.1.2); 100 Trying never does. We do not test
+///   for that tag, because the caller may stamp it after us via a reply header
+///   — and a Record-Route on a tagless provisional is inert, since the UAC
+///   builds no dialog from it and so reads nothing off it.
+fn response_establishes_dialog(request: &SipMessage, status_code: u16) -> bool {
+    if !(101..300).contains(&status_code) {
+        return false;
+    }
+    if !matches!(
+        request.method(),
+        Some(Method::Invite) | Some(Method::Subscribe) | Some(Method::Refer)
+    ) {
+        return false;
+    }
+    request.headers.to().is_some_and(|to| !to.contains(";tag="))
+}
+
 /// Build a SIP response from a request, copying mandatory headers.
 fn build_response(
     request: &SipMessage,
@@ -9356,6 +9388,34 @@ fn build_response(
     }
     if let Some(cseq) = request.headers.cseq() {
         builder = builder.cseq(cseq.clone());
+    }
+
+    // RFC 3261 §12.1.1 — a UAS answering a dialog-forming request MUST copy
+    // *every* Record-Route value from the request into the response that
+    // establishes the dialog, in order, with all URI and header parameters
+    // intact, "whether they are known or unknown to the UAS". The UAC reverses
+    // that list to build its route set (§12.1.2), so dropping one entry hands
+    // the peer a route set short by exactly one hop.
+    //
+    // This is protocol, not policy, which is why it lives here rather than in
+    // each script: the rule is the same for every UAS, and a script could not
+    // satisfy it anyway — `get_header` reads one value, so a request spreading
+    // Record-Route over several lines was unreadable from Python until
+    // `get_headers` landed alongside this.
+    //
+    // Lines are copied verbatim rather than parsed and re-emitted: a parameter
+    // we do not understand still has to survive, and re-serializing is exactly
+    // what cannot promise that.
+    //
+    // A script that wants something else still wins — the `reply_headers` loop
+    // below runs after this, so `set_reply_header("Record-Route", …)` replaces
+    // what we copied.
+    if response_establishes_dialog(request, status_code) {
+        if let Some(record_routes) = request.headers.get_all("Record-Route") {
+            for record_route in record_routes {
+                builder = builder.header("Record-Route", record_route.clone());
+            }
+        }
     }
 
     // Copy any auth challenge headers the script may have set.
@@ -34171,6 +34231,184 @@ mod tests {
     // build_response must apply Replace ops via `set_header` so that
     // a script-supplied To-tag (RFC 3261 §12.1.1.2 / RFC 6665 §4.1.3)
     // ends up as exactly one To header in the wire response.
+
+    // --- RFC 3261 §12.1.1 Record-Route echo --------------------------------
+    //
+    // A UAS answering a dialog-forming request MUST copy every Record-Route
+    // value into the response that establishes the dialog, in order and with
+    // all parameters intact. The failure this guards is silent and one-sided:
+    // the response looks well-formed, and only the UAC notices, because its
+    // route set (§12.1.2, the echo reversed) is short by a hop.
+
+    /// Two entries in, two entries out, same order, parameters intact.
+    ///
+    /// The shape that forced this: a P-CSCF bridging its protected Gm port to
+    /// its core port Record-Routes once per socket, so the UAS sees two. The
+    /// UAC reverses them, and it is the *second* — the access-facing one — that
+    /// its in-dialog requests have to leave on. Drop it and the UE is left
+    /// addressing a port with no IPsec SA covering it.
+    #[test]
+    fn build_response_echoes_every_record_route_in_order() {
+        let mut request = sample_invite();
+        request.headers.set_all(
+            "Record-Route",
+            vec![
+                "<sip:198.51.100.1:5060;transport=udp;lr>".to_string(),
+                "<sip:198.51.100.1:5066;transport=udp;lr>".to_string(),
+            ],
+        );
+        let response = build_response(&request, 200, "OK", None, &[]);
+
+        let echoed = response
+            .headers
+            .get_all("Record-Route")
+            .expect("2xx to a dialog-forming INVITE must carry the Record-Route echo");
+        assert_eq!(echoed.len(), 2, "both entries must survive, got {echoed:?}");
+        assert_eq!(echoed[0], "<sip:198.51.100.1:5060;transport=udp;lr>");
+        assert_eq!(echoed[1], "<sip:198.51.100.1:5066;transport=udp;lr>");
+
+        // And on the wire, not just in the map.
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("Record-Route:"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "wire output must carry both lines: {lines:?}"
+        );
+    }
+
+    /// An unknown parameter has to survive verbatim — §12.1.1 says "whether
+    /// they are known or unknown to the UAS", which is precisely why the echo
+    /// copies lines rather than parsing and re-emitting them.
+    #[test]
+    fn build_response_record_route_echo_preserves_unknown_parameters() {
+        let mut request = sample_invite();
+        request.headers.set(
+            "Record-Route",
+            "<sip:198.51.100.1:5060;lr;x-vendor-token=abc123>;some-hdr-param".to_string(),
+        );
+        let response = build_response(&request, 200, "OK", None, &[]);
+
+        assert_eq!(
+            response.headers.get("Record-Route").map(String::as_str),
+            Some("<sip:198.51.100.1:5060;lr;x-vendor-token=abc123>;some-hdr-param"),
+        );
+    }
+
+    /// SUBSCRIBE is the one the field defect landed on — a UAS answering
+    /// reg-event owes the same echo an INVITE does (RFC 6665 §4.1.2).
+    #[test]
+    fn build_response_echoes_record_route_for_subscribe_and_refer() {
+        for method in [Method::Subscribe, Method::Refer] {
+            let mut request = sample_invite();
+            request.start_line = StartLine::Request(RequestLine {
+                method: method.clone(),
+                request_uri: SipUri::new("example.com".to_string()).with_user("alice".to_string()),
+                version: Version::sip_2_0(),
+            });
+            request
+                .headers
+                .set("Record-Route", "<sip:198.51.100.1:5066;lr>".to_string());
+            let response = build_response(&request, 200, "OK", None, &[]);
+            assert_eq!(
+                response.headers.get("Record-Route").map(String::as_str),
+                Some("<sip:198.51.100.1:5066;lr>"),
+                "{method:?} 2xx must echo Record-Route",
+            );
+        }
+    }
+
+    /// An early dialog needs the route set too, so a provisional above 100 gets
+    /// the echo — but 100 Trying establishes nothing and must stay clean.
+    #[test]
+    fn build_response_record_route_echo_covers_18x_but_not_100_trying() {
+        let mut request = sample_invite();
+        request
+            .headers
+            .set("Record-Route", "<sip:198.51.100.1:5066;lr>".to_string());
+
+        let ringing = build_response(&request, 180, "Ringing", None, &[]);
+        assert!(
+            ringing.headers.has("Record-Route"),
+            "an 18x may open an early dialog, so it owes the echo",
+        );
+
+        let trying = build_response(&request, 100, "Trying", None, &[]);
+        assert!(
+            !trying.headers.has("Record-Route"),
+            "100 Trying establishes no dialog and must not echo",
+        );
+    }
+
+    /// Nothing else gets it: a non-dialog-forming method, an in-dialog request
+    /// (§12.2.1.2 forbids the UAC refreshing its route set from one), and a
+    /// failure response all stay as they were.
+    #[test]
+    fn build_response_withholds_record_route_echo_where_no_dialog_forms() {
+        let record_route = "<sip:198.51.100.1:5066;lr>".to_string();
+
+        // REGISTER — dialogless.
+        let mut register = sample_invite();
+        register.start_line = StartLine::Request(RequestLine {
+            method: Method::Register,
+            request_uri: SipUri::new("example.com".to_string()),
+            version: Version::sip_2_0(),
+        });
+        register.headers.set("Record-Route", record_route.clone());
+        assert!(!build_response(&register, 200, "OK", None, &[])
+            .headers
+            .has("Record-Route"));
+
+        // Re-INVITE — the To tag says the dialog already exists.
+        let mut reinvite = sample_invite();
+        reinvite.headers.set(
+            "To",
+            "Bob <sip:bob@biloxi.com>;tag=already-here".to_string(),
+        );
+        reinvite.headers.set("Record-Route", record_route.clone());
+        assert!(!build_response(&reinvite, 200, "OK", None, &[])
+            .headers
+            .has("Record-Route"));
+
+        // A failure response establishes nothing.
+        let mut invite = sample_invite();
+        invite.headers.set("Record-Route", record_route);
+        assert!(!build_response(&invite, 404, "Not Found", None, &[])
+            .headers
+            .has("Record-Route"));
+    }
+
+    /// Script precedence is unchanged: `set_reply_header` still wins over the
+    /// framework copy, so a script with its own route set keeps control.
+    #[test]
+    fn build_response_script_reply_header_overrides_record_route_echo() {
+        use crate::script::api::request::ReplyHeaderOp;
+        let mut request = sample_invite();
+        request.headers.set_all(
+            "Record-Route",
+            vec![
+                "<sip:198.51.100.1:5060;lr>".to_string(),
+                "<sip:198.51.100.1:5066;lr>".to_string(),
+            ],
+        );
+        let reply_headers = vec![(
+            ReplyHeaderOp::Replace,
+            "Record-Route".to_string(),
+            "<sip:203.0.113.9:5060;lr>".to_string(),
+        )];
+        let response = build_response(&request, 200, "OK", None, &reply_headers);
+
+        let echoed = response.headers.get_all("Record-Route").unwrap();
+        assert_eq!(
+            echoed.len(),
+            1,
+            "Replace must clear the echo, got {echoed:?}"
+        );
+        assert_eq!(echoed[0], "<sip:203.0.113.9:5060;lr>");
+    }
 
     #[test]
     fn build_response_replace_op_overwrites_copied_to_header() {

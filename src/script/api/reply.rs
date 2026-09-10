@@ -277,6 +277,28 @@ impl PyReply {
         self.get_header(name)
     }
 
+    /// Every value of a header, in order — an empty list when it is absent.
+    ///
+    /// ``get_header`` returns only the *first* value, which silently truncates
+    /// a header the peer spread over several lines. Record-Route, Via, Route,
+    /// Contact, Supported, Path and the P-* family are all routinely
+    /// multi-value (RFC 3261 §7.3.1), so read those with this.
+    ///
+    /// Values come back exactly as they arrived, one entry per header line. A
+    /// single line holding several comma-separated URIs stays one entry —
+    /// split it yourself if you need the individual URIs.
+    ///
+    /// ```python,ignore
+    /// for via in reply.get_headers("Via"):
+    ///     log.info(via)
+    /// ```
+    fn get_headers(&self, name: &str) -> PyResult<Vec<String>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.get_all(name).cloned().unwrap_or_default())
+    }
+
     /// Set (replace) a header value.
     fn set_header(&self, name: &str, value: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
@@ -636,6 +658,33 @@ mod tests {
         let reply = PyReply::new(message);
 
         assert_eq!(reply.call_id().unwrap(), Some("call-42@host".to_string()));
+    }
+
+    /// Same truncation as on the request side: a reply routinely carries
+    /// several Via and Record-Route lines, and `get_header` shows only the
+    /// first of them.
+    #[test]
+    fn get_headers_returns_every_value_in_order() {
+        let mut message = make_response(200, "OK");
+        message.headers.set_all(
+            "Record-Route",
+            vec![
+                "<sip:198.51.100.1:5060;lr>".to_string(),
+                "<sip:198.51.100.1:5066;lr>".to_string(),
+            ],
+        );
+        let reply = PyReply::new(Arc::new(Mutex::new(message)));
+
+        let all = reply.get_headers("Record-Route").unwrap();
+        assert_eq!(all.len(), 2, "both lines must come back, got {all:?}");
+        assert_eq!(all[0], "<sip:198.51.100.1:5060;lr>");
+        assert_eq!(all[1], "<sip:198.51.100.1:5066;lr>");
+
+        assert_eq!(
+            reply.get_header("Record-Route").unwrap().as_deref(),
+            Some("<sip:198.51.100.1:5060;lr>"),
+        );
+        assert!(reply.get_headers("X-Nothing-Here").unwrap().is_empty());
     }
 
     #[test]
