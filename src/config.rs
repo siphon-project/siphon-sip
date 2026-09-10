@@ -1771,7 +1771,24 @@ pub struct FailedAuthBanConfig {
     #[serde(default = "default_failed_auth_window_secs")]
     pub window_secs: u32,
     /// How long a ban lasts (seconds) before the source IP is allowed again.
+    ///
+    /// The expiry **slides**: an abuse signal from an already-banned source
+    /// pushes it out to a full `ban_duration_secs` from that signal, so a
+    /// scanner that keeps hammering through its ban does not walk out on
+    /// schedule. `max_ban_duration_secs` caps the total.
     pub ban_duration_secs: u32,
+    /// Ceiling (seconds) on how far continued abuse may push a single ban's
+    /// expiry, measured from the instant that ban was raised. Defaults to
+    /// 24 × `ban_duration_secs`; clamped up to at least `ban_duration_secs`.
+    ///
+    /// This is the safety valve on the sliding expiry. Uncapped, one source in a
+    /// retry loop is banned forever — a handset with a stale password re-tries
+    /// on a timer, and behind CGNAT the address it holds is shared with every
+    /// other subscriber on that NAT, none of whom did anything. The cap bounds
+    /// how long a wrong verdict can last while still pinning a real scanner far
+    /// longer than a fixed TTL would.
+    #[serde(default)]
+    pub max_ban_duration_secs: Option<u32>,
     /// Weight applied to a single high-confidence abuse signal — present-but-
     /// invalid credentials (wrong password), a forged/stale/replayed digest
     /// nonce, non-SIP garbage on a stream transport, or a scanner User-Agent —

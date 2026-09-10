@@ -29,6 +29,19 @@ DIR="$REPO_ROOT/sipp/banscan"
 cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# The container runs with --network host and binds 0.0.0.0. A pre-existing
+# listener on 127.0.0.1:<port> is MORE specific, so the kernel routes the
+# clients' loopback connections to *it* and this harness silently grades another
+# process — which looks exactly like a real regression. Refuse to start instead.
+for port in 5560 5562; do
+  if ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+    echo "REFUSING TO RUN: something is already listening on port $port."
+    echo "This harness would test that process instead of the siphon under test."
+    ss -lntp "sport = :$port" 2>/dev/null | tail -n +2
+    exit 2
+  fi
+done
+
 echo "=== build siphon image ==="
 docker build -t "$IMAGE" "$REPO_ROOT" >/dev/null
 
@@ -64,6 +77,17 @@ if python3 "$DIR/httpprobe_client.py"; then
   echo "PASS: non-SIP probe closed unanswered and banned at accept"
 else
   fail "non-SIP probe not dropped/counted — a scanner can probe indefinitely" $?
+fi
+
+echo "=== restart siphon (empty ban store for the ws upgrade probe) ==="
+docker restart "$CONTAINER" >/dev/null
+sleep 4
+
+echo "=== run ws upgrade client (rejected upgrade is a strong signal) ==="
+if python3 "$DIR/wsupgrade_client.py"; then
+  echo "PASS: rejected WebSocket upgrade banned the source at strong weight"
+else
+  fail "rejected upgrade not scored as strong — a ws scanner gets 3x the probes" $?
 fi
 
 exit 0

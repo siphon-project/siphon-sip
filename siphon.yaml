@@ -449,7 +449,21 @@ auth:
 #   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
 #     threshold: 10             # weighted failures within window_secs before a ban
 #     window_secs: 600          # sliding window for counting failures (default 600)
-#     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires)
+#     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires).
+#                               # The expiry SLIDES: a further abuse signal from
+#                               # an already-banned source pushes it out to a
+#                               # full ban_duration_secs from that signal, so a
+#                               # scanner that keeps hammering through its ban
+#                               # does not walk out on the original schedule.
+#     max_ban_duration_secs: 86400      # cap on how far that slide can go,
+#                               # measured from when the ban was raised.
+#                               # Default 24 x ban_duration_secs; clamped up to
+#                               # at least ban_duration_secs. This is the safety
+#                               # valve: uncapped, one source in a retry loop is
+#                               # banned forever, and behind CGNAT that address
+#                               # is shared with every other subscriber on the
+#                               # NAT. Set it to ban_duration_secs to switch the
+#                               # slide off and get a fixed TTL back.
 #     strong_signal_weight: 3   # weight of a high-confidence abuse signal toward
 #                               # threshold (default 3); a plain probe counts as 1
 #     missing_credentials_weight: 0     # weight of a challenge issued because the
@@ -465,12 +479,21 @@ auth:
 #     # Failures counted toward the ban, by weight:
 #     #   weight 1 (low-confidence — may fire for a benign peer):
 #     #     - a non-ACK INVITE server-transaction timeout (toll-fraud pattern)
-#     #     - a failed/timed-out TLS / WSS / WS handshake
+#     #     - a failed/timed-out TLS handshake. Stays weight 1 on purpose: a
+#     #       client that does not trust your chain, offers no usable cipher, or
+#     #       is an L4 probe is benign, and weighting that like abuse turns a
+#     #       certificate rollover into a ban wave
 #     #   weight = strong_signal_weight (high-confidence abuse — bans faster):
 #     #     - present-but-invalid digest credentials (wrong password), a username
 #     #       the auth backend denied, or a forged / stale / replayed nonce
 #     #       [over UDP this stays weight 1, since a UDP source is spoofable and
 #     #       would amplify a reflected ban]
+#     #     - a rejected WebSocket upgrade on a WS/WSS port: the peer completed
+#     #       the transport handshake and THEN sent something that is not an
+#     #       upgrade (an HTTPS probe, a bare GET). RFC 7118 §5 leaves a
+#     #       conforming SIP-over-WebSocket client no way to produce this.
+#     #       Point an external HTTP uptime monitor at a WS/WSS port and it will
+#     #       ban itself — put its source in trusted_cidrs
 #     #     - non-SIP bytes on a TCP/TLS stream — decided from the connection's
 #     #       first line at accept AND from the start line of every message
 #     #       thereafter (an HTTP probe such as a /phpinfo.php scan, a TLS record
@@ -492,7 +515,10 @@ auth:
 #     # (e.g. AWS NLB) there; L4 (connect-only) checks send no data and are
 #     # never mistaken for garbage, but an L7/HTTP health check against a SIP
 #     # port would be, so its source belongs in trusted_cidrs.
-#     # Banned IPs are dropped at accept/recv, before any SIP parsing.
+#     # Banned IPs are dropped at accept/recv, before any SIP parsing, and
+#     # re-checked once a TLS/WebSocket handshake completes — so connections
+#     # already open from a source that a sibling connection just got banned are
+#     # dropped with it instead of being served out.
 #
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org

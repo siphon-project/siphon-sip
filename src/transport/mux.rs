@@ -245,6 +245,16 @@ async fn dispatch<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (sip_transport, websocket_transport) = transports;
+    // The ACL cleared this source at accept, but the handshake takes long enough
+    // for a *sibling* connection from the same burst to have banned it since.
+    // Re-check before spending anything else on the peer.
+    if crate::security::is_source_banned(remote_addr.ip()) {
+        debug!(
+            "{sip_transport}+{websocket_transport} mux dropping {remote_addr}: \
+             source banned during its handshake"
+        );
+        return;
+    }
     let (protocol, prefix) = match sniff_stream(&mut stream).await {
         Ok(sniffed) => sniffed,
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
@@ -287,7 +297,9 @@ async fn dispatch<S>(
             .await;
         }
         StreamProtocol::WebSocket => {
-            info!("{websocket_transport} accepted {remote_addr} as {connection_id:?} (mux)");
+            // Same level as the SIP arm above: one line per accepted connection
+            // is debug detail, and at INFO a scanning burst buries the log.
+            debug!("{websocket_transport} accepted {remote_addr} as {connection_id:?} (mux)");
             // Replay the sniffed bytes so the upgrade handshake sees its own
             // request line.
             crate::transport::ws::handle_connection(

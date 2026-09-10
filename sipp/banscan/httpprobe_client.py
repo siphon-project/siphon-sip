@@ -16,7 +16,7 @@ import socket
 import sys
 import time
 
-HOST, PORT = "127.0.0.1", 5060
+HOST, PORT = "127.0.0.1", 5560
 
 PROBE = (
     b"GET /phpinfo.php HTTP/1.1\r\n"

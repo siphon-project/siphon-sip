@@ -168,6 +168,12 @@ nft list ruleset
 # }
 ```
 
+- **An element's `expires` went *up* between two listings?** That's the sliding
+  ban expiry, not a bug. A further abuse signal from an already-banned source
+  pushes its deadline out, and the kernel element is re-armed to match (the set
+  element is re-added with the new timeout). `max_ban_duration_secs` bounds how
+  far it can go; see
+  [Hardening & security](cookbook/security.md#a-ban-that-slides).
 - **Nothing in the sets?** Check that `failed_auth_ban` and/or `apiban` are
   configured — the firewall only mirrors bans those produce. Trigger a few failed
   auths and watch the set fill.
