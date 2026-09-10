@@ -449,10 +449,43 @@ pub struct SiphonMetrics {
 
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
+    /// Per-peer connection state, 0/1, keyed on the configured peer name (or the
+    /// asserted `Origin-Host` for an inbound accepted peer).
+    ///
+    /// [`diameter_peers_connected`](Self::diameter_peers_connected) is a bare
+    /// count, so "1 peer connected" cannot say *which* — the question that
+    /// matters on a node with an HSS and an OCS, where losing either is a
+    /// different outage. Every configured peer is pre-created at 0, so a peer
+    /// that has never connected reads as down rather than being absent.
+    pub diameter_peer_up: IntGaugeVec,
     pub diameter_requests_total: IntCounterVec,
+    /// Total Diameter answers received, by command and Result-Code.
+    ///
+    /// **Alert on the non-2xxx rate.**
+    /// [`diameter_request_errors_total`](Self::diameter_request_errors_total)
+    /// counts only transport failures — a write that blocked, a dropped channel,
+    /// a timeout. An answer that *arrives* carrying 4012 CREDIT_LIMIT_REACHED or
+    /// 5012 UNABLE_TO_COMPLY is a successful round trip by that measure, so an
+    /// OCS refusing every single CCR showed up as "errors: 0". This is the
+    /// counter that distinguishes "the peer is unreachable" from "the peer is
+    /// answering, and saying no".
+    pub diameter_answers_total: IntCounterVec,
     pub diameter_request_errors_total: IntCounterVec,
     pub diameter_request_duration_seconds: HistogramVec,
     pub diameter_watchdog_failures_total: IntCounter,
+
+    // --- Ro online charging (TS 32.299) ---
+    /// Total calls refused credit by the OCS, by Result-Code.
+    ///
+    /// **Alert on this.** A denial is a call that did not happen, and it is
+    /// invisible everywhere else: the CCR/CCA round trip succeeded, no SIP error
+    /// counter moves, and the only trace was an `info!` line.
+    pub ro_denials_total: IntCounterVec,
+    /// Total established calls torn down mid-session on credit exhaustion, by
+    /// reason. The `no_teardown_hook` label is the one to watch: it means credit
+    /// ran out, siphon had nothing wired to enforce it, and the call kept running
+    /// unpaid.
+    pub ro_credit_teardowns_total: IntCounterVec,
 
     // --- RTPEngine health ---
     pub rtpengine_instances_up: IntGauge,
@@ -800,12 +833,44 @@ impl SiphonMetrics {
             "Number of currently connected Diameter peers",
         )?;
 
+        let diameter_peer_up = IntGaugeVec::new(
+            Opts::new(
+                "siphon_diameter_peer_up",
+                "Diameter peer connection state (1 = open, 0 = closed), by peer name",
+            ),
+            &["peer"],
+        )?;
+
         let diameter_requests_total = IntCounterVec::new(
             Opts::new(
                 "siphon_diameter_requests_total",
                 "Total Diameter requests sent",
             ),
             &["command"],
+        )?;
+
+        let diameter_answers_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_answers_total",
+                "Total Diameter answers received, by command and Result-Code",
+            ),
+            &["command", "result_code"],
+        )?;
+
+        let ro_denials_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_ro_denials_total",
+                "Total calls refused credit by the OCS, by Result-Code",
+            ),
+            &["result_code"],
+        )?;
+
+        let ro_credit_teardowns_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_ro_credit_teardowns_total",
+                "Total established calls torn down on credit exhaustion, by reason",
+            ),
+            &["reason"],
         )?;
 
         let diameter_request_errors_total = IntCounterVec::new(
@@ -1020,7 +1085,11 @@ impl SiphonMetrics {
         registry.register(Box::new(firewall_commands_dropped_total.clone()))?;
         registry.register(Box::new(firewall_command_failures_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
+        registry.register(Box::new(diameter_peer_up.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
+        registry.register(Box::new(diameter_answers_total.clone()))?;
+        registry.register(Box::new(ro_denials_total.clone()))?;
+        registry.register(Box::new(ro_credit_teardowns_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
         registry.register(Box::new(diameter_request_duration_seconds.clone()))?;
         registry.register(Box::new(diameter_watchdog_failures_total.clone()))?;
@@ -1085,7 +1154,11 @@ impl SiphonMetrics {
             firewall_commands_dropped_total,
             firewall_command_failures_total,
             diameter_peers_connected,
+            diameter_peer_up,
             diameter_requests_total,
+            diameter_answers_total,
+            ro_denials_total,
+            ro_credit_teardowns_total,
             diameter_request_errors_total,
             diameter_request_duration_seconds,
             diameter_watchdog_failures_total,
@@ -1245,6 +1318,49 @@ pub fn record_call_cost(route: Option<&crate::lcr::Route>, talk_seconds: Option<
         .inc_by(cost);
 }
 
+/// Publish one Diameter peer's connection state, keyed on its configured name.
+///
+/// Call with `up = false` at configuration time as well as on disconnect: a peer
+/// that has never once connected must read as down, not be missing from the
+/// gauge. `siphon_diameter_peers_connected` is a bare count and cannot express
+/// which of an HSS and an OCS is the one that went away.
+pub fn set_diameter_peer_up(peer: &str, up: bool) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    metrics
+        .diameter_peer_up
+        .with_label_values(&[peer])
+        .set(if up { 1 } else { 0 });
+}
+
+/// Count a call refused credit by the OCS (Ro, TS 32.299).
+pub fn record_ro_denial(result_code: u32) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    metrics
+        .ro_denials_total
+        .with_label_values(&[crate::diameter::dictionary::result_code_label(
+            result_code,
+            false,
+        )])
+        .inc();
+}
+
+/// Count an established call torn down on credit exhaustion (Ro, TS 32.299).
+///
+/// `reason` is a fixed set from the call sites, never peer-supplied.
+pub fn record_ro_credit_teardown(reason: &str) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    metrics
+        .ro_credit_teardowns_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// Publish the current per-minute burn, one series per currency.
 ///
 /// Deliberately *not* part of `publish_store_gauges`, which documents an O(1)
@@ -1345,6 +1461,87 @@ pub fn counter_vec_rows(
         }
     }
     rows
+}
+
+/// Histogram summary per label value: sample count, total, mean and p95.
+///
+/// The dashboard cannot plot raw buckets usefully, and a histogram that only
+/// ever reaches Prometheus is invisible to anyone who has not built a Grafana
+/// panel for it — which is how Diameter round-trip latency stayed collected and
+/// unread. Reducing it here to the three numbers an operator reads at a glance
+/// ("typical, and how bad is the tail") is what makes it renderable.
+///
+/// p95 is interpolated within the bucket it falls in, so it is bounded by the
+/// bucket edges and no more precise than they are — good enough to see a peer
+/// degrade, not a substitute for `histogram_quantile` over the real series.
+/// Returns `None` for a p95 that lands in the `+Inf` bucket, where there is no
+/// upper edge to interpolate against and any number would be invented.
+pub fn histogram_vec_summary_by_label(
+    vector: &HistogramVec,
+    label: &str,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let key = metric
+                .get_label()
+                .iter()
+                .find(|pair| pair.name() == label)
+                .map(|pair| pair.value().to_owned())
+                .unwrap_or_default();
+            let histogram = metric.get_histogram();
+            let count = histogram.get_sample_count();
+            if count == 0 {
+                continue;
+            }
+            let sum = histogram.get_sample_sum();
+            let mut summary = serde_json::Map::new();
+            summary.insert("count".into(), serde_json::Value::from(count));
+            summary.insert("sum".into(), serde_json::Value::from(sum));
+            summary.insert("mean".into(), serde_json::Value::from(sum / count as f64));
+            if let Some(p95) = interpolated_quantile(histogram, 0.95) {
+                summary.insert("p95".into(), serde_json::Value::from(p95));
+            }
+            out.insert(key, serde_json::Value::Object(summary));
+        }
+    }
+    out
+}
+
+/// Linear interpolation of `quantile` within the cumulative bucket it falls in.
+///
+/// Prometheus buckets are cumulative, so `bucket[i].cumulative_count` already
+/// includes every lower bucket. Returns `None` when the target rank sits above
+/// the last finite bucket — the `+Inf` overflow has no upper edge, and reporting
+/// its lower edge would understate a tail that is by definition worse than it.
+fn interpolated_quantile(histogram: &prometheus::proto::Histogram, quantile: f64) -> Option<f64> {
+    let count = histogram.get_sample_count();
+    if count == 0 {
+        return None;
+    }
+    let target = quantile * count as f64;
+    let mut lower_edge = 0.0_f64;
+    let mut lower_count = 0.0_f64;
+    for bucket in histogram.get_bucket() {
+        let cumulative = bucket.cumulative_count() as f64;
+        if cumulative >= target {
+            let upper_edge = bucket.upper_bound();
+            if !upper_edge.is_finite() {
+                return None;
+            }
+            let in_bucket = cumulative - lower_count;
+            if in_bucket <= 0.0 {
+                return Some(upper_edge);
+            }
+            let fraction = (target - lower_count) / in_bucket;
+            return Some(lower_edge + (upper_edge - lower_edge) * fraction);
+        }
+        lower_edge = bucket.upper_bound();
+        lower_count = cumulative;
+    }
+    // Every finite bucket is below the target rank: the sample is in `+Inf`.
+    None
 }
 
 /// Per-label totals for one value of a second label — e.g. `requests_total`
@@ -1774,6 +1971,14 @@ mod tests {
         // `recorders_are_called_from_the_datapath` pins those call sites.
         "call_cost_total",
         "call_spend_rate",
+        // Written by `set_diameter_peer_up` / `record_ro_denial` /
+        // `record_ro_credit_teardown` below — from the peer reconnect task and
+        // the Ro enforcement paths, by label rather than by field name, so the
+        // heuristic cannot see them either.
+        // `recorders_are_called_from_the_datapath` pins those call sites.
+        "diameter_peer_up",
+        "ro_denials_total",
+        "ro_credit_teardowns_total",
     ];
 
     fn crate_source_files() -> Vec<std::path::PathBuf> {
@@ -1875,6 +2080,10 @@ mod tests {
             // pin where they are actually driven from.
             "record_call_cost(",
             "publish_spend_rate(",
+            // And the Diameter/Ro trio, for the same reason.
+            "set_diameter_peer_up(",
+            "record_ro_denial(",
+            "record_ro_credit_teardown(",
         ] {
             assert!(
                 sources.iter().any(|body| body.contains(recorder)),
@@ -1895,10 +2104,6 @@ mod tests {
             "registry",
             "requests_by_method",
             "responses_by_class",
-            // Exported for Prometheus scrape only — the JSON has no consumer for
-            // a bare latency histogram, and the dashboard reads the per-command
-            // request/error counters beside it instead.
-            "diameter_request_duration_seconds",
             "control_handoff_timeouts_total",
             "memory_metadata_bytes",
             "glibc_free_bytes",
@@ -2081,6 +2286,72 @@ mod tests {
         assert_eq!(map.get("udp"), Some(&6.0));
         assert_eq!(map.get("tcp"), Some(&2.0));
         assert_eq!(map.len(), 2);
+    }
+
+    /// Build an isolated latency histogram with siphon's own bucket set.
+    fn test_latency_histogram() -> HistogramVec {
+        HistogramVec::new(
+            HistogramOpts::new("test_latency_seconds", "test").buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0,
+            ]),
+            &["command"],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn histogram_summary_reports_count_mean_and_p95() {
+        let vector = test_latency_histogram();
+        // 100 observations: 95 fast, 5 slow. p95 sits at the boundary.
+        for _ in 0..95 {
+            vector.with_label_values(&["CCR"]).observe(0.002);
+        }
+        for _ in 0..5 {
+            vector.with_label_values(&["CCR"]).observe(0.4);
+        }
+
+        let summary = histogram_vec_summary_by_label(&vector, "command");
+        let ccr = summary.get("CCR").expect("CCR series present");
+
+        assert_eq!(ccr["count"].as_u64(), Some(100));
+        let mean = ccr["mean"].as_f64().unwrap();
+        // (95 * 0.002 + 5 * 0.4) / 100
+        assert!(
+            (mean - 0.0219).abs() < 1e-9,
+            "mean should be the sample sum over the count, got {mean}"
+        );
+        // The 95th of these lands in the (0.001, 0.005] bucket that holds the
+        // 95 fast samples, so it is bounded by those edges — bucket-limited
+        // precision, which is the documented contract.
+        let p95 = ccr["p95"].as_f64().unwrap();
+        assert!(
+            (0.001..=0.005).contains(&p95),
+            "p95 {p95} should fall inside the bucket holding the 95th sample"
+        );
+    }
+
+    #[test]
+    fn histogram_summary_skips_untouched_series_and_omits_an_unbounded_p95() {
+        let vector = test_latency_histogram();
+
+        // A series that exists but was never observed carries no information;
+        // emitting a zeroed row would read as "measured, and instant".
+        let _ = vector.with_label_values(&["UAR"]);
+        assert!(histogram_vec_summary_by_label(&vector, "command").is_empty());
+
+        // Every sample above the last finite bucket lands in `+Inf`, which has
+        // no upper edge — reporting one would be inventing a number for a tail
+        // that is by definition worse than the last edge.
+        for _ in 0..10 {
+            vector.with_label_values(&["SAR"]).observe(60.0);
+        }
+        let summary = histogram_vec_summary_by_label(&vector, "command");
+        let sar = summary.get("SAR").expect("SAR series present");
+        assert_eq!(sar["count"].as_u64(), Some(10));
+        assert!(
+            sar.get("p95").is_none(),
+            "a p95 in the +Inf bucket must be omitted, not guessed: {sar:?}"
+        );
     }
 
     #[test]

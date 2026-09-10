@@ -254,3 +254,39 @@ out-of-credit teardown reports the same cause whenever the balance ran out.
 matching CCR-TERMINATION); under a steady completed-call workload it returns to
 ~0. Alert on it climbing while call rate is flat — that's a charging-session
 leak.
+
+A session count tells you the OCS is answering. It cannot tell you *what* it is
+answering, and a refused call moves nothing else — the CCR/CCA round trip
+succeeded, and no SIP error counter fires. These three cover that:
+
+| Metric | Labels | What it means |
+|---|---|---|
+| `siphon_diameter_answers_total` | `command`, `result_code` | Every answer received, by Result-Code. `siphon_diameter_request_errors_total` counts only *transport* failures, so a peer that answers and refuses reads as zero errors there. |
+| `siphon_ro_denials_total` | `result_code` | A call refused credit at setup — a call that never happened. |
+| `siphon_ro_credit_teardowns_total` | `reason` | An established call cut off mid-way when credit ran out. |
+
+Result-Code labels are bounded: codes siphon knows appear as themselves
+(`4012`), anything else collapses into its RFC 6733 §7.1 class (`4xxx_other`),
+and 3GPP Experimental-Result-Codes carry an `exp:` prefix so a vendor 5001 is
+never conflated with a base 5001. The value comes off the wire from a peer, so
+the label set is bounded at compile time rather than by what the peer sends.
+
+Alerts worth having:
+
+```promql
+# The OCS is reachable and refusing. Invisible before these counters existed.
+rate(siphon_ro_denials_total[5m]) > 0
+
+# Credit ran out and nothing was wired to enforce it: the call is still up,
+# and unpaid. `ro.teardown` must be connected for enforcement to happen.
+increase(siphon_ro_credit_teardowns_total{reason="no_teardown_hook"}[15m]) > 0
+
+# Answers that are not 2xxx, across every reference point.
+sum(rate(siphon_diameter_answers_total{result_code!~"2.*"}[5m])) > 0
+```
+
+`siphon_diameter_peer_up{peer}` reports each configured peer as 0/1 by its name
+from `siphon.yaml`. Every configured peer is published at 0 before its first
+connect attempt, so a peer that has never come up reads as down rather than
+being absent from the metric — alert on `siphon_diameter_peer_up == 0`, which
+`siphon_diameter_peers_connected` (a bare count) cannot express per peer.

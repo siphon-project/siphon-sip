@@ -4,10 +4,23 @@
 // totals, per-error-kind totals and latency histograms sat unread in the
 // registry. Command codes name the interface, so the breakdown is also the
 // answer to "is my Cx working but my Rf not".
+//
+// The page now answers four questions rather than one, because "peers: 1,
+// requests: 640" said nothing about whether any of it was working:
+//
+//   which peer   — per-peer up/down, since a count cannot say whether it is the
+//                  HSS or the OCS that went away
+//   which point  — requests grouped by 3GPP reference point
+//   which answer — Result-Code breakdown. The error counter beside it only ever
+//                  counted *transport* failures, so an OCS answering every CCR
+//                  with 4012 read as zero errors, on a card that also showed
+//                  the CCRs going out
+//   how slow     — the round-trip histogram, collected since the metric was
+//                  added and never once rendered
 
 import { $, html, esc } from "../lib/dom.js";
 import { notConfigured } from "../lib/dom.js";
-import { count, isAbsent, sum } from "../lib/format.js";
+import { count, isAbsent, latency, sum } from "../lib/format.js";
 import { barList, metaLine } from "../lib/widgets.js";
 
 /**
@@ -35,14 +48,107 @@ function byInterface(commands) {
   return grouped;
 }
 
+/**
+ * Colour for a Result-Code label, by its RFC 6733 §7.1 class.
+ *
+ * Labels are either a bare code ("4012"), a class bucket ("5xxx_other"), the
+ * 3GPP experimental namespace ("exp:5001"), or "none". The leading digit after
+ * any `exp:` prefix is the class in every one of those shapes.
+ */
+function resultCodeColor(label) {
+  const digit = String(label).replace(/^exp:/, "").charAt(0);
+  if (digit === "2") return "var(--up)";
+  if (digit === "1") return "var(--faint)";
+  if (digit === "3" || digit === "4") return "var(--warn)";
+  if (digit === "5") return "var(--crit)";
+  return "var(--faint)";
+}
+
+/** Answers that are not 2xxx — the peer replied, and refused. */
+function failedAnswers(answers) {
+  return Object.entries(answers || {})
+    .filter(([label]) => {
+      const digit = String(label).replace(/^exp:/, "").charAt(0);
+      return digit === "3" || digit === "4" || digit === "5";
+    })
+    .reduce((total, [, value]) => total + (value || 0), 0);
+}
+
+/**
+ * Result codes as a bar list, each row coloured by its class.
+ *
+ * `barList` paints one colour for the whole list, so this renders per-class
+ * sub-lists in class order. Success first, then the failures in ascending
+ * severity — the eye should land on 2xxx being the tall one, and on anything
+ * red immediately after.
+ */
+function resultCodeBars(answers) {
+  const entries = Object.entries(answers || {}).filter(([, value]) => value > 0);
+  if (!entries.length) return '<div class="empty">no answers yet</div>';
+
+  const classOf = (label) => {
+    const digit = String(label).replace(/^exp:/, "").charAt(0);
+    return "12345".includes(digit) ? digit : "0";
+  };
+  return ["2", "1", "3", "4", "5", "0"]
+    .map((cls) => {
+      const group = entries.filter(([label]) => classOf(label) === cls);
+      if (!group.length) return "";
+      return barList(Object.fromEntries(group), { color: resultCodeColor(cls + "000") });
+    })
+    .join("");
+}
+
+/** Per-peer connection state, mirroring the per-instance media health card. */
+function peerRows(peers) {
+  const entries = Object.entries(peers || {});
+  if (!entries.length) {
+    return '<div class="empty">no Diameter peers configured</div>';
+  }
+  return entries
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([peer, up]) =>
+      metaLine(peer, up ? "up" : "down", { color: up ? "var(--up)" : "var(--crit)" }),
+    )
+    .join("");
+}
+
+/**
+ * Round-trip latency per command: mean, and p95 when it is bounded.
+ *
+ * p95 is absent when the 95th sample landed in the `+Inf` bucket, where the
+ * histogram has no upper edge to interpolate against. Rendering it as an em
+ * dash says "off the top of the scale", which is the honest reading and the one
+ * worth alerting on — a number invented there would understate it.
+ */
+function latencyRows(byCommand) {
+  const entries = Object.entries(byCommand || {});
+  if (!entries.length) return '<div class="empty">no answered requests yet</div>';
+  return entries
+    .sort(([, a], [, b]) => (b.mean || 0) - (a.mean || 0))
+    .map(([command, stats]) => {
+      const p95 = isAbsent(stats.p95) ? "p95 over scale" : "p95 " + latency(stats.p95);
+      return metaLine(command, latency(stats.mean) + "  ·  " + p95, {
+        color: isAbsent(stats.p95) ? "var(--warn)" : undefined,
+      });
+    })
+    .join("");
+}
+
 export function render(snapshot) {
   const diameter = snapshot.diameter;
   const sip = snapshot.sip || {};
 
-  // The two per-command cards only mean anything alongside a configured
-  // Diameter stack, so they are hidden rather than left as empty boxes — an
-  // empty card reads as "no data", which is a different claim.
-  const dependent = [$("sig-commands-card"), $("sig-errors-card")];
+  // The dependent cards only mean anything alongside a configured Diameter
+  // stack, so they are hidden rather than left as empty boxes — an empty card
+  // reads as "no data", which is a different claim.
+  const dependent = [
+    $("sig-peers-card"),
+    $("sig-commands-card"),
+    $("sig-answers-card"),
+    $("sig-errors-card"),
+    $("sig-latency-card"),
+  ];
   dependent.forEach((card) => card && (card.hidden = isAbsent(diameter)));
 
   if (isAbsent(diameter)) {
@@ -50,27 +156,41 @@ export function render(snapshot) {
   } else {
     const peers = diameter.peers_connected || 0;
     const commands = diameter.requests_by_command || {};
+    const answers = diameter.answers_by_result_code || {};
     // The watchdog (RFC 6733 DWR/DWA) failing is the early warning that a peer
     // is about to drop, well before peers_connected moves.
     const watchdog = diameter.watchdog_failures || 0;
+    const refused = failedAnswers(answers);
+    const transportErrors = sum(diameter.errors_by_kind);
     html(
       "sig-diameter",
       [
         metaLine("Peers connected", peers, { color: peers > 0 ? "var(--up)" : "var(--crit)" }),
         metaLine("Requests total", count(sum(commands))),
-        metaLine("Errors total", count(sum(diameter.errors_by_kind)), {
-          color: sum(diameter.errors_by_kind) > 0 ? "var(--warn)" : undefined,
+        metaLine("Answers total", count(sum(answers))),
+        // Two different failures, deliberately on two lines. A peer that cannot
+        // be reached and a peer that answers "no" need different people woken
+        // up, and folding them into one "errors" number is what hid the second
+        // one entirely.
+        metaLine("Refused answers (3xxx–5xxx)", count(refused), {
+          color: refused > 0 ? "var(--crit)" : undefined,
+        }),
+        metaLine("Transport errors", count(transportErrors), {
+          color: transportErrors > 0 ? "var(--warn)" : undefined,
         }),
         metaLine("Watchdog failures", count(watchdog), { color: watchdog > 0 ? "var(--warn)" : undefined }),
         '<div class="subhead" style="margin-top:12px">By reference point</div>',
         barList(byInterface(commands), { color: "var(--cyan)", empty: "no Diameter traffic yet" }),
       ].join(""),
     );
+    html("sig-peers", peerRows(diameter.peers));
     html("sig-commands", barList(commands, { color: "var(--indigo)", empty: "no commands yet" }));
+    html("sig-answers", resultCodeBars(answers));
     html(
       "sig-errors",
-      barList(diameter.errors_by_kind, { color: "var(--crit)", empty: "no Diameter errors" }),
+      barList(diameter.errors_by_kind, { color: "var(--crit)", empty: "no transport errors" }),
     );
+    html("sig-latency", latencyRows(diameter.latency_by_command));
   }
 
   // SIP transport. UDP is stated as not-applicable rather than shown as zero.
@@ -89,8 +209,15 @@ export function render(snapshot) {
   html("sig-transport", rows.join(""));
 
   // Charging — Rf and Ro are Diameter reference points (TS 32.299), so they sit
-  // with Diameter rather than with the 5GC or with access security.
+  // with Diameter rather than with the 5GC or with access security. They are
+  // also independent of each other: a node commonly runs online charging with
+  // no offline charging at all, and this card used to read Ro's state off Rf's
+  // flag and declare online charging unconfigured on every one of them.
   const sessions = snapshot.sessions || {};
+  const denials = sessions.ro_denials || {};
+  const teardowns = sessions.ro_credit_teardowns || {};
+  const deniedTotal = sum(denials);
+  const tornDownTotal = sum(teardowns);
   html(
     "sig-charging",
     [
@@ -100,6 +227,31 @@ export function render(snapshot) {
       isAbsent(sessions.ro)
         ? metaLine("Ro — online (CCR/CCA)", "not configured", { color: "var(--faint)" })
         : metaLine("Ro — online (CCR/CCA)", count(sessions.ro) + " sessions"),
+      // A live session count says the OCS is answering; it cannot say what it
+      // is answering. A denial is a call that never happened and a teardown is
+      // one cut off mid-way, and neither moves any other counter siphon keeps.
+      isAbsent(sessions.ro)
+        ? ""
+        : [
+            metaLine("Calls refused credit", count(deniedTotal), {
+              color: deniedTotal > 0 ? "var(--crit)" : undefined,
+            }),
+            deniedTotal > 0
+              ? barList(denials, { color: "var(--crit)" })
+              : "",
+            metaLine("Torn down on credit", count(tornDownTotal), {
+              color: tornDownTotal > 0 ? "var(--warn)" : undefined,
+            }),
+            tornDownTotal > 0 ? barList(teardowns, { color: "var(--warn)" }) : "",
+            // Credit ran out and siphon had nothing wired to act on it, so the
+            // call is still up and unpaid. Worth its own line, not a row in a
+            // breakdown nobody scrolls to.
+            teardowns.no_teardown_hook > 0
+              ? metaLine("Unenforced (no teardown hook)", count(teardowns.no_teardown_hook), {
+                  color: "var(--crit)",
+                })
+              : "",
+          ].join(""),
     ].join(""),
   );
 
@@ -150,13 +302,28 @@ export function markup() {
         <div class="panelhead"><span class="t">Diameter</span><span class="count-pill">Cx / Rx / Rf / Ro / Sh</span></div>
         <div class="panelbody" id="sig-diameter"></div>
       </div>
+      <div class="card" id="sig-peers-card">
+        <div class="panelhead"><span class="t">Peers</span><span class="count-pill">RFC 6733</span></div>
+        <div class="panelbody" id="sig-peers"></div>
+      </div>
       <div class="card" id="sig-commands-card">
         <div class="panelhead"><span class="t">By command</span><span class="count-pill">requests</span></div>
         <div class="panelbody" id="sig-commands"></div>
       </div>
+      <!-- The card the dashboard was missing: what the peers actually said.
+           "Errors" below counts transport failures only, so a peer refusing
+           every request sat at zero there. -->
+      <div class="card" id="sig-answers-card">
+        <div class="panelhead"><span class="t">Answers by Result-Code</span><span class="count-pill">RFC 6733 §7.1</span></div>
+        <div class="panelbody" id="sig-answers"></div>
+      </div>
       <div class="card" id="sig-errors-card">
-        <div class="panelhead"><span class="t">Diameter errors</span><span class="count-pill">by kind</span></div>
+        <div class="panelhead"><span class="t">Transport errors</span><span class="count-pill">by kind</span></div>
         <div class="panelbody" id="sig-errors"></div>
+      </div>
+      <div class="card" id="sig-latency-card">
+        <div class="panelhead"><span class="t">Round-trip latency</span><span class="count-pill">mean · p95</span></div>
+        <div class="panelbody" id="sig-latency"></div>
       </div>
       <div class="card">
         <div class="panelhead"><span class="t">Charging</span><span class="count-pill">Rf / Ro · TS 32.299</span></div>

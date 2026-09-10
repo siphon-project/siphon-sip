@@ -68,6 +68,12 @@ pub struct AdminFeatures {
     pub ipsec: bool,
     pub lawful_intercept: bool,
     pub rf: bool,
+    /// Ro online charging. Separate from [`rf`](Self::rf): offline and online
+    /// charging are independent reference points and a node commonly has one
+    /// without the other. Gating Ro on the Rf flag reported online charging as
+    /// unconfigured on every node that runs `ro:` without `rf:`, while that same
+    /// node's CCR counters climbed one card away.
+    pub ro: bool,
 }
 
 impl AdminFeatures {
@@ -81,6 +87,7 @@ impl AdminFeatures {
             ipsec: config.ipsec.is_some(),
             lawful_intercept: config.lawful_intercept.is_some(),
             rf: config.rf.is_some(),
+            ro: config.ro.is_some(),
         }
     }
 }
@@ -875,13 +882,24 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         // row of zeros that reads as "configured and broken".
         "diameter": state.features.diameter.then(|| serde_json::json!({
             "peers_connected": metrics.diameter_peers_connected.get(),
+            // Which peer, not just how many. A count of 1 across an HSS and an
+            // OCS cannot say which of the two is the one that went away.
+            "peers": crate::metrics::int_gauge_vec_by_label(&metrics.diameter_peer_up, "peer"),
             // Per-command totals and latency were already collected and never
             // shown; "1 peer connected" was the entire Diameter story on the
             // dashboard while this sat in the registry.
             "requests_by_command":
                 crate::metrics::int_counter_vec_by_label(&metrics.diameter_requests_total, "command"),
+            // Answers by Result-Code, summed across commands. `errors_by_kind`
+            // below counts only transport failures, so a peer that answers every
+            // request with 5012 reads as zero errors there; this is where that
+            // shows up.
+            "answers_by_result_code":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_answers_total, "result_code"),
             "errors_by_kind":
                 crate::metrics::int_counter_vec_by_label(&metrics.diameter_request_errors_total, "error"),
+            "latency_by_command":
+                crate::metrics::histogram_vec_summary_by_label(&metrics.diameter_request_duration_seconds, "command"),
             "watchdog_failures": metrics.diameter_watchdog_failures_total.get(),
         })),
         "rtpengine": state.features.media.then(|| serde_json::json!({
@@ -895,7 +913,15 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         // dashboard never read.
         "sessions": {
             "rf": state.features.rf.then(|| metrics.rf_sessions.get()),
-            "ro": state.features.rf.then(|| metrics.ro_sessions.get()),
+            "ro": state.features.ro.then(|| metrics.ro_sessions.get()),
+            // A live session count says the OCS is answering; it cannot say what
+            // it is answering. A denial is a call that never happened and a
+            // credit teardown is one cut off mid-way, and neither moves any
+            // other counter siphon keeps.
+            "ro_denials": state.features.ro
+                .then(|| crate::metrics::int_counter_vec_by_label(&metrics.ro_denials_total, "result_code")),
+            "ro_credit_teardowns": state.features.ro
+                .then(|| crate::metrics::int_counter_vec_by_label(&metrics.ro_credit_teardowns_total, "reason")),
             "li_remembered": state.features.lawful_intercept
                 .then(|| metrics.li_remembered_sessions.get()),
         },
@@ -2019,6 +2045,133 @@ mod tests {
 
         // Core SIP state is never optional, so it stays a real number.
         assert!(json["sip"]["transactions_active"].as_i64().is_some());
+    }
+
+    /// Fetch `/admin/metrics.json` for a node with exactly `features` configured.
+    async fn snapshot_with(features: AdminFeatures) -> serde_json::Value {
+        let app = router(
+            AdminState {
+                features,
+                ..test_state()
+            },
+            None,
+            false,
+        );
+        let response = app
+            .oneshot(
+                Request::get("/admin/metrics.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ro_reports_configured_without_rf() {
+        // Offline (Rf) and online (Ro) charging are independent reference
+        // points, and a node commonly runs one without the other. Ro was gated
+        // on the *Rf* flag, so every `ro:`-without-`rf:` node reported online
+        // charging as unconfigured while its own CCR counter climbed on the
+        // card beside it — the dashboard actively denying what the same
+        // snapshot showed.
+        crate::metrics::init().unwrap();
+        let json = snapshot_with(AdminFeatures {
+            ro: true,
+            ..AdminFeatures::default()
+        })
+        .await;
+
+        assert!(
+            json["sessions"]["ro"].as_i64().is_some(),
+            "ro: is configured, so sessions.ro must be a number: {:?}",
+            json["sessions"]["ro"]
+        );
+        assert!(
+            json["sessions"]["rf"].is_null(),
+            "rf: is NOT configured, so sessions.rf must stay null"
+        );
+        // The two Ro breakdowns ride the same flag.
+        assert!(json["sessions"]["ro_denials"].is_object());
+        assert!(json["sessions"]["ro_credit_teardowns"].is_object());
+    }
+
+    #[tokio::test]
+    async fn rf_reports_configured_without_ro() {
+        // The mirror image, so the fix cannot be a swap of one wrong flag for
+        // another.
+        crate::metrics::init().unwrap();
+        let json = snapshot_with(AdminFeatures {
+            rf: true,
+            ..AdminFeatures::default()
+        })
+        .await;
+
+        assert!(json["sessions"]["rf"].as_i64().is_some());
+        assert!(json["sessions"]["ro"].is_null());
+        assert!(json["sessions"]["ro_denials"].is_null());
+    }
+
+    #[tokio::test]
+    async fn each_subsystem_is_gated_on_its_own_flag() {
+        // The generalisation of the two tests above, and the one that would
+        // have caught the Ro/Rf mix-up on the day it was written: enabling one
+        // subsystem must surface that subsystem and *only* that subsystem.
+        // Asserting the negative half is the whole point — a gate wired to a
+        // neighbouring flag passes every test that only checks its own key.
+        crate::metrics::init().unwrap();
+
+        /// A subsystem's flag setter, paired with the snapshot pointers that
+        /// flag alone must populate.
+        type GateCase = (fn(&mut AdminFeatures), &'static [&'static str]);
+
+        let cases: &[GateCase] = &[
+            (|f| f.diameter = true, &["/diameter"]),
+            (|f| f.media = true, &["/rtpengine"]),
+            (|f| f.control = true, &["/control"]),
+            (|f| f.sbi = true, &["/sbi"]),
+            (|f| f.ipsec = true, &["/ipsec"]),
+            (|f| f.rf = true, &["/sessions/rf"]),
+            (
+                |f| f.ro = true,
+                &[
+                    "/sessions/ro",
+                    "/sessions/ro_denials",
+                    "/sessions/ro_credit_teardowns",
+                ],
+            ),
+            (|f| f.lawful_intercept = true, &["/sessions/li_remembered"]),
+        ];
+
+        // Every pointer any case owns; each case must leave the rest null.
+        let all: Vec<&str> = cases.iter().flat_map(|(_, keys)| *keys).copied().collect();
+
+        for (enable, owned) in cases {
+            let mut features = AdminFeatures::default();
+            enable(&mut features);
+            let json = snapshot_with(features).await;
+
+            for pointer in &all {
+                let value = json.pointer(pointer).unwrap_or(&serde_json::Value::Null);
+                if owned.contains(pointer) {
+                    assert!(
+                        !value.is_null(),
+                        "{pointer} belongs to the one subsystem enabled here, so it \
+                         must be populated, not null"
+                    );
+                } else {
+                    assert!(
+                        value.is_null(),
+                        "{pointer} is NOT the subsystem enabled here, so it must be \
+                         null — it is gated on the wrong feature flag: {value:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

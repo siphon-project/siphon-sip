@@ -145,6 +145,31 @@ fn session_high_seed() -> u32 {
         .unwrap_or(0)
 }
 
+/// Bounded metric label for the Result-Code an answer carries.
+///
+/// Prefers the base `Result-Code`, falling back to the 3GPP
+/// `Experimental-Result-Code` — which Cx/Sh/Rx answers carry *instead of*, not
+/// alongside, the base code (TS 29.229 §6.2), nested inside the
+/// `Experimental-Result` grouped AVP. An answer with neither is labelled `none`
+/// rather than being dropped: a peer answering without a Result-Code at all is
+/// itself worth seeing.
+fn answer_result_label(answer: &DiameterMessage) -> &'static str {
+    if let Some(code) = answer.avps.get("Result-Code").and_then(|v| v.as_u64()) {
+        return dictionary::result_code_label(code as u32, false);
+    }
+    let experimental = answer
+        .avps
+        .get("Experimental-Result")
+        .and_then(|group| group.get("Experimental-Result-Code"))
+        // Tolerate a decoder that hoists the code to the top level.
+        .or_else(|| answer.avps.get("Experimental-Result-Code"))
+        .and_then(|v| v.as_u64());
+    match experimental {
+        Some(code) => dictionary::result_code_label(code as u32, true),
+        None => "none",
+    }
+}
+
 pub struct DiameterPeer {
     config: PeerConfig,
     /// Channel to send outgoing messages to the writer task
@@ -270,6 +295,24 @@ impl DiameterPeer {
                         .diameter_request_duration_seconds
                         .with_label_values(&[command_label])
                         .observe(start.elapsed().as_secs_f64());
+                    // An answer that arrives is a successful round trip as far
+                    // as the error counter above is concerned, whatever it says.
+                    // Counting the Result-Code here is what separates "the peer
+                    // is unreachable" from "the peer is answering, and saying
+                    // no" — an OCS refusing every CCR used to read as zero
+                    // errors. One lookup per transaction, not per message.
+                    //
+                    // Labelled with the *answer* name (CCA, not CCR): the
+                    // command code is shared and only the R-bit differs, and a
+                    // counter of answers reading `CCR` would be a lie about
+                    // which half of the exchange it counted.
+                    metrics
+                        .diameter_answers_total
+                        .with_label_values(&[
+                            codec::command_name(command_code, false),
+                            answer_result_label(&answer),
+                        ])
+                        .inc();
                 }
                 Ok(answer)
             }
@@ -1068,6 +1111,163 @@ mod tests {
             incoming_tx,
         );
         (peer, incoming_rx)
+    }
+
+    /// Stand up a real [`DiameterPeer`] whose far end answers every request with
+    /// a CEA carrying `result_code`. Unlike [`loopback_peer_with_echo`] the
+    /// answer has a real Result-Code AVP, which is what the answer counter reads.
+    async fn loopback_peer_answering(
+        result_code: u32,
+    ) -> (Arc<DiameterPeer>, mpsc::Receiver<IncomingRequest>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = leak_test_config();
+        let answer_config = config.clone();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half);
+                while let Ok(bytes) = codec::read_diameter_message(&mut reader).await {
+                    let Some(request) = codec::decode_diameter(&bytes) else {
+                        break;
+                    };
+                    // Correlate on the request's own Hop-by-Hop id, so the
+                    // production reader task resolves the pending entry.
+                    let answer = build_cea(
+                        &answer_config,
+                        result_code,
+                        request.hop_by_hop,
+                        request.end_to_end,
+                    );
+                    if write_half.write_all(&answer).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (incoming_tx, incoming_rx) = mpsc::channel(16);
+        let peer = spawn_connection_tasks(config, DiameterStream::Tcp(client_stream), incoming_tx);
+        (peer, incoming_rx)
+    }
+
+    fn answers_counter(command: &str, result_code: &str) -> u64 {
+        crate::metrics::metrics()
+            .map(|metrics| {
+                metrics
+                    .diameter_answers_total
+                    .with_label_values(&[command, result_code])
+                    .get()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The blindness this counter exists to fix: a peer that answers, and says
+    /// no. The round trip succeeds, so no transport error is recorded and the
+    /// dashboard's "Errors total" stays at zero — an OCS refusing every single
+    /// CCR looked identical to one granting them all.
+    ///
+    /// "Not a transport error" is asserted as `send_request` returning `Ok`,
+    /// which is the observable form of it: every write to
+    /// `diameter_request_errors_total` lives in an `Err` arm of the same match.
+    /// The counter itself cannot carry an exact-delta assertion here — the
+    /// registry is process-wide and the timeout tests below write to it in
+    /// parallel.
+    #[tokio::test]
+    async fn a_failure_answer_counts_as_an_answer_not_a_transport_error() {
+        crate::metrics::init().ok();
+        let before = answers_counter("CEA", "4012");
+
+        let (peer, _incoming_rx) = loopback_peer_answering(4012).await;
+        let config = peer.config().clone();
+        let request = build_cer(&config, peer.next_hbh(), 1);
+        let result = peer.send_request(request).await;
+
+        // The round trip itself succeeded — that is the whole point.
+        let answer = result.expect(
+            "a delivered answer is not a transport failure, however bad its \
+             Result-Code; returning Err here would file a reachable peer that \
+             is refusing everything under a metric that means something else",
+        );
+        assert_eq!(
+            answer.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(4012)
+        );
+        assert_eq!(
+            answers_counter("CEA", "4012") - before,
+            1,
+            "a 4012 answer must be counted under its own Result-Code"
+        );
+    }
+
+    /// A code siphon does not know must still be counted, and must not mint a
+    /// series of its own — the value is chosen by the peer.
+    #[tokio::test]
+    async fn an_unknown_result_code_is_counted_in_its_class_bucket() {
+        crate::metrics::init().ok();
+        let before = answers_counter("CEA", "5xxx_other");
+
+        let (peer, _incoming_rx) = loopback_peer_answering(5099).await;
+        let config = peer.config().clone();
+        let request = build_cer(&config, peer.next_hbh(), 1);
+        peer.send_request(request).await.unwrap();
+
+        assert_eq!(answers_counter("CEA", "5xxx_other") - before, 1);
+        assert_eq!(
+            answers_counter("CEA", "5099"),
+            0,
+            "an unlisted code must not get a series of its own"
+        );
+    }
+
+    #[test]
+    fn answer_result_label_prefers_base_then_experimental_then_none() {
+        fn answer(avps: serde_json::Value) -> DiameterMessage {
+            DiameterMessage {
+                version: 1,
+                length: 0,
+                flags: 0,
+                command_code: 272,
+                application_id: 4,
+                hop_by_hop: 1,
+                end_to_end: 1,
+                is_request: false,
+                avps,
+                raw: Vec::new(),
+            }
+        }
+
+        assert_eq!(
+            answer_result_label(&answer(serde_json::json!({"Result-Code": 2001}))),
+            "2001"
+        );
+
+        // Cx/Sh/Rx answers carry Experimental-Result *instead of* Result-Code
+        // (TS 29.229 §6.2), nested in the grouped AVP.
+        assert_eq!(
+            answer_result_label(&answer(serde_json::json!({
+                "Experimental-Result": {"Experimental-Result-Code": 5001}
+            }))),
+            "exp:5001"
+        );
+
+        // The base code wins when a peer sends both, so one answer is never
+        // counted twice or under the wrong namespace.
+        assert_eq!(
+            answer_result_label(&answer(serde_json::json!({
+                "Result-Code": 2001,
+                "Experimental-Result": {"Experimental-Result-Code": 5001}
+            }))),
+            "2001"
+        );
+
+        // A peer answering with no Result-Code at all is itself worth seeing.
+        assert_eq!(answer_result_label(&answer(serde_json::json!({}))), "none");
     }
 
     /// Leak guard for the Diameter request/answer correlation map shared by every
