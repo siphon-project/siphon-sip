@@ -165,7 +165,7 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 # TS 103 221-1 derives XId/DId/X1TransactionId from the dictionary UUID):
 # those identifiers are parsed into real `Uuid` newtypes, so the typed model
 # covers precisely what the validator misses. See src/li/x1/schema.rs.
-uppsala = "0.9"
+uppsala = "0.10"
 # Materialises the `include_str!`-embedded ETSI XSDs to a scratch directory
 # at LI startup so uppsala can resolve their imports; the compiled validator
 # outlives the directory, so there is no runtime file dependency.
