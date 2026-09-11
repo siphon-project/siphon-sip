@@ -238,7 +238,7 @@ fn outbound_endpoint_for_sa(
 /// single-transport pins the SA's protocol wins, since a UDP-over-TCP
 /// or TCP-over-UDP mismatch silently drops the frame at the kernel
 /// XFRM selector.
-fn outbound_for_sa(
+pub(crate) fn outbound_for_sa(
     sa: &SecurityAssociationPair,
     dst_port: u16,
     current_transport: crate::transport::Transport,

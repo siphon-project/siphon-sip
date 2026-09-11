@@ -8,33 +8,41 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
-- **The registrar liveness probe for an IPsec-protected binding now goes over
-  SA #3, from `port_pc` to the UE's protected server port, instead of back down
-  the UE's own client flow.**
+- **The registrar liveness probe now takes the route an MT request to the
+  binding would take, and a TCP send from an IPsec-protected port whose
+  connection has gone now leaves from that port.**
 
-  The idle-liveness sweep addressed its OPTIONS to the binding's source address,
-  which is the UE's protected *client* port where the REGISTER came from, and
-  for a stream registration it rode the captured inbound connection. But the
-  flow-close handler deliberately *retains* an IPsec binding when its TCP flow
-  closes, so that a UE whose SIP-over-TCP flow FINs at the radio inactivity
-  timer can still be paged. The SA is the liveness authority, not the flow. So
-  by the time the sweep probed such a binding, the flow it rode was already
-  gone. The send fell back to a fresh connection from an ephemeral port toward
-  the UE's client port. No SA selector matches an ephemeral source port, and a
-  UE does not listen on its client port, so the probe could never be answered.
-  Every sweep missed, and a live but idle UE was network-deregistered and its SA
-  torn down, only to re-register from scratch minutes later. A UE whose TCP flow
-  happened to stay up answered normally, which is why this showed up on some
-  handsets and not others.
+  The idle-liveness sweep probed an IPsec-protected binding by sending OPTIONS
+  to the binding's source address and, for a stream registration, riding the
+  captured inbound connection. But the flow-close handler deliberately
+  *retains* an IPsec binding when its TCP flow closes, detaching it so that a UE
+  whose SIP-over-TCP flow FINs at the radio inactivity timer can still be paged.
+  By the time the sweep probed such a binding, the connection it rode was gone.
+  The send fell through the stream distributor to the connection pool, which
+  opened a fresh connection from an ephemeral port toward the UE's client port.
+  No SA selector matches an ephemeral source port and nothing listens on a
+  client port, so the probe could never be answered. Every sweep missed, and a
+  live but idle UE was network-deregistered and its SA torn down, only to
+  re-register from scratch minutes later. A UE whose TCP flow happened to stay
+  up answered normally, which is why this showed up on some handsets and not
+  others.
 
-  The probe now goes to the UE's protected server port from `port_pc` over SA
-  #3. That is 3GPP TS 33.203's path for P-CSCF-originated requests, the one an
-  MT INVITE or NOTIFY takes. It uses UDP, which every SIP UE must accept (RFC
-  3261 §18) and which needs no connection state. Probing the path an MT request
-  actually uses is also the better liveness signal, since it is exactly the
-  reachability the retained binding exists to preserve. A UDP registration moves
-  from the SA #2 response path to SA #3 as well. A TCP-pinned SA can't carry a
-  UDP probe and keeps the captured-flow route unchanged.
+  The probe now asks where an MT request to the binding goes and sends there. A
+  binding that still has a flow (UDP, or TCP while the connection is up) keeps
+  the route it always had, the one `relay(flow=...)` takes. A detached binding
+  is probed the way MT reaches it: over its own SA from `port_pc` to the UE's
+  protected server port, with the SA's transport pin applied exactly as the
+  relay applies it. The SA is looked up from the binding's own client port
+  rather than by UE address, so a re-authentication overlap can no longer route
+  the probe over the wrong pair.
+
+  Underneath that, the stream distributor's pool fallback ignored the source a
+  message asked to leave from. It now honours it when it is an IPsec-protected
+  P-CSCF port, where an ESP-over-TCP SA selector requires that exact source, so
+  any TCP send toward a UE whose captured connection has closed goes out inside
+  the SA instead of from an ephemeral port. Every other send stays ephemeral as
+  before, since reconnecting from a listen port collides with a TIME_WAIT
+  4-tuple.
 
 - **A UAS answering a dialog-forming request now echoes the full `Record-Route`
   into its response, and scripts can finally read a multi-value header at all

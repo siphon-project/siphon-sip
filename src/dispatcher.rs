@@ -2824,34 +2824,59 @@ struct LivenessProbeRoute {
     connection_id: ConnectionId,
 }
 
-/// The SA #3 route for an IPsec binding's idle-liveness OPTIONS — the way
-/// every other P-CSCF-originated request to the UE goes: from `port_pc` to the
-/// UE's protected server port `port_us` (3GPP TS 33.203), the path an MT INVITE
-/// or NOTIFY takes and so the reachability the retained binding exists to
-/// preserve.
+/// Where an MT request to this binding goes, as the idle-liveness OPTIONS
+/// route.  The probe answers "can an MT request reach this binding?", so it
+/// has to take the MT route in every binding state, or it can pass while MT
+/// fails (and fail while MT works).
 ///
-/// `sa3` is what `ipsec::outbound_for(ue:port_us, Udp)` resolved: the P-CSCF
-/// egress for SA #3 and the transport the SA allows.  Yields a route only when
-/// that is UDP — every SIP UE must accept it (RFC 3261 §18) and it needs no
-/// connection state, which is the point: [`liveness_on_flow_close`] retains an
-/// IPsec binding precisely *because* its TCP flow has closed, so a probe that
-/// rides that flow is probing a socket that is gone by design.  `None` (a
-/// TCP-pinned SA, or no SA resolved) leaves the caller on the captured-flow
-/// route.
-fn liveness_probe_sa3_route(
-    ue_ip: std::net::IpAddr,
-    ue_port_s: u16,
-    sa3: Option<(SocketAddr, Transport)>,
+/// - The binding still has a flow (UDP, or TCP while the connection is up):
+///   what `relay(flow=...)` does, the UE's source address from the listener
+///   the REGISTER landed on, on the captured connection, with the SA's
+///   transport pin applied as the relay applies it.
+/// - It has no flow: a stream binding [`registrar::Registrar::close_flow`]
+///   detached because its socket closed.  MT to it is relayed without a flow
+///   to its Contact, the UE's protected server port, so the probe goes the
+///   same way: over the binding's own SA from `port_pc` (SA #3), with the
+///   binding's transport under the SA pin.
+///
+/// `sa` is the binding's own SA pair.  `None` when a detached binding has no
+/// SA to route over, or a transport an SA cannot carry.
+fn liveness_probe_route(
+    contact: &crate::registrar::Contact,
+    sa: Option<&crate::ipsec::SecurityAssociationPair>,
 ) -> Option<LivenessProbeRoute> {
-    match sa3 {
-        Some((source_local_addr, Transport::Udp)) => Some(LivenessProbeRoute {
-            destination: SocketAddr::new(ue_ip, ue_port_s),
-            source_local_addr,
-            transport: Transport::Udp,
-            connection_id: ConnectionId::default(),
-        }),
-        _ => None,
+    if let Some(flow) = contact.flow() {
+        let transport = match (sa, flow.transport) {
+            (Some(sa), Transport::Udp | Transport::Tcp) => {
+                crate::script::api::ipsec::outbound_for_sa(
+                    sa,
+                    flow.source_addr.port(),
+                    flow.transport,
+                )
+                .map_or(flow.transport, |(_, pinned)| pinned)
+            }
+            _ => flow.transport,
+        };
+        return Some(LivenessProbeRoute {
+            destination: flow.source_addr,
+            source_local_addr: flow.local_addr,
+            transport,
+            connection_id: ConnectionId(flow.connection_id),
+        });
     }
+    let sa = sa?;
+    let binding_transport = contact.source_transport.unwrap_or(Transport::Udp);
+    if !matches!(binding_transport, Transport::Udp | Transport::Tcp) {
+        return None;
+    }
+    let (source_local_addr, transport) =
+        crate::script::api::ipsec::outbound_for_sa(sa, sa.ue_port_s, binding_transport)?;
+    Some(LivenessProbeRoute {
+        destination: SocketAddr::new(sa.ue_addr, sa.ue_port_s),
+        source_local_addr,
+        transport,
+        connection_id: ConnectionId::default(),
+    })
 }
 
 /// Hysteresis decision after a suspect binding fails its in-sweep OPTIONS probe
@@ -3153,46 +3178,27 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
             continue;
         }
 
-        // Suspect.  Probe over SA #3 — port_pc → the UE's protected server
-        // port, the way an MT request reaches it — whenever the SA allows UDP
-        // (`liveness_probe_sa3_route` explains why not the captured flow).  Only
-        // a TCP-pinned SA keeps the old route: the binding's actual transport,
-        // riding the captured inbound connection, so a dead half-open socket
-        // yields no answer within probe_timeout.  Detach so a slow UE can't
+        // Suspect.  Probe the route an MT request to this binding takes
+        // (`liveness_probe_route`): its flow while it has one, else its own SA
+        // from port_pc to the UE's protected server port.  The SA is the
+        // binding's own pair, looked up by its client port; the per-IP row above
+        // only decides eligibility and activity.  Detach so a slow UE can't
         // stall the sweep.
         suspects += 1;
         let binding_transport = contact.source_transport.unwrap_or(Transport::Udp);
-        let sa3 = crate::script::api::ipsec::outbound_for(
-            SocketAddr::new(ue_addr.ip(), row.ue_port_s),
-            Transport::Udp,
-        );
-        let route =
-            liveness_probe_sa3_route(ue_addr.ip(), row.ue_port_s, sa3).unwrap_or_else(|| {
-                let (source_local_addr, transport) =
-                    crate::script::api::ipsec::outbound_for(ue_addr, binding_transport).unwrap_or(
-                        (
-                            contact.inbound_local_addr.unwrap_or(ue_addr),
-                            binding_transport,
-                        ),
-                    );
-                // Stream: ride the captured inbound connection (a dead half-open
-                // socket times out → dereg).  UDP routes by source_local_addr, so
-                // the sentinel id is correct there.
-                let connection_id = if matches!(transport, Transport::Udp) {
-                    ConnectionId::default()
-                } else {
-                    contact
-                        .inbound_connection_id
-                        .map(ConnectionId)
-                        .unwrap_or_default()
-                };
-                LivenessProbeRoute {
-                    destination: ue_addr,
-                    source_local_addr,
-                    transport,
-                    connection_id,
-                }
-            });
+        let sa = manager.get_sa(&ue_addr.ip(), ue_addr.port());
+        let Some(route) = liveness_probe_route(&contact, sa.as_ref()) else {
+            // No SA to route a detached binding over (a re-authentication
+            // overlap, a stale port): skip it this sweep rather than count a
+            // miss.  A binding whose SA is really gone is reaped by the
+            // abandoned-SA sweep.
+            debug!(
+                aor = %aor,
+                ue = %ue_addr,
+                "registrar liveness: no MT route for idle binding, skipping this sweep"
+            );
+            continue;
+        };
         debug!(
             aor = %aor,
             ue = %ue_addr,
@@ -3206,7 +3212,9 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         let context = context.clone();
         let aor = aor.clone();
         let contact = contact.clone();
-        let ue_port_c = row.ue_port_c;
+        // Tear down the binding's own SA pair on a reap, not whichever pair
+        // the per-IP row happened to index during a re-auth overlap.
+        let ue_port_c = sa.as_ref().map_or(row.ue_port_c, |sa| sa.ue_port_c);
         tokio::spawn(async move {
             liveness_probe_then_dereg(context, aor, contact, ue_port_c, route, probe_timeout).await;
         });
@@ -5437,6 +5445,36 @@ fn handle_request(
     flush_deferred_sends(state);
 }
 
+/// Where `request.relay(flow=...)` sends: the UE's source address, over the
+/// flow's transport, egressing the listener the REGISTER landed on, on the
+/// captured connection.  An unrecognised transport name falls back to
+/// `fallback` (the inbound transport) with a warning.
+///
+/// Named so the registrar-liveness probe's agreement test builds the MT route
+/// from the relay's own mapping rather than from a copy of it.
+fn flow_relay_egress(
+    flow: &crate::script::api::registrar::PyFlow,
+    fallback: Transport,
+) -> (SocketAddr, Transport, SocketAddr, ConnectionId) {
+    let transport = match flow.transport.as_str() {
+        "udp" => Transport::Udp,
+        "tcp" => Transport::Tcp,
+        "tls" => Transport::Tls,
+        "ws" => Transport::WebSocket,
+        "wss" => Transport::WebSocketSecure,
+        other => {
+            warn!(transport = %other, "flow-relay: unknown transport, falling back to inbound");
+            fallback
+        }
+    };
+    (
+        flow.source_addr,
+        transport,
+        flow.local_addr,
+        ConnectionId(flow.connection_id),
+    )
+}
+
 /// Relay a SIP request to its destination.
 ///
 /// 1. Determine target address (explicit next_hop, or Request-URI)
@@ -5472,17 +5510,8 @@ fn relay_request(
     //   b) flow=None — resolve the next_hop / top Route / R-URI as usual.
     let (target_uri_string, mut destination, mut outbound_transport, flow_local_addr) =
         if let Some(flow) = flow {
-            let transport = match flow.transport.as_str() {
-                "udp" => Transport::Udp,
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                "ws" => Transport::WebSocket,
-                "wss" => Transport::WebSocketSecure,
-                other => {
-                    warn!(transport = %other, "flow-relay: unknown transport, falling back to inbound");
-                    inbound.transport
-                }
-            };
+            let (flow_destination, transport, flow_local, _) =
+                flow_relay_egress(flow, inbound.transport);
             // For diagnostics only — the URI isn't used to pick the destination.
             let uri_string = match &message.start_line {
                 StartLine::Request(request_line) => request_line.request_uri.to_string(),
@@ -5491,12 +5520,7 @@ fn relay_request(
                     return;
                 }
             };
-            (
-                uri_string,
-                flow.source_addr,
-                transport,
-                Some(flow.local_addr),
-            )
+            (uri_string, flow_destination, transport, Some(flow_local))
         } else {
             // Determine target URI string (RFC 3261 §16.6 step 6):
             // 1. Explicit next-hop from script
@@ -32592,72 +32616,194 @@ mod tests {
         assert!(liveness_recently_active(now, now + 10, 90));
     }
 
-    #[test]
-    fn liveness_probe_takes_sa3_to_port_us_when_the_sa_allows_udp() {
-        // The probe must go the way every P-CSCF-originated request to the UE
-        // goes (TS 33.203 SA #3: port_pc -> port_us), not back to the UE's
-        // client port, and on a fresh send rather than a captured flow — the
-        // flow-close handler retains an IPsec binding *because* its flow is gone.
-        let pcscf_port_c: std::net::SocketAddr = "192.0.2.10:5064".parse().expect("fixture");
-        let route = liveness_probe_sa3_route(
-            ip("198.51.100.20"),
-            50002,
-            Some((pcscf_port_c, Transport::Udp)),
-        )
-        .expect("a UDP-capable SA must yield an SA #3 route");
-        assert_eq!(
-            route.destination,
-            "198.51.100.20:50002"
-                .parse::<std::net::SocketAddr>()
-                .expect("fixture")
-        );
-        assert_eq!(route.source_local_addr, pcscf_port_c);
-        assert_eq!(route.transport, Transport::Udp);
-        assert_eq!(
-            route.connection_id,
-            ConnectionId::default(),
-            "must not ride a captured flow"
-        );
+    /// The SA pair for the probe/MT agreement test: UE 198.51.100.20 with
+    /// port_uc 50001 / port_us 50002, P-CSCF 192.0.2.10 with port_pc 5064 /
+    /// port_ps 5066.
+    fn agreement_sa(protocol: crate::ipsec::SaProtocol) -> crate::ipsec::SecurityAssociationPair {
+        crate::ipsec::SecurityAssociationPair {
+            ue_addr: ip("198.51.100.20"),
+            pcscf_addr: ip("192.0.2.10"),
+            ue_port_c: 50001,
+            ue_port_s: 50002,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 1000,
+            spi_us: 1001,
+            spi_pc: 10000,
+            spi_ps: 10001,
+            ealg: crate::ipsec::EncryptionAlgorithm::Null,
+            aalg: crate::ipsec::IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+            hard_lifetime_secs: None,
+            protocol,
+            expires_at: std::time::Instant::now(),
+            created_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
+        }
     }
 
-    #[test]
-    fn liveness_probe_sa3_route_carries_ipv6() {
-        let pcscf_port_c: std::net::SocketAddr = "[2001:db8::10]:5064".parse().expect("fixture");
-        let route = liveness_probe_sa3_route(
-            ip("2001:db8::20"),
-            50002,
-            Some((pcscf_port_c, Transport::Udp)),
-        )
-        .expect("a UDP-capable SA must yield an SA #3 route");
-        assert_eq!(
-            route.destination,
-            "[2001:db8::20]:50002"
-                .parse::<std::net::SocketAddr>()
-                .expect("fixture")
-        );
-        assert_eq!(route.source_local_addr, pcscf_port_c);
+    /// Save the agreement test's binding the way the P-CSCF does (a REGISTER
+    /// from port_uc landing on port_ps, flow captured, Contact on port_us) and
+    /// hand back the stored contact.  `detach` runs the real `close_flow`, the
+    /// path a TCP FIN takes for an IPsec binding.
+    fn agreement_binding(transport: Transport, detach: bool) -> crate::registrar::Contact {
+        let registrar = crate::registrar::Registrar::default();
+        let mut uri = SipUri::new("198.51.100.20".to_string())
+            .with_user("alice".to_string())
+            .with_port(50002);
+        if transport == Transport::Tcp {
+            uri = uri.with_param("transport".to_string(), Some("tcp".to_string()));
+        }
+        registrar
+            .save_full(
+                "sip:alice@ims.example.com",
+                uri,
+                3600,
+                1.0,
+                "call-agreement".to_string(),
+                1,
+                Some("198.51.100.20:50001".parse().expect("fixture")),
+                Some(transport),
+                None,
+                None,
+                vec![],
+                crate::registrar::FlowCapture {
+                    flow_token: Some("tok-agreement".into()),
+                    inbound_local_addr: Some("192.0.2.10:5066".parse().expect("fixture")),
+                    inbound_connection_id: (transport == Transport::Tcp).then_some(7),
+                },
+                Vec::new(),
+            )
+            .expect("fixture binding saves");
+        if detach {
+            let keep: std::collections::HashSet<String> = registrar
+                .bindings_for_connection(7)
+                .iter()
+                .map(|(_, contact)| contact.uri.to_string())
+                .collect();
+            assert!(
+                registrar.close_flow(7, &keep).is_empty(),
+                "an IPsec binding detaches on a flow close, it is not removed"
+            );
+        }
+        registrar
+            .all_contacts()
+            .into_iter()
+            .next()
+            .expect("the fixture binding is stored")
+            .1
     }
 
-    #[test]
-    fn liveness_probe_keeps_the_flow_route_for_a_tcp_pinned_sa() {
-        // A TCP-pinned SA cannot carry a UDP probe: leave the caller on the
-        // captured-flow route, exactly as before.
-        let pcscf_port_c: std::net::SocketAddr = "192.0.2.10:5064".parse().expect("fixture");
-        assert_eq!(
-            liveness_probe_sa3_route(
-                ip("198.51.100.20"),
-                50002,
-                Some((pcscf_port_c, Transport::Tcp)),
+    /// Where an MT request to `contact` goes, built from the relay's own code and
+    /// never from the probe's: the flow the script hands `relay(flow=...)`
+    /// (`binding.flow`) through the relay's flow mapping, or with no flow, the
+    /// Contact URI resolved as `relay(uri)` resolves it; then the SA's transport
+    /// pin, as the relay's IPsec egress step applies it.  UDP stands in for the
+    /// inbound transport on both paths: the adversarial choice, since a mapping
+    /// that lost the binding's own transport then shows up as a mismatch.
+    fn mt_route(
+        contact: &crate::registrar::Contact,
+        sa: &crate::ipsec::SecurityAssociationPair,
+    ) -> (SocketAddr, SocketAddr, Transport, ConnectionId) {
+        match crate::script::api::registrar::PyContact::from_rust_contact(contact).flow() {
+            Some(flow) => {
+                let (destination, transport, local, connection_id) =
+                    flow_relay_egress(&flow, Transport::Udp);
+                let transport =
+                    crate::script::api::ipsec::outbound_for_sa(sa, destination.port(), transport)
+                        .map_or(transport, |(_, pinned)| pinned);
+                (destination, local, transport, connection_id)
+            }
+            None => {
+                let target = resolve_target(&contact.uri.to_string(), &test_resolver())
+                    .expect("the contact URI resolves");
+                let (source, transport) = crate::script::api::ipsec::outbound_for_sa(
+                    sa,
+                    target.address.port(),
+                    target.transport.unwrap_or(Transport::Udp),
+                )
+                .expect("the contact port is one of the SA's ports");
+                (target.address, source, transport, ConnectionId::default())
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn liveness_probe_route_agrees_with_the_mt_route_in_every_binding_state() {
+        use crate::ipsec::SaProtocol;
+        // The probe exists to answer "can an MT request reach this binding?",
+        // so it has to take exactly the route MT takes, in every binding state.
+        // Each row also pins the MT route to concrete values, so a fault shared
+        // by both sides (the flow tuple is common to them on purpose) cannot
+        // hide behind an agreement.
+        let rows = [
+            (
+                "UDP",
+                Transport::Udp,
+                false,
+                SaProtocol::Any,
+                "198.51.100.20:50001",
+                "192.0.2.10:5066",
+                Transport::Udp,
             ),
-            None
-        );
-    }
-
-    #[test]
-    fn liveness_probe_keeps_the_flow_route_when_no_sa_resolves() {
-        assert_eq!(
-            liveness_probe_sa3_route(ip("198.51.100.20"), 50002, None),
-            None
+            (
+                "live TCP",
+                Transport::Tcp,
+                false,
+                SaProtocol::Any,
+                "198.51.100.20:50001",
+                "192.0.2.10:5066",
+                Transport::Tcp,
+            ),
+            (
+                "detached TCP",
+                Transport::Tcp,
+                true,
+                SaProtocol::Any,
+                "198.51.100.20:50002",
+                "192.0.2.10:5064",
+                Transport::Tcp,
+            ),
+            (
+                "detached TCP, TCP-pinned SA",
+                Transport::Tcp,
+                true,
+                SaProtocol::Tcp,
+                "198.51.100.20:50002",
+                "192.0.2.10:5064",
+                Transport::Tcp,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (state, transport, detach, protocol, destination, source, expected_transport) in rows {
+            let contact = agreement_binding(transport, detach);
+            let sa = agreement_sa(protocol);
+            let mt = mt_route(&contact, &sa);
+            let expected = (
+                destination.parse::<SocketAddr>().expect("fixture"),
+                source.parse::<SocketAddr>().expect("fixture"),
+                expected_transport,
+            );
+            if (mt.0, mt.1, mt.2) != expected {
+                failures.push(format!("{state}: MT route {mt:?}, expected {expected:?}"));
+            }
+            let probe = liveness_probe_route(&contact, Some(&sa)).map(|route| {
+                (
+                    route.destination,
+                    route.source_local_addr,
+                    route.transport,
+                    route.connection_id,
+                )
+            });
+            if probe != Some(mt) {
+                failures.push(format!("{state}: probe {probe:?}, MT {mt:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the liveness probe must take the MT route:\n{}",
+            failures.join("\n")
         );
     }
 

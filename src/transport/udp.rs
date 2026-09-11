@@ -149,7 +149,7 @@ pub async fn listen(
 }
 
 /// Compute a stable ConnectionId for a UDP (local, remote) pair.
-fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> ConnectionId {
+pub(crate) fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> ConnectionId {
     let mut hasher = DefaultHasher::new();
     local.hash(&mut hasher);
     remote.hash(&mut hasher);

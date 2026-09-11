@@ -278,7 +278,48 @@ fn sort_by_preference(contacts: &mut [Contact]) {
     });
 }
 
+/// The inbound flow a binding's REGISTER arrived on: where an MT request
+/// relayed with `relay(flow=...)` goes.  One definition, shared by the script's
+/// `Contact.flow` view and the registrar-liveness probe, so the two can never
+/// disagree about whether a binding still has a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactFlow {
+    /// Transport the REGISTER arrived on.
+    pub transport: Transport,
+    /// The UE's source address (where the REGISTER came from).
+    pub source_addr: SocketAddr,
+    /// The listener the REGISTER landed on.
+    pub local_addr: SocketAddr,
+    /// `ConnectionId.0` of the accepted inbound connection; for UDP, the
+    /// deterministic `(local_addr, source_addr)` hash.
+    pub connection_id: u64,
+}
+
 impl Contact {
+    /// The captured inbound flow, or `None` when there is no usable one: an
+    /// address is missing, or a stream binding has no connection id, which is
+    /// what `close_flow` leaves behind when it detaches an IPsec binding whose
+    /// socket closed.  A UDP binding with no stored id gets one recomputed,
+    /// since a UDP connection id is a deterministic hash.
+    pub fn flow(&self) -> Option<ContactFlow> {
+        let source_addr = self.source_addr?;
+        let local_addr = self.inbound_local_addr?;
+        let transport = self.source_transport.unwrap_or(Transport::Udp);
+        let connection_id = match self.inbound_connection_id {
+            Some(id) => id,
+            None if transport == Transport::Udp => {
+                crate::transport::udp::udp_connection_id(local_addr, source_addr).0
+            }
+            None => return None,
+        };
+        Some(ContactFlow {
+            transport,
+            source_addr,
+            local_addr,
+            connection_id,
+        })
+    }
+
     /// Seconds remaining until this contact expires.
     pub fn remaining_seconds(&self) -> u64 {
         let elapsed = self.registered_at.elapsed();
