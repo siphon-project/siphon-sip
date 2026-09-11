@@ -8,6 +8,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **The registrar liveness probe for an IPsec-protected binding now goes over
+  SA #3, from `port_pc` to the UE's protected server port, instead of back down
+  the UE's own client flow.**
+
+  The idle-liveness sweep addressed its OPTIONS to the binding's source address,
+  which is the UE's protected *client* port where the REGISTER came from, and
+  for a stream registration it rode the captured inbound connection. But the
+  flow-close handler deliberately *retains* an IPsec binding when its TCP flow
+  closes, so that a UE whose SIP-over-TCP flow FINs at the radio inactivity
+  timer can still be paged. The SA is the liveness authority, not the flow. So
+  by the time the sweep probed such a binding, the flow it rode was already
+  gone. The send fell back to a fresh connection from an ephemeral port toward
+  the UE's client port. No SA selector matches an ephemeral source port, and a
+  UE does not listen on its client port, so the probe could never be answered.
+  Every sweep missed, and a live but idle UE was network-deregistered and its SA
+  torn down, only to re-register from scratch minutes later. A UE whose TCP flow
+  happened to stay up answered normally, which is why this showed up on some
+  handsets and not others.
+
+  The probe now goes to the UE's protected server port from `port_pc` over SA
+  #3. That is 3GPP TS 33.203's path for P-CSCF-originated requests, the one an
+  MT INVITE or NOTIFY takes. It uses UDP, which every SIP UE must accept (RFC
+  3261 §18) and which needs no connection state. Probing the path an MT request
+  actually uses is also the better liveness signal, since it is exactly the
+  reachability the retained binding exists to preserve. A UDP registration moves
+  from the SA #2 response path to SA #3 as well. A TCP-pinned SA can't carry a
+  UDP probe and keeps the captured-flow route unchanged.
+
 - **A UAS answering a dialog-forming request now echoes the full `Record-Route`
   into its response, and scripts can finally read a multi-value header at all
   (`get_headers`).**

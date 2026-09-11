@@ -2811,6 +2811,49 @@ fn liveness_recently_active(now: u64, last_active: u64, idle_window: u64) -> boo
     now.saturating_sub(last_active) <= idle_window
 }
 
+/// Where and how one idle-liveness OPTIONS is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LivenessProbeRoute {
+    /// Where the OPTIONS is addressed.
+    destination: SocketAddr,
+    /// The P-CSCF listener it leaves from — what the kernel XFRM egress policy
+    /// keys on, so it must be the SA's own port.
+    source_local_addr: SocketAddr,
+    transport: Transport,
+    /// A captured stream connection to ride, or the default for a fresh send.
+    connection_id: ConnectionId,
+}
+
+/// The SA #3 route for an IPsec binding's idle-liveness OPTIONS — the way
+/// every other P-CSCF-originated request to the UE goes: from `port_pc` to the
+/// UE's protected server port `port_us` (3GPP TS 33.203), the path an MT INVITE
+/// or NOTIFY takes and so the reachability the retained binding exists to
+/// preserve.
+///
+/// `sa3` is what `ipsec::outbound_for(ue:port_us, Udp)` resolved: the P-CSCF
+/// egress for SA #3 and the transport the SA allows.  Yields a route only when
+/// that is UDP — every SIP UE must accept it (RFC 3261 §18) and it needs no
+/// connection state, which is the point: [`liveness_on_flow_close`] retains an
+/// IPsec binding precisely *because* its TCP flow has closed, so a probe that
+/// rides that flow is probing a socket that is gone by design.  `None` (a
+/// TCP-pinned SA, or no SA resolved) leaves the caller on the captured-flow
+/// route.
+fn liveness_probe_sa3_route(
+    ue_ip: std::net::IpAddr,
+    ue_port_s: u16,
+    sa3: Option<(SocketAddr, Transport)>,
+) -> Option<LivenessProbeRoute> {
+    match sa3 {
+        Some((source_local_addr, Transport::Udp)) => Some(LivenessProbeRoute {
+            destination: SocketAddr::new(ue_ip, ue_port_s),
+            source_local_addr,
+            transport: Transport::Udp,
+            connection_id: ConnectionId::default(),
+        }),
+        _ => None,
+    }
+}
+
 /// Hysteresis decision after a suspect binding fails its in-sweep OPTIONS probe
 /// loop.  Given the prior consecutive-miss count and the configured threshold,
 /// returns `(new_count, reap)`: within grace it bumps the counter and keeps the
@@ -3110,52 +3153,62 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
             continue;
         }
 
-        // Suspect.  Probe over the binding's *actual* transport — for a stream
-        // binding the OPTIONS rides the captured inbound connection, so a dead
-        // half-open socket simply yields no answer within probe_timeout.
-        // Detach so a slow UE can't stall the sweep.
+        // Suspect.  Probe over SA #3 — port_pc → the UE's protected server
+        // port, the way an MT request reaches it — whenever the SA allows UDP
+        // (`liveness_probe_sa3_route` explains why not the captured flow).  Only
+        // a TCP-pinned SA keeps the old route: the binding's actual transport,
+        // riding the captured inbound connection, so a dead half-open socket
+        // yields no answer within probe_timeout.  Detach so a slow UE can't
+        // stall the sweep.
         suspects += 1;
         let binding_transport = contact.source_transport.unwrap_or(Transport::Udp);
+        let sa3 = crate::script::api::ipsec::outbound_for(
+            SocketAddr::new(ue_addr.ip(), row.ue_port_s),
+            Transport::Udp,
+        );
+        let route =
+            liveness_probe_sa3_route(ue_addr.ip(), row.ue_port_s, sa3).unwrap_or_else(|| {
+                let (source_local_addr, transport) =
+                    crate::script::api::ipsec::outbound_for(ue_addr, binding_transport).unwrap_or(
+                        (
+                            contact.inbound_local_addr.unwrap_or(ue_addr),
+                            binding_transport,
+                        ),
+                    );
+                // Stream: ride the captured inbound connection (a dead half-open
+                // socket times out → dereg).  UDP routes by source_local_addr, so
+                // the sentinel id is correct there.
+                let connection_id = if matches!(transport, Transport::Udp) {
+                    ConnectionId::default()
+                } else {
+                    contact
+                        .inbound_connection_id
+                        .map(ConnectionId)
+                        .unwrap_or_default()
+                };
+                LivenessProbeRoute {
+                    destination: ue_addr,
+                    source_local_addr,
+                    transport,
+                    connection_id,
+                }
+            });
         debug!(
             aor = %aor,
             ue = %ue_addr,
-            transport = %binding_transport,
+            binding_transport = %binding_transport,
+            probe_destination = %route.destination,
+            probe_transport = %route.transport,
             idle_secs = now.saturating_sub(last_active),
             idle_window,
             "registrar liveness: binding idle past window — probing with OPTIONS"
         );
-        let (source_local_addr, transport) =
-            crate::script::api::ipsec::outbound_for(ue_addr, binding_transport).unwrap_or((
-                contact.inbound_local_addr.unwrap_or(ue_addr),
-                binding_transport,
-            ));
-        // Stream: ride the captured inbound connection (a dead half-open socket
-        // times out → dereg).  UDP routes by source_local_addr, so the sentinel
-        // id is correct there.
-        let connection_id = if matches!(transport, Transport::Udp) {
-            ConnectionId::default()
-        } else {
-            contact
-                .inbound_connection_id
-                .map(ConnectionId)
-                .unwrap_or_default()
-        };
         let context = context.clone();
         let aor = aor.clone();
         let contact = contact.clone();
         let ue_port_c = row.ue_port_c;
         tokio::spawn(async move {
-            liveness_probe_then_dereg(
-                context,
-                aor,
-                contact,
-                ue_port_c,
-                source_local_addr,
-                transport,
-                connection_id,
-                probe_timeout,
-            )
-            .await;
+            liveness_probe_then_dereg(context, aor, contact, ue_port_c, route, probe_timeout).await;
         });
     }
 
@@ -3179,7 +3232,7 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
     );
 }
 
-/// Send one OPTIONS over the captured flow (with a single retry); if the UE
+/// Send one OPTIONS along `route` (with a single retry); if the UE
 /// answers, stamp its SIP-layer last-seen and clear any miss strike so the next
 /// sweep skips it for a full idle window.  On no answer, apply consecutive-miss
 /// hysteresis: keep the binding for `miss_threshold` failed sweeps (a UE racing
@@ -3190,23 +3243,18 @@ async fn liveness_probe_then_dereg(
     aor: String,
     contact: crate::registrar::Contact,
     ue_port_c: u16,
-    source_local_addr: SocketAddr,
-    transport: Transport,
-    connection_id: ConnectionId,
+    route: LivenessProbeRoute,
     probe_timeout: std::time::Duration,
 ) {
-    let destination = match contact.source_addr {
-        Some(addr) => addr,
-        None => return,
-    };
+    let destination = route.destination;
     let request_uri = contact.uri.clone();
 
     for attempt in 0..2 {
         let receiver = context.uac_sender.send_options_over_flow(
             destination,
-            source_local_addr,
-            transport,
-            connection_id,
+            route.source_local_addr,
+            route.transport,
+            route.connection_id,
             request_uri.clone(),
         );
         if let Ok(Ok(crate::uac::UacResult::Response(_))) =
@@ -32542,6 +32590,75 @@ mod tests {
         assert!(!liveness_recently_active(now, now - 91, 90));
         // A last_active in the future (clock skew) is never idle.
         assert!(liveness_recently_active(now, now + 10, 90));
+    }
+
+    #[test]
+    fn liveness_probe_takes_sa3_to_port_us_when_the_sa_allows_udp() {
+        // The probe must go the way every P-CSCF-originated request to the UE
+        // goes (TS 33.203 SA #3: port_pc -> port_us), not back to the UE's
+        // client port, and on a fresh send rather than a captured flow — the
+        // flow-close handler retains an IPsec binding *because* its flow is gone.
+        let pcscf_port_c: std::net::SocketAddr = "192.0.2.10:5064".parse().expect("fixture");
+        let route = liveness_probe_sa3_route(
+            ip("198.51.100.20"),
+            50002,
+            Some((pcscf_port_c, Transport::Udp)),
+        )
+        .expect("a UDP-capable SA must yield an SA #3 route");
+        assert_eq!(
+            route.destination,
+            "198.51.100.20:50002"
+                .parse::<std::net::SocketAddr>()
+                .expect("fixture")
+        );
+        assert_eq!(route.source_local_addr, pcscf_port_c);
+        assert_eq!(route.transport, Transport::Udp);
+        assert_eq!(
+            route.connection_id,
+            ConnectionId::default(),
+            "must not ride a captured flow"
+        );
+    }
+
+    #[test]
+    fn liveness_probe_sa3_route_carries_ipv6() {
+        let pcscf_port_c: std::net::SocketAddr = "[2001:db8::10]:5064".parse().expect("fixture");
+        let route = liveness_probe_sa3_route(
+            ip("2001:db8::20"),
+            50002,
+            Some((pcscf_port_c, Transport::Udp)),
+        )
+        .expect("a UDP-capable SA must yield an SA #3 route");
+        assert_eq!(
+            route.destination,
+            "[2001:db8::20]:50002"
+                .parse::<std::net::SocketAddr>()
+                .expect("fixture")
+        );
+        assert_eq!(route.source_local_addr, pcscf_port_c);
+    }
+
+    #[test]
+    fn liveness_probe_keeps_the_flow_route_for_a_tcp_pinned_sa() {
+        // A TCP-pinned SA cannot carry a UDP probe: leave the caller on the
+        // captured-flow route, exactly as before.
+        let pcscf_port_c: std::net::SocketAddr = "192.0.2.10:5064".parse().expect("fixture");
+        assert_eq!(
+            liveness_probe_sa3_route(
+                ip("198.51.100.20"),
+                50002,
+                Some((pcscf_port_c, Transport::Tcp)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn liveness_probe_keeps_the_flow_route_when_no_sa_resolves() {
+        assert_eq!(
+            liveness_probe_sa3_route(ip("198.51.100.20"), 50002, None),
+            None
+        );
     }
 
     #[test]
