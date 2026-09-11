@@ -8,6 +8,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A TCP or TLS send that has to open a new connection no longer holds up
+  every other send while it connects.**
+
+  When a stream send finds no live connection it falls back to the connection
+  pool, which connects. That connect ran on the stream outbound distributor, so
+  everything queued behind it waited too, live connections included. A connect
+  to a UE that died with its IPsec SA still installed gets neither a SYN-ACK nor
+  an RST, so it runs the pool's full 5 s connect timeout. The registrar liveness
+  sweep sends to exactly those peers, two attempts each, so a sweep over a few
+  dozen dead UEs could stall TCP egress for over a minute, MT requests included.
+
+  Fallback sends now run on a lane per destination, off the distributor. A dead
+  peer stalls only its own lane. Its messages stay in order, the lane sheds once
+  64 are queued (the bound a live connection already has), and it retires once
+  idle.
+
 - **The registrar liveness probe now takes the route an MT request to the
   binding would take, and a TCP send from an IPsec-protected port whose
   connection has gone now leaves from that port.**
