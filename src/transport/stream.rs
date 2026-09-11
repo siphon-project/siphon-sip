@@ -14,6 +14,8 @@
 //!   one listening socket can carry raw SIP *and* SIP-over-WebSocket
 //!   (RFC 7118). See [`super::mux`] for the listener that uses them.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -98,36 +100,266 @@ fn pool_tcp_source(
         .filter(|source| source.is_ipv4() == destination.is_ipv4() && is_protected(source.port()))
 }
 
+/// A pool-fallback send: carries one [`OutboundMessage`] that has no live
+/// connection out through the [`ConnectionPool`], connecting if it must.
+/// Injected so tests can stand in a destination whose connect never completes.
+type FallbackSend =
+    Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The production [`FallbackSend`]: [`send_via_pool`] for `transport`.
+fn pool_fallback_send(
+    pool: Arc<ConnectionPool>,
+    transport: Transport,
+    is_protected: fn(u16) -> bool,
+) -> FallbackSend {
+    Arc::new(move |outbound: OutboundMessage| {
+        let pool = Arc::clone(&pool);
+        Box::pin(async move { send_via_pool(&pool, transport, is_protected, outbound).await })
+    })
+}
+
+/// Send one message through the pool, its frames in order on the one
+/// connection the pool coalesces to for the destination.  TCP binds the
+/// protected source where [`pool_tcp_source`] requires one.
+async fn send_via_pool(
+    pool: &ConnectionPool,
+    transport: Transport,
+    is_protected: fn(u16) -> bool,
+    outbound: OutboundMessage,
+) {
+    let destination = outbound.destination;
+    let server_name = outbound.server_name.clone();
+    let requested_connection_id = outbound.connection_id;
+    let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
+    for frame in outbound.into_frames() {
+        let sent = match transport {
+            Transport::Tls => {
+                pool.send_tls(destination, server_name.as_deref(), frame)
+                    .await
+            }
+            Transport::Tcp => match source {
+                Some(source) => pool.send_tcp_from(source, destination, frame).await,
+                None => pool.send_tcp(destination, frame).await,
+            },
+            // WS/WSS are client-initiated (RFC 7118 §5): there is no
+            // outbound-connect path, so a miss here is a dead UE.
+            other => {
+                warn!(
+                    destination = %destination,
+                    connection_id = ?requested_connection_id,
+                    "{other} outbound dropped: no live connection and no outbound-connect path for this transport"
+                );
+                return;
+            }
+        };
+        match sent {
+            Ok(connection_id) => {
+                debug!(
+                    destination = %destination,
+                    connection_id = ?connection_id,
+                    "{transport} outbound: sent via pool"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    destination = %destination,
+                    connection_id = ?requested_connection_id,
+                    "{transport} outbound pool connect failed: {error}"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Queue depth of one fallback lane: the same bound a live connection's
+/// channel has, and shed the same way when a peer cannot keep up.
+const FALLBACK_LANE_CAPACITY: usize = 64;
+
+/// How long an empty fallback lane waits for another message before it retires.
+const FALLBACK_LANE_IDLE: Duration = Duration::from_secs(1);
+
+/// Pool-fallback sends, each destination on its own serial lane, so the
+/// distributor never waits on a connect.
+///
+/// A fallback send may have to connect, and a connect to a UE that died with its
+/// SA still installed gets neither SYN-ACK nor RST, so it runs the pool's full
+/// connect timeout.  Awaited on the distributor, that parked every other send
+/// the distributor carries — live connections included — behind one dead peer,
+/// and the registrar-liveness sweep sends to likely-dead peers by design.  A
+/// lane is a task that sends one destination's messages in arrival order, so a
+/// dead peer stalls only its own lane.
+///
+/// Lanes retire once idle.  A lane removes itself from the map only while it
+/// holds the map lock and has seen its queue empty, and [`dispatch`] enqueues
+/// under the same lock, so no message can land in a lane that is leaving: the
+/// store drains to empty, and a destination never has two lanes running at once
+/// (which could reorder its messages).
+///
+/// [`dispatch`]: FallbackLanes::dispatch
+struct FallbackLanes {
+    lanes: Arc<std::sync::Mutex<HashMap<SocketAddr, FallbackLane>>>,
+    send: FallbackSend,
+    idle: Duration,
+    next_id: u64,
+}
+
+struct FallbackLane {
+    /// Tells this lane apart from a later one for the same destination, so a
+    /// retiring lane only ever removes itself.
+    id: u64,
+    sender: mpsc::Sender<OutboundMessage>,
+}
+
+impl FallbackLanes {
+    fn new(send: FallbackSend, idle: Duration) -> Self {
+        Self {
+            lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            send,
+            idle,
+            next_id: 0,
+        }
+    }
+
+    /// Queue `outbound` behind any earlier fallback send to the same
+    /// destination.  Never awaits.  Returns `false` when the message was shed
+    /// because that destination already has a full lane.
+    fn dispatch(&mut self, outbound: OutboundMessage) -> bool {
+        let destination = outbound.destination;
+        let mut lanes = lock_lanes(&self.lanes);
+        let outbound = match lanes.get(&destination) {
+            Some(lane) => match lane.sender.try_send(outbound) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(outbound)) => {
+                    warn!(
+                        destination = %destination,
+                        connection_id = ?outbound.connection_id,
+                        "outbound dropped: {FALLBACK_LANE_CAPACITY} sends already queued behind a pool connect to this destination (slow/stuck peer)"
+                    );
+                    return false;
+                }
+                // The lane's task ended without retiring, which only a panic
+                // can do: replace it.
+                Err(mpsc::error::TrySendError::Closed(outbound)) => outbound,
+            },
+            None => outbound,
+        };
+        let (sender, receiver) = mpsc::channel(FALLBACK_LANE_CAPACITY);
+        if sender.try_send(outbound).is_err() {
+            error!(
+                destination = %destination,
+                "outbound dropped: a new pool-fallback lane refused its first send"
+            );
+            return false;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        lanes.insert(destination, FallbackLane { id, sender });
+        drop(lanes);
+        tokio::spawn(run_fallback_lane(
+            Arc::clone(&self.lanes),
+            destination,
+            id,
+            receiver,
+            Arc::clone(&self.send),
+            self.idle,
+        ));
+        true
+    }
+
+    /// Lanes currently running, for the drain-to-empty leak test.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock_lanes(&self.lanes).len()
+    }
+}
+
+/// Lock the lane map.  Nothing panics while holding it, and a poisoned lock
+/// still guards a consistent map, so recover it rather than lose every lane.
+fn lock_lanes(
+    lanes: &std::sync::Mutex<HashMap<SocketAddr, FallbackLane>>,
+) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, FallbackLane>> {
+    lanes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One destination's lane: send its messages in arrival order, and retire once
+/// it has sat empty for `idle`.  [`FallbackLanes`] explains why retiring can
+/// neither lose nor reorder a message.
+async fn run_fallback_lane(
+    lanes: Arc<std::sync::Mutex<HashMap<SocketAddr, FallbackLane>>>,
+    destination: SocketAddr,
+    id: u64,
+    mut receiver: mpsc::Receiver<OutboundMessage>,
+    send: FallbackSend,
+    idle: Duration,
+) {
+    loop {
+        match tokio::time::timeout(idle, receiver.recv()).await {
+            Ok(Some(outbound)) => send(outbound).await,
+            // Every sender is gone, so nothing more can arrive.
+            Ok(None) => return,
+            Err(_) => {
+                if retire_fallback_lane(&lanes, destination, id, &receiver) {
+                    return;
+                }
+                // A send landed as the idle timer fired: keep going.
+            }
+        }
+    }
+}
+
+/// Remove lane `id` from the map if its queue is empty, under the map lock that
+/// [`FallbackLanes::dispatch`] enqueues under.  `true` once it has retired.
+fn retire_fallback_lane(
+    lanes: &std::sync::Mutex<HashMap<SocketAddr, FallbackLane>>,
+    destination: SocketAddr,
+    id: u64,
+    receiver: &mpsc::Receiver<OutboundMessage>,
+) -> bool {
+    let mut lanes = lock_lanes(lanes);
+    if !receiver.is_empty() {
+        return false;
+    }
+    if lanes.get(&destination).is_some_and(|lane| lane.id == id) {
+        lanes.remove(&destination);
+    }
+    true
+}
+
 /// Spawn the outbound distributor for one stream listener.
 ///
 /// Routes each [`OutboundMessage`] to its connection's bounded sender; when no
 /// live connection matches (a fire-and-forget send with
 /// `ConnectionId::default()`, or a connection that has since closed) it falls
-/// back to the outbound [`ConnectionPool`] where one is supplied.
+/// back to the outbound [`ConnectionPool`] where one is supplied, on a lane per
+/// destination ([`FallbackLanes`]) so a connect never stalls the distributor.
 pub(crate) fn spawn_outbound_distributor(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     transport: Transport,
     pool: Option<Arc<ConnectionPool>>,
 ) {
-    spawn_outbound_distributor_with(
-        outbound_rx,
-        connection_map,
-        transport,
-        pool,
-        crate::script::api::ipsec::is_protected_local_port,
-    );
+    let fallback = pool.map(|pool| {
+        pool_fallback_send(
+            pool,
+            transport,
+            crate::script::api::ipsec::is_protected_local_port,
+        )
+    });
+    spawn_outbound_distributor_with(outbound_rx, connection_map, transport, fallback);
 }
 
-/// [`spawn_outbound_distributor`] with the IPsec protected-port predicate
-/// injected, so tests do not depend on the process-wide IPsec config.
+/// [`spawn_outbound_distributor`] with the pool fallback injected, so tests do
+/// not depend on a real pool or the process-wide IPsec config.
 fn spawn_outbound_distributor_with(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     transport: Transport,
-    pool: Option<Arc<ConnectionPool>>,
-    is_protected: fn(u16) -> bool,
+    fallback: Option<FallbackSend>,
 ) {
+    let mut lanes = fallback.map(|send| FallbackLanes::new(send, FALLBACK_LANE_IDLE));
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map.get(&outbound.connection_id) {
@@ -160,52 +392,10 @@ fn spawn_outbound_distributor_with(
                         }
                     }
                 }
-            } else if let Some(pool) = pool.as_ref() {
-                let destination = outbound.destination;
-                let server_name = outbound.server_name.clone();
-                let requested_connection_id = outbound.connection_id;
-                let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
-                // Sequential await per frame — the pool coalesces to one
-                // connection per destination, so frames stay in order on it.
-                for frame in outbound.into_frames() {
-                    let sent = match transport {
-                        Transport::Tls => {
-                            pool.send_tls(destination, server_name.as_deref(), frame)
-                                .await
-                        }
-                        Transport::Tcp => match source {
-                            Some(source) => pool.send_tcp_from(source, destination, frame).await,
-                            None => pool.send_tcp(destination, frame).await,
-                        },
-                        // WS/WSS are client-initiated (RFC 7118 §5): there is no
-                        // outbound-connect path, so a miss here is a dead UE.
-                        other => {
-                            warn!(
-                                destination = %destination,
-                                connection_id = ?requested_connection_id,
-                                "{other} outbound dropped: no live connection and no outbound-connect path for this transport"
-                            );
-                            break;
-                        }
-                    };
-                    match sent {
-                        Ok(connection_id) => {
-                            debug!(
-                                destination = %destination,
-                                connection_id = ?connection_id,
-                                "{transport} outbound: sent via pool"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(
-                                destination = %destination,
-                                connection_id = ?requested_connection_id,
-                                "{transport} outbound pool connect failed: {error}"
-                            );
-                            break;
-                        }
-                    }
-                }
+            } else if let Some(lanes) = lanes.as_mut() {
+                // Never awaited here: a connect can run the pool's full timeout,
+                // and this task carries every other send too.
+                lanes.dispatch(outbound);
             } else {
                 debug!(
                     "{transport} outbound: connection {:?} not found (may have closed)",
@@ -777,8 +967,7 @@ mod tests {
             outbound_rx,
             Arc::new(DashMap::new()),
             Transport::Tcp,
-            Some(pool),
-            |_| true,
+            Some(pool_fallback_send(pool, Transport::Tcp, |_| true)),
         );
         outbound_tx
             .send(OutboundMessage {
@@ -799,6 +988,183 @@ mod tests {
         assert_eq!(
             peer, source,
             "the pool fallback must leave from the protected source, not an ephemeral port"
+        );
+    }
+
+    /// A send with no live connection, bound for `destination`.
+    fn fallback_message(destination: SocketAddr) -> OutboundMessage {
+        OutboundMessage {
+            connection_id: ConnectionId::default(),
+            transport: Transport::Tcp,
+            destination,
+            data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
+            source_local_addr: None,
+            server_name: None,
+            followups: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_pool_fallback_does_not_stall_the_distributor() {
+        // A UE that died with its SA still installed answers neither SYN nor
+        // RST, so a fallback connect to it runs the full connect timeout.  The
+        // registrar-liveness sweep sends exactly those.  It must hold up
+        // neither a live connection's traffic nor a fallback send to anyone
+        // else.
+        let hung: SocketAddr = "198.51.100.1:5060".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:5060".parse().unwrap();
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel::<SocketAddr>();
+        let fallback: FallbackSend = Arc::new(move |outbound: OutboundMessage| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                if outbound.destination == hung {
+                    std::future::pending::<()>().await;
+                }
+                let _ = sent_tx.send(outbound.destination);
+            })
+        });
+        let connection_map = Arc::new(DashMap::new());
+        let live = ConnectionId(42);
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(4);
+        connection_map.insert(live, live_tx);
+        let (outbound_tx, outbound_rx) = flume::unbounded();
+        spawn_outbound_distributor_with(
+            outbound_rx,
+            connection_map,
+            Transport::Tcp,
+            Some(fallback),
+        );
+
+        outbound_tx.send(fallback_message(hung)).unwrap();
+        outbound_tx
+            .send(OutboundMessage {
+                connection_id: live,
+                ..fallback_message(other)
+            })
+            .unwrap();
+        outbound_tx.send(fallback_message(other)).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("a live connection's frame must not wait behind a hung fallback connect")
+            .expect("the live frame is delivered");
+        let reached = tokio::time::timeout(Duration::from_secs(2), sent_rx.recv())
+            .await
+            .expect("a fallback send to another destination must not wait behind a hung one");
+        assert_eq!(reached, Some(other));
+    }
+
+    /// A fallback send that records each message's body, in the order sent.
+    fn recording_send(
+        delay_first: Option<Duration>,
+    ) -> (FallbackSend, mpsc::UnboundedReceiver<(SocketAddr, Bytes)>) {
+        let (sent_tx, sent_rx) = mpsc::unbounded_channel();
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let send: FallbackSend = Arc::new(move |outbound: OutboundMessage| {
+            let sent_tx = sent_tx.clone();
+            let is_first = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if let (true, Some(delay)) = (is_first, delay_first) {
+                    tokio::time::sleep(delay).await;
+                }
+                let _ = sent_tx.send((outbound.destination, outbound.data.clone()));
+            })
+        });
+        (send, sent_rx)
+    }
+
+    fn message_with_body(destination: SocketAddr, body: &'static [u8]) -> OutboundMessage {
+        OutboundMessage {
+            data: Bytes::from_static(body),
+            ..fallback_message(destination)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_lane_keeps_one_destinations_messages_in_order() {
+        // The first send is slow (a connect in flight); the second must still
+        // go after it, since reordering, say, a 180 behind a 200 breaks the call.
+        let destination: SocketAddr = "198.51.100.3:5060".parse().unwrap();
+        let (send, mut sent_rx) = recording_send(Some(Duration::from_millis(200)));
+        let mut lanes = FallbackLanes::new(send, Duration::from_millis(50));
+        assert!(lanes.dispatch(message_with_body(destination, b"first")));
+        assert!(lanes.dispatch(message_with_body(destination, b"second")));
+
+        let mut order = Vec::new();
+        for _ in 0..2 {
+            let (_, body) = tokio::time::timeout(Duration::from_secs(2), sent_rx.recv())
+                .await
+                .expect("both sends complete")
+                .expect("the recorder stays open");
+            order.push(body);
+        }
+        assert_eq!(
+            order,
+            vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_lanes_drain_to_empty_once_idle() {
+        // Per-module leak gate: a lane exists per destination while it has work
+        // and must be gone once that work is done, or the store grows by one
+        // entry per peer the pool ever had to connect to.
+        let (send, mut sent_rx) = recording_send(None);
+        let mut lanes = FallbackLanes::new(send, Duration::from_millis(50));
+        for batch in 0..2 {
+            for index in 0..200u16 {
+                let destination =
+                    SocketAddr::new("198.51.100.10".parse().unwrap(), 5060 + index % 20);
+                assert!(lanes.dispatch(fallback_message(destination)));
+            }
+            for _ in 0..200 {
+                tokio::time::timeout(Duration::from_secs(2), sent_rx.recv())
+                    .await
+                    .expect("every send completes")
+                    .expect("the recorder stays open");
+            }
+            let drained = tokio::time::timeout(Duration::from_secs(2), async {
+                while lanes.len() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                drained.is_ok(),
+                "batch {batch}: {} lane(s) still held after every send completed",
+                lanes.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_fallback_lane_sheds_rather_than_grows() {
+        // A dead peer keeps its lane busy on the first connect; everything
+        // behind it queues, up to the same bound a live connection has, and
+        // the next send is shed rather than held without limit.
+        let destination: SocketAddr = "198.51.100.4:5060".parse().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let send: FallbackSend = {
+            let started = Arc::clone(&started);
+            Arc::new(move |_outbound: OutboundMessage| {
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            })
+        };
+        let mut lanes = FallbackLanes::new(send, Duration::from_millis(50));
+        assert!(lanes.dispatch(fallback_message(destination)));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("the lane picks up its first send");
+        for _ in 0..FALLBACK_LANE_CAPACITY {
+            assert!(lanes.dispatch(fallback_message(destination)));
+        }
+        assert!(
+            !lanes.dispatch(fallback_message(destination)),
+            "a send past the lane's bound must be shed"
         );
     }
 
