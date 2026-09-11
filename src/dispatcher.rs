@@ -2826,8 +2826,8 @@ struct LivenessProbeRoute {
 
 /// Where an MT request to this binding goes, as the idle-liveness OPTIONS
 /// route.  The probe answers "can an MT request reach this binding?", so it
-/// has to take the MT route in every binding state, or it can pass while MT
-/// fails (and fail while MT works).
+/// has to take the route MT takes wherever MT's route is determined, or it can
+/// pass while MT fails (and fail while MT works).
 ///
 /// - The binding still has a flow (UDP, or TCP while the connection is up):
 ///   what `relay(flow=...)` does, the UE's source address from the listener
@@ -2836,8 +2836,12 @@ struct LivenessProbeRoute {
 /// - It has no flow: a stream binding [`registrar::Registrar::close_flow`]
 ///   detached because its socket closed.  MT to it is relayed without a flow
 ///   to its Contact, the UE's protected server port, so the probe goes the
-///   same way: over the binding's own SA from `port_pc` (SA #3), with the
-///   binding's transport under the SA pin.
+///   same way: over the binding's own SA from `port_pc` (SA #3), on the
+///   transport the Contact's `;transport=` names (mapped as the relay maps
+///   it), under the SA pin.  A bare Contact is the one case MT leaves open,
+///   because MT then follows the transport its own request arrived on; the
+///   probe cannot know that, and uses the transport the binding registered
+///   over.
 ///
 /// `sa` is the binding's own SA pair.  `None` when a detached binding has no
 /// SA to route over, or a transport an SA cannot carry.
@@ -2865,12 +2869,16 @@ fn liveness_probe_route(
         });
     }
     let sa = sa?;
-    let binding_transport = contact.source_transport.unwrap_or(Transport::Udp);
-    if !matches!(binding_transport, Transport::Udp | Transport::Tcp) {
+    let transport = contact
+        .uri
+        .get_param("transport")
+        .and_then(transport_from_token)
+        .unwrap_or_else(|| contact.source_transport.unwrap_or(Transport::Udp));
+    if !matches!(transport, Transport::Udp | Transport::Tcp) {
         return None;
     }
     let (source_local_addr, transport) =
-        crate::script::api::ipsec::outbound_for_sa(sa, sa.ue_port_s, binding_transport)?;
+        crate::script::api::ipsec::outbound_for_sa(sa, sa.ue_port_s, transport)?;
     Some(LivenessProbeRoute {
         destination: SocketAddr::new(sa.ue_addr, sa.ue_port_s),
         source_local_addr,
@@ -32645,15 +32653,20 @@ mod tests {
 
     /// Save the agreement test's binding the way the P-CSCF does (a REGISTER
     /// from port_uc landing on port_ps, flow captured, Contact on port_us) and
-    /// hand back the stored contact.  `detach` runs the real `close_flow`, the
-    /// path a TCP FIN takes for an IPsec binding.
-    fn agreement_binding(transport: Transport, detach: bool) -> crate::registrar::Contact {
+    /// hand back the stored contact.  `contact_transport` is the Contact's
+    /// `;transport=` parameter, `None` for a bare Contact.  `detach` runs the
+    /// real `close_flow`, the path a TCP FIN takes for an IPsec binding.
+    fn agreement_binding(
+        transport: Transport,
+        contact_transport: Option<&str>,
+        detach: bool,
+    ) -> crate::registrar::Contact {
         let registrar = crate::registrar::Registrar::default();
         let mut uri = SipUri::new("198.51.100.20".to_string())
             .with_user("alice".to_string())
             .with_port(50002);
-        if transport == Transport::Tcp {
-            uri = uri.with_param("transport".to_string(), Some("tcp".to_string()));
+        if let Some(param) = contact_transport {
+            uri = uri.with_param("transport".to_string(), Some(param.to_string()));
         }
         registrar
             .save_full(
@@ -32699,13 +32712,17 @@ mod tests {
     /// never from the probe's: the flow the script hands `relay(flow=...)`
     /// (`binding.flow`) through the relay's flow mapping, or with no flow, the
     /// Contact URI resolved as `relay(uri)` resolves it; then the SA's transport
-    /// pin, as the relay's IPsec egress step applies it.  UDP stands in for the
-    /// inbound transport on both paths: the adversarial choice, since a mapping
-    /// that lost the binding's own transport then shows up as a mismatch.
+    /// pin, as the relay's IPsec egress step applies it.
+    ///
+    /// The transport comes back `None` where MT itself leaves it open: with no
+    /// flow and no `;transport=` on the Contact, the relay falls back to the MT
+    /// request's own inbound transport, which only an SA pin overrides.  That is
+    /// found by resolving against both inbound transports, not by restating the
+    /// rule.
     fn mt_route(
         contact: &crate::registrar::Contact,
         sa: &crate::ipsec::SecurityAssociationPair,
-    ) -> (SocketAddr, SocketAddr, Transport, ConnectionId) {
+    ) -> (SocketAddr, SocketAddr, Option<Transport>, ConnectionId) {
         match crate::script::api::registrar::PyContact::from_rust_contact(contact).flow() {
             Some(flow) => {
                 let (destination, transport, local, connection_id) =
@@ -32713,90 +32730,150 @@ mod tests {
                 let transport =
                     crate::script::api::ipsec::outbound_for_sa(sa, destination.port(), transport)
                         .map_or(transport, |(_, pinned)| pinned);
-                (destination, local, transport, connection_id)
+                (destination, local, Some(transport), connection_id)
             }
             None => {
                 let target = resolve_target(&contact.uri.to_string(), &test_resolver())
                     .expect("the contact URI resolves");
-                let (source, transport) = crate::script::api::ipsec::outbound_for_sa(
-                    sa,
-                    target.address.port(),
-                    target.transport.unwrap_or(Transport::Udp),
-                )
-                .expect("the contact port is one of the SA's ports");
+                let egress = |inbound: Transport| {
+                    crate::script::api::ipsec::outbound_for_sa(
+                        sa,
+                        target.address.port(),
+                        target.transport.unwrap_or(inbound),
+                    )
+                    .expect("the contact port is one of the SA's ports")
+                };
+                let (source, over_udp) = egress(Transport::Udp);
+                let (_, over_tcp) = egress(Transport::Tcp);
+                let transport = (over_udp == over_tcp).then_some(over_udp);
                 (target.address, source, transport, ConnectionId::default())
             }
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn liveness_probe_route_agrees_with_the_mt_route_in_every_binding_state() {
+    async fn liveness_probe_route_agrees_with_the_mt_route_wherever_it_is_determined() {
         use crate::ipsec::SaProtocol;
-        // The probe exists to answer "can an MT request reach this binding?",
-        // so it has to take exactly the route MT takes, in every binding state.
-        // Each row also pins the MT route to concrete values, so a fault shared
-        // by both sides (the flow tuple is common to them on purpose) cannot
-        // hide behind an agreement.
+        // The probe answers "can an MT request reach this binding?", so it has
+        // to take the route MT takes.  MT does not always fix the transport: for
+        // a detached binding with a bare Contact it follows the MT request's own
+        // inbound transport, which the probe cannot know.  There the probe uses
+        // the binding's transport, and the row checks exactly that.  Each row
+        // also pins the MT route to concrete values, so a fault shared by both
+        // sides (the flow tuple is common to them on purpose) cannot hide behind
+        // an agreement.
         let rows = [
             (
                 "UDP",
                 Transport::Udp,
+                None,
                 false,
                 SaProtocol::Any,
                 "198.51.100.20:50001",
                 "192.0.2.10:5066",
-                Transport::Udp,
+                Some(Transport::Udp),
             ),
             (
                 "live TCP",
                 Transport::Tcp,
+                Some("tcp"),
                 false,
                 SaProtocol::Any,
                 "198.51.100.20:50001",
                 "192.0.2.10:5066",
-                Transport::Tcp,
+                Some(Transport::Tcp),
             ),
             (
-                "detached TCP",
+                "detached TCP, Contact ;transport=tcp",
                 Transport::Tcp,
+                Some("tcp"),
                 true,
                 SaProtocol::Any,
                 "198.51.100.20:50002",
                 "192.0.2.10:5064",
-                Transport::Tcp,
+                Some(Transport::Tcp),
             ),
             (
-                "detached TCP, TCP-pinned SA",
+                "detached TCP, Contact ;transport=tcp, TCP-pinned SA",
                 Transport::Tcp,
+                Some("tcp"),
                 true,
                 SaProtocol::Tcp,
                 "198.51.100.20:50002",
                 "192.0.2.10:5064",
+                Some(Transport::Tcp),
+            ),
+            (
+                "detached TCP, Contact ;transport=udp",
                 Transport::Tcp,
+                Some("udp"),
+                true,
+                SaProtocol::Any,
+                "198.51.100.20:50002",
+                "192.0.2.10:5064",
+                Some(Transport::Udp),
+            ),
+            (
+                "detached TCP, bare Contact",
+                Transport::Tcp,
+                None,
+                true,
+                SaProtocol::Any,
+                "198.51.100.20:50002",
+                "192.0.2.10:5064",
+                None,
+            ),
+            (
+                "detached TCP, bare Contact, TCP-pinned SA",
+                Transport::Tcp,
+                None,
+                true,
+                SaProtocol::Tcp,
+                "198.51.100.20:50002",
+                "192.0.2.10:5064",
+                Some(Transport::Tcp),
             ),
         ];
         let mut failures = Vec::new();
-        for (state, transport, detach, protocol, destination, source, expected_transport) in rows {
-            let contact = agreement_binding(transport, detach);
+        for (
+            state,
+            transport,
+            contact_transport,
+            detach,
+            protocol,
+            destination,
+            source,
+            expected,
+        ) in rows
+        {
+            let contact = agreement_binding(transport, contact_transport, detach);
             let sa = agreement_sa(protocol);
             let mt = mt_route(&contact, &sa);
             let expected = (
                 destination.parse::<SocketAddr>().expect("fixture"),
                 source.parse::<SocketAddr>().expect("fixture"),
-                expected_transport,
+                expected,
             );
             if (mt.0, mt.1, mt.2) != expected {
                 failures.push(format!("{state}: MT route {mt:?}, expected {expected:?}"));
             }
-            let probe = liveness_probe_route(&contact, Some(&sa)).map(|route| {
-                (
-                    route.destination,
-                    route.source_local_addr,
-                    route.transport,
-                    route.connection_id,
-                )
-            });
-            if probe != Some(mt) {
+            let Some(probe) = liveness_probe_route(&contact, Some(&sa)) else {
+                failures.push(format!("{state}: no probe route, MT {mt:?}"));
+                continue;
+            };
+            // Where MT fixes the transport the probe must match it; where MT
+            // follows its own inbound transport, the probe uses the binding's.
+            let transport_agrees = match mt.2 {
+                Some(mt_transport) => probe.transport == mt_transport,
+                None => probe.transport == transport,
+            };
+            if (
+                probe.destination,
+                probe.source_local_addr,
+                probe.connection_id,
+            ) != (mt.0, mt.1, mt.3)
+                || !transport_agrees
+            {
                 failures.push(format!("{state}: probe {probe:?}, MT {mt:?}"));
             }
         }

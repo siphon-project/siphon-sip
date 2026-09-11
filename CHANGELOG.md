@@ -27,22 +27,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   up answered normally, which is why this showed up on some handsets and not
   others.
 
-  The probe now asks where an MT request to the binding goes and sends there. A
-  binding that still has a flow (UDP, or TCP while the connection is up) keeps
-  the route it always had, the one `relay(flow=...)` takes. A detached binding
-  is probed the way MT reaches it: over its own SA from `port_pc` to the UE's
-  protected server port, with the SA's transport pin applied exactly as the
-  relay applies it. The SA is looked up from the binding's own client port
-  rather than by UE address, so a re-authentication overlap can no longer route
-  the probe over the wrong pair.
+  The probe now takes the route an MT request to the binding takes, wherever
+  that route can be determined. A binding that still has a flow (UDP, or TCP
+  while the connection is up) keeps the route it always had, the one
+  `relay(flow=...)` takes. A detached binding is probed the way MT reaches it:
+  over its own SA from `port_pc` to the UE's protected server port, on the
+  transport the Contact's `;transport=` names, under the SA's transport pin as
+  the relay applies it. A bare Contact is the one case MT itself leaves open,
+  because MT then follows the transport its own request arrived on; there the
+  probe uses the transport the binding registered over. The SA is looked up
+  from the binding's own client port rather than by UE address, so a
+  re-authentication overlap can no longer route the probe over the wrong pair.
 
   Underneath that, the stream distributor's pool fallback ignored the source a
   message asked to leave from. It now honours it when it is an IPsec-protected
   P-CSCF port, where an ESP-over-TCP SA selector requires that exact source, so
   any TCP send toward a UE whose captured connection has closed goes out inside
-  the SA instead of from an ephemeral port. Every other send stays ephemeral as
-  before, since reconnecting from a listen port collides with a TIME_WAIT
-  4-tuple.
+  the SA instead of from an ephemeral port. Every other send keeps the pool's
+  existing ephemeral bind.
 
 - **A UAS answering a dialog-forming request now echoes the full `Record-Route`
   into its response, and scripts can finally read a multi-value header at all

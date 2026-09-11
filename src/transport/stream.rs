@@ -84,9 +84,11 @@ pub(crate) struct StreamContext {
 /// has closed has to leave from that port, or it matches no SA and never
 /// arrives (3GPP TS 33.203).  Everything else stays ephemeral, as the pool has
 /// always bound it: `source_local_addr` is stamped on responses too (the
-/// listener they arrived on), and reconnecting from a listen port collides with
-/// a TIME_WAIT 4-tuple (see `ConnectionPool::establish_tcp_connection`).  A
-/// source of the other address family can never be bound for the connect.
+/// listener they arrived on), and a reconnect from a listen port fails with
+/// EADDRNOTAVAIL while an earlier connection to a peer that negotiated no TCP
+/// timestamps sits in TIME_WAIT on the same 4-tuple (see
+/// `ConnectionPool::establish_tcp_connection`).  A source of the other address
+/// family can never be bound for the connect.
 fn pool_tcp_source(
     source_local_addr: Option<SocketAddr>,
     destination: SocketAddr,
@@ -724,7 +726,8 @@ mod tests {
             Some(pcscf_port_c)
         );
         // Any other listener stays ephemeral, as the pool always bound it, so a
-        // reconnect never collides with a TIME_WAIT 4-tuple on the listen port.
+        // reconnect to a peer without TCP timestamps never lands on our
+        // TIME_WAIT 4-tuple on the listen port.
         let plain: SocketAddr = "192.0.2.10:5060".parse().unwrap();
         assert_eq!(pool_tcp_source(Some(plain), destination, protected), None);
         // A v6 listener cannot be bound for a v4 connect.
