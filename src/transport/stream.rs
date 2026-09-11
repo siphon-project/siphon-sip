@@ -77,6 +77,27 @@ pub(crate) struct StreamContext {
     pub remote_addr: SocketAddr,
 }
 
+/// The source a pool-fallback TCP connect must bind, if any.
+///
+/// Only an IPsec-protected P-CSCF port.  An ESP-over-TCP SA selector keys on
+/// the P-CSCF's exact source port, so a connect toward a UE whose captured flow
+/// has closed has to leave from that port, or it matches no SA and never
+/// arrives (3GPP TS 33.203).  Everything else stays ephemeral, as the pool has
+/// always bound it: `source_local_addr` is stamped on responses too (the
+/// listener they arrived on), and a reconnect from a listen port fails with
+/// EADDRNOTAVAIL while an earlier connection to a peer that negotiated no TCP
+/// timestamps sits in TIME_WAIT on the same 4-tuple (see
+/// `ConnectionPool::establish_tcp_connection`).  A source of the other address
+/// family can never be bound for the connect.
+fn pool_tcp_source(
+    source_local_addr: Option<SocketAddr>,
+    destination: SocketAddr,
+    is_protected: fn(u16) -> bool,
+) -> Option<SocketAddr> {
+    source_local_addr
+        .filter(|source| source.is_ipv4() == destination.is_ipv4() && is_protected(source.port()))
+}
+
 /// Spawn the outbound distributor for one stream listener.
 ///
 /// Routes each [`OutboundMessage`] to its connection's bounded sender; when no
@@ -88,6 +109,24 @@ pub(crate) fn spawn_outbound_distributor(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     transport: Transport,
     pool: Option<Arc<ConnectionPool>>,
+) {
+    spawn_outbound_distributor_with(
+        outbound_rx,
+        connection_map,
+        transport,
+        pool,
+        crate::script::api::ipsec::is_protected_local_port,
+    );
+}
+
+/// [`spawn_outbound_distributor`] with the IPsec protected-port predicate
+/// injected, so tests do not depend on the process-wide IPsec config.
+fn spawn_outbound_distributor_with(
+    outbound_rx: flume::Receiver<OutboundMessage>,
+    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    transport: Transport,
+    pool: Option<Arc<ConnectionPool>>,
+    is_protected: fn(u16) -> bool,
 ) {
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
@@ -125,6 +164,7 @@ pub(crate) fn spawn_outbound_distributor(
                 let destination = outbound.destination;
                 let server_name = outbound.server_name.clone();
                 let requested_connection_id = outbound.connection_id;
+                let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
                 // Sequential await per frame — the pool coalesces to one
                 // connection per destination, so frames stay in order on it.
                 for frame in outbound.into_frames() {
@@ -133,7 +173,10 @@ pub(crate) fn spawn_outbound_distributor(
                             pool.send_tls(destination, server_name.as_deref(), frame)
                                 .await
                         }
-                        Transport::Tcp => pool.send_tcp(destination, frame).await,
+                        Transport::Tcp => match source {
+                            Some(source) => pool.send_tcp_from(source, destination, frame).await,
+                            None => pool.send_tcp(destination, frame).await,
+                        },
                         // WS/WSS are client-initiated (RFC 7118 §5): there is no
                         // outbound-connect path, so a miss here is a dead UE.
                         other => {
@@ -665,6 +708,99 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 mod tests {
     use super::*;
     use crate::transport::tcp::extract_sip_message_length;
+
+    // --- pool fallback: protected source binding ---------------------------
+
+    fn ensure_crypto_provider() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn pool_tcp_source_binds_only_a_protected_same_family_source() {
+        let protected: fn(u16) -> bool = |port| port == 5064;
+        let destination: SocketAddr = "198.51.100.20:50002".parse().unwrap();
+        // An IPsec SA's own port: the only source its selector matches.
+        let pcscf_port_c: SocketAddr = "192.0.2.10:5064".parse().unwrap();
+        assert_eq!(
+            pool_tcp_source(Some(pcscf_port_c), destination, protected),
+            Some(pcscf_port_c)
+        );
+        // Any other listener stays ephemeral, as the pool always bound it, so a
+        // reconnect to a peer without TCP timestamps never lands on our
+        // TIME_WAIT 4-tuple on the listen port.
+        let plain: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        assert_eq!(pool_tcp_source(Some(plain), destination, protected), None);
+        // A v6 listener cannot be bound for a v4 connect.
+        let v6: SocketAddr = "[2001:db8::10]:5064".parse().unwrap();
+        assert_eq!(pool_tcp_source(Some(v6), destination, protected), None);
+        assert_eq!(pool_tcp_source(None, destination, protected), None);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_fallback_leaves_from_a_protected_source() {
+        // What a closed flow leaves behind: a send with no live connection (the
+        // default id) that names the protected port it has to leave from.
+        ensure_crypto_provider();
+        // Reserve a port to stand in for pcscf_port_c; SO_REUSEADDR lets the
+        // pool rebind it once it is released.
+        let reserve = tokio::net::TcpSocket::new_v4().unwrap();
+        reserve.set_reuseaddr(true).unwrap();
+        reserve.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let source = reserve.local_addr().unwrap();
+        drop(reserve);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            // Hold the socket so the pool's reader sees no EOF mid-send.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(socket);
+            peer
+        });
+
+        let pool = Arc::new(ConnectionPool::new(
+            Arc::new(DashMap::new()),
+            flume::unbounded().0,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            crate::transport::pool::build_outbound_tls_config(
+                None,
+                crate::config::TlsMethod::default(),
+            )
+            .expect("outbound tls config"),
+        ));
+        let (outbound_tx, outbound_rx) = flume::unbounded();
+        spawn_outbound_distributor_with(
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Transport::Tcp,
+            Some(pool),
+            |_| true,
+        );
+        outbound_tx
+            .send(OutboundMessage {
+                connection_id: ConnectionId::default(),
+                transport: Transport::Tcp,
+                destination: server,
+                data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
+                source_local_addr: Some(source),
+                server_name: None,
+                followups: None,
+            })
+            .unwrap();
+
+        let peer = tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .expect("the pool fallback must connect within 2 s")
+            .unwrap();
+        assert_eq!(
+            peer, source,
+            "the pool fallback must leave from the protected source, not an ephemeral port"
+        );
+    }
 
     const INVITE: &[u8] = concat!(
         "INVITE sip:bob@biloxi.com SIP/2.0\r\n",

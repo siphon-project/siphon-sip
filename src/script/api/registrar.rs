@@ -320,7 +320,7 @@ impl PyContact {
     /// `inbound_local_addr`/`inbound_connection_id` fields were absent
     /// in the persisted record).
     #[getter]
-    fn flow(&self) -> Option<PyFlow> {
+    pub(crate) fn flow(&self) -> Option<PyFlow> {
         self.flow_value.clone()
     }
 
@@ -411,56 +411,16 @@ impl PyContact {
         let is_local_value = registrar
             .map(|registrar| registrar.is_local_contact(contact))
             .unwrap_or(false);
-        // Reconstitute the `Flow` view from the stored tuple.  Requires
-        // both source_addr (the UE) and inbound_local_addr (our listener)
-        // to be present — otherwise the flow is incomplete and we can't
-        // honor `relay(flow=...)`, so expose `None`.
-        let flow_value = match (contact.source_addr, contact.inbound_local_addr) {
-            (Some(source_addr), Some(local_addr)) => {
-                let transport = contact
-                    .source_transport
-                    .unwrap_or(crate::transport::Transport::Udp);
-                let connection_id = match contact.inbound_connection_id {
-                    Some(id) => id,
-                    // For UDP, the connection_id is a deterministic hash of
-                    // `(local_addr, remote_addr)` — recompute on demand if
-                    // the stored binding lacks it (older record).  For
-                    // stream transports, no captured id means no flow.
-                    None if transport == crate::transport::Transport::Udp => {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        local_addr.hash(&mut hasher);
-                        source_addr.hash(&mut hasher);
-                        hasher.finish()
-                    }
-                    None => {
-                        return Self {
-                            uri_string: contact.uri.to_string(),
-                            q_value: contact.q,
-                            expires_remaining: contact.remaining_seconds(),
-                            age_seconds: contact.age_seconds(),
-                            received_string,
-                            path_headers: contact.path.iter().map(|v| v.to_string()).collect(),
-                            instance_id_value: contact.instance_id().map(str::to_string),
-                            instance_epoch_value: contact.instance_epoch().map(str::to_string),
-                            is_local_value,
-                            flow_token_value: contact.flow_token.as_ref().map(|v| v.to_string()),
-                            flow_value: None,
-                            params_value: contact.params.clone(),
-                            kind_value: contact.kind,
-                        }
-                    }
-                };
-                Some(PyFlow {
-                    transport: transport.as_scheme().to_string(),
-                    source_addr,
-                    local_addr,
-                    connection_id,
-                })
-            }
-            _ => None,
-        };
+        // The `Flow` view of the binding's captured inbound flow.  One
+        // definition, `Contact::flow`, shared with the registrar-liveness
+        // probe: `None` when an address is missing or a stream binding has no
+        // connection id (detached after its socket closed).
+        let flow_value = contact.flow().map(|flow| PyFlow {
+            transport: flow.transport.as_scheme().to_string(),
+            source_addr: flow.source_addr,
+            local_addr: flow.local_addr,
+            connection_id: flow.connection_id,
+        });
         Self {
             uri_string: contact.uri.to_string(),
             q_value: contact.q,
