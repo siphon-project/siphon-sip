@@ -587,6 +587,7 @@ pub struct SiphonMetrics {
 }
 
 impl SiphonMetrics {
+    #[allow(clippy::too_many_lines)] // Permanent: SiphonMetrics::new: one registration per metric — a table, like the struct it fills
     fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
