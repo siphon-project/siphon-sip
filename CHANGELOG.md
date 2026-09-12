@@ -13,6 +13,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **A `backend:` selector nothing dispatches to is now rejected at config
+  load.** `registrar.backend: python` named `@registrar.on_save` /
+  `@registrar.on_lookup` hooks that do not exist and silently behaved as
+  `memory`, so registrations were not persisted; `auth.backend: database` and
+  `diameter_cx` made every credential check fail closed. All three now refuse to
+  start, with the message naming what to use instead. (The documented
+  `diameter_cx` spelling never parsed either — the variant is `diametercx`.) For
+  Cx MAR/MAA, keep `auth.backend` as `static` or `http` and call
+  `auth.require_ims_digest()` from the REGISTER handler.
+
 - **Pending auth vectors now expire.** An entry is consumed on use, times out
   after 120 s, and is pruned as new challenges are issued, so an unanswered
   challenge no longer retains it for the life of the process. Affects both AKA
