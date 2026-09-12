@@ -2608,10 +2608,10 @@ fn lock_message(
     })
 }
 
-/// Extract the SDP body from a SIP message, handling multipart/mixed bodies.
+/// Extract the SDP body from a SIP message, handling multipart bodies.
 ///
-/// If the Content-Type is `multipart/mixed`, extracts the `application/sdp`
-/// part from the multipart body. Otherwise returns the raw body as-is.
+/// If the Content-Type is a `multipart/*`, extracts the `application/sdp` part
+/// from it (RFC 5621 §3). Otherwise returns the raw body as-is.
 pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
     let body = &message.body;
     if body.is_empty() {
@@ -2627,25 +2627,12 @@ pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
         .or_else(|| message.headers.get("c"))
         .unwrap_or(&empty_string);
 
-    if content_type
-        .to_ascii_lowercase()
-        .contains("multipart/mixed")
-    {
-        // Parse multipart body and extract the SDP part.
-        let parts =
-            crate::siprec::multipart::parse_multipart(content_type, body).map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "failed to parse multipart body: {error}"
-                ))
-            })?;
-        let sdp_part =
-            crate::siprec::multipart::find_part(&parts, "application/sdp").ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "multipart body has no application/sdp part",
-                )
-            })?;
-        Ok(sdp_part.body.clone())
+    if crate::media::body::is_multipart(content_type) {
+        crate::media::body::sdp_from_body(content_type, body)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
     } else {
+        // Unchanged for every other body: handed over as-is, including one that
+        // arrived with no Content-Type at all.
         Ok(body.clone())
     }
 }

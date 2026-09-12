@@ -42,7 +42,11 @@ def reminders():
 
 Exactly one media plan is required — an INVITE with no offer and no way to answer
 the callee's would connect a call with no audio: `sdp=` (your own offer, any
-backend) or `media=True` (siphon anchors it; `siphon-rtp` backend). The full
+backend), `body=` + `content_type=` (the same slot with the type spelled out,
+for an offer travelling inside a `multipart/*` body per RFC 5621 §3), or
+`media=True` (siphon anchors it; `siphon-rtp` backend). Whichever spelling, the
+body has to carry an SDP offer — a body that carries none raises rather than
+placing a call the callee can only answer by offering into silence. The full
 argument set and its failure modes are below; the out-of-process twin is the
 control plane's [`originate` verb](control-plane.md#placing-a-call-originate).
 

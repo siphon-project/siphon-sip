@@ -673,6 +673,8 @@ class MockB2bua:
         profile: Optional[str] = None,
         ws_uri: Optional[str] = None,
         timeout: int = 30,
+        body: Optional[Union[str, bytes]] = None,
+        content_type: Optional[str] = None,
     ) -> str:
         """Place an outbound call siphon owns, with no inbound INVITE behind it.
 
@@ -690,10 +692,23 @@ class MockB2bua:
         Exactly one media plan is required — an INVITE with no offer and no way
         to answer the callee's would connect a call with no audio:
 
-        * ``sdp="v=0..."`` — your own offer, carried verbatim (any backend);
+        * ``sdp="v=0..."`` — your own offer, carried verbatim as
+          ``application/sdp`` (any backend);
+        * ``body=…, content_type=…`` — the same slot with the type spelled out,
+          for an INVITE whose offer travels as one part of a ``multipart/*``
+          body (RFC 5621 §3) beside a part SIP does not interpret: ISUP on a
+          SIP-I trunk, a PIDF-LO location object, an operator-specific document.
+          You assemble the multipart; siphon carries it verbatim and derives
+          Content-Length from it;
         * ``media=True`` — siphon anchors the leg on the configured media
           backend (siphon-rtp), so ``rtpengine.play_media()``, DTMF and the
           WebSocket tee all work against it.
+
+        Whichever spelling, the body must carry an SDP offer — bare
+        ``application/sdp``, or a ``multipart/*`` with an ``application/sdp``
+        part in it. Live siphon raises for one that carries none, because a
+        callee that reads the INVITE as offerless offers in its own 2xx and this
+        plan has nothing to answer that with (RFC 3261 §13.2.2.4).
 
         Args:
             to: called party — the Request-URI and the To URI.
@@ -709,22 +724,29 @@ class MockB2bua:
                 ``P-Asserted-Identity``.
             headers: dict of extra headers applied last. Dialog-defining headers
                 (Via/From/To/Call-ID/CSeq/Contact/Route/…) are ignored.
-            sdp: your own SDP offer.
+            sdp: your own SDP offer, carried as ``application/sdp``.
             media: True to have siphon anchor the leg on the media backend.
             profile: media profile for ``media=True`` (default
                 ``"rtp_passthrough"``).
             ws_uri: per-call WebSocket bridge URI for ``media=True``.
             timeout: ring timeout in seconds; the call is CANCELled when it
                 elapses. 0 disables it.
+            body: the INVITE body, ``str`` or ``bytes`` — the offer itself, or a
+                multipart carrying it. Mutually exclusive with ``sdp``.
+            content_type: Content-Type for ``body`` (e.g.
+                ``"multipart/mixed;boundary=…"``). Defaults to
+                ``"application/sdp"``, which makes ``body`` identical to ``sdp``.
 
         Returns:
             str: the new leg's SIP Call-ID.
 
         Raises:
-            ValueError: no media plan, both media plans, or an unrecognised
-                ``privacy`` value. Live siphon also raises for unparseable URIs,
-                no route, and a media plan the backend cannot serve — never a
-                silent ``None`` for a call that was never placed.
+            ValueError: no media plan, two media plans, both spellings of the
+                offer, a ``content_type`` with nothing to describe, or an
+                unrecognised ``privacy`` value. Live siphon also raises for
+                unparseable URIs, no route, a media plan the backend cannot
+                serve, and a body carrying no offer — never a silent ``None``
+                for a call that was never placed.
 
         In the mock, records the full argument set on ``originates`` and returns
         a synthetic Call-ID. Inspect via ``siphon.get_b2bua().originates``.
@@ -740,17 +762,35 @@ class MockB2bua:
                         media=True,
                     )
         """
-        if sdp is not None and media:
+        if sdp is not None and body is not None:
             raise ValueError(
-                "b2bua.originate takes either sdp= (your own offer) or "
+                "b2bua.originate takes either sdp= (an SDP offer) or body= "
+                "(a body with its own content_type=), not both"
+            )
+        if sdp is not None and content_type is not None:
+            raise ValueError(
+                "b2bua.originate content_type= goes with body= — sdp= is "
+                "application/sdp by definition"
+            )
+        offer = sdp if sdp is not None else body
+        if offer is not None and media:
+            raise ValueError(
+                "b2bua.originate takes either your own offer (sdp= / body=) or "
                 "media=True (siphon anchors the leg), not both"
             )
-        if sdp is not None and not sdp.strip():
-            raise ValueError("b2bua.originate sdp= must not be empty")
-        if sdp is None and not media:
+        if offer is not None:
+            probe = offer.decode("utf-8", "replace") if isinstance(offer, bytes) else offer
+            if not probe.strip():
+                raise ValueError("b2bua.originate sdp= / body= must not be empty")
+        if offer is None and media and content_type is not None:
             raise ValueError(
-                "b2bua.originate needs a media plan: sdp= (your own offer) or "
-                "media=True (siphon anchors the leg)"
+                "b2bua.originate content_type= needs body= — media=True sends "
+                "an offerless INVITE"
+            )
+        if offer is None and not media:
+            raise ValueError(
+                "b2bua.originate needs a media plan: sdp= / body= (your own "
+                "offer) or media=True (siphon anchors the leg)"
             )
         if privacy is not None and privacy not in (
             "allowed", "allow", "present", "presented",
@@ -778,6 +818,14 @@ class MockB2bua:
             "profile": profile,
             "ws_uri": ws_uri,
             "timeout": timeout,
+            "body": body,
+            # What the INVITE would actually carry the body under, so a test can
+            # assert the wire shape without restating the default.
+            "content_type": (
+                content_type
+                if content_type is not None
+                else ("application/sdp" if offer is not None else None)
+            ),
         })
         return call_id
 

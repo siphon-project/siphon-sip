@@ -73,6 +73,71 @@ class TestB2buaOriginate:
         placed = harness.b2bua.originates[-1]
         assert placed["sdp"] == offer
         assert placed["media"] is False
+        # sdp= is the body carried as application/sdp — the same slot body= fills.
+        assert placed["content_type"] == "application/sdp"
+
+    def test_a_multipart_body_carries_its_own_content_type(self, harness):
+        # RFC 5621 §3: the offer may ride as one part of a multipart body, beside
+        # a part SIP does not interpret. The script assembles that body and names
+        # its type.
+        import siphon
+
+        body = (
+            "--siphon-1\r\n"
+            "Content-Type: application/sdp\r\n"
+            "\r\n"
+            "v=0\r\nm=audio 40000 RTP/AVP 0\r\n"
+            "\r\n--siphon-1\r\n"
+            "Content-Type: application/vnd.example+xml\r\n"
+            "\r\n"
+            "<additional-data/>\r\n"
+            "--siphon-1--\r\n"
+        )
+        siphon.b2bua.originate(
+            to="sip:1@carrier.example",
+            body=body,
+            content_type="multipart/mixed;boundary=siphon-1",
+        )
+        placed = harness.b2bua.originates[-1]
+        assert placed["body"] == body
+        assert placed["content_type"] == "multipart/mixed;boundary=siphon-1"
+        assert placed["sdp"] is None
+        assert placed["media"] is False
+
+    def test_a_bytes_body_is_accepted(self, harness):
+        # Live siphon takes str or bytes, so the mock must not reject bytes.
+        import siphon
+
+        siphon.b2bua.originate(
+            to="sip:1@carrier.example", body=b"v=0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        )
+        placed = harness.b2bua.originates[-1]
+        assert placed["body"] == b"v=0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        assert placed["content_type"] == "application/sdp"
+
+    def test_both_spellings_of_the_offer_is_a_hard_error(self, harness):
+        # One slot, two spellings — passing both leaves it ambiguous which body
+        # goes on the wire.
+        import siphon
+
+        with pytest.raises(ValueError, match="not both"):
+            siphon.b2bua.originate(
+                to="sip:1@carrier.example", sdp="v=0\r\n", body="v=0\r\n"
+            )
+        assert harness.b2bua.originates == []
+
+    def test_a_content_type_with_nothing_to_describe_is_a_hard_error(self, harness):
+        import siphon
+
+        with pytest.raises(ValueError, match="content_type"):
+            siphon.b2bua.originate(
+                to="sip:1@carrier.example", sdp="v=0\r\n", content_type="text/plain"
+            )
+        with pytest.raises(ValueError, match="content_type"):
+            siphon.b2bua.originate(
+                to="sip:1@carrier.example", media=True, content_type="application/sdp"
+            )
+        assert harness.b2bua.originates == []
 
     def test_no_media_plan_is_a_hard_error(self, harness):
         # An INVITE with no offer and no anchor cannot answer the callee's own

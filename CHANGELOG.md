@@ -6,6 +6,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **`originate` now takes a `body` with its own `content_type`, so an INVITE can
+  carry its offer inside a `multipart/*` body** — `b2bua.originate(body=…,
+  content_type=…)` in a script, `args.body` / `args.content_type` on the control
+  rail.
+
+  RFC 5621 §3 lets the session description travel as one part of a multipart
+  body, beside a part SIP itself does not interpret: ISUP on a SIP-I trunk
+  (RFC 3204), a PIDF-LO location object (RFC 6442), an operator-specific
+  document. `originate` had one body slot named `sdp`, so the only way to place
+  such a call was to pass the assembled multipart as `sdp=` and overwrite the
+  framework's `Content-Type` through `headers` — which worked, but only as an
+  accident of header ordering that nothing tested and nothing checked.
+
+  `sdp=` keeps its meaning and its behaviour (it is the body, carried as
+  `application/sdp`), `body=` is the same slot with the type spelled out, and
+  passing both is an error. Scripts can hand `body=` `bytes` as well as `str`;
+  `args.body` on the control rail is JSON text, the same limit `answer` and
+  `progress` already have.
+
 ### Fixed
 
 - **A re-INVITE or UPDATE from the callee no longer addresses the media engine as
@@ -39,6 +60,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   client that changed network mid-call (Wi-Fi to mobile data) stayed gated on its
   old public address paired with its new port, and every packet from the new
   address was dropped.
+
+- **An `originate` body that carries no SDP offer is now refused instead of
+  placing a call that can never have audio.**
+
+  The offer plan promises siphon has an offer to send, and the callee answers a
+  genuinely offerless INVITE by offering in its own 2xx — which that plan has
+  nothing to answer with (RFC 3261 §13.2.2.4), so the call connects mute. A
+  `Content-Type` naming neither SDP nor a multipart carrying it now fails the
+  command (`bad_request` on the control rail, `ValueError` in a script), and the
+  check runs again after `headers` has been applied, so rewriting the header
+  cannot strip the offer off the INVITE. Wrapping the offer in a multipart that
+  does contain it is unaffected, and an anchored (offerless) originate now
+  refuses a `Content-Type` in `headers` describing a body it does not send.
+
+- **An originated leg records only the SDP as its media description, not the
+  whole multipart body.**
+
+  `last_sdp` is what a later re-INVITE re-offers (hold, bridge), and the other
+  parts of a multipart body belong to the initial INVITE alone.
 
 - **A TCP or TLS send that has to open a new connection no longer holds up
   every other send while it connects.**

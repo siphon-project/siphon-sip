@@ -206,6 +206,8 @@ class _B2buaNamespace:
         profile=None,
         ws_uri=None,
         timeout=30,
+        body=None,
+        content_type=None,
     ):
         """Place an outbound call siphon owns, with no inbound INVITE behind it.
 
@@ -223,10 +225,21 @@ class _B2buaNamespace:
         Exactly one media plan is required — an INVITE with no offer and no way
         to answer the callee's would connect a call with no audio:
 
-        * ``sdp="v=0..."`` — your own offer, carried verbatim (any backend);
+        * ``sdp="v=0..."`` — your own offer, carried verbatim as
+          ``application/sdp`` (any backend);
+        * ``body=…, content_type=…`` — the same slot with the type spelled out,
+          for an INVITE whose offer travels as one part of a ``multipart/*``
+          body (RFC 5621 §3) beside a part SIP does not interpret: ISUP on a
+          SIP-I trunk, a PIDF-LO location object, an operator-specific document;
         * ``media=True`` — siphon anchors the leg on the configured media
           backend (siphon-rtp), so ``rtpengine.play_media()``, DTMF and the
           WebSocket tee all work against it.
+
+        Whichever spelling, the body must carry an SDP offer — bare
+        ``application/sdp``, or a ``multipart/*`` with an ``application/sdp``
+        part in it. One that carries none raises, because a callee that reads
+        the INVITE as offerless offers in its own 2xx and this plan has nothing
+        to answer that with (RFC 3261 §13.2.2.4).
 
         Args:
             to: called party — the Request-URI and the To URI.
@@ -243,21 +256,27 @@ class _B2buaNamespace:
             headers: dict of extra headers applied last. Dialog-defining headers
                 (Via/From/To/Call-ID/CSeq/Contact/…) are ignored — the stack owns
                 them.
-            sdp: your own SDP offer.
+            sdp: your own SDP offer, carried as ``application/sdp``.
             media: True to have siphon anchor the leg on the media backend.
             profile: media profile for ``media=True`` (default
                 ``"rtp_passthrough"``).
             ws_uri: per-call WebSocket bridge URI for ``media=True``.
             timeout: ring timeout in seconds; the call is CANCELled when it
                 elapses. 0 disables it.
+            body: the INVITE body, ``str`` or ``bytes`` — the offer itself, or a
+                multipart carrying it. Mutually exclusive with ``sdp``.
+            content_type: Content-Type for ``body`` (e.g.
+                ``"multipart/mixed;boundary=…"``). Defaults to
+                ``"application/sdp"``, which makes ``body`` identical to ``sdp``.
 
         Returns:
             str: the new leg's SIP Call-ID.
 
         Raises:
             ValueError: the URIs do not parse, no route exists, the media plan
-                is not one the configured backend can serve, or the B2BUA is not
-                running. Never a silent None for a call that was never placed.
+                is not one the configured backend can serve, the body carries no
+                offer, or the B2BUA is not running. Never a silent None for a
+                call that was never placed.
 
         Usage:
             @timer.every(seconds=60)
@@ -286,6 +305,8 @@ class _B2buaNamespace:
             profile,
             ws_uri,
             timeout,
+            body,
+            content_type,
         )
 
     def bridge(self, call_id, with_call_id, on_peer_hangup="hangup"):
