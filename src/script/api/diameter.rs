@@ -829,6 +829,16 @@ fn credit_control_answer_to_dict<'py>(
     Ok(dict)
 }
 
+/// Clamp a script-supplied per-request timeout.
+///
+/// `forward_to` already floors its timeout, and for the same reason: a zero
+/// would otherwise mean "give up before the request can be answered", which is
+/// never what a script passing `timeout_ms=0` intends. The floor matches
+/// `forward_to`'s 100 ms.
+fn request_timeout(timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(timeout_ms.max(100))
+}
+
 #[pymethods]
 impl PyDiameter {
     /// Check if a peer is connected.
@@ -1697,7 +1707,8 @@ impl PyDiameter {
     ///
     /// Used by an Application Server to subscribe (or unsubscribe) for
     /// notifications about a user's profile changes. The HSS will later push
-    /// updates via PNR — register a handler via ``@diameter.on_pnr``.
+    /// updates via PNR — handle them with ``@diameter.on_request`` and match
+    /// on ``req.command_name == "PNR"``.
     ///
     /// Args:
     ///     public_identity: Target user's public identity.
@@ -2002,8 +2013,6 @@ impl PyDiameter {
         timeout_ms: u64,
         avps: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let _ = timeout_ms; // forwarded peer applies its own timeout today
-
         let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown Diameter command name: {command}"
@@ -2082,7 +2091,11 @@ impl PyDiameter {
             &avp_bytes,
         );
 
-        let answer = crate::script::detach_block_on(client.peer().send_request(wire));
+        let answer = crate::script::detach_block_on(
+            client
+                .peer()
+                .send_request_timeout(wire, request_timeout(timeout_ms)),
+        );
         let message = match answer {
             Ok(message) => message,
             Err(error) => {
@@ -3715,6 +3728,20 @@ mod tests {
                 "MSISDN must not be raw ASCII on the wire"
             );
         });
+    }
+
+    /// `timeout_ms` was accepted, documented as per-request, and then dropped
+    /// on the floor (`let _ = timeout_ms`), so every call waited the peer's
+    /// fixed 10 s. It now reaches `send_request_timeout`, with a floor so that
+    /// a zero cannot mean "give up before the request can be answered".
+    #[test]
+    fn request_timeout_honours_the_value_and_floors_zero() {
+        assert_eq!(request_timeout(2_000), std::time::Duration::from_secs(2));
+        assert_eq!(request_timeout(10_000), std::time::Duration::from_secs(10));
+        assert_eq!(request_timeout(150), std::time::Duration::from_millis(150));
+        // Floor, matching `forward_to`.
+        assert_eq!(request_timeout(0), std::time::Duration::from_millis(100));
+        assert_eq!(request_timeout(50), std::time::Duration::from_millis(100));
     }
 
     #[test]

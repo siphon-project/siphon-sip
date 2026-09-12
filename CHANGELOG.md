@@ -13,6 +13,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **`diameter.send_request(timeout_ms=...)` is now honoured.** It was accepted,
+  documented as a per-request timeout, and discarded, so every call waited the
+  peer's fixed 10 s. Values below 100 ms are floored, matching `forward_to`, so
+  a `timeout_ms=0` cannot mean "give up before the request can be answered".
+
+### Removed
+
+- **The `@diameter.on_rtr` / `on_rar` / `on_asr` / `on_pnr` decorators.** They
+  registered handlers nothing dispatched: with `diameter:` configured they
+  raised `AttributeError` at import, and without it they registered a handler
+  that never fired. Use `@diameter.on_request` and match on
+  `req.command_name`. Not present in the SDK or the docs.
+
+### Fixed
+
 - **A `backend:` selector nothing dispatches to is now rejected at config
   load.** `registrar.backend: python` named `@registrar.on_save` /
   `@registrar.on_lookup` hooks that do not exist and silently behaved as
