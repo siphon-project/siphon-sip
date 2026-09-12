@@ -17,7 +17,7 @@ src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a 
 src/metrics/mod.rs          1850  # metric registry: one struct field + one registration per metric
 
 # ── Scheduled for the 1.9.0 module split ────────────────────────────────────
-src/dispatcher.rs           30900  # THE reason this gate exists; splits into src/dispatcher/**
+src/dispatcher/mod.rs       30900  # THE reason this gate exists; extracted into src/dispatcher/** across 1.9.0
 src/config.rs                5050  # splits by YAML top-level key into src/config/**
 src/server.rs                3900  # run_async is one 2,214-line fn; splits into src/server/**
 
