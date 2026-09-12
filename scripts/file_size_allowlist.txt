@@ -33,7 +33,6 @@ src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction schedul
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    1950  # same
 src/script/api/auth.rs       2050  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0
-src/script/api/ipsec.rs      1600  # runtime lookups move to src/ipsec/runtime.rs
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched

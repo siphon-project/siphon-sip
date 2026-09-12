@@ -6,6 +6,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+
+- **The IPsec runtime lookups moved from `script::api::ipsec` to
+  `ipsec::runtime`.** They are Rust-side process state that the scripting API
+  happens to populate, not part of the Python surface, and living in the PyO3
+  binding layer meant `transport::stream` imported from it — a transport module
+  reaching into the Python bindings for a kernel-level question. Every existing
+  path still resolves: `script::api::ipsec` re-exports them and remains the only
+  thing that installs them. No scripting-API change.
+
 ### Fixed
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
