@@ -112,16 +112,22 @@ pub async fn listen(
     let sip_connection_map = channels.sip_connection_map;
     let websocket_connection_map = channels.websocket_connection_map;
 
-    tokio::spawn(async move {
-        let listener = match bind_tcp_listener(local_addr, tos) {
-            Ok(listener) => listener,
-            Err(error) => {
-                tracing::error!("failed to bind {sip_transport}+{websocket_transport} mux listener on {local_addr}: {error}");
-                return;
-            }
-        };
-        info!("{sip_transport}+{websocket_transport} mux listener on {local_addr}");
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists.
+    let listener = match bind_tcp_listener(local_addr, tos) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!("failed to bind {sip_transport}+{websocket_transport} mux listener on {local_addr}: {error}");
+            return;
+        }
+    };
+    info!("{sip_transport}+{websocket_transport} mux listener on {local_addr}");
 
+    tokio::spawn(async move {
         loop {
             let (tcp_stream, remote_addr) = match listener.accept().await {
                 Ok(accepted) => accepted,

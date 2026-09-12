@@ -13,6 +13,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **Stream listeners now bind before returning.** `tcp`, `tls`, `ws`, `wss` and
+  the protocol mux all bound inside the spawned accept task, so `listen()`
+  returned before the socket existed: a peer connecting in that window was
+  refused for no reason but scheduling, and a bind failure surfaced only as a
+  log line while the caller carried on believing the listener was up. The bind
+  now happens before the spawn, so awaiting `listen` means the socket is
+  accepting.
+
 - **The criterion gate no longer skips benchmarks silently.** It iterates the
   baseline's ids, so a benchmark with no baseline row ran and was never
   compared — `framing/*` and `traffic_counters/*` had been ungated since they

@@ -238,16 +238,22 @@ pub async fn listen(
         None,
     );
 
-    tokio::spawn(async move {
-        let listener = match bind_tcp_listener(local_addr, tos) {
-            Ok(listener) => listener,
-            Err(error) => {
-                error!("failed to bind WS listener on {local_addr}: {error}");
-                return;
-            }
-        };
-        info!("WS listener on {}", local_addr);
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists.
+    let listener = match bind_tcp_listener(local_addr, tos) {
+        Ok(listener) => listener,
+        Err(error) => {
+            error!("failed to bind WS listener on {local_addr}: {error}");
+            return;
+        }
+    };
+    info!("WS listener on {}", local_addr);
 
+    tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((tcp_stream, remote_addr)) => {
@@ -324,16 +330,22 @@ pub async fn listen_secure(
         None,
     );
 
-    tokio::spawn(async move {
-        let listener = match bind_tcp_listener(local_addr, tos) {
-            Ok(listener) => listener,
-            Err(error) => {
-                error!("failed to bind WSS listener on {local_addr}: {error}");
-                return;
-            }
-        };
-        info!("WSS listener on {}", local_addr);
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists.
+    let listener = match bind_tcp_listener(local_addr, tos) {
+        Ok(listener) => listener,
+        Err(error) => {
+            error!("failed to bind WSS listener on {local_addr}: {error}");
+            return;
+        }
+    };
+    info!("WSS listener on {}", local_addr);
 
+    tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((tcp_stream, remote_addr)) => {

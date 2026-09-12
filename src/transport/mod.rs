@@ -29,10 +29,11 @@ pub(crate) mod testutil {
     /// * the kernel auto-assigns from the ephemeral range (32768-60999 here),
     ///   so between the probe closing and the real bind, any outbound socket in
     ///   this process can take that exact port, and
-    /// * `listen()` binds on a **spawned task** and merely logs on failure, so
-    ///   the caller never learns. The test then sits waiting on a listener that
-    ///   was never created and fails as a connect timeout, pointing at the
-    ///   wrong thing entirely.
+    /// * `listen()` used to bind on a **spawned task**, so the caller returned
+    ///   before the socket existed and a connect could be refused for no reason
+    ///   but scheduling. The listeners now bind before spawning, so awaiting
+    ///   `listen` means the socket is accepting; this helper still matters for
+    ///   the collision above.
     ///
     /// Handing out ports from a counter *below* the ephemeral range removes the
     /// collision at its source: nothing is auto-assigned there, so only an
