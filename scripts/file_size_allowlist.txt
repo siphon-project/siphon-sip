@@ -20,7 +20,6 @@ src/metrics/mod.rs          1850  # metric registry: one struct field + one regi
 src/dispatcher.rs           30900  # THE reason this gate exists; splits into src/dispatcher/**
 src/config.rs                5050  # splits by YAML top-level key into src/config/**
 src/server.rs                3900  # run_async is one 2,214-line fn; splits into src/server/**
-src/b2bua/actor.rs           3550  # splits into actor/{leg,helpers,call,store,leg_actor}
 
 # ── PyO3 binding layer ──────────────────────────────────────────────────────
 # One `#[pymethods]` block per class without the `multiple-pymethods` feature,
@@ -35,6 +34,7 @@ src/script/api/request.rs    1950  # same
 src/script/api/auth.rs       2050  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
+src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 thin delegations
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
 src/rtpengine/siphon_rtp.rs  2200  # one backend; client/set/events/connection split when touched
 src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched
