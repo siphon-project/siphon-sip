@@ -6,6 +6,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`auth.require_aka_digest()` now verifies the digest response** against the
+  expected value derived at challenge time (RFC 3310 §3.3), using the method the
+  request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
+  was unaffected.
+
+- **Pending auth vectors now expire.** An entry is consumed on use, times out
+  after 120 s, and is pruned as new challenges are issued, so an unanswered
+  challenge no longer retains it for the life of the process. Affects both AKA
+  paths.
+
 ## [1.8.7] — 2026-09-12
 
 ### Added

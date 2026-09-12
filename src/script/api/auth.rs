@@ -18,12 +18,16 @@ use super::request::PyRequest;
 use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 
-/// Auth vector from the HSS MAA, cached between the 401 challenge and the
-/// verification REGISTER so that we don't send a second MAR (which would
-/// return a different XRES and always fail).
+/// Expected response, cached between the 401 challenge and the verification
+/// REGISTER so the second REGISTER can be checked without deriving a fresh
+/// vector (which would carry a different RAND, hence a different XRES, and so
+/// could never match).
+///
+/// Serves both AKA paths: HSS-backed (XRES from the MAA) and local Milenage
+/// (XRES from `generate_vector`).
 #[derive(Debug, Clone)]
 struct ImsAuthVector {
-    /// Expected response (SIP-Authorization / XRES) from the HSS.
+    /// Expected response (SIP-Authorization / XRES).
     ///
     /// CK/IK (AVP 625/626) are not cached here — they are consumed at
     /// challenge time via the `hss_ck`/`hss_ik` locals when building the
@@ -31,6 +35,9 @@ struct ImsAuthVector {
     /// relayed 401 header via `reply.take_av()`. The verification REGISTER
     /// only needs the expected response.
     expected_response: Vec<u8>,
+    /// When the challenge was issued, so one that is never answered expires
+    /// instead of sitting in the store for the life of the process.
+    stored_at: std::time::Instant,
 }
 
 /// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
@@ -57,6 +64,50 @@ static IMS_AUTH_STORE: OnceLock<Arc<DashMap<String, ImsAuthVector>>> = OnceLock:
 
 fn ims_auth_store() -> &'static Arc<DashMap<String, ImsAuthVector>> {
     IMS_AUTH_STORE.get_or_init(|| Arc::new(DashMap::new()))
+}
+
+/// How long a pending auth vector stays usable after its 401 went out.
+///
+/// A UE answers a challenge inside one SIP transaction, so RFC 3261 Timer F
+/// (64*T1 = 32 s) is the natural ceiling; 120 s leaves room for a slow radio
+/// link and a retransmitted REGISTER. The bound matters because the store only
+/// ever shrank on a *successful* verification, so a peer that collects 401s and
+/// never answers grew it for the life of the process.
+const AUTH_VECTOR_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Prune every Nth insert rather than on each one, so a burst of challenges
+/// does not turn every insert into a full scan of the store. A trickle keeps
+/// the store small on its own, and a burst reaches the threshold quickly.
+const AUTH_VECTOR_PRUNE_EVERY: u64 = 64;
+
+static AUTH_VECTOR_INSERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cache the expected response for `nonce`, dropping any vector whose
+/// challenge has since expired.
+fn store_auth_vector(nonce: String, expected_response: Vec<u8>) {
+    let store = ims_auth_store();
+    let count = AUTH_VECTOR_INSERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count % AUTH_VECTOR_PRUNE_EVERY == 0 {
+        store.retain(|_, vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL);
+    }
+    store.insert(
+        nonce,
+        ImsAuthVector {
+            expected_response,
+            stored_at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// Consume the vector for `nonce`, if one is cached and still within its TTL.
+///
+/// Removal is unconditional, so a nonce is single-use whether or not the
+/// response verifies: replaying a captured `Authorization` finds nothing.
+fn take_auth_vector(nonce: &str) -> Option<ImsAuthVector> {
+    ims_auth_store()
+        .remove(nonce)
+        .map(|(_, vector)| vector)
+        .filter(|vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL)
 }
 
 /// A credential the script handed to a digest helper, in place of the
@@ -601,9 +652,7 @@ impl PyAuth {
                 store_size = ims_auth_store().len(),
                 "IMS auth: cache lookup",
             );
-            let stored = nonce_str
-                .as_ref()
-                .and_then(|n| ims_auth_store().remove(n).map(|(_, v)| v));
+            let stored = nonce_str.as_ref().and_then(|n| take_auth_vector(n));
 
             if let Some(vector) = stored {
                 // Per RFC 3310 §3.3: for AKAv1-MD5, raw XRES bytes are used
@@ -666,7 +715,7 @@ impl PyAuth {
         let realm = realm.unwrap_or(&self.default_realm);
 
         // Extract username from the request (From header or Authorization)
-        let (existing_auth, from_user) = {
+        let (existing_auth, from_user, method) = {
             let message = request.message();
             let guard = message.lock().map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -675,7 +724,13 @@ impl PyAuth {
             let from = guard.headers.from().cloned().unwrap_or_default();
             // Extract user part from From header for credential lookup
             let user = extract_username_from_uri(&from);
-            (auth, user)
+            // HA2 is H(method:uri), so the method has to be the one the UE
+            // actually sent rather than an assumed REGISTER.
+            let method = match &guard.start_line {
+                crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
+                _ => "REGISTER".to_string(),
+            };
+            (auth, user, method)
         };
 
         // Look up AKA credentials for this user
@@ -734,26 +789,37 @@ impl PyAuth {
 
         match existing_auth {
             Some(auth_value) => {
-                // Second REGISTER — verify the response
-                // Extract nonce from Authorization header to find our stored vector
-                let auth_nonce = extract_nonce_field(&auth_value);
-                if let Some(nonce_str) = auth_nonce {
-                    // Decode the nonce to confirm it carries a valid RAND||AUTN.
-                    if let Some(nonce_bytes) = base64_decode(&nonce_str) {
-                        if nonce_bytes.len() >= 32 {
-                            // For AKAv1-MD5: the "password" for MD5 digest is the XRES.
-                            // In IMS AKA, we compare the response field directly against
-                            // XRES. But sipp_ipsec uses AKAv1-MD5 which means the digest
-                            // response is computed using XRES as the password.
-                            // For simplicity in static auth: accept if username matches a known user.
-                            if let Some(username) = extract_username(&auth_value) {
-                                request.set_auth_user(username);
-                                return Ok(true);
-                            }
+                // Second REGISTER — verify `response=` against the XRES cached
+                // when the challenge went out. RFC 3310 §3.3: for AKAv1-MD5 the
+                // digest password is the raw XRES bytes, so
+                // HA1 = MD5(username:realm:XRES).
+                //
+                // The vector is consumed whether or not it verifies, so a
+                // captured Authorization replayed against the same nonce finds
+                // nothing and is challenged afresh.
+                let stored = extract_nonce_field(&auth_value).and_then(|n| take_auth_vector(&n));
+
+                match (stored, DigestFields::parse(&auth_value)) {
+                    (Some(vector), Some(fields)) => {
+                        let ha1 = md5_ha1_aka(&fields.username, realm, &vector.expected_response);
+                        if fields.verify(&ha1, &method) {
+                            request.set_auth_user(fields.username);
+                            return Ok(true);
                         }
+                        debug!(
+                            username = %fields.username,
+                            "AKA auth: digest response did not verify",
+                        );
+                    }
+                    (None, _) => debug!(
+                        "AKA auth: no live vector for this nonce (expired, replayed, or never issued)",
+                    ),
+                    (Some(_), None) => {
+                        debug!("AKA auth: Authorization header could not be parsed")
                     }
                 }
-                // Invalid auth — re-challenge
+
+                // Wrong, stale or replayed — challenge again with a fresh vector.
                 self.send_aka_challenge(request, realm, &k, &op, &sqn, &amf)?;
                 Ok(false)
             }
@@ -1175,6 +1241,10 @@ impl PyAuth {
         nonce_bytes.extend_from_slice(&vector.autn);
         let nonce = base64_encode(&nonce_bytes);
 
+        // The verification REGISTER has to check against *this* vector: a fresh
+        // one would carry a different RAND, so its XRES could never match.
+        store_auth_vector(nonce.clone(), vector.xres.clone());
+
         request.set_reply(401, "Unauthorized".to_string());
 
         let header_value = format!(
@@ -1223,12 +1293,7 @@ impl PyAuth {
                 xres_len = expected_bytes.len(),
                 "IMS auth: stored pending challenge",
             );
-            ims_auth_store().insert(
-                nonce_str,
-                ImsAuthVector {
-                    expected_response: expected_bytes.clone(),
-                },
-            );
+            store_auth_vector(nonce_str, expected_bytes.clone());
         }
 
         self.send_ims_challenge(
@@ -3021,6 +3086,7 @@ mod tests {
             nonce.clone(),
             ImsAuthVector {
                 expected_response: vec![0xAA; 16],
+                stored_at: std::time::Instant::now(),
             },
         );
 
@@ -3162,6 +3228,199 @@ mod tests {
             auth.validate_credentials("Digest nonsense", "example.com", "REGISTER"),
             CredentialCheck::Rejected
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Local-Milenage AKA (`auth.require_aka_digest`)
+    //
+    // The verification path used to accept ANY Authorization whose nonce
+    // base64-decoded to >= 32 bytes and whose username was provisioned,
+    // without ever looking at `response=`. Knowing an IMPI was enough to
+    // authenticate. These cover the response check, the single-use nonce, and
+    // the eviction that keeps the vector store bounded.
+    // ---------------------------------------------------------------
+
+    /// 3GPP TS 35.208 Test Set 1, so the vector is anchored on the spec rather
+    /// than on whatever our own generator happens to produce.
+    fn aka_test_set_1() -> (String, String, String, [u8; 16]) {
+        (
+            "465b5ce8b199b49faa5f0a2ee238a6bc".to_string(), // K
+            "cdc202d5123e20f62b6d676ac72cb318".to_string(), // OP
+            "b9b9".to_string(),                             // AMF
+            [
+                0x23, 0x55, 0x3c, 0xbe, 0x96, 0x37, 0xa8, 0x9d, 0x21, 0x8a, 0xe6, 0x4d, 0xae, 0x47,
+                0xbf, 0x35,
+            ], // RAND
+        )
+    }
+
+    fn aka_auth_with_credentials(impi: &str) -> PyAuth {
+        let (k, op, amf, _) = aka_test_set_1();
+        let mut auth = PyAuth::empty();
+        let mut credentials = HashMap::new();
+        credentials.insert(impi.to_string(), AkaCredential { k, op, amf });
+        auth.set_aka_credentials(credentials);
+        auth
+    }
+
+    /// The XRES a UE holding TS 35.208 Test Set 1 keys would derive.
+    fn aka_expected_xres() -> Vec<u8> {
+        let (k_hex, op_hex, amf_hex, rand) = aka_test_set_1();
+        let k: [u8; 16] = crate::ipsec::milenage::hex_to_bytes(&k_hex)
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .expect("test set 1 K");
+        let op: [u8; 16] = crate::ipsec::milenage::hex_to_bytes(&op_hex)
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .expect("test set 1 OP");
+        let amf: [u8; 2] = crate::ipsec::milenage::hex_to_bytes(&amf_hex)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .expect("test set 1 AMF");
+        let sqn: [u8; 6] = [0, 0, 0, 0, 0, 1];
+        crate::ipsec::milenage::generate_vector_with_rand(&k, &op, &sqn, &amf, &rand).xres
+    }
+
+    /// Build the Authorization a compliant UE would send: RFC 3310 §3.3 makes
+    /// the raw XRES bytes the digest password, so HA1 = MD5(impi:realm:XRES).
+    fn aka_authorization(impi: &str, realm: &str, nonce: &str, xres: &[u8]) -> String {
+        let uri = "sip:example.com";
+        let ha1 = md5_ha1_aka(impi, realm, xres);
+        let alg = crate::auth::DigestAlgorithm::Md5;
+        let ha2 = crate::auth::hash_hex_public(alg, format!("REGISTER:{uri}").as_bytes());
+        let response = crate::auth::hash_hex_public(alg, format!("{ha1}:{nonce}:{ha2}").as_bytes());
+        format!(
+            "Digest username=\"{impi}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+             uri=\"{uri}\", response=\"{response}\", algorithm=AKAv1-MD5"
+        )
+    }
+
+    fn aka_request_with(auth_value: &str) -> PyRequest {
+        let request = make_register_request();
+        {
+            let message = request.message();
+            let mut guard = message.lock().expect("lock");
+            guard.headers.set("Authorization", auth_value.to_string());
+        }
+        request
+    }
+
+    #[test]
+    fn aka_digest_accepts_the_response_the_keys_produce() {
+        let impi = "001010000000001";
+        let auth = aka_auth_with_credentials(impi);
+        let nonce = "aka-nonce-accepts";
+        let xres = aka_expected_xres();
+        store_auth_vector(nonce.to_string(), xres.clone());
+
+        let mut request = aka_request_with(&aka_authorization(impi, "example.com", nonce, &xres));
+        assert!(auth
+            .require_aka_digest(&mut request, Some("example.com"))
+            .expect("verification runs"));
+        assert_eq!(request.get_auth_user(), Some(impi));
+    }
+
+    /// The regression test for the bypass: a well-formed Authorization naming a
+    /// provisioned IMPI, with a nonce siphon never issued, must NOT authenticate.
+    /// This is exactly what used to return true.
+    #[test]
+    fn aka_digest_rejects_a_nonce_we_never_issued() {
+        let impi = "001010000000001";
+        let auth = aka_auth_with_credentials(impi);
+        // 32+ bytes once base64-decoded, which was the entire old check.
+        let forged = base64_encode(&[0x41u8; 32]);
+        let xres = aka_expected_xres();
+
+        let mut request = aka_request_with(&aka_authorization(impi, "example.com", &forged, &xres));
+        assert!(!auth
+            .require_aka_digest(&mut request, Some("example.com"))
+            .expect("verification runs"));
+        assert_eq!(request.get_auth_user(), None);
+    }
+
+    #[test]
+    fn aka_digest_rejects_a_wrong_response() {
+        let impi = "001010000000001";
+        let auth = aka_auth_with_credentials(impi);
+        let nonce = "aka-nonce-wrong";
+        store_auth_vector(nonce.to_string(), aka_expected_xres());
+
+        // A UE that holds different keys derives a different XRES.
+        let mut request =
+            aka_request_with(&aka_authorization(impi, "example.com", nonce, &[0xFFu8; 8]));
+        assert!(!auth
+            .require_aka_digest(&mut request, Some("example.com"))
+            .expect("verification runs"));
+        assert_eq!(request.get_auth_user(), None);
+    }
+
+    /// The vector is consumed on use, so a captured Authorization replayed
+    /// against the same nonce finds nothing.
+    #[test]
+    fn aka_digest_nonce_is_single_use() {
+        let impi = "001010000000001";
+        let auth = aka_auth_with_credentials(impi);
+        let nonce = "aka-nonce-replay";
+        let xres = aka_expected_xres();
+        store_auth_vector(nonce.to_string(), xres.clone());
+
+        let header = aka_authorization(impi, "example.com", nonce, &xres);
+        let mut first = aka_request_with(&header);
+        assert!(auth
+            .require_aka_digest(&mut first, Some("example.com"))
+            .expect("first verification runs"));
+
+        let mut replay = aka_request_with(&header);
+        assert!(!auth
+            .require_aka_digest(&mut replay, Some("example.com"))
+            .expect("replay verification runs"));
+    }
+
+    /// An unanswered challenge must not sit in the store for the life of the
+    /// process: that is a peer-drivable growth path (collect 401s, never
+    /// answer). Eviction is what bounds it.
+    #[test]
+    fn auth_vector_expires_and_is_not_accepted() {
+        let nonce = "aka-nonce-expired";
+        ims_auth_store().insert(
+            nonce.to_string(),
+            ImsAuthVector {
+                expected_response: vec![0xAA; 8],
+                stored_at: std::time::Instant::now()
+                    - (AUTH_VECTOR_TTL + std::time::Duration::from_secs(1)),
+            },
+        );
+
+        assert!(
+            take_auth_vector(nonce).is_none(),
+            "expired vector is refused"
+        );
+        assert!(
+            !ims_auth_store().contains_key(nonce),
+            "and is dropped rather than left behind"
+        );
+    }
+
+    #[test]
+    fn auth_vector_store_prunes_expired_entries_on_insert() {
+        let store = ims_auth_store();
+        let stale = "aka-nonce-stale-prune";
+        store.insert(
+            stale.to_string(),
+            ImsAuthVector {
+                expected_response: vec![0xBB; 8],
+                stored_at: std::time::Instant::now()
+                    - (AUTH_VECTOR_TTL + std::time::Duration::from_secs(1)),
+            },
+        );
+
+        // Reach the prune threshold; the stale entry must not survive it.
+        for index in 0..=AUTH_VECTOR_PRUNE_EVERY {
+            store_auth_vector(format!("aka-nonce-prune-{index}"), vec![0xCC; 8]);
+        }
+
+        assert!(!store.contains_key(stale), "prune drops expired vectors");
+        for index in 0..=AUTH_VECTOR_PRUNE_EVERY {
+            store.remove(&format!("aka-nonce-prune-{index}"));
+        }
     }
 
     /// A backend siphon cannot dispatch to is an operator error. Nothing about
