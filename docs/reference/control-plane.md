@@ -251,7 +251,7 @@ chunk, so logs join Homer and billing with no mapping table.
 
 | verb | module | args | notes |
 |---|---|---|---|
-| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
+| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
 | `answer` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
 | `ring` | sip | `{reason?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
 | `progress` | sip | `{code, reason?, body?, content_type?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress` |
@@ -431,7 +431,26 @@ events on your id:
 way to answer the callee's leaves its 2xx unanswerable (RFC 3261 §13.2.2.4) — a
 connected call with no audio:
 
-- `sdp` — your own offer, carried verbatim. Works on any backend, or none.
+- `sdp` — your own offer, carried verbatim as `application/sdp`. Works on any
+  backend, or none.
+- `body` + `content_type` — the same slot with the type spelled out, for an
+  INVITE whose offer travels as one part of a `multipart/*` body (RFC 5621 §3)
+  beside a part SIP does not interpret: ISUP on a SIP-I trunk (RFC 3204), a
+  PIDF-LO location object (RFC 6442), an operator-specific document. You
+  assemble the multipart; siphon carries it verbatim and derives Content-Length
+  from it. `content_type` defaults to `application/sdp`, which makes `body`
+  alone identical to `sdp`.
+
+    The body must still carry an SDP offer — `application/sdp`, or a
+    `multipart/*` with an `application/sdp` part in it. One that does not is
+    `bad_request` at the command, because a callee reading the INVITE as
+    offerless offers in its own 2xx and this plan has nothing to answer that
+    with (RFC 3261 §13.2.2.4). The same check runs on the Content-Type after
+    `headers` is applied, so rewriting the header cannot strip the offer off the
+    INVITE either. Note that `args.body` is JSON text: a part whose bytes are
+    not UTF-8 (raw ISUP, say) cannot be spelled on this rail today, the same
+    limit `answer` and `progress` have.
+
 - `media: true` — siphon anchors the leg on the media backend: the INVITE goes
   out offerless, the callee offers in its 2xx and siphon answers it locally with
   the answer on the ACK. The session is keyed on the leg's SIP Call-ID, so

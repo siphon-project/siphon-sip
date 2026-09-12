@@ -24295,10 +24295,23 @@ pub fn b2bua_progress_call(
 /// no offer), i.e. a connected call with no media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginateMedia {
-    /// The controller supplied the SDP offer; it rides on the INVITE verbatim
-    /// and the callee's answer arrives in the 2xx (RFC 3264 §5). Works on every
-    /// media backend, and on none at all.
-    Offer(String),
+    /// The controller supplied the body; it rides on the INVITE verbatim under
+    /// `content_type`, and the callee's answer arrives in the 2xx (RFC 3264 §5).
+    /// Works on every media backend, and on none at all.
+    ///
+    /// `content_type` is `application/sdp` for a plain offer, or a `multipart/*`
+    /// carrying the offer as one of its parts (RFC 5621 §3) — beside ISUP on a
+    /// SIP-I trunk, a PIDF-LO location object, an operator-specific document.
+    /// Either way the body has to carry an SDP offer, and
+    /// [`build_originate_invite`] refuses one that does not: a callee that reads
+    /// the INVITE as offerless offers in its own 2xx, and this plan has nothing
+    /// to answer that with (RFC 3261 §13.2.2.4).
+    Offer {
+        /// The bytes carried on the INVITE.
+        body: Vec<u8>,
+        /// The `Content-Type` they are carried under.
+        content_type: String,
+    },
     /// siphon anchors the leg on the configured media backend: the INVITE goes
     /// out **offerless**, the callee's 2xx carries the offer, and siphon answers
     /// it locally (`answer_local`) with the answer riding on the ACK — RFC 3261
@@ -24363,6 +24376,10 @@ pub enum OriginateError {
     Unroutable(String),
     /// The configured backend cannot serve the requested media plan.
     Unsupported(String),
+    /// The supplied body is not one an INVITE can carry an offer in: a
+    /// `Content-Type` naming neither SDP nor a multipart carrying it, a
+    /// multipart body that does not parse, or one with no SDP part in it.
+    InvalidBody(String),
     /// The INVITE could not be built (should not happen; surfaced, never panicked).
     BuildFailed(String),
 }
@@ -24376,6 +24393,7 @@ impl std::fmt::Display for OriginateError {
             }
             OriginateError::Unroutable(detail) => write!(formatter, "{detail}"),
             OriginateError::Unsupported(detail) => write!(formatter, "{detail}"),
+            OriginateError::InvalidBody(detail) => write!(formatter, "{detail}"),
             OriginateError::BuildFailed(detail) => write!(formatter, "{detail}"),
         }
     }
@@ -24493,7 +24511,13 @@ pub fn b2bua_originate_prepare(
     leg.dialog.local_from_uri = invite.headers.from().cloned();
     leg.dialog.remote_to_uri = invite.headers.to().cloned();
     if !invite.body.is_empty() {
-        leg.last_sdp = Some(invite.body.clone());
+        // The SDP alone, never the whole body: `last_sdp` is this leg's current
+        // media description and a later re-INVITE (hold, bridge) re-offers it,
+        // while the other parts of a multipart body belong to the initial
+        // INVITE only. `build_originate_invite` has already refused a body with
+        // no SDP in it, so this cannot quietly drop an offer.
+        leg.last_sdp =
+            crate::media::body::sdp_from_body(message_content_type(&invite), &invite.body).ok();
     }
 
     let internal_call_id = state.call_actors.create_call(leg);
@@ -24599,10 +24623,11 @@ fn build_originate_invite(
         builder = builder.header("P-Asserted-Identity", format!("<{asserted}>"));
     }
     let builder = match &params.media {
-        OriginateMedia::Offer(sdp) => builder
-            .content_type("application/sdp".to_string())
-            .content_length(sdp.len())
-            .body(sdp.as_bytes().to_vec()),
+        OriginateMedia::Offer { body, content_type } => builder
+            .content_type(content_type.clone())
+            // `body` derives Content-Length from the bytes themselves, so the
+            // framing always describes what is actually carried.
+            .body(body.clone()),
         // Offerless: the callee offers in its 2xx and we answer in the ACK.
         OriginateMedia::Anchor { .. } => builder.content_length(0),
     };
@@ -24624,6 +24649,16 @@ fn build_originate_invite(
         invite.headers.set(name, value.clone());
     }
 
+    // The body and the Content-Type describing it have to still agree once
+    // `headers` has had its say. Content-Type is deliberately not reserved —
+    // rewriting it is how a caller wraps its offer in a `multipart/*` beside a
+    // part SIP does not interpret (RFC 5621 §3) — but rewriting it to something
+    // that carries no offer at all is a different act: the callee then reads an
+    // offerless INVITE and offers in its own 2xx, which an `Offer` plan has
+    // nothing to answer with (RFC 3261 §13.2.2.4). That is a connected call
+    // with no audio, so it is refused here rather than placed.
+    originate_check_body(&invite, &params.media)?;
+
     // CLIR last of all — anonymisation is the final identity step, or a custom
     // From / P-Asserted-Identity header set after it would undo it
     // (RFC 3323 §4.1 / TS 24.607).
@@ -24631,6 +24666,37 @@ fn build_originate_invite(
         crate::sip::privacy::restrict_calling_identity(&mut invite);
     }
     Ok(invite)
+}
+
+/// The `Content-Type` a built message carries, compact form included: a caller
+/// can spell the header either way in `headers` (RFC 3261 §7.3.1, §20).
+fn message_content_type(message: &SipMessage) -> &str {
+    message
+        .headers
+        .get("Content-Type")
+        .or_else(|| message.headers.get("c"))
+        .map(String::as_str)
+        .unwrap_or_default()
+}
+
+/// Refuse an originate whose body and `Content-Type` no longer match its media
+/// plan once `headers` has been applied. See the call site for why this runs
+/// after the custom headers rather than before them.
+fn originate_check_body(invite: &SipMessage, media: &OriginateMedia) -> Result<(), OriginateError> {
+    let content_type = message_content_type(invite);
+    match media {
+        OriginateMedia::Offer { .. } => crate::media::body::sdp_from_body(content_type, &invite.body)
+            .map(|_| ())
+            .map_err(OriginateError::InvalidBody),
+        // An anchored originate sends no body at all, so a Content-Type on it
+        // describes a body that is not there.
+        OriginateMedia::Anchor { .. } if !content_type.is_empty() => {
+            Err(OriginateError::InvalidBody(format!(
+                "originate with media anchoring sends an offerless INVITE, so the Content-Type '{content_type}' supplied in headers describes a body that is not there"
+            )))
+        }
+        OriginateMedia::Anchor { .. } => Ok(()),
+    }
 }
 
 /// Headers an `originate` caller must not set: the dialog identity and framing
@@ -38424,9 +38490,42 @@ mod originate_tests {
         }
     }
 
-    fn build(params: &OriginateParams) -> SipMessage {
+    fn build_result(params: &OriginateParams) -> Result<SipMessage, OriginateError> {
         let uri = parse_uri_standalone(&params.to).expect("target parses");
-        build_originate_invite(params, uri, identity()).expect("invite builds")
+        build_originate_invite(params, uri, identity())
+    }
+
+    fn build(params: &OriginateParams) -> SipMessage {
+        build_result(params).expect("invite builds")
+    }
+
+    /// A plain SDP offer — what the `sdp=` / `args.sdp` shorthand produces.
+    fn offer(sdp: &str) -> OriginateMedia {
+        OriginateMedia::Offer {
+            body: sdp.as_bytes().to_vec(),
+            content_type: "application/sdp".to_string(),
+        }
+    }
+
+    /// A `multipart/mixed` body of the shape a SIP-I / PIDF-LO INVITE carries:
+    /// the SDP offer plus one part SIP itself does not interpret.
+    fn multipart_offer_body() -> &'static str {
+        concat!(
+            "--siphon-1\r\n",
+            "Content-Type: application/sdp\r\n",
+            "\r\n",
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.10\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.10\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+            "\r\n--siphon-1\r\n",
+            "Content-Type: application/vnd.example+xml\r\n",
+            "\r\n",
+            "<additional-data/>\r\n",
+            "--siphon-1--\r\n",
+        )
     }
 
     #[test]
@@ -38634,7 +38733,7 @@ mod originate_tests {
     #[test]
     fn a_caller_supplied_offer_rides_on_the_invite() {
         let sdp = "v=0\r\no=- 1 1 IN IP4 198.51.100.10\r\ns=-\r\nc=IN IP4 198.51.100.10\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n";
-        let invite = build(&params(OriginateMedia::Offer(sdp.to_string())));
+        let invite = build(&params(offer(sdp)));
         assert_eq!(invite.body, sdp.as_bytes());
         assert_eq!(
             invite.headers.get("Content-Type").unwrap(),
@@ -38644,6 +38743,106 @@ mod originate_tests {
             invite.headers.get("Content-Length").unwrap(),
             &sdp.len().to_string()
         );
+    }
+
+    #[test]
+    fn a_multipart_offer_keeps_its_own_content_type_and_rides_whole() {
+        // RFC 5621 §3: the offer may travel as one part of a multipart body,
+        // beside a part SIP does not interpret. The whole body goes on the wire
+        // under the caller's Content-Type, MIME framing and all.
+        let body = multipart_offer_body();
+        let invite = build(&params(OriginateMedia::Offer {
+            body: body.as_bytes().to_vec(),
+            content_type: "multipart/mixed;boundary=siphon-1".to_string(),
+        }));
+
+        assert_eq!(invite.body, body.as_bytes());
+        assert_eq!(
+            invite.headers.get("Content-Type").unwrap(),
+            "multipart/mixed;boundary=siphon-1"
+        );
+        assert_eq!(
+            invite.headers.get("Content-Length").unwrap(),
+            &body.len().to_string()
+        );
+        // What the leg records as its media description is the SDP part alone —
+        // `b2bua_originate_prepare` stores exactly this expression's result.
+        let recorded =
+            crate::media::body::sdp_from_body(message_content_type(&invite), &invite.body)
+                .expect("the offer is found inside the multipart body");
+        let recorded = String::from_utf8(recorded).expect("SDP is text");
+        assert!(recorded.starts_with("v=0\r\n"), "got: {recorded:?}");
+        assert!(!recorded.contains("additional-data"));
+        assert!(!recorded.contains("--siphon-1"));
+    }
+
+    #[test]
+    fn an_offer_body_carrying_no_sdp_is_refused() {
+        // The plan says the caller supplied the offer while the body supplies
+        // none, so the callee would offer in its 2xx with nothing here able to
+        // answer it.
+        let error = build_result(&params(OriginateMedia::Offer {
+            body: b"hello".to_vec(),
+            content_type: "text/plain".to_string(),
+        }))
+        .expect_err("a non-SDP body is not an offer");
+        assert!(
+            matches!(&error, OriginateError::InvalidBody(detail) if detail.contains("text/plain")),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_multipart_offer_without_an_sdp_part_is_refused() {
+        let body = concat!(
+            "--siphon-1\r\n",
+            "Content-Type: application/vnd.example+xml\r\n",
+            "\r\n",
+            "<additional-data/>\r\n",
+            "--siphon-1--\r\n",
+        );
+        let error = build_result(&params(OriginateMedia::Offer {
+            body: body.as_bytes().to_vec(),
+            content_type: "multipart/mixed;boundary=siphon-1".to_string(),
+        }))
+        .expect_err("a multipart body with no SDP part is not an offer");
+        assert!(
+            matches!(&error, OriginateError::InvalidBody(_)),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_type_header_cannot_strip_the_offer_off_the_invite() {
+        // Content-Type is settable on purpose, but not to the point of leaving
+        // an INVITE the callee reads as offerless while the plan still says the
+        // caller supplied the offer.
+        let mut params = params(offer("v=0\r\nm=audio 40000 RTP/AVP 0\r\n"));
+        params.headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let error = build_result(&params).expect_err("the offer was rewritten away");
+        assert!(
+            matches!(&error, OriginateError::InvalidBody(_)),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_type_header_may_still_wrap_the_offer_in_multipart() {
+        // The other half of the same rule: a caller that assembles the
+        // multipart body itself and names it in `headers` keeps working,
+        // because what comes out does carry an offer.
+        let body = multipart_offer_body();
+        let mut params = params(offer(body));
+        params.headers = vec![(
+            "Content-Type".to_string(),
+            "multipart/mixed;boundary=siphon-1".to_string(),
+        )];
+        let invite = build(&params);
+        assert_eq!(
+            invite.headers.get("Content-Type").unwrap(),
+            "multipart/mixed;boundary=siphon-1"
+        );
+        assert_eq!(invite.body, body.as_bytes());
     }
 
     #[test]
@@ -38657,6 +38856,22 @@ mod originate_tests {
         assert!(invite.body.is_empty());
         assert_eq!(invite.headers.get("Content-Length").unwrap(), "0");
         assert!(!invite.headers.has("Content-Type"));
+    }
+
+    #[test]
+    fn an_anchored_originate_refuses_a_content_type_header() {
+        // An anchored originate carries no body, so a Content-Type from
+        // `headers` describes one that is not there.
+        let mut params = params(OriginateMedia::Anchor {
+            profile: "rtp_passthrough".to_string(),
+            ws_uri: None,
+        });
+        params.headers = vec![("Content-Type".to_string(), "application/sdp".to_string())];
+        let error = build_result(&params).expect_err("a body-less INVITE has no content type");
+        assert!(
+            matches!(&error, OriginateError::InvalidBody(_)),
+            "got: {error:?}"
+        );
     }
 
     #[test]

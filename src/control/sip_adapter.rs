@@ -1088,8 +1088,15 @@ fn string_arg(args: &serde_json::Value, name: &str) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-/// Parse the media plan: exactly one of `args.sdp` (a controller-supplied
-/// offer) or `args.media: true` (siphon anchors the leg on the media backend).
+/// Parse the media plan: exactly one of a controller-supplied offer
+/// (`args.sdp`, or `args.body` with its own `args.content_type`) or
+/// `args.media: true` (siphon anchors the leg on the media backend).
+///
+/// `args.sdp` is the shorthand — the body, carried as `application/sdp`.
+/// `args.body` is the same slot with the type spelled out, for an INVITE whose
+/// offer travels as one part of a `multipart/*` body (RFC 5621 §3) beside a
+/// part SIP does not interpret. Either spelling has to carry an SDP offer; the
+/// dispatcher refuses a body that does not.
 ///
 /// Neither is a `bad_request` rather than a default, because an INVITE with no
 /// offer and no plan to answer the callee's leaves its 2xx un-answerable
@@ -1099,19 +1106,40 @@ fn parse_originate_media(
     args: &serde_json::Value,
 ) -> Result<crate::dispatcher::OriginateMedia, String> {
     let sdp = args.get("sdp").and_then(|value| value.as_str());
+    let body = args.get("body").and_then(|value| value.as_str());
+    let content_type = args.get("content_type").and_then(|value| value.as_str());
     let anchor = args
         .get("media")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    match (sdp, anchor) {
+
+    if sdp.is_some() && body.is_some() {
+        return Err(
+            "originate takes either args.sdp (an SDP offer) or args.body (a body with its own args.content_type), not both"
+                .to_string(),
+        );
+    }
+    match (sdp.or(body), anchor) {
         (Some(_), true) => Err(
-            "originate takes either args.sdp (your own offer) or args.media=true (siphon anchors the leg), not both"
+            "originate takes either your own offer (args.sdp / args.body) or args.media=true (siphon anchors the leg), not both"
                 .to_string(),
         ),
-        (Some(sdp), false) if sdp.trim().is_empty() => {
-            Err("originate args.sdp must not be empty".to_string())
-        }
-        (Some(sdp), false) => Ok(crate::dispatcher::OriginateMedia::Offer(sdp.to_string())),
+        (Some(offer), false) if offer.trim().is_empty() => Err(format!(
+            "originate {} must not be empty",
+            if sdp.is_some() { "args.sdp" } else { "args.body" }
+        )),
+        (Some(_), false) if sdp.is_some() && content_type.is_some() => Err(
+            "originate args.content_type goes with args.body — args.sdp is application/sdp by definition"
+                .to_string(),
+        ),
+        (Some(offer), false) => Ok(crate::dispatcher::OriginateMedia::Offer {
+            body: offer.as_bytes().to_vec(),
+            content_type: content_type.unwrap_or("application/sdp").to_string(),
+        }),
+        (None, true) if content_type.is_some() => Err(
+            "originate args.content_type needs args.body — args.media=true sends an offerless INVITE"
+                .to_string(),
+        ),
         (None, true) => Ok(crate::dispatcher::OriginateMedia::Anchor {
             profile: args
                 .get("profile")
@@ -1124,7 +1152,7 @@ fn parse_originate_media(
                 .map(|value| value.to_string()),
         }),
         (None, false) => Err(
-            "originate requires a media plan: args.sdp (your own offer) or args.media=true (siphon anchors the leg)"
+            "originate requires a media plan: args.sdp / args.body (your own offer) or args.media=true (siphon anchors the leg)"
                 .to_string(),
         ),
     }
@@ -1156,7 +1184,9 @@ fn originate_error(error: crate::dispatcher::OriginateError) -> ControlResult {
     use crate::dispatcher::OriginateError;
     let message = error.to_string();
     match error {
-        OriginateError::InvalidUri { .. } => {
+        // A malformed argument either way: the URI does not parse, or the body
+        // is not one an INVITE can carry an offer in.
+        OriginateError::InvalidUri { .. } | OriginateError::InvalidBody(_) => {
             ControlResult::error(ControlErrorCode::BadRequest, message)
         }
         // No reachable destination for the target: the request was well formed
@@ -2443,7 +2473,10 @@ mod tests {
         use crate::dispatcher::OriginateMedia;
         assert_eq!(
             parse_originate_media(&serde_json::json!({ "sdp": "v=0\r\n" })),
-            Ok(OriginateMedia::Offer("v=0\r\n".to_string()))
+            Ok(OriginateMedia::Offer {
+                body: b"v=0\r\n".to_vec(),
+                content_type: "application/sdp".to_string(),
+            })
         );
         assert_eq!(
             parse_originate_media(&serde_json::json!({ "media": true })),
@@ -2466,6 +2499,68 @@ mod tests {
         assert!(
             parse_originate_media(&serde_json::json!({ "sdp": "v=0", "media": true })).is_err()
         );
+    }
+
+    #[test]
+    fn parse_originate_media_takes_a_body_with_its_own_content_type() {
+        // RFC 5621 §3: the offer may ride as one part of a multipart body. The
+        // controller assembles that body and names its type; siphon carries it.
+        use crate::dispatcher::OriginateMedia;
+        assert_eq!(
+            parse_originate_media(&serde_json::json!({
+                "body": "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b--\r\n",
+                "content_type": "multipart/mixed;boundary=b",
+            })),
+            Ok(OriginateMedia::Offer {
+                body: b"--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b--\r\n".to_vec(),
+                content_type: "multipart/mixed;boundary=b".to_string(),
+            })
+        );
+        // A body with no content_type is SDP, exactly like args.sdp.
+        assert_eq!(
+            parse_originate_media(&serde_json::json!({ "body": "v=0\r\n" })),
+            Ok(OriginateMedia::Offer {
+                body: b"v=0\r\n".to_vec(),
+                content_type: "application/sdp".to_string(),
+            })
+        );
+
+        // Two spellings of the same slot, an empty body, a content_type with no
+        // body to describe, and a content_type contradicting args.sdp are each
+        // a malformed request rather than a guess.
+        assert!(
+            parse_originate_media(&serde_json::json!({ "sdp": "v=0\r\n", "body": "v=0\r\n" }))
+                .is_err()
+        );
+        assert!(parse_originate_media(&serde_json::json!({ "body": "  " })).is_err());
+        assert!(
+            parse_originate_media(&serde_json::json!({ "body": "v=0", "media": true })).is_err()
+        );
+        assert!(parse_originate_media(
+            &serde_json::json!({ "media": true, "content_type": "application/sdp" })
+        )
+        .is_err());
+        assert!(parse_originate_media(
+            &serde_json::json!({ "sdp": "v=0", "content_type": "multipart/mixed;boundary=b" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn originate_error_maps_an_invalid_body_to_bad_request() {
+        // A body that carries no offer is the caller's frame to fix, not a
+        // missing resource and not a backend that cannot do it.
+        use crate::dispatcher::OriginateError;
+        match originate_error(OriginateError::InvalidBody(
+            "Content-Type 'text/plain' is neither application/sdp nor a multipart body carrying one"
+                .to_string(),
+        )) {
+            ControlResult::Error { code, ref message } => {
+                assert_eq!(code, ControlErrorCode::BadRequest);
+                assert!(message.contains("text/plain"), "message was: {message}");
+            }
+            other => panic!("expected bad_request, got {other:?}"),
+        }
     }
 
     #[test]

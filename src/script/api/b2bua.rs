@@ -67,10 +67,25 @@ impl PyB2buaControl {
     ///
     /// Exactly one media plan is required, because an INVITE with no offer and
     /// no way to answer the callee's leaves a connected call with no audio:
-    ///   * `sdp="v=0..."` — your own offer, carried verbatim; or
+    ///   * `sdp="v=0..."` — your own offer, carried verbatim as
+    ///     `application/sdp`; or
+    ///   * `body=…, content_type=…` — the same slot with the type spelled out,
+    ///     for an INVITE whose offer travels as one part of a `multipart/*`
+    ///     body (RFC 5621 §3) beside a part SIP does not interpret: ISUP on a
+    ///     SIP-I trunk, a PIDF-LO location object, an operator-specific
+    ///     document. You assemble the multipart, siphon carries it verbatim and
+    ///     derives Content-Length from it. `body=` takes `str` or `bytes`, and
+    ///     `content_type=` defaults to `application/sdp` (so `body=` alone is
+    ///     `sdp=`); or
     ///   * `media=True` — siphon anchors the leg on the configured media
     ///     backend (siphon-rtp), so `rtpengine.play_media()`, DTMF and the
     ///     WebSocket tee all work against it.
+    ///
+    /// Whichever spelling, the body has to carry an SDP offer — bare
+    /// `application/sdp`, or a `multipart/*` with an `application/sdp` part in
+    /// it. One that carries none raises, because a callee that reads the INVITE
+    /// as offerless offers in its own 2xx and this plan has nothing to answer
+    /// that with (RFC 3261 §13.2.2.4).
     ///
     /// ```python
     /// call_id = b2bua.originate(
@@ -84,9 +99,9 @@ impl PyB2buaControl {
     /// ```
     ///
     /// Raises `ValueError` when the target/identity URIs do not parse, no route
-    /// exists, the media plan is not one the configured backend can serve, or
-    /// the B2BUA is not running — never a silent `None` for a call that was
-    /// never placed.
+    /// exists, the media plan is not one the configured backend can serve, the
+    /// body carries no offer, or the B2BUA is not running — never a silent
+    /// `None` for a call that was never placed.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         to,
@@ -102,6 +117,8 @@ impl PyB2buaControl {
         profile=None,
         ws_uri=None,
         timeout=30,
+        body=None,
+        content_type=None,
     ))]
     fn originate(
         &self,
@@ -118,28 +135,59 @@ impl PyB2buaControl {
         profile: Option<&str>,
         ws_uri: Option<&str>,
         timeout: u32,
+        body: Option<&Bound<'_, pyo3::types::PyAny>>,
+        content_type: Option<&str>,
     ) -> PyResult<String> {
         use pyo3::exceptions::PyValueError;
 
-        let media_plan = match (sdp, media) {
+        // `sdp=` and `body=` are one slot with two spellings — `sdp=` is the
+        // body carried as application/sdp, `body=` is the body with its type
+        // named — so supplying both leaves it ambiguous what goes on the wire.
+        let supplied_offer = match (sdp, body) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "b2bua.originate takes either sdp= (an SDP offer) or body= (a body with its own content_type=), not both",
+                ));
+            }
+            (Some(_), None) if content_type.is_some() => {
+                return Err(PyValueError::new_err(
+                    "b2bua.originate content_type= goes with body= — sdp= is application/sdp by definition",
+                ));
+            }
+            (Some(sdp), None) => Some((sdp.as_bytes().to_vec(), "application/sdp".to_string())),
+            (None, Some(body)) => Some((
+                super::request::extract_body_bytes(body)?,
+                content_type.unwrap_or("application/sdp").to_string(),
+            )),
+            (None, None) => None,
+        };
+
+        let media_plan = match (supplied_offer, media) {
             (Some(_), true) => {
                 return Err(PyValueError::new_err(
-                    "b2bua.originate takes either sdp= (your own offer) or media=True (siphon anchors the leg), not both",
+                    "b2bua.originate takes either your own offer (sdp= / body=) or media=True (siphon anchors the leg), not both",
                 ));
             }
-            (Some(sdp), false) if sdp.trim().is_empty() => {
+            (Some((body, _)), false) if body.iter().all(u8::is_ascii_whitespace) => {
                 return Err(PyValueError::new_err(
-                    "b2bua.originate sdp= must not be empty",
+                    "b2bua.originate sdp= / body= must not be empty",
                 ));
             }
-            (Some(sdp), false) => crate::dispatcher::OriginateMedia::Offer(sdp.to_string()),
+            (Some((body, content_type)), false) => {
+                crate::dispatcher::OriginateMedia::Offer { body, content_type }
+            }
+            (None, true) if content_type.is_some() => {
+                return Err(PyValueError::new_err(
+                    "b2bua.originate content_type= needs body= — media=True sends an offerless INVITE",
+                ));
+            }
             (None, true) => crate::dispatcher::OriginateMedia::Anchor {
                 profile: profile.unwrap_or("rtp_passthrough").to_string(),
                 ws_uri: ws_uri.map(str::to_string),
             },
             (None, false) => {
                 return Err(PyValueError::new_err(
-                    "b2bua.originate needs a media plan: sdp= (your own offer) or media=True (siphon anchors the leg)",
+                    "b2bua.originate needs a media plan: sdp= / body= (your own offer) or media=True (siphon anchors the leg)",
                 ));
             }
         };
