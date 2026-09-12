@@ -35,6 +35,10 @@ pub mod sip_uri;
 pub mod srs;
 pub mod stir;
 pub mod subscribe_state;
+/// Byte-for-byte guard on the Python surface, so a refactor cannot move it
+/// silently. Test-only.
+#[cfg(test)]
+mod surface_snapshot;
 pub mod timer;
 
 use std::ffi::CString;

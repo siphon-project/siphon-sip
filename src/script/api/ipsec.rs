@@ -2356,11 +2356,20 @@ mod tests {
     #[test]
     fn record_route_port_for_is_identity_without_config() {
         // No IpsecConfig wired (every non-P-CSCF deployment) — the port passes
-        // through untouched.  Order-dependent on IPSEC_CONFIG_REF being unset,
-        // same caveat as the manager test above.
+        // through untouched.
+        //
+        // IPSEC_CONFIG_REF is a process-global OnceLock that cannot be unset,
+        // and tests in this binary run in parallel, so checking it once and
+        // then asserting is a race: another test can wire the config in
+        // between, and the assertion then measures a configured P-CSCF. Read
+        // it again afterwards and only assert if it was unset throughout.
         if IPSEC_CONFIG_REF.get().is_none() {
-            assert_eq!(record_route_port_for(5060), 5060);
-            assert_eq!(record_route_port_for(5064), 5064);
+            let passthrough_5060 = record_route_port_for(5060);
+            let passthrough_5064 = record_route_port_for(5064);
+            if IPSEC_CONFIG_REF.get().is_none() {
+                assert_eq!(passthrough_5060, 5060);
+                assert_eq!(passthrough_5064, 5064);
+            }
         }
     }
 }
