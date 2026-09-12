@@ -31453,7 +31453,7 @@ mod tests {
     /// that is what has to stay wired.
     #[test]
     fn the_proxy_cdr_settle_is_still_wired_to_the_authenticated_identity() {
-        let source = include_str!("dispatcher.rs");
+        let source = include_str!("mod.rs");
 
         // The block in `handle_request` that decides the outcome and settles.
         let block = source
@@ -31481,7 +31481,7 @@ mod tests {
     /// dispatcher and a live interpreter to drive.
     #[test]
     fn the_proxy_cdr_record_is_opened_before_the_script_handler_runs() {
-        let source = include_str!("dispatcher.rs");
+        let source = include_str!("mod.rs");
 
         let opened = source
             .find("    let cdr_key = if method == \"INVITE\" {")
@@ -39066,5 +39066,85 @@ mod ro_orphan_backstop_tests {
     fn the_key_written_is_the_key_read_back() {
         let key = ro_b2bua_key("abc-123");
         assert_eq!(key.strip_prefix(RO_B2BUA_KEY_PREFIX), Some("abc-123"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public-surface guard
+// ---------------------------------------------------------------------------
+
+/// Pins every publicly-reachable item of this module by name.
+///
+/// `siphon` is a published library crate and `lib.rs` declares `pub mod
+/// dispatcher`, so each of these is `siphon::dispatcher::…` to an embedder.
+/// 1.9.0 is a minor release, so none of them may move or disappear.
+///
+/// The 1.9.0 split moves ~30,000 lines out of this file into `dispatcher/**`.
+/// Each extraction re-exports what it took; forgetting one would compile fine
+/// here and break an embedder at their next `cargo update`. Naming them
+/// explicitly — no glob — turns that into a build failure in this crate.
+///
+/// `siphon-bin` and the extension crates reach exactly six of these
+/// (`run`, `DrainState`, `init_rtpengine`, `inject_python_singletons`,
+/// `spawn_rtpengine_health_check`, `liveness_on_flow_close`); the rest are
+/// reached from `control`, `script::api` and `admin` inside this crate.
+#[cfg(test)]
+mod public_api_surface {
+    #[allow(unused_imports)]
+    use super::{
+        b2bua_accept_refer_call, b2bua_answer_call, b2bua_answer_call_anchored, b2bua_bridge_calls,
+        b2bua_cancel_originated_call, b2bua_local_tag, b2bua_media_set_ws_bridge_attached,
+        b2bua_media_set_ws_tee, b2bua_media_target, b2bua_originate, b2bua_originate_dial,
+        b2bua_originate_prepare, b2bua_progress_call, b2bua_refer_call, b2bua_reject_call,
+        b2bua_reject_refer_call, b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call,
+        b2bua_unbridge_call, init_rtpengine, inject_python_singletons,
+        liveness_flow_failure_network_dereg, liveness_on_flow_close, publish_store_gauges,
+        ro_authorize_b2bua, run, spawn_rtpengine_health_check, BridgeAccepted, BridgeParams,
+        DrainState, OriginateError, OriginateMedia, OriginateParams, PreparedOriginate,
+        ProxyRfState, ReliableProvisional, RoAuthorizeOutcome, RouteError, RouteTarget,
+    };
+
+    /// Coercing to a fn pointer pins arity and types, not merely the name — a
+    /// split that "keeps" a function but changes its signature fails here too.
+    ///
+    /// `run` is deliberately absent: it takes 24 arguments and naming its type
+    /// would be unreadable. The import above pins its existence; `server.rs`
+    /// pins its signature by calling it.
+    #[test]
+    fn signatures_are_pinned() {
+        let _: fn(&str, Option<&str>) -> bool = super::b2bua_terminate_call;
+        let _: fn(&str, u16, &str) -> bool = super::b2bua_reject_call;
+        let _: fn(&str, u16, &str) -> bool = super::b2bua_reject_refer_call;
+        let _: fn(&str) -> Option<String> = super::b2bua_local_tag;
+        let _: fn(&str, Option<&str>) -> bool = super::b2bua_cancel_originated_call;
+        let _: fn(&str, Option<String>) = super::b2bua_media_set_ws_tee;
+        let _: fn(&str, bool) = super::b2bua_media_set_ws_bridge_attached;
+    }
+
+    /// The count is the tripwire: adding a public item to this module is a
+    /// deliberate act with a semver consequence, so it has to be recorded here
+    /// as well as in the import list above.
+    #[test]
+    fn the_public_surface_is_exactly_forty_items() {
+        let source = include_str!("mod.rs");
+        let declared = source
+            .lines()
+            .filter(|line| {
+                let line = line.trim_end();
+                (line.starts_with("pub fn ")
+                    || line.starts_with("pub async fn ")
+                    || line.starts_with("pub struct ")
+                    || line.starts_with("pub enum ")
+                    || line.starts_with("pub(crate) async fn ")
+                    || line.starts_with("pub(crate) fn ")
+                    || line.starts_with("pub(crate) struct ")
+                    || line.starts_with("pub(crate) enum "))
+                    && !line.starts_with("pub use")
+            })
+            .count();
+        assert_eq!(
+            declared, 40,
+            "this module declares {declared} public items, not 40. Adding one is a semver              commitment on a published crate; removing one breaks embedders. Update the import              list and this count together, deliberately.",
+        );
     }
 }
