@@ -469,10 +469,46 @@ use dashmap::DashMap;
 /// Manages multiple Diameter peer connections.
 ///
 /// Created at startup from config, holds connected clients indexed by peer name.
+/// How a route picks among its peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteAlgorithm {
+    /// Peers in configured order; the first connected one wins.
+    #[default]
+    Failover,
+    /// Rotate across the connected peers, one step per request.
+    RoundRobin,
+}
+
+impl RouteAlgorithm {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "round_robin" | "roundrobin" => Self::RoundRobin,
+            _ => Self::Failover,
+        }
+    }
+}
+
+/// One `diameter.routes[]` entry, resolved at startup.
+#[derive(Debug)]
+struct ResolvedRoute {
+    application: crate::config::DiameterApplication,
+    realm: Option<String>,
+    peers: Vec<String>,
+    algorithm: RouteAlgorithm,
+    /// Round-robin position. Only read for `RouteAlgorithm::RoundRobin`.
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
 pub struct DiameterManager {
     /// Client-mode peers (`diameter.peers`), keyed by peer name. Used by
     /// `send_request` / `send_air` / etc. — never tenant-scoped.
     clients: DashMap<String, Arc<DiameterClient>>,
+    /// The `diameter.routes[]` table, in configured order.
+    ///
+    /// Before this existed every application call took `any_client()` — an
+    /// arbitrary DashMap entry — so a deployment with an HSS and a CDF could
+    /// send a Cx request to the CDF depending on iteration order.
+    routes: Vec<ResolvedRoute>,
     /// Server-mode relay backends, keyed by `(tenant, peer name)`. Keeping the
     /// tenant in the key means two tenants can each register a backend called
     /// `hss` without one silently overwriting the other — no naming convention
@@ -490,8 +526,102 @@ impl DiameterManager {
     pub fn new() -> Self {
         Self {
             clients: DashMap::new(),
+            routes: Vec::new(),
             backends: DashMap::new(),
         }
+    }
+
+    /// Build a manager that routes by application, per `diameter.routes[]`.
+    pub fn with_routes(routes: &[crate::config::DiameterRouteEntry]) -> Self {
+        Self {
+            clients: DashMap::new(),
+            routes: routes
+                .iter()
+                .map(|route| ResolvedRoute {
+                    application: route.application.clone(),
+                    realm: route.realm.clone(),
+                    peers: route.peers.clone(),
+                    algorithm: RouteAlgorithm::parse(&route.algorithm),
+                    cursor: std::sync::atomic::AtomicUsize::new(0),
+                })
+                .collect(),
+            backends: DashMap::new(),
+        }
+    }
+
+    /// Whether any route is configured, so callers can tell "no table" from
+    /// "table says no peer".
+    pub fn has_routes(&self) -> bool {
+        !self.routes.is_empty()
+    }
+
+    /// Pick a connected peer for `application`, honouring the routing table.
+    ///
+    /// A route whose `realm` is set matches only that destination realm, unless
+    /// the caller has no realm to offer. The first matching route decides: if
+    /// every peer on it is down the call fails rather than silently falling
+    /// through to an unrelated peer, because sending a Cx request to a CDF is
+    /// worse than not sending it.
+    ///
+    /// With no routes configured at all this falls back to `any_client()`, so
+    /// single-peer deployments and pre-routing configs are unaffected. But once
+    /// a table exists it is authoritative: an application it does not cover
+    /// returns `None` rather than reaching for an arbitrary peer.
+    pub fn route_client(
+        &self,
+        application: &crate::config::DiameterApplication,
+        realm: Option<&str>,
+    ) -> Option<Arc<DiameterClient>> {
+        let Some(route) = self.routes.iter().find(|route| {
+            if &route.application != application {
+                return false;
+            }
+            match (&route.realm, realm) {
+                (Some(route_realm), Some(requested)) => route_realm == requested,
+                _ => true,
+            }
+        }) else {
+            // No table at all: single-peer deployments and every config written
+            // before the table did anything keep working unchanged.
+            if self.routes.is_empty() {
+                return self.any_client();
+            }
+            // A table that exists but does not cover this application is a
+            // config gap, not a licence to pick an arbitrary peer. Once the
+            // operator has declared routing, it is authoritative.
+            tracing::warn!(
+                application = ?application,
+                realm = realm.unwrap_or("-"),
+                "diameter: no route configured for this application",
+            );
+            return None;
+        };
+
+        if route.peers.is_empty() {
+            return None;
+        }
+
+        let start = match route.algorithm {
+            RouteAlgorithm::Failover => 0,
+            RouteAlgorithm::RoundRobin => route
+                .cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+
+        for offset in 0..route.peers.len() {
+            let index = (start.wrapping_add(offset)) % route.peers.len();
+            if let Some(client) = self.live_client(&route.peers[index]) {
+                return Some(client);
+            }
+        }
+
+        tracing::warn!(
+            application = ?application,
+            realm = realm.unwrap_or("-"),
+            peers = ?route.peers,
+            "diameter: no connected peer on the route for this application",
+        );
+        None
     }
 
     /// Register a connected client under its peer name.
@@ -579,6 +709,206 @@ impl DiameterManager {
 mod tests {
     use super::*;
     use crate::diameter::peer::PeerConfig;
+
+    fn test_peer_config(host: &str) -> PeerConfig {
+        PeerConfig {
+            host: host.to_string(),
+            port: 3868,
+            origin_host: "siphon.example.com".to_string(),
+            origin_realm: "example.com".to_string(),
+            destination_host: None,
+            destination_realm: "example.com".to_string(),
+            local_ip: "192.0.2.1".parse().expect("test local ip"),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 100,
+        }
+    }
+
+    /// Register `name` and hand back its peer so a test can close it.
+    fn register_test_peer(manager: &DiameterManager, name: &str) -> Arc<peer::DiameterPeer> {
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(1);
+        // Keep the receiver alive for the peer's lifetime; nothing reads it.
+        std::mem::forget(write_rx);
+        let peer = Arc::new(peer::DiameterPeer::new_for_test(
+            test_peer_config(name),
+            write_tx,
+        ));
+        manager.register(
+            name.to_string(),
+            Arc::new(DiameterClient::new(Arc::clone(&peer))),
+        );
+        peer
+    }
+
+    fn route(
+        application: &str,
+        peers: &[&str],
+        algorithm: &str,
+    ) -> crate::config::DiameterRouteEntry {
+        crate::config::DiameterRouteEntry {
+            application: match application {
+                "cx" => crate::config::DiameterApplication::Cx,
+                "rf" => crate::config::DiameterApplication::Rf,
+                _ => crate::config::DiameterApplication::Ro,
+            },
+            realm: None,
+            peers: peers.iter().map(|p| p.to_string()).collect(),
+            algorithm: algorithm.to_string(),
+        }
+    }
+
+    fn peer_host(client: &Arc<DiameterClient>) -> String {
+        client.peer().config().host.clone()
+    }
+
+    /// The whole point of the routing table: a Cx request must reach the peer
+    /// the operator routed Cx at, not whichever entry the map yields first.
+    /// Before this, every application call took `any_client()`, so an HSS + CDF
+    /// deployment could send a Cx request to the CDF.
+    #[test]
+    fn route_client_picks_the_peer_the_application_is_routed_at() {
+        let manager = DiameterManager::with_routes(&[
+            route("cx", &["hss"], "failover"),
+            route("rf", &["cdf"], "failover"),
+        ]);
+        register_test_peer(&manager, "cdf");
+        register_test_peer(&manager, "hss");
+
+        let cx = manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+            .expect("cx route resolves");
+        assert_eq!(peer_host(&cx), "hss");
+
+        let rf = manager
+            .route_client(&crate::config::DiameterApplication::Rf, None)
+            .expect("rf route resolves");
+        assert_eq!(peer_host(&rf), "cdf");
+    }
+
+    /// Failover order is the configured order, and a closed peer is skipped.
+    #[test]
+    fn route_client_fails_over_to_the_next_connected_peer() {
+        let manager = DiameterManager::with_routes(&[route("cx", &["hss-a", "hss-b"], "failover")]);
+        let primary = register_test_peer(&manager, "hss-a");
+        register_test_peer(&manager, "hss-b");
+
+        let first = manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+            .expect("primary resolves");
+        assert_eq!(peer_host(&first), "hss-a");
+
+        primary.set_state_for_test(peer::PeerState::Closed);
+        let second = manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+            .expect("falls over to the standby");
+        assert_eq!(peer_host(&second), "hss-b");
+    }
+
+    #[test]
+    fn route_client_round_robin_rotates() {
+        let manager =
+            DiameterManager::with_routes(&[route("cx", &["hss-a", "hss-b"], "round_robin")]);
+        register_test_peer(&manager, "hss-a");
+        register_test_peer(&manager, "hss-b");
+
+        let picks: Vec<String> = (0..4)
+            .map(|_| {
+                peer_host(
+                    &manager
+                        .route_client(&crate::config::DiameterApplication::Cx, None)
+                        .expect("round robin resolves"),
+                )
+            })
+            .collect();
+        assert_eq!(picks[0], picks[2], "rotation wraps");
+        assert_eq!(picks[1], picks[3], "rotation wraps");
+        assert_ne!(picks[0], picks[1], "consecutive requests alternate");
+    }
+
+    /// A route whose peers are all down must fail rather than fall through to
+    /// an unrelated peer — sending a Cx request to a CDF is worse than not
+    /// sending it.
+    #[test]
+    fn route_client_does_not_fall_through_to_an_unrelated_peer() {
+        let manager = DiameterManager::with_routes(&[route("cx", &["hss"], "failover")]);
+        let hss = register_test_peer(&manager, "hss");
+        register_test_peer(&manager, "cdf");
+
+        hss.set_state_for_test(peer::PeerState::Closed);
+        assert!(
+            manager
+                .route_client(&crate::config::DiameterApplication::Cx, None)
+                .is_none(),
+            "a dead route must not borrow the CDF"
+        );
+    }
+
+    /// A declared table is authoritative: an application it does not cover must
+    /// fail rather than borrow whichever peer the map yields, which is the same
+    /// mistake as the all-down case.
+    #[test]
+    fn route_client_refuses_an_application_the_table_does_not_cover() {
+        let manager = DiameterManager::with_routes(&[route("cx", &["hss"], "failover")]);
+        register_test_peer(&manager, "hss");
+        register_test_peer(&manager, "cdf");
+
+        assert!(
+            manager
+                .route_client(&crate::config::DiameterApplication::Rf, None)
+                .is_none(),
+            "an unrouted application must not fall through to an arbitrary peer"
+        );
+    }
+
+    /// Configs written before the table did anything have no routes at all, so
+    /// the single-peer case must keep working untouched.
+    #[test]
+    fn route_client_falls_back_to_any_peer_when_no_routes_are_configured() {
+        let manager = DiameterManager::new();
+        register_test_peer(&manager, "hss");
+        assert!(!manager.has_routes());
+        assert!(manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+            .is_some());
+    }
+
+    #[test]
+    fn route_client_realm_filter_selects_between_routes() {
+        let mut home = route("cx", &["hss-home"], "failover");
+        home.realm = Some("home.example.com".to_string());
+        let mut visited = route("cx", &["hss-visited"], "failover");
+        visited.realm = Some("visited.example.com".to_string());
+
+        let manager = DiameterManager::with_routes(&[home, visited]);
+        register_test_peer(&manager, "hss-home");
+        register_test_peer(&manager, "hss-visited");
+
+        let picked = manager
+            .route_client(
+                &crate::config::DiameterApplication::Cx,
+                Some("visited.example.com"),
+            )
+            .expect("realm route resolves");
+        assert_eq!(peer_host(&picked), "hss-visited");
+    }
+
+    #[test]
+    fn route_algorithm_parses_and_defaults_to_failover() {
+        assert_eq!(
+            RouteAlgorithm::parse("round_robin"),
+            RouteAlgorithm::RoundRobin
+        );
+        assert_eq!(
+            RouteAlgorithm::parse("  RoundRobin "),
+            RouteAlgorithm::RoundRobin
+        );
+        assert_eq!(RouteAlgorithm::parse("failover"), RouteAlgorithm::Failover);
+        // An unknown value is the safe default rather than a startup failure.
+        assert_eq!(RouteAlgorithm::parse("magic"), RouteAlgorithm::Failover);
+    }
 
     #[test]
     fn manager_empty() {

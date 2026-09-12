@@ -219,10 +219,12 @@ impl RfChargingService {
             }
             warn!(
                 peer = %name,
-                "rf: configured peer not connected, falling back to any peer"
+                "rf: configured peer not connected, falling back to the application route"
             );
         }
-        self.manager.any_client().map(|c| c.peer().clone())
+        self.manager
+            .route_client(&crate::config::DiameterApplication::Rf, None)
+            .map(|c| c.peer().clone())
     }
 
     /// Send ACR-START.  Returns a session handle that the caller stores

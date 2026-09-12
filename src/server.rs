@@ -3062,7 +3062,11 @@ fn init_li(config: &Config) -> Option<LiState> {
 fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager>> {
     let diameter_config = config.diameter.as_ref()?;
 
-    let manager = Arc::new(crate::diameter::DiameterManager::new());
+    // Route by application, so a Cx request reaches the HSS rather than
+    // whichever peer the map happened to yield first.
+    let manager = Arc::new(crate::diameter::DiameterManager::with_routes(
+        &diameter_config.routes,
+    ));
 
     // Server mode runtime: a JSON snapshot of tenants/listen for
     // `diameter.config`, plus the event sink behind `diameter.event_sink`.
