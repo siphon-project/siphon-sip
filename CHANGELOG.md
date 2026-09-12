@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.7] — 2026-09-12
+
 ### Added
 
 - **`originate` now takes a `body` with its own `content_type`, so an INVITE can
@@ -378,6 +380,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   every other subscriber on the NAT. Set it equal to `ban_duration_secs` to keep
   a fixed TTL. The `security.rate_limit` ban deliberately does not slide — being
   over a rate limit is a capacity verdict, not evidence of intent.
+
+### Changed
+
+- **Dependency updates.** In the `siphon-sip` graph: `uppsala` 0.9 → 0.10.1 (the
+  ETSI X1 XSD validator), `redis` 1.6 → 1.7, `hickory-resolver` 0.26.1 → 0.26.2,
+  `indexmap` 2.14.1 → 2.14.2, `ipnet` 2.12.1 → 2.12.2, `combine` 4.6.7 → 4.6.8
+  and `tokio-rustls` 0.26.4 → 0.26.5. In the `siphon-bin` composition the
+  released binary is built from, additionally `netlink-sys` 0.8.8 → 0.9.0,
+  `quick-xml` 0.41 → 0.42 and `siphon-rtp-proto` 0.4.2 → 0.5.2.
 
 ## [1.8.6] — 2026-09-08
 
