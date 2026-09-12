@@ -53,6 +53,11 @@ mod admin_tests;
 #[path = "integration/packaging_tests.rs"]
 mod packaging_tests;
 
+// Layering rules the 1.9.0 module split rests on, read out of the source
+// because Rust cannot express "this module may not depend on that one".
+#[path = "integration/module_boundary_tests.rs"]
+mod module_boundary_tests;
+
 #[path = "integration/nat_tests.rs"]
 mod nat_tests;
 
