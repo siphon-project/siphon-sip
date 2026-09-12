@@ -8,6 +8,38 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A re-INVITE or UPDATE from the callee no longer addresses the media engine as
+  the caller, and one the engine refuses is answered 488 instead of being
+  forwarded around the anchor.**
+
+  Three faults on the same path, each ending in media that nothing reports as
+  broken.
+
+  The tag naming the offering party fell back to the caller's tag whenever the
+  callee re-INVITEd on a session whose answerer tag had never been recorded. The
+  engine resolves the re-offering party *by* that tag, so the fallback did not
+  name the callee — it claimed to be the caller, and the rewritten SDP came back
+  describing the wrong leg. There is no safe substitute, so such a request is now
+  rejected with 488 (RFC 3261 §14.2; under §14.1 the offerer then keeps the
+  session it already had). The answer direction follows the same rule, except a
+  2xx cannot be refused: there the SDP is left unanchored and the gap logged
+  rather than quietly attributed to the wrong party. The caller-offers direction
+  is unchanged, including its empty answerer tag, which is load-bearing — on a
+  session with no recorded answerer, that 2xx is the first answer the engine sees.
+
+  When the engine refused an offer, the re-INVITE was forwarded anyway carrying
+  the offerer's own SDP, signalling both parties around the anchor with each given
+  the other's real address, and only a warning logged. It is now answered 488, and
+  the glare flag the path had already taken is released so the dialog does not
+  answer 491 to every later re-INVITE.
+
+  `received_from` is now filled on in-dialog offers and answers from the address
+  the request or response actually arrived from, as the initial offer already
+  does. The engine gates a leg's media ingress on the last hint it was given, so a
+  client that changed network mid-call (Wi-Fi to mobile data) stayed gated on its
+  old public address paired with its new port, and every packet from the new
+  address was dropped.
+
 - **A TCP or TLS send that has to open a new connection no longer holds up
   every other send while it connects.**
 

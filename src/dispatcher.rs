@@ -18806,44 +18806,45 @@ fn handle_b2bua_response(
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
-                        // The answer comes from the opposite side of the offer.
-                        // In RTPEngine: from_tag = offerer, to_tag = answerer.
-                        let (answer_from, answer_to) = if is_a2b {
-                            // A→B re-INVITE: A offered (from_tag), B answers (to_tag)
-                            (
-                                session.from_tag.as_str(),
-                                session.to_tag.as_deref().unwrap_or(""),
-                            )
+                        // The answer comes from the opposite side of the offer, and the engine keys
+                        // the exchange on the offerer. A B→A answer must therefore name the callee
+                        // as offerer: the caller's tag would claim the exchange ran the other way
+                        // round and re-point the wrong leg's media. A 2xx cannot be refused, so when
+                        // the pair cannot be named the SDP is left alone and the gap is logged.
+                        if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
+                            let mut answer_flags = profile.answer.clone();
+                            // Pin the answering party's ingress to where its own 2xx arrived from,
+                            // as the offer side now does for the offerer.
+                            if answer_flags.carry_received_from {
+                                answer_flags.received_from = Some(response_source.ip());
+                            }
+                            match tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
+                                    session.rtpengine_id(),
+                                    answer_from,
+                                    answer_to,
+                                    &message.body,
+                                    &answer_flags,
+                                ))
+                            }) {
+                                Ok(rewritten_sdp) => {
+                                    message.body = rewritten_sdp;
+                                    message
+                                        .headers
+                                        .set("Content-Length", message.body.len().to_string());
+                                    debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE response SDP (answer)");
+                                }
+                                Err(error) => {
+                                    warn!(call_id = %call_id, "RTPEngine answer for re-INVITE failed: {error}");
+                                }
+                            }
                         } else {
-                            // B→A re-INVITE: B offered (to_tag), A answers (from_tag)
-                            (
-                                session
-                                    .to_tag
-                                    .as_deref()
-                                    .unwrap_or(session.from_tag.as_str()),
-                                session.from_tag.as_str(),
-                            )
-                        };
-                        let answer_flags = profile.answer.clone();
-                        match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
-                                session.rtpengine_id(),
-                                answer_from,
-                                answer_to,
-                                &message.body,
-                                &answer_flags,
-                            ))
-                        }) {
-                            Ok(rewritten_sdp) => {
-                                message.body = rewritten_sdp;
-                                message
-                                    .headers
-                                    .set("Content-Length", message.body.len().to_string());
-                                debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE response SDP (answer)");
-                            }
-                            Err(error) => {
-                                warn!(call_id = %call_id, "RTPEngine answer for re-INVITE failed: {error}");
-                            }
+                            error!(
+                                call_id = %call_id,
+                                "re-INVITE from the callee answered on a media session with no \
+                                 recorded answerer tag — leaving the answer SDP unanchored rather \
+                                 than naming the caller to the media engine"
+                            );
                         }
                     }
                 }
@@ -19184,40 +19185,41 @@ fn handle_b2bua_response(
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
-                        let (answer_from, answer_to) = if is_a2b {
-                            (
-                                session.from_tag.as_str(),
-                                session.to_tag.as_deref().unwrap_or(""),
-                            )
+                        // Same rule as the re-INVITE answer above: a B→A answer must name the callee
+                        // as offerer, and a 2xx cannot be refused, so an unnameable pair leaves the
+                        // SDP alone rather than attributing it to the wrong party.
+                        if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
+                            let mut answer_flags = profile.answer.clone();
+                            if answer_flags.carry_received_from {
+                                answer_flags.received_from = Some(response_source.ip());
+                            }
+                            match tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
+                                    session.rtpengine_id(),
+                                    answer_from,
+                                    answer_to,
+                                    &message.body,
+                                    &answer_flags,
+                                ))
+                            }) {
+                                Ok(rewritten_sdp) => {
+                                    message.body = rewritten_sdp;
+                                    message
+                                        .headers
+                                        .set("Content-Length", message.body.len().to_string());
+                                    debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
+                                }
+                                Err(error) => {
+                                    warn!(call_id = %call_id, "RTPEngine answer for UPDATE failed: {error}");
+                                }
+                            }
                         } else {
-                            (
-                                session
-                                    .to_tag
-                                    .as_deref()
-                                    .unwrap_or(session.from_tag.as_str()),
-                                session.from_tag.as_str(),
-                            )
-                        };
-                        let answer_flags = profile.answer.clone();
-                        match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
-                                session.rtpengine_id(),
-                                answer_from,
-                                answer_to,
-                                &message.body,
-                                &answer_flags,
-                            ))
-                        }) {
-                            Ok(rewritten_sdp) => {
-                                message.body = rewritten_sdp;
-                                message
-                                    .headers
-                                    .set("Content-Length", message.body.len().to_string());
-                                debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
-                            }
-                            Err(error) => {
-                                warn!(call_id = %call_id, "RTPEngine answer for UPDATE failed: {error}");
-                            }
+                            error!(
+                                call_id = %call_id,
+                                "UPDATE from the callee answered on a media session with no \
+                                 recorded answerer tag — leaving the answer SDP unanchored rather \
+                                 than naming the caller to the media engine"
+                            );
                         }
                     }
                 }
@@ -26638,6 +26640,43 @@ fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &Disp
 ///
 /// Re-INVITEs are used for session timer refreshes (RFC 4028), hold/resume,
 /// and codec renegotiation. They are forwarded to the other leg transparently.
+/// Answer an in-dialog offer the media engine will not anchor with 488 Not Acceptable Here (RFC 3261
+/// §14.2; under §14.1 the offerer then keeps the session exactly as it was, which is the safe
+/// outcome). Forwarding the offer with its own SDP instead would route both parties around the
+/// anchor — each told the other's real address — and nothing downstream reports a fault.
+///
+/// `clear_pending_on_a_leg` names the leg whose glare flag the caller took before reaching this
+/// point (`Some(!from_a_leg)` on the re-INVITE path, `None` on UPDATE, which takes none): leaving it
+/// set would have the dialog answer 491 to every later re-INVITE.
+fn reject_unanchorable_offer(
+    message: &SipMessage,
+    inbound: &InboundMessage,
+    state: &DispatcherState,
+    call_id: &str,
+    clear_pending_on_a_leg: Option<bool>,
+) {
+    if let Some(on_a_leg) = clear_pending_on_a_leg {
+        state
+            .call_actors
+            .set_pending_reinvite(call_id, on_a_leg, false);
+    }
+    let response = build_response(
+        message,
+        488,
+        "Not Acceptable Here",
+        state.server_header.as_deref(),
+        &[],
+    );
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+}
+
 fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let sip_call_id = message
         .headers
@@ -27052,16 +27091,34 @@ fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &D
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
-                        // Use the tag of whichever side is sending the offer
-                        let offer_tag = if from_a_leg {
-                            session.from_tag.as_str()
-                        } else {
-                            session
-                                .to_tag
-                                .as_deref()
-                                .unwrap_or(session.from_tag.as_str())
+                        // The tag of whichever side is sending the offer. A re-offer from the callee
+                        // must carry the callee's own tag: the engine resolves the re-offering party
+                        // by tag and answers with the leg facing the *other* one, so substituting
+                        // the caller's tag does not identify the callee — it claims to be the caller
+                        // and comes back wired to the wrong leg.
+                        let Some(offer_tag) = session.offer_tag(from_a_leg) else {
+                            warn!(
+                                call_id = %call_id,
+                                "B2BUA re-INVITE from the callee on a media session with no \
+                                 recorded answerer tag — rejecting with 488 rather than naming the \
+                                 caller to the media engine"
+                            );
+                            reject_unanchorable_offer(
+                                &message,
+                                &inbound,
+                                state,
+                                &call_id,
+                                Some(!from_a_leg),
+                            );
+                            return;
                         };
-                        let offer_flags = profile.offer.clone();
+                        let mut offer_flags = profile.offer.clone();
+                        // Pin media ingress to where this re-INVITE actually came from, the way the
+                        // initial offer does: a client that changed network re-INVITEs from a new
+                        // public address, and the engine gates the leg on the last hint it was given.
+                        if offer_flags.carry_received_from {
+                            offer_flags.received_from = Some(inbound.remote_addr.ip());
+                        }
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
                                 session.rtpengine_id(),
@@ -27075,7 +27132,20 @@ fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &D
                                 debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE SDP (offer)");
                             }
                             Err(error) => {
-                                warn!(call_id = %call_id, "RTPEngine offer for re-INVITE failed: {error}");
+                                error!(
+                                    call_id = %call_id,
+                                    "RTPEngine offer for re-INVITE failed: {error} — rejecting the \
+                                     re-INVITE with 488 rather than forwarding SDP that routes both \
+                                     parties around the anchor"
+                                );
+                                reject_unanchorable_offer(
+                                    &message,
+                                    &inbound,
+                                    state,
+                                    &call_id,
+                                    Some(!from_a_leg),
+                                );
+                                return;
                             }
                         }
                     }
@@ -27584,15 +27654,22 @@ fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: &Dis
                 let a_sip_call_id = &a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
                     if let Some(profile) = profiles.get(&session.profile) {
-                        let offer_tag = if from_a_leg {
-                            session.from_tag.as_str()
-                        } else {
-                            session
-                                .to_tag
-                                .as_deref()
-                                .unwrap_or(session.from_tag.as_str())
+                        // Same tag rule as the re-INVITE path: an UPDATE from the callee needs the
+                        // callee's own tag, and there is no substitute for it.
+                        let Some(offer_tag) = session.offer_tag(from_a_leg) else {
+                            warn!(
+                                call_id = %call_id,
+                                "B2BUA UPDATE from the callee on a media session with no recorded \
+                                 answerer tag — rejecting with 488 rather than naming the caller to \
+                                 the media engine"
+                            );
+                            reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
+                            return;
                         };
-                        let offer_flags = profile.offer.clone();
+                        let mut offer_flags = profile.offer.clone();
+                        if offer_flags.carry_received_from {
+                            offer_flags.received_from = Some(inbound.remote_addr.ip());
+                        }
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
                                 session.rtpengine_id(),
@@ -27606,7 +27683,16 @@ fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: &Dis
                                 debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE SDP (offer)");
                             }
                             Err(error) => {
-                                warn!(call_id = %call_id, "RTPEngine offer for UPDATE failed: {error}");
+                                error!(
+                                    call_id = %call_id,
+                                    "RTPEngine offer for UPDATE failed: {error} — rejecting the \
+                                     UPDATE with 488 rather than forwarding SDP that routes both \
+                                     parties around the anchor"
+                                );
+                                reject_unanchorable_offer(
+                                    &message, &inbound, state, &call_id, None,
+                                );
+                                return;
                             }
                         }
                     }
