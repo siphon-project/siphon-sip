@@ -1123,92 +1123,20 @@ class _DiameterNamespace:
     """Stub diameter namespace with decorator support.
 
     When ``diameter:`` is configured, the Rust DiameterNamespace replaces this.
-    The ``@on_rtr`` decorator still needs to be available for registration even
-    before the Rust instance is injected (decorators run at import time).
+    The decorator still needs to be available for registration even before the
+    Rust instance is injected (decorators run at import time).
     """
 
     @staticmethod
-    def on_rtr(fn):
-        """Register handler for incoming RTR (Registration-Termination-Request).
+    def on_request(fn):
+        """Register a handler for any inbound Diameter request.
 
-        Handler receives (public_identity, reason_code, reason_info).
-        Siphon auto-sends RTA (result 2001) after the handler returns.
-
-        Reason codes: 0=PERMANENT_TERMINATION, 1=NEW_SERVER_ASSIGNED,
-                      2=SERVER_CHANGE, 3=REMOVE_SCSCF
-
-        Usage:
-            @diameter.on_rtr
-            def handle_rtr(public_identity, reason_code, reason_info):
-                registrar.remove(public_identity)
+        There are no per-command decorators: read ``req.command_name`` and
+        answer with ``req.answer(code)`` / ``req.reject(code)`` /
+        ``await req.forward_to(peer)``.
         """
         is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("diameter.on_rtr", None, fn, is_async)
-        return fn
-
-    @staticmethod
-    def on_rar(fn):
-        """Register handler for incoming RAR (Re-Auth-Request) from PCRF.
-
-        Handler receives (session_id, abort_cause, specific_actions).
-        Siphon auto-sends RAA (result 2001) after the handler returns.
-
-        specific_actions is a list of int values (TS 29.214 Specific-Action):
-            1=CHARGING_CORRELATION_EXCHANGE
-            2=INDICATION_OF_LOSS_OF_BEARER
-            3=INDICATION_OF_RECOVERY_OF_BEARER
-            4=INDICATION_OF_RELEASE_OF_BEARER
-            6=INDICATION_OF_ESTABLISHMENT_OF_BEARER
-            7=IP_CAN_CHANGE
-
-        Usage:
-            @diameter.on_rar
-            def handle_rar(session_id, abort_cause, specific_actions):
-                if 2 in specific_actions:
-                    log.warn(f"Bearer lost for session {session_id}")
-        """
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("diameter.on_rar", None, fn, is_async)
-        return fn
-
-    @staticmethod
-    def on_asr(fn):
-        """Register handler for incoming ASR (Abort-Session-Request) from PCRF.
-
-        Handler receives (session_id, abort_cause, origin_host).
-        Siphon auto-sends ASA (result 2001) after the handler returns.
-
-        abort_cause values (TS 29.214):
-            0=BEARER_RELEASED
-            1=INSUFFICIENT_SERVER_RESOURCES
-            2=INSUFFICIENT_BEARER_RESOURCES
-
-        Usage:
-            @diameter.on_asr
-            def handle_asr(session_id, abort_cause, origin_host):
-                log.info(f"Session abort from {origin_host}: {session_id}")
-        """
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("diameter.on_asr", None, fn, is_async)
-        return fn
-
-    @staticmethod
-    def on_pnr(fn):
-        """Register handler for incoming Sh PNR (Push-Notification-Request) from HSS.
-
-        Handler receives (public_identity, user_data_xml).
-        Siphon auto-sends PNA (result 2001) after the handler returns.
-
-        The HSS sends PNR when a user's profile changes (simservs edit,
-        iFC update, etc.) after the AS subscribed via ``diameter.sh_snr``.
-
-        Usage:
-            @diameter.on_pnr
-            def handle_pnr(public_identity, user_data_xml):
-                cache.put("simservs", public_identity, user_data_xml)
-        """
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("diameter.on_pnr", None, fn, is_async)
+        _registry.register("diameter.on_request", None, fn, is_async)
         return fn
 
 
