@@ -216,7 +216,7 @@ criterion = "0.8"
 # `cargo bench --benches` and auto-discovers each benchmark id, so adding a new
 # bench file here needs no other wiring.
 [[bench]]
-name = "sip_hot_path"      # SIP parse / serialize / header touch / txn keying
+name = "sip_hot_path"      # SIP parse/validate, clone, serialize, header touch, txn keying, framing, counters
 harness = false
 
 [[bench]]
