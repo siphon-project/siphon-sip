@@ -19,9 +19,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   fell back to it, so a deployment with more than one client peer could send a
   Cx request to the CDF. Selection now walks the route's peers, skipping any
   that is not connected, with `failover` (configured order) and `round_robin`
-  honoured. A route whose peers are all down fails rather than falling through
-  to an unrelated peer. Deployments with no `routes:` block, or a single peer,
-  are unaffected.
+  honoured. Once a `routes:` block exists it is authoritative: a route whose
+  peers are all down, or an application the table does not cover, fails rather
+  than falling through to an arbitrary peer. Deployments with no `routes:`
+  block, or a single peer, are unaffected. If you have a `routes:` block, check
+  it covers every application you use, including `rf`/`ro` auto-emit, which are
+  not called from a script.
 
 - **`diameter.send_request(timeout_ms=...)` is now honoured.** It was accepted,
   documented as a per-request timeout, and discarded, so every call waited the

@@ -563,9 +563,10 @@ impl DiameterManager {
     /// through to an unrelated peer, because sending a Cx request to a CDF is
     /// worse than not sending it.
     ///
-    /// With no matching route this falls back to `any_client()`, which keeps
-    /// single-peer deployments (and every config written before the table did
-    /// anything) working unchanged.
+    /// With no routes configured at all this falls back to `any_client()`, so
+    /// single-peer deployments and pre-routing configs are unaffected. But once
+    /// a table exists it is authoritative: an application it does not cover
+    /// returns `None` rather than reaching for an arbitrary peer.
     pub fn route_client(
         &self,
         application: &crate::config::DiameterApplication,
@@ -580,7 +581,20 @@ impl DiameterManager {
                 _ => true,
             }
         }) else {
-            return self.any_client();
+            // No table at all: single-peer deployments and every config written
+            // before the table did anything keep working unchanged.
+            if self.routes.is_empty() {
+                return self.any_client();
+            }
+            // A table that exists but does not cover this application is a
+            // config gap, not a licence to pick an arbitrary peer. Once the
+            // operator has declared routing, it is authoritative.
+            tracing::warn!(
+                application = ?application,
+                realm = realm.unwrap_or("-"),
+                "diameter: no route configured for this application",
+            );
+            return None;
         };
 
         if route.peers.is_empty() {
@@ -832,10 +846,27 @@ mod tests {
         );
     }
 
+    /// A declared table is authoritative: an application it does not cover must
+    /// fail rather than borrow whichever peer the map yields, which is the same
+    /// mistake as the all-down case.
+    #[test]
+    fn route_client_refuses_an_application_the_table_does_not_cover() {
+        let manager = DiameterManager::with_routes(&[route("cx", &["hss"], "failover")]);
+        register_test_peer(&manager, "hss");
+        register_test_peer(&manager, "cdf");
+
+        assert!(
+            manager
+                .route_client(&crate::config::DiameterApplication::Rf, None)
+                .is_none(),
+            "an unrouted application must not fall through to an arbitrary peer"
+        );
+    }
+
     /// Configs written before the table did anything have no routes at all, so
     /// the single-peer case must keep working untouched.
     #[test]
-    fn route_client_falls_back_to_any_peer_when_no_route_matches() {
+    fn route_client_falls_back_to_any_peer_when_no_routes_are_configured() {
         let manager = DiameterManager::new();
         register_test_peer(&manager, "hss");
         assert!(!manager.has_routes());
