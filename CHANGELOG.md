@@ -13,6 +13,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **`diameter.routes[]` is now an actual routing table.** `application`,
+  `realm`, peer order and `algorithm` were parsed and never consulted: every
+  Cx/Sh/Rx/S6c/SGd call took `any_client()` (an arbitrary map entry) and Rf/Ro
+  fell back to it, so a deployment with more than one client peer could send a
+  Cx request to the CDF. Selection now walks the route's peers, skipping any
+  that is not connected, with `failover` (configured order) and `round_robin`
+  honoured. A route whose peers are all down fails rather than falling through
+  to an unrelated peer. Deployments with no `routes:` block, or a single peer,
+  are unaffected.
+
 - **`diameter.send_request(timeout_ms=...)` is now honoured.** It was accepted,
   documented as a per-request timeout, and discarded, so every call waited the
   peer's fixed 10 s. Values below 100 ms are floored, matching `forward_to`, so

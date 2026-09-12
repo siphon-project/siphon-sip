@@ -945,7 +945,10 @@ impl PyDiameter {
         visited_network_id: Option<&str>,
         user_auth_type: Option<u32>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+        {
             Some(client) => client,
             None => {
                 warn!("cx_uar: no Diameter peer connected");
@@ -998,7 +1001,10 @@ impl PyDiameter {
         server_name: Option<&str>,
         assignment_type: u32,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+        {
             Some(client) => client,
             None => {
                 warn!("cx_sar: no Diameter peer connected");
@@ -1045,7 +1051,10 @@ impl PyDiameter {
         python: Python<'py>,
         public_identity: &str,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+        {
             Some(client) => client,
             None => {
                 warn!("cx_lir: no Diameter peer connected");
@@ -1272,7 +1281,10 @@ impl PyDiameter {
         use crate::diameter::dictionary::{self, avp};
         use crate::diameter::rx::MediaComponent;
 
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Rx, None)
+        {
             Some(client) => client,
             None => {
                 warn!("rx_aar: no Diameter peer connected");
@@ -1616,7 +1628,10 @@ impl PyDiameter {
         data_reference: &Bound<'_, PyAny>,
         service_indication: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Sh, None)
+        {
             Some(client) => client,
             None => {
                 warn!("sh_udr: no Diameter peer connected");
@@ -1674,7 +1689,10 @@ impl PyDiameter {
         xml: &str,
         service_indication: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Sh, None)
+        {
             Some(client) => client,
             None => {
                 warn!("sh_pur: no Diameter peer connected");
@@ -1730,7 +1748,10 @@ impl PyDiameter {
         subs_req_type: u32,
         service_indication: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Sh, None)
+        {
             Some(client) => client,
             None => {
                 warn!("sh_snr: no Diameter peer connected");
@@ -1763,7 +1784,10 @@ impl PyDiameter {
 
     #[pyo3(signature = (session_id,))]
     fn rx_str(&self, session_id: &str) -> PyResult<Option<u32>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Rx, None)
+        {
             Some(client) => client,
             None => {
                 warn!("rx_str: no Diameter peer connected");
@@ -1814,7 +1838,10 @@ impl PyDiameter {
         sc_address: &str,
         sm_rp_mti: Option<u32>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::S6c, None)
+        {
             Some(client) => client,
             None => {
                 warn!("s6c_srr: no Diameter peer connected");
@@ -1867,7 +1894,10 @@ impl PyDiameter {
         sc_address: &str,
         delivery_outcome: u32,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::S6c, None)
+        {
             Some(client) => client,
             None => {
                 warn!("s6c_rsr: no Diameter peer connected");
@@ -1925,7 +1955,10 @@ impl PyDiameter {
         smsmi_correlation_id: Option<&str>,
         sm_rp_mti: Option<u32>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let client = match self.manager.any_client() {
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Sgd, None)
+        {
             Some(client) => client,
             None => {
                 warn!("sgd_tfr: no Diameter peer connected");
