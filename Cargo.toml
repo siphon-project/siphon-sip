@@ -270,6 +270,9 @@ unused = "warn"
 
 [lints.clippy]
 all = "warn"
+# Pedantic, so `all` does not enable it. See clippy.toml for the threshold and
+# why this matters more than the file-size gate.
+too_many_lines = "warn"
 
 [profile.release]
 strip = true

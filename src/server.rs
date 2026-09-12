@@ -346,6 +346,7 @@ impl SiphonServer {
     }
 
     /// Async entry point — all the real work happens here.
+    #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. run_async: 60 bootstrap sections; becomes src/server/{logging,components,...}
     async fn run_async(mut self) {
         let product_name = self.product_name.unwrap_or("SIPhon");
         let product_version = self.product_version.unwrap_or(env!("CARGO_PKG_VERSION"));

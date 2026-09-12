@@ -8,3 +8,18 @@
 # domain's inherently-wide protocol functions. This replaces the scattered
 # per-function `#[allow(clippy::too_many_arguments)]` attributes.
 too-many-arguments-threshold = 12
+
+# too-many-lines-threshold: the rule that would actually have prevented
+# dispatcher.rs. That file did not grow by adding functions, it grew by adding
+# to them — handle_b2bua_response passed 500 lines long before the file passed
+# 10,000, and no file-size gate catches that.
+#
+# 300 is where a match with a dozen arms still reads top to bottom. Twelve
+# functions exceed it today and each carries an #[allow] naming why: ten are in
+# dispatcher.rs and one is server.rs::run_async, all decomposed by the 1.9.0
+# module split, and the twelfth is metrics::SiphonMetrics::new, a flat table of
+# one registration per metric and a permanent exemption for the same reason its
+# file is on the size allowlist.
+#
+# scripts/check_too_many_lines_allows.py pins that count so it can only fall.
+too-many-lines-threshold = 300
