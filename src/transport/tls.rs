@@ -516,7 +516,7 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) {
+) -> std::io::Result<()> {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
         std::process::exit(1);
@@ -533,13 +533,7 @@ pub async fn listen(
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
     // surfacing as a listener that silently never exists.
-    let listener = match bind_tcp_listener(local_addr, tos) {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind TLS listener on {local_addr}: {error}");
-            return;
-        }
-    };
+    let listener = bind_tcp_listener(local_addr, tos)?;
     info!("TLS listener on {}", local_addr);
 
     tokio::spawn(async move {
@@ -657,6 +651,8 @@ pub async fn listen(
             }
         }
     });
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -956,7 +952,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("tls listener must bind");
 
         // We need the actual bound port. Since listen() binds inside a spawned task,
         // give it a moment to bind.
@@ -1008,7 +1005,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("tls listener must bind");
 
         // Give the listener time to bind
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1085,7 +1083,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("tls listener must bind");
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

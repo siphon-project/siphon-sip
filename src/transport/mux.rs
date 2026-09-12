@@ -78,7 +78,7 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) {
+) -> std::io::Result<()> {
     let secure = tls_config.is_some();
     let (sip_transport, websocket_transport) = if secure {
         (Transport::Tls, Transport::WebSocketSecure)
@@ -118,13 +118,7 @@ pub async fn listen(
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
     // surfacing as a listener that silently never exists.
-    let listener = match bind_tcp_listener(local_addr, tos) {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!("failed to bind {sip_transport}+{websocket_transport} mux listener on {local_addr}: {error}");
-            return;
-        }
-    };
+    let listener = bind_tcp_listener(local_addr, tos)?;
     info!("{sip_transport}+{websocket_transport} mux listener on {local_addr}");
 
     tokio::spawn(async move {
@@ -227,6 +221,8 @@ pub async fn listen(
             });
         }
     });
+
+    Ok(())
 }
 
 /// Sniff one accepted (and, for `tls`/`wss`, already-decrypted) stream and run
@@ -383,7 +379,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("mux listener must bind");
         // listen() binds inside a spawned task.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

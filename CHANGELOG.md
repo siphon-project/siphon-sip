@@ -13,6 +13,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **A listener that cannot bind now fails startup instead of logging.**
+  `tcp`, `tls`, `ws`, `wss` and the mux returned `()` and reported a failed bind
+  through `error!`, so siphon came up reporting healthy while silently missing a
+  transport — an operator learned of it from a customer. `listen()` now returns
+  `io::Result<()>` and a failed bind on a configured listener exits, naming the
+  transport and address, the way every other SIP proxy behaves.
+
 - **Stream listeners now bind before returning.** `tcp`, `tls`, `ws`, `wss` and
   the protocol mux all bound inside the spawned accept task, so `listen()`
   returned before the socket existed: a peer connecting in that window was

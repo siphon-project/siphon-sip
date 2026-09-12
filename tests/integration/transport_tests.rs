@@ -27,6 +27,38 @@ fn test_acl() -> Arc<TransportAcl> {
     Arc::new(TransportAcl::new(vec![], vec![]))
 }
 
+/// A bind that cannot succeed has to reach the caller.
+///
+/// It used to be logged inside the spawned accept task and swallowed, so
+/// `listen()` returned as if all was well and the socket simply never existed.
+/// An operator got one `error!` line and a node that looked healthy while
+/// missing a transport; a test got a connect timeout pointing at the wrong
+/// thing entirely. Port 1 is privileged, so this bind always fails unprivileged.
+#[tokio::test]
+async fn bind_failure_reaches_the_caller() {
+    let privileged: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+    let (inbound_tx, _inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+
+    let result = tcp::listen(
+        privileged,
+        inbound_tx,
+        outbound_rx,
+        Arc::new(DashMap::new()),
+        test_acl(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a bind that cannot succeed must return Err, not log and carry on"
+    );
+}
+
 /// Helper: find a free port by binding and releasing.
 /// A loopback address reserved for this test, on a port the kernel will not
 /// hand to anything else.
@@ -211,7 +243,8 @@ async fn tcp_roundtrip() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("tcp listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
@@ -287,7 +320,8 @@ async fn tcp_close_notifies_flow_failure() {
         None,
         Some(close_tx),
     )
-    .await;
+    .await
+    .expect("tcp listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // Connect and send a request so we learn the assigned ConnectionId.
@@ -385,7 +419,8 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("tcp listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // 4) Fire-and-forget: send the OutboundMessage UacSender::send_request()
@@ -469,7 +504,8 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
         Some(Arc::clone(&tracker)),
         None,
     )
-    .await;
+    .await
+    .expect("tcp listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
@@ -543,7 +579,8 @@ async fn tls_roundtrip() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("tls listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -626,7 +663,8 @@ async fn ws_roundtrip() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("ws listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect via WebSocket
@@ -714,7 +752,8 @@ async fn wss_roundtrip() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("ws listener must bind");
     tokio::time::sleep(SETTLE).await;
 
     // Manual TLS connect then WebSocket upgrade
@@ -828,7 +867,8 @@ async fn multi_transport_shared_inbound_channel() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("tcp listener must bind");
     ws::listen(
         ws_addr,
         inbound_tx.clone(),
@@ -839,7 +879,8 @@ async fn multi_transport_shared_inbound_channel() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("ws listener must bind");
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
 
