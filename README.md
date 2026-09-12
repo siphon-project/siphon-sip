@@ -789,7 +789,7 @@ call, or auth:
 
 | Bench file | What it measures |
 |------------|------------------|
-| `sip_hot_path`     | RFC 3261 parse (INVITE ±SDP, REGISTER, 200 OK), serialize, roundtrip, header read + copy-on-write mutate, transaction-key extraction (§17) |
+| `sip_hot_path`     | RFC 3261 parse — both the `&str` grammar and the byte-level entry the datapath actually calls — message validation, the two combined (pre-dispatch cost), deep clone, serialize, roundtrip, header read + copy-on-write mutate, transaction-key extraction (§17), stream framing, traffic counters |
 | `sdp_hot_path`     | SDP parse, codec filter, serialize, and the per-call parse→filter→serialize rewrite |
 | `diameter_codec`   | Diameter AVP encode + message decode — a representative IMS Cx MAR (per registration/charging transaction) |
 | `rtpengine_bencode`| rtpengine NG bencode encode/decode of an `offer` (per media-anchored call) |

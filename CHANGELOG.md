@@ -13,6 +13,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)
   was unaffected.
 
+- **The criterion gate no longer skips benchmarks silently.** It iterates the
+  baseline's ids, so a benchmark with no baseline row ran and was never
+  compared — `framing/*` and `traffic_counters/*` had been ungated since they
+  were added. Unbaselined ids are now reported, and fail under `BENCH_STRICT=1`.
+  `scripts/bench_regression.sh --save-new` baselines only ids that have none,
+  so adding a bench can no longer re-floor its neighbours the way `--save`
+  does.
+
 - **`diameter.routes[]` is now an actual routing table.** `application`,
   `realm`, peer order and `algorithm` were parsed and never consulted: every
   Cx/Sh/Rx/S6c/SGd call took `any_client()` (an arbitrary map entry) and Rf/Ro

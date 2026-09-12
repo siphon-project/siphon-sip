@@ -15,6 +15,8 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use siphon::sip::parse_sip_message;
+use siphon::sip::parser::parse_sip_message_bytes;
+use siphon::sip::validate::validate_message;
 use siphon::transaction::TransactionManager;
 use siphon::transport::tcp::{frame_sip_message, FrameVerdict};
 use std::hint::black_box;
@@ -133,6 +135,93 @@ fn bench_parse(criterion: &mut Criterion) {
             let (_, message) = parse_sip_message(black_box(RESPONSE_200)).expect("parse 200");
             black_box(message)
         });
+    });
+
+    group.finish();
+}
+
+/// What the datapath actually calls.
+///
+/// `parse/*` above measures `parse_sip_message(&str)`; the only production
+/// parse site is `parse_sip_message_bytes(&[u8])`, which additionally walks the
+/// header block for the boundary, validates line endings, checks UTF-8, and
+/// re-reads Content-Length with the RFC 4475 overrun check. Every hardening
+/// pass added to that path was invisible to the gate. Keep both groups: the
+/// delta between them is the cost of the byte-level entry.
+fn bench_parse_bytes(criterion: &mut Criterion) {
+    let invite_sdp = invite_with_sdp();
+    let mut group = criterion.benchmark_group("parse_bytes");
+
+    for (name, raw) in [
+        ("invite_sdp", invite_sdp.as_str()),
+        ("invite_no_sdp", INVITE_NO_SDP),
+        ("register", REGISTER),
+        ("response_200", RESPONSE_200),
+    ] {
+        group.throughput(Throughput::Bytes(raw.len() as u64));
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let message =
+                    parse_sip_message_bytes(black_box(raw.as_bytes())).expect("parse bytes");
+                black_box(message)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Shape/version/CSeq/address-header checks, run on every inbound message right
+/// after parse and before any routing decision. Nothing measured it, so a
+/// careless addition here taxes every message invisibly.
+fn bench_validate(criterion: &mut Criterion) {
+    let invite_sdp = invite_with_sdp();
+    let mut group = criterion.benchmark_group("validate");
+
+    for (name, raw) in [
+        ("invite_sdp", invite_sdp.as_str()),
+        ("register", REGISTER),
+        ("response_200", RESPONSE_200),
+    ] {
+        let (_, message) = parse_sip_message(raw).expect("setup parse");
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| black_box(validate_message(black_box(&message))).is_ok());
+        });
+    }
+
+    group.finish();
+}
+
+/// Parse + validate in one region: the exact pre-dispatch cost of an inbound
+/// message, and the number to quote as "what siphon pays before the dispatcher
+/// sees anything".
+fn bench_inbound(criterion: &mut Criterion) {
+    let invite_sdp = invite_with_sdp();
+    let mut group = criterion.benchmark_group("inbound");
+
+    group.throughput(Throughput::Bytes(invite_sdp.len() as u64));
+    group.bench_function("invite_sdp", |bencher| {
+        bencher.iter(|| {
+            let message =
+                parse_sip_message_bytes(black_box(invite_sdp.as_bytes())).expect("parse bytes");
+            let accepted = validate_message(&message).is_ok();
+            black_box((message, accepted))
+        });
+    });
+
+    group.finish();
+}
+
+/// A relayed INVITE is deep-cloned two to four times (relay, proxy session,
+/// each transaction's stored copy). The `Arc<SipMessage>` experiment in the
+/// perf log was reached for because of this cost, and no row measured it.
+fn bench_clone(criterion: &mut Criterion) {
+    let invite_sdp = invite_with_sdp();
+    let (_, message) = parse_sip_message(&invite_sdp).expect("setup parse invite+sdp");
+    let mut group = criterion.benchmark_group("message");
+
+    group.bench_function("clone_invite_sdp", |bencher| {
+        bencher.iter(|| black_box(black_box(&message).clone()));
     });
 
     group.finish();
@@ -348,6 +437,10 @@ fn bench_traffic_counters(criterion: &mut Criterion) {
 criterion_group!(
     benches,
     bench_parse,
+    bench_parse_bytes,
+    bench_validate,
+    bench_inbound,
+    bench_clone,
     bench_serialize,
     bench_roundtrip,
     bench_headers,

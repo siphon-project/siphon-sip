@@ -16,6 +16,13 @@
 # Usage:
 #   scripts/bench_regression.sh            # run + gate against benches/baseline.json
 #   scripts/bench_regression.sh --save     # run + overwrite the baseline (new floor)
+#   scripts/bench_regression.sh --save-new # run + baseline only ids that have none
+#
+# --save-new is how a NEW bench gets its first baseline. Plain --save rewrites
+# every row, which re-floors benchmarks the change never touched; that is fine
+# when locking in a measured improvement and wrong when all you did was add a
+# file. Set BENCH_STRICT=1 to make an unbaselined benchmark a hard failure
+# rather than a warning.
 #   BENCH_THRESHOLD_PCT=10 scripts/bench_regression.sh
 #   BENCH_ARGS="--measurement-time 2 --warm-up-time 1" scripts/bench_regression.sh
 #
@@ -30,21 +37,28 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 MODE="gate"
-[ "${1:-}" = "--save" ] && MODE="save"
+case "${1:-}" in
+  --save) MODE="save" ;;
+  --save-new) MODE="save-new" ;;
+  "") ;;
+  *) die "unknown argument: $1 (expected --save or --save-new)" ;;
+esac
 
 export BENCH_THRESHOLD_PCT="${BENCH_THRESHOLD_PCT:-10}"
 export BENCH_BASELINE="benches/baseline.json"
 export BENCH_CRITERION_DIR="target/criterion"
 export BENCH_MODE="$MODE"
 
-if [ "$MODE" = "gate" ] && [ ! -f "$BENCH_BASELINE" ]; then
+if [ "$MODE" != "save" ] && [ ! -f "$BENCH_BASELINE" ]; then
   die "no baseline at $BENCH_BASELINE — establish one first: scripts/bench_regression.sh --save"
 fi
 
 echo "==> running criterion benches (all hot-path bench targets)"
-# --benches runs every [[bench]] target; the comparison below auto-discovers
-# all benchmark ids under target/criterion, so new bench files are covered with
-# no change here.
+# --benches runs every [[bench]] target. The gate below iterates the BASELINE's
+# ids, so a benchmark with no baseline row runs and is never compared — that is
+# what let `framing/*` and `traffic_counters/*` go ungated for two releases.
+# Unbaselined ids are now reported (and fail under BENCH_STRICT=1); add them
+# with --save-new.
 # shellcheck disable=SC2086
 PYO3_PYTHON="${PYO3_PYTHON:-python3}" cargo bench --benches -- ${BENCH_ARGS:-}
 
@@ -80,11 +94,35 @@ def discover_ids():
     return sorted(found)
 
 
-if mode == "save":
+if mode in ("save", "save-new"):
     measured = {bid: point_estimate(bid) for bid in discover_ids()}
     measured = {bid: ns for bid, ns in measured.items() if ns is not None}
     if not measured:
         sys.exit("error: no benchmark results found to save — did the bench run?")
+
+    if mode == "save-new":
+        # Only add ids that have no row yet. Existing rows are carried over
+        # untouched, so adding a bench cannot quietly re-floor its neighbours.
+        existing = {}
+        if os.path.isfile(baseline_path):
+            with open(baseline_path) as handle:
+                existing = json.load(handle)
+        added = {bid: ns for bid, ns in measured.items() if bid not in existing}
+        if not added:
+            print(f"no unbaselined benchmarks — {baseline_path} already covers all "
+                  f"{len(existing)} measured id(s)")
+            sys.exit(0)
+        combined = dict(existing)
+        combined.update(added)
+        with open(baseline_path, "w") as handle:
+            json.dump(combined, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"added {len(added)} new benchmark(s) to {baseline_path} "
+              f"({len(existing)} existing row(s) untouched)")
+        for bid, ns in sorted(added.items()):
+            print(f"  {bid:<28} {ns/1000:8.3f} us")
+        sys.exit(0)
+
     with open(baseline_path, "w") as handle:
         json.dump(measured, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -126,12 +164,27 @@ if missing:
     for bid in missing:
         print(f"  {bid}")
 
+# The mirror image, and the one that actually bit: a benchmark that ran and has
+# no baseline row is silently not gated.
+unbaselined = [bid for bid in discover_ids() if bid not in baseline]
+if unbaselined:
+    print()
+    print(f"warning: {len(unbaselined)} benchmark(s) ran with no baseline row "
+          f"(not gated — add with --save-new):")
+    for bid in unbaselined:
+        print(f"  {bid}")
+
 if regressions:
     print()
     print(f"FAIL: {len(regressions)} benchmark(s) regressed > {threshold:.0f}%:")
     for bid, delta_pct in regressions:
         print(f"  {bid}: {delta_pct:+.1f}%")
     print("Diagnose and fix, or roll back. Do NOT raise the baseline to go green.")
+    sys.exit(1)
+
+if unbaselined and os.environ.get("BENCH_STRICT") == "1":
+    print()
+    print(f"FAIL: BENCH_STRICT=1 and {len(unbaselined)} benchmark(s) have no baseline.")
     sys.exit(1)
 
 print()
