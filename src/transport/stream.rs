@@ -345,7 +345,7 @@ pub(crate) fn spawn_outbound_distributor(
         pool_fallback_send(
             pool,
             transport,
-            crate::script::api::ipsec::is_protected_local_port,
+            crate::ipsec::runtime::is_protected_local_port,
         )
     });
     spawn_outbound_distributor_with(outbound_rx, connection_map, transport, fallback);
