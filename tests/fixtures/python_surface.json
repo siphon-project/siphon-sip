@@ -1,0 +1,2726 @@
+{
+  "module_attributes": [
+    "AuthVectorHandle",
+    "BsfError",
+    "Flow",
+    "LcrDecision",
+    "PendingSA",
+    "Route",
+    "SAHandle",
+    "SecurityOffer",
+    "SecurityServerParams",
+    "Transform",
+    "auth",
+    "b2bua",
+    "cache",
+    "diameter",
+    "gateway",
+    "isc",
+    "lcr",
+    "li",
+    "log",
+    "metrics",
+    "numbers",
+    "presence",
+    "proxy",
+    "qos",
+    "registrar",
+    "registration",
+    "rtpengine",
+    "sbi",
+    "sdp",
+    "srs",
+    "timer"
+  ],
+  "types": {
+    "AuthNamespace": {
+      "generate_nonce": {
+        "doc": "Challenge with 401 WWW-Authenticate if not yet authenticated.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "require_aka_digest": {
+        "doc": "Local AKA digest authentication using Milenage key derivation.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, realm=None)"
+      },
+      "require_digest": {
+        "doc": "Convenience alias: same as `require_www_digest`.",
+        "kind": "method_descriptor",
+        "sig": "($self, target, realm=None, password=None, ha1=None)"
+      },
+      "require_ims_digest": {
+        "doc": "IMS digest authentication via Diameter Cx MAR/MAA.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, realm=None)"
+      },
+      "require_proxy_digest": {
+        "doc": "Challenge with 407 Proxy-Authenticate if not yet authenticated.",
+        "kind": "method_descriptor",
+        "sig": "($self, target, realm=None, password=None, ha1=None)"
+      },
+      "require_www_digest": {
+        "doc": "If the message carries valid credentials, sets `request.auth_user` /",
+        "kind": "method_descriptor",
+        "sig": "($self, target, realm=None, password=None, ha1=None)"
+      },
+      "validate_nonce": {
+        "doc": "Whether `nonce` is one this engine minted and still accepts.",
+        "kind": "method_descriptor",
+        "sig": "($self, nonce)"
+      },
+      "verify_digest": {
+        "doc": "Verify credentials without sending a challenge.",
+        "kind": "method_descriptor",
+        "sig": "($self, target, realm=None, password=None, ha1=None)"
+      }
+    },
+    "AuthVectorHandle": {},
+    "B2buaControl": {
+      "bridge": {
+        "doc": "Join two answered calls this process owns, so the two parties hear each",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, with_call_id, on_peer_hangup=\"hangup\")"
+      },
+      "originate": {
+        "doc": "Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.",
+        "kind": "method_descriptor",
+        "sig": "($self, to, from_uri=None, from_display=None, to_display=None, next_hop=None, p_asserted_identity=None, privacy=None, headers=None, sdp=None, media=False, profile=None, ws_uri=None, timeout=30, body=None, content_type=None)"
+      },
+      "refer": {
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, target, replaces=None)"
+      },
+      "replace_peer": {
+        "doc": "Replace one leg of an answered call with a freshly dialed target,",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, target, next_hop=None, replace_a_leg=False, profile=None, timeout=30, number_policy=None, format=None)"
+      },
+      "terminate": {
+        "doc": "Imperatively end a B2BUA call by its SIP Call-ID, sending an in-dialog",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, reason=\"Normal Clearing\")"
+      },
+      "unbridge": {
+        "doc": "Break a bridge. Both legs stay answered, owned and held (RFC 3264 \u00a78.4),",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, reason=\"unbridged\")"
+      }
+    },
+    "ByeInitiator": {
+      "side": {
+        "doc": "\"a\" (caller) or \"b\" (callee).",
+        "kind": "getset_descriptor"
+      }
+    },
+    "CacheNamespace": {
+      "delete": {
+        "doc": "Delete a key from a named cache.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key)"
+      },
+      "exists": {
+        "doc": "Check whether ``key`` exists in the named cache.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key)"
+      },
+      "expire": {
+        "doc": "Set a TTL (seconds) on an existing key.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key, ttl)"
+      },
+      "fetch": {
+        "doc": "Fetch a value from a named cache.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key)"
+      },
+      "has_cache": {
+        "doc": "Check if a named cache exists in the configuration.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "list_len": {
+        "doc": "Return the length of the Redis list under ``key`` (``LLEN``).",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key)"
+      },
+      "list_len_sum": {
+        "doc": "Sum ``LLEN`` over every key matching ``{prefix}*`` \u2014 the live",
+        "kind": "method_descriptor",
+        "sig": "($self, name, prefix)"
+      },
+      "list_pop_all": {
+        "doc": "Atomically read and clear a Redis list. Returns the items in",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key)"
+      },
+      "list_push": {
+        "doc": "Push an item onto the right of a Redis list (FIFO when paired",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key, item)"
+      },
+      "store": {
+        "doc": "Store a value in a named cache with optional TTL.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, key, value, ttl=None)"
+      }
+    },
+    "Call": {
+      "accept_refer": {
+        "doc": "Accept the REFER and proceed with the transfer.",
+        "kind": "method_descriptor",
+        "sig": "($self, target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None)"
+      },
+      "active_route": {
+        "doc": "The carrier route that won an LCR sequence (`call.route(...)`), or `None`",
+        "kind": "getset_descriptor"
+      },
+      "answer": {
+        "doc": "UAS-mode answer \u2014 send a final 2xx response to the A-leg INVITE",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason, body=None, content_type=None)"
+      },
+      "auth_user": {
+        "doc": "Username the A-leg authenticated as, or `None` if it was never",
+        "kind": "getset_descriptor"
+      },
+      "body": {
+        "doc": "SDP body content, if present.",
+        "kind": "getset_descriptor"
+      },
+      "call_id": {
+        "doc": "Call-ID header value.",
+        "kind": "getset_descriptor"
+      },
+      "dial": {
+        "doc": "Dial a single target (simple B-leg).",
+        "kind": "method_descriptor",
+        "sig": "($self, uri, timeout=30, max_duration=None, next_hop=None, flow=None, header_policy=None, copy=..., strip=..., translate=..., route=..., send_socket=None, auth_passthrough=False, number_policy=None, format=None)"
+      },
+      "flow": {
+        "doc": "The inbound flow this call's INVITE arrived on \u2014 the B2BUA twin of",
+        "kind": "getset_descriptor"
+      },
+      "fork": {
+        "doc": "Fork to multiple targets.",
+        "kind": "method_descriptor",
+        "sig": "($self, targets, strategy=\"parallel\", timeout=30, max_duration=None, header_policy=None, copy=..., strip=..., translate=..., send_socket=None, auth_passthrough=False, number_policy=None, format=None)"
+      },
+      "from_gateway": {
+        "doc": "True when the A-leg source IP is a member of the resolved addresses",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name)"
+      },
+      "from_uri": {
+        "doc": "From URI of the A-leg.",
+        "kind": "getset_descriptor"
+      },
+      "get_header": {
+        "doc": "Get a header value by name.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "handover": {
+        "doc": "Hand this call over to an out-of-process control application (ARI",
+        "kind": "method_descriptor",
+        "sig": "($self, app, on_lost=None, deadline_ms=None, vars=None, answer=False, profile=None, ws_uri=None)"
+      },
+      "has_header": {
+        "doc": "Check if a header exists.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "header": {
+        "doc": "Alias for get_header.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "id": {
+        "doc": "Unique call identifier.",
+        "kind": "getset_descriptor"
+      },
+      "keep_call_id": {
+        "doc": "Copy the A-leg Call-ID to the B-leg instead of generating a new one.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "local_tag": {
+        "doc": "The UAS To-tag siphon minted for this call's A-leg.",
+        "kind": "getset_descriptor"
+      },
+      "media": {
+        "doc": "Media anchoring handle.",
+        "kind": "getset_descriptor"
+      },
+      "progress": {
+        "doc": "UAS-mode provisional \u2014 send a 1xx response to the A-leg INVITE",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason=\"Ringing\", body=None, content_type=None)"
+      },
+      "refer": {
+        "doc": "Originate an outbound REFER on this call's connected leg \u2014 siphon is the",
+        "kind": "method_descriptor",
+        "sig": "($self, target, replaces=None)"
+      },
+      "refer_replaces": {
+        "doc": "Replaces info from the Refer-To header (for attended transfer).",
+        "kind": "getset_descriptor"
+      },
+      "refer_side": {
+        "doc": "Which side sent the REFER: `\"a\"` (the caller's leg) or `\"b\"` (the",
+        "kind": "getset_descriptor"
+      },
+      "refer_to": {
+        "doc": "The Refer-To URI (only set during @b2bua.on_refer handler).",
+        "kind": "getset_descriptor"
+      },
+      "reject": {
+        "doc": "Reject the call with a status code.",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason)"
+      },
+      "reject_refer": {
+        "doc": "Reject the REFER with a status code and reason.",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason)"
+      },
+      "remove_header": {
+        "doc": "Remove a header.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "remove_headers_matching": {
+        "doc": "Remove all headers whose names start with a given prefix (case-insensitive).",
+        "kind": "method_descriptor",
+        "sig": "($self, prefix)"
+      },
+      "restrict_caller_id": {
+        "doc": "Withhold the calling party's identity on the B-leg (CLIR), per",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "rewrite_identities": {
+        "doc": "Rewrite dialable identity userparts into a target E.164 shape.",
+        "kind": "method_descriptor",
+        "sig": "($self, policy=None, format=None, headers=None, home=None)"
+      },
+      "ro_authorize": {
+        "doc": "Reserve prepaid credit (Ro CCR-INITIAL) for this call BEFORE dialing the",
+        "kind": "method_descriptor",
+        "sig": "($self, *, subscription_id=None, subscription_id_type=None)"
+      },
+      "route": {
+        "doc": "Route this call across an ordered list of carrier `Route`s with",
+        "kind": "method_descriptor",
+        "sig": "($self, routes, timeout=30, max_duration=None, send_socket=None)"
+      },
+      "route_attempts": {
+        "doc": "Every carrier attempt that FAILED before this call settled, oldest first",
+        "kind": "getset_descriptor"
+      },
+      "ruri": {
+        "doc": "Request-URI of the A-leg INVITE.",
+        "kind": "getset_descriptor"
+      },
+      "session_timer": {
+        "doc": "Set per-call session timer parameters (overrides global config).",
+        "kind": "method_descriptor",
+        "sig": "($self, expires=1800, min_se=90, refresher=\"b2bua\")"
+      },
+      "set_body": {
+        "doc": "Replace the body of the captured A-leg INVITE.",
+        "kind": "method_descriptor",
+        "sig": "($self, body, content_type=None)"
+      },
+      "set_caller_id": {
+        "doc": "Present `number` as the calling party, on `From` and on",
+        "kind": "method_descriptor",
+        "sig": "($self, number)"
+      },
+      "set_charging_param": {
+        "doc": "Stash a charging-param the dispatcher's Rf B2BUA auto-emit hook",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "set_contact_uri": {
+        "doc": "Replace the entire B-leg Contact URI \u2014 a full override of siphon's",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_contact_user": {
+        "doc": "Inject a userpart into the B-leg Contact URI, keeping siphon's advertised",
+        "kind": "method_descriptor",
+        "sig": "($self, user)"
+      },
+      "set_credentials": {
+        "doc": "Set outbound credentials for B-leg digest auth.",
+        "kind": "method_descriptor",
+        "sig": "($self, username, password)"
+      },
+      "set_from_host": {
+        "doc": "Pin the host part of the B-leg From header URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_from_uri": {
+        "doc": "Replace the entire From header URI on the B-leg INVITE \u2014 scheme, user,",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_from_user": {
+        "doc": "Set the user part of the From header URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_header": {
+        "doc": "Set a header value (for B-leg INVITE generation).",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "set_max_duration": {
+        "doc": "Cap how long this call may stay answered, in seconds.",
+        "kind": "method_descriptor",
+        "sig": "($self, seconds)"
+      },
+      "set_ruri_user": {
+        "doc": "Set the user part of the Request-URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_to_host": {
+        "doc": "Pin the host part of the B-leg To header URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_to_uri": {
+        "doc": "Replace the entire To header URI on the B-leg INVITE \u2014 scheme, user,",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_to_user": {
+        "doc": "Set the user part of the To header URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "source_ip": {
+        "doc": "Source IP of the A-leg caller.",
+        "kind": "getset_descriptor"
+      },
+      "source_ip_in": {
+        "doc": "Check if the A-leg source IP is within any of the given CIDR ranges.",
+        "kind": "method_descriptor",
+        "sig": "($self, cidr_list)"
+      },
+      "state": {
+        "doc": "Call state: \"calling\", \"ringing\", \"answered\", \"terminated\".",
+        "kind": "getset_descriptor"
+      },
+      "terminate": {
+        "doc": "Terminate the call (send BYE to both legs).",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "to_uri": {
+        "doc": "To URI of the A-leg.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "CdrNamespace": {
+      "enabled": {
+        "doc": "Check if the CDR system is enabled.",
+        "kind": "getset_descriptor"
+      },
+      "write": {
+        "doc": "Write a CDR from a Python script, or attach fields to the record",
+        "kind": "method_descriptor",
+        "sig": "($self, source, extra=None)"
+      }
+    },
+    "Contact": {
+      "age_secs": {
+        "doc": "Seconds since this binding was created or last refreshed.",
+        "kind": "getset_descriptor"
+      },
+      "expires": {
+        "doc": "Seconds remaining until this contact expires.",
+        "kind": "getset_descriptor"
+      },
+      "flow": {
+        "doc": "Captured inbound flow (`Flow` view) \u2014 pass to",
+        "kind": "getset_descriptor"
+      },
+      "flow_token": {
+        "doc": "Opaque proxy-side token attached at REGISTER time via",
+        "kind": "getset_descriptor"
+      },
+      "instance_epoch": {
+        "doc": "Boot-time epoch UUID of the process that accepted this REGISTER.",
+        "kind": "getset_descriptor"
+      },
+      "instance_id": {
+        "doc": "Stable identity of the siphon instance that accepted this REGISTER.",
+        "kind": "getset_descriptor"
+      },
+      "is_local": {
+        "doc": "True when this binding was accepted by the *current* siphon process.",
+        "kind": "getset_descriptor"
+      },
+      "kind": {
+        "doc": "What kind of binding this is \u2014 ``\"ue\"`` (default) or ``\"as\"``.",
+        "kind": "getset_descriptor"
+      },
+      "params": {
+        "doc": "Contact-header parameters preserved from the originating REGISTER.",
+        "kind": "getset_descriptor"
+      },
+      "path": {
+        "doc": "RFC 3327 Path headers stored with this contact binding.",
+        "kind": "getset_descriptor"
+      },
+      "q": {
+        "doc": "Quality value (0.0\u20131.0).",
+        "kind": "getset_descriptor"
+      },
+      "received": {
+        "doc": "The transport source address of the REGISTER, as a SIP URI:",
+        "kind": "getset_descriptor"
+      },
+      "uri": {
+        "doc": "The contact URI as a string.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "Counter": {
+      "inc": {
+        "doc": "Increment the counter (no-label metrics only).",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      },
+      "labels": {
+        "doc": "Return a labeled child counter.",
+        "kind": "method_descriptor",
+        "sig": "($self, **kwargs)"
+      }
+    },
+    "CounterChild": {
+      "inc": {
+        "doc": "Increment this labeled counter.",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      }
+    },
+    "Destination": {
+      "address": {
+        "doc": "The socket address as a string.",
+        "kind": "getset_descriptor"
+      },
+      "attrs": {
+        "doc": "User-defined attributes.",
+        "kind": "getset_descriptor"
+      },
+      "healthy": {
+        "doc": "Whether the destination is healthy.",
+        "kind": "getset_descriptor"
+      },
+      "priority": {
+        "doc": "Priority tier (lower = higher priority).",
+        "kind": "getset_descriptor"
+      },
+      "uri": {
+        "doc": "The SIP URI to route to.",
+        "kind": "getset_descriptor"
+      },
+      "weight": {
+        "doc": "Weight for load balancing.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "DiameterAnswer": {
+      "command_code": {
+        "kind": "getset_descriptor"
+      },
+      "get_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, vendor=0)"
+      },
+      "is_error": {
+        "kind": "getset_descriptor"
+      },
+      "iter_avps": {
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "remove_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, vendor=0)"
+      },
+      "result_code": {
+        "kind": "getset_descriptor"
+      },
+      "set_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, value, vendor=0)"
+      }
+    },
+    "DiameterEventSink": {
+      "emit": {
+        "doc": "Emit a JSON-serializable row. No-op when no sink is configured.",
+        "kind": "method_descriptor",
+        "sig": "($self, row)"
+      }
+    },
+    "DiameterInboundPeer": {
+      "addr": {
+        "kind": "getset_descriptor"
+      },
+      "name": {
+        "kind": "getset_descriptor"
+      },
+      "tenant": {
+        "kind": "getset_descriptor"
+      },
+      "transport": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "DiameterNamespace": {
+      "config": {
+        "doc": "Read-only view of the parsed `diameter` config (`tenants`, `listen`),",
+        "kind": "getset_descriptor"
+      },
+      "cx_lir": {
+        "doc": "Send a Cx Location-Info-Request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity)"
+      },
+      "cx_sar": {
+        "doc": "Send a Cx Server-Assignment-Request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, server_name=None, assignment_type=1)"
+      },
+      "cx_uar": {
+        "doc": "Send a Cx User-Authorization-Request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, visited_network_id=None, user_auth_type=None)"
+      },
+      "decode_isdn_address": {
+        "doc": "Decode an ISDN-AddressString (3GPP TS 29.002 \u00a717.7.8) to its E.164",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "encode_isdn_address": {
+        "doc": "Encode an E.164 digit string as an ISDN-AddressString (TS 29.002",
+        "kind": "method_descriptor",
+        "sig": "($self, digits, ton_npi=None)"
+      },
+      "event_sink": {
+        "doc": "The generic event sink (`diameter.event_sink.emit(row)`).",
+        "kind": "getset_descriptor"
+      },
+      "fnmatch": {
+        "doc": "Shell-style glob match (`*`, `?`) \u2014 for route-table matching in scripts.",
+        "kind": "builtin_function_or_method",
+        "sig": "(value, pattern)"
+      },
+      "ip_in_cidr": {
+        "doc": "Whether `addr` falls within `cidr` (helper for routing scripts).",
+        "kind": "builtin_function_or_method",
+        "sig": "(addr, cidr)"
+      },
+      "is_connected": {
+        "doc": "Check if a peer is connected.",
+        "kind": "method_descriptor",
+        "sig": "($self, peer_name)"
+      },
+      "now_us": {
+        "doc": "Monotonic-ish wall-clock microseconds since the Unix epoch.",
+        "kind": "builtin_function_or_method",
+        "sig": "()"
+      },
+      "on_inbound_cer": {
+        "doc": "Register the server mode CER identity callback.",
+        "kind": "builtin_function_or_method",
+        "sig": "(func)"
+      },
+      "on_reply": {
+        "doc": "Register the server mode answer-rewrite hook.",
+        "kind": "builtin_function_or_method",
+        "sig": "(func)"
+      },
+      "on_request": {
+        "doc": "Register the server mode inbound-request dispatcher.",
+        "kind": "builtin_function_or_method",
+        "sig": "(arg=None)"
+      },
+      "on_request_completed": {
+        "doc": "Register the server mode post-answer hook.",
+        "kind": "builtin_function_or_method",
+        "sig": "(func)"
+      },
+      "peer_count": {
+        "doc": "Get the number of connected peers.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "peer_pool": {
+        "doc": "Build a backend peer pool for `target` (a peer name or list of names)",
+        "kind": "method_descriptor",
+        "sig": "($self, target, tenant=None)"
+      },
+      "rf_acr_event": {
+        "doc": "Send an Rf ACR-EVENT to the CDF.",
+        "kind": "method_descriptor",
+        "sig": "($self, *, calling_party=None, called_party=None, sip_method=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, originator_address=None, recipient_address=None, originator_sccp_address=None, recipient_sccp_address=None, sm_message_type=None, reply_path_requested=None, sm_user_data_header=None, sm_service_type=None, sms_node=None, sm_discharge_time=None, number_of_messages_sent=None, client_address=None, data_coding_scheme=None, sms_result=None, sm_protocol_id=None, sm_status=None, application_port_identifier=None, external_identifier=None, sm_device_trigger_indicator=None, mtc_iwf_address=None, user_name=None, subscription_id=None, subscription_id_type=None, cause_code=None, service_context_id=None, peer=None)"
+      },
+      "rf_acr_interim": {
+        "doc": "Send an Rf ACR-INTERIM to the CDF.",
+        "kind": "method_descriptor",
+        "sig": "($self, session_id, record_number, *, calling_party=None, called_party=None, sip_method=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, originator_address=None, recipient_address=None, originator_sccp_address=None, recipient_sccp_address=None, sm_message_type=None, reply_path_requested=None, sm_user_data_header=None, sm_service_type=None, sms_node=None, sm_discharge_time=None, number_of_messages_sent=None, client_address=None, data_coding_scheme=None, sms_result=None, sm_protocol_id=None, sm_status=None, application_port_identifier=None, external_identifier=None, sm_device_trigger_indicator=None, mtc_iwf_address=None, user_name=None, subscription_id=None, subscription_id_type=None, cause_code=None, service_context_id=None, peer=None)"
+      },
+      "rf_acr_start": {
+        "doc": "Send an Rf ACR-START to the CDF.",
+        "kind": "method_descriptor",
+        "sig": "($self, *, calling_party=None, called_party=None, sip_method=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, originator_address=None, recipient_address=None, originator_sccp_address=None, recipient_sccp_address=None, sm_message_type=None, reply_path_requested=None, sm_user_data_header=None, sm_service_type=None, sms_node=None, sm_discharge_time=None, number_of_messages_sent=None, client_address=None, data_coding_scheme=None, sms_result=None, sm_protocol_id=None, sm_status=None, application_port_identifier=None, external_identifier=None, sm_device_trigger_indicator=None, mtc_iwf_address=None, user_name=None, subscription_id=None, subscription_id_type=None, cause_code=None, service_context_id=None, peer=None)"
+      },
+      "rf_acr_stop": {
+        "doc": "Send an Rf ACR-STOP to the CDF.",
+        "kind": "method_descriptor",
+        "sig": "($self, session_id, record_number, *, termination_cause=1, calling_party=None, called_party=None, sip_method=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, originator_address=None, recipient_address=None, originator_sccp_address=None, recipient_sccp_address=None, sm_message_type=None, reply_path_requested=None, sm_user_data_header=None, sm_service_type=None, sms_node=None, sm_discharge_time=None, number_of_messages_sent=None, client_address=None, data_coding_scheme=None, sms_result=None, sm_protocol_id=None, sm_status=None, application_port_identifier=None, external_identifier=None, sm_device_trigger_indicator=None, mtc_iwf_address=None, user_name=None, subscription_id=None, subscription_id_type=None, cause_code=None, service_context_id=None, peer=None)"
+      },
+      "ro_ccr_event": {
+        "doc": "Send a one-shot Ro CCR-EVENT (IEC \u2014 SMS/RCS DIRECT_DEBITING). No session",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, *, subscription_id_type=None, service_context_id=None, requested_action=None, calling_party=None, called_party=None, node_functionality=None, user_session_id=None, originator_address=None, recipient_address=None, sm_message_type=None, sm_service_type=None, sms_node=None, data_coding_scheme=None, peer=None)"
+      },
+      "ro_ccr_initial": {
+        "doc": "Send a Ro CCR-INITIAL (open a Credit-Control session, RFC 8506 / TS",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, *, subscription_id_type=None, service_context_id=None, requested_seconds=None, rating_group=None, service_identifier=None, calling_party=None, called_party=None, sip_method=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, cause_code=None, peer=None)"
+      },
+      "ro_ccr_terminate": {
+        "doc": "Send a Ro CCR-TERMINATION closing a session and reporting final usage.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, session_id, request_number, *, subscription_id_type=None, service_context_id=None, used_seconds=None, rating_group=None, service_identifier=None, peer=None)"
+      },
+      "ro_ccr_update": {
+        "doc": "Send a Ro CCR-UPDATE for an existing session. `request_number` MUST be a",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, session_id, request_number, *, subscription_id_type=None, service_context_id=None, used_seconds=None, requested_seconds=None, rating_group=None, service_identifier=None, peer=None)"
+      },
+      "rx_aar": {
+        "doc": "Send an Rx AA-Request to authorize an IMS media session.",
+        "kind": "method_descriptor",
+        "sig": "($self, session_id=None, framed_ip=None, framed_ipv6=None, media_components=None, af_application_id=\"IMS Services\", subscription_id=None)"
+      },
+      "rx_str": {
+        "kind": "method_descriptor",
+        "sig": "($self, session_id)"
+      },
+      "s6a_air": {
+        "doc": "Send an S6a Authentication-Information-Request to the HSS (MME role).",
+        "kind": "method_descriptor",
+        "sig": "($self, imsi, visited_plmn_id, num_vectors=1, immediate_response_preferred=True, resync_info=None, peer=None)"
+      },
+      "s6a_purge_ue": {
+        "doc": "Send an S6a Purge-UE-Request to the HSS (MME role).",
+        "kind": "method_descriptor",
+        "sig": "($self, imsi, pur_flags=None, peer=None)"
+      },
+      "s6a_ulr": {
+        "doc": "Send an S6a Update-Location-Request to the HSS (MME role).",
+        "kind": "method_descriptor",
+        "sig": "($self, imsi, visited_plmn_id, rat_type=1004, ulr_flags=0, peer=None)"
+      },
+      "s6c_rsr": {
+        "doc": "Send an S6c Report-SM-Delivery-Status request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, user_name, sc_address, delivery_outcome)"
+      },
+      "s6c_srr": {
+        "doc": "Send an S6c Send-Routing-Info-for-SM request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, msisdn, sc_address, sm_rp_mti=None)"
+      },
+      "send_request": {
+        "doc": "Originate a Diameter request by spec name + application name +",
+        "kind": "method_descriptor",
+        "sig": "($self, command, application, peer=None, timeout_ms=10000, **avps)"
+      },
+      "sgd_tfr": {
+        "doc": "Send an SGd MT-Forward-Short-Message request to the served node",
+        "kind": "method_descriptor",
+        "sig": "($self, user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None)"
+      },
+      "sh_pur": {
+        "doc": "Send a Sh Profile-Update-Request to the HSS (AS role).",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, data_reference, xml, service_indication=None)"
+      },
+      "sh_snr": {
+        "doc": "Send a Sh Subscribe-Notifications-Request to the HSS (AS role).",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, data_reference, subs_req_type, service_indication=None)"
+      },
+      "sh_udr": {
+        "doc": "Send a Sh User-Data-Request to the HSS (AS role).",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, data_reference, service_indication=None)"
+      }
+    },
+    "DiameterPeer": {
+      "addr": {
+        "kind": "getset_descriptor"
+      },
+      "name": {
+        "kind": "getset_descriptor"
+      },
+      "tenant": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "DiameterPeerPool": {
+      "live_count": {
+        "kind": "getset_descriptor"
+      },
+      "pick_round_robin": {
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "pick_sticky": {
+        "kind": "method_descriptor",
+        "sig": "($self, key, ttl_secs=300.0)"
+      },
+      "pick_weighted": {
+        "kind": "method_descriptor",
+        "sig": "($self, weights)"
+      }
+    },
+    "DiameterRequest": {
+      "answer": {
+        "doc": "Build an answer for this request carrying `result_code` and the local",
+        "kind": "method_descriptor",
+        "sig": "($self, result_code=2001, error_message=None)"
+      },
+      "application_id": {
+        "kind": "getset_descriptor"
+      },
+      "application_name": {
+        "kind": "getset_descriptor"
+      },
+      "command_code": {
+        "kind": "getset_descriptor"
+      },
+      "command_name": {
+        "kind": "getset_descriptor"
+      },
+      "dest_host": {
+        "kind": "getset_descriptor"
+      },
+      "dest_realm": {
+        "kind": "getset_descriptor"
+      },
+      "extract_imsi": {
+        "doc": "IMSI from the User-Name AVP, if present.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "forward_to": {
+        "doc": "Relay this request to `peer` and await the answer. On loop detection,",
+        "kind": "method_descriptor",
+        "sig": "($self, peer, identity=None, timeout_secs=10.0)"
+      },
+      "get_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, vendor=0)"
+      },
+      "insert_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, value, vendor=0)"
+      },
+      "is_proxiable": {
+        "kind": "getset_descriptor"
+      },
+      "is_request": {
+        "kind": "getset_descriptor"
+      },
+      "iter_avps": {
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "origin_host": {
+        "kind": "getset_descriptor"
+      },
+      "origin_realm": {
+        "kind": "getset_descriptor"
+      },
+      "peer": {
+        "kind": "getset_descriptor"
+      },
+      "reject": {
+        "doc": "Build an error answer for this request (alias of `answer` kept for",
+        "kind": "method_descriptor",
+        "sig": "($self, result_code, error_message=None)"
+      },
+      "remove_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, vendor=0)"
+      },
+      "session_id": {
+        "kind": "getset_descriptor"
+      },
+      "set_avp": {
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, value, vendor=0)"
+      }
+    },
+    "Flow": {
+      "connection_id": {
+        "doc": "Identifier of the accepted inbound connection this flow was captured on.",
+        "kind": "getset_descriptor"
+      },
+      "is_alive": {
+        "doc": "Whether the flow is still usable.",
+        "kind": "getset_descriptor"
+      },
+      "local_addr": {
+        "doc": "String form of the captured listener local address.",
+        "kind": "getset_descriptor"
+      },
+      "remote_addr": {
+        "doc": "String form of the captured remote (UE) address.",
+        "kind": "getset_descriptor"
+      },
+      "transport": {
+        "doc": "Lowercase transport name (\"udp\", \"tcp\", \"tls\", \"ws\", \"wss\").",
+        "kind": "getset_descriptor"
+      }
+    },
+    "GatewayNamespace": {
+      "add_group": {
+        "doc": "Dynamically add a new dispatcher group from Python.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, destinations, /, algorithm=\"weighted\", probe=False)"
+      },
+      "groups": {
+        "doc": "List all group names.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "list": {
+        "doc": "List all destinations in a group.",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name)"
+      },
+      "mark_down": {
+        "doc": "Manually mark a destination as down.",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name, uri)"
+      },
+      "mark_up": {
+        "doc": "Manually mark a destination as up.",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name, uri)"
+      },
+      "remove_group": {
+        "doc": "Remove a group by name.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "select": {
+        "doc": "Select a destination from a named group.",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name, /, key=None, attrs=None)"
+      },
+      "status": {
+        "doc": "Get status of all destinations in a group.",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name)"
+      }
+    },
+    "Gauge": {
+      "dec": {
+        "doc": "Decrement the gauge (no-label metrics only).",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      },
+      "inc": {
+        "doc": "Increment the gauge (no-label metrics only).",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      },
+      "labels": {
+        "doc": "Return a labeled child gauge.",
+        "kind": "method_descriptor",
+        "sig": "($self, **kwargs)"
+      },
+      "set": {
+        "doc": "Set the gauge value (no-label metrics only).",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      }
+    },
+    "GaugeChild": {
+      "dec": {
+        "doc": "Decrement this labeled gauge.",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      },
+      "inc": {
+        "doc": "Increment this labeled gauge.",
+        "kind": "method_descriptor",
+        "sig": "($self, n=1.0)"
+      },
+      "set": {
+        "doc": "Set this labeled gauge value.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      }
+    },
+    "Histogram": {
+      "labels": {
+        "doc": "Return a labeled child histogram.",
+        "kind": "method_descriptor",
+        "sig": "($self, **kwargs)"
+      },
+      "observe": {
+        "doc": "Observe a value (no-label metrics only).",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      }
+    },
+    "HistogramChild": {
+      "observe": {
+        "doc": "Observe a value on this labeled histogram.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      }
+    },
+    "Ipsec": {
+      "active_count": {
+        "doc": "Number of active SA pairs in the kernel (across all UEs).",
+        "kind": "getset_descriptor"
+      },
+      "allocate": {
+        "doc": "Allocate SPIs and install the four IPsec SAs + four policies in the",
+        "kind": "method_descriptor",
+        "sig": "($self, av, offer, transform, expires_secs=None, protocol=None)"
+      },
+      "pcscf_port_c": {
+        "doc": "The configured P-CSCF protected client port (shared across all UEs).",
+        "kind": "getset_descriptor"
+      },
+      "pcscf_port_s": {
+        "doc": "The configured P-CSCF protected server port (shared across all UEs).",
+        "kind": "getset_descriptor"
+      },
+      "stash": {
+        "doc": "Stash a :class:`PendingSA` under ``call_id`` so it survives until the",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, pending)"
+      },
+      "stash_size": {
+        "doc": "Number of PendingSAs currently stashed awaiting the auth REGISTER.",
+        "kind": "getset_descriptor"
+      },
+      "unstash": {
+        "doc": "Pop a stashed :class:`PendingSA`.  Returns ``None`` if the call_id",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id)"
+      }
+    },
+    "IscNamespace": {
+      "evaluate": {
+        "doc": "Evaluate iFCs for a request and return matching Application Servers.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, method, ruri, headers, session_case=\"originating\", start_after_priority=None)"
+      },
+      "has_profile": {
+        "doc": "Check whether a profile is stored for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "profile_count": {
+        "doc": "Number of stored per-user iFC profiles.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "remove_profile": {
+        "doc": "Remove the stored iFC profile for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "store_profile": {
+        "doc": "Parse and store an iFC XML profile for an Address of Record.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, ifc_xml)"
+      }
+    },
+    "LcrDecision": {
+      "reject": {
+        "doc": "The API-side reject, as a dict `{\"code\": int, \"reason\": str}` or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "routes": {
+        "doc": "Ordered carriers, cheapest/most-preferred first. Hand to `call.route()`.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "LcrNamespace": {
+      "route": {
+        "doc": "Query the external LCR API for a routing decision \u2014 **B2BUA-only**.",
+        "kind": "method_descriptor",
+        "sig": "($self, call, trunk_group=None, attributes=None)"
+      }
+    },
+    "LiNamespace": {
+      "destination_count": {
+        "doc": "How many delivery destinations the ADMF has provisioned over X1.",
+        "kind": "getset_descriptor"
+      },
+      "intercept": {
+        "doc": "Report whether this request is being intercepted.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "is_enabled": {
+        "doc": "Check if the LI subsystem is enabled.",
+        "kind": "getset_descriptor"
+      },
+      "is_target": {
+        "doc": "Check whether an active intercept target matches this request.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "record": {
+        "doc": "Start SIPREC recording for a request or call.",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "stop_intercept": {
+        "doc": "Report whether this request is being intercepted.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "stop_recording": {
+        "doc": "Stop SIPREC recording for a request or call.",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "task_count": {
+        "doc": "How many intercept tasks the ADMF has provisioned over X1.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "LogNamespace": {
+      "debug": {
+        "kind": "method_descriptor",
+        "sig": "($self, message)"
+      },
+      "error": {
+        "kind": "method_descriptor",
+        "sig": "($self, message)"
+      },
+      "info": {
+        "kind": "method_descriptor",
+        "sig": "($self, message)"
+      },
+      "warn": {
+        "kind": "method_descriptor",
+        "sig": "($self, message)"
+      },
+      "warning": {
+        "doc": "Alias for `warn()` \u2014 Python convention uses `warning`.",
+        "kind": "method_descriptor",
+        "sig": "($self, message)"
+      }
+    },
+    "MediaHandle": {
+      "anchor": {
+        "doc": "Anchor media through a media proxy.",
+        "kind": "method_descriptor",
+        "sig": "($self, engine=\"rtpengine\", profile=\"srtp_to_rtp\")"
+      },
+      "is_active": {
+        "doc": "Whether media is currently anchored.",
+        "kind": "getset_descriptor"
+      },
+      "release": {
+        "doc": "Release the media anchor.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      }
+    },
+    "MediaSection": {
+      "attrs": {
+        "doc": "All `a=` attribute values for this media section.",
+        "kind": "getset_descriptor"
+      },
+      "codecs": {
+        "doc": "Codec names derived from rtpmap and static payload types.",
+        "kind": "getset_descriptor"
+      },
+      "connection": {
+        "doc": "Media-level connection (`c=`), or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "get_attr": {
+        "doc": "Get the value of the first attribute matching `name`.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "get_attrs_by_name": {
+        "doc": "Get all values of ``a=`` attributes matching ``name``, preserving order.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "has_attr": {
+        "doc": "Check whether a media-level attribute with `name` exists.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "media_type": {
+        "doc": "Media type: `\"audio\"`, `\"video\"`, `\"application\"`, etc.",
+        "kind": "getset_descriptor"
+      },
+      "port": {
+        "doc": "Port number.",
+        "kind": "getset_descriptor"
+      },
+      "protocol": {
+        "doc": "Protocol: `\"RTP/AVP\"`, `\"RTP/SAVPF\"`, etc.",
+        "kind": "getset_descriptor"
+      },
+      "remove_attr": {
+        "doc": "Remove all media-level attributes matching `name`.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "set_attr": {
+        "doc": "Set (replace first or append) a media-level attribute.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value=\"\")"
+      },
+      "set_attrs_by_name": {
+        "doc": "Replace all ``a=`` attributes matching ``name`` with new values.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, values)"
+      }
+    },
+    "MetricsNamespace": {
+      "counter": {
+        "doc": "Create a new counter metric.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, help, labels=None)"
+      },
+      "gauge": {
+        "doc": "Create a new gauge metric.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, help, labels=None)"
+      },
+      "histogram": {
+        "doc": "Create a new histogram metric.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, help, labels=None, buckets=None)"
+      }
+    },
+    "Number": {
+      "cc": {
+        "doc": "Country code, if it matched the configured home country, else `None`.",
+        "kind": "getset_descriptor"
+      },
+      "e164": {
+        "doc": "Global E.164, `+CCNSN` (e.g. `+31612345678`).",
+        "kind": "getset_descriptor"
+      },
+      "format": {
+        "doc": "Format into a named shape: `\"e164\"`, `\"plain\"`, `\"international\"`,",
+        "kind": "method_descriptor",
+        "sig": "($self, format)"
+      },
+      "international": {
+        "doc": "International access form (e.g. `0031612345678`).",
+        "kind": "getset_descriptor"
+      },
+      "national": {
+        "doc": "National trunk form (e.g. `0612345678`); international form for a",
+        "kind": "getset_descriptor"
+      },
+      "nsn": {
+        "doc": "National significant number (digits after the country code).",
+        "kind": "getset_descriptor"
+      },
+      "plain": {
+        "doc": "E.164 digits, no `+` (e.g. `31612345678`).",
+        "kind": "getset_descriptor"
+      }
+    },
+    "NumbersNamespace": {
+      "parse": {
+        "doc": "Parse a raw number string into a [`PyNumber`] using the configured home",
+        "kind": "method_descriptor",
+        "sig": "($self, raw, home=None)"
+      },
+      "policy_names": {
+        "doc": "Names of the configured number policies.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      }
+    },
+    "PendingSA": {
+      "activate": {
+        "doc": "Mark the SA pair active.  Call on receipt of the 200 OK to the auth",
+        "kind": "method_descriptor",
+        "sig": "($self, *, hard_lifetime_secs=None)"
+      },
+      "cleanup": {
+        "doc": "Tear down all four XFRM states + policies for this pair.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "is_active": {
+        "doc": "Whether this PendingSA is in the active state.",
+        "kind": "getset_descriptor"
+      },
+      "is_cleaned": {
+        "doc": "Whether this PendingSA has been torn down.",
+        "kind": "getset_descriptor"
+      },
+      "refresh": {
+        "doc": "Re-key the SA pair for a re-REGISTER under the same Call-ID.",
+        "kind": "method_descriptor",
+        "sig": "($self, av_new)"
+      },
+      "security_server_params": {
+        "doc": "The chosen ``Security-Server`` parameters \u2014 feed these into the",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      }
+    },
+    "PresenceNamespace": {
+      "document_count": {
+        "doc": "Get the total number of entities with published documents.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "expire_stale": {
+        "doc": "Remove expired subscriptions and documents.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "find_by_dialog": {
+        "doc": "Resolve a subscription id from its dialog `(Call-ID, From-tag)`.",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, from_tag)"
+      },
+      "lookup": {
+        "doc": "Look up the current presence document for a URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, entity)"
+      },
+      "notify": {
+        "doc": "Send an in-dialog NOTIFY for a subscription (RFC 3265 \u00a73.2.2).",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, body=None, content_type=None, subscription_state=\"active\")"
+      },
+      "parse_reginfo": {
+        "doc": "Parse an RFC 3680 ``application/reginfo+xml`` body.",
+        "kind": "method_descriptor",
+        "sig": "($self, xml)"
+      },
+      "publish": {
+        "doc": "Publish a presence document for a presentity.",
+        "kind": "method_descriptor",
+        "sig": "($self, entity, pidf_xml, expires=3600)"
+      },
+      "refresh": {
+        "doc": "Refresh a subscription's expiry (RFC 6665 \u00a74.4.1 in-dialog re-SUBSCRIBE).",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, expires)"
+      },
+      "subscribe": {
+        "doc": "Subscribe to presence for a resource.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscriber, resource, event=\"presence\", expires=3600)"
+      },
+      "subscribe_dialog": {
+        "doc": "Create a subscription with full dialog state from a SUBSCRIBE request.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None)"
+      },
+      "subscribers": {
+        "doc": "List subscribers (watchers) for a resource.",
+        "kind": "method_descriptor",
+        "sig": "($self, resource)"
+      },
+      "subscription_count": {
+        "doc": "Get the total number of subscriptions in the store.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "terminate": {
+        "doc": "Send a terminating NOTIFY for a subscription and remove it from the",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, reason=None, body=None, content_type=None)"
+      },
+      "unsubscribe": {
+        "doc": "Unsubscribe by subscription ID.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id)"
+      }
+    },
+    "ProxyUtils": {
+      "enum_lookup": {
+        "doc": "Look up a phone number via ENUM (DNS NAPTR) query.",
+        "kind": "method_descriptor",
+        "sig": "($self, number, suffix=\"e164.arpa.\", service=\"E2U+sip\")"
+      },
+      "memory_used_pct": {
+        "doc": "Return approximate RSS memory usage as a percentage (0-100).",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "rate_limit": {
+        "doc": "Check if a request exceeds the rate limit for its source IP.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, window_secs, max_requests)"
+      },
+      "sanity_check": {
+        "doc": "Perform basic RFC 3261 sanity checks on a request.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "send_request": {
+        "doc": "Originate an outbound SIP request.",
+        "kind": "method_descriptor",
+        "sig": "($self, method, ruri, headers=None, body=None, next_hop=None, wait_for_response=False, timeout_ms=2000)"
+      }
+    },
+    "QosNamespace": {
+      "media_flows_from_sdp": {
+        "doc": "Translate an SDP offer/answer pair into a ``media_components`` list.",
+        "kind": "method_descriptor",
+        "sig": "($self, *, offer, answer, direction=\"orig\")"
+      }
+    },
+    "RecordingMetadata": {
+      "original_call_id": {
+        "doc": "Original call-id of the recorded dialog (first sipSessionID, if any).",
+        "kind": "getset_descriptor"
+      },
+      "participants": {
+        "doc": "List of participants in the recorded call.",
+        "kind": "getset_descriptor"
+      },
+      "session_id": {
+        "doc": "Recording session ID from the SIPREC metadata.",
+        "kind": "getset_descriptor"
+      },
+      "sip_session_ids": {
+        "doc": "SIP Session-IDs from the original call dialog(s) being recorded (RFC 7865).",
+        "kind": "getset_descriptor"
+      },
+      "streams": {
+        "doc": "List of media streams being recorded.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "RegistrarNamespace": {
+      "aor_count": {
+        "doc": "Number of currently registered AoRs across the deployment.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "asserted_identity": {
+        "doc": "Look up stored P-Asserted-Identity for a URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "associated_uris": {
+        "doc": "Retrieve stored P-Associated-URI list for a URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "confirm_pending": {
+        "doc": "Confirm pending contacts for a URI (IMS: SAR succeeded).",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "expire": {
+        "doc": "Force-expire (remove) all contacts for a URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "is_registered": {
+        "doc": "Check if a URI has any registered contacts.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "is_registered_contact": {
+        "doc": "Whether any registered binding has a **Contact** URI matching `uri`.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "lookup": {
+        "doc": "Look up contacts for a URI string or SipUri.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "lookup_by_token": {
+        "doc": "Look up a binding by the opaque token previously attached via",
+        "kind": "method_descriptor",
+        "sig": "($self, token)"
+      },
+      "lookup_contact": {
+        "doc": "Reverse lookup by **Contact** URI: return the registered contacts whose",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "on_change": {
+        "doc": "Decorator to register a handler for registration state changes.",
+        "kind": "builtin_function_or_method",
+        "sig": "(func)"
+      },
+      "reginfo_xml": {
+        "doc": "Generate RFC 3680 reginfo XML for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, state=\"full\", version=0, include_as_contacts=False)"
+      },
+      "remove": {
+        "doc": "Remove all contacts for a URI (deregistration).",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "save": {
+        "doc": "Save contact bindings from a REGISTER and send 200 OK with granted",
+        "kind": "method_descriptor",
+        "sig": "($self, request, force=False, aliases=..., flow_token=None)"
+      },
+      "save_as_contact": {
+        "doc": "Save AS-side capability contacts from a 3PR 200 OK",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, reply, expires_secs=None)"
+      },
+      "save_pending": {
+        "doc": "Save a contact in pending state (IMS: awaiting SAR confirmation).",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "save_proxy": {
+        "doc": "Cache a binding on a proxy after the upstream registrar accepted it.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, reply, aliases=..., flow_token=None)"
+      },
+      "service_route": {
+        "doc": "Get stored Service-Route headers for a URI (RFC 3608).",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_associated_uris": {
+        "doc": "Store P-Associated-URI list for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, uris)"
+      },
+      "set_service_routes": {
+        "doc": "Store Service-Route headers for an AoR (RFC 3608).",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, routes)"
+      }
+    },
+    "RegistrationNamespace": {
+      "add": {
+        "doc": "Add a new outbound registration.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, registrar, *, user, password=\"\", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None)"
+      },
+      "associated_uris": {
+        "doc": "The P-Associated-URI list (implicit registration set) for this AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "count": {
+        "doc": "Number of configured registrations.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "flow": {
+        "doc": "A `Flow` over the established UE\u2192P-CSCF IPsec SA for MO B2BUA calls.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, ue_ip)"
+      },
+      "list": {
+        "doc": "List all registrations with their current state.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "on_change": {
+        "doc": "Decorator to register a handler for outbound-registration state changes.",
+        "kind": "builtin_function_or_method",
+        "sig": "(func)"
+      },
+      "refresh": {
+        "doc": "Force an immediate re-registration for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "remove": {
+        "doc": "Remove an outbound registration by AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "service_route": {
+        "doc": "The Service-Route set (RFC 3608) the S-CSCF granted this AoR on the",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "status": {
+        "doc": "Get the state of a specific registration.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      }
+    },
+    "Reply": {
+      "body": {
+        "doc": "Message body as bytes, or None if empty.",
+        "kind": "getset_descriptor"
+      },
+      "call_id": {
+        "doc": "Call-ID header value.",
+        "kind": "getset_descriptor"
+      },
+      "content_type": {
+        "doc": "Content-Type header value.",
+        "kind": "getset_descriptor"
+      },
+      "fix_nated_contact": {
+        "doc": "Fix NAT for Contact in this response: rewrite Contact URI host:port",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "forward": {
+        "doc": "Alias for `relay()` (used in P-CSCF and S-CSCF scripts).",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "from_gateway": {
+        "doc": "True when the source IP of this response is a member of the resolved",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name)"
+      },
+      "from_uri": {
+        "doc": "From URI parsed from the From header.",
+        "kind": "getset_descriptor"
+      },
+      "get_header": {
+        "doc": "Get the first value of a header, or None.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "get_headers": {
+        "doc": "Every value of a header, in order \u2014 an empty list when it is absent.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "has_body": {
+        "doc": "Check if the body matches a given content type.",
+        "kind": "method_descriptor",
+        "sig": "($self, content_type)"
+      },
+      "has_header": {
+        "doc": "Check if a header exists.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "header": {
+        "doc": "Alias for `get_header` (used in CNAM-AS script).",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "reason": {
+        "doc": "Reason phrase (e.g. \"OK\", \"Not Found\").",
+        "kind": "getset_descriptor"
+      },
+      "reject": {
+        "doc": "Reject an in-progress proxied INVITE from the reply context.",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason=None)"
+      },
+      "relay": {
+        "doc": "Mark this reply for forwarding upstream.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "remove_header": {
+        "doc": "Remove a header entirely.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "remove_headers_matching": {
+        "doc": "Remove all headers whose names start with a given prefix (case-insensitive).",
+        "kind": "method_descriptor",
+        "sig": "($self, prefix)"
+      },
+      "set_header": {
+        "doc": "Set (replace) a header value.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "source_ip": {
+        "doc": "Source IP of the entity that sent this response, or `None` when siphon",
+        "kind": "getset_descriptor"
+      },
+      "source_port": {
+        "doc": "Source port of the entity that sent this response, or `None` (see",
+        "kind": "getset_descriptor"
+      },
+      "status_code": {
+        "doc": "Response status code (e.g. 200, 404, 503).",
+        "kind": "getset_descriptor"
+      },
+      "take_av": {
+        "doc": "Extract the IMS-AKA authentication vector (CK/IK) from any auth",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "to_uri": {
+        "doc": "To URI parsed from the To header.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "Request": {
+      "add_contact_alias": {
+        "doc": "Append `;alias` parameter to the Contact URI for NAT traversal.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "add_path": {
+        "doc": "Prepend a `Path: <uri;lr>` header.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "add_pcscf_path": {
+        "doc": "Insert a Path header (RFC 3327) of the form",
+        "kind": "method_descriptor",
+        "sig": "($self, token)"
+      },
+      "add_reply_header": {
+        "doc": "Append a header to the response built by ``request.reply()`` or",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "auth_user": {
+        "doc": "Authenticated username (set after digest auth succeeds).",
+        "kind": "getset_descriptor"
+      },
+      "body": {
+        "doc": "Message body as bytes, or None if empty.",
+        "kind": "getset_descriptor"
+      },
+      "call_id": {
+        "doc": "Call-ID header value.",
+        "kind": "getset_descriptor"
+      },
+      "consumed_route": {
+        "doc": "First Route entry that ``loose_route()`` consumed, parsed as a",
+        "kind": "getset_descriptor"
+      },
+      "consumed_route_user": {
+        "doc": "User part of the first Route entry that ``loose_route()`` consumed,",
+        "kind": "getset_descriptor"
+      },
+      "consumed_routes": {
+        "doc": "URIs of all Route entries consumed by ``loose_route()`` (in the",
+        "kind": "getset_descriptor"
+      },
+      "contact_expires": {
+        "doc": "Contact expires value \u2014 from the Contact header `expires` parameter,",
+        "kind": "getset_descriptor"
+      },
+      "content_type": {
+        "doc": "Content-Type header value.",
+        "kind": "getset_descriptor"
+      },
+      "cseq": {
+        "doc": "CSeq as a tuple (sequence_number, method_string).",
+        "kind": "getset_descriptor"
+      },
+      "ensure_header": {
+        "doc": "Set a header only if it is not already present.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "event": {
+        "doc": "Event header value (e.g. \"reg\", \"presence\").",
+        "kind": "getset_descriptor"
+      },
+      "fix_nated_contact": {
+        "doc": "Fix NAT for Contact: rewrite Contact URI host:port with source IP:port.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "fix_nated_register": {
+        "doc": "Fix NAT for REGISTER: add `received=` and `rport=` to the top Via",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "flow": {
+        "doc": "View of the inbound flow this request arrived on.  Returns",
+        "kind": "getset_descriptor"
+      },
+      "force_send_via": {
+        "doc": "Force the Via header to use a specific transport and target for sending.",
+        "kind": "method_descriptor",
+        "sig": "($self, transport, target)"
+      },
+      "fork": {
+        "doc": "Fork to multiple targets.",
+        "kind": "method_descriptor",
+        "sig": "($self, targets, strategy=\"parallel\", send_socket=None)"
+      },
+      "from_gateway": {
+        "doc": "True when this request's source IP is a member of the resolved",
+        "kind": "method_descriptor",
+        "sig": "($self, group_name)"
+      },
+      "from_tag": {
+        "doc": "From-tag.",
+        "kind": "getset_descriptor"
+      },
+      "from_uri": {
+        "doc": "From URI parsed from the From header.",
+        "kind": "getset_descriptor"
+      },
+      "generate_icid": {
+        "doc": "Generate a unique ICID for P-Charging-Vector.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "get_header": {
+        "doc": "Get the first value of a header, or None.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "get_headers": {
+        "doc": "Every value of a header, in order \u2014 an empty list when it is absent.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "has_body": {
+        "doc": "Check if the body matches a given content type.",
+        "kind": "method_descriptor",
+        "sig": "($self, content_type)"
+      },
+      "has_header": {
+        "doc": "Check if a header exists.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "header": {
+        "doc": "Alias for get_header (confirmed: CNAM-AS script).",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "in_dialog": {
+        "doc": "Whether the request is in-dialog (has both From-tag and To-tag).",
+        "kind": "getset_descriptor"
+      },
+      "is_ipsec_protected": {
+        "doc": "Whether this request arrived over an IPsec-protected SA.",
+        "kind": "getset_descriptor"
+      },
+      "loose_route": {
+        "doc": "Process loose routing per RFC 3261 \u00a716.4 / \u00a716.12.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "matched_sa": {
+        "doc": "Handle to the SA that decrypted this request, or ``None``.",
+        "kind": "getset_descriptor"
+      },
+      "max_forwards": {
+        "doc": "Max-Forwards value.",
+        "kind": "getset_descriptor"
+      },
+      "method": {
+        "doc": "SIP method as a string (e.g. \"INVITE\", \"REGISTER\").",
+        "kind": "getset_descriptor"
+      },
+      "parse_security_client": {
+        "doc": "Parse the ``Security-Client`` header (RFC 3329, 3GPP TS 33.203) into",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "prepend_route": {
+        "doc": "Prepend a `Route: <uri;lr>` header.",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "record_route": {
+        "doc": "Mark that Record-Route should be inserted.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "relay": {
+        "doc": "Relay the request to its Request-URI, or to an explicit next-hop,",
+        "kind": "method_descriptor",
+        "sig": "($self, next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None)"
+      },
+      "remove_from_header_list": {
+        "doc": "Remove a specific value from a multi-value (comma-separated) header.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "remove_header": {
+        "doc": "Remove a header entirely.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "remove_headers_matching": {
+        "doc": "Remove all headers whose names start with a given prefix (case-insensitive).",
+        "kind": "method_descriptor",
+        "sig": "($self, prefix)"
+      },
+      "reply": {
+        "doc": "Send a response with the given status code and reason phrase.",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason, reliable=False)"
+      },
+      "rewrite_identities": {
+        "doc": "Rewrite dialable identity userparts into a target E.164 shape.",
+        "kind": "method_descriptor",
+        "sig": "($self, policy=None, format=None, headers=None, home=None)"
+      },
+      "route_user": {
+        "doc": "User part of the top Route header URI, or None.",
+        "kind": "getset_descriptor"
+      },
+      "ruri": {
+        "doc": "Request-URI as a PySipUri.",
+        "kind": "getset_descriptor"
+      },
+      "set_body": {
+        "doc": "Replace the body of the incoming request message.",
+        "kind": "method_descriptor",
+        "sig": "($self, body, content_type=None)"
+      },
+      "set_charging_param": {
+        "doc": "Stash a charging-param the dispatcher's Rf auto-emit hook will",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "set_contact_uri": {
+        "doc": "Replace the whole Contact header URI, preserving the display name and any",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_contact_user": {
+        "doc": "Rewrite only the userpart of the Contact header URI, leaving host/port/",
+        "kind": "method_descriptor",
+        "sig": "($self, user)"
+      },
+      "set_from_display": {
+        "doc": "Rewrite the display name in the From header.",
+        "kind": "method_descriptor",
+        "sig": "($self, display_name)"
+      },
+      "set_from_uri": {
+        "doc": "Replace the whole From header URI (scheme/user/host/port/params) in one",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "set_header": {
+        "doc": "Set (replace) a header value on the request message.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "set_reply_body": {
+        "doc": "Attach a body to the response built by ``request.reply()``.",
+        "kind": "method_descriptor",
+        "sig": "($self, body, content_type)"
+      },
+      "set_reply_header": {
+        "doc": "Set (replace) a header on the response built by ``request.reply()``",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value)"
+      },
+      "set_reply_to_tag": {
+        "doc": "Attach a To-tag to the response built by ``request.reply()``.",
+        "kind": "method_descriptor",
+        "sig": "($self, tag)"
+      },
+      "set_ruri_host": {
+        "doc": "Set the host part of the Request-URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_ruri_user": {
+        "doc": "Set the user part of the Request-URI.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
+      "set_to_display": {
+        "doc": "Rewrite the display name in the To header.",
+        "kind": "method_descriptor",
+        "sig": "($self, display_name)"
+      },
+      "set_to_uri": {
+        "doc": "Replace the whole To header URI, preserving the display name and any",
+        "kind": "method_descriptor",
+        "sig": "($self, uri)"
+      },
+      "source_ip": {
+        "doc": "Source IP address.",
+        "kind": "getset_descriptor"
+      },
+      "source_ip_in": {
+        "doc": "Check if the source IP is within any of the given CIDR ranges.",
+        "kind": "method_descriptor",
+        "sig": "($self, cidr_list)"
+      },
+      "source_port": {
+        "doc": "Source port.",
+        "kind": "getset_descriptor"
+      },
+      "stop_propagation": {
+        "doc": "Stop the dispatcher running any further handlers for this request.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "to_tag": {
+        "doc": "To-tag (None for initial requests).",
+        "kind": "getset_descriptor"
+      },
+      "to_uri": {
+        "doc": "To URI parsed from the To header.",
+        "kind": "getset_descriptor"
+      },
+      "transport": {
+        "doc": "Transport protocol (\"udp\", \"tcp\", \"tls\", \"ws\", \"wss\").",
+        "kind": "getset_descriptor"
+      },
+      "user_agent": {
+        "doc": "User-Agent header value.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "Route": {
+      "billing_increment": {
+        "doc": "Billing increment in seconds (60 = per-minute, 1 = per-second).",
+        "kind": "getset_descriptor"
+      },
+      "caller_id": {
+        "doc": "Calling number this carrier is presented (the CLI), or `None` to keep",
+        "kind": "getset_descriptor"
+      },
+      "caller_id_presentation": {
+        "doc": "`\"allowed\"` | `\"restricted\"` \u2014 whether the calling identity may be",
+        "kind": "getset_descriptor"
+      },
+      "carrier_id": {
+        "doc": "Opaque carrier identifier \u2014 carry into CDR / charging, never route on it.",
+        "kind": "getset_descriptor"
+      },
+      "cdr_fields": {
+        "doc": "Fields auto-stamped onto the CDR when this carrier wins.",
+        "kind": "getset_descriptor"
+      },
+      "currency": {
+        "doc": "Rate currency (ISO 4217).",
+        "kind": "getset_descriptor"
+      },
+      "destination": {
+        "doc": "Destination number this carrier's attempt is retargeted at",
+        "kind": "getset_descriptor"
+      },
+      "gateway_group": {
+        "doc": "Configured `gateway:` group siphon resolves to a healthy member at dial",
+        "kind": "getset_descriptor"
+      },
+      "headers": {
+        "doc": "Extra headers injected on this carrier's B-leg INVITE.",
+        "kind": "getset_descriptor"
+      },
+      "is_routable": {
+        "doc": "Whether this route names a gateway group, next-hop, or R-URI.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "min_duration": {
+        "doc": "Minimum billable duration in seconds.",
+        "kind": "getset_descriptor"
+      },
+      "next_hop": {
+        "doc": "Explicit next-hop URI, if the decision pinned one.",
+        "kind": "getset_descriptor"
+      },
+      "number_policy": {
+        "doc": "Named number policy applied to this carrier's B-leg identity headers.",
+        "kind": "getset_descriptor"
+      },
+      "rate": {
+        "doc": "Per-minute rate (for CDR / charging).",
+        "kind": "getset_descriptor"
+      },
+      "reroute_causes": {
+        "doc": "Per-carrier reroute causes (SIP codes that fail over to the next carrier).",
+        "kind": "getset_descriptor"
+      },
+      "ruri": {
+        "doc": "R-URI override for this carrier (e.g. a tech-prefixed number).",
+        "kind": "getset_descriptor"
+      },
+      "tech_prefix": {
+        "doc": "Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart.",
+        "kind": "getset_descriptor"
+      },
+      "timeout_secs": {
+        "doc": "Per-attempt ring timeout in seconds (else the call-level default).",
+        "kind": "getset_descriptor"
+      }
+    },
+    "RtpEngineNamespace": {
+      "active_sessions": {
+        "doc": "Number of active media sessions being tracked.",
+        "kind": "getset_descriptor"
+      },
+      "answer": {
+        "doc": "Send an RTPEngine `answer` command.",
+        "kind": "method_descriptor",
+        "sig": "($self, reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+      },
+      "answer_local": {
+        "doc": "Single-leg UAS answer \u2014 synthesise an RFC 3264 answer for the caller's",
+        "kind": "method_descriptor",
+        "sig": "($self, call, profile=None, auto_reject=True, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+      },
+      "attach_ws_bridge": {
+        "doc": "Attach a **WebSocket takeover bridge** to a live call, or re-point an",
+        "kind": "method_descriptor",
+        "sig": "($self, target, ws_uri)"
+      },
+      "attach_ws_tee": {
+        "doc": "Attach a **WebSocket tee** to a live call \u2014 stream a copy of its decoded",
+        "kind": "method_descriptor",
+        "sig": "($self, target, ws_uri, direction=\"both\", channels=None, sample_rate=None)"
+      },
+      "block_media": {
+        "doc": "Send a `block media` command \u2014 drop outgoing packets on the selected",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "delete": {
+        "doc": "Send an RTPEngine `delete` command to tear down the media session.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
+      "detach_ws_bridge": {
+        "doc": "Detach a call's **WebSocket takeover bridge**, putting its media path",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "detach_ws_tee": {
+        "doc": "Detach a call's **WebSocket tee**, closing its stream.",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "echo": {
+        "doc": "Enable/disable echo-test mode on a call \u2014 reflect the caller's ingress",
+        "kind": "method_descriptor",
+        "sig": "($self, target, enabled=True)"
+      },
+      "instance_count": {
+        "doc": "Number of configured RTPEngine instances.",
+        "kind": "getset_descriptor"
+      },
+      "offer": {
+        "doc": "Send an RTPEngine `offer` command.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+      },
+      "on_beep": {
+        "doc": "Register a handler for **record-tone (voicemail beep)** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_dtmf": {
+        "doc": "Register a handler for inbound DTMF events from rtpengine.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_media_timeout": {
+        "doc": "Register a handler for media-timeout events from the media engine.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_play_finished": {
+        "doc": "Register a handler for **playback finished** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_text": {
+        "doc": "Register a handler for **RFC 4103 real-time text** (T.140) increments.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_bridge_ended": {
+        "doc": "Register a handler for **WebSocket takeover bridge ended** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_bridge_started": {
+        "doc": "Register a handler for **WebSocket takeover bridge started** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_tee_ended": {
+        "doc": "Register a handler for **WebSocket tee ended** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_tee_started": {
+        "doc": "Register a handler for **WebSocket tee started** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "ping": {
+        "doc": "Ping the RTPEngine instance(s). Returns True if healthy.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "play_dtmf": {
+        "doc": "Send a `play DTMF` command \u2014 inject DTMF tone(s) into the call.",
+        "kind": "method_descriptor",
+        "sig": "($self, target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None)"
+      },
+      "play_media": {
+        "doc": "Send a `play media` command \u2014 inject an audio prompt into the call.",
+        "kind": "method_descriptor",
+        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=True)"
+      },
+      "play_overlay": {
+        "doc": "Start an **overlay** playback \u2014 mix audio *under* the party's live egress",
+        "kind": "method_descriptor",
+        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None)"
+      },
+      "set_play_gain": {
+        "doc": "Retune the playout gain of a playback that is already running \u2014 how a",
+        "kind": "method_descriptor",
+        "sig": "($self, target, play_id, gain_decibels, to_tag=None)"
+      },
+      "silence_media": {
+        "doc": "Send a `silence media` command \u2014 replace outgoing audio on the selected",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "stop_media": {
+        "doc": "Send a `stop media` command \u2014 stop prompt playback on the monologue",
+        "kind": "method_descriptor",
+        "sig": "($self, target, play_id=None)"
+      },
+      "subscribe_answer": {
+        "doc": "Send a `subscribe answer` \u2014 complete the SDP negotiation for a",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, from_tag, to_tag, sdp, profile=None)"
+      },
+      "subscribe_request": {
+        "doc": "Send a `subscribe request` \u2014 create a new subscription to an existing",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, from_tag, to_tag, sdp=None, profile=None)"
+      },
+      "unblock_media": {
+        "doc": "Send an `unblock media` command \u2014 resume forwarding the selected",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "unsilence_media": {
+        "doc": "Send an `unsilence media` command \u2014 pass the original stream through",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "unsubscribe": {
+        "doc": "Send an `unsubscribe` command \u2014 tear down a subscription created via",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, from_tag, to_tag)"
+      }
+    },
+    "SAHandle": {
+      "alg": {
+        "kind": "getset_descriptor"
+      },
+      "ealg": {
+        "kind": "getset_descriptor"
+      },
+      "pcscf_addr": {
+        "kind": "getset_descriptor"
+      },
+      "pcscf_port_c": {
+        "kind": "getset_descriptor"
+      },
+      "pcscf_port_s": {
+        "kind": "getset_descriptor"
+      },
+      "protocol": {
+        "doc": "Lower-case transport carrying ESP \u2014 ``\"udp\"`` or ``\"tcp\"``.",
+        "kind": "getset_descriptor"
+      },
+      "spi_pc": {
+        "kind": "getset_descriptor"
+      },
+      "spi_ps": {
+        "kind": "getset_descriptor"
+      },
+      "spi_uc": {
+        "kind": "getset_descriptor"
+      },
+      "spi_us": {
+        "kind": "getset_descriptor"
+      },
+      "ue_addr": {
+        "kind": "getset_descriptor"
+      },
+      "ue_port_c": {
+        "kind": "getset_descriptor"
+      },
+      "ue_port_s": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "SbiNamespace": {
+      "BsfError": {
+        "doc": "Raised by sbi.discover_pcf_binding() when the BSF is unhealthy (5xx / timeout / transport / malformed body). A 404 (no binding) is NOT a BsfError \u2014 it returns None.",
+        "kind": "type"
+      },
+      "create_session": {
+        "doc": "Create an N5 app session for QoS policy authorization.",
+        "kind": "method_descriptor",
+        "sig": "($self, af_app_id=\"IMS Services\", sip_call_id=None, supi=None, ue_ipv4=None, ue_ipv6=None, dnn=None, notif_uri=None, media_components=None, pcf_uri=None)"
+      },
+      "delete_session": {
+        "doc": "Delete an N5 app session.",
+        "kind": "method_descriptor",
+        "sig": "($self, session_id)"
+      },
+      "discover_pcf_binding": {
+        "doc": "Nbsf_Management discovery \u2014 look up the PCF binding for a UE IP.",
+        "kind": "method_descriptor",
+        "sig": "($self, ue_ipv4=None, ue_ipv6=None)"
+      },
+      "update_session": {
+        "doc": "Update an N5 app session \u2014 media renegotiation (re-INVITE / UPDATE).",
+        "kind": "method_descriptor",
+        "sig": "($self, session_id, media_components=None)"
+      }
+    },
+    "Sdp": {
+      "apply": {
+        "doc": "Write the SDP back into a Request/Reply/Call message.",
+        "kind": "method_descriptor",
+        "sig": "($self, target)"
+      },
+      "attrs": {
+        "doc": "All session-level `a=` values as a list of strings.",
+        "kind": "getset_descriptor"
+      },
+      "connection": {
+        "doc": "Session-level connection (`c=`), or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "filter_codecs": {
+        "doc": "Keep only codecs whose names match the given list (case-insensitive).",
+        "kind": "method_descriptor",
+        "sig": "($self, keep)"
+      },
+      "get_attr": {
+        "doc": "Get the value of the first session-level attribute matching `name`.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "get_attrs_by_name": {
+        "doc": "Get all session-level attribute values matching ``name``.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "has_attr": {
+        "doc": "Check whether a session-level attribute with `name` exists.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "media": {
+        "doc": "List of media sections.",
+        "kind": "getset_descriptor"
+      },
+      "origin": {
+        "doc": "Origin line value (`o=`), or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "remove_attr": {
+        "doc": "Remove all session-level attributes matching `name`.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "remove_codecs": {
+        "doc": "Remove codecs by name (case-insensitive).",
+        "kind": "method_descriptor",
+        "sig": "($self, remove)"
+      },
+      "remove_media": {
+        "doc": "Remove all media sections with the given type (e.g. `\"video\"`).",
+        "kind": "method_descriptor",
+        "sig": "($self, media_type)"
+      },
+      "session_name": {
+        "doc": "Session name (`s=`), or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "set_attr": {
+        "doc": "Set (replace or append) a session-level attribute.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value=\"\")"
+      },
+      "set_attrs_by_name": {
+        "doc": "Replace all session-level attributes matching ``name`` with new values.",
+        "kind": "method_descriptor",
+        "sig": "($self, name, values)"
+      }
+    },
+    "SdpNamespace": {
+      "parse": {
+        "doc": "Parse SDP from a Request/Reply/Call message, a string, or bytes.",
+        "kind": "method_descriptor",
+        "sig": "($self, source)"
+      }
+    },
+    "SecurityOffer": {
+      "alg": {
+        "doc": "Integrity algorithm, e.g. ``\"hmac-sha-1-96\"``.",
+        "kind": "getset_descriptor"
+      },
+      "ealg": {
+        "doc": "Encryption algorithm.  Always a string \u2014 ``\"null\"`` when the UE",
+        "kind": "getset_descriptor"
+      },
+      "mechanism": {
+        "doc": "Security mechanism, typically ``\"ipsec-3gpp\"``.",
+        "kind": "getset_descriptor"
+      },
+      "port_c": {
+        "doc": "Client port proposed by the UE.",
+        "kind": "getset_descriptor"
+      },
+      "port_s": {
+        "doc": "Server port proposed by the UE.",
+        "kind": "getset_descriptor"
+      },
+      "spi_c": {
+        "doc": "Client SPI proposed by the UE.",
+        "kind": "getset_descriptor"
+      },
+      "spi_s": {
+        "doc": "Server SPI proposed by the UE.",
+        "kind": "getset_descriptor"
+      },
+      "ue_addr": {
+        "doc": "UE source address (string), captured from",
+        "kind": "getset_descriptor"
+      }
+    },
+    "SecurityServerParams": {
+      "alg": {
+        "doc": "Integrity algorithm name as it should appear in the",
+        "kind": "getset_descriptor"
+      },
+      "ealg": {
+        "doc": "Encryption algorithm name (e.g. ``\"null\"``).",
+        "kind": "getset_descriptor"
+      },
+      "mechanism": {
+        "doc": "Always ``\"ipsec-3gpp\"`` in Phase 1.",
+        "kind": "getset_descriptor"
+      },
+      "port_c": {
+        "doc": "P-CSCF protected client port (shared across all UEs \u2014 see",
+        "kind": "getset_descriptor"
+      },
+      "port_s": {
+        "doc": "P-CSCF protected server port.",
+        "kind": "getset_descriptor"
+      },
+      "protocol": {
+        "doc": "Wire-form transport for the RFC 3329 ``Security-Server``",
+        "kind": "getset_descriptor"
+      },
+      "spi_c": {
+        "doc": "P-CSCF client SPI.",
+        "kind": "getset_descriptor"
+      },
+      "spi_s": {
+        "doc": "P-CSCF server SPI.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "SipUri": {
+      "host": {
+        "kind": "getset_descriptor"
+      },
+      "is_local": {
+        "doc": "Whether the URI host matches one of the configured local domains.",
+        "kind": "getset_descriptor"
+      },
+      "is_tel": {
+        "doc": "Whether this is a tel: URI (scheme == \"tel\").",
+        "kind": "getset_descriptor"
+      },
+      "params": {
+        "doc": "URI parameters as a dict.  Flag parameters (no `=value`, e.g.",
+        "kind": "getset_descriptor"
+      },
+      "port": {
+        "kind": "getset_descriptor"
+      },
+      "scheme": {
+        "kind": "getset_descriptor"
+      },
+      "user": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "SrsParticipant": {
+      "aor": {
+        "kind": "getset_descriptor"
+      },
+      "name": {
+        "kind": "getset_descriptor"
+      },
+      "participant_id": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "SrsSession": {
+      "duration": {
+        "kind": "getset_descriptor"
+      },
+      "original_call_id": {
+        "kind": "getset_descriptor"
+      },
+      "participants": {
+        "kind": "getset_descriptor"
+      },
+      "recording_call_id": {
+        "kind": "getset_descriptor"
+      },
+      "recording_dir": {
+        "kind": "getset_descriptor"
+      },
+      "session_id": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "SrsStreamInfo": {
+      "label": {
+        "kind": "getset_descriptor"
+      },
+      "stream_id": {
+        "kind": "getset_descriptor"
+      }
+    },
+    "StirNamespace": {
+      "apply_verstat": {
+        "doc": "Stamp the `verstat` parameter onto the asserted identity (P-Asserted-",
+        "kind": "method_descriptor",
+        "sig": "($self, request, result)"
+      },
+      "sign": {
+        "doc": "Build and add a SHAKEN `Identity` header to the request.",
+        "kind": "method_descriptor",
+        "sig": "($self, request, attestation=None, origid=None, orig_tn=None, dest_tn=None)"
+      },
+      "sign_div": {
+        "doc": "Build and add a diverted-call (`div`) `Identity` header (RFC 8946).",
+        "kind": "method_descriptor",
+        "sig": "($self, request, orig_tn=None, dest_tn=None, div_tn=None)"
+      },
+      "signing_enabled": {
+        "doc": "Whether the Authentication Service (signing) is configured.",
+        "kind": "getset_descriptor"
+      },
+      "verification_enabled": {
+        "doc": "Whether the Verification Service is configured.",
+        "kind": "getset_descriptor"
+      },
+      "verify": {
+        "doc": "Verify the `Identity` header(s) on the request.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      }
+    },
+    "StirResult": {
+      "attestation": {
+        "doc": "Attestation level (`\"A\"`/`\"B\"`/`\"C\"`) from the SHAKEN PASSporT.",
+        "kind": "getset_descriptor"
+      },
+      "orig_tn": {
+        "doc": "Originating TN from the SHAKEN PASSporT.",
+        "kind": "getset_descriptor"
+      },
+      "origid": {
+        "doc": "`origid` from the SHAKEN PASSporT.",
+        "kind": "getset_descriptor"
+      },
+      "passed": {
+        "doc": "`True` only when the SHAKEN PASSporT validated end to end.",
+        "kind": "getset_descriptor"
+      },
+      "passports": {
+        "doc": "Decoded claim sets of every PASSporT that parsed, as a list of dicts.",
+        "kind": "getset_descriptor"
+      },
+      "reason": {
+        "doc": "Human-readable diagnostic / failure cause.",
+        "kind": "getset_descriptor"
+      },
+      "verstat": {
+        "doc": "`\"TN-Validation-Passed\"` | `\"TN-Validation-Failed\"` | `\"No-TN-Validation\"`.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "SubscribeHandle": {
+      "event": {
+        "doc": "The SIP Event package (copied from the SUBSCRIBE).",
+        "kind": "getset_descriptor"
+      },
+      "event_version": {
+        "doc": "Current event-package body version (monotonic NOTIFY body counter).",
+        "kind": "getset_descriptor"
+      },
+      "expires": {
+        "doc": "Seconds remaining until the dialog expires.",
+        "kind": "getset_descriptor"
+      },
+      "id": {
+        "doc": "The durable id \u2014 pass to ``proxy.subscribe_state.get()`` to",
+        "kind": "getset_descriptor"
+      },
+      "mirror_reply": {
+        "doc": "Send a final NOTIFY using an already-built",
+        "kind": "method_descriptor",
+        "sig": "($self, reply)"
+      },
+      "next_event_version": {
+        "doc": "Atomically increment and return the next event-package body version.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "notify": {
+        "doc": "Send an in-dialog NOTIFY with ``body``/``content_type``.",
+        "kind": "method_descriptor",
+        "sig": "($self, body=None, content_type=None, state=None)"
+      },
+      "refresh": {
+        "doc": "Re-SUBSCRIBE to refresh the dialog. Only valid on dialogs",
+        "kind": "method_descriptor",
+        "sig": "($self, expires=None, timeout_ms=2000)"
+      },
+      "terminate": {
+        "doc": "Terminate the subscription dialog.",
+        "kind": "method_descriptor",
+        "sig": "($self, reason=None, body=None, content_type=None)"
+      }
+    },
+    "SubscribeStateNamespace": {
+      "create": {
+        "doc": "Capture the dialog from an incoming SUBSCRIBE request and return a",
+        "kind": "method_descriptor",
+        "sig": "($self, request, expires=None)"
+      },
+      "find": {
+        "doc": "Look up a live dialog by its three identity tags. Used to",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, local_tag, remote_tag)"
+      },
+      "get": {
+        "doc": "Look up a previously-created handle by id.  Returns ``None`` if",
+        "kind": "method_descriptor",
+        "sig": "($self, id)"
+      },
+      "local_count": {
+        "doc": "Number of subscribe dialogs currently held in the in-process",
+        "kind": "getset_descriptor"
+      },
+      "send": {
+        "doc": "Originate an outbound SUBSCRIBE and capture the resulting dialog.",
+        "kind": "method_descriptor",
+        "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000)"
+      }
+    },
+    "TimerHandle": {
+      "cancel": {
+        "doc": "Cancel this timer.  Returns ``True`` if the timer was still armed.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "key": {
+        "doc": "The key the timer was registered under.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "TimerNamespace": {
+      "active_count": {
+        "doc": "Number of currently-armed one-shot timers.",
+        "kind": "getset_descriptor"
+      },
+      "cancel": {
+        "doc": "Cancel the timer registered under ``key``.  Returns ``True`` if a",
+        "kind": "method_descriptor",
+        "sig": "($self, key)"
+      },
+      "every": {
+        "doc": "Register a periodic timer callback.",
+        "kind": "method_descriptor",
+        "sig": "($self, seconds, name=None, jitter=0)"
+      },
+      "set": {
+        "doc": "Schedule a one-shot callback to fire after ``delay_ms`` milliseconds.",
+        "kind": "method_descriptor",
+        "sig": "($self, key, delay_ms, handler)"
+      }
+    },
+    "Transform": {
+      "HmacMd5_96AesCbc128": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "HmacMd5_96Null": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "HmacSha1_96AesCbc128": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "HmacSha1_96Null": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "HmacSha256_128AesCbc128": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "HmacSha256_128Null": {
+        "doc": "Operator policy choice for which IPsec transform to install.",
+        "kind": "Transform"
+      },
+      "alg": {
+        "doc": "Integrity algorithm name as it appears in a ``Security-Client`` /",
+        "kind": "getset_descriptor"
+      },
+      "compatible_with": {
+        "doc": "Whether this transform is compatible with the UE's offer.",
+        "kind": "method_descriptor",
+        "sig": "($self, offer)"
+      },
+      "ealg": {
+        "doc": "Encryption algorithm name as it appears in a ``Security-Client`` /",
+        "kind": "getset_descriptor"
+      }
+    }
+  }
+}
