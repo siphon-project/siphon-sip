@@ -908,7 +908,10 @@ pub enum RegistrarBackendType {
     Memory,
     Redis,
     Postgres,
-    /// Custom backend via Python hooks: `@registrar.on_save` / `@registrar.on_lookup`.
+    /// Rejected at config load: the `@registrar.on_save` / `@registrar.on_lookup`
+    /// hooks this names were never implemented, and selecting it silently
+    /// behaved as `Memory`. Kept as a variant so an existing config fails with
+    /// an explanation rather than a deserialization error; removed at 2.0.
     Python,
 }
 
@@ -1385,12 +1388,13 @@ fn default_realm() -> String {
 pub enum AuthBackendType {
     /// Credentials defined inline under `auth.users`.
     Static,
-    /// PostgreSQL / generic DB (planned).
+    /// PostgreSQL / generic DB. Not dispatched — rejected at config load.
     Database,
     /// REST lookup — GET `{url}` where `{username}` is substituted.
     /// Response body is either a plaintext password or a pre-hashed HA1.
     Http,
-    /// Diameter Cx MAR → HSS (IMS S-CSCF, planned).
+    /// Not a dispatchable backend — rejected at config load. Cx MAR/MAA
+    /// authentication is reached from a script via `auth.require_ims_digest()`.
     DiameterCx,
 }
 
@@ -4444,6 +4448,7 @@ impl Config {
     fn from_str_raw(yaml: &str) -> Result<Self> {
         let config: Self = serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
+        config.validate_backends()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -4522,6 +4527,46 @@ impl Config {
              (X1 provisioning and X2 IRI delivery work on every backend).",
             backend.as_str(),
         )))
+    }
+
+    /// Refuse a `backend:` selector nothing dispatches to.
+    ///
+    /// Each of these deserialized happily and then did nothing useful at
+    /// runtime: `registrar.backend: python` fell through to the in-memory arm,
+    /// so registrations silently did not persist, and the two unimplemented
+    /// `auth.backend` values made every credential check return
+    /// `Unavailable`, so nobody could authenticate. Both failures surfaced at
+    /// the first request rather than at startup, which is the wrong end: an
+    /// option an operator can select has to either work or refuse to boot.
+    fn validate_backends(&self) -> Result<()> {
+        if self.registrar.backend == RegistrarBackendType::Python {
+            return Err(SiphonError::Config(
+                "registrar.backend: python selects a custom-hook backend that does not exist — \
+                 there are no `@registrar.on_save` / `@registrar.on_lookup` hooks, and the \
+                 setting silently behaved as `memory`, so registrations were not persisted. \
+                 Use \"redis\" or \"postgres\" for shared persistence, or \"memory\" to be \
+                 explicit about keeping bindings in-process."
+                    .to_string(),
+            ));
+        }
+
+        match self.auth.backend {
+            AuthBackendType::Static | AuthBackendType::Http => Ok(()),
+            AuthBackendType::Database => Err(SiphonError::Config(
+                "auth.backend: database is not implemented — every credential check would \
+                 fail closed, so no subscriber could register. Use \"static\" with \
+                 `auth.users`, or \"http\" with an `auth.http` lookup endpoint."
+                    .to_string(),
+            )),
+            AuthBackendType::DiameterCx => Err(SiphonError::Config(
+                "auth.backend: diameter_cx is not a dispatchable backend — Cx MAR/MAA \
+                 authentication is reachable from a script through \
+                 `auth.require_ims_digest()`, which uses the `diameter:` peer configuration \
+                 directly. Set auth.backend to \"static\" or \"http\" and call \
+                 `require_ims_digest()` from the REGISTER handler."
+                    .to_string(),
+            )),
+        }
     }
 
     /// Reject a media profile asking for something `media.backend` cannot do.
@@ -7194,6 +7239,65 @@ media:
         assert!(offer.beep_detection);
         assert_eq!(offer.beep_cadence_guard_ms, Some(3_000));
         assert_eq!(offer.ws_tee_sample_rate, Some(48_000));
+    }
+
+    /// A backend nothing dispatches to has to refuse at boot. Each of these
+    /// used to load clean and then fail at the first request instead: the
+    /// registrar one behaved as `memory` (bindings silently not persisted), the
+    /// auth ones returned `Unavailable` for every credential check (nobody
+    /// could register).
+    /// Minimal loadable config plus whatever the case is actually about.
+    fn backend_yaml(block: &str) -> String {
+        format!(
+            "listen:\n  udp:\n    - \"0.0.0.0:5060\"\ndomain:\n  local:\n    \
+             - \"example.com\"\nscript:\n  path: \"scripts/proxy_default.py\"\n{block}"
+        )
+    }
+
+    #[test]
+    fn rejects_registrar_python_backend() {
+        let error = Config::from_str(&backend_yaml("registrar:\n  backend: python\n"))
+            .expect_err("python registrar backend must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("registrar.backend: python"),
+            "error should name the setting: {message}"
+        );
+        assert!(
+            message.contains("redis") && message.contains("postgres"),
+            "error should point at the backends that do persist: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_undispatched_auth_backends() {
+        for (value, expected) in [
+            ("database", "auth.backend: database"),
+            // The serde name has no underscore; `siphon.yaml` documented
+            // `diameter_cx`, which never parsed in the first place.
+            ("diametercx", "auth.backend: diameter_cx"),
+        ] {
+            let error = Config::from_str(&backend_yaml(&format!("auth:\n  backend: {value}\n")))
+                .expect_err("undispatched auth backend must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "error should name the setting: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_dispatchable_backends() {
+        for block in [
+            "registrar:\n  backend: memory\n",
+            "auth:\n  backend: static\n",
+            "auth:\n  backend: http\n",
+        ] {
+            let yaml = backend_yaml(block);
+            Config::from_str(&yaml).unwrap_or_else(|error| {
+                panic!("dispatchable backend must load: {block:?} -> {error}")
+            });
+        }
     }
 
     /// `ws_vad_engine` is a closed selector: an unknown detector must be a hard

@@ -210,7 +210,7 @@ script:
 # Registrar
 # ---------------------------------------------------------------------------
 registrar:
-  backend: memory   # memory | redis | postgres | python (custom hook)
+  backend: memory   # memory | redis | postgres
   default_expires: 3600   # seconds; used when client omits Expires header
   max_expires: 7200        # reject/clamp registrations above this
   # min_expires: 60        # reject with 423 Interval Too Brief if below this
@@ -320,7 +320,11 @@ registrar:
 # ---------------------------------------------------------------------------
 auth:
   realm: "example.com"
-  backend: static   # static | http | database | diameter_cx
+  backend: static   # static | http
+  # For Cx MAR/MAA against an HSS, leave backend as static/http and call
+  # auth.require_ims_digest() from the REGISTER handler; it uses the diameter:
+  # peer configuration directly. (The old `diameter_cx` value never parsed —
+  # the variant is spelled `diametercx` — and is now rejected outright.)
 
   # Digest-nonce anti-replay (RFC 7616 §3.3). Nonces embed a timestamp and are
   # rejected once older than nonce_ttl_secs, so a captured Authorization can no
