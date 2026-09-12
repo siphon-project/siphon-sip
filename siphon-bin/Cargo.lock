@@ -1886,9 +1886,9 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "netlink-sys"
-version = "0.8.8"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+checksum = "c99d38e00b420df49e940fe0826e667c3dad82ac68eb4c2bbf754c1c14a83a10"
 dependencies = [
  "bytes",
  "libc",
@@ -2414,9 +2414,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
  "serde",
@@ -3184,9 +3184,9 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.4.2"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca271e94b5f3e4b3bb85cefc2b5922fff7536fe76d10b37d0e594607edf730d6"
+checksum = "1d116c63e6e26d19dbc455d85c25b938ce33eb6a25301370fe524d2e38415986"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3222,8 +3222,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.8.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#0b5c0c1ce900dc73e472401475c1f756b21477b8"
+version = "1.8.6"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#c50a7f4473af51c30e448c7bc96e533923a942f3"
 dependencies = [
  "aes",
  "arc-swap",
