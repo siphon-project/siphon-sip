@@ -65,6 +65,90 @@ impl MediaSession {
             &self.rtpengine_call_id
         }
     }
+
+    /// The tag naming the party that is **sending** an in-dialog offer, for the media engine's
+    /// re-offer: the A-leg's `from_tag` when the offer came from A, the B-leg's `to_tag` when it came
+    /// from B.
+    ///
+    /// `None` when B is offering on a session whose `to_tag` was never recorded. The engine resolves
+    /// the re-offering party *by tag*, so substituting A's tag there does not name B — it claims to be
+    /// A, and the engine then answers with the leg facing the wrong party and re-points that party's
+    /// media. There is no safe guess, so the caller refuses the request instead.
+    #[must_use]
+    pub fn offer_tag(&self, from_a_leg: bool) -> Option<&str> {
+        if from_a_leg {
+            Some(self.from_tag.as_str())
+        } else {
+            self.to_tag.as_deref()
+        }
+    }
+
+    /// The `(offerer, answerer)` tag pair naming both parties of an in-dialog **answer**; `is_a2b`
+    /// says the A-leg made the offer.
+    ///
+    /// The B→A direction returns `None` on a session with no recorded `to_tag`, for the reason
+    /// [`MediaSession::offer_tag`] gives — naming B is exactly what the pair is for. The A→B direction
+    /// keeps an empty answerer tag rather than refusing: on a session whose `to_tag` was never
+    /// recorded, that answer is the *first* one the engine sees for the original offer, and dropping
+    /// it would leave the call unanchored.
+    #[must_use]
+    pub fn answer_tags(&self, is_a2b: bool) -> Option<(&str, &str)> {
+        if is_a2b {
+            Some((self.from_tag.as_str(), self.to_tag.as_deref().unwrap_or("")))
+        } else {
+            Some((self.to_tag.as_deref()?, self.from_tag.as_str()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_session_tests {
+    use super::*;
+
+    fn session(to_tag: Option<&str>) -> MediaSession {
+        MediaSession {
+            call_id: "call-1".to_string(),
+            rtpengine_call_id: String::new(),
+            from_tag: "tag-a".to_string(),
+            to_tag: to_tag.map(str::to_string),
+            profile: "default".to_string(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn offer_tag_names_the_offering_party() {
+        let answered = session(Some("tag-b"));
+        assert_eq!(answered.offer_tag(true), Some("tag-a"));
+        assert_eq!(answered.offer_tag(false), Some("tag-b"));
+    }
+
+    #[test]
+    fn an_offer_from_b_without_a_recorded_answerer_tag_has_no_tag_to_use() {
+        // The caller must refuse: A's tag would name the wrong party to the engine.
+        let unanswered = session(None);
+        assert_eq!(unanswered.offer_tag(true), Some("tag-a"));
+        assert_eq!(unanswered.offer_tag(false), None);
+    }
+
+    #[test]
+    fn answer_tags_put_the_offerer_first() {
+        let answered = session(Some("tag-b"));
+        assert_eq!(answered.answer_tags(true), Some(("tag-a", "tag-b")));
+        assert_eq!(answered.answer_tags(false), Some(("tag-b", "tag-a")));
+    }
+
+    #[test]
+    fn an_answer_to_b_without_a_recorded_answerer_tag_is_refused_only_in_the_b_to_a_direction() {
+        let unanswered = session(None);
+        // A→B keeps the empty answerer tag: this is the first answer the engine sees.
+        assert_eq!(unanswered.answer_tags(true), Some(("tag-a", "")));
+        // B→A cannot name the offerer at all.
+        assert_eq!(unanswered.answer_tags(false), None);
+    }
 }
 
 /// Thread-safe store of active media sessions, keyed by SIP Call-ID.
