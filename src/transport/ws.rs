@@ -230,7 +230,7 @@ pub async fn listen(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
-) {
+) -> std::io::Result<()> {
     spawn_outbound_distributor(
         outbound_rx,
         connection_map.clone(),
@@ -244,13 +244,7 @@ pub async fn listen(
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
     // surfacing as a listener that silently never exists.
-    let listener = match bind_tcp_listener(local_addr, tos) {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind WS listener on {local_addr}: {error}");
-            return;
-        }
-    };
+    let listener = bind_tcp_listener(local_addr, tos)?;
     info!("WS listener on {}", local_addr);
 
     tokio::spawn(async move {
@@ -302,6 +296,8 @@ pub async fn listen(
             }
         }
     });
+
+    Ok(())
 }
 
 /// Spawn a secure WebSocket (WSS) listener. Reuses the TLS cert from
@@ -316,7 +312,7 @@ pub async fn listen_secure(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
-) {
+) -> std::io::Result<()> {
     let acceptor =
         crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
             eprintln!("Failed to build TLS acceptor for WSS: {error}");
@@ -336,13 +332,7 @@ pub async fn listen_secure(
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
     // surfacing as a listener that silently never exists.
-    let listener = match bind_tcp_listener(local_addr, tos) {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind WSS listener on {local_addr}: {error}");
-            return;
-        }
-    };
+    let listener = bind_tcp_listener(local_addr, tos)?;
     info!("WSS listener on {}", local_addr);
 
     tokio::spawn(async move {
@@ -420,6 +410,8 @@ pub async fn listen_secure(
             }
         }
     });
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -451,7 +443,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a WebSocket client
@@ -516,7 +509,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -580,7 +574,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut request = format!("ws://127.0.0.1:{}", addr.port())
@@ -620,7 +615,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -671,7 +667,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -720,7 +717,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("ws listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Build a TLS client config that trusts our self-signed cert

@@ -44,7 +44,7 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) {
+) -> std::io::Result<()> {
     // Distribute outbound messages to per-connection senders. When no existing
     // connection matches (`ConnectionId::default()` from fire-and-forget UAC
     // sends, or a connection that has since closed), the distributor falls back
@@ -60,13 +60,7 @@ pub async fn listen(
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
     // surfacing as a listener that silently never exists.
-    let listener = match bind_tcp_listener(local_addr, tos) {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind TCP listener to {local_addr}: {error}");
-            return;
-        }
-    };
+    let listener = bind_tcp_listener(local_addr, tos)?;
     info!("TCP listener on {}", local_addr);
 
     tokio::spawn(async move {
@@ -145,6 +139,8 @@ pub async fn listen(
             }
         }
     });
+
+    Ok(())
 }
 
 /// Determine the total length of a complete SIP message in the buffer.
@@ -813,7 +809,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("tcp listener must bind");
         // listen() binds inside a spawned task.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (addr, inbound_rx)

@@ -1619,7 +1619,10 @@ impl SiphonServer {
                 continue; // served by the TCP+WS mux listener below
             }
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
-            transport::tcp::listen(
+            // A configured listener that cannot bind is fatal. Coming up
+            // "healthy" while silently missing a transport is how an operator
+            // learns of it from a customer instead of from us.
+            if let Err(error) = transport::tcp::listen(
                 addr,
                 inbound_tx.clone(),
                 tcp_outbound_rx.clone(),
@@ -1630,7 +1633,11 @@ impl SiphonServer {
                 crlf_pong_tracker.clone(),
                 connection_close_tx.clone(),
             )
-            .await;
+            .await
+            {
+                error!(%addr, "failed to bind TCP listener: {error}");
+                std::process::exit(1);
+            }
         }
 
         if let Some(ref tls_config) = config.tls {
@@ -1660,7 +1667,10 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(
+                // A configured listener that cannot bind is fatal. Coming up
+                // "healthy" while silently missing a transport is how an operator
+                // learns of it from a customer instead of from us.
+                if let Err(error) = transport::tls::listen(
                     addr,
                     tls_config,
                     inbound_tx.clone(),
@@ -1673,7 +1683,11 @@ impl SiphonServer {
                     crlf_pong_tracker.clone(),
                     connection_close_tx.clone(),
                 )
-                .await;
+                .await
+                {
+                    error!(%addr, "failed to bind TLS listener: {error}");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -1704,7 +1718,10 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
-            transport::ws::listen(
+            // A configured listener that cannot bind is fatal. Coming up
+            // "healthy" while silently missing a transport is how an operator
+            // learns of it from a customer instead of from us.
+            if let Err(error) = transport::ws::listen(
                 addr,
                 inbound_tx.clone(),
                 ws_outbound_rx.clone(),
@@ -1714,7 +1731,11 @@ impl SiphonServer {
                 tos,
                 connection_close_tx.clone(),
             )
-            .await;
+            .await
+            {
+                error!(%addr, "failed to bind WS listener: {error}");
+                std::process::exit(1);
+            }
         }
 
         // WSS
@@ -1745,7 +1766,10 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
-                transport::ws::listen_secure(
+                // A configured listener that cannot bind is fatal. Coming up
+                // "healthy" while silently missing a transport is how an operator
+                // learns of it from a customer instead of from us.
+                if let Err(error) = transport::ws::listen_secure(
                     addr,
                     tls_config,
                     inbound_tx.clone(),
@@ -1756,7 +1780,11 @@ impl SiphonServer {
                     tos,
                     connection_close_tx.clone(),
                 )
-                .await;
+                .await
+                {
+                    error!(%addr, "failed to bind WSS listener: {error}");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -1774,7 +1802,10 @@ impl SiphonServer {
             }
             info!(addr = %addr, dscp = ?tcp_listen[&addr].dscp().or(global_dscp),
                 "starting TCP+WS mux transport");
-            transport::mux::listen(
+            // A configured listener that cannot bind is fatal. Coming up
+            // "healthy" while silently missing a transport is how an operator
+            // learns of it from a customer instead of from us.
+            if let Err(error) = transport::mux::listen(
                 addr,
                 None,
                 transport::mux::MuxChannels {
@@ -1791,7 +1822,11 @@ impl SiphonServer {
                 crlf_pong_tracker.clone(),
                 connection_close_tx.clone(),
             )
-            .await;
+            .await
+            {
+                error!(%addr, "failed to bind mux listener: {error}");
+                std::process::exit(1);
+            }
         }
         if let Some(ref tls_config) = config.tls {
             for addr in tls_wss_mux {
@@ -1803,7 +1838,10 @@ impl SiphonServer {
                 }
                 info!(addr = %addr, dscp = ?tls_listen[&addr].dscp().or(global_dscp),
                     "starting TLS+WSS mux transport");
-                transport::mux::listen(
+                // A configured listener that cannot bind is fatal. Coming up
+                // "healthy" while silently missing a transport is how an operator
+                // learns of it from a customer instead of from us.
+                if let Err(error) = transport::mux::listen(
                     addr,
                     Some(tls_config),
                     transport::mux::MuxChannels {
@@ -1820,7 +1858,11 @@ impl SiphonServer {
                     crlf_pong_tracker.clone(),
                     connection_close_tx.clone(),
                 )
-                .await;
+                .await
+                {
+                    error!(%addr, "failed to bind mux listener: {error}");
+                    std::process::exit(1);
+                }
             }
         }
 
