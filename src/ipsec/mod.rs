@@ -7,6 +7,8 @@ pub mod milenage;
 
 #[cfg(target_os = "linux")]
 pub mod netlink;
+/// Process-wide access to the running manager/config, used by the datapath.
+pub mod runtime;
 
 pub mod ue;
 
