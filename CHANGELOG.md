@@ -70,6 +70,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `auth.database` block, a `query` that never binds `$1` (which would return one
   row for every subscriber), and a binary built without the `postgres-backend`
   feature.
+- **The inbound control listener can terminate TLS** (`control.tls` with
+  `certificate` / `private_key`), so applications dial `wss://` instead of
+  `ws://`. The rail was plaintext-only, which made the bearer token — a single
+  replayable secret — readable by anything on the path, so the listener could
+  not cross a network without a sidecar terminating TLS for it. An optional
+  `client_ca` turns on **mutual** TLS, where an application must also present a
+  certificate one of those CAs signed; a leaked config file is then not enough
+  on its own. A `control.tls` block siphon cannot serve is refused at config
+  load, and so is one set without `control.listen` — that combination says the
+  operator believes the rail is encrypted when there is no inbound rail at all.
+
+  The TLS handshake runs on a task per connection rather than on the accept
+  loop. `axum::serve` awaits its listener serially, so an inline handshake would
+  let one peer that connects and then stalls hold up every other application's
+  connection; completed streams arrive over a bounded channel instead. Handshakes
+  are bounded by the same timeout the SIP TLS listeners use.
 
 ### Changed
 

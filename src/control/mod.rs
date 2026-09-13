@@ -195,7 +195,9 @@ pub fn spawn_control_plane(config: &ControlConfig, extra_adapters: Vec<Arc<dyn C
     if let Some(listen) = config.listen.as_deref() {
         match listen.parse::<SocketAddr>() {
             Ok(addr) => {
-                tokio::spawn(listener::serve(addr, Arc::clone(&bus)));
+                let tls = config.tls.clone();
+                let bus = Arc::clone(&bus);
+                tokio::spawn(async move { listener::serve(addr, bus, tls.as_ref()).await });
             }
             Err(error) => {
                 error!(%listen, %error, "invalid control.listen address — inbound control disabled");

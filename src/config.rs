@@ -2204,6 +2204,28 @@ pub struct ControlConfig {
     /// Global resource caps + backpressure policy.
     #[serde(default)]
     pub limits: ControlLimits,
+    /// Terminate TLS on `listen` (`wss://` instead of `ws://`). Absent leaves
+    /// the listener plaintext, which is only safe on a loopback or a trusted
+    /// segment — the bearer token is replayable by anything that can read it.
+    #[serde(default)]
+    pub tls: Option<ControlTlsConfig>,
+}
+
+/// TLS for the inbound control listener (`control.tls`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlTlsConfig {
+    /// PEM certificate chain siphon presents to connecting applications.
+    pub certificate: String,
+    /// PEM private key for `certificate`.
+    pub private_key: String,
+    /// PEM CA bundle that turns on **mutual** TLS: an application must present
+    /// a certificate one of these CAs signed, on top of its bearer token.
+    ///
+    /// Worth it for a rail that crosses a network: the token is a single
+    /// replayable secret, and a client certificate is a second factor that a
+    /// leaked config file alone does not give an attacker.
+    #[serde(default)]
+    pub client_ca: Option<String>,
 }
 
 /// A single registered control application.
@@ -4568,7 +4590,39 @@ impl Config {
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
         config.validate_max_message_bytes()?;
+        config.validate_control_tls()?;
         Ok(config)
+    }
+
+    /// Reject a `control.tls` block siphon cannot serve.
+    ///
+    /// At load, because the alternative is a control listener that binds, looks
+    /// healthy, and fails every handshake — which reads to an operator as a
+    /// broken client rather than an unreadable key file. `control.tls` without
+    /// `control.listen` is refused too: it says the operator believes the rail
+    /// is encrypted, and there is no inbound rail at all.
+    fn validate_control_tls(&self) -> Result<()> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let Some(tls) = &control.tls else {
+            return Ok(());
+        };
+        if control.listen.is_none() {
+            return Err(SiphonError::Config(
+                "control.tls is set but control.listen is not — there is no inbound control \
+                 listener to terminate TLS on. Remove control.tls, or add control.listen."
+                    .to_string(),
+            ));
+        }
+        crate::transport::tls::server_config(
+            &tls.certificate,
+            &tls.private_key,
+            tls.client_ca.as_deref(),
+            "control.tls",
+        )
+        .map_err(|error| SiphonError::Config(error.to_string()))?;
+        Ok(())
     }
 
     /// Reject a message-size ceiling too small to carry a SIP message.
@@ -5175,6 +5229,49 @@ fn default_lcr_cache_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_yaml(block: &str) -> Result<Config> {
+        Config::from_str(&format!(
+            "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\ncontrol:\n{block}"
+        ))
+    }
+
+    #[test]
+    fn control_tls_without_a_listener_is_refused() {
+        // It says the operator believes the rail is encrypted, and there is no
+        // inbound rail at all — the most dangerous shape of wrong.
+        let error = control_yaml(
+            "  apps:\n    - name: \"pbx\"\n  tls:\n    certificate: \"/etc/siphon/c.pem\"\n    private_key: \"/etc/siphon/k.pem\"\n",
+        )
+        .expect_err("control.tls without control.listen must be refused");
+        let message = error.to_string();
+        assert!(message.contains("control.listen"), "{message}");
+    }
+
+    #[test]
+    fn control_tls_with_an_unreadable_certificate_is_refused_at_load() {
+        // Otherwise the listener binds, looks healthy, and fails every
+        // handshake — which reads as a broken client, not a missing file.
+        let error = control_yaml(
+            "  listen: \"127.0.0.1:9092\"\n  tls:\n    certificate: \"/nonexistent/siphon-control.pem\"\n    private_key: \"/nonexistent/siphon-control.key\"\n",
+        )
+        .expect_err("an unreadable certificate must be refused");
+        let message = error.to_string();
+        assert!(message.contains("control.tls.certificate"), "{message}");
+        assert!(
+            message.contains("/nonexistent/siphon-control.pem"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_control_listener_without_tls_still_loads() {
+        // Plaintext stays valid: a loopback or trusted-segment deployment is
+        // the common case and must not be forced to generate certificates.
+        let config = control_yaml("  listen: \"127.0.0.1:9092\"\n")
+            .expect("a plaintext control listener must load");
+        assert!(config.control.expect("control").tls.is_none());
+    }
 
     /// `server.auto_options` defaults ON, and it has to default ON from *both*
     /// directions: an absent `server:` block (the common case — nobody adds one

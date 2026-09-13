@@ -17,7 +17,7 @@ src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a 
 src/metrics/mod.rs          1850  # metric registry: one struct field + one registration per metric
 
 # ── Scheduled for the 1.9.0 module split ────────────────────────────────────
-src/config.rs                5150  # splits by YAML top-level key into src/config/**; +48 for the cdr.backends sink list and its validator, +35 for the auth.database block and its validator
+src/config.rs                5150  # splits by YAML top-level key into src/config/**; +48 for the cdr.backends sink list and its validator, +35 for the auth.database block and its validator, +20 for the control.tls block and its load-time validation
 src/server.rs                3900  # run_async is one 2,214-line fn; splits into src/server/**
 
 # ── PyO3 binding layer ──────────────────────────────────────────────────────
