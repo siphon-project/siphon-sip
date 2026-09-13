@@ -4,6 +4,8 @@
 //! then whichever action it asked for.
 
 use super::*;
+// The B2BUA builders and send path live in their own subtree.
+use super::b2bua::*;
 
 /// Does this request carry a To-tag, i.e. is it in-dialog (RFC 3261 §12)?
 pub(super) fn to_has_tag(message: &SipMessage) -> bool {
