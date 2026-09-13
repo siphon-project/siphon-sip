@@ -566,6 +566,62 @@ async def case_media(app: App, session: Session, event: dict, verdict: Verdict) 
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+async def case_info(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """In-dialog INFO on a one-legged call: answered by siphon, digits surfaced.
+
+    The application answers, so there is no far leg and siphon owes the caller
+    each INFO's response itself — the SIPp scenario asserts those 200s. What it
+    cannot see is whether the DTMF inside the INFO went anywhere, and a handler
+    that answered 200 and dropped the digit would read as working from the
+    wire. So this side asserts the digits: both arrive, `11` is normalised to
+    `#`, the relay form's duration is carried, and each surfaces exactly once.
+    """
+    channel = event.get("channel") or ""
+
+    reply = await answer_with_our_sdp(session, channel)
+    verdict.check(
+        "answer_accepted",
+        reply.get("status") == "ok"
+        and (reply.get("result") or {}).get("state") == "answered",
+        json.dumps(reply),
+    )
+
+    def is_dtmf(frame: dict) -> bool:
+        return frame.get("event") == "ChannelDtmfReceived" and frame.get("channel") == channel
+
+    # Collected as a set rather than in order: each digit is handed to the
+    # dispatcher runtime as its own task, and the contract is that both
+    # arrive, not which one wins a scheduling race.
+    first = await session.wait_event(is_dtmf, timeout=15)
+    second = await session.wait_event(is_dtmf, timeout=15)
+    payloads = [first.get("payload") or {}, second.get("payload") or {}]
+    by_digit = {payload.get("digit"): payload for payload in payloads}
+
+    verdict.check(
+        "both_info_digits_surfaced",
+        sorted(by_digit) == ["#", "5"],
+        json.dumps(payloads),
+    )
+    verdict.check(
+        "dtmf_relay_duration_is_carried",
+        (by_digit.get("5") or {}).get("duration_ms") == 160,
+        json.dumps(by_digit.get("5")),
+    )
+    verdict.check(
+        "each_digit_names_the_leg_it_came_from",
+        all(payload.get("from_tag") for payload in payloads),
+        json.dumps(payloads),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+    # After StasisEnd, so every INFO the caller sent has been processed: a
+    # digit surfaced twice would drive an IVR menu twice.
+    extra = session.take_events(is_dtmf)
+    verdict.check("each_digit_surfaced_exactly_once", not extra, json.dumps(extra))
+
+
 async def case_owner(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Exactly-one-owner dispatch: with several connections of the same app up,
     exactly one is given the call and the others cannot command it."""
@@ -667,6 +723,7 @@ CASES = {
     "progress": case_progress,
     "deadline": case_deadline,
     "media": case_media,
+    "info": case_info,
     "owner": case_owner,
     "resync": case_resync,
 }
