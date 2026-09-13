@@ -11,16 +11,22 @@
 //! rtpengine, diameter, cdr and li. `tests/integration/module_boundary_tests.rs`
 //! enforces that direction.
 
+mod b_leg;
 mod builders;
 mod cancel;
 mod handover;
 mod invite;
 mod outbound;
+mod response;
 mod routing;
+mod timeouts;
 
+pub(super) use b_leg::*;
 pub(super) use builders::*;
 pub(super) use cancel::*;
 pub(super) use handover::*;
 pub(super) use invite::*;
 pub(super) use outbound::*;
+pub(super) use response::*;
 pub(super) use routing::*;
+pub(super) use timeouts::*;
