@@ -1019,6 +1019,33 @@ impl ControlBus {
         }
     }
 
+    /// Publish an application-level event to every app that asked for its class.
+    ///
+    /// Unlike [`Self::publish_to_channel`], this is not about a call anyone
+    /// owns: a registration changing concerns the deployment, and the app that
+    /// wants it on a dashboard may own no channel at all. It goes to *every*
+    /// connection of a subscribed app rather than one picked round robin — a
+    /// dashboard behind two replicas needs both to see it, and there is no call
+    /// here whose ownership would decide which.
+    ///
+    /// Opt-in per app (`control.apps[].events`): without that, a registration
+    /// storm would land on the event queue of an application that only places
+    /// outbound calls.
+    pub fn publish_app_event(&self, class: &str, event: &str, payload: serde_json::Value) {
+        for (app, config) in self.app_config.iter() {
+            if !config.events.iter().any(|wanted| wanted == class) {
+                continue;
+            }
+            let Some(fanout) = self.apps.get(app) else {
+                continue;
+            };
+            let frame = EventFrame::for_app(event, app, payload.clone());
+            for conn in fanout.lock().iter() {
+                record_push_outcome(app, conn.events.try_push_event(frame.clone()));
+            }
+        }
+    }
+
     /// Emit a `StasisEnd` for the call identified by `sip_call_id` and remove
     /// the channel. Idempotent — a no-op when the call is not controlled.
     /// Called from every B2BUA teardown junction, guarded internally.
@@ -1504,6 +1531,7 @@ mod tests {
             connect_url: None,
             on_lost: Some("hangup".to_string()),
             ca_file: None,
+            events: Vec::new(),
         }
     }
 

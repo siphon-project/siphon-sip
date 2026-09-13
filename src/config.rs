@@ -2263,6 +2263,17 @@ pub struct ControlAppConfig {
     /// certificate through too.
     #[serde(default)]
     pub ca_file: Option<String>,
+    /// Application-level event classes this app wants, beyond the per-call
+    /// events its own channels produce.
+    ///
+    /// Opt-in and empty by default: these are not about a call the app owns, so
+    /// sending them to every connected app would put a registration storm on
+    /// the event queue of an application that only makes outbound calls.
+    ///
+    /// Known class: `registration` — `RegistrationChanged {aor, event,
+    /// contacts}` on every registrar state change.
+    #[serde(default)]
+    pub events: Vec<String>,
 }
 
 /// Global control-plane resource caps + backpressure policy.
@@ -4595,6 +4606,7 @@ impl Config {
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_backends()?;
         config.validate_cdr()?;
+        config.validate_control_app_events()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -4844,6 +4856,32 @@ impl Config {
                  Query: {:?}",
                 database.query
             )));
+        }
+        Ok(())
+    }
+
+    /// Reject an app-level event class siphon does not publish.
+    ///
+    /// A typo here is silent: the app subscribes to nothing, waits for events
+    /// that never come, and there is no request/reply to carry the mistake
+    /// back — `events` is read at start-up, not asked for at run time.
+    fn validate_control_app_events(&self) -> Result<()> {
+        const KNOWN: &[&str] = &["registration"];
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        for app in &control.apps {
+            for class in &app.events {
+                if !KNOWN.contains(&class.as_str()) {
+                    return Err(SiphonError::Config(format!(
+                        "control.apps[{:?}].events names {class:?}, which siphon does not \
+                         publish — the classes are: {}. An app subscribed to a name nothing \
+                         sends waits forever and is told nothing.",
+                        app.name,
+                        KNOWN.join(", ")
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -7720,6 +7758,46 @@ media:
             runtime.backends[0],
             crate::cdr::CdrBackendType::File { .. }
         ));
+    }
+
+    /// A typo in `events` is silent: `events` is read at start-up, not asked
+    /// for at run time, so the app subscribes to nothing and waits for events
+    /// that never come with no reply to carry the mistake back.
+    #[test]
+    fn rejects_an_unknown_control_app_event_class() {
+        let error = Config::from_str(&backend_yaml(
+            "control:\n  apps:\n    - name: pbx\n      token: \"t\"\n      events: [registrations]\n",
+        ))
+        .expect_err("an unknown event class must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("registrations") && message.contains("registration"),
+            "the error should name the typo and the class that exists: {message}"
+        );
+    }
+
+    /// The class that exists loads, and the default is no app-level events at
+    /// all — an app that only places calls must not be handed a registration
+    /// storm it never asked for.
+    #[test]
+    fn control_app_events_are_opt_in() {
+        let config = Config::from_str(&backend_yaml(
+            "control:\n  apps:\n    - name: pbx\n      token: \"t\"\n      events: [registration]\n",
+        ))
+        .expect("a known event class must load");
+        let apps = &config.control.as_ref().expect("control block").apps;
+        assert_eq!(apps[0].events, vec!["registration".to_string()]);
+
+        let config = Config::from_str(&backend_yaml(
+            "control:\n  apps:\n    - name: pbx\n      token: \"t\"\n",
+        ))
+        .expect("an app with no events must load");
+        assert!(
+            config.control.as_ref().expect("control block").apps[0]
+                .events
+                .is_empty(),
+            "app-level events are opt-in"
+        );
     }
 
     #[test]

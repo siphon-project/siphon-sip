@@ -105,6 +105,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   than the CDR and HEP clients. The TLS half is built with the `tokio-rustls`
   already present, and the CDR and HEP clients now share that one root store
   too.
+- **`RegistrationChanged` on the control plane.** Registration changes reached
+  Python and the CDR only, so a controller could not show which phones are
+  registered without a script forwarding them — and every other event belongs to
+  a channel, which a dashboard may not own any of.
+
+  ```yaml
+  control:
+    apps:
+      - name: dashboard
+        events: [registration]
+  ```
+
+  The frame carries no channel ids and a payload of
+  `{aor, event, contacts}`, with `event` one of `registered`, `refreshed`,
+  `deregistered`, `expired`. It reaches every connection of a subscribed app
+  rather than one picked round robin, since a dashboard behind two replicas
+  needs both to see it. It fires whether or not a `@registrar.on_change` handler
+  exists.
+
+  Opt-in per app and empty by default, so a registration storm does not land on
+  an application that only places outbound calls. An unknown class in `events`
+  is refused at config load — the list is read at start-up, so a typo would
+  otherwise leave the app waiting for events that never come.
 
 ### Changed
 

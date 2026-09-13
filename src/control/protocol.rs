@@ -182,6 +182,26 @@ impl EventFrame {
             payload,
         }
     }
+
+    /// Build an event frame that belongs to an application rather than to a
+    /// call — a registration changing, say. Every id but `app` is absent,
+    /// because there is no channel for it to be about, and an invented one
+    /// would be a channel an app could try to address.
+    pub fn for_app(
+        event: impl Into<String>,
+        app: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            frame_type: FrameType::Event,
+            event: event.into(),
+            channel: None,
+            app: Some(app.into()),
+            call_id: None,
+            sip_call_id: None,
+            payload,
+        }
+    }
 }
 
 /// The outcome of applying a command — carried back to the connection's read

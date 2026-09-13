@@ -535,6 +535,7 @@ mod tests {
             connect_url: None,
             on_lost: Some("hangup".to_string()),
             ca_file: None,
+            events: Vec::new(),
         }
     }
 

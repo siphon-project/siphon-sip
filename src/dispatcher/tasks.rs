@@ -200,6 +200,34 @@ pub fn spawn_registrar_events(
                     cdr_emit_register(&aor, event_type);
                 }
 
+                // Control applications that asked for the registration class
+                // (`control.apps[].events`). Emitted before the Python
+                // short-circuit below so it fires whether or not a
+                // `@registrar.on_change` handler is registered — a dashboard
+                // should not depend on a script existing.
+                if let Some(bus) = crate::control::ControlBus::global() {
+                    let bindings: Vec<serde_json::Value> = registrar
+                        .lookup(&aor)
+                        .into_iter()
+                        .map(|contact| {
+                            serde_json::json!({
+                                "uri": contact.uri.to_string(),
+                                "expires": contact.remaining_seconds(),
+                                "q": contact.q,
+                            })
+                        })
+                        .collect();
+                    bus.publish_app_event(
+                        "registration",
+                        "RegistrationChanged",
+                        serde_json::json!({
+                            "aor": aor,
+                            "event": event_type,
+                            "contacts": bindings,
+                        }),
+                    );
+                }
+
                 // Quick check if any handlers exist (avoids spawn_blocking overhead)
                 {
                     let engine_state = state_for_events.engine.state();
