@@ -4,6 +4,8 @@
 //! handlers, and forwards upstream with the top Via stripped.
 
 use super::*;
+// The B2BUA builders and send path live in their own subtree.
+use super::b2bua::*;
 
 /// Handle an inbound SIP response — route back to the original sender.
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_response: pre-session guards + session forwarding; splits in two
