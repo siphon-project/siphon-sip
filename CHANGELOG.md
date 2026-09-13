@@ -204,6 +204,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   would end on the handoff default) and a `mode` that is neither `deferred` nor
   `answer` (which would otherwise fall back silently to the opposite of what was
   meant).
+### Fixed
+
+- **An anchored answer no longer requires a WebSocket bridge.** `answer
+  {anchor: true}` (and `call.handover(answer=True)`) refused any profile that
+  resolved no `ws_uri` — "nowhere to bridge the AI audio" — so a controller
+  could only anchor a leg by also opening an audio bridge it did not want.
+
+  Most of what an application does to a caller before a person picks up is the
+  engine talking to them: the IVR menu, the queue announcement, music on hold,
+  the voicemail greeting and the recording after the beep. None of it involves a
+  WebSocket, and none of it was reachable over the control rail. A profile with
+  no `ws_uri` now anchors the leg on the engine with no bridge, and `play`, DTMF
+  and recording run on it.
 
 ### Changed
 

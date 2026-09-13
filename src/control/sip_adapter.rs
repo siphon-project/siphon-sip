@@ -56,7 +56,7 @@ impl ControlAdapter for SipControlAdapter {
             module: "sip".to_string(),
             verbs: vec![
                 verb("originate", "Place an outbound call under a caller-supplied channel id and return as soon as the INVITE is on the wire (args: channel, to, from, from_display, to_display, next_hop, p_asserted_identity, privacy, headers, sdp | media, profile, ws_uri, timeout, on_lost, vars)"),
-                verb("answer", "Send a UAS 2xx to the parked A-leg; with anchor (or a profile / ws_uri, which imply it) the SDP answer is synthesized and the media anchored to the media engine in the same act — the verb form of call.handover(answer=True) (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
+                verb("answer", "Send a UAS 2xx to the parked A-leg; with anchor (or a profile / ws_uri, which imply it) the SDP answer is synthesized and the media anchored to the media engine in the same act — the verb form of call.handover(answer=True). Without a ws_uri the leg is anchored on the engine with no bridge, which is what play / DTMF / recording need for an IVR, a queue or a voicemail box (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
                 verb("ring", "Send 180 Ringing to the parked A-leg — alerting only, no early media (RFC 3261 §13.2.1); a body is refused, use progress for that (args: reason)"),
                 verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress (args: code, reason, body, content_type)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),

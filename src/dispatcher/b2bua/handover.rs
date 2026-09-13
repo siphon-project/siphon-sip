@@ -331,9 +331,20 @@ pub fn answer_first_prepare(
             flags.ws_uri = Some(expanded);
         }
         None => {
-            return Err(format!(
-                "answer-first profile '{profile_name}' has no ws_uri and none was passed — nowhere to bridge the AI audio"
-            ));
+            // No bridge. The engine terminates the leg itself and siphon drives
+            // it with `play`, DTMF and recording — which is the IVR menu, the
+            // queue announcement, music on hold and the voicemail greeting, and
+            // none of them involve a WebSocket.
+            //
+            // Refusing here meant a controller could only anchor a leg by also
+            // opening an AI audio bridge it did not want, so most of what an
+            // application does to a caller before a person picks up was not
+            // reachable over the control rail at all.
+            debug!(
+                call_id = %media_call_id,
+                profile = %profile_name,
+                "answer-first: anchoring on the engine with no bridge"
+            );
         }
     }
 

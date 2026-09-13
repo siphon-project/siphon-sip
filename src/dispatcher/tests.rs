@@ -1531,17 +1531,22 @@ async fn answer_first_prepare_rejects_non_siphon_rtp_backend() {
 }
 
 #[tokio::test]
-async fn answer_first_prepare_requires_ws_uri() {
-    // The built-in voice_ai profile leaves ws_uri deliberately unset (#131);
-    // with none passed there is nowhere to bridge — a hard error.
+async fn answer_first_prepare_anchors_without_a_bridge() {
+    // No ws_uri used to be a hard error — "nowhere to bridge the AI audio" —
+    // which made an anchored answer inseparable from opening a WebSocket. Most
+    // of what an application does to a caller before a person picks up is the
+    // engine talking to them: the IVR menu, the queue announcement, music on
+    // hold, the voicemail greeting. None of it involves a WebSocket, and none
+    // of it was reachable over the control rail while this refused.
     let backend = siphon_rtp_backend();
     let registry = crate::rtpengine::ProfileRegistry::new();
     let invite = invite_with_offer(b"v=0\r\n");
-    let error =
-        answer_first_prepare(&invite, local_ip(), &backend, &registry, None, None).unwrap_err();
+    let plan = answer_first_prepare(&invite, local_ip(), &backend, &registry, None, None)
+        .expect("anchoring with no bridge is the IVR / voicemail case");
     assert!(
-        error.contains("ws_uri") || error.contains("bridge"),
-        "expected a missing-ws_uri error, got: {error}"
+        plan.flags.ws_uri.is_none(),
+        "no bridge was asked for, so none should be planned: {:?}",
+        plan.flags.ws_uri
     );
 }
 
