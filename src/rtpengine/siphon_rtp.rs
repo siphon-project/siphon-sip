@@ -490,7 +490,9 @@ impl SiphonRtpClient {
                 call_id: call_id.to_string(),
                 from_tag: from_tag.to_string(),
                 source: proto_play_source(source),
-                repeat_times,
+                // A count from siphon-sip's own API; the endless form
+                // (`PlayRepeat::Forever`) is reached through the play verb.
+                repeat_times: repeat_times.map(siphon_rtp_proto::PlayRepeat::Times),
                 start_pos_ms,
                 duration_ms,
                 overlay,
@@ -1553,9 +1555,21 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             volume,
             source,
         }),
-        Event::MediaTimeout { call_id, from_tag } => {
-            RtpEngineEvent::MediaTimeout { call_id, from_tag }
-        }
+        Event::MediaTimeout {
+            call_id,
+            from_tag,
+            reason,
+        } => RtpEngineEvent::MediaTimeout {
+            call_id,
+            from_tag,
+            reason: match reason {
+                siphon_rtp_proto::MediaTimeoutReason::NoMedia => "no_media",
+                siphon_rtp_proto::MediaTimeoutReason::HeldTooLong => "held_too_long",
+                // The reason set can grow; an unrecognised one is still a
+                // timeout, and naming it that is better than refusing to build.
+                _ => "unknown",
+            },
+        },
         Event::CallSummary {
             call_id,
             reason,
@@ -1605,6 +1619,9 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             play_id,
             reason,
             played_ms,
+            // Room playback (`conference_id`) has no siphon-sip concept to map
+            // onto yet — it lands with the conference verbs, not here.
+            ..
         } => RtpEngineEvent::PlayFinished(PlayFinishedEvent {
             call_id,
             from_tag,
@@ -2248,6 +2265,7 @@ mod tests {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                             _ => CmdResult::Ok {
                                 sdp: None,
@@ -2255,6 +2273,7 @@ mod tests {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                         };
                         write_frame(
@@ -2331,6 +2350,7 @@ mod tests {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                             _ => CmdResult::Ok {
                                 sdp: None,
@@ -2338,6 +2358,7 @@ mod tests {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                         };
                         write_frame(
@@ -2405,6 +2426,7 @@ mod tests {
                                     to_tag: None,
                                     stats: None,
                                     play_id: None,
+                                    recording_id: None,
                                 }
                             }
                             _ => CmdResult::Ok {
@@ -2413,6 +2435,7 @@ mod tests {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                         };
                         write_frame(
@@ -3099,6 +3122,7 @@ mod tests {
             play_id: 7,
             reason: PlayEndReason::Completed,
             played_ms: Some(1500),
+            conference_id: None,
         });
         match mapped {
             RtpEngineEvent::PlayFinished(play) => {
@@ -3293,8 +3317,14 @@ mod tests {
         match convert_event(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
+            reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
         }) {
-            RtpEngineEvent::MediaTimeout { call_id, from_tag } => {
+            RtpEngineEvent::MediaTimeout {
+                call_id,
+                from_tag,
+                reason,
+            } => {
+                assert_eq!(reason, "no_media");
                 assert_eq!(call_id, "c");
                 assert_eq!(from_tag, "f");
             }
@@ -3475,6 +3505,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3526,6 +3557,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3571,6 +3603,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3613,6 +3646,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: Some(play_id),
+                        recording_id: None,
                     },
                 },
             )
@@ -3629,6 +3663,7 @@ mod tests {
                         play_id,
                         reason,
                         played_ms,
+                        conference_id: None,
                     },
                 )
                 .await;
@@ -3824,6 +3859,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3868,6 +3904,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3882,6 +3919,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -3922,6 +3960,7 @@ mod tests {
             write_frame(
                 &mut stream,
                 &Event::MediaTimeout {
+                    reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
                     call_id: "c2".into(),
                     from_tag: "f2".into(),
                 },
@@ -4010,6 +4049,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -4033,6 +4073,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -4078,6 +4119,7 @@ mod tests {
                         to_tag: None,
                         stats: None,
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )
@@ -4159,6 +4201,7 @@ mod tests {
                         to_tag: None,
                         stats: Some(SessionStats::default()),
                         play_id: None,
+                        recording_id: None,
                     },
                 },
             )

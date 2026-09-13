@@ -22,8 +22,9 @@ pub fn spawn_rtpengine_events(
                     crate::rtpengine::events::RtpEngineEvent::MediaTimeout {
                         call_id,
                         from_tag,
+                        reason,
                     } => {
-                        on_media_timeout(&state_for_events, call_id, from_tag).await;
+                        on_media_timeout(&state_for_events, call_id, from_tag, reason).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::CallSummary(summary) => {
                         on_call_summary(&state_for_events, summary).await;
@@ -137,7 +138,12 @@ async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::D
     .await;
 }
 
-async fn on_media_timeout(state: &Arc<DispatcherState>, call_id: String, from_tag: String) {
+async fn on_media_timeout(
+    state: &Arc<DispatcherState>,
+    call_id: String,
+    from_tag: String,
+    reason: &'static str,
+) {
     // The media engine owns the call and reaped it on timeout
     // (the reaper removes the call *before* emitting this
     // event), so drop our own per-call media bookkeeping now.
@@ -154,6 +160,11 @@ async fn on_media_timeout(state: &Arc<DispatcherState>, call_id: String, from_ta
     tracing::warn!(
         %call_id,
         %from_tag,
+        reason,
+        // `no_media` is a dead path — the media never arrived or stopped.
+        // `held_too_long` is a call everybody left on hold, which is not a
+        // fault: separating them is the difference between "the network broke"
+        // and "nobody came back", and only the first is worth alerting on.
         "media engine reported media timeout (engine tore down call)"
     );
     let engine_state = state.engine.state();
