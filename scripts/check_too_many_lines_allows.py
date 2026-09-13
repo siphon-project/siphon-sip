@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUDGET = 11
+BUDGET = 10
 NEEDLE = "#[allow(clippy::too_many_lines)]"
 
 
