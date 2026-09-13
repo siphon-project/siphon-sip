@@ -475,6 +475,21 @@ pub(super) fn handle_request(
             }
         }
     }
+    if method == "INFO" && engine_state.has_b2bua_handlers() {
+        // RFC 6086 in-dialog INFO on a tracked B2BUA call. Without this it took
+        // the proxy path and was answered `405` (no `@proxy.on_request` covering
+        // INFO) or routed by Request-URI, so it never crossed a two-leg call and
+        // a DTMF digit sent as INFO was dropped. Calls that match no tracked
+        // B2BUA dialog still fall through to proxy mode.
+        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
+        if let Some(ref sip_call_id) = sip_call_id {
+            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
+                drop(engine_state);
+                handle_b2bua_info(inbound, message, state);
+                return;
+            }
+        }
+    }
     if method == "REFER" && engine_state.has_b2bua_handlers() {
         // RFC 3515 in-dialog REFER belonging to a B2BUA call: siphon owns the
         // transfer (fire @b2bua.on_refer, then terminate / forward / reject).

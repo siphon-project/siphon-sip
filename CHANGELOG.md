@@ -128,6 +128,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an application that only places outbound calls. An unknown class in `events`
   is refused at config load — the list is read at start-up, so a typo would
   otherwise leave the app waiting for events that never come.
+- **In-dialog INFO on a B2BUA call is handled as part of the call.** INFO was
+  not one of the methods the B2BUA intercepted, so it took the proxy path: a
+  B2BUA script with no `@proxy.on_request` covering INFO got
+  `405 Method Not Allowed`, and one with such a handler sent it to proxy routing
+  instead. Either way it never crossed a two-leg call, which is how a peer that
+  signals DTMF only as SIP INFO (RFC 2976 / RFC 6086 `application/dtmf-relay`,
+  still common on handsets and trunks) had its digits dropped.
+
+  It is relayed to the far leg on a two-leg call, and answered `200` on a
+  one-legged one. A DTMF payload — `application/dtmf-relay`'s `Signal=` /
+  `Duration=`, or a bare `application/dtmf` digit, including RFC 2833's `10` and
+  `11` for `*` and `#` — is surfaced through the same path an RFC 4733 digit
+  takes, so `@rtpengine.on_dtmf` and a controller's `ChannelDtmfReceived` see it
+  without knowing which wire carried it. A body that is not DTMF is left alone.
 
 ### Changed
 
