@@ -1,0 +1,647 @@
+//! An inbound re-INVITE on a bridged call: glare, the offer/answer it drives
+//! across the bridge, and the media re-anchor behind it.
+use crate::dispatcher::*;
+
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_reinvite
+pub fn handle_b2bua_reinvite(
+    inbound: InboundMessage,
+    message: SipMessage,
+    state: &DispatcherState,
+) {
+    let sip_call_id = message
+        .headers
+        .get("Call-ID")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
+        Some(id) => id,
+        None => {
+            // Raced a concurrent teardown (the `is_reinvite` gate had matched).
+            // 481 like the no-dialog-leg arm below, never a silent drop.
+            warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: no matching call — 481");
+            let response = build_response(
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+            return;
+        }
+    };
+
+    // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
+    // never by source socket: a Teams-style peer opens a NEW TLS connection (new
+    // source port) for its re-INVITE, so a socket comparison misclassifies the
+    // direction and reflects the re-INVITE back at the leg it came from.
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
+    let from_a_leg = match state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| call.request_direction(&sip_call_id, from_tag.as_deref()))
+    {
+        Some(crate::b2bua::actor::LegSide::A) => true,
+        Some(crate::b2bua::actor::LegSide::B) => false,
+        None => {
+            warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: Call-ID matches no dialog leg — 481");
+            let response = build_response(
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+            return;
+        }
+    };
+
+    // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
+    // before any topology/rtpengine rewrite) so a later siphon-terminated
+    // transfer offers this leg's *current* media if it is the survivor.
+    if !message.body.is_empty() {
+        state
+            .call_actors
+            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
+    }
+
+    // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): the peer may have sent this
+    // in-dialog re-INVITE on a new flow (TLS reconnect / NAT rebind). Re-anchor
+    // the originating leg's transport + remote target on the arrival flow so the
+    // 200 OK toward that peer — and later in-dialog requests — reach the live
+    // connection instead of the peer's dead original socket. Done before the
+    // snapshot below so the clones carry the live flow.
+    let refreshed_contact = message
+        .headers
+        .get("Contact")
+        .or_else(|| message.headers.get("m"))
+        .map(|value| crate::b2bua::actor::extract_contact_uri(value));
+    if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+        let winner_index = call.winner;
+        let origin_leg: Option<&mut Leg> = if from_a_leg {
+            Some(&mut call.a_leg)
+        } else if let Some(index) = winner_index {
+            call.b_legs.get_mut(index)
+        } else {
+            None
+        };
+        if let Some(leg) = origin_leg {
+            if leg.transport.remote_addr != inbound.remote_addr
+                || leg.transport.connection_id != inbound.connection_id
+            {
+                leg.transport.remote_addr = inbound.remote_addr;
+                leg.transport.connection_id = inbound.connection_id;
+                leg.transport.local_addr = Some(inbound.local_addr);
+            }
+            if let Some(ref contact) = refreshed_contact {
+                leg.dialog.remote_contact = Some(contact.clone());
+            }
+        }
+    }
+
+    // Snapshot routing info + per-leg contacts AFTER the flow refresh.
+    let (a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
+        Some(call) => {
+            let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
+            (call.a_leg.clone(), b_leg)
+        }
+        None => return,
+    };
+
+    // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
+    let (target_remote_contact, target_local_contact, _target_remote_aor_host) = if from_a_leg {
+        // A→B: target is B-leg
+        winner_b_leg
+            .as_ref()
+            .map(|b| {
+                (
+                    b.dialog.remote_contact.clone(),
+                    b.dialog.local_contact.clone(),
+                    b.dialog.remote_aor_host.clone(),
+                )
+            })
+            .unwrap_or((None, None, None))
+    } else {
+        // B→A: target is A-leg
+        (
+            a_leg.dialog.remote_contact.clone(),
+            a_leg.dialog.local_contact.clone(),
+            a_leg.dialog.remote_aor_host.clone(),
+        )
+    };
+
+    // Glare prevention (RFC 3261 §14.1):
+    //  (a) Don't forward a re-INVITE if the target hasn't ACKed the initial
+    //      INVITE yet — the offer/answer from the initial transaction is
+    //      still in flight.
+    //  (b) Don't forward a second re-INVITE while one is already pending
+    //      toward the same leg — two concurrent offer/answer exchanges
+    //      would leave the media state undefined.
+    // In either case we respond 491 Request Pending so the originator can
+    // retry after a random delay per the RFC.
+    let target_acked = if from_a_leg {
+        winner_b_leg
+            .as_ref()
+            .map(|b| b.initial_acked)
+            .unwrap_or(false)
+    } else {
+        a_leg.initial_acked
+    };
+    if !target_acked {
+        debug!(
+            call_id = %call_id,
+            from_a_leg = from_a_leg,
+            "B2BUA: rejecting re-INVITE with 491 — target leg not yet ACKed"
+        );
+        let response = build_response(
+            &message,
+            491,
+            "Request Pending",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
+    // `on_a_leg = !from_a_leg` because the "target" of the re-INVITE is the
+    // OPPOSITE side from where it arrived. A re-INVITE from the A-leg is
+    // forwarded toward the B-leg (and vice versa). Take-and-set the pending
+    // flag atomically so the glare check races against nothing.
+    let already_pending =
+        state
+            .call_actors
+            .set_pending_reinvite(&call_id, /*on_a_leg=*/ !from_a_leg, true);
+    if already_pending {
+        debug!(
+            call_id = %call_id,
+            from_a_leg = from_a_leg,
+            "B2BUA: rejecting re-INVITE with 491 — another re-INVITE already pending toward target"
+        );
+        let response = build_response(
+            &message,
+            491,
+            "Request Pending",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
+    debug!(
+        call_id = %call_id,
+        from_a_leg = from_a_leg,
+        "B2BUA: forwarding re-INVITE"
+    );
+
+    // Send 100 Trying to the re-INVITE sender
+    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+    // Answer on the same listener the request arrived on so a multi-homed UDP
+    // host keeps a symmetric source port (a peer that sent to :5066 rejects a
+    // reply sourced from :5060). No-op for stream transports / single listener.
+    send_message_from(
+        trying,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+
+    // Build the forwarded re-INVITE with new Via/branch
+    let branch = TransactionKey::generate_branch();
+
+    let mut forwarded = message.clone();
+    // Register this branch for response routing back to the re-INVITE sender
+    let reinvite_target = if from_a_leg {
+        // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
+        if let Some(b_leg) = &winner_b_leg {
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded,
+                &b_leg.dialog.call_id,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                &b_leg.dialog.local_tag,
+                b_leg.dialog.remote_tag.as_deref(),
+            );
+            Some((
+                b_leg.transport.remote_addr,
+                b_leg.transport.transport,
+                b_leg.transport.local_addr,
+                b_leg.transport.connection_id,
+                b_leg.dialog.call_id.clone(),
+                b_leg.dialog.local_tag.clone(),
+            ))
+        } else {
+            warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
+            return;
+        }
+    } else {
+        // B→A: forward to A-leg, rewrite B-leg → A-leg dialog headers
+        if let Some(b_leg) = &winner_b_leg {
+            crate::b2bua::actor::Dialog::rewrite_headers(
+                &mut forwarded,
+                &a_leg.dialog.call_id,
+                &b_leg.dialog.local_tag,
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                Some(&a_leg.dialog.local_tag),
+            );
+        }
+        Some((
+            a_leg.transport.remote_addr,
+            a_leg.transport.transport,
+            a_leg.transport.local_addr,
+            a_leg.transport.connection_id,
+            a_leg.dialog.call_id.clone(),
+            a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+        ))
+    };
+
+    if let Some((
+        destination,
+        transport,
+        target_local_addr,
+        target_connection_id,
+        leg_call_id,
+        leg_from_tag,
+    )) = reinvite_target
+    {
+        // Set Via with correct transport for the target leg.
+        // Via host + port = the target leg's anchored socket: the A-leg's arrival
+        // listener (family-correct, advertised identity) on a B→A forward, the
+        // B-leg's flow socket on an A→B forward when it was dialled over one.
+        // Unanchored legs keep the per-transport via_host/via_port.
+        let transport_str = format!("{}", transport).to_uppercase();
+        let (via_host, via_port) = if from_a_leg {
+            b_leg_sent_by(target_local_addr, state, &transport)
+        } else {
+            (
+                state.a_leg_advertised_host(target_local_addr, &transport),
+                a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+            )
+        };
+        let via_value = format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str, via_host, via_port, branch,
+        );
+        forwarded.headers.set("Via", via_value);
+
+        // Sanitize: strip headers that leak the other leg's identity/capabilities.
+        // A B2BUA terminates the dialog — no cross-leg headers should pass through.
+        if let Some(ref ua) = state.user_agent_header {
+            forwarded.headers.set("User-Agent", ua.clone());
+        } else {
+            forwarded.headers.remove("User-Agent");
+        }
+        forwarded.headers.remove("Server");
+        forwarded.headers.remove("Allow");
+        forwarded.headers.remove("Allow-Events");
+        forwarded.headers.remove("Supported");
+        forwarded.headers.remove("Require");
+        forwarded.headers.remove("Proxy-Require");
+        forwarded.headers.remove("P-Asserted-Identity");
+        forwarded.headers.remove("P-Access-Network-Info");
+        forwarded.headers.remove("Security-Verify");
+        forwarded.headers.remove("Security-Client");
+        forwarded.headers.remove("Authorization");
+        forwarded.headers.remove("Proxy-Authorization");
+        // Strip cross-leg Record-Route and Route — replace with target leg's route set
+        forwarded.headers.remove("Record-Route");
+        forwarded.headers.remove("Route");
+
+        // Add target leg's dialog route set as Route headers
+        let target_route_set = if from_a_leg {
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.route_set.clone())
+                .unwrap_or_default()
+        } else {
+            a_leg.dialog.route_set.clone()
+        };
+        for route in &target_route_set {
+            forwarded.headers.add("Route", route.clone());
+        }
+
+        // From/To: stitch URI string with dialog tag (RFC 3261 §12.2 —
+        // dialog identity requires the tag). The URIs are captured at
+        // INVITE-send time without tags; tags arrive in the 2xx and are
+        // stored separately. ensure_tag survives the URI being reset by
+        // a 401/407 retry path (which re-captures the bare URI).
+        let (target_from_uri, target_from_tag, target_to_uri, target_to_tag) = if from_a_leg {
+            let b = winner_b_leg.as_ref();
+            (
+                b.and_then(|b| b.dialog.local_from_uri.clone()),
+                b.map(|b| b.dialog.local_tag.clone()),
+                b.and_then(|b| b.dialog.remote_to_uri.clone()),
+                b.and_then(|b| b.dialog.remote_tag.clone()),
+            )
+        } else {
+            (
+                a_leg.dialog.local_from_uri.clone(),
+                Some(a_leg.dialog.local_tag.clone()),
+                a_leg.dialog.remote_to_uri.clone(),
+                a_leg.dialog.remote_tag.clone(),
+            )
+        };
+        if let Some(uri) = target_from_uri {
+            forwarded.headers.set(
+                "From",
+                crate::b2bua::actor::ensure_tag(&uri, target_from_tag.as_deref()),
+            );
+        }
+        if let Some(uri) = target_to_uri {
+            forwarded.headers.set(
+                "To",
+                crate::b2bua::actor::ensure_tag(&uri, target_to_tag.as_deref()),
+            );
+        }
+
+        // Regenerate CSeq for the target leg's dialog (RFC 3261 — independent CSeq per dialog)
+        let target_cseq = if from_a_leg {
+            winner_b_leg
+                .as_ref()
+                .map(|b| b.dialog.local_cseq)
+                .unwrap_or(1)
+        } else {
+            a_leg.dialog.local_cseq
+        };
+        forwarded
+            .headers
+            .set("CSeq", format!("{} INVITE", target_cseq));
+
+        // Decrement Max-Forwards (RFC 7332 — B2BUAs MUST decrement)
+        let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
+
+        // Sanitize SDP: mask other leg's identity in o= and s= lines, and
+        // rewrite the o= address for topology hiding — family-matched to the
+        // target leg (same arrival socket as the Via above), so a v6 A-leg gets
+        // a v6 o= address to go with its v6 Via.
+        let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
+        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+
+        // RTPEngine: rewrite re-INVITE SDP through offer to maintain media anchoring.
+        // Without this, re-INVITE SDP passes through unmodified — if the remote side
+        // includes stale or cross-wired RTP ports, media breaks (one-way audio).
+        if !forwarded.body.is_empty() {
+            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
+                &state.rtpengine_set,
+                &state.rtpengine_sessions,
+                &state.rtpengine_profiles,
+            ) {
+                let a_sip_call_id = &a_leg.dialog.call_id;
+                if let Some(session) = media_sessions.get(a_sip_call_id) {
+                    if let Some(profile) = profiles.get(&session.profile) {
+                        // The tag of whichever side is sending the offer. A re-offer from the callee
+                        // must carry the callee's own tag: the engine resolves the re-offering party
+                        // by tag and answers with the leg facing the *other* one, so substituting
+                        // the caller's tag does not identify the callee — it claims to be the caller
+                        // and comes back wired to the wrong leg.
+                        let Some(offer_tag) = session.offer_tag(from_a_leg) else {
+                            warn!(
+                                call_id = %call_id,
+                                "B2BUA re-INVITE from the callee on a media session with no \
+                                 recorded answerer tag — rejecting with 488 rather than naming the \
+                                 caller to the media engine"
+                            );
+                            reject_unanchorable_offer(
+                                &message,
+                                &inbound,
+                                state,
+                                &call_id,
+                                Some(!from_a_leg),
+                            );
+                            return;
+                        };
+                        let mut offer_flags = profile.offer.clone();
+                        // Pin media ingress to where this re-INVITE actually came from, the way the
+                        // initial offer does: a client that changed network re-INVITEs from a new
+                        // public address, and the engine gates the leg on the last hint it was given.
+                        if offer_flags.carry_received_from {
+                            offer_flags.received_from = Some(inbound.remote_addr.ip());
+                        }
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
+                                session.rtpengine_id(),
+                                offer_tag,
+                                &forwarded.body,
+                                &offer_flags,
+                            ))
+                        }) {
+                            Ok(rewritten_sdp) => {
+                                forwarded.body = rewritten_sdp;
+                                debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE SDP (offer)");
+                            }
+                            Err(error) => {
+                                error!(
+                                    call_id = %call_id,
+                                    "RTPEngine offer for re-INVITE failed: {error} — rejecting the \
+                                     re-INVITE with 488 rather than forwarding SDP that routes both \
+                                     parties around the anchor"
+                                );
+                                reject_unanchorable_offer(
+                                    &message,
+                                    &inbound,
+                                    state,
+                                    &call_id,
+                                    Some(!from_a_leg),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Own the o= identity toward the leg this re-INVITE is sent to (RFC 3264
+        // §8): stable per-leg session-id + monotonic version, applied AFTER any
+        // rtpengine rewrite so siphon's o= is final on the wire (address left as
+        // rtpengine/sanitize set it — §8 keys on the session-id, not the address).
+        if !forwarded.body.is_empty() {
+            if let Some((sess_id, version)) = state
+                .call_actors
+                .reserve_leg_sdp_version(&call_id, !from_a_leg)
+            {
+                stamp_sdp_origin(&mut forwarded.body, &state.sdp_name, sess_id, version, None);
+            }
+        }
+
+        // Update Content-Length after SDP rewrite (o=/s= and RTPEngine changes may alter body size)
+        if !forwarded.body.is_empty() {
+            forwarded
+                .headers
+                .set("Content-Length", forwarded.body.len().to_string());
+        }
+
+        // Rewrite RURI to target leg's remote Contact (RFC 3261 §12.2.1.1).
+        // In-dialog requests MUST use the remote target from the last 2xx/INVITE.
+        if let Some(ref uri_str) = target_remote_contact {
+            if let Ok(parsed) = parse_uri_standalone(uri_str) {
+                forwarded.start_line = StartLine::Request(crate::sip::message::RequestLine {
+                    method: crate::sip::message::Method::Invite,
+                    request_uri: parsed,
+                    version: crate::sip::message::Version::sip_2_0(),
+                });
+            }
+        }
+
+        // Rewrite Contact to what we advertised to the target leg
+        if let Some(ref contact) = target_local_contact {
+            forwarded.headers.set("Contact", contact.clone());
+        }
+
+        // In-dialog requests follow the dialog route set (RFC 3261 §12.2.1.1):
+        // send to the route-set first hop, not the cached INVITE next-hop. In an
+        // IMS topology the INVITE was sent to a non-Record-Routing I-CSCF while
+        // the dialog routes via the S-CSCF, so the cached leg destination is the
+        // wrong target for an in-dialog re-INVITE (mirrors the PRACK/ACK/BYE
+        // paths). Falls back to the cached destination when there is no route set.
+        let (send_dest, send_transport) =
+            resolve_in_dialog_destination(&target_route_set, state, destination, transport);
+
+        // Track the re-INVITE branch → call_id for response routing.
+        // Encode the direction so the response handler knows where to relay.
+        // Store the originator's Via(s) so we can restore them on the response.
+        let direction = if from_a_leg {
+            "reinvite:a2b"
+        } else {
+            "reinvite:b2a"
+        };
+        let originator_vias = message
+            .headers
+            .get_all("Via")
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        let mut reinvite_leg = Leg::new_b_leg(
+            leg_call_id,
+            leg_from_tag,
+            direction.to_string(),
+            branch.clone(),
+            LegTransport {
+                remote_addr: send_dest,
+                // Reuse the target leg's live connection (mirrors the framework
+                // BYE) so a B→A forward writes on the connection the peer is on
+                // rather than dialing its dead ephemeral source port.
+                connection_id: target_connection_id,
+                transport: send_transport,
+                // Anchor the tracking leg on the target's socket (the A-leg's arrival
+                // listener for B→A) so a post-teardown zombie re-ACK to this leg
+                // still leaves from the right port on a multi-homed host.
+                local_addr: target_local_addr,
+            },
+        );
+        reinvite_leg.stored_vias = originator_vias;
+        reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
+        // The originator's own From/To, kept verbatim for the same reason as its
+        // Via and CSeq: RFC 3261 §8.2.6.2 requires the response to echo the
+        // request being answered, and this re-INVITE is that request. The
+        // forwarded response is a clone of the *responder's* 200, whose From/To
+        // name the far leg's dialog, and swapping only the tags (what
+        // `Dialog::rewrite_headers` does) leaves the far leg's URIs in place.
+        // Both are in-dialog here, so the To arrives already tagged and is
+        // echoed as-is — §8.2.6.2's "if a request contained a To tag ... the To
+        // header field in the response MUST equal that of the request".
+        reinvite_leg.stored_from = message.headers.from().map(|f| f.to_string());
+        reinvite_leg.stored_to = message.headers.to().map(|t| t.to_string());
+        // The route set the forwarded re-INVITE carries, so the ACK for its 200
+        // is routed identically (RFC 3261 §12.2.1.1).
+        reinvite_leg.dialog.route_set = target_route_set.clone();
+        state.call_actors.add_b_leg(&call_id, reinvite_leg);
+
+        // Forward to the target leg. A→B: destination-keyed reuse via
+        // stream_connections + pool/SNI. B→A: reuse the target leg's live
+        // connection via the connection_map exactly like the framework BYE
+        // (send_message_from → OutboundRouter → TLS/TCP distributor connection_map
+        // lookup, dialing only on a miss); target_local_addr keeps the UDP egress
+        // pinned for multi-homed source-port parity. If the target's TLS
+        // connection is dead, dial its remote-target Contact instead of the dead
+        // cached socket (RFC 3261 §12.2.1.1).
+        let contact_fallback = contact_fallback_target(
+            from_a_leg,
+            send_dest,
+            send_transport,
+            target_connection_id,
+            target_route_set.is_empty(),
+            target_remote_contact.as_deref(),
+            state,
+        );
+        if from_a_leg {
+            send_b2bua_to_bleg(
+                forwarded,
+                send_transport,
+                send_dest,
+                target_local_addr,
+                state,
+            );
+        } else if let Some(target) = contact_fallback {
+            warn!(
+                call_id = %call_id, dest = %target.address,
+                "B2BUA re-INVITE B→A: stored TLS connection dead — dialing remote target Contact"
+            );
+            let data = Bytes::from(forwarded.to_bytes());
+            send_to_target(
+                data,
+                &target,
+                send_transport,
+                ConnectionId::default(),
+                target_local_addr,
+                state,
+            );
+        } else {
+            send_message_from(
+                forwarded,
+                send_transport,
+                send_dest,
+                target_connection_id,
+                target_local_addr,
+                state,
+            );
+        }
+
+        // Increment the target leg's local CSeq after sending the re-INVITE
+        if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+            if from_a_leg {
+                if let Some(winner_idx) = call.winner {
+                    if let Some(b_leg) = call.b_legs.get_mut(winner_idx) {
+                        b_leg.dialog.local_cseq += 1;
+                    }
+                }
+            } else {
+                call.a_leg.dialog.local_cseq += 1;
+            }
+        }
+    }
+
+    // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
+    // via handle_b2bua_response which calls set_state — we reset the timer there)
+}
