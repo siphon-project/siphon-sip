@@ -320,7 +320,7 @@ registrar:
 # ---------------------------------------------------------------------------
 auth:
   realm: "example.com"
-  backend: static   # static | http
+  backend: static   # static | http | database
   # For Cx MAR/MAA against an HSS, leave backend as static/http and call
   # auth.require_ims_digest() from the REGISTER handler; it uses the diameter:
   # peer configuration directly. (The old `diameter_cx` value never parsed —
@@ -389,6 +389,44 @@ auth:
   #                        # change, so a non-zero TTL is recommended in
   #                        # production; a change propagates after <= cache_ttl_secs.
   #                        # Hits are counted by siphon_auth_ha1_cache_hits_total.
+
+  # SQL credential source (backend: database). Needs the postgres-backend
+  # cargo feature, which is on by default.
+  # database:
+  #   url: "postgresql://siphon@db.internal/siphon"
+  #   query: "SELECT password FROM subscribers WHERE username = $1 AND realm = $2"
+  #                        # Your schema, not ours. Run as a prepared statement
+  #                        # with $1 bound to the digest username and $2 to the
+  #                        # realm when the statement references it, so a crafted
+  #                        # username is a parameter and never SQL. Must select
+  #                        # exactly one text column: the credential. A query
+  #                        # that does not bind $1 is refused at config load.
+  #   ha1: false           # true = the columns are pre-hashed HA1 hex strings.
+  #                        # An HA1 is bound to the hash it was computed with
+  #                        # (RFC 7616 §3.4.3), so a single `ha1` column only
+  #                        # serves clients answering with that one algorithm.
+  #                        # Select one column per hash instead and siphon picks
+  #                        # the one matching what the client answered with
+  #                        # (RFC 8760), which is what lets a deployment move to
+  #                        # SHA-256 while its phones catch up:
+  #                        #   query: "SELECT ha1_md5, ha1_sha256 FROM sip_credentials
+  #                        #           WHERE username = $1 AND realm = $2"
+  #                        # Columns are named ha1_md5 / ha1_sha256 /
+  #                        # ha1_sha512_256; the -sess variants share the base
+  #                        # hash's column. Prefer this to a password column: a
+  #                        # read of the table then does not hand out something
+  #                        # that registers as the subscriber.
+  #   cache_ttl_secs: 300  # same contract as auth.http.cache_ttl_secs above:
+  #                        # 0 (the default) means every digest verification
+  #                        # makes a BLOCKING query that pins a handler-pool
+  #                        # worker. Non-zero is the production setting.
+  #   timeout_ms: 2000     # per-lookup deadline, connection included
+  #
+  # The connection is lazy and reconnects on its own, so a database that is
+  # slow to come up does not hold up start-up and a restart does not wedge
+  # authentication for the life of the process. While it is unreachable every
+  # check is "unavailable", which fails closed WITHOUT counting toward the
+  # auto-ban — an outage of your credential store must not ban your subscribers.
 
 # ---------------------------------------------------------------------------
 # Security — rate limiting, scanner blocking, trust lists

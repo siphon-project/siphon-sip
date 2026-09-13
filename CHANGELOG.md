@@ -42,6 +42,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   server's "names no plan" and "names two plans" refusals unrepresentable rather
   than discovered at runtime. Returns the channel id, siphon's call id and the
   SIP Call-ID; the call is `calling`, and the answer still arrives as an event.
+- **`auth.backend: database` is implemented.** A SQL credential source under
+  `auth.database`: a libpq `url`, a `query` that binds the digest username to
+  `$1` (and the realm to `$2` when the statement references it), and `ha1` to
+  say whether the columns are plaintext passwords or pre-hashed H(A1)s. The
+  statement is the operator's — schemas differ enough that a fixed one would
+  mean every deployment maintaining a view — and it is prepared, so a crafted
+  username is a bound parameter and never SQL.
+
+  The selector previously parsed and was then refused at config load, because
+  nothing dispatched to it. It now shares the TTL cache (`cache_ttl_secs`) and
+  the failure semantics of the HTTP backend: a database that cannot answer is
+  `Unavailable`, which fails closed *without* counting toward the auto-ban, so
+  an outage of the credential store does not ban the subscribers retrying
+  through it. The connection is lazy and reconnects on its own, so a database
+  that is slow to start does not hold up boot and a restart does not wedge
+  authentication for the life of the process.
+
+  With `ha1: true` the query may select one column per hash — `ha1_md5`,
+  `ha1_sha256`, `ha1_sha512_256` — and siphon picks the one matching the
+  algorithm the client answered with (RFC 8760). An H(A1) is bound to its hash
+  (RFC 7616 §3.4.3), so a single column only ever serves one algorithm; per-hash
+  columns are what let a deployment move to SHA-256 while its phones catch up,
+  without storing a password that would register as the subscriber.
+
+  Config load still refuses the combinations that cannot work: no
+  `auth.database` block, a `query` that never binds `$1` (which would return one
+  row for every subscriber), and a binary built without the `postgres-backend`
+  feature.
 
 ### Changed
 

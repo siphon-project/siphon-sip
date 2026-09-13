@@ -517,6 +517,19 @@ pub fn inject_python_singletons(config: &Config) {
         );
     }
 
+    // Wire the SQL auth backend if configured. Config load refuses
+    // `backend: database` without this block, so a missing one here means the
+    // operator selected another backend and left the block behind.
+    if let Some(database_config) = &config.auth.database {
+        py_auth.set_database_config(database_config.clone());
+        info!(
+            query = %database_config.query,
+            ha1 = database_config.ha1,
+            cache_ttl_secs = database_config.cache_ttl_secs,
+            "database auth backend configured"
+        );
+    }
+
     // Wire AKA credentials for local Milenage auth (IMS P-CSCF)
     if !config.auth.aka_credentials.is_empty() {
         py_auth.set_aka_credentials(config.auth.aka_credentials.clone());
