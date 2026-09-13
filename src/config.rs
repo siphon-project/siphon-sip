@@ -2250,8 +2250,13 @@ pub struct ControlAppConfig {
     /// (e.g. "ws://controller.internal:8443/siphon").
     #[serde(default)]
     pub connect_url: Option<String>,
-    /// What to do if the owning connection is lost mid-call (owner disconnects):
-    /// "hangup" (default), "continue", or "fallback".
+    /// What to do if the owning connection is lost mid-call (owner
+    /// disconnects): `hangup` (the default) or `continue`.
+    ///
+    /// `fallback` — re-dispatch the call through the Python handlers — is
+    /// refused at config load rather than accepted: it silently behaved as
+    /// `hangup`, so an operator who chose it to keep calls alive got them torn
+    /// down and nothing said so.
     #[serde(default)]
     pub on_lost: Option<String>,
     /// PEM bundle to verify the controller's certificate against when
@@ -4607,6 +4612,7 @@ impl Config {
         config.validate_backends()?;
         config.validate_cdr()?;
         config.validate_control_app_events()?;
+        config.validate_control_apps()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -4881,6 +4887,38 @@ impl Config {
                         KNOWN.join(", ")
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a control-loss policy siphon does not implement.
+    ///
+    /// `fallback` parsed and then behaved as `hangup`, because re-dispatching a
+    /// call through the Python handlers was never built. An operator who set it
+    /// to keep calls alive when a controller dies got exactly the opposite, on
+    /// every call, with nothing in the logs to say so.
+    fn validate_control_apps(&self) -> Result<()> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        for app in &control.apps {
+            let Some(policy) = app.on_lost.as_deref() else {
+                continue;
+            };
+            if policy != "hangup" && policy != "continue" {
+                return Err(SiphonError::Config(format!(
+                    "control.apps[{:?}].on_lost is {policy:?}, which siphon does not implement \
+                     — it is \"hangup\" (end the call, the default) or \"continue\" (leave it \
+                     running without an owner). {}",
+                    app.name,
+                    if policy == "fallback" {
+                        "`fallback` would re-dispatch through the Python handlers, which does \
+                         not exist; it behaved as `hangup`."
+                    } else {
+                        ""
+                    }
+                )));
             }
         }
         Ok(())
@@ -7798,6 +7836,37 @@ media:
                 .is_empty(),
             "app-level events are opt-in"
         );
+    }
+
+    /// `fallback` parsed and then behaved as `hangup`, so an operator who set
+    /// it to keep calls alive when a controller dies got exactly the opposite,
+    /// on every call, with nothing saying so.
+    #[test]
+    fn rejects_an_unimplemented_control_loss_policy() {
+        let error = Config::from_str(&backend_yaml(
+            "control:\n  apps:\n    - name: pbx\n      token: \"t\"\n      on_lost: fallback\n",
+        ))
+        .expect_err("an unimplemented on_lost must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("on_lost") && message.contains("fallback"),
+            "the error should name the setting and the value: {message}"
+        );
+        assert!(
+            message.contains("hangup") && message.contains("continue"),
+            "and the policies that do exist: {message}"
+        );
+    }
+
+    /// The two that are implemented still load.
+    #[test]
+    fn accepts_the_implemented_control_loss_policies() {
+        for policy in ["hangup", "continue"] {
+            Config::from_str(&backend_yaml(&format!(
+                "control:\n  apps:\n    - name: pbx\n      token: \"t\"\n      on_lost: {policy}\n"
+            )))
+            .unwrap_or_else(|error| panic!("on_lost: {policy} must load: {error}"));
+        }
     }
 
     #[test]

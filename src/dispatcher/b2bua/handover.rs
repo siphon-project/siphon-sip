@@ -110,7 +110,21 @@ pub fn control_handover(
     // already kept alive by the automatic 100 Trying (a 180 would falsely signal
     // ringing before anything is dialed); the app sends its own via `progress`.
     // In answer-first mode the 200 already went out and the state is Answered.
-    state.call_actors.set_control_owner(call_id, app, on_lost);
+    // Per-call value first, then the app's configured policy, then hangup.
+    // `control.apps[].on_lost` parsed and was never read: only a per-call value
+    // reached a channel, so an operator who set the policy once for the app got
+    // the hardcoded default on every call and no indication of it.
+    let app_on_lost = bus
+        .app_config(app)
+        .and_then(|config| config.on_lost.clone());
+    let on_lost = on_lost
+        .map(str::to_string)
+        .or(app_on_lost)
+        .unwrap_or_else(|| "hangup".to_string());
+
+    state
+        .call_actors
+        .set_control_owner(call_id, app, Some(&on_lost));
     if !answer {
         state.call_actors.set_state(call_id, CallState::Ringing);
     }
@@ -120,7 +134,7 @@ pub fn control_handover(
         &channel_id,
         call_id,
         &sip_call_id,
-        on_lost.unwrap_or("hangup"),
+        &on_lost,
         vars,
         stasis_payload,
     );

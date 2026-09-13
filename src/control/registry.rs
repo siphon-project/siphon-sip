@@ -796,8 +796,10 @@ impl ControlBus {
             "continue" => {
                 // Leave the call running autonomously; nothing to tear down.
             }
-            // "fallback" re-dispatch through Python handlers is a Phase-2 item;
-            // degrade to hangup so a lost controller never silently strands a call.
+            // Anything else ends the call. `fallback` is refused at config
+            // load and by the verbs that take it, so reaching here with one
+            // would be a bug rather than a policy — and ending the call is the
+            // safe reading of "the owner is gone".
             _ => {
                 crate::dispatcher::b2bua_terminate_call(
                     &sip_call_id,
