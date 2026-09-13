@@ -53,6 +53,7 @@
 
 mod client;
 mod error;
+mod originate;
 mod server;
 mod session;
 pub mod sip;

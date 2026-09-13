@@ -30,6 +30,8 @@ use siphon_control_proto::{ChannelSnapshot, EventFrame};
 
 use crate::client::{ClientConfig, ClientEvent, ControlClient};
 use crate::error::ControlError;
+use crate::originate::originate_on;
+pub use crate::originate::{OriginateMedia, OriginateOptions, OriginatePrivacy, Originated};
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 
@@ -109,7 +111,7 @@ impl From<String> for RouteTarget {
     }
 }
 
-fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
+pub(crate) fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
     let mut object = serde_json::Map::new();
     for (name, value) in headers {
         object.insert(name.clone(), json!(value));
@@ -1339,6 +1341,45 @@ impl SipClient {
         self.client.describe().await
     }
 
+    /// Place an outbound call under a caller-supplied channel id.
+    ///
+    /// The one verb that *creates* a channel rather than addressing one, which
+    /// is why it lives here and not on [`Call`]. It returns as soon as the
+    /// INVITE is on the wire — the call is `calling`, and the answer, failure or
+    /// timeout arrives later as an event on the channel, exactly as a handed-over
+    /// call's does.
+    ///
+    /// The channel id is yours to choose so the call is addressable before it is
+    /// answered (and before any server-assigned id could have reached you). A id
+    /// already in use is a `conflict`, never silently reused.
+    ///
+    /// ```no_run
+    /// # use siphon_control_client::sip::{OriginateMedia, OriginateOptions, SipClient};
+    /// # async fn example(client: &SipClient) -> Result<(), siphon_control_client::ControlError> {
+    /// let call = client
+    ///     .originate(
+    ///         "wake-up-42",
+    ///         "sip:1001@pbx.example",
+    ///         OriginateMedia::anchor(),
+    ///         OriginateOptions::default()
+    ///             .from("sip:alarm@pbx.example")
+    ///             .timeout(20),
+    ///     )
+    ///     .await?;
+    /// println!("ringing on {}", call.channel);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn originate(
+        &self,
+        channel: &str,
+        to: &str,
+        media: OriginateMedia,
+        options: OriginateOptions,
+    ) -> Result<Originated, ControlError> {
+        originate_on(&self.client.commander(), channel, to, media, options).await
+    }
+
     /// Send a raw command on any module (the generic escape hatch).
     pub async fn command(
         &self,
@@ -1476,6 +1517,193 @@ mod tests {
             vars: HashMap::new(),
         };
         Call::from_snapshot(transport, snapshot, event_rx)
+    }
+
+    fn recorder(result: serde_json::Value) -> Arc<RecordingTransport> {
+        Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result,
+        })
+    }
+
+    fn originate_result() -> serde_json::Value {
+        json!({
+            "channel": "out-1",
+            "call_id": "call-uuid",
+            "sip_call_id": "sip@host",
+            "state": "calling",
+        })
+    }
+
+    #[tokio::test]
+    async fn originate_is_module_level_and_carries_the_caller_supplied_channel() {
+        // Module-level: `originate` creates the channel, so it must NOT carry a
+        // channel target — a target would make the substrate resolve an id that
+        // does not exist yet and refuse the command.
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let originated = originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let recorded = lock(&recorder.calls)[0].clone();
+        assert_eq!(recorded.module.as_deref(), Some("sip"));
+        assert_eq!(recorded.verb, "originate");
+        assert_eq!(recorded.target, serde_json::Value::Null);
+        assert_eq!(recorded.args["channel"], "out-1");
+        assert_eq!(recorded.args["to"], "sip:1001@pbx.example");
+
+        assert_eq!(originated.channel, "out-1");
+        assert_eq!(originated.sip_call_id.as_deref(), Some("sip@host"));
+    }
+
+    #[tokio::test]
+    async fn an_anchored_originate_sends_media_true_and_no_offer() {
+        // The server refuses an originate that names both an offer and an
+        // anchor, and refuses one that names neither. The enum makes both
+        // unrepresentable, so what is left to check is that each variant emits
+        // exactly the one plan it stands for.
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor_with("voice_ai"),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["media"], true);
+        assert_eq!(args["profile"], "voice_ai");
+        assert!(args.get("sdp").is_none(), "{args}");
+        assert!(args.get("body").is_none(), "{args}");
+    }
+
+    #[tokio::test]
+    async fn an_sdp_originate_sends_the_offer_and_never_media_true() {
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::sdp("v=0\r\n"),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["sdp"], "v=0\r\n");
+        assert!(args.get("media").is_none(), "{args}");
+        // application/sdp by definition — the server refuses a content_type
+        // alongside an sdp offer.
+        assert!(args.get("content_type").is_none(), "{args}");
+    }
+
+    #[tokio::test]
+    async fn a_body_originate_carries_its_own_content_type() {
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::Body {
+                body: "hello".to_string(),
+                content_type: "text/plain".to_string(),
+            },
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["body"], "hello");
+        assert_eq!(args["content_type"], "text/plain");
+        assert!(args.get("media").is_none(), "{args}");
+    }
+
+    #[tokio::test]
+    async fn every_option_lands_under_the_name_the_server_parses() {
+        // Spelling is the whole risk here: a dropped or misspelled field still
+        // places a call, just to the wrong party or without the privacy that was
+        // asked for, and nothing on either side complains.
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default()
+                .from("sip:alarm@pbx.example")
+                .next_hop("sip:sbc.example:5060")
+                .p_asserted_identity("sip:+15550001@pbx.example")
+                .privacy(OriginatePrivacy::Restricted)
+                .header("X-Reason", "wake-up")
+                .timeout(20)
+                .var("case", "wake"),
+        )
+        .await
+        .expect("originate");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["from"], "sip:alarm@pbx.example");
+        assert_eq!(args["next_hop"], "sip:sbc.example:5060");
+        assert_eq!(args["p_asserted_identity"], "sip:+15550001@pbx.example");
+        assert_eq!(args["privacy"], "restricted");
+        assert_eq!(args["headers"]["X-Reason"], "wake-up");
+        assert_eq!(args["timeout"], 20);
+        assert_eq!(args["vars"]["case"], "wake");
+    }
+
+    #[tokio::test]
+    async fn untouched_options_are_absent_rather_than_null() {
+        // A null is not the same as an absent key to a server reading
+        // `args.get(..).and_then(as_str)`: it is the difference between "take
+        // the default" and a typed error on some fields.
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        for absent in [
+            "from",
+            "from_display",
+            "to_display",
+            "next_hop",
+            "p_asserted_identity",
+            "privacy",
+            "headers",
+            "timeout",
+            "on_lost",
+            "vars",
+            "profile",
+            "ws_uri",
+        ] {
+            assert!(
+                args.get(absent).is_none(),
+                "{absent} should be absent: {args}"
+            );
+        }
     }
 
     #[tokio::test]

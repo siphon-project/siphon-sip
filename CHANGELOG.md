@@ -32,6 +32,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The single form (`backend:` plus its block) is unchanged and means one sink.
   Setting both `backend` and `backends` is refused at config load, naming both,
   rather than siphon guessing which one was meant.
+- **`originate` is now a typed method on both the Rust and TypeScript control
+  SDKs** (`SipClient::originate` / `client.originate()`). It was the only verb
+  with no typed helper, so placing a call meant hand-building JSON through the
+  raw `command` escape hatch — the verb with more optional arguments than every
+  other one combined, where a misspelled field still places a call, just to the
+  wrong party or without the asserted identity or privacy that was asked for.
+  The media plan is a required enum (`anchor` / `sdp` / `body`), which makes the
+  server's "names no plan" and "names two plans" refusals unrepresentable rather
+  than discovered at runtime. Returns the channel id, siphon's call id and the
+  SIP Call-ID; the call is `calling`, and the answer still arrives as an event.
 
 ### Changed
 

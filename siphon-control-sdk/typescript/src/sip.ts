@@ -196,6 +196,96 @@ function stringValue(result: unknown): string | null {
  * path, an rtpengine media-DB id, or an inline blob. A blob is base64-encoded on
  * the wire (the control rail is JSON text).
  */
+/**
+ * The media plan for {@link SipClient.originate} — what the outbound INVITE
+ * offers.
+ *
+ * Required, and a union, because the server requires exactly one plan and
+ * rejects every combination of the raw `sdp` / `body` / `media` arguments that
+ * names none or more than one. Expressed this way those errors cannot be
+ * written down.
+ */
+export type OriginateMedia =
+  /** Offerless INVITE: siphon anchors the leg on the media engine. */
+  | { anchor: true; profile?: string; wsUri?: string }
+  /** Your own SDP offer (`application/sdp` by definition). */
+  | { sdp: string }
+  /** Your own body with its own content type. */
+  | { body: string; contentType: string };
+
+/** Optional shaping for {@link SipClient.originate}. */
+export interface OriginateOptions {
+  /** From-URI to place the call as. */
+  from?: string;
+  /** From display name. */
+  fromDisplay?: string;
+  /** To display name. */
+  toDisplay?: string;
+  /** Route the INVITE here while keeping `to` as the R-URI. */
+  nextHop?: string;
+  /** P-Asserted-Identity to assert (RFC 3325). */
+  pAssertedIdentity?: string;
+  /** Caller-identity presentation (RFC 3323 §4.1). */
+  privacy?: "allowed" | "restricted";
+  /** Extra headers on the outbound INVITE. */
+  headers?: Record<string, string>;
+  /** Ring timeout in seconds. */
+  timeout?: number;
+  /** Control-loss policy for the created channel. */
+  onLost?: string;
+  /** Per-call variables carried on the channel. */
+  vars?: Record<string, string>;
+}
+
+/**
+ * What the server answers an accepted `originate` with: the call is `calling`,
+ * not answered — the answer arrives later as an event on the channel.
+ */
+export interface Originated {
+  /** The caller-supplied channel id the call is addressed by. */
+  channel: string;
+  /** siphon's internal call id. */
+  callId?: string;
+  /** The SIP Call-ID on the wire, for joining CDR / HEP. */
+  sipCallId?: string;
+}
+
+export function originateArgs(
+  channel: string,
+  to: string,
+  media: OriginateMedia,
+  options?: OriginateOptions,
+): Record<string, unknown> {
+  const args: Record<string, unknown> = { channel, to };
+  if ("anchor" in media) {
+    args.media = true;
+    if (media.profile !== undefined) args.profile = media.profile;
+    if (media.wsUri !== undefined) args.ws_uri = media.wsUri;
+  } else if ("sdp" in media) {
+    args.sdp = media.sdp;
+  } else {
+    args.body = media.body;
+    args.content_type = media.contentType;
+  }
+  if (!options) return args;
+  // Spelled out rather than looped: these are the exact wire names the server
+  // parses, and a camelCase key would be silently ignored there — the call
+  // still places, just without the identity or privacy that was asked for.
+  if (options.from !== undefined) args.from = options.from;
+  if (options.fromDisplay !== undefined) args.from_display = options.fromDisplay;
+  if (options.toDisplay !== undefined) args.to_display = options.toDisplay;
+  if (options.nextHop !== undefined) args.next_hop = options.nextHop;
+  if (options.pAssertedIdentity !== undefined) {
+    args.p_asserted_identity = options.pAssertedIdentity;
+  }
+  if (options.privacy !== undefined) args.privacy = options.privacy;
+  if (options.headers !== undefined) args.headers = options.headers;
+  if (options.timeout !== undefined) args.timeout = options.timeout;
+  if (options.onLost !== undefined) args.on_lost = options.onLost;
+  if (options.vars !== undefined) args.vars = options.vars;
+  return args;
+}
+
 export type PlaySource =
   | { file: string }
   | { dbId: number }
@@ -905,6 +995,48 @@ export class SipClient {
   /** Fetch the registered adapters' schema (`describe`). */
   describe(): Promise<unknown> {
     return this.client.describe();
+  }
+
+  /**
+   * Place an outbound call under a caller-supplied channel id.
+   *
+   * The one verb that *creates* a channel rather than addressing one, which is
+   * why it lives here and not on {@link Call}. It resolves as soon as the
+   * INVITE is on the wire — the call is `calling`, and the answer, failure or
+   * timeout arrives later as an event on the channel.
+   *
+   * ```ts
+   * const call = await client.originate(
+   *   "wake-up-42",
+   *   "sip:1001@pbx.example",
+   *   { anchor: true },
+   *   { from: "sip:alarm@pbx.example", timeout: 20 },
+   * );
+   * ```
+   */
+  async originate(
+    channel: string,
+    to: string,
+    media: OriginateMedia,
+    options?: OriginateOptions,
+  ): Promise<Originated> {
+    const result = (await this.client.command(
+      MODULE_SIP,
+      "originate",
+      null,
+      originateArgs(channel, to, media, options),
+    )) as Record<string, unknown> | null;
+    const text = (name: string): string | undefined => {
+      const value = result?.[name];
+      return typeof value === "string" ? value : undefined;
+    };
+    return {
+      // The server echoes the id back; fall back to the one we asked for
+      // rather than returning an empty channel a caller cannot address.
+      channel: text("channel") ?? channel,
+      callId: text("call_id"),
+      sipCallId: text("sip_call_id"),
+    };
   }
 
   /** Send a raw command on any module (the generic escape hatch). */

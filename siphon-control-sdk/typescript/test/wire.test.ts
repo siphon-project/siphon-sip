@@ -17,6 +17,7 @@ import {
   SipVerb,
   transferOutcome,
   MODULE_SIP,
+  originateArgs,
 } from "../src/index";
 import type {
   BridgeFailedPayload,
@@ -454,5 +455,80 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     expect(transport.calls).toEqual([
       { module: MODULE_SIP, verb: "remove_header", target: { channel: "ch1" }, args: { name: "X-Foo" } },
     ]);
+  });
+});
+
+describe("originate args map to the names the server parses", () => {
+  it("is module-level: it creates the channel, so it carries no channel target", () => {
+    // A target would make the substrate resolve an id that does not exist yet
+    // and refuse the command.
+    const args = originateArgs("out-1", "sip:1001@pbx.example", { anchor: true });
+    expect(args).toEqual({ channel: "out-1", to: "sip:1001@pbx.example", media: true });
+  });
+
+  it("emits exactly one media plan per variant", () => {
+    expect(
+      originateArgs("out-1", "sip:1001@pbx.example", { anchor: true, profile: "voice_ai" }),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      media: true,
+      profile: "voice_ai",
+    });
+    expect(originateArgs("out-1", "sip:1001@pbx.example", { sdp: "v=0\r\n" })).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      sdp: "v=0\r\n",
+    });
+    expect(
+      originateArgs("out-1", "sip:1001@pbx.example", { body: "hi", contentType: "text/plain" }),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      body: "hi",
+      content_type: "text/plain",
+    });
+  });
+
+  it("snake_cases every option the server reads", () => {
+    // A camelCase key is silently ignored server-side: the call still places,
+    // just without the identity or privacy that was asked for.
+    const args = originateArgs(
+      "out-1",
+      "sip:1001@pbx.example",
+      { anchor: true },
+      {
+        from: "sip:alarm@pbx.example",
+        fromDisplay: "Alarm",
+        toDisplay: "Desk",
+        nextHop: "sip:sbc.example:5060",
+        pAssertedIdentity: "sip:+15550001@pbx.example",
+        privacy: "restricted",
+        headers: { "X-Reason": "wake-up" },
+        timeout: 20,
+        onLost: "continue",
+        vars: { case: "wake" },
+      },
+    );
+    expect(args).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      media: true,
+      from: "sip:alarm@pbx.example",
+      from_display: "Alarm",
+      to_display: "Desk",
+      next_hop: "sip:sbc.example:5060",
+      p_asserted_identity: "sip:+15550001@pbx.example",
+      privacy: "restricted",
+      headers: { "X-Reason": "wake-up" },
+      timeout: 20,
+      on_lost: "continue",
+      vars: { case: "wake" },
+    });
+  });
+
+  it("omits untouched options rather than sending undefined", () => {
+    const args = originateArgs("out-1", "sip:1001@pbx.example", { anchor: true }, {});
+    expect(Object.keys(args).sort()).toEqual(["channel", "media", "to"]);
   });
 });

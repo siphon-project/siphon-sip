@@ -106,10 +106,13 @@ export type { ServerConfig, ConnectionEventSink } from "./server";
 
 export type { CommandTransport, EventSink } from "./session";
 
-export { Call, CallStream, SipClient, SipServer } from "./sip";
+export { Call, CallStream, SipClient, SipServer, originateArgs } from "./sip";
 export type {
   CallEvent,
   CallHandler,
+  OriginateMedia,
+  OriginateOptions,
+  Originated,
   ResponseOptions,
   AnchoredAnswerOptions,
   ReferReplaces,
