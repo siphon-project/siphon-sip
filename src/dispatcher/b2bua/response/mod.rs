@@ -158,6 +158,9 @@ pub fn handle_b2bua_response(
         );
         return;
     }
+    if absorb_cancelled_branch_response(call_id, branch, message, status_code, state, &snapshot) {
+        return;
+    }
     auto_prack_b_leg(call_id, message, status_code, state, &snapshot);
 
     // Absorb the B-leg's 200 OK PRACK so it never gets forwarded to the
@@ -279,19 +282,7 @@ pub fn handle_b2bua_response(
                 // transfer whose target answered `486 Busy Here` (11 copies at
                 // T1-doubling to T2) while siphon had already reported the
                 // failure to the referrer and moved on.
-                if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
-                    let (ack_via_host, ack_via_port) =
-                        b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
-                    let ack = build_b2bua_ack_for_non2xx(
-                        message,
-                        branch,
-                        snapshot.b_leg_target.as_deref(),
-                        b_transport,
-                        &ack_via_host,
-                        ack_via_port,
-                    );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
-                } else {
+                if !ack_b_leg_non2xx(branch, message, state, &snapshot) {
                     warn!(
                         call_id = %call_id,
                         status = status_code,

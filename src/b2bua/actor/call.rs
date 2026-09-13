@@ -422,6 +422,16 @@ pub struct CallActor {
     /// peer's actor, so either side's teardown finds the other
     /// ([`crate::b2bua::bridge`]).
     pub bridge: Option<crate::b2bua::bridge::BridgeContext>,
+    /// True while `call.fork()` is still putting its branches on the wire.
+    ///
+    /// Branches go out one at a time, and one can fail before the next has even
+    /// been added, so a fork settled on the branches it could see would fail a
+    /// call whose other branches were about to ring. Failures recorded meanwhile
+    /// are held until [`finish_fork_dispatch`](Self::finish_fork_dispatch).
+    pub fork_dispatching: bool,
+    /// The best final failure this call's branches have produced so far, which
+    /// is what the A-leg is sent once no branch is left ringing (RFC 3261 §16.7).
+    pub fork_best_failure: Option<BranchFailure>,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -490,6 +500,8 @@ impl CallActor {
             originate_anchor: None,
             early_media_anchor: None,
             bridge: None,
+            fork_dispatching: false,
+            fork_best_failure: None,
         }
     }
 
@@ -784,6 +796,9 @@ impl CallActor {
         if index < self.b_leg_status.len() {
             self.b_leg_status[index] = BLegStatus::Answered;
         }
+        // An answered call has no failure left to report, so a response a
+        // sibling failed with before the answer is not held for the call's life.
+        self.fork_best_failure = None;
     }
 
     /// Check if a BYE from a specific B-leg should tear down the A-leg.
@@ -859,6 +874,136 @@ impl CallActor {
                 )
             })
             .collect()
+    }
+
+    /// Whether the B-leg at `index` is a branch still waiting for its final
+    /// response. The re-INVITE / UPDATE / REFER tracking pseudo-legs share
+    /// `b_legs` but are never branches.
+    pub fn is_pending_branch(&self, index: usize) -> bool {
+        matches!(
+            self.b_leg_status.get(index),
+            Some(BLegStatus::Trying | BLegStatus::Ringing)
+        ) && self
+            .b_legs
+            .get(index)
+            .is_some_and(|leg| !leg.is_tracking_leg())
+    }
+
+    /// Mark every pending branch but `keep` cancelled, and return the ones whose
+    /// INVITE is on the wire, for the caller to CANCEL (RFC 3261 §9.1).
+    ///
+    /// A CANCEL is built from the INVITE it cancels, so a branch whose INVITE is
+    /// not stashed yet is flagged `pending_cancel` instead, and the send path
+    /// CANCELs it as soon as the stash lands.
+    pub fn cancel_pending_branches(&mut self, keep: Option<usize>) -> Vec<Leg> {
+        let mut cancelled = Vec::new();
+        for index in 0..self.b_legs.len() {
+            if Some(index) == keep || !self.is_pending_branch(index) {
+                continue;
+            }
+            if let Some(status) = self.b_leg_status.get_mut(index) {
+                *status = BLegStatus::Cancelled;
+            }
+            if let Some(leg) = self.b_legs.get_mut(index) {
+                if leg.b_leg_invite.is_some() {
+                    cancelled.push(leg.clone());
+                } else {
+                    leg.pending_cancel = true;
+                }
+            }
+        }
+        cancelled
+    }
+
+    /// Record the branch at `index` failing with `response`, and settle the
+    /// fork if no branch is left that could still answer.
+    ///
+    /// A parallel fork fails only once every branch has (RFC 3261 §16.7): one
+    /// branch busy while another rings leaves the caller ringing. Meanwhile the
+    /// best response is kept, and it is that one, not whichever came last, the
+    /// A-leg is sent. A 6xx settles at once and cancels the rest, because it
+    /// says no branch will do. `call.dial()` is a fork of one and settles on its
+    /// first failure.
+    ///
+    /// On an answered call this settles and cancels nothing: a failure landing
+    /// there is a straggler rather than the call failing, and a leg still
+    /// pending on an answered call (a transfer target) is no branch of the fork.
+    pub fn record_branch_failure(
+        &mut self,
+        index: usize,
+        status_code: u16,
+        response: &SipMessage,
+    ) -> BranchSettlement {
+        if let Some(status) = self.b_leg_status.get_mut(index) {
+            *status = BLegStatus::Failed(status_code);
+        }
+        if self.state == CallState::Answered {
+            return BranchSettlement::default();
+        }
+        // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
+        let improves = self.fork_best_failure.as_ref().map_or(true, |best| {
+            error_priority(status_code) > error_priority(best.status_code)
+        });
+        if improves {
+            if let Some(leg) = self.b_legs.get(index) {
+                self.fork_best_failure = Some(BranchFailure {
+                    branch: leg.branch.clone(),
+                    status_code,
+                    response: response.clone(),
+                });
+            }
+        }
+        self.settle_fork()
+    }
+
+    /// Close the dispatch window [`fork_dispatching`](Self::fork_dispatching)
+    /// held open, and settle what happened inside it.
+    ///
+    /// A branch may have answered before the later ones were sent, and those are
+    /// cancelled now instead of ringing beside an answered call. Or every branch
+    /// may have failed while the fork was still going out, and this is then the
+    /// only place left to report it.
+    pub fn finish_fork_dispatch(&mut self) -> BranchSettlement {
+        self.fork_dispatching = false;
+        if self.state == CallState::Answered {
+            return BranchSettlement {
+                cancelled: self.cancel_pending_branches(self.winner),
+                failure: None,
+            };
+        }
+        self.settle_fork()
+    }
+
+    /// Settle the fork when none of its branches can still answer.
+    fn settle_fork(&mut self) -> BranchSettlement {
+        if self.fork_dispatching {
+            return BranchSettlement::default();
+        }
+        let declined = self
+            .fork_best_failure
+            .as_ref()
+            .is_some_and(|best| (600..700).contains(&best.status_code));
+        let cancelled = if declined {
+            self.cancel_pending_branches(None)
+        } else {
+            Vec::new()
+        };
+        // Only a branch whose INVITE went on the wire (is stashed) can still
+        // answer. One whose send failed was never a branch, and must not hold
+        // the caller in ringback until the ring timeout.
+        let ringing = (0..self.b_legs.len()).any(|index| {
+            self.is_pending_branch(index)
+                && self
+                    .b_legs
+                    .get(index)
+                    .is_some_and(|leg| leg.b_leg_invite.is_some())
+        });
+        let failure = if ringing {
+            None
+        } else {
+            self.fork_best_failure.take()
+        };
+        BranchSettlement { cancelled, failure }
     }
 
     /// Check if the message came from the A-leg (by source address).
@@ -966,12 +1111,38 @@ pub struct ZombieCancelledLeg {
     /// gets retried) without emitting a second BYE.
     pub byed: bool,
 }
+/// A fork branch's final failure, held until the fork settles.
+#[derive(Debug, Clone)]
+pub struct BranchFailure {
+    /// Via branch of the leg it came from: the relayed response is rewritten
+    /// from that leg's dialog, so the leg has to be found again at settle time.
+    pub branch: String,
+    /// Its status code.
+    pub status_code: u16,
+    /// The response itself, relayed to the A-leg if it stays the best.
+    pub response: SipMessage,
+}
+
+/// What a branch's final failure, or the end of a fork's dispatch, settles.
+#[derive(Debug, Default)]
+pub struct BranchSettlement {
+    /// Branches that are over and must be CANCELled now (RFC 3261 §9.1): the
+    /// siblings of a 6xx, or branches sent after another had already answered.
+    pub cancelled: Vec<Leg>,
+    /// Set once no branch is left that could answer: the best failure across
+    /// all of them, which the A-leg is sent. `None` while the call can still be
+    /// answered, or when it already has been.
+    pub failure: Option<BranchFailure>,
+}
+
 /// Outcome of an atomic answer claim ([`CallActorStore::try_win`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum WinOutcome {
     /// This 2xx is the first to answer the call: the winner and `Answered`
-    /// state were set under the per-call lock.
-    FirstWin,
+    /// state were set under the per-call lock, and every branch still ringing
+    /// was cancelled under it too. `cancelled` holds those branches, for the
+    /// caller to CANCEL (RFC 3261 §9.1).
+    FirstWin { cancelled: Vec<Leg> },
     /// The call was already answered — this 2xx is a retransmit of the winning
     /// B-leg's answer (or a losing fork branch). `b_leg_acked` reports whether
     /// the winning B-leg's ACK has already gone out, so the caller can re-ACK

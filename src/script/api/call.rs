@@ -1761,6 +1761,12 @@ impl PyCall {
     /// `.invalid` contact) — and two bindings of one AoR would share the first
     /// one's route set.  Bare-string targets keep pure Request-URI routing.
     ///
+    /// `strategy="parallel"` rings every target; the first to answer wins and
+    /// the rest are CANCELled.  A branch failing leaves the call ringing while
+    /// another can still answer, and the call fails only once none can, with the
+    /// best of the branches' failures and a single `@b2bua.on_failure`
+    /// (RFC 3261 §16.7).
+    ///
     /// `strategy="sequential"` carries the same route set per carrier (as an
     /// explicit next-hop plus a `Route` header), so serial failover across an
     /// AoR's bindings reaches each binding's own proxy chain.

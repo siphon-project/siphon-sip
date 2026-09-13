@@ -756,6 +756,9 @@ impl CallActorStore {
     /// where two concurrent B-leg 200s both observe a stale "not answered"
     /// snapshot and both forward to the A-leg, delivering a duplicate 200 to a
     /// call the caller already ACKed.
+    ///
+    /// A first win also cancels every other branch still ringing, under the same
+    /// lock, and keeps each answerable for the final response its CANCEL draws.
     pub fn try_win(&self, call_id: &str, index: usize) -> WinOutcome {
         let Some(mut call) = self.calls.get_mut(call_id) else {
             return WinOutcome::AlreadyAnswered { b_leg_acked: false };
@@ -769,8 +772,42 @@ impl CallActorStore {
             WinOutcome::AlreadyAnswered { b_leg_acked }
         } else {
             call.set_winner(index);
-            WinOutcome::FirstWin
+            let cancelled = call.cancel_pending_branches(Some(index));
+            self.keep_answerable(&cancelled);
+            WinOutcome::FirstWin { cancelled }
         }
+    }
+
+    /// Record a B-leg's final failure and settle its fork, keeping any branch
+    /// that settlement cancels answerable. See
+    /// [`CallActor::record_branch_failure`]. `None` when the call is gone.
+    pub fn record_branch_failure(
+        &self,
+        call_id: &str,
+        index: usize,
+        status_code: u16,
+        response: &SipMessage,
+    ) -> Option<BranchSettlement> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let settlement = call.record_branch_failure(index, status_code, response);
+        self.keep_answerable(&settlement.cancelled);
+        Some(settlement)
+    }
+
+    /// Open a fork's dispatch window. See [`CallActor::fork_dispatching`].
+    pub fn start_fork_dispatch(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.fork_dispatching = true;
+        }
+    }
+
+    /// Close a fork's dispatch window and settle it. See
+    /// [`CallActor::finish_fork_dispatch`]. `None` when the call is gone.
+    pub fn finish_fork_dispatch(&self, call_id: &str) -> Option<BranchSettlement> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let settlement = call.finish_fork_dispatch();
+        self.keep_answerable(&settlement.cancelled);
+        Some(settlement)
     }
 
     /// Atomically decide whether a 1xx provisional should be forwarded to the
@@ -1262,29 +1299,50 @@ impl CallActorStore {
                     captured = true;
                 }
             }
-            for (index, b_leg) in call.b_legs.iter().enumerate() {
-                let pending = matches!(
-                    call.b_leg_status.get(index),
+            let pending = call.b_legs.iter().enumerate().filter(|(index, _)| {
+                matches!(
+                    call.b_leg_status.get(*index),
                     Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
-                );
-                // Only legs whose INVITE actually went on the wire can answer.
-                if pending {
-                    if let Some(invite) = b_leg.b_leg_invite.as_ref() {
-                        self.zombie_cancelled.insert(
-                            b_leg.dialog.call_id.clone(),
-                            ZombieCancelledLeg {
-                                leg: b_leg.clone(),
-                                invite_ruri: request_uri_of(invite),
-                                byed: false,
-                            },
-                        );
-                        captured = true;
-                    }
-                }
-            }
+                )
+            });
+            captured |= self.keep_answerable(pending.map(|(_, leg)| leg));
         }
         self.remove_call(call_id);
         captured
+    }
+
+    /// Keep legs whose INVITE siphon is CANCELling answerable after the CANCEL,
+    /// as [`ZombieCancelledLeg`]s. Only a leg whose INVITE is stashed went on the
+    /// wire, so only such a leg can answer and only it is kept.
+    ///
+    /// Returns whether any leg was kept, so the caller can schedule the expiry.
+    fn keep_answerable<'a>(&self, legs: impl IntoIterator<Item = &'a Leg>) -> bool {
+        let mut kept = false;
+        for leg in legs {
+            if let Some(invite) = leg.b_leg_invite.as_ref() {
+                self.zombie_cancelled.insert(
+                    leg.dialog.call_id.clone(),
+                    ZombieCancelledLeg {
+                        leg: leg.clone(),
+                        invite_ruri: request_uri_of(invite),
+                        byed: false,
+                    },
+                );
+                kept = true;
+            }
+        }
+        kept
+    }
+
+    /// Whether `branch` is a leg siphon CANCELled and is keeping answerable.
+    ///
+    /// Matched on the branch as well as the Call-ID: under
+    /// `call.preserve_call_id()` every branch shares one Call-ID, and a response
+    /// on a live branch must not be taken for its cancelled sibling's.
+    pub fn is_cancelled_branch(&self, sip_call_id: &str, branch: &str) -> bool {
+        self.zombie_cancelled
+            .get(sip_call_id)
+            .is_some_and(|entry| entry.leg.branch == branch)
     }
 
     /// Resolve a racing 2xx to a CANCELled leg by SIP Call-ID.

@@ -719,6 +719,242 @@ fn call_actor_all_failed() {
     assert_eq!(call.best_error_code(), 503); // 5xx > 4xx
 }
 
+// --- Parallel fork settlement (RFC 3261 §16.7) ---
+
+/// A fork branch whose INVITE went on the wire: its hygiene-processed form is
+/// stashed, which is what a CANCEL for it is built from (§9.1).
+fn make_sent_b_leg(index: usize) -> Leg {
+    let mut leg = make_b_leg(index);
+    let invite = crate::sip::builder::SipMessageBuilder::new()
+        .request(
+            crate::sip::message::Method::Invite,
+            crate::sip::uri::SipUri::new("10.0.0.2".to_string()),
+        )
+        .via(format!("SIP/2.0/UDP 10.0.0.9:5060;branch={}", leg.branch))
+        .from(format!("<sip:alice@10.0.0.1>;tag={}", leg.dialog.local_tag))
+        .to("<sip:bob@10.0.0.2>".to_string())
+        .call_id(leg.dialog.call_id.clone())
+        .cseq("1 INVITE".to_string())
+        .content_length(0)
+        .build()
+        .unwrap();
+    leg.b_leg_invite = Some(Arc::new(Mutex::new(invite)));
+    leg
+}
+
+/// A branch's final failure, To-tagged so a test can tell whose response was kept.
+fn branch_failure(status_code: u16, to_tag: &str) -> crate::sip::message::SipMessage {
+    crate::sip::builder::SipMessageBuilder::new()
+        .response(status_code, "Failed".to_string())
+        .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-any".to_string())
+        .from("<sip:alice@10.0.0.1>;tag=a".to_string())
+        .to(format!("<sip:bob@10.0.0.2>;tag={to_tag}"))
+        .call_id("b2b-any".to_string())
+        .cseq("1 INVITE".to_string())
+        .content_length(0)
+        .build()
+        .unwrap()
+}
+
+fn branches(legs: &[Leg]) -> Vec<&str> {
+    legs.iter().map(|leg| leg.branch.as_str()).collect()
+}
+
+/// One branch failing is not the call failing while another still rings: the
+/// caller must keep ringing, which is the whole point of forking.
+#[test]
+fn a_failed_branch_leaves_the_fork_ringing() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+
+    let settlement = call.record_branch_failure(0, 486, &branch_failure(486, "busy"));
+
+    assert!(settlement.failure.is_none(), "branch 1 is still ringing");
+    assert!(settlement.cancelled.is_empty());
+    assert_eq!(call.b_leg_status[0], BLegStatus::Failed(486));
+    assert_eq!(call.b_leg_status[1], BLegStatus::Trying);
+}
+
+/// The last branch to fail settles the fork, and what the caller gets is the
+/// best response across all of them, not merely the last one to arrive.
+#[test]
+fn the_last_branch_settles_the_fork_with_the_best_response() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    let settlement = call.record_branch_failure(1, 480, &branch_failure(480, "away"));
+
+    let best = settlement.failure.expect("every branch has failed");
+    assert_eq!(best.status_code, 486);
+    assert_eq!(best.branch, "z9hG4bK-bleg0");
+    assert_eq!(extract_to_tag(&best.response).as_deref(), Some("busy"));
+    assert!(settlement.cancelled.is_empty());
+    assert!(
+        call.fork_best_failure.is_none(),
+        "a settled fork hands its failure over exactly once"
+    );
+}
+
+/// A 6xx means no branch will do (RFC 3261 §16.7), so the fork settles on it at
+/// once and the branches still ringing are cancelled rather than waited for.
+#[test]
+fn a_6xx_cancels_the_ringing_siblings() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    call.add_b_leg(make_sent_b_leg(2));
+
+    let settlement = call.record_branch_failure(1, 603, &branch_failure(603, "decline"));
+
+    assert_eq!(settlement.failure.map(|best| best.status_code), Some(603));
+    assert_eq!(
+        branches(&settlement.cancelled),
+        vec!["z9hG4bK-bleg0", "z9hG4bK-bleg2"]
+    );
+    assert_eq!(call.b_leg_status[0], BLegStatus::Cancelled);
+    assert_eq!(call.b_leg_status[2], BLegStatus::Cancelled);
+}
+
+/// `call.dial()` is a fork of one. Its failure settles at once, and it does even
+/// when the response is handled before the send path has stashed the INVITE,
+/// which on loopback it can be.
+#[test]
+fn a_single_branch_settles_on_its_failure_even_before_its_invite_is_stashed() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_b_leg(0));
+
+    let settlement = call.record_branch_failure(0, 503, &branch_failure(503, "down"));
+
+    assert_eq!(settlement.failure.map(|best| best.status_code), Some(503));
+}
+
+/// Branches are added and sent one at a time, so the first can fail before the
+/// second even exists. Settling then would fail a call whose other branch is
+/// about to ring.
+#[test]
+fn a_failure_during_dispatch_waits_for_the_branches_still_going_out() {
+    let mut call = CallActor::new(make_a_leg());
+    call.fork_dispatching = true;
+    call.add_b_leg(make_sent_b_leg(0));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    call.add_b_leg(make_sent_b_leg(1));
+
+    assert!(
+        call.finish_fork_dispatch().failure.is_none(),
+        "branch 1 is ringing"
+    );
+    assert_eq!(
+        call.record_branch_failure(1, 480, &branch_failure(480, "away"))
+            .failure
+            .map(|best| best.status_code),
+        Some(486)
+    );
+}
+
+/// ...and when every branch fails before dispatch finishes, nothing is left to
+/// report the failure but the end of dispatch itself.
+#[test]
+fn every_branch_failing_during_dispatch_settles_when_dispatch_ends() {
+    let mut call = CallActor::new(make_a_leg());
+    call.fork_dispatching = true;
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    assert!(call
+        .record_branch_failure(1, 480, &branch_failure(480, "away"))
+        .failure
+        .is_none());
+
+    let best = call
+        .finish_fork_dispatch()
+        .failure
+        .expect("every branch failed while the fork was going out");
+    assert_eq!(best.status_code, 486);
+}
+
+/// A branch answering before its siblings are sent: those siblings are cancelled
+/// as soon as they are out, instead of ringing next to an answered call.
+#[test]
+fn branches_sent_after_the_answer_are_cancelled_when_dispatch_ends() {
+    let mut call = CallActor::new(make_a_leg());
+    call.fork_dispatching = true;
+    call.add_b_leg(make_sent_b_leg(0));
+    call.set_winner(0);
+    call.add_b_leg(make_sent_b_leg(1));
+
+    let settlement = call.finish_fork_dispatch();
+
+    assert!(settlement.failure.is_none());
+    assert_eq!(branches(&settlement.cancelled), vec!["z9hG4bK-bleg1"]);
+    assert_eq!(call.b_leg_status[1], BLegStatus::Cancelled);
+}
+
+/// A failure that reaches an answered call settles nothing and cancels nothing:
+/// the call is not failing, and a leg still pending on it (a transfer target) is
+/// not a fork branch to cancel.
+#[test]
+fn a_failure_on_an_answered_call_settles_nothing() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    call.set_winner(0);
+    call.add_b_leg(make_sent_b_leg(2));
+
+    let settlement = call.record_branch_failure(1, 487, &branch_failure(487, "gone"));
+
+    assert!(settlement.failure.is_none());
+    assert!(settlement.cancelled.is_empty());
+    assert_eq!(call.b_leg_status[2], BLegStatus::Trying);
+}
+
+/// The re-INVITE / UPDATE tracking pseudo-legs share `b_legs` but are not
+/// branches: they neither hold a fork open nor get cancelled with one.
+#[test]
+fn tracking_legs_are_not_fork_branches() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    let mut tracking = make_b_leg(1);
+    tracking.dialog.target_uri = Some("update:a2b".to_string());
+    call.add_b_leg(tracking);
+
+    assert!(!call.is_pending_branch(1));
+    assert!(call.cancel_pending_branches(Some(0)).is_empty());
+    assert_eq!(call.b_leg_status[1], BLegStatus::Trying);
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_some());
+}
+
+/// A CANCEL is a copy of its INVITE (§9.1), so a branch whose INVITE is not
+/// stashed yet cannot be cancelled now. It is flagged instead, and the send path
+/// CANCELs it the moment the INVITE lands.
+#[test]
+fn a_branch_not_yet_on_the_wire_is_cancelled_when_its_invite_lands() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_b_leg(1));
+
+    let cancelled = call.cancel_pending_branches(Some(0));
+
+    assert!(cancelled.is_empty());
+    assert!(call.b_legs[1].pending_cancel);
+    assert_eq!(call.b_leg_status[1], BLegStatus::Cancelled);
+    assert_eq!(call.b_leg_status[0], BLegStatus::Trying);
+}
+
 #[test]
 fn call_actor_remove_b_leg_adjusts_winner() {
     let mut call = CallActor::new(make_a_leg());
@@ -793,7 +1029,10 @@ fn try_win_claims_the_answer_exactly_once() {
     store.add_b_leg(&call_id, make_b_leg(1));
 
     // First 200 (B-leg 0) wins, setting winner + state atomically.
-    assert_eq!(store.try_win(&call_id, 0), WinOutcome::FirstWin);
+    assert!(matches!(
+        store.try_win(&call_id, 0),
+        WinOutcome::FirstWin { .. }
+    ));
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.winner, Some(0));
@@ -802,25 +1041,130 @@ fn try_win_claims_the_answer_exactly_once() {
 
     // A retransmit of the winner's 200 before the B-leg ACK went out:
     // already answered, absorb silently.
-    assert_eq!(
+    assert!(matches!(
         store.try_win(&call_id, 0),
         WinOutcome::AlreadyAnswered { b_leg_acked: false }
-    );
+    ));
     // A losing fork branch's 200 (B-leg 1): also already answered, not a win.
-    assert_eq!(
+    assert!(matches!(
         store.try_win(&call_id, 1),
         WinOutcome::AlreadyAnswered { b_leg_acked: false }
-    );
+    ));
     // The winner is unchanged (still B-leg 0).
     assert_eq!(store.get_call(&call_id).unwrap().winner, Some(0));
 
     // Once the winner's ACK has gone out, a further retransmit reports
     // acked=true so the caller re-ACKs to stop the UAS retransmitting.
     store.get_call_mut(&call_id).unwrap().b_legs[0].initial_acked = true;
-    assert_eq!(
+    assert!(matches!(
         store.try_win(&call_id, 0),
         WinOutcome::AlreadyAnswered { b_leg_acked: true }
+    ));
+}
+
+/// Answering a fork cancels the branches still ringing, under the same lock that
+/// claims the answer, so no second 2xx can slip in between. Each cancelled
+/// branch stays answerable after its CANCEL: the 487 it draws is owed an ACK
+/// (RFC 3261 §17.1.1.3), and a 2xx that crosses the CANCEL an ACK and a BYE
+/// (§13.2.2.4, §15).
+#[test]
+fn try_win_cancels_the_branches_still_ringing() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+    store.add_b_leg(&call_id, make_sent_b_leg(1));
+    store.add_b_leg(&call_id, make_sent_b_leg(2));
+    assert!(store
+        .record_branch_failure(&call_id, 2, 486, &branch_failure(486, "busy"))
+        .expect("the call exists")
+        .failure
+        .is_none());
+
+    let WinOutcome::FirstWin { cancelled } = store.try_win(&call_id, 0) else {
+        panic!("the first 2xx wins");
+    };
+
+    assert_eq!(
+        branches(&cancelled),
+        vec!["z9hG4bK-bleg1"],
+        "the branch that already failed has nothing left to cancel"
     );
+    assert_eq!(
+        store.get_call(&call_id).unwrap().b_leg_status[1],
+        BLegStatus::Cancelled
+    );
+    assert!(store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-bleg1"));
+    assert!(
+        !store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-elsewhere"),
+        "a leg sharing the Call-ID on another branch is a different transaction"
+    );
+    assert!(!store.is_cancelled_branch("b2b-bleg2", "z9hG4bK-bleg2"));
+    let (leg, first_2xx) = store
+        .zombie_cancelled_for_2xx("b2b-bleg1")
+        .expect("the cancelled branch is kept for its final response");
+    assert_eq!(leg.branch, "z9hG4bK-bleg1");
+    assert!(first_2xx);
+}
+
+/// The siblings a 6xx cancels are kept answerable the same way, since the call
+/// is torn down right after and their 487s arrive for a call that is gone.
+#[test]
+fn a_6xx_keeps_the_branches_it_cancelled_answerable() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+    store.add_b_leg(&call_id, make_sent_b_leg(1));
+
+    let settlement = store
+        .record_branch_failure(&call_id, 0, 603, &branch_failure(603, "decline"))
+        .expect("the call exists");
+
+    assert_eq!(branches(&settlement.cancelled), vec!["z9hG4bK-bleg1"]);
+    assert!(store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-bleg1"));
+    assert!(store
+        .record_branch_failure("no-such-call", 0, 486, &branch_failure(486, "busy"))
+        .is_none());
+}
+
+/// The dispatch window is opened and closed through the store, and closing it
+/// is where a fork that failed entirely while going out is reported.
+#[test]
+fn store_fork_dispatch_window_holds_back_settlement() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.start_fork_dispatch(&call_id);
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+    assert!(store
+        .record_branch_failure(&call_id, 0, 486, &branch_failure(486, "busy"))
+        .expect("the call exists")
+        .failure
+        .is_none());
+
+    let settlement = store
+        .finish_fork_dispatch(&call_id)
+        .expect("the call exists");
+
+    assert_eq!(settlement.failure.map(|best| best.status_code), Some(486));
+    assert!(store.finish_fork_dispatch("no-such-call").is_none());
+}
+
+/// A failure held for the fork is dropped once a branch answers: an answered
+/// call has no failure left to report, and holding one would keep a response
+/// alive for as long as the call lasts.
+#[test]
+fn answering_drops_the_failure_held_for_the_fork() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    assert!(call.fork_best_failure.is_some());
+
+    call.set_winner(1);
+
+    assert!(call.fork_best_failure.is_none());
 }
 
 /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the

@@ -108,6 +108,19 @@ pub fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::C
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
+    schedule_zombie_cancelled_expiry(call_actors, keys);
+}
+
+/// Expire the named post-CANCEL entries after 32 s (Timer H / 64·T1).
+///
+/// For a caller that knows which entries it just created. A fork cancels its
+/// losing branches on every answered call, and re-arming the expiry of every
+/// entry in the map each time, as [`schedule_zombie_cancelled_cleanup`] does,
+/// would copy all of them per call.
+pub fn schedule_zombie_cancelled_expiry(
+    call_actors: Arc<crate::b2bua::actor::CallActorStore>,
+    keys: Vec<String>,
+) {
     if keys.is_empty() {
         return;
     }
@@ -117,6 +130,48 @@ pub fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::C
             call_actors.zombie_cancelled.remove(&key);
         }
     });
+}
+
+/// CANCEL the fork branches a settlement ended (RFC 3261 §9.1): those still
+/// ringing when another branch answered, or when one declined with a 6xx.
+///
+/// The store has already kept each one answerable, so the 487 its CANCEL draws
+/// gets an ACK and a 2xx that crosses the CANCEL an ACK and a BYE. This puts the
+/// CANCELs on the wire and arms the expiry of what was kept.
+pub fn cancel_settled_branches(legs: &[crate::b2bua::actor::Leg], state: &DispatcherState) {
+    if legs.is_empty() {
+        return;
+    }
+    let mut kept = Vec::with_capacity(legs.len());
+    for leg in legs {
+        // Stop retransmitting the INVITE, as the ring-timeout CANCEL does: an
+        // INVITE delivered after its own CANCEL would start the branch ringing
+        // again, with nothing left to cancel it.
+        state.b2bua_retransmits.disarm_branch(&leg.branch);
+        let Some(invite_arc) = leg.b_leg_invite.as_ref() else {
+            continue;
+        };
+        // The store kept exactly the legs with a stashed INVITE, under this key.
+        kept.push(leg.dialog.call_id.clone());
+        let cancel = match invite_arc.lock() {
+            Ok(invite) => build_cancel_from_invite(&invite),
+            Err(_) => None,
+        };
+        match cancel {
+            Some(cancel) => send_b2bua_to_bleg(
+                cancel,
+                leg.transport.transport,
+                leg.transport.remote_addr,
+                leg.transport.local_addr,
+                state,
+            ),
+            None => warn!(
+                branch = %leg.branch,
+                "B2BUA: cannot build the CANCEL for a fork branch from its stored INVITE — it rings on until it answers or times out"
+            ),
+        }
+    }
+    schedule_zombie_cancelled_expiry(state.call_actors.clone(), kept);
 }
 
 /// Build an ACK for a 2xx INVITE response on a B2BUA B-leg (RFC 3261 §13.2.2.4).

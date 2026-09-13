@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A parallel-fork branch that keeps ringing while its sibling answers
+     (sipp/b2bua-fork/b2bua_fork.py).
+
+     The CANCEL row is RFC 3261 §9.1: once a sibling has answered, siphon has no
+     further use for this branch and must CANCEL it, or it rings on for the whole
+     fork timeout. The timeout on that row turns a CANCEL that never comes into a
+     failed call instead of a silent pass.
+
+     The 487 that follows lands on a call that is still up. It has to be ACKed
+     (§17.1.1.3) and absorbed there: forwarding it to the caller, or tearing the
+     answered call down for it, is what the caller's closing BYE catches.
+
+     The 487's CSeq is hardcoded `1 INVITE`: a 487 echoes the INVITE's CSeq, not
+     the CANCEL's, and siphon's B-leg INVITE is CSeq 1. -->
+
+<scenario name="B2BUA fork branch that is cancelled">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:cancelled@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send>
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000" crlf="true" />
+
+</scenario>

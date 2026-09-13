@@ -86,7 +86,15 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // yet get marked pending_cancel; the CANCEL drains automatically
     // once the stash lands.
     let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
-    for b_leg in call.b_legs.iter_mut() {
+    let pending: Vec<bool> = (0..call.b_legs.len())
+        .map(|index| call.is_pending_branch(index))
+        .collect();
+    for (index, b_leg) in call.b_legs.iter_mut().enumerate() {
+        // A fork branch that already has its final response, or was CANCELled
+        // when a sibling declined, has nothing left to cancel (RFC 3261 §9.1).
+        if !pending.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         match b_leg.b_leg_invite.as_ref() {
             Some(invite_arc) => {
                 let invite = match invite_arc.lock() {
