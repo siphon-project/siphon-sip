@@ -121,7 +121,7 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
             &call_id,
             from_a_leg,
             Method::Info,
-            "info",
+            crate::b2bua::actor::ForwardedMarker::Info,
             state,
         );
         return;

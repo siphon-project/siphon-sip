@@ -1,8 +1,8 @@
-//! Responses to a re-INVITE siphon sent as part of a transfer.
+//! Responses to non-INVITE in-dialog requests siphon forwarded across a call.
 
 use crate::dispatcher::*;
 
-/// A response to a re-INVITE siphon sent as part of a transfer. Returns
+/// A response to a forwarded non-INVITE in-dialog request (REFER, NOTIFY, INFO). Returns
 /// `true` when the response was consumed here.
 pub fn forward_transfer_response(
     call_id: &str,
@@ -11,19 +11,19 @@ pub fn forward_transfer_response(
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) -> bool {
-    // Detect transparent-transfer REFER / NOTIFY responses: target_uri starts
-    // with "refer:" or "notify:". Relayed back to the originator like the UPDATE
-    // arm — no ACK (non-INVITE) and no media handling (REFER is bodyless, a
-    // NOTIFY sipfrag body is opaque and rides back untouched).
-    let transfer_response = snapshot.b_leg_target.as_deref().and_then(|t| {
-        t.strip_prefix("refer:")
-            .map(|direction| ("refer", direction))
-            .or_else(|| {
-                t.strip_prefix("notify:")
-                    .map(|direction| ("notify", direction))
-            })
-    });
-    if let Some((marker, direction)) = transfer_response {
+    // A response to a non-INVITE in-dialog request siphon forwarded across the
+    // call (transparent REFER / NOTIFY, and INFO): relayed back to the
+    // originator like the UPDATE arm — no ACK (non-INVITE) and no media
+    // handling (REFER is bodyless; a NOTIFY sipfrag or INFO body is opaque and
+    // rides back untouched). The set is `ForwardedMarker`, the same type the
+    // forward tagged the pseudo-leg with, so a request type cannot be forwarded
+    // without also being recognised here.
+    let forwarded_response = snapshot
+        .b_leg_target
+        .as_deref()
+        .and_then(crate::b2bua::actor::ForwardedMarker::from_tracking_target);
+    if let Some((marker, direction)) = forwarded_response {
+        let marker_name = marker.as_str();
         let is_a2b = direction == "a2b";
         // 4th element: the responder leg's anchored egress socket (see the
         // re-INVITE response path above).
@@ -44,7 +44,7 @@ pub fn forward_transfer_response(
                         b.transport.local_addr,
                     ),
                     None => {
-                        warn!(call_id = %call_id, marker, "B2BUA transfer response: no winning B-leg");
+                        warn!(call_id = %call_id, marker = marker_name, "B2BUA forwarded response: no winning B-leg");
                         return true;
                     }
                 },
@@ -150,11 +150,9 @@ pub fn forward_transfer_response(
 
         if (200..300).contains(&status_code) {
             if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.set_b_leg_target_uri(
-                    call_id,
-                    idx,
-                    format!("{marker}_done:{direction}"),
-                );
+                state
+                    .call_actors
+                    .set_b_leg_target_uri(call_id, idx, marker.done_target(direction));
             }
         } else if status_code >= 300 {
             if let Some(idx) = snapshot.b_leg_index {
@@ -180,7 +178,7 @@ pub fn forward_transfer_response(
                 state,
             );
         }
-        debug!(call_id = %call_id, status = status_code, marker, direction, "B2BUA: forwarded transparent transfer response");
+        debug!(call_id = %call_id, status = status_code, marker = marker_name, direction, "B2BUA: relayed forwarded in-dialog response");
         return true;
     }
 

@@ -143,6 +143,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   takes, so `@rtpengine.on_dtmf` and a controller's `ChannelDtmfReceived` see it
   without knowing which wire carried it. A body that is not DTMF is left alone.
 
+- **A forwarded REFER, NOTIFY or INFO no longer draws an ACK for its response.**
+  Each is relayed across a two-leg call through one path that tags a
+  response-tracking pseudo-leg, but the response side recognised only `refer:`
+  and `notify:`. INFO's first `200` therefore fell into the INVITE-answer path,
+  which took it for a retransmitted INVITE 2xx: it never reached the caller, and
+  siphon sent the far leg an ACK — which a non-INVITE transaction never takes
+  (RFC 3261 §17.1.2) — with the tracking marker as its Request-URI. A
+  retransmitted final response to a completed REFER or NOTIFY hit the same path.
+  The set of forwarded request types is now one enum shared by the forward, the
+  response relay, the tracking-leg check and a new retransmit guard, so a type
+  cannot be forwarded without being recognised on the way back.
+
 ### Changed
 
 - **The IPsec runtime lookups moved from `script::api::ipsec` to

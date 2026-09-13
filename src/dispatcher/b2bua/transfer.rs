@@ -427,7 +427,7 @@ pub fn b2bua_refer_accept(
                 call_id,
                 from_a_leg,
                 Method::Refer,
-                "refer",
+                crate::b2bua::actor::ForwardedMarker::Refer,
                 state,
             );
         }

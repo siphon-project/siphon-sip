@@ -325,6 +325,35 @@ pub fn absorb_completed_update_retransmit(
     false
 }
 
+/// A retransmitted response for a forwarded REFER, NOTIFY or INFO whose final
+/// response was already relayed.
+///
+/// Absorbed, never answered: none of these is an INVITE, so there is no ACK to
+/// send (RFC 3261 §17.1.2) and nothing to relay a second time. Without this a
+/// duplicate fell through to the INVITE-answer path, which read it as a
+/// retransmitted INVITE 2xx and ACKed it with the pseudo-leg's marker as the
+/// Request-URI.
+pub fn absorb_completed_forward_retransmit(
+    call_id: &str,
+    status_code: u16,
+    snapshot: &BLegResponseSnapshot,
+) -> bool {
+    if snapshot
+        .b_leg_target
+        .as_deref()
+        .is_some_and(crate::b2bua::actor::ForwardedMarker::is_done_target)
+    {
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            "B2BUA: absorbing retransmitted response for a completed forwarded request"
+        );
+        return true;
+    }
+
+    false
+}
+
 /// A response to one of a bridge's own re-INVITEs, which drives the bridge's
 /// next step rather than being forwarded to an originator leg.
 pub fn dispatch_bridge_reinvite_response(
