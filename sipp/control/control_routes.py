@@ -18,6 +18,8 @@ The dialled user selects the case, and the case is echoed into the handover's
   record@   — answer-first handover with NO ws_uri: the engine terminates the
               leg and nothing streams anywhere, which is the voicemail-box shape.
               The app records the call, stops it, and waits for the closed file.
+  early@    — deferred handover; the app opens early media anchored on the engine,
+              plays into it, then answers — the 200 must repeat the 183's SDP.
   deadline@ — deferred handover to an app that deliberately never acts, so the
               configured `control.limits.handoff_deadline_ms` is what ends the
               call. No `deadline_ms` here on purpose: the config value is what
@@ -102,6 +104,12 @@ def route(call):
             answer=True,
             profile="voice_ai",
             vars={"case": "record"},
+        )
+    elif user == "early":
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            deadline_ms=GENEROUS_DEADLINE_MS,
+            vars={"case": "early"},
         )
     elif user == "deadline":
         # No deadline_ms: control.limits.handoff_deadline_ms is the thing under
