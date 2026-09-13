@@ -2876,6 +2876,21 @@ async fn init_registrar_backend(config: &Config) {
 ///
 /// Called from `init_registrar_backend` when the registrar uses a Redis backend,
 /// reusing the same Redis instance for iFC profile storage.
+/// Stand-in when the `redis-backend` feature is off.
+///
+/// The registrar's own Redis backend already has a stub for this build, so the
+/// `RegistrarBackendType::Redis` arm still compiles and runs; without one here
+/// it did not, and `cargo build --no-default-features` failed outright. Same
+/// contract as `sctp` and `ui`: the config still parses and the feature is
+/// skipped with a loud warning rather than silently doing nothing.
+#[cfg(not(feature = "redis-backend"))]
+async fn init_ifc_redis_backend(_redis_url: &str, _config: &Config) {
+    warn!(
+        "iFC profile persistence needs the redis-backend cargo feature, which this binary \
+         was built without — profiles stay in memory and are lost on restart"
+    );
+}
+
 #[cfg(feature = "redis-backend")]
 async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
     use crate::script::api::ifc_store_arc;
