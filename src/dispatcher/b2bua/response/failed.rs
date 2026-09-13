@@ -206,8 +206,23 @@ fn fail_call_on_b_leg_failure(
         // caller gets, and the B-leg's own 503 is still what is ACKed. Without
         // the A-leg INVITE (logged) no 500 can be built, and the B-leg's
         // response is relayed as before.
+        //
+        // An exhausted route sequence ends on the best of its carriers' failures
+        // (§16.7 step 6 over every attempt, this one included), not on whichever
+        // carrier happened to be tried last. When that best came from an earlier
+        // carrier, only its status was kept, so the caller's failure is generated
+        // from the A-leg INVITE with that status. A relayed auth challenge is the
+        // caller's to answer and is never swapped for another attempt's failure.
+        let chosen_status = if relay_challenge {
+            status_code
+        } else {
+            state
+                .call_actors
+                .best_route_error(call_id)
+                .unwrap_or(status_code)
+        };
         let generated_failure = {
-            let upstream = crate::sip::best_response::upstream_status(status_code);
+            let upstream = crate::sip::best_response::upstream_status(chosen_status);
             (upstream != status_code)
                 .then(|| {
                     a_leg_final_response(
@@ -215,7 +230,7 @@ fn fail_call_on_b_leg_failure(
                         &snapshot.a_leg,
                         snapshot.a_leg_invite.as_ref(),
                         upstream,
-                        crate::sip::best_response::SERVER_INTERNAL_ERROR,
+                        best_error_reason(upstream),
                         state,
                     )
                 })
@@ -357,13 +372,15 @@ fn fail_call_on_b_leg_failure(
         // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
         // the call has not failed and the reservation must survive the re-INVITE.
         if !relay_challenge {
-            // The B-leg's own final status is the cause: a busy reports -486, a
-            // ring timeout -408, and so on, which is what makes an unanswered
-            // call distinguishable from a normal hangup on the OCS side.
+            // The status the caller was sent is the cause: a busy reports -486,
+            // a ring timeout -408, and so on, which is what makes an unanswered
+            // call distinguishable from a normal hangup on the OCS side. It is
+            // the same status the CDR and @b2bua.on_failure report, so the three
+            // never disagree about why a call ended.
             spawn_ro_b2bua_stop(
                 state,
                 call_id,
-                crate::diameter::rf::sip_status_to_cause_code(status_code),
+                crate::diameter::rf::sip_status_to_cause_code(upstream_status),
             );
         }
 

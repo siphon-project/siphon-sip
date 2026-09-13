@@ -338,7 +338,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   triggers LCR failover. The proxy forwards the chosen branch's own response
   instead of a bare one built from the request, so a 3xx keeps its Contact and a
   401/407 its challenge, with the challenges from every other 401/407 branch
-  added (step 7).
+  added (step 7). A B2BUA relaying a 3xx now keeps the callee's Contact too,
+  where it used to put siphon's own address there and redirect the caller back
+  to siphon. An exhausted LCR or sequential-fork sequence sends the best of its
+  carriers' failures rather than the last one's, and Ro's Cause-Code reports the
+  status the caller was sent, like the CDR.
 
 - **A fork's ring timeout relays the failure a branch already returned.** A
   `call.fork()` with one branch busy and the other ringing out answered the

@@ -6622,9 +6622,9 @@ services:
       - bridge
 
   # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ────────────────────
-  # One siphon, six callees each scripted for a single branch outcome, and one
-  # caller run once per case with `-s` naming it. The cases, and which two
-  # callees each forks to, are in b2bua-fork/b2bua_fork.py; b2bua-fork/run_case.sh
+  # One siphon, eight callees each scripted for a single branch outcome, and one
+  # caller run once per case with `-s` naming it. The cases, and which callees
+  # each forks to, are in b2bua-fork/b2bua_fork.py; b2bua-fork/run_case.sh
   # runs one. The callees carry most of the assertions and run detached, so the
   # runner checks their exit codes as well as the caller's.
   #
@@ -6637,6 +6637,8 @@ services:
   #   172.20.0.188 — cancelled callee (expects a CANCEL, answers 487)
   #   172.20.0.189 — glare callee (answers the INVITE into the CANCEL)
   #   172.20.0.190 — unavailable callee (480 at 2 s)
+  #   172.20.0.193 — service-unavailable callee (503 at once)
+  #   172.20.0.194 — redirect callee (302 naming another target)
   siphon-b2bua-fork:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
@@ -6823,6 +6825,52 @@ services:
       - /sipp/scenarios/b2bua_fork_unavailable_uas.xml
       - -d
       - "2000"
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-service-unavailable-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-service-unavailable-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.193
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_service_unavailable_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-redirect-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-redirect-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.194
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_redirect_uas.xml
       - -p
       - "5060"
       - -m
