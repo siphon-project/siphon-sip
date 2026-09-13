@@ -28,6 +28,10 @@ The dialled user selects the case, and the case is echoed into the handover's
               connections; exactly one of them must be given the call.
   resync@   — deferred handover to the persistent app, which answers, drops the
               owning socket, reconnects and re-claims the call.
+  dial@     — deferred handover; the app rings a target that never answers, and
+              the point is what happens next: the caller is STILL unanswered and
+              still the app's, so the app answers it itself. That is the whole
+              reason `dial` exists and the thing `route` cannot express.
 
 The non-deadline cases pass a generous explicit `deadline_ms` so a slow CI box
 cannot turn a controller round trip into a spurious 503 — the deadline is a
@@ -120,6 +124,12 @@ def route(call):
             PERSISTENT_APP,
             deadline_ms=GENEROUS_DEADLINE_MS,
             vars={"case": "owner"},
+        )
+    elif user == "dial":
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            deadline_ms=GENEROUS_DEADLINE_MS,
+            vars={"case": "dial"},
         )
     elif user == "resync":
         call.handover(

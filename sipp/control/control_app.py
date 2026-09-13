@@ -906,6 +906,69 @@ async def case_resync(app: App, session: Session, event: dict, verdict: Verdict)
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+# The B-leg target for the dial case: reserved documentation space (RFC 5737
+# TEST-NET-2) with nothing listening, so the INVITE goes out and nothing ever
+# answers it. Nothing to stand up, and the failure is the ring timeout rather
+# than a rejection, which is the harder of the two paths to get right.
+DIAL_DEAD_TARGET = "sip:nobody@198.51.100.200:5060"
+DIAL_RING_TIMEOUT_SECS = 2
+
+
+async def case_dial(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """Ring a target that never answers, then answer the caller anyway.
+
+    The claim under test is not that the dial fails — it is what the caller is
+    doing while it does. `route` hands the call back to siphon, so an app that
+    used it would have lost the channel by now and the caller would have been
+    sent the failure. Here the caller is still unanswered, still parked, still
+    this app's, so "ring the extension, and if nobody answers, voicemail" is
+    expressible: the answer below is the voicemail.
+    """
+    channel = event.get("channel") or ""
+    assert_sip_context(verdict, event, "dial")
+
+    reply = await session.command(
+        "dial",
+        {
+            "targets": [DIAL_DEAD_TARGET],
+            "strategy": "parallel",
+            "timeout": DIAL_RING_TIMEOUT_SECS,
+        },
+        target={"channel": channel},
+    )
+    result = reply.get("result") or {}
+    verdict.check(
+        "dial_accepted",
+        reply.get("status") == "ok" and result.get("state") == "dialing",
+        json.dumps(reply),
+    )
+
+    failed = await session.wait_event(
+        lambda e: e.get("event") == "DialFailed" and e.get("channel") == channel,
+        timeout=DIAL_RING_TIMEOUT_SECS + EVENT_TIMEOUT,
+    )
+    payload = failed.get("payload") or {}
+    verdict.check(
+        "dial_failed_reported",
+        payload.get("timed_out") is True and payload.get("code") == 408,
+        json.dumps(payload),
+    )
+
+    # The caller must still be here. If the failure had been forwarded to it —
+    # what happens without the control-dial path — this answer would be refused
+    # because the call would already be gone.
+    reply = await answer_with_our_sdp(session, channel)
+    result = reply.get("result") or {}
+    verdict.check(
+        "caller_still_answerable_after_dial_failed",
+        reply.get("status") == "ok" and result.get("state") == "answered",
+        json.dumps(reply),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 CASES = {
     "handover": case_handover,
     "progress": case_progress,
@@ -917,6 +980,7 @@ CASES = {
     "early": case_early,
     "owner": case_owner,
     "resync": case_resync,
+    "dial": case_dial,
 }
 
 
