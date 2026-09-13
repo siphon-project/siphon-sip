@@ -231,6 +231,11 @@ pub struct SiphonMetrics {
     /// means completed-call dialog keys are leaking (`by_dialog_key`).
     pub proxy_dialog_sessions: IntGauge,
 
+    /// CDRs dropped because a sink's channel was full or closed, labelled by
+    /// sink. Per sink because the point of configuring several is that one
+    /// falling behind does not cost the others anything — an unlabelled total
+    /// cannot tell you which one is losing records.
+    pub cdr_dropped_total: IntCounterVec,
     /// Live `cdr.auto_emit` per-call tracking entries (INVITE → answer → BYE).
     /// Returns to ~0 when calls are idle; a monotonic climb under a steady,
     /// completed-call workload means a call teardown hook isn't draining the
@@ -654,6 +659,13 @@ impl SiphonMetrics {
             "Live proxy dialog-key entries (INVITEs within their 2xx ACK window)",
         )?;
 
+        let cdr_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_cdr_dropped_total",
+                "CDRs dropped because a sink's channel was full or closed",
+            ),
+            &["sink"],
+        )?;
         let cdr_sessions = IntGauge::new(
             "siphon_cdr_sessions",
             "Live cdr.auto_emit per-call tracking entries (INVITE to BYE)",
@@ -1094,6 +1106,7 @@ impl SiphonMetrics {
         registry.register(Box::new(transactions_active.clone()))?;
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
+        registry.register(Box::new(cdr_dropped_total.clone()))?;
         registry.register(Box::new(cdr_sessions.clone()))?;
         registry.register(Box::new(rf_sessions.clone()))?;
         registry.register(Box::new(ro_sessions.clone()))?;
@@ -1166,6 +1179,7 @@ impl SiphonMetrics {
             transactions_active,
             uac_pending_requests,
             proxy_dialog_sessions,
+            cdr_dropped_total,
             cdr_sessions,
             rf_sessions,
             ro_sessions,

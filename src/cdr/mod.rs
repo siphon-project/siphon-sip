@@ -37,10 +37,18 @@ use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Global CDR sender — initialized once at startup.
-static CDR_SENDER: OnceLock<mpsc::Sender<Cdr>> = OnceLock::new();
+static CDR_SENDER: OnceLock<Vec<CdrSink>> = OnceLock::new();
+
+/// A configured sink: the channel into its writer task, and its name for logs
+/// and the drop counter.
+#[derive(Debug, Clone)]
+struct CdrSink {
+    name: String,
+    sender: mpsc::Sender<Cdr>,
+}
 
 /// A Call Detail Record.
 #[derive(Debug, Clone, Serialize)]
@@ -207,7 +215,17 @@ pub struct CdrConfig {
     /// Enable CDR generation.
     pub enabled: bool,
     /// Backend type.
+    ///
+    /// Superseded by [`Self::backends`], which may name several. Kept because
+    /// this is a published struct: a consumer that builds a `CdrConfig` by hand
+    /// and sets only this field still gets exactly the sink it asked for
+    /// ([`init`] falls back to it when `backends` is empty). `to_cdr_config`
+    /// fills it with the first sink so reading it stays sensible.
     pub backend: CdrBackendType,
+    /// Every sink a record is written to. Each gets its own channel and writer
+    /// task, so a slow or failing sink cannot delay, block or drop another's
+    /// records. Empty means "use [`Self::backend`]".
+    pub backends: Vec<CdrBackendType>,
     /// Automatically emit a CDR per call on lifecycle events (no script
     /// `cdr.write()` needed).
     pub auto_emit: bool,
@@ -225,6 +243,7 @@ impl Default for CdrConfig {
                 path: "/var/log/siphon/cdr.jsonl".to_string(),
                 rotate_size_mb: 100,
             },
+            backends: Vec::new(),
             auto_emit: false,
             include_register: false,
             channel_size: 10_000,
@@ -254,6 +273,19 @@ pub enum CdrBackendType {
         url: String,
         auth_header: Option<String>,
     },
+}
+
+impl CdrBackendType {
+    /// Short label for logs and the per-sink drop counter. Carries where the
+    /// records go, because "the http sink is dropping" is not actionable when
+    /// two of them are configured.
+    pub fn sink_name(&self) -> String {
+        match self {
+            CdrBackendType::File { path, .. } => format!("file:{path}"),
+            CdrBackendType::Syslog { target } => format!("syslog:{target}"),
+            CdrBackendType::Http { url, .. } => format!("http:{url}"),
+        }
+    }
 }
 
 /// In-flight per-call state accumulated between the INVITE and the BYE so an
@@ -484,21 +516,63 @@ pub fn merge_extra_into_session(keys: &[String], extra: &HashMap<String, String>
     }
 }
 
-/// Initialize the CDR subsystem. Returns the receiver for the background writer.
-pub fn init(config: &CdrConfig) -> Option<mpsc::Receiver<Cdr>> {
+/// Initialize the CDR subsystem and start a writer task per configured sink.
+///
+/// Each sink gets its own channel, so one that is slow or failing cannot delay,
+/// block or drop another's records: a full channel drops for that sink alone,
+/// counted and logged under its own name. Per-sink ordering is preserved,
+/// because each sink's channel is drained by exactly one task.
+///
+/// Returns `true` when the subsystem was started.
+pub fn init(config: &CdrConfig) -> bool {
     if !config.enabled {
-        return None;
+        return false;
     }
 
-    let (sender, receiver) = mpsc::channel(config.channel_size);
-    CDR_SENDER.set(sender).ok()?;
+    // An empty list means the single-sink `backend` field, so a consumer that
+    // builds `CdrConfig` by hand keeps the sink it asked for.
+    let sinks: Vec<CdrBackendType> = if config.backends.is_empty() {
+        vec![config.backend.clone()]
+    } else {
+        config.backends.clone()
+    };
+
+    let senders = spawn_sink_writers(&sinks, config.channel_size);
+    let handles: Vec<CdrSink> = sinks
+        .iter()
+        .zip(senders)
+        .map(|(backend, sender)| CdrSink {
+            name: backend.sink_name(),
+            sender,
+        })
+        .collect();
+    if CDR_SENDER.set(handles).is_err() {
+        return false;
+    }
+
     // Latch the auto-emit flags for the dispatcher hot path. Ignore a second
     // set (only `init` writes it, once).
     let _ = CDR_AUTO_FLAGS.set(CdrAutoFlags {
         auto_emit: config.auto_emit,
         include_register: config.include_register,
     });
-    Some(receiver)
+    info!(sinks = sinks.len(), "CDR writer started");
+    true
+}
+
+/// Start one writer task per sink and return their senders, in the same order.
+///
+/// Separate from [`init`] so the fan-out can be driven in a test without the
+/// process-wide `CDR_SENDER`, which is set once for the life of the process.
+fn spawn_sink_writers(sinks: &[CdrBackendType], channel_size: usize) -> Vec<mpsc::Sender<Cdr>> {
+    sinks
+        .iter()
+        .map(|backend| {
+            let (sender, receiver) = mpsc::channel(channel_size);
+            tokio::spawn(sink_writer_task(receiver, backend.clone()));
+            sender
+        })
+        .collect()
 }
 
 /// Whether siphon should auto-generate call CDRs on lifecycle events.
@@ -516,23 +590,42 @@ pub fn include_register_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Write a CDR to the channel (non-blocking). Returns false if channel is full.
+/// Queue a CDR for every configured sink (non-blocking).
+///
+/// Returns whether *any* sink accepted it. A sink whose channel is full drops
+/// this record for itself alone and is named in the log and the
+/// `siphon_cdr_dropped_total` counter — the point of several sinks is that a
+/// collector falling behind does not cost the durable file copy anything.
 pub fn write(cdr: Cdr) -> bool {
-    if let Some(sender) = CDR_SENDER.get() {
-        match sender.try_send(cdr) {
-            Ok(()) => true,
+    let Some(sinks) = CDR_SENDER.get() else {
+        return false;
+    };
+    let mut accepted = false;
+    for sink in sinks {
+        // The last sink can take the record itself; the rest need a copy.
+        match sink.sender.try_send(cdr.clone()) {
+            Ok(()) => accepted = true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("CDR channel full — dropping CDR");
-                false
+                warn!(sink = %sink.name, "CDR channel full — dropping CDR for this sink");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics
+                        .cdr_dropped_total
+                        .with_label_values(&[sink.name.as_str()])
+                        .inc();
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                error!("CDR channel closed");
-                false
+                error!(sink = %sink.name, "CDR channel closed");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics
+                        .cdr_dropped_total
+                        .with_label_values(&[sink.name.as_str()])
+                        .inc();
+                }
             }
         }
-    } else {
-        false
     }
+    accepted
 }
 
 /// Check if CDR system is initialized and enabled.
@@ -540,12 +633,16 @@ pub fn is_enabled() -> bool {
     CDR_SENDER.get().is_some()
 }
 
-/// Background CDR writer task. Drains the receiver and writes to the configured backend.
-pub async fn writer_task(mut receiver: mpsc::Receiver<Cdr>, config: CdrConfig) {
-    debug!("CDR writer started with backend: {:?}", config.backend);
+/// Background writer for one sink. Drains its channel and writes each record.
+///
+/// One task per sink is what keeps them independent: the write is awaited here,
+/// so a collector that takes seconds to answer holds up only its own channel.
+pub async fn sink_writer_task(mut receiver: mpsc::Receiver<Cdr>, backend: CdrBackendType) {
+    let name = backend.sink_name();
+    debug!(sink = %name, "CDR sink writer started");
 
-    // Pre-parse HTTP URL once if using HTTP backend
-    let http_state = match &config.backend {
+    // Parse the HTTP URL once rather than per record.
+    let http_state = match &backend {
         CdrBackendType::Http { url, auth_header } => {
             Some(HttpState::new(url, auth_header.as_deref()))
         }
@@ -553,7 +650,7 @@ pub async fn writer_task(mut receiver: mpsc::Receiver<Cdr>, config: CdrConfig) {
     };
 
     while let Some(cdr) = receiver.recv().await {
-        match &config.backend {
+        match &backend {
             CdrBackendType::File {
                 path,
                 rotate_size_mb,
@@ -571,7 +668,7 @@ pub async fn writer_task(mut receiver: mpsc::Receiver<Cdr>, config: CdrConfig) {
         }
     }
 
-    debug!("CDR writer shutting down");
+    debug!(sink = %name, "CDR sink writer shutting down");
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,5 +1583,244 @@ mod tests {
         for sibling in siblings {
             assert!(std::fs::metadata(sibling).unwrap().len() > 1024 * 1024);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fan-out across several sinks
+    // -----------------------------------------------------------------------
+
+    fn cdr_for(call_id: &str) -> Cdr {
+        Cdr::new(
+            call_id.to_string(),
+            "sip:alice@example.com".to_string(),
+            "sip:bob@example.com".to_string(),
+            "sip:bob@192.0.2.1:5060".to_string(),
+            "INVITE".to_string(),
+            "192.0.2.100".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    /// Accept one HTTP request per connection, reply `200`, and report the
+    /// bodies over a channel. Enough to prove delivery without a dependency.
+    async fn collector(listener: tokio::net::TcpListener, seen: tokio::sync::mpsc::Sender<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                // One POST per connection; read until the body has arrived.
+                while let Ok(read) = socket.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                        if !body.is_empty() {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                            let _ = seen.send(body.to_string()).await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Every sink gets every record. A deployment keeps the file as the durable
+    /// copy and ships the same records to a collector; before this, choosing one
+    /// gave up the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_reaches_every_sink() {
+        let directory =
+            std::env::temp_dir().join(format!("siphon-cdr-fanout-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("cdr.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let address = crate::transport::testutil::free_port();
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("bind collector");
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(collector(listener, seen_tx));
+
+        let sinks = vec![
+            CdrBackendType::File {
+                path: path.to_string_lossy().to_string(),
+                rotate_size_mb: 0,
+            },
+            CdrBackendType::Http {
+                url: format!("http://{address}/cdr"),
+                auth_header: None,
+            },
+        ];
+        let senders = spawn_sink_writers(&sinks, 16);
+        assert_eq!(senders.len(), 2, "one channel per sink");
+
+        for sender in &senders {
+            sender.try_send(cdr_for("fanout-1")).expect("queued");
+        }
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx.recv())
+            .await
+            .expect("the collector should receive the record")
+            .expect("collector channel open");
+        assert!(
+            body.contains("fanout-1"),
+            "http sink got the record: {body}"
+        );
+
+        let written = read_when_nonempty(&path).await;
+        assert!(
+            written.contains("fanout-1"),
+            "file sink got the record: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A sink that cannot deliver must not cost the others anything. The file is
+    /// the durable copy precisely for the case where the collector is down or
+    /// does not exist yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_sink_does_not_starve_the_others() {
+        let directory =
+            std::env::temp_dir().join(format!("siphon-cdr-isolation-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("cdr.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        // Reserved and never listened on, so every POST is refused.
+        let dead = crate::transport::testutil::free_port();
+
+        let sinks = vec![
+            CdrBackendType::File {
+                path: path.to_string_lossy().to_string(),
+                rotate_size_mb: 0,
+            },
+            CdrBackendType::Http {
+                url: format!("http://{dead}/cdr"),
+                auth_header: None,
+            },
+        ];
+        let senders = spawn_sink_writers(&sinks, 16);
+
+        for index in 0..5 {
+            for sender in &senders {
+                sender
+                    .try_send(cdr_for(&format!("isolated-{index}")))
+                    .expect("queued");
+            }
+        }
+
+        let written = read_until_lines(&path, 5).await;
+        let lines: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "every record reached the file sink: {written}"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            assert!(
+                line.contains(&format!("isolated-{index}")),
+                "per-sink order is preserved: line {index} is {line}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Rotation is a property of the file sink, not of being the only sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_sink_still_rotates_with_another_sink_beside_it() {
+        let directory =
+            std::env::temp_dir().join(format!("siphon-cdr-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("cdr.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let dead = crate::transport::testutil::free_port();
+        let sinks = vec![
+            CdrBackendType::File {
+                path: path.to_string_lossy().to_string(),
+                // 1 MB, and each record is far smaller — so rotation is driven
+                // by the loop below rather than by a fragile byte count.
+                rotate_size_mb: 1,
+            },
+            CdrBackendType::Http {
+                url: format!("http://{dead}/cdr"),
+                auth_header: None,
+            },
+        ];
+        let senders = spawn_sink_writers(&sinks, 4096);
+
+        // Enough records to cross 1 MB.
+        for index in 0..4000 {
+            for sender in &senders {
+                let _ = sender.try_send(cdr_for(&format!("rotate-{index}")));
+            }
+        }
+
+        let rotated = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let count = std::fs::read_dir(&directory)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("cdr.jsonl.")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if count > 0 {
+                    return count;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the file sink should rotate with an http sink beside it");
+        assert!(rotated > 0, "at least one rotated file");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    async fn read_when_nonempty(path: &std::path::Path) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if !text.trim().is_empty() {
+                        return text;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the file sink should write the record")
+    }
+
+    async fn read_until_lines(path: &std::path::Path, want: usize) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if text.lines().filter(|l| !l.trim().is_empty()).count() >= want {
+                        return text;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the file sink should write every record")
     }
 }

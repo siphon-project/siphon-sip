@@ -3763,15 +3763,68 @@ pub struct CdrYamlConfig {
     /// Async channel buffer size. Default: 10000.
     #[serde(default = "default_cdr_channel_size")]
     pub channel_size: usize,
-    /// Backend type: "file", "syslog", or "http".
-    #[serde(default = "default_cdr_backend")]
-    pub backend: String,
+    /// Single-sink form: "file", "syslog", or "http", configured by the
+    /// matching block below. Mutually exclusive with [`Self::backends`];
+    /// absent means "file" unless `backends` names the sinks instead.
+    #[serde(default)]
+    pub backend: Option<String>,
     /// File backend settings.
     pub file: Option<CdrFileConfig>,
     /// Syslog backend settings.
     pub syslog: Option<CdrSyslogConfig>,
     /// HTTP webhook backend settings.
     pub http: Option<CdrHttpConfig>,
+    /// Every sink each record is written to.
+    ///
+    /// A deployment usually wants both a file on the node — the durable copy —
+    /// and delivery to a collector, and with one sink a record the collector
+    /// fails to take exists nowhere else. Each sink gets its own channel and
+    /// writer task, so a slow or failing one cannot delay, block or drop
+    /// another's records, and `channel_size` applies per sink.
+    #[serde(default)]
+    pub backends: Vec<CdrSinkConfig>,
+}
+
+/// One sink in [`CdrYamlConfig::backends`].
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CdrSinkConfig {
+    /// JSON-lines file with optional rotation.
+    File {
+        #[serde(default = "default_cdr_file_path")]
+        path: String,
+        #[serde(default = "default_cdr_rotate_size")]
+        rotate_size_mb: u64,
+    },
+    /// UDP syslog to a remote collector.
+    Syslog { target: String },
+    /// HTTP POST webhook.
+    Http {
+        url: String,
+        #[serde(default)]
+        auth_header: Option<String>,
+    },
+}
+
+impl CdrSinkConfig {
+    fn to_backend(&self) -> crate::cdr::CdrBackendType {
+        match self {
+            CdrSinkConfig::File {
+                path,
+                rotate_size_mb,
+            } => crate::cdr::CdrBackendType::File {
+                path: path.clone(),
+                rotate_size_mb: *rotate_size_mb,
+            },
+            CdrSinkConfig::Syslog { target } => crate::cdr::CdrBackendType::Syslog {
+                target: target.clone(),
+            },
+            CdrSinkConfig::Http { url, auth_header } => crate::cdr::CdrBackendType::Http {
+                url: url.clone(),
+                auth_header: auth_header.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -3805,7 +3858,24 @@ pub struct CdrHttpConfig {
 impl CdrYamlConfig {
     /// Convert YAML config into runtime `CdrConfig`.
     pub fn to_cdr_config(&self) -> crate::cdr::CdrConfig {
-        let backend = match self.backend.as_str() {
+        // The list form wins when present; `validate_cdr` has already refused a
+        // config that sets both.
+        if !self.backends.is_empty() {
+            let backends: Vec<crate::cdr::CdrBackendType> =
+                self.backends.iter().map(|sink| sink.to_backend()).collect();
+            return crate::cdr::CdrConfig {
+                enabled: self.enabled,
+                // The first sink, so a consumer reading the single-sink field
+                // still sees something true rather than a default.
+                backend: backends[0].clone(),
+                backends,
+                auto_emit: self.auto_emit,
+                include_register: self.include_register,
+                channel_size: self.channel_size,
+            };
+        }
+
+        let backend = match self.backend.as_deref().unwrap_or("file") {
             "syslog" => {
                 let target = self
                     .syslog
@@ -3837,6 +3907,7 @@ impl CdrYamlConfig {
 
         crate::cdr::CdrConfig {
             enabled: self.enabled,
+            backends: vec![backend.clone()],
             backend,
             auto_emit: self.auto_emit,
             include_register: self.include_register,
@@ -3847,10 +3918,6 @@ impl CdrYamlConfig {
 
 fn default_cdr_channel_size() -> usize {
     10_000
-}
-
-fn default_cdr_backend() -> String {
-    "file".to_string()
 }
 
 fn default_cdr_file_path() -> String {
@@ -4449,6 +4516,7 @@ impl Config {
         let config: Self = serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_backends()?;
+        config.validate_cdr()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -4567,6 +4635,28 @@ impl Config {
                     .to_string(),
             )),
         }
+    }
+
+    /// Reject a CDR block that names its sinks twice.
+    ///
+    /// `backend` and `backends` are two ways to say the same thing, and picking
+    /// one silently would send records somewhere the operator did not intend —
+    /// either losing the collector or losing the durable file. Both spellings
+    /// are named in the error so it is obvious which line to delete.
+    fn validate_cdr(&self) -> Result<()> {
+        let Some(cdr) = &self.cdr else {
+            return Ok(());
+        };
+        if cdr.backend.is_some() && !cdr.backends.is_empty() {
+            return Err(SiphonError::Config(format!(
+                "cdr sets both `backend: {}` and `backends` ({} sink(s)) — they are two \
+                 spellings of the same setting and siphon will not guess which one you meant. \
+                 Keep `backends` for several sinks, or `backend` for one.",
+                cdr.backend.as_deref().unwrap_or(""),
+                cdr.backends.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Reject a media profile asking for something `media.backend` cannot do.
@@ -7254,6 +7344,85 @@ media:
         )
     }
 
+    // -----------------------------------------------------------------------
+    // CDR sinks
+    // -----------------------------------------------------------------------
+
+    /// The single form is what every existing deployment has written, so it has
+    /// to keep meaning exactly one sink of exactly that kind.
+    #[test]
+    fn cdr_single_backend_form_is_one_sink() {
+        let config = Config::from_str(&backend_yaml(
+            "cdr:\n  enabled: true\n  backend: http\n  http:\n    url: \"https://collector.example/cdr\"\n",
+        ))
+        .expect("the single form must load");
+        let runtime = config.cdr.as_ref().expect("cdr block").to_cdr_config();
+        assert_eq!(runtime.backends.len(), 1);
+        match &runtime.backends[0] {
+            crate::cdr::CdrBackendType::Http { url, .. } => {
+                assert_eq!(url, "https://collector.example/cdr")
+            }
+            other => panic!("expected the http sink, got {other:?}"),
+        }
+        // The single-sink field still reads true for a consumer that looks at it.
+        assert!(matches!(
+            runtime.backend,
+            crate::cdr::CdrBackendType::Http { .. }
+        ));
+    }
+
+    /// The list form is the point: a durable file beside a collector.
+    #[test]
+    fn cdr_backends_list_form_parses_every_sink() {
+        let config = Config::from_str(&backend_yaml(
+            "cdr:\n  enabled: true\n  backends:\n    - type: file\n      path: /var/log/siphon/cdr.jsonl\n    \
+             - type: http\n      url: \"https://collector.example/cdr\"\n      auth_header: \"Bearer t\"\n",
+        ))
+        .expect("the list form must load");
+        let runtime = config.cdr.as_ref().expect("cdr block").to_cdr_config();
+        assert_eq!(runtime.backends.len(), 2, "both sinks are kept");
+        assert!(matches!(
+            runtime.backends[0],
+            crate::cdr::CdrBackendType::File { .. }
+        ));
+        match &runtime.backends[1] {
+            crate::cdr::CdrBackendType::Http { url, auth_header } => {
+                assert_eq!(url, "https://collector.example/cdr");
+                assert_eq!(auth_header.as_deref(), Some("Bearer t"));
+            }
+            other => panic!("expected the http sink, got {other:?}"),
+        }
+    }
+
+    /// Two spellings of the same setting: guessing would send records somewhere
+    /// the operator did not intend, so it is a load error naming both keys.
+    #[test]
+    fn rejects_cdr_backend_and_backends_together() {
+        let error = Config::from_str(&backend_yaml(
+            "cdr:\n  enabled: true\n  backend: file\n  backends:\n    - type: syslog\n      \
+             target: \"192.0.2.9:514\"\n",
+        ))
+        .expect_err("naming the sinks twice must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("backend") && message.contains("backends"),
+            "the error should name both keys: {message}"
+        );
+    }
+
+    /// A `cdr` block with neither key is the historical default: one file sink.
+    #[test]
+    fn cdr_with_no_backend_named_is_the_file_sink() {
+        let config = Config::from_str(&backend_yaml("cdr:\n  enabled: true\n"))
+            .expect("a cdr block with no backend must load");
+        let runtime = config.cdr.as_ref().expect("cdr block").to_cdr_config();
+        assert_eq!(runtime.backends.len(), 1);
+        assert!(matches!(
+            runtime.backends[0],
+            crate::cdr::CdrBackendType::File { .. }
+        ));
+    }
+
     #[test]
     fn rejects_registrar_python_backend() {
         let error = Config::from_str(&backend_yaml("registrar:\n  backend: python\n"))
@@ -7824,7 +7993,7 @@ session_timer:
         assert!(cdr.enabled);
         assert!(cdr.include_register);
         assert_eq!(cdr.channel_size, 5000);
-        assert_eq!(cdr.backend, "file");
+        assert_eq!(cdr.backend.as_deref(), Some("file"));
 
         let runtime = cdr.to_cdr_config();
         assert!(runtime.enabled);
@@ -7855,7 +8024,7 @@ session_timer:
         );
         let config = Config::from_str(yaml).unwrap();
         let cdr = config.cdr.unwrap();
-        assert_eq!(cdr.backend, "http");
+        assert_eq!(cdr.backend.as_deref(), Some("http"));
 
         let runtime = cdr.to_cdr_config();
         assert!(
