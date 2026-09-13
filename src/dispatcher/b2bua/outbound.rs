@@ -60,6 +60,54 @@ pub fn send_b2bua_to_bleg(
     );
 }
 
+/// Send siphon-originated messages to a B-leg in the given order, with nothing
+/// interleaved.
+///
+/// [`send_b2bua_to_bleg`] once per message does not order them on UDP: the
+/// workers share the outbound channel and each owns its own socket, so two
+/// enqueues race to the wire (see [`OutboundMessage::followups`]). An ACK and
+/// the BYE that releases the dialog it confirms are such a pair: a callee that
+/// gets the BYE first has not yet seen the dialog confirmed (RFC 3261 §13.2.2.4,
+/// §15), and a strict one rejects or drops it. Each request's retransmit
+/// schedule is armed as usual. Stream transports already keep order on their
+/// connection, so there the messages go out one by one.
+pub fn send_b2bua_sequence_to_bleg(
+    messages: Vec<SipMessage>,
+    transport: Transport,
+    destination: SocketAddr,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    if !matches!(transport, Transport::Udp) {
+        for message in messages {
+            send_b2bua_to_bleg(message, transport, destination, source_local_addr, state);
+        }
+        return;
+    }
+    // The socket every frame leaves from, the same one `send_to_target` would
+    // pick: the IPsec auto-source for a protected destination, else the pin.
+    let egress = udp_egress_source(transport, destination, source_local_addr);
+    let mut frames = Vec::with_capacity(messages.len());
+    for message in &messages {
+        let data = Bytes::from(message.to_bytes());
+        arm_b2bua_retransmit(message, &data, transport, destination, egress, state);
+        frames.push(data);
+    }
+    let mut frames = frames.into_iter();
+    let Some(first) = frames.next() else {
+        return;
+    };
+    send_frames_in_order_from(
+        first,
+        frames.collect(),
+        transport,
+        destination,
+        ConnectionId::default(),
+        egress,
+        state,
+    );
+}
+
 /// Arm an RFC 3261 §17.1 retransmit schedule for a siphon-originated B2BUA
 /// request, keyed on its own topmost Via branch.
 ///

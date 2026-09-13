@@ -338,8 +338,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   They used to ring on beside the answered call until each gave up (RFC 3261
   §9.1). The 487 each returns is ACKed without disturbing the call, and a branch
   whose 2xx crosses the CANCEL is ACKed and released with a BYE (§13.2.2.4, §15).
-  A caller's CANCEL and the ring timeout likewise stop CANCELling branches that
-  already have a final response.
+  That ACK and BYE now leave as one ordered unit: sent separately over UDP they
+  could reach the callee BYE first, which a strict UA drops, leaving the BYE
+  retransmitting unanswered. A caller's CANCEL and the ring timeout likewise stop
+  CANCELling branches that already have a final response.
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the

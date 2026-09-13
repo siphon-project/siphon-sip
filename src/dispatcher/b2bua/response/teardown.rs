@@ -286,11 +286,12 @@ pub fn b2bua_ack_and_bye_answered_leg(
         resolve_in_dialog_destination(&route_set, state, destination, transport);
 
     // ACK on every call — a lost ACK leaves the callee retransmitting.
-    if let Some(ack) = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port) {
-        send_b2bua_to_bleg(ack, transport, destination, local_addr, state);
-    }
+    let ack = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port);
 
     if !send_bye {
+        if let Some(ack) = ack {
+            send_b2bua_to_bleg(ack, transport, destination, local_addr, state);
+        }
         return false;
     }
 
@@ -311,13 +312,13 @@ pub fn b2bua_ack_and_bye_answered_leg(
         .unwrap_or(leg.dialog.local_cseq);
     leg.dialog.local_cseq = invite_cseq.saturating_add(1);
 
-    match build_b2bua_bye(&leg, state) {
-        Some(bye) => {
-            send_b2bua_to_bleg(bye, transport, destination, local_addr, state);
-            true
-        }
-        None => false,
-    }
+    let bye = build_b2bua_bye(&leg, state);
+    let bye_sent = bye.is_some();
+    // The ACK confirms the dialog the BYE ends, so the two leave as one ordered
+    // unit: sent separately on UDP they can reach the callee BYE first.
+    let messages: Vec<SipMessage> = ack.into_iter().chain(bye).collect();
+    send_b2bua_sequence_to_bleg(messages, transport, destination, local_addr, state);
+    bye_sent
 }
 
 /// Handle a 2xx that raced an outbound CANCEL (RFC 3261 §9.1 glare).
