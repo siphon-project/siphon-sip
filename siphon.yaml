@@ -1950,7 +1950,15 @@ log:
 #       token: "${IVR_APP_TOKEN}"   # bearer token (constant-time compared)
 #       # production default — siphon dials the controller once per call:
 #       per_call_connect: true
+#       # ws:// or wss://. Port defaults per scheme the way a browser would:
+#       # 443 for wss://, 80 for ws://. Refused at load if siphon cannot dial
+#       # it, rather than once per call at handover.
 #       connect_url: "wss://controller.internal:8443/siphon"
+#       # wss:// only. PEM bundle the controller's certificate is verified
+#       # against; absent means the public (Mozilla) roots. Naming one
+#       # REPLACES the public roots rather than adding to them — a controller
+#       # behind a private CA should be the only certificate that works.
+#       ca_file: "/etc/siphon/control-ca.pem"
 #       on_lost: "hangup"           # owner-disconnect policy: hangup|continue|fallback
 #   limits:
 #     event_queue_depth: 1024       # bounded per-connection outbound queue

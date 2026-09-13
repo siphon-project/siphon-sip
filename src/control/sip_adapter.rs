@@ -2340,6 +2340,7 @@ mod tests {
                 per_call_connect: false,
                 connect_url: None,
                 on_lost: Some("hangup".to_string()),
+                ca_file: None,
             }],
             64,
             crate::control::SlowConsumerPolicy::DropOldest,

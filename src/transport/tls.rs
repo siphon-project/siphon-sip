@@ -47,6 +47,9 @@ pub(crate) const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duratio
 /// builder. `server.rs` installs ring as the process default before any
 /// listener starts; the fallback keeps unit tests and library embedders that
 /// never installed one working instead of failing to load a valid key.
+///
+/// Shared with [`client_tls`](crate::transport::client_tls), which needs the
+/// same fallback for the same reason on the dialing side.
 pub(crate) fn crypto_provider() -> Arc<tokio_rustls::rustls::crypto::CryptoProvider> {
     tokio_rustls::rustls::crypto::CryptoProvider::get_default()
         .cloned()

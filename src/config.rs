@@ -2254,6 +2254,15 @@ pub struct ControlAppConfig {
     /// "hangup" (default), "continue", or "fallback".
     #[serde(default)]
     pub on_lost: Option<String>,
+    /// PEM bundle to verify the controller's certificate against when
+    /// `connect_url` is `wss://`. Absent means the public (Mozilla) roots.
+    ///
+    /// Naming one **replaces** the public roots rather than adding to them: a
+    /// controller behind a private CA should be the only certificate that works,
+    /// and keeping the public roots alongside it would let a mis-issued public
+    /// certificate through too.
+    #[serde(default)]
+    pub ca_file: Option<String>,
 }
 
 /// Global control-plane resource caps + backpressure policy.
@@ -4591,6 +4600,7 @@ impl Config {
         config.validate_lawful_intercept()?;
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
+        config.validate_control_connect_urls()?;
         Ok(config)
     }
 
@@ -4622,6 +4632,54 @@ impl Config {
             "control.tls",
         )
         .map_err(|error| SiphonError::Config(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reject a per-call-connect app whose `connect_url` siphon cannot dial, and
+    /// a `ca_file` that is not a readable CA bundle.
+    ///
+    /// At load rather than at the first handover: a controller siphon cannot
+    /// reach means every handed-over call ends on the handoff default, so the
+    /// box comes up healthy and answers every call with its timeout. That reads
+    /// as a controller outage, not as a typo in a URL.
+    fn validate_control_connect_urls(&self) -> Result<()> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        for app in &control.apps {
+            let Some(connect_url) = app.connect_url.as_deref() else {
+                continue;
+            };
+            let target =
+                crate::control::outbound::parse_connect_url(connect_url).map_err(|error| {
+                    SiphonError::Config(format!(
+                        "control.apps[{}].connect_url {connect_url:?}: {error}",
+                        app.name
+                    ))
+                })?;
+            match (&app.ca_file, target.tls) {
+                // A CA bundle on a ws:// app is not merely redundant: it says
+                // the operator believes this connection is verified, and it
+                // is not encrypted at all.
+                (Some(ca_file), false) => {
+                    return Err(SiphonError::Config(format!(
+                        "control.apps[{}] sets ca_file {ca_file:?} but its connect_url is                          ws://, which is not encrypted — use wss:// or drop the ca_file",
+                        app.name
+                    )))
+                }
+                (Some(ca_file), true) => {
+                    crate::transport::client_tls::client_config(Some(ca_file)).map_err(
+                        |error| {
+                            SiphonError::Config(format!(
+                                "control.apps[{}].ca_file: {error}",
+                                app.name
+                            ))
+                        },
+                    )?;
+                }
+                (None, _) => {}
+            }
+        }
         Ok(())
     }
 
@@ -5236,6 +5294,12 @@ mod tests {
         ))
     }
 
+    fn control_config(app_block: &str) -> Result<Config> {
+        Config::from_str(&format!(
+            "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\ncontrol:\n  apps:\n{app_block}"
+        ))
+    }
+
     #[test]
     fn control_tls_without_a_listener_is_refused() {
         // It says the operator believes the rail is encrypted, and there is no
@@ -5265,12 +5329,73 @@ mod tests {
     }
 
     #[test]
+    fn a_control_app_dialing_an_unsupported_scheme_is_refused_at_load() {
+        // At load, not at the first handover: an unreachable controller means
+        // every handed-over call ends on the handoff default, so the box comes
+        // up healthy and times out every call, which reads as an outage rather
+        // than a typo.
+        let error = control_config(
+            "    - name: \"pbx\"\n      per_call_connect: true\n      connect_url: \"https://controller.example\"\n",
+        )
+        .expect_err("https:// is not a WebSocket scheme");
+        let message = error.to_string();
+        assert!(message.contains("ws:// or wss://"), "{message}");
+        assert!(message.contains("pbx"), "{message}");
+    }
+
+    #[test]
+    fn a_ca_file_on_a_plaintext_control_app_is_refused() {
+        // Not merely redundant: it says the operator believes the connection is
+        // verified, and it is not encrypted at all.
+        let error = control_config(
+            "    - name: \"pbx\"\n      per_call_connect: true\n      connect_url: \"ws://controller.example:9092\"\n      ca_file: \"/etc/siphon/ca.pem\"\n",
+        )
+        .expect_err("a ca_file on ws:// must be refused");
+        let message = error.to_string();
+        assert!(message.contains("not encrypted"), "{message}");
+    }
+
+    #[test]
+    fn a_ca_file_that_cannot_be_read_is_refused_at_load() {
+        let error = control_config(
+            "    - name: \"pbx\"\n      per_call_connect: true\n      connect_url: \"wss://controller.example\"\n      ca_file: \"/nonexistent/siphon-control-ca.pem\"\n",
+        )
+        .expect_err("an unreadable ca_file must be refused");
+        let message = error.to_string();
+        assert!(message.contains("ca_file"), "{message}");
+        assert!(
+            message.contains("/nonexistent/siphon-control-ca.pem"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_control_listener_without_tls_still_loads() {
         // Plaintext stays valid: a loopback or trusted-segment deployment is
         // the common case and must not be forced to generate certificates.
         let config = control_yaml("  listen: \"127.0.0.1:9092\"\n")
             .expect("a plaintext control listener must load");
         assert!(config.control.expect("control").tls.is_none());
+    }
+
+    #[test]
+    fn a_wss_control_app_without_a_ca_file_loads_on_the_public_roots() {
+        let config = control_config(
+            "    - name: \"pbx\"\n      per_call_connect: true\n      connect_url: \"wss://controller.example\"\n",
+        )
+        .expect("wss:// on the public roots must load");
+        let app = &config.control.expect("control").apps[0];
+        assert_eq!(app.ca_file, None);
+    }
+
+    #[test]
+    fn an_inbound_only_control_app_needs_no_connect_url() {
+        // The persistent mode dials in, so there is nothing to validate.
+        let config = control_config("    - name: \"pbx\"\n      token: \"t\"\n")
+            .expect("an app with no connect_url must load");
+        assert!(config.control.expect("control").apps[0]
+            .connect_url
+            .is_none());
     }
 
     /// `server.auto_options` defaults ON, and it has to default ON from *both*

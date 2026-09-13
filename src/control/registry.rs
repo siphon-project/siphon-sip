@@ -1337,6 +1337,7 @@ impl ControlBus {
                 config.name.clone(),
                 config.token.clone(),
                 connect_url,
+                config.ca_file.clone(),
                 super::outbound::PendingOwn {
                     channel_id: channel_id.to_string(),
                     call_actor_id: call_actor_id.to_string(),
@@ -1502,6 +1503,7 @@ mod tests {
             per_call_connect: false,
             connect_url: None,
             on_lost: Some("hangup".to_string()),
+            ca_file: None,
         }
     }
 

@@ -86,6 +86,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   let one peer that connects and then stalls hold up every other application's
   connection; completed streams arrive over a bounded channel instead. Handshakes
   are bounded by the same timeout the SIP TLS listeners use.
+- **A per-call-connect control app can now be dialed over `wss://`.**
+  `control.apps[].connect_url` accepted only `ws://` in practice — the `wss://`
+  form the config reference has always shown failed at dial time, so the control
+  rail could not cross an untrusted network without a sidecar terminating TLS.
+  The port now defaults per scheme (443 / 80) the way a browser resolves one, and
+  a new `control.apps[].ca_file` names a PEM bundle to verify the controller
+  against; absent means the public roots, and naming one *replaces* them rather
+  than adding to them, so a controller behind a private CA is the only
+  certificate that works. A `connect_url` siphon cannot dial, and a `ca_file`
+  that is not a readable bundle or that sits on a `ws://` app, are refused at
+  config load — an unreachable controller otherwise leaves the box healthy while
+  every handed-over call ends on the handoff deadline.
+
+  No new dependency: `tokio-tungstenite`'s own TLS features each resolve a
+  second copy of `webpki-roots` beside the one already in the tree, which would
+  leave the control plane validating against a different, older trust bundle
+  than the CDR and HEP clients. The TLS half is built with the `tokio-rustls`
+  already present, and the CDR and HEP clients now share that one root store
+  too.
 
 ### Changed
 
