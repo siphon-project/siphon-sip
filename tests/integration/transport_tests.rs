@@ -59,37 +59,96 @@ async fn bind_failure_reaches_the_caller() {
     );
 }
 
-/// Helper: find a free port by binding and releasing.
-/// A loopback address reserved for this test, on a port the kernel will not
-/// hand to anything else.
+/// Reserve `port` for this process across every test binary on the machine.
 ///
-/// The obvious version — bind port 0, read the address, drop the socket — looks
-/// fine and is why these tests flapped. Two things go wrong:
+/// The counter below only stops two callers *in one process* being handed
+/// the same port, and that is not the situation that bites: the lib and
+/// integration binaries run separately, a second worktree runs its own, and
+/// each starts its counter from the same base. The file is created
+/// exclusively, so exactly one process wins a given port; a reservation
+/// older than an hour belonged to a run that is long gone and is taken over.
+fn claim_port(port: u16) -> bool {
+    let directory = std::env::temp_dir().join("siphon-test-ports");
+    if std::fs::create_dir_all(&directory).is_err() {
+        // No shared directory to coordinate through — fall back to the
+        // probe alone rather than failing every test.
+        return true;
+    }
+    let path = directory.join(port.to_string());
+    let pid = std::process::id();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => std::fs::write(&path, pid.to_string()).is_ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A reservation whose process has exited is free again. On Linux
+            // that is knowable immediately, which matters because a run that
+            // could not reuse its own ports would walk up the range on every
+            // invocation; elsewhere, fall back to the file's age.
+            let owner = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            let gone = owner.is_some_and(|owner| {
+                !std::path::Path::new("/proc")
+                    .join(owner.to_string())
+                    .exists()
+            });
+            let old = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| {
+                    modified.elapsed().unwrap_or_default() > std::time::Duration::from_secs(3600)
+                })
+                .unwrap_or(false);
+            (gone || old) && std::fs::write(&path, pid.to_string()).is_ok()
+        }
+        Err(_) => true,
+    }
+}
+
+/// A loopback address reserved for this test, on a port nothing else on this
+/// machine will bind.
 ///
-/// * the kernel auto-assigns from the ephemeral range (32768-60999 on Linux),
-///   so between the probe closing and the real bind, any outbound socket in this
-///   process can take that exact port, and
-/// * `listen()` binds on a **spawned task** and merely logs on failure, so the
-///   caller never learns. The test then waits on a listener that was never
-///   created and fails as a connect timeout, pointing at the wrong thing.
+/// The obvious version — bind port 0, read the address, drop the socket —
+/// looks fine and is the reason these tests flapped. Three things go wrong:
+///
+/// * the kernel auto-assigns from the ephemeral range (32768-60999 here),
+///   so between the probe closing and the real bind, any outbound socket in
+///   this process can take that exact port,
+/// * `listen()` used to bind on a **spawned task**, so the caller returned
+///   before the socket existed and a connect could be refused for no reason
+///   but scheduling. The listeners now bind before spawning, so awaiting
+///   `listen` means the socket is accepting; this helper still matters for
+///   the collision above, and
+/// * a counter is per process, and several test binaries run at once on one
+///   machine. Two of them hand out the same port, and the probe below is the
+///   thing that then fails the *other* process: the probe socket carries no
+///   `SO_REUSEPORT` and `bind_tcp_listener` sets it, and Linux refuses a
+///   `SO_REUSEPORT` bind when an existing socket on the port lacks it — so
+///   one process's probe turns the other's listener into `AddrInUse`. That
+///   is the `AddrInUse` these tests saw, and why it never reproduced when
+///   the binary ran on its own.
 ///
 /// Handing out ports from a counter *below* the ephemeral range removes the
-/// collision at its source: nothing is auto-assigned there, so only an explicit
-/// bind can take one, and the counter guarantees no two callers in this process
-/// get the same port. The probe then confirms it really is free.
-///
-/// (The in-crate twin lives in `transport::testutil`; `tests/` is a separate
-/// crate and cannot see `#[cfg(test)]` items.)
+/// first collision at its source: nothing is auto-assigned there, so only an
+/// explicit bind can take one. [`claim_port`] removes the third by making
+/// the reservation machine-wide. The probe then confirms the port is
+/// actually free before it is used.
 fn free_port() -> SocketAddr {
     use std::sync::atomic::{AtomicU16, Ordering};
-    // A different base from the in-crate helper: both binaries can run at once.
-    static NEXT: AtomicU16 = AtomicU16::new(24000);
+    // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
+    // privileged range and clear of the SIP defaults these tests also use.
+    static NEXT: AtomicU16 = AtomicU16::new(21000);
 
     for _ in 0..2048 {
         let port = NEXT.fetch_add(1, Ordering::Relaxed);
         assert!(port < 32000, "exhausted the reserved test port range");
-        // TCP and UDP are separate namespaces and these tests bind either, so a
-        // port is only free when it is free on both.
+        if !claim_port(port) {
+            continue;
+        }
+        // TCP and UDP are separate namespaces and these tests bind either,
+        // so a port is only free when it is free on both.
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
             continue;
         }
