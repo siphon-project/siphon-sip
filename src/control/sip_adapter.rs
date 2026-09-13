@@ -45,8 +45,20 @@ impl ControlAdapter for SipControlAdapter {
                 apply_bridge_verb(command).await
             } else if is_media_verb(&command.verb) {
                 apply_media_verb(command).await
-            } else {
+            } else if is_sip_verb(&command.verb) {
                 apply_sip(command)
+            } else {
+                // Refused at the door rather than by falling through into the
+                // SIP table. A verb that reaches the wrong table is answered
+                // `unsupported_verb` by accident, which reads exactly like this
+                // and is how `record_start` shipped dispatching nowhere.
+                ControlResult::error(
+                    ControlErrorCode::UnsupportedVerb,
+                    format!(
+                        "sip adapter does not implement verb '{}' in this build",
+                        command.verb
+                    ),
+                )
             }
         })
     }
@@ -173,7 +185,15 @@ fn verb(name: &str, summary: &str) -> VerbSchema {
 fn is_media_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "play" | "stop" | "dtmf" | "hold" | "unhold" | "stream_start" | "stream_stop"
+        "play"
+            | "stop"
+            | "dtmf"
+            | "hold"
+            | "unhold"
+            | "stream_start"
+            | "stream_stop"
+            | "record_start"
+            | "record_stop"
     )
 }
 
@@ -182,6 +202,34 @@ fn is_media_verb(verb: &str) -> bool {
 /// with the backend before answering).
 fn is_bridge_verb(verb: &str) -> bool {
     matches!(verb, "bridge" | "unbridge")
+}
+
+/// The verbs [`apply_sip`] dispatches synchronously over the B2BUA rail — the
+/// arms of its own `match`, restated so the schema guard in the tests can prove
+/// every advertised verb is claimed by exactly one dispatch table.
+///
+/// That guard exists because of a failure mode that is invisible everywhere
+/// else: a verb added to `describe()` and to one dispatch table, but not to the
+/// classifier in [`ControlAdapter::apply`] that routes to it, falls through to
+/// the wrong table and answers `unsupported_verb` on the wire — while every unit
+/// test that calls the handler function directly still passes.
+fn is_sip_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "answer"
+            | "ring"
+            | "progress"
+            | "reject"
+            | "hangup"
+            | "refer"
+            | "accept_refer"
+            | "reject_refer"
+            | "replace_peer"
+            | "route"
+            | "set_header"
+            | "remove_header"
+            | "get_header"
+    )
 }
 
 /// Resolve the command's channel target and mark the controller as having acted
@@ -3309,6 +3357,69 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_verb_is_claimed_by_a_dispatch_table() {
+        // The wire-level version of the split test below: `apply` picks a table
+        // by classifier, so a verb the schema advertises that no classifier
+        // claims is answered `unsupported_verb` no matter how complete its
+        // handler is. Caught exactly that on `record_start` / `record_stop`.
+        for advertised in SipControlAdapter::new().describe().verbs {
+            let verb = advertised.verb.as_str();
+            assert!(
+                verb == "originate"
+                    || is_bridge_verb(verb)
+                    || is_media_verb(verb)
+                    || is_sip_verb(verb),
+                "describe() advertises '{verb}' but no dispatch table claims it — \
+                 apply() would answer unsupported_verb"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatchable_verb_is_advertised() {
+        // The other direction: a verb siphon implements but never describes is
+        // one an application cannot discover, so it may as well not exist.
+        let advertised: Vec<String> = SipControlAdapter::new()
+            .describe()
+            .verbs
+            .into_iter()
+            .map(|verb| verb.verb)
+            .collect();
+        for verb in [
+            "originate",
+            "bridge",
+            "unbridge",
+            "play",
+            "stop",
+            "dtmf",
+            "hold",
+            "unhold",
+            "stream_start",
+            "stream_stop",
+            "record_start",
+            "record_stop",
+            "answer",
+            "ring",
+            "progress",
+            "reject",
+            "hangup",
+            "refer",
+            "accept_refer",
+            "reject_refer",
+            "replace_peer",
+            "route",
+            "set_header",
+            "remove_header",
+            "get_header",
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == verb),
+                "'{verb}' dispatches but describe() never mentions it"
+            );
+        }
+    }
+
+    #[test]
     fn is_media_verb_splits_media_from_sip() {
         for verb in [
             "play",
@@ -3318,6 +3429,8 @@ mod tests {
             "unhold",
             "stream_start",
             "stream_stop",
+            "record_start",
+            "record_stop",
         ] {
             assert!(
                 is_media_verb(verb),
