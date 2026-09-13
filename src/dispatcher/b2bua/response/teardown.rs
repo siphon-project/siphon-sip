@@ -4,6 +4,64 @@
 
 use crate::dispatcher::*;
 
+/// A final response for the caller generated from the stored A-leg INVITE,
+/// rather than a B-leg response relayed back: it already carries the A-leg's
+/// own Via / From / To / Call-ID / CSeq, and needs none of the B-leg
+/// sanitisation a relayed failure does. `None`, logged, when the INVITE is not
+/// available.
+pub fn a_leg_final_response(
+    call_id: &str,
+    a_leg: &crate::b2bua::actor::Leg,
+    a_leg_invite: Option<&Arc<std::sync::Mutex<SipMessage>>>,
+    status_code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) -> Option<SipMessage> {
+    let Some(invite_arc) = a_leg_invite else {
+        warn!(
+            call_id = %call_id,
+            "B2BUA: no stored A-leg INVITE — the caller cannot be sent a {status_code}"
+        );
+        return None;
+    };
+    match invite_arc.lock() {
+        Ok(invite) => Some(build_a_leg_final_response(
+            &invite,
+            &a_leg.dialog.local_tag,
+            status_code,
+            reason,
+            state.server_header.as_deref(),
+        )),
+        Err(error) => {
+            error!(
+                call_id = %call_id,
+                "B2BUA: A-leg INVITE lock poisoned while building the caller's {status_code}: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// [`a_leg_final_response`] from the INVITE itself. The To-tag is the A-leg
+/// dialog's own (RFC 3261 §8.2.6.2 — a UAS tags every response bar 100), the
+/// same tag its 2xx would have carried.
+pub fn build_a_leg_final_response(
+    invite: &SipMessage,
+    a_leg_local_tag: &str,
+    status_code: u16,
+    reason: &str,
+    server_header: Option<&str>,
+) -> SipMessage {
+    let mut response = build_response(invite, status_code, reason, server_header, &[]);
+    if let Some(to) = response.headers.to().cloned() {
+        response.headers.set(
+            "To",
+            crate::b2bua::actor::ensure_tag(&to, Some(a_leg_local_tag)),
+        );
+    }
+    response
+}
+
 /// Invoke `@b2bua.on_route_failure` for one failed carrier of a sequential
 /// failover sequence.
 ///
@@ -412,41 +470,17 @@ pub fn b2bua_fail_after_answer(
         "B2BUA: failing a call whose B-leg answered — the caller gets {STATUS} and the answered B-leg is released"
     );
 
-    // The caller's final response. Built from the stored A-leg INVITE, so it
-    // already carries the A-leg's own Via / From / To / Call-ID / CSeq and needs
-    // none of the B-leg sanitisation the forwarded-error path does. The To-tag is
-    // the A-leg dialog's own (RFC 3261 §8.2.6.2 — a UAS tags every response bar
-    // 100), the same tag its 2xx would have carried.
-    match a_leg_invite {
-        Some(invite_arc) => match invite_arc.lock() {
-            Ok(invite) => {
-                let mut failure =
-                    build_response(&invite, STATUS, REASON, state.server_header.as_deref(), &[]);
-                drop(invite);
-                if let Some(to) = failure.headers.to().cloned() {
-                    failure.headers.set(
-                        "To",
-                        crate::b2bua::actor::ensure_tag(&to, Some(&a_leg.dialog.local_tag)),
-                    );
-                }
-                send_message_from(
-                    failure,
-                    a_leg.transport.transport,
-                    a_leg.transport.remote_addr,
-                    a_leg.transport.connection_id,
-                    a_leg_local_addr,
-                    state,
-                );
-            }
-            Err(error) => error!(
-                call_id = %call_id,
-                "B2BUA: A-leg INVITE lock poisoned while failing an answered call: {error}"
-            ),
-        },
-        None => warn!(
-            call_id = %call_id,
-            "B2BUA: no stored A-leg INVITE — the caller cannot be sent a failure response"
-        ),
+    // The caller's final response, built from the stored A-leg INVITE.
+    if let Some(failure) = a_leg_final_response(call_id, a_leg, a_leg_invite, STATUS, REASON, state)
+    {
+        send_message_from(
+            failure,
+            a_leg.transport.transport,
+            a_leg.transport.remote_addr,
+            a_leg.transport.connection_id,
+            a_leg_local_addr,
+            state,
+        );
     }
 
     // Release the answered B-leg dialog. The leg is re-read here rather than
