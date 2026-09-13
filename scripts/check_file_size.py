@@ -94,6 +94,15 @@ def load_allowlist() -> dict[str, int]:
 # for. `fuzz/` likewise.
 EXCLUDED_ROOTS = ("tests/", "benches/", "fuzz/")
 
+# A module whose whole file is tests carries no `#[cfg(test)]` *inside* it — the
+# attribute sits on the `#[cfg(test)] mod tests;` declaration in the parent — so
+# the stripper sees every line as production. That is the shape the module split
+# produces (each module's tests move to its own file beside it), so match on the
+# filename instead.
+def is_test_file(path: Path) -> bool:
+    name = path.name
+    return name == "tests.rs" or name.endswith("_tests.rs")
+
 
 def tracked_rust_files() -> list[Path]:
     listed = subprocess.run(
@@ -105,6 +114,7 @@ def tracked_rust_files() -> list[Path]:
         if Path(p).is_file()
         and not any(part in p for part in ("/tests/", "/benches/", "/fuzz/"))
         and not p.startswith(EXCLUDED_ROOTS)
+        and not is_test_file(Path(p))
     ]
 
 
