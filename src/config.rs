@@ -2209,6 +2209,17 @@ pub struct ControlConfig {
     /// segment — the bearer token is replayable by anything that can read it.
     #[serde(default)]
     pub tls: Option<ControlTlsConfig>,
+    /// Hand every out-of-dialog INVITE to a control application, with no script.
+    ///
+    /// Without this the only way into the control plane is a script calling
+    /// `call.handover(...)`, so a deployment whose policy lives entirely in its
+    /// controller still has to ship a routing script that does nothing but
+    /// forward — a second place for policy to live and a second thing to
+    /// version. A script, when one is configured, still runs first and may hand
+    /// over itself; this is what happens when no `@b2bua.on_invite` handler is
+    /// registered to decide.
+    #[serde(default)]
+    pub inbound: Option<ControlInboundConfig>,
 }
 
 /// TLS for the inbound control listener (`control.tls`).
@@ -2226,6 +2237,36 @@ pub struct ControlTlsConfig {
     /// leaked config file alone does not give an attacker.
     #[serde(default)]
     pub client_ca: Option<String>,
+}
+
+/// Script-free inbound handover (`control.inbound`).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ControlInboundConfig {
+    /// Which registered application receives the call. Must name an entry in
+    /// `control.apps`, or config load fails.
+    pub app: String,
+    /// `deferred` (the default) holds the INVITE unanswered with the automatic
+    /// `100 Trying`, exactly as `call.handover()` does; `answer` answers it and
+    /// anchors the media first, as `call.handover(answer=True)` does.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// How long the controller has to act before the handoff default fires.
+    /// Falls back to `control.limits.handoff_deadline_ms`.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    /// `answer` mode only: the media profile to anchor with.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// `answer` mode only: the per-call WebSocket bridge URI.
+    #[serde(default)]
+    pub ws_uri: Option<String>,
+}
+
+impl ControlInboundConfig {
+    /// Whether the INVITE is answered and anchored before the handover.
+    pub fn answer_first(&self) -> bool {
+        self.mode.as_deref().is_some_and(|mode| mode == "answer")
+    }
 }
 
 /// A single registered control application.
@@ -4613,6 +4654,7 @@ impl Config {
         config.validate_cdr()?;
         config.validate_control_app_events()?;
         config.validate_control_apps()?;
+        config.validate_control_inbound()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -4918,6 +4960,50 @@ impl Config {
                     } else {
                         ""
                     }
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a `control.inbound` that names an application nothing serves.
+    ///
+    /// Every inbound call would be handed to an app that cannot exist, and the
+    /// handoff default would fire on each one — a deployment that answers every
+    /// call with its timeout default, which is worse than refusing to start.
+    fn validate_control_inbound(&self) -> Result<()> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let Some(inbound) = &control.inbound else {
+            return Ok(());
+        };
+        if inbound.app.is_empty() {
+            return Err(SiphonError::Config(
+                "control.inbound.app is empty — name the application every inbound INVITE is \
+                 handed to."
+                    .to_string(),
+            ));
+        }
+        if !control.apps.iter().any(|app| app.name == inbound.app) {
+            let known: Vec<&str> = control.apps.iter().map(|app| app.name.as_str()).collect();
+            return Err(SiphonError::Config(format!(
+                "control.inbound.app is {:?}, which is not one of the configured control.apps \
+                 ({}). Every inbound call would be handed to an application that cannot \
+                 connect.",
+                inbound.app,
+                if known.is_empty() {
+                    "none are configured".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )));
+        }
+        if let Some(mode) = inbound.mode.as_deref() {
+            if mode != "deferred" && mode != "answer" {
+                return Err(SiphonError::Config(format!(
+                    "control.inbound.mode is {mode:?} — it is \"deferred\" (hold the INVITE \
+                     unanswered) or \"answer\" (answer and anchor media first)."
                 )));
             }
         }
@@ -7867,6 +7953,81 @@ media:
             )))
             .unwrap_or_else(|error| panic!("on_lost: {policy} must load: {error}"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // control.inbound — script-free handover
+    // -----------------------------------------------------------------------
+
+    fn control_yaml(block: &str) -> String {
+        backend_yaml(&format!("control:\n  listen: \"127.0.0.1:9092\"\n{block}"))
+    }
+
+    /// Naming an app nothing serves would hand every inbound call to something
+    /// that cannot connect, so every call would end on the handoff default.
+    /// A box that boots and answers every call with its timeout default is
+    /// worse than one that refuses to start.
+    #[test]
+    fn rejects_control_inbound_naming_an_unknown_app() {
+        let error = Config::from_str(&control_yaml(
+            "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: typo\n",
+        ))
+        .expect_err("an unknown inbound app must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("control.inbound.app") && message.contains("pbx"),
+            "the error should name the setting and the apps that do exist: {message}"
+        );
+    }
+
+    /// A mode that is neither of the two would otherwise fall back silently to
+    /// deferred, which is the opposite of what someone writing `answer` meant.
+    #[test]
+    fn rejects_control_inbound_with_an_unknown_mode() {
+        let error = Config::from_str(&control_yaml(
+            "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n    \
+             mode: answer-first\n",
+        ))
+        .expect_err("an unknown mode must be rejected");
+        assert!(
+            error.to_string().contains("control.inbound.mode"),
+            "the error should name the setting: {error}"
+        );
+    }
+
+    /// The happy path, and the default mode.
+    #[test]
+    fn accepts_control_inbound_naming_a_configured_app() {
+        let config = Config::from_str(&control_yaml(
+            "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n",
+        ))
+        .expect("a configured app must load");
+        let inbound = config
+            .control
+            .as_ref()
+            .and_then(|control| control.inbound.as_ref())
+            .expect("the inbound block should parse");
+        assert_eq!(inbound.app, "pbx");
+        assert!(
+            !inbound.answer_first(),
+            "the default holds the INVITE unanswered"
+        );
+    }
+
+    /// `mode: answer` is what answers and anchors before handing over.
+    #[test]
+    fn control_inbound_answer_mode_answers_first() {
+        let config = Config::from_str(&control_yaml(
+            "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n    \
+             mode: answer\n",
+        ))
+        .expect("answer mode must load");
+        assert!(config
+            .control
+            .as_ref()
+            .and_then(|control| control.inbound.as_ref())
+            .expect("inbound block")
+            .answer_first());
     }
 
     #[test]

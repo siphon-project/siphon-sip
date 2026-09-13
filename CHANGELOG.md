@@ -178,6 +178,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `per_call_connect` + `connect_url` and `control.limits.handoff_deadline_ms`.
   `docker-compose.yaml` said `siphon.yaml` is hot-reloaded — only the scripts
   are; the config is read once at start-up.
+- **`control.inbound` hands every inbound call to a control application with no
+  script.** The only way into the control plane was a script calling
+  `call.handover(...)`, and B2BUA mode itself only switched on when a Python
+  `@b2bua.*` handler was registered — so a deployment whose policy lives
+  entirely in its controller still had to ship a routing script that did nothing
+  but forward every call. That is a second place for policy to live and a second
+  thing to version.
+
+  ```yaml
+  control:
+    apps: [{ name: pbx, token: "${PBX_CONTROL_TOKEN}" }]
+    inbound:
+      app: pbx
+      mode: deferred      # or `answer` to answer + anchor media first
+      deadline_ms: 5000
+  ```
+
+  Setting it turns B2BUA mode on by itself, the way a registered handler does. A
+  script, when configured, still runs first and may hand over itself; this is
+  what happens when no `@b2bua.on_invite` handler exists to decide — a handler
+  that ran and chose the silent drop still gets it.
+
+  Config load refuses an `app` that names nothing in `control.apps` (every call
+  would end on the handoff default) and a `mode` that is neither `deferred` nor
+  `answer` (which would otherwise fall back silently to the opposite of what was
+  meant).
 
 ### Changed
 

@@ -403,7 +403,7 @@ pub(super) fn handle_request(
 
     // Check if B2BUA mode should handle this INVITE
     let engine_state = state.engine.state();
-    if method == "INVITE" && engine_state.has_b2bua_handlers() {
+    if method == "INVITE" && b2bua_mode_active(&engine_state, state) {
         // Detect re-INVITE (has To-tag + matches existing call)
         let to_tag = message.headers.get("To").and_then(|t| {
             t.split(';')
@@ -428,7 +428,7 @@ pub(super) fn handle_request(
         handle_b2bua_invite(inbound, message, state);
         return;
     }
-    if method == "BYE" && engine_state.has_b2bua_handlers() {
+    if method == "BYE" && b2bua_mode_active(&engine_state, state) {
         // Check if this BYE belongs to a B2BUA call
         let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
         if let Some(ref sip_call_id) = sip_call_id {
@@ -461,7 +461,7 @@ pub(super) fn handle_request(
     } else {
         None
     };
-    if method == "UPDATE" && engine_state.has_b2bua_handlers() {
+    if method == "UPDATE" && b2bua_mode_active(&engine_state, state) {
         // RFC 3311 in-dialog UPDATE belonging to a B2BUA call: bridge it
         // across like a re-INVITE. Calls that don't match a tracked B2BUA
         // dialog fall through to proxy mode (correct for stateless UPDATE
@@ -475,7 +475,7 @@ pub(super) fn handle_request(
             }
         }
     }
-    if method == "INFO" && engine_state.has_b2bua_handlers() {
+    if method == "INFO" && b2bua_mode_active(&engine_state, state) {
         // RFC 6086 in-dialog INFO on a tracked B2BUA call. Without this it took
         // the proxy path and was answered `405` (no `@proxy.on_request` covering
         // INFO) or routed by Request-URI, so it never crossed a two-leg call and
@@ -490,7 +490,7 @@ pub(super) fn handle_request(
             }
         }
     }
-    if method == "REFER" && engine_state.has_b2bua_handlers() {
+    if method == "REFER" && b2bua_mode_active(&engine_state, state) {
         // RFC 3515 in-dialog REFER belonging to a B2BUA call: siphon owns the
         // transfer (fire @b2bua.on_refer, then terminate / forward / reject).
         // This intercept MUST run before the generic proxy path below — an
@@ -507,7 +507,7 @@ pub(super) fn handle_request(
             }
         }
     }
-    if method == "NOTIFY" && engine_state.has_b2bua_handlers() {
+    if method == "NOTIFY" && b2bua_mode_active(&engine_state, state) {
         // In-dialog NOTIFY belonging to a B2BUA call — the sipfrag progress of a
         // REFER subscription (RFC 3515 §2.4). Either a subscription siphon owns
         // (siphon-originated transfer: 200 OK + read the sipfrag) or the far
@@ -563,7 +563,7 @@ pub(super) fn handle_request(
             }
         }
 
-        if engine_state.has_b2bua_handlers() {
+        if b2bua_mode_active(&engine_state, state) {
             // RFC 3262: the A-leg PRACK acknowledges our reliable provisional.
             // In B2BUA mode siphon already PRACKed the B-leg locally (see the
             // auto-PRACK path in the response handler), so the A-leg PRACK has

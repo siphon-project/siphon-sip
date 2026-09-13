@@ -99,6 +99,10 @@ pub struct DispatcherState {
     /// RTPEngine media profile registry (None when media is not configured).
     pub rtpengine_profiles: Option<Arc<crate::rtpengine::ProfileRegistry>>,
     /// RFC 4028 session timer configuration (None when not configured).
+    /// Hand every out-of-dialog INVITE to a control application, with no
+    /// script (`control.inbound`). `Some` turns B2BUA mode on by itself, the
+    /// way a registered `@b2bua.*` handler does.
+    pub control_inbound: Option<crate::config::ControlInboundConfig>,
     pub session_timer_config: Option<crate::config::SessionTimerConfig>,
     /// B2BUA header policy library — keyed by qualified name (e.g.
     /// `"transparent-b2bua@2026"`).  Built once at startup by

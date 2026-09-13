@@ -58,3 +58,15 @@ pub use terminate::*;
 pub use timeouts::*;
 pub use transfer::*;
 pub use update::*;
+
+/// Whether B2BUA mode handles this call.
+///
+/// A registered `@b2bua.*` Python handler turns it on, and so does
+/// `control.inbound`: a deployment whose policy lives in its controller should
+/// not have to ship a routing script that exists only to forward every call.
+pub fn b2bua_mode_active(
+    engine_state: &crate::script::engine::ScriptState,
+    state: &crate::dispatcher::DispatcherState,
+) -> bool {
+    engine_state.has_b2bua_handlers() || state.control_inbound.is_some()
+}
