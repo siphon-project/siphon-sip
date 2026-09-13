@@ -903,7 +903,10 @@ class Call:
                       fails only once every branch has, with the best of their
                       failures and a single ``@b2bua.on_failure``) or
                       ``"sequential"`` (try in order).
-            timeout: Per-branch ring timeout in seconds.
+            timeout: Per-branch ring timeout in seconds.  On expiry siphon
+                CANCELs the branches still ringing and answers the caller
+                ``408``, unless a branch already failed with something that
+                outranks a timeout (a ``486``, say), which is relayed instead.
             max_duration: Cap on how long the call may stay answered, in
                 seconds — same semantics as :meth:`dial`.  Unlike ``timeout``
                 this is not per-branch: whichever branch answers hands over one

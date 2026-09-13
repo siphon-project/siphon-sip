@@ -1006,6 +1006,27 @@ impl CallActor {
         BranchSettlement { cancelled, failure }
     }
 
+    /// On the ring timeout: the failure this fork already holds, when it beats
+    /// the 408 the timeout itself amounts to (RFC 3261 §16.8 counts a branch
+    /// that never answered as a 408 in the response context).
+    ///
+    /// When it does, every branch still ringing is cancelled and the held
+    /// failure is handed back for the caller to relay, as it would have been had
+    /// those branches failed too. `None` otherwise, and the timeout answers 408.
+    pub fn settle_fork_on_timeout(&mut self) -> Option<BranchSettlement> {
+        let beats_timeout = self
+            .fork_best_failure
+            .as_ref()
+            .is_some_and(|best| error_priority(best.status_code) > error_priority(408));
+        if !beats_timeout {
+            return None;
+        }
+        Some(BranchSettlement {
+            cancelled: self.cancel_pending_branches(None),
+            failure: self.fork_best_failure.take(),
+        })
+    }
+
     /// Check if the message came from the A-leg (by source address).
     pub fn is_from_a_leg(&self, source_addr: SocketAddr) -> bool {
         self.a_leg.transport.remote_addr == source_addr

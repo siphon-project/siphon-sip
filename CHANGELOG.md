@@ -327,6 +327,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+- **A fork's ring timeout relays the failure a branch already returned.** A
+  `call.fork()` with one branch busy and the other ringing out answered the
+  caller `408 Request Timeout`, discarding the busy. The timeout now relays the
+  held failure whenever it outranks the 408 a timeout amounts to (RFC 3261
+  §16.7, §16.8), CANCELs the branch still ringing, and `@b2bua.on_failure` sees
+  that code.
+
 - **Every cancelled fork branch now gets its final response answered, even
   under `call.preserve_call_id()`.** The record that keeps a CANCELled leg's
   487 ACKed and a crossing 2xx ACKed and BYEd was keyed by SIP Call-ID, which
