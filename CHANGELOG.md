@@ -344,6 +344,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   carriers' failures rather than the last one's, and Ro's Cause-Code reports the
   status the caller was sent, like the CDR.
 
+- **A carrier CANCELled on an LCR ring timeout gets its 487 ACKed.** The
+  timed-out carrier was only marked cancelled on the call, so when the next
+  carrier failed first and ended the call, the 487 arrived for a call that was
+  gone and was never ACKed (RFC 3261 §17.1.1.3), leaving the carrier
+  retransmitting it until Timer H. It is now kept answerable apart from the
+  call, like a CANCELled fork branch.
+
 - **A fork's ring timeout relays the failure a branch already returned.** A
   `call.fork()` with one branch busy and the other ringing out answered the
   caller `408 Request Timeout`, discarding the busy. The timeout now relays the

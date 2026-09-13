@@ -1320,6 +1320,29 @@ fn a_ring_timeout_keeps_its_408_when_nothing_held_beats_it() {
     assert_eq!(call.b_leg_status[1], BLegStatus::Trying);
 }
 
+/// A carrier the ring timeout CANCELs stays answerable once the call is gone:
+/// the next carrier can fail, and end the call, before the timed-out one's 487
+/// arrives, and that 487 is still owed its ACK (RFC 3261 §17.1.1.3).
+#[test]
+fn a_branch_cancelled_on_ring_timeout_stays_answerable_after_the_call_ends() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+
+    let cancelled = store.cancel_ringing_branches(&call_id);
+
+    assert_eq!(branches(&cancelled), vec!["z9hG4bK-bleg0"]);
+    assert_eq!(
+        store
+            .get_call(&call_id)
+            .map(|call| call.b_leg_status[0].clone()),
+        Some(BLegStatus::Cancelled)
+    );
+    store.remove_call(&call_id);
+    assert!(store.zombie_cancelled_for_non2xx("z9hG4bK-bleg0").is_some());
+    assert!(store.cancel_ringing_branches("no-such-call").is_empty());
+}
+
 /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the
 /// call is answered; a late provisional reordered behind its 200 is then
 /// dropped and must NOT downgrade the confirmed dialog back to Ringing.

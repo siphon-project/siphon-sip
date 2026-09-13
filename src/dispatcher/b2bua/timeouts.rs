@@ -263,15 +263,16 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         if let Some(route) = &timed_out_route {
             b2bua_dispatch_route_failure(call_id, route, 408, &a_leg, a_leg_invite.as_ref(), state);
         }
-        // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1) and
-        // mark them cancelled so their stray 487s are absorbed.
-        for (cancel_msg, transport, dest, local) in &cancel_targets {
-            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, *local, state);
-        }
+        // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1), each
+        // kept answerable apart from the call. The next carrier can fail, and end
+        // the call, before this one's 487 arrives, and that 487 is owed its ACK
+        // (§17.1.1.3) either way; while the call lives, the cancelled status also
+        // keeps it from counting as a fresh carrier failure.
         for tx in &handle_txs {
             let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
         }
-        state.call_actors.mark_active_b_legs_cancelled(call_id);
+        let cancelled = state.call_actors.cancel_ringing_branches(call_id);
+        cancel_settled_branches(&cancelled, state);
         let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
             Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
             _ => RouteAdvance::none(),

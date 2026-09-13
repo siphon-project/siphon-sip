@@ -850,20 +850,6 @@ impl CallActorStore {
             .is_some_and(|call| call.has_pending_routes())
     }
 
-    /// Mark every not-yet-settled B-leg (Trying/Ringing) as Cancelled — used
-    /// when a failover-advance CANCELs the in-flight carrier, so that carrier's
-    /// stray `487 Request Terminated` is absorbed rather than mistaken for a
-    /// fresh carrier failure (which would trigger another advance).
-    pub fn mark_active_b_legs_cancelled(&self, call_id: &str) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            for status in call.b_leg_status.iter_mut() {
-                if matches!(status, BLegStatus::Trying | BLegStatus::Ringing) {
-                    *status = BLegStatus::Cancelled;
-                }
-            }
-        }
-    }
-
     /// Whether a call is running a sequential route/failover sequence.
     pub fn is_route_sequence(&self, call_id: &str) -> bool {
         self.calls
