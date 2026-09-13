@@ -11,22 +11,48 @@
 //! rtpengine, diameter, cdr and li. `tests/integration/module_boundary_tests.rs`
 //! enforces that direction.
 
+mod ack;
 mod b_leg;
+mod bridge;
 mod builders;
+mod bye;
 mod cancel;
+mod control;
+mod forward;
 mod handover;
 mod invite;
+mod originate;
 mod outbound;
+mod refer;
+mod refer_outbound;
+mod reinvite_in;
+mod reinvite_out;
 mod response;
 mod routing;
+mod terminate;
 mod timeouts;
+mod transfer;
+mod update;
 
-pub(super) use b_leg::*;
-pub(super) use builders::*;
-pub(super) use cancel::*;
-pub(super) use handover::*;
-pub(super) use invite::*;
-pub(super) use outbound::*;
-pub(super) use response::*;
-pub(super) use routing::*;
-pub(super) use timeouts::*;
+pub use ack::*;
+pub use b_leg::*;
+pub use bridge::*;
+pub use builders::*;
+pub use bye::*;
+pub use cancel::*;
+pub use control::*;
+pub use forward::*;
+pub use handover::*;
+pub use invite::*;
+pub use originate::*;
+pub use outbound::*;
+pub use refer::*;
+pub use refer_outbound::*;
+pub use reinvite_in::*;
+pub use reinvite_out::*;
+pub use response::*;
+pub use routing::*;
+pub use terminate::*;
+pub use timeouts::*;
+pub use transfer::*;
+pub use update::*;
