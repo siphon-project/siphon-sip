@@ -6300,6 +6300,37 @@ services:
     profiles:
       - control
 
+  # Answer-first handover with no bridge, then record the anchored leg.
+  sipp-control-record-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+      mock-control-rtp:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.175
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_record_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
   # One call, several app connections — exactly one must own it.
   sipp-control-owner-uac:
     image: ctaloi/sipp:latest

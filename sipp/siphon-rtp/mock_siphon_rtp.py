@@ -49,6 +49,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 
 LISTEN_HOST = os.environ.get("SIPHON_RTP_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("SIPHON_RTP_PORT", "8080"))
@@ -96,6 +97,7 @@ NEXT_PORT = [int(MOCK_MEDIA_PORT)]
 # Starts at 1: a play_id of 0 is a real handle in the contract, so a test that
 # saw 0 could not tell it from a field the mock forgot to set.
 NEXT_PLAY_ID = [1]
+NEXT_RECORDING_ID = [1]
 
 
 def allocate_port() -> int:
@@ -103,6 +105,14 @@ def allocate_port() -> int:
     port = NEXT_PORT[0]
     NEXT_PORT[0] += 2
     return port
+
+
+def next_recording_id() -> str:
+    """Hand out the next recording handle, as the engine's start_recording does."""
+    with CALLS_LOCK:
+        recording_id = NEXT_RECORDING_ID[0]
+        NEXT_RECORDING_ID[0] += 1
+    return f"rec-{recording_id}"
 
 
 def next_play_id() -> int:
@@ -121,7 +131,7 @@ def primary_codec(sdp: str) -> str:
     return rtpmap.group(1).upper() if rtpmap else f"PT{payload}"
 
 
-def handle_command(command: dict) -> dict:
+def handle_command(command: dict, connection) -> dict:
     verb = command.get("command")
     call_id = command.get("call_id", "")
     if verb == "ping":
@@ -175,6 +185,56 @@ def handle_command(command: dict) -> dict:
         # completion correlates against. A mock that omitted it would let siphon
         # ship a play whose accept carries no handle without anything noticing.
         return {"result": "ok", "play_id": next_play_id(), "duration_ms": 1500}
+    if verb == "start_recording":
+        # The accept carries the id every later stop and the finished event key
+        # on. A mock that omitted it would let siphon ship an accept with no
+        # handle without anything noticing.
+        recording_id = next_recording_id()
+        with CALLS_LOCK:
+            call = CALLS.get(call_id)
+            if call is None:
+                return {"result": "error", "reason": f"unknown call-id {call_id!r}"}
+            call.setdefault("recordings", {})[recording_id] = {
+                "from_tag": command.get("from_tag", ""),
+                "path": command.get("path") or f"/var/spool/siphon/{recording_id}.wav",
+                # The connection that asked, so the finished event goes back to
+                # it. Not "the newest connection": the container healthcheck
+                # opens one of its own every few seconds, and an event pushed
+                # onto that lands on a socket that is already closing.
+                "connection": connection,
+            }
+        return {"result": "ok", "recording_id": recording_id}
+    if verb == "stop_recording":
+        # The real engine finalises the file *after* accepting the stop, and
+        # only then emits RecordingFinished. Modelling that ordering is the
+        # point: an app that acted on the stop reply would race a half-written
+        # file, and a mock that emitted the event synchronously would hide it.
+        with CALLS_LOCK:
+            call = CALLS.get(call_id)
+            if call is None:
+                return {"result": "error", "reason": f"unknown call-id {call_id!r}"}
+            recordings = call.get("recordings") or {}
+            wanted = command.get("recording_id")
+            if wanted is None:
+                # No id stops every recording on the call, which is what the NG
+                # front-end (which has no id) means by "stop recording".
+                stopping = dict(recordings)
+            elif wanted in recordings:
+                stopping = {wanted: recordings[wanted]}
+            else:
+                # Deliberately an error rather than falling back to stop-all: a
+                # mock that stopped everything when handed an id it never issued
+                # would hide siphon mangling or dropping the handle, and the
+                # call would still look like it recorded correctly.
+                return {
+                    "result": "error",
+                    "reason": f"unknown recording-id {wanted!r} on call {call_id!r}",
+                }
+            for key in stopping:
+                recordings.pop(key, None)
+        for recording_id, record in stopping.items():
+            schedule_recording_finished(call_id, recording_id, record)
+        return {"result": "ok"}
     if verb in ("attach_ws_tee", "detach_ws_tee", "stop_media"):
         return {"result": "ok"}
     if verb == "attach_ws_bridge":
@@ -214,6 +274,52 @@ def handle_command(command: dict) -> dict:
     return {"result": "error", "reason": f"mock: unsupported verb {verb!r}"}
 
 
+# Every frame write goes through this. An event is pushed from a timer thread
+# while the connection thread may be answering a command, and two interleaved
+# sendall()s on one socket splice into a frame neither side can parse.
+SEND_LOCK = threading.Lock()
+
+
+def send_frame(connection, frame: dict) -> bool:
+    """Write one length-prefixed JSON frame. False when the peer is gone."""
+    payload = json.dumps(frame).encode()
+    with SEND_LOCK:
+        try:
+            connection.sendall(HEADER.pack(len(payload)) + payload)
+        except OSError:
+            return False
+    return True
+
+
+def push_event(connection, event: dict) -> None:
+    """Send an unsolicited event frame, the way the engine does."""
+    if connection is None:
+        return
+    if send_frame(connection, event):
+        print(json.dumps({"pushed": event.get("event"), **event}), flush=True)
+
+
+def schedule_recording_finished(call_id: str, recording_id: str, record: dict) -> None:
+    """Emit RecordingFinished shortly after the stop is accepted, not with it."""
+
+    def emit() -> None:
+        time.sleep(0.2)
+        push_event(
+            record.get("connection"),
+            {
+                "event": "recording_finished",
+                "call_id": call_id,
+                "from_tag": record["from_tag"],
+                "recording_id": recording_id,
+                "path": record["path"],
+                "duration_ms": 1200,
+                "reason": "stopped",
+            },
+        )
+
+    threading.Thread(target=emit, daemon=True).start()
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         buffer = b""
@@ -236,7 +342,7 @@ class Handler(socketserver.BaseRequestHandler):
                 except ValueError:
                     continue
                 print(json.dumps(command), flush=True)
-                response = handle_command(command)
+                response = handle_command(command, self.request)
                 # Refusals are echoed too. Without this a scenario can only
                 # assert on what siphon *sent*, never on whether the engine
                 # accepted it — and a command the real engine would reject
@@ -245,10 +351,7 @@ class Handler(socketserver.BaseRequestHandler):
                     print(json.dumps({"refused": command.get("command"), **response}),
                           flush=True)
                 response["id"] = command.get("id", 0)
-                payload = json.dumps(response).encode()
-                try:
-                    self.request.sendall(HEADER.pack(len(payload)) + payload)
-                except OSError:
+                if not send_frame(self.request, response):
                     return
 
 
