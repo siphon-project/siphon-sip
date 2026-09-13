@@ -655,6 +655,43 @@ tell them apart without parsing prose:
 | `unsupported_verb` | the configured media backend refused one of the bridge's media steps |
 | `unavailable` | the B2BUA is not running, or the media backend failed |
 
+### `dial` — ring while the caller waits
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "targets": [ {"aor": "sip:204@pbx.example"},
+                         {"uri": "sip:+15550177@trunk.example", "next_hop": "sip:192.0.2.9:5060"} ],
+            "strategy": "parallel", "timeout": 20 } }
+```
+
+Rings the targets as B-legs of the caller's call while the caller stays
+**unanswered** and this app keeps the channel. Provisional responses and early
+media reach the caller as they do for a script's `call.fork`; the first 2xx
+answers the caller with the winner's SDP and the pair becomes an ordinary
+two-leg B2BUA call, with the app still owning it.
+
+A failure or a timeout arrives as `DialFailed {code, reason, timed_out}` with
+the caller **still ringing and still parked**. Nothing is forwarded to it, so
+the app decides what happens next: dial somewhere else on the same channel,
+answer into voicemail, or reject with its own code. That is the difference from
+[`route`](#route), which hands the call back to siphon — the app gets
+`StasisEnd{reason: routed}` and loses it, so "ring the extension, then
+voicemail" is not expressible with `route`.
+
+A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`. An `aor`
+resolves against the registrar and forks to **every** registered contact, each
+over that contact's own captured flow and Path route set — which is the only way
+to reach a phone registered over TCP, TLS or WSS behind NAT, since such a
+contact is reachable only on the connection it registered over. An AoR nobody
+has registered contributes no branch; `dial` answers `not_found` when no target
+yields one.
+
+`strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
+timeout in seconds (default 30). Dialling a call that is already answered is
+`invalid_state` — answering first is what the verb exists to avoid, since it
+starts billing before anyone picks up and denies the caller the callee's own
+ringback.
+
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.
 

@@ -1404,6 +1404,38 @@ impl CallActorStore {
         }
     }
 
+    /// Mark (or clear) that a controller-issued `dial` owns this call's
+    /// outcome, so a B-leg failure is reported to the controller instead of
+    /// being forwarded to the still-unanswered caller.
+    pub fn set_control_dial(&self, call_id: &str, pending: bool) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.control_dial = pending;
+        }
+    }
+
+    /// Drop every B-leg of a call, leaving the A-leg and its dialog intact.
+    ///
+    /// A controller-owned dial that failed is done with the legs it rang, but
+    /// not with the caller: the controller may dial somewhere else on the same
+    /// channel, and a stale B-leg would make the next attempt look like glare
+    /// and confuse the winner bookkeeping.
+    pub fn clear_b_legs(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.b_legs.clear();
+            call.b_leg_status.clear();
+            call.b_leg_handles.clear();
+            call.winner = None;
+        }
+    }
+
+    /// Whether a controller-issued `dial` is still awaiting its outcome.
+    pub fn is_control_dial(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .map(|call| call.control_dial)
+            .unwrap_or(false)
+    }
+
     /// Release a parked call from external control: clear the control owner + the
     /// control-loss policy + the handoff-pending flag, so the call becomes an
     /// ordinary autonomous B2BUA call. Used when the controller hands control

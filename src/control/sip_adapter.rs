@@ -80,6 +80,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
+                verb("dial", "Ring one or more targets as B-legs while the caller stays unanswered and this app keeps the channel: the first 2xx answers the caller and the pair becomes an ordinary two-leg call, and a failure or timeout arrives as DialFailed with the caller still ringing (args: targets, strategy, timeout, headers). A target is a URI string, {uri, next_hop, headers} or {aor} — an AoR forks to every registered contact over its own flow, which is the only way to reach a phone registered on TCP, TLS or WSS"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
@@ -273,6 +274,7 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "reject_refer" => reject_refer(&channel, &command.args),
         "replace_peer" => replace_peer(&channel, &command.args),
         "route" => route(&channel, &command.args),
+        "dial" => dial(&channel, &command.args),
         "set_header" => set_header(&channel, &command.args),
         "remove_header" => remove_header(&channel, &command.args),
         "get_header" => get_header(&channel, &command.args),
@@ -2048,6 +2050,147 @@ fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
             "route requires at least one target",
         ),
     }
+}
+
+/// `dial` — ring B-legs while the caller stays unanswered and app-owned.
+///
+/// The difference from [`route`] is who holds the call afterwards. `route`
+/// hands it back to siphon, so the app gets `StasisEnd{reason: routed}` and
+/// loses it; there is then no way to say "ring the extension, and if nobody
+/// answers, voicemail" without answering the caller first — which starts
+/// billing before anyone picks up, records an unanswered call as answered, and
+/// denies the caller the callee's own ringback.
+fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let Some(targets_json) = args.get("targets").and_then(|v| v.as_array()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "dial requires args.targets (a non-empty array of URIs, {uri, next_hop, headers} or {aor})",
+        );
+    };
+    if targets_json.is_empty() {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "dial requires at least one target",
+        );
+    }
+
+    let mut targets = Vec::with_capacity(targets_json.len());
+    for item in targets_json {
+        match parse_dial_target(item) {
+            Ok(mut resolved) => targets.append(&mut resolved),
+            Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+        }
+    }
+    if targets.is_empty() {
+        // Every AoR resolved to nothing. Distinct from a malformed request:
+        // the app asked for something reasonable and nobody is registered.
+        return ControlResult::error(
+            ControlErrorCode::NotFound,
+            "no registered contact for any target",
+        );
+    }
+
+    let strategy = args
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("parallel");
+    let timeout_secs = args
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .clamp(1, 3600) as u32;
+    let extra_headers = parse_extra_headers(args.get("headers"));
+    let target_count = targets.len();
+
+    match crate::dispatcher::b2bua_dial_call(
+        &channel.sip_call_id,
+        targets,
+        strategy,
+        timeout_secs,
+        &extra_headers,
+    ) {
+        Ok(true) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "dialing",
+            "targets": target_count,
+            "strategy": strategy,
+            "timeout": timeout_secs,
+        })),
+        Ok(false) => ControlResult::error(ControlErrorCode::NotFound, "call is gone"),
+        Err(error @ crate::dispatcher::DialError::UnsupportedStrategy(_)) => {
+            ControlResult::error(ControlErrorCode::UnsupportedVerb, error.to_string())
+        }
+        Err(error @ crate::dispatcher::DialError::AlreadyAnswered) => {
+            ControlResult::error(ControlErrorCode::InvalidState, error.to_string())
+        }
+        Err(error @ crate::dispatcher::DialError::NoContacts(_)) => {
+            ControlResult::error(ControlErrorCode::NotFound, error.to_string())
+        }
+        Err(error @ crate::dispatcher::DialError::NoTargets) => {
+            ControlResult::error(ControlErrorCode::BadRequest, error.to_string())
+        }
+    }
+}
+
+/// Parse one `dial` target into the branches it stands for.
+///
+/// A URI is one branch. An `{aor}` is one branch per registered contact, each
+/// over that contact's own captured flow — a phone on TCP, TLS or WSS behind
+/// NAT is reachable only on the connection it registered over, so resolving its
+/// Contact URI by DNS reaches nothing.
+fn parse_dial_target(
+    item: &serde_json::Value,
+) -> Result<Vec<crate::dispatcher::DialTarget>, String> {
+    if let Some(uri) = item.as_str() {
+        return Ok(vec![crate::dispatcher::DialTarget {
+            uri: uri.to_string(),
+            ..Default::default()
+        }]);
+    }
+    let Some(object) = item.as_object() else {
+        return Err(
+            "each target must be a URI string, {uri, next_hop, headers} or {aor}".to_string(),
+        );
+    };
+
+    if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
+        let headers: std::collections::HashMap<String, String> = object
+            .get("headers")
+            .map(parse_json_headers)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        return match crate::dispatcher::dial_targets_for_aor(aor) {
+            Ok(mut branches) => {
+                for branch in &mut branches {
+                    branch.headers.extend(headers.clone());
+                }
+                Ok(branches)
+            }
+            // Nobody registered is not a malformed request; the caller gets a
+            // typed `not_found` once every target has been tried.
+            Err(_) => Ok(Vec::new()),
+        };
+    }
+
+    let Some(uri) = object.get("uri").and_then(|v| v.as_str()) else {
+        return Err("target object requires a string 'uri' or 'aor'".to_string());
+    };
+    Ok(vec![crate::dispatcher::DialTarget {
+        uri: uri.to_string(),
+        next_hop: object
+            .get("next_hop")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        flow: None,
+        route: Vec::new(),
+        headers: object
+            .get("headers")
+            .map(parse_json_headers)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+    }])
 }
 
 /// Parse one `targets[]` entry: a bare URI string, or an object
@@ -4098,6 +4241,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A bare URI is one branch, verbatim.
+    #[test]
+    fn dial_target_accepts_a_bare_uri() {
+        let parsed = parse_dial_target(&serde_json::json!("sip:204@pbx.example"))
+            .expect("a URI string is a target");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].uri, "sip:204@pbx.example");
+        assert!(parsed[0].next_hop.is_none());
+        assert!(parsed[0].flow.is_none());
+    }
+
+    /// The object form carries the routing destination and per-target headers,
+    /// while the R-URI keeps the shape the app asked for.
+    #[test]
+    fn dial_target_accepts_uri_with_next_hop_and_headers() {
+        let parsed = parse_dial_target(&serde_json::json!({
+            "uri": "sip:+15550177@trunk.example",
+            "next_hop": "sip:192.0.2.9:5060",
+            "headers": {"X-Tag": "a"},
+        }))
+        .expect("the object form is a target");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].uri, "sip:+15550177@trunk.example");
+        assert_eq!(parsed[0].next_hop.as_deref(), Some("sip:192.0.2.9:5060"));
+        assert_eq!(
+            parsed[0].headers.get("X-Tag").map(String::as_str),
+            Some("a")
+        );
+    }
+
+    /// An AoR with nobody registered is not a malformed request. It yields no
+    /// branch, and `dial` answers `not_found` once every target has been tried
+    /// — an app dialling a ring group must not be told its JSON is wrong
+    /// because one member happens to be offline.
+    #[test]
+    fn dial_target_with_an_unregistered_aor_is_no_branch_not_an_error() {
+        let parsed = parse_dial_target(&serde_json::json!({"aor": "sip:nobody@pbx.example"}))
+            .expect("an unregistered AoR is not a parse error");
+        assert!(parsed.is_empty(), "no contact means no branch");
+    }
+
+    /// Neither a URI nor an AoR is a request the app has to fix.
+    #[test]
+    fn dial_target_without_uri_or_aor_is_rejected() {
+        let error = parse_dial_target(&serde_json::json!({"next_hop": "sip:192.0.2.9"}))
+            .expect_err("a target naming nothing must be rejected");
+        assert!(
+            error.contains("uri") && error.contains("aor"),
+            "the error should name both accepted forms: {error}"
+        );
+        let error =
+            parse_dial_target(&serde_json::json!(42)).expect_err("a number is not a target");
+        assert!(error.contains("URI string"), "{error}");
     }
 
     #[test]

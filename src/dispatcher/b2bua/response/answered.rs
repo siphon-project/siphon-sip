@@ -48,6 +48,11 @@ pub fn b_leg_answered(
         }
 
         // CDR: stamp the answer time (cdr.auto_emit).
+        // A controller-issued `dial` is decided the moment somebody answers:
+        // this is an ordinary two-leg call now, and a later failure on a losing
+        // branch is not a dial outcome.
+        state.call_actors.set_control_dial(call_id, false);
+
         cdr_mark_b2bua_answer(state, call_id, status_code);
 
         // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR, and
