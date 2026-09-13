@@ -401,6 +401,11 @@ pub struct CallActor {
     /// answer on the ACK (RFC 3261 §13.2.2.4). `None` for a call originated with
     /// a controller-supplied offer, and for every inbound call.
     pub originate_anchor: Option<OriginateAnchor>,
+    /// The media anchor an early-media response opened on the A-leg, and the
+    /// SDP answer that response carried. The 2xx that follows repeats that
+    /// answer (RFC 3264 §4) instead of anchoring again. `None` until a
+    /// controller sends an anchored `progress`.
+    pub early_media_anchor: Option<EarlyMediaAnchor>,
     /// This call's half of a bridge with another call this process owns, set
     /// while a `bridge` is forming and for as long as it holds. Mirrored on the
     /// peer's actor, so either side's teardown finds the other
@@ -416,6 +421,18 @@ pub struct OriginateAnchor {
     pub profile: String,
     /// Per-call WebSocket bridge URI (templated), overriding the profile's.
     pub ws_uri: Option<String>,
+}
+/// Early media anchored on the media engine: the SDP answer siphon already sent
+/// the caller in an 18x, kept so the 2xx can repeat it.
+///
+/// Holds the SDP text rather than engine flags, like [`OriginateAnchor`], so the
+/// actor layer stays free of media types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlyMediaAnchor {
+    /// The engine's SDP answer, exactly as the early response carried it.
+    pub answer_sdp: String,
+    /// The media profile the anchor was made with.
+    pub profile: String,
 }
 impl CallActor {
     /// Create a new call actor with an A-leg.
@@ -459,6 +476,7 @@ impl CallActor {
             handoff_pending: false,
             originated: false,
             originate_anchor: None,
+            early_media_anchor: None,
             bridge: None,
         }
     }

@@ -70,7 +70,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("originate", "Place an outbound call under a caller-supplied channel id and return as soon as the INVITE is on the wire (args: channel, to, from, from_display, to_display, next_hop, p_asserted_identity, privacy, headers, sdp | media, profile, ws_uri, timeout, on_lost, vars)"),
                 verb("answer", "Send a UAS 2xx to the parked A-leg; with anchor (or a profile / ws_uri, which imply it) the SDP answer is synthesized and the media anchored to the media engine in the same act — the verb form of call.handover(answer=True). Without a ws_uri the leg is anchored on the engine with no bridge, which is what play / DTMF / recording need for an IVR, a queue or a voicemail box (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
                 verb("ring", "Send 180 Ringing to the parked A-leg — alerting only, no early media (RFC 3261 §13.2.1); a body is refused, use progress for that (args: reason)"),
-                verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress (args: code, reason, body, content_type)"),
+                verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress. With anchor (or a profile / ws_uri, which imply it) the SDP is the media engine's and a later answer repeats it — how ringback or an announcement plays before answering (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
@@ -1502,20 +1502,44 @@ fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) 
         || profile.is_some()
         || ws_uri.is_some();
     if anchor {
-        if !final_response {
-            return ControlResult::error(
-                ControlErrorCode::BadRequest,
-                "progress(anchor/profile/ws_uri) is not a thing — those anchor the media the \
-                 answer establishes; use answer for that, or attach a stream to an \
-                 already-answered call",
-            );
-        }
         if arg_present(args, "body") {
             return ControlResult::error(
                 ControlErrorCode::BadRequest,
-                "an anchored answer synthesizes the SDP answer itself (RFC 3264) — a body \
-                 passed alongside it would be discarded, so pass one or the other",
+                "an anchored answer or progress synthesizes the SDP itself (RFC 3264) — a \
+                 body passed alongside it would be discarded, so pass one or the other",
             );
+        }
+        if !final_response {
+            // Early media through the engine (RFC 3960 §3.1): the 18x carries
+            // the engine's SDP, and the answer is kept so the 2xx repeats it. A
+            // 100 is hop-by-hop, opens no early dialog and carries no body
+            // (RFC 3261 §8.2.6.1), so there is nothing for it to anchor.
+            if code == 100 {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "an anchored progress needs a 101-199 response to carry its SDP — a 100 \
+                     Trying opens no early dialog and carries no body",
+                );
+            }
+            return match crate::dispatcher::b2bua_progress_call_anchored(
+                &channel.call_actor_id,
+                code,
+                &reason,
+                profile,
+                ws_uri,
+            ) {
+                Ok(()) => ControlResult::Ok(serde_json::json!({
+                    "channel": channel.channel_id,
+                    "state": provisional_state(true),
+                    "code": code,
+                    "early_media": true,
+                    "media": "anchored",
+                })),
+                // Unavailable, not not_found, for the same reason as the
+                // anchored answer: the media plan failed and the call is still
+                // parked — retry with another profile, answer plainly, or reject.
+                Err(reason) => ControlResult::error(ControlErrorCode::Unavailable, reason),
+            };
         }
         return match crate::dispatcher::b2bua_answer_call_anchored(
             &channel.call_actor_id,
@@ -1537,6 +1561,25 @@ fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) 
             // rather than handed a 200 with nothing behind it.
             Err(reason) => ControlResult::error(ControlErrorCode::Unavailable, reason),
         };
+    }
+
+    // After anchored early media the caller already holds siphon's SDP answer
+    // from the 18x. A 2xx carrying a different one would renegotiate outside an
+    // offer/answer exchange (RFC 3264 §4), so it is refused; an answer with no
+    // body is accepted and the dispatcher repeats the early answer.
+    if final_response {
+        if let (Some(given), Some(early)) = (
+            body.as_ref(),
+            crate::dispatcher::b2bua_early_media_sdp(&channel.call_actor_id),
+        ) {
+            if given.as_slice() != early.as_bytes() {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "this call's early media already carried siphon's SDP answer — the 2xx must \
+                     repeat it (RFC 3264 §4), so answer with no body",
+                );
+            }
+        }
     }
 
     let has_body = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
@@ -3783,13 +3826,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_refuses_the_answer_only_media_args() {
-        // `anchor` / `profile` / `ws_uri` anchor the media the *answer*
-        // establishes. On a 1xx there is nothing to anchor, and silently
-        // ignoring them would leave an app believing its call is on the AI
-        // bridge when it is not — the same rule
-        // `call.handover(profile=…/ws_uri=…) requires answer=True` enforces on
-        // the script side.
+    fn anchored_progress_reaches_the_media_path_instead_of_being_refused() {
+        // This test used to assert the opposite: that `anchor` / `profile` /
+        // `ws_uri` on a 1xx were refused, because a provisional had nothing to
+        // anchor. Early media through the engine is exactly a provisional with
+        // something to anchor (RFC 3960 §3.1 — ringback or an announcement
+        // before answering), so the refusal is gone, deliberately. What is
+        // asserted now is that the call reaches the dispatcher: none exists in a
+        // unit context, so a typed `unavailable` — never a bad_request, and
+        // never a hollow ok.
         for args in [
             serde_json::json!({ "anchor": true }),
             serde_json::json!({ "profile": "voice_ai" }),
@@ -3799,13 +3844,53 @@ mod tests {
                 matches!(
                     answer(&channel(), &args, /*final_response=*/ false),
                     ControlResult::Error {
-                        code: ControlErrorCode::BadRequest,
+                        code: ControlErrorCode::Unavailable,
                         ..
                     }
                 ),
-                "progress must refuse {args}"
+                "anchored progress must reach the media path for {args}"
             );
         }
+    }
+
+    #[test]
+    fn anchored_progress_refuses_a_100() {
+        // A 100 opens no early dialog and carries no body, so it cannot carry
+        // the engine's SDP — refused before any media is anchored for nothing.
+        let result = answer(
+            &channel(),
+            &serde_json::json!({ "anchor": true, "code": 100 }),
+            false,
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anchored_progress_refuses_a_caller_supplied_body() {
+        // Same rule as the anchored answer: the engine synthesizes the SDP, so a
+        // body alongside it would be discarded.
+        let result = answer(
+            &channel(),
+            &serde_json::json!({
+                "anchor": true,
+                "body": "v=0\r\n",
+                "content_type": "application/sdp",
+            }),
+            false,
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
+        ));
     }
 
     #[test]

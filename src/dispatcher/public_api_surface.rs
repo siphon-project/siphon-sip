@@ -17,14 +17,15 @@
 #[allow(unused_imports)]
 use super::{
     b2bua_accept_refer_call, b2bua_answer_call, b2bua_answer_call_anchored, b2bua_bridge_calls,
-    b2bua_cancel_originated_call, b2bua_local_tag, b2bua_media_set_ws_bridge_attached,
-    b2bua_media_set_ws_tee, b2bua_media_target, b2bua_originate, b2bua_originate_dial,
-    b2bua_originate_prepare, b2bua_progress_call, b2bua_refer_call, b2bua_reject_call,
-    b2bua_reject_refer_call, b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call,
-    b2bua_unbridge_call, init_rtpengine, inject_python_singletons, liveness_on_flow_close,
-    publish_store_gauges, ro_authorize_b2bua, run, spawn_rtpengine_health_check, BridgeAccepted,
-    BridgeParams, DrainState, OriginateError, OriginateMedia, OriginateParams, PreparedOriginate,
-    ProxyRfState, ReliableProvisional, RoAuthorizeOutcome, RouteError, RouteTarget,
+    b2bua_cancel_originated_call, b2bua_early_media_sdp, b2bua_local_tag,
+    b2bua_media_set_ws_bridge_attached, b2bua_media_set_ws_tee, b2bua_media_target,
+    b2bua_originate, b2bua_originate_dial, b2bua_originate_prepare, b2bua_progress_call,
+    b2bua_progress_call_anchored, b2bua_refer_call, b2bua_reject_call, b2bua_reject_refer_call,
+    b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call, b2bua_unbridge_call,
+    init_rtpengine, inject_python_singletons, liveness_on_flow_close, publish_store_gauges,
+    ro_authorize_b2bua, run, spawn_rtpengine_health_check, BridgeAccepted, BridgeParams,
+    DrainState, OriginateError, OriginateMedia, OriginateParams, PreparedOriginate, ProxyRfState,
+    ReliableProvisional, RoAuthorizeOutcome, RouteError, RouteTarget,
 };
 
 /// Coercing to a fn pointer pins arity and types, not merely the name — a
@@ -42,6 +43,10 @@ fn signatures_are_pinned() {
     let _: fn(&str, Option<&str>) -> bool = super::b2bua_cancel_originated_call;
     let _: fn(&str, Option<String>) = super::b2bua_media_set_ws_tee;
     let _: fn(&str, bool) = super::b2bua_media_set_ws_bridge_attached;
+    // Named, because clippy's type_complexity refuses the bare fn-pointer type.
+    type AnchoredProgress = fn(&str, u16, &str, Option<&str>, Option<&str>) -> Result<(), String>;
+    let _: AnchoredProgress = super::b2bua_progress_call_anchored;
+    let _: fn(&str) -> Option<String> = super::b2bua_early_media_sdp;
 }
 
 /// The count is the tripwire: adding a public item to this module is a
@@ -53,7 +58,7 @@ fn signatures_are_pinned() {
 /// file declares plus what it re-exports. Counting only declarations would
 /// shrink with every extraction and stop being a tripwire.
 #[test]
-fn the_public_surface_is_exactly_thirty_nine_items() {
+fn the_public_surface_is_pinned() {
     let source = include_str!("mod.rs");
 
     let declared = source
@@ -113,11 +118,14 @@ fn the_public_surface_is_exactly_thirty_nine_items() {
             .count();
     }
 
+    // 41: the 39 the 1.9.0 split preserved, plus `b2bua_progress_call_anchored`
+    // and `b2bua_early_media_sdp` for anchored early media. Both additive, so
+    // a minor-compatible change — recorded here because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        39,
+        41,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 39. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 41. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

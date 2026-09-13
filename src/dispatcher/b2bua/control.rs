@@ -379,6 +379,24 @@ pub fn b2bua_answer_call(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
 ) -> bool {
+    // After anchored early media the caller already holds siphon's SDP answer
+    // from the 18x; a 2xx sent without a body repeats it (RFC 3264 §4) rather
+    // than reaching the caller as a 200 that silently drops the session.
+    let (body, content_type) = match body {
+        Some(body) => (Some(body), content_type),
+        None => match B2BUA_CONTROL.get().and_then(|control| {
+            control
+                .state
+                .call_actors
+                .early_media_anchor(internal_call_id)
+        }) {
+            Some(anchor) => (
+                Some(anchor.answer_sdp.into_bytes()),
+                Some("application/sdp"),
+            ),
+            None => (None, content_type),
+        },
+    };
     b2bua_send_uas_response(
         internal_call_id,
         invite,
@@ -458,6 +476,70 @@ pub fn b2bua_answer_call_anchored(
         ws_uri,
         state,
     )
+}
+
+/// Open early media on a parked B2BUA call through the media engine — the
+/// control plane's `progress(anchor=…, profile=…, ws_uri=…)`.
+///
+/// An 18x carrying the engine's SDP, so an application can play ringback or an
+/// announcement before it answers — which needs an SDP the caller can be sent
+/// before any B-leg has produced one. The anchor is kept on the call and the
+/// later 2xx repeats its answer (RFC 3264 §4). Refuses an answered call, and on
+/// a media failure sends nothing: the call stays parked and answerable.
+pub fn b2bua_progress_call_anchored(
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+) -> Result<(), String> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err("B2BUA is not running".to_string());
+    };
+    let state = &control.state;
+
+    let Some((source_ip, invite_arc)) =
+        state
+            .call_actors
+            .get_call(internal_call_id)
+            .and_then(|call| match (&call.state, call.a_leg_invite.as_ref()) {
+                (CallState::Answered, _) | (_, None) => None,
+                (_, Some(invite)) => {
+                    Some((call.a_leg.transport.remote_addr.ip(), Arc::clone(invite)))
+                }
+            })
+    else {
+        return Err("call is gone or already answered".to_string());
+    };
+    let Ok(invite) = invite_arc.lock() else {
+        return Err("call invite lock poisoned".to_string());
+    };
+
+    let _enter = control.runtime.enter();
+    early_media_anchor_progress(
+        internal_call_id,
+        &invite,
+        source_ip,
+        code,
+        reason,
+        profile,
+        ws_uri,
+        state,
+    )
+}
+
+/// The SDP answer an early-media anchor already sent on this call, if any.
+///
+/// What a 2xx after anchored early media has to repeat. The control adapter
+/// reads it to refuse an `answer` whose own body would contradict an answer the
+/// caller already holds.
+pub fn b2bua_early_media_sdp(internal_call_id: &str) -> Option<String> {
+    let control = B2BUA_CONTROL.get()?;
+    control
+        .state
+        .call_actors
+        .early_media_anchor(internal_call_id)
+        .map(|anchor| anchor.answer_sdp)
 }
 
 /// The A-leg's local (UAS) To-tag for a live B2BUA call (`call.local_tag`).

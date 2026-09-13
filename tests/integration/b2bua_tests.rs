@@ -5,7 +5,8 @@
 
 use siphon::b2bua::actor::{
     generate_call_id, generate_tag, CallActor, CallActorStore, CallEvent, CallState,
-    ForwardedMarker, Leg, LegActor, LegSide, ReferSubscription, SessionTimerState, TransportInfo,
+    EarlyMediaAnchor, ForwardedMarker, Leg, LegActor, LegSide, ReferSubscription,
+    SessionTimerState, TransportInfo,
 };
 use siphon::b2bua::header_policy::{
     apply_to_request, apply_to_response, build_registry, builtin_presets, validate_preset,
@@ -2388,6 +2389,27 @@ fn refer_call_matched_by_call_id_gates_loop_killer() {
     assert!(store
         .find_by_sip_call_id("someone-elses-call@test")
         .is_none());
+}
+
+#[test]
+fn an_early_media_anchor_is_kept_on_the_call_for_the_answer_to_repeat() {
+    // The 2xx after anchored early media repeats the answer the 18x carried
+    // (RFC 3264 §4). This is the state that makes that possible, so it has to
+    // start empty and survive on the call between the two responses.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("early-media@test"));
+    assert!(
+        store.early_media_anchor(&call_id).is_none(),
+        "a new call has no early-media anchor"
+    );
+
+    let anchor = EarlyMediaAnchor {
+        answer_sdp: "v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string(),
+        profile: "voice_ai".to_string(),
+    };
+    store.set_early_media_anchor(&call_id, anchor.clone());
+    assert_eq!(store.early_media_anchor(&call_id), Some(anchor));
+    assert!(store.early_media_anchor("no-such-call").is_none());
 }
 
 #[test]

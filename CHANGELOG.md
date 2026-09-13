@@ -220,6 +220,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   is. `siphon-rtp` only: rtpengine's `start recording` writes a pcap of the wire
   with no id to stop or correlate by, and rtpproxy has none, so both answer
   `unsupported_verb` rather than produce a different artefact silently.
+- **A control application can anchor early media on the media engine**
+  (`progress {anchor: true}`, or a `profile` / `ws_uri`, which imply it). The
+  18x carries the engine's SDP, so ringback or an announcement can play to a
+  caller before the application answers — which needed an SDP the caller could
+  be sent in a 183, and that existed only once a B-leg had answered with one or
+  the application supplied its own. The answer is kept on the call and the
+  following `answer` repeats it instead of anchoring a second time (RFC 3264
+  §4); an `answer` whose own body contradicts it is refused, and a `100` cannot
+  be anchored. `progress` with those arguments was previously refused outright.
 
 ### Fixed
 
