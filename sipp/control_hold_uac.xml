@@ -116,11 +116,11 @@ a=sendonly
 
   <recv response="200" rtd="true">
     <action>
-      <ereg regexp="^v=0"
+      <ereg regexp="v=0"
             search_in="body"
             check_it="true"
             assign_to="hold_answer" />
-      <log message="hold answered with SDP, not 491" />
+      <log message="hold answered with SDP, not 491: [$hold_answer]" />
     </action>
   </recv>
 
