@@ -27,7 +27,9 @@ paths in siphon and a given app can only reach one of them:
 
 Which behaviour to run for a call is read off the ``vars.case`` seeded by
 ``call.handover(vars=…)`` in the routing script, so the compose profile drives
-every case through one long-running app rather than one container per case.
+every case through one long-running app rather than one container per case. A
+call handed over by ``control.inbound`` has no script and so carries no vars at
+all; ``CONTROL_DEFAULT_CASE`` names what to run for those.
 
 Output contract (both greppable, both with `json.dumps`'s ``"key": "value"``
 spacing — a pattern written without the space matches nothing and passes
@@ -94,6 +96,13 @@ PROMPT_FILE = os.environ.get("CONTROL_PROMPT", "/prompts/control-harness.wav")
 # tell the reattached controller's hangup apart from the on_lost teardown that
 # would fire if the grace window had lapsed instead.
 HANGUP_REASON = os.environ.get("CONTROL_HANGUP_REASON", "resync-hangup")
+
+# Which case to run for a call that arrives with no `vars.case`. The script-free
+# path (`control.inbound`) has no script to seed vars in, so its StasisStart
+# carries none — that absence is the signal, and this names what to do with it.
+# Unset everywhere else, so a call that lost its vars still hangs up rather than
+# silently running somebody else's case.
+DEFAULT_CASE = os.environ.get("CONTROL_DEFAULT_CASE", "")
 
 HEARTBEAT_SECS = float(os.environ.get("CONTROL_HEARTBEAT_SECS", "2"))
 EVENT_TIMEOUT = float(os.environ.get("CONTROL_EVENT_TIMEOUT", "40"))
@@ -272,7 +281,7 @@ class App:
 
     async def on_stasis_start(self, session: Session, event: dict) -> None:
         payload = event.get("payload") or {}
-        case = (payload.get("vars") or {}).get("case", "unknown")
+        case = (payload.get("vars") or {}).get("case") or DEFAULT_CASE or "unknown"
         handler = CASES.get(case)
         channel = event.get("channel")
         if handler is None:
@@ -622,6 +631,38 @@ async def case_info(app: App, session: Session, event: dict, verdict: Verdict) -
     verdict.check("each_digit_surfaced_exactly_once", not extra, json.dumps(extra))
 
 
+async def case_inbound(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """The script-free path: `control.inbound` hands the call over, not a script.
+
+    Nothing in the routing script decided this call — there is no
+    `@b2bua.on_invite` in it at all. So the checks that matter are that the app
+    was reached anyway, and that it was reached with the *same* contract a
+    `call.handover()` gives it: the full SIP context, the id triple, and a
+    channel it can answer. The empty `vars` is the fingerprint of the config
+    path, since every scripted case seeds one.
+    """
+    channel = event.get("channel") or ""
+    payload = event.get("payload") or {}
+
+    verdict.check(
+        "reached_the_app_with_no_script_decision",
+        not (payload.get("vars") or {}),
+        json.dumps(payload.get("vars")),
+    )
+    assert_sip_context(verdict, event, "inbound")
+
+    reply = await answer_with_our_sdp(session, channel)
+    result = reply.get("result") or {}
+    verdict.check(
+        "answer_accepted",
+        reply.get("status") == "ok" and result.get("state") == "answered",
+        json.dumps(reply),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 async def case_owner(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Exactly-one-owner dispatch: with several connections of the same app up,
     exactly one is given the call and the others cannot command it."""
@@ -724,6 +765,7 @@ CASES = {
     "deadline": case_deadline,
     "media": case_media,
     "info": case_info,
+    "inbound": case_inbound,
     "owner": case_owner,
     "resync": case_resync,
 }

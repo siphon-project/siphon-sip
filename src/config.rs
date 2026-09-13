@@ -7959,7 +7959,7 @@ media:
     // control.inbound — script-free handover
     // -----------------------------------------------------------------------
 
-    fn control_yaml(block: &str) -> String {
+    fn control_inbound_yaml(block: &str) -> String {
         backend_yaml(&format!("control:\n  listen: \"127.0.0.1:9092\"\n{block}"))
     }
 
@@ -7969,7 +7969,7 @@ media:
     /// worse than one that refuses to start.
     #[test]
     fn rejects_control_inbound_naming_an_unknown_app() {
-        let error = Config::from_str(&control_yaml(
+        let error = Config::from_str(&control_inbound_yaml(
             "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: typo\n",
         ))
         .expect_err("an unknown inbound app must be rejected");
@@ -7984,7 +7984,7 @@ media:
     /// deferred, which is the opposite of what someone writing `answer` meant.
     #[test]
     fn rejects_control_inbound_with_an_unknown_mode() {
-        let error = Config::from_str(&control_yaml(
+        let error = Config::from_str(&control_inbound_yaml(
             "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n    \
              mode: answer-first\n",
         ))
@@ -7998,7 +7998,7 @@ media:
     /// The happy path, and the default mode.
     #[test]
     fn accepts_control_inbound_naming_a_configured_app() {
-        let config = Config::from_str(&control_yaml(
+        let config = Config::from_str(&control_inbound_yaml(
             "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n",
         ))
         .expect("a configured app must load");
@@ -8017,7 +8017,7 @@ media:
     /// `mode: answer` is what answers and anchors before handing over.
     #[test]
     fn control_inbound_answer_mode_answers_first() {
-        let config = Config::from_str(&control_yaml(
+        let config = Config::from_str(&control_inbound_yaml(
             "  apps:\n    - name: pbx\n      token: \"t\"\n  inbound:\n    app: pbx\n    \
              mode: answer\n",
         ))

@@ -1216,6 +1216,11 @@ jobs:
       - name: Start siphon, both control applications and the media engine
         run: docker compose -f sipp/docker-compose.yaml --profile control up -d --force-recreate --wait mock-control-rtp control-app-edge siphon-control control-app-ivr
 
+      # A second siphon, because the script-free path is about the ABSENCE of a
+      # routing decision and the instance above registers @b2bua.on_invite.
+      - name: Start the script-free siphon and its application
+        run: docker compose -f sipp/docker-compose.yaml --profile control up -d --force-recreate --wait control-app-inbound siphon-control-inbound
+
       - name: Deferred handover — siphon parks the INVITE, the app answers it
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-handover-uac sipp-control-handover-uac
 
@@ -1231,6 +1236,9 @@ jobs:
       - name: In-dialog INFO on a one-legged call — answered, digits surfaced
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-info-uac sipp-control-info-uac
 
+      - name: No script at all — control.inbound hands the call to the app
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-inbound-uac sipp-control-inbound-uac
+
       - name: Exactly-one-owner dispatch across several app connections
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
 
@@ -1243,6 +1251,7 @@ jobs:
           docker compose -f sipp/docker-compose.yaml logs control-app-edge > control-app-edge.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs control-app-ivr > control-app-ivr.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs mock-control-rtp > mock-control-rtp.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs control-app-inbound > control-app-inbound.log 2>&1 || true
           fail=0
           assert_verdict() {
             local case="$1" log="$2" line
@@ -1275,13 +1284,16 @@ jobs:
           assert_verdict info     control-app-edge.log
           assert_verdict owner    control-app-ivr.log
           assert_verdict resync   control-app-ivr.log
+          assert_verdict inbound  control-app-inbound.log
           assert_performed play_media
           assert_performed stop_media
           exit $fail
 
       - name: Collect logs
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml logs siphon-control > siphon-control.log 2>&1 || true
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-control > siphon-control.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-control-inbound > siphon-control-inbound.log 2>&1 || true
 
       - name: Teardown
         if: always()
@@ -1294,8 +1306,10 @@ jobs:
           name: sipp-control-logs
           path: |
             siphon-control.log
+            siphon-control-inbound.log
             control-app-edge.log
             control-app-ivr.log
+            control-app-inbound.log
             mock-control-rtp.log
             *.log
 
