@@ -1,0 +1,45 @@
+# Files permitted above the 1,500 production-line threshold.
+#
+#   <path>  <max production lines>  # why
+#
+# The number is a ceiling, not a target: the gate fails if a listed file grows
+# past its own entry, so an exemption cannot quietly become a licence. Raising a
+# number means editing the justification in the same diff, and that edit is the
+# review hook. Shrinking a file below 1,500 should remove its entry — the gate
+# prints a reminder when that happens.
+#
+# Two entries below are permanent. The rest each name the split that retires
+# them; most are scheduled by the 1.9.0 module split.
+
+# ── Permanent ───────────────────────────────────────────────────────────────
+# Data, not logic. Splitting a table costs greppability and buys nothing.
+src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a table
+src/metrics/mod.rs          1850  # metric registry: one struct field + one registration per metric
+
+# ── Scheduled for the 1.9.0 module split ────────────────────────────────────
+src/dispatcher.rs           30900  # THE reason this gate exists; splits into src/dispatcher/**
+src/config.rs                5050  # splits by YAML top-level key into src/config/**
+src/server.rs                3900  # run_async is one 2,214-line fn; splits into src/server/**
+src/b2bua/actor.rs           3550  # splits into actor/{leg,helpers,call,store,leg_actor}
+
+# ── PyO3 binding layer ──────────────────────────────────────────────────────
+# One `#[pymethods]` block per class without the `multiple-pymethods` feature,
+# which pulls the `inventory` crate — a new dependency for a navigation win, so
+# rejected. Splitting needs the thin-wrapper restructure, scheduled post-1.9.0.
+# A large share of each is `///` docstrings, which are the SDK's LLM context and
+# are load-bearing rather than padding.
+src/script/api/diameter.rs   3350  # single #[pymethods] block; kwargs marshalling per interface
+src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
+src/script/api/call.rs       2600  # same; ~40% docstrings
+src/script/api/request.rs    1950  # same
+src/script/api/auth.rs       2050  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0
+src/script/api/ipsec.rs      1600  # runtime lookups move to src/ipsec/runtime.rs
+
+# ── Cohesive today, split when next touched ─────────────────────────────────
+src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
+src/rtpengine/siphon_rtp.rs  2200  # one backend; client/set/events/connection split when touched
+src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched
+src/control/sip_adapter.rs   2000  # 56 private fns, 1 pub item; splits by verb when touched
+src/script/engine.rs         1600  # 74 lines over; ratchet down on next touch
+src/admin/mod.rs             1600  # axum handlers; split by handler group when touched
+src/registrant/mod.rs        1550  # 4 lines over; ratchet down on next touch

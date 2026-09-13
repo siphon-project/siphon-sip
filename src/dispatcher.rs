@@ -667,6 +667,7 @@ where
 // Wide by necessity: the dispatcher loop is wired to every transport channel,
 // store, and engine handle at startup, exceeding the configured threshold.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. run: construction plus four event-drain loops; becomes dispatcher/{bootstrap,events}
 pub async fn run(
     inbound_rx: flume::Receiver<InboundMessage>,
     outbound: Arc<OutboundRouter>,
@@ -4281,6 +4282,7 @@ fn invite_action_target_gone(call_id: &str, calls: &crate::b2bua::actor::CallAct
 }
 
 /// Handle an inbound SIP request — run through Python handlers.
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_request: security, method intercepts, script dispatch, action arms
 fn handle_request(
     inbound: InboundMessage,
     message: SipMessage,
@@ -5498,6 +5500,7 @@ fn flow_relay_egress(
 /// REGISTER.  Via host/port are derived from `flow.local_addr` so
 /// the UE's response routes back to the right port (load-bearing for
 /// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. relay_request: shares most of its body with relay_fork_branch; dedupe pending
 fn relay_request(
     message: &SipMessage,
     next_hop: Option<&str>,
@@ -6976,6 +6979,7 @@ fn fail_branch_locally(
 }
 
 /// Handle an inbound SIP response — route back to the original sender.
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_response: pre-session guards + session forwarding; splits in two
 fn handle_response(
     inbound: InboundMessage,
     mut message: SipMessage,
@@ -15484,6 +15488,7 @@ impl InviteHandlerOutcome {
 ///
 /// Creates a Call object, invokes `@b2bua.on_invite`, and processes the
 /// script's action (dial, fork, reject).
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_invite: guards, call creation, script dispatch, action arms
 fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let sip_call_id = message
         .headers
@@ -16947,6 +16952,7 @@ fn advertise_option_tag(headers: &mut crate::sip::headers::SipHeaders, tag: &str
 /// never saw a packet for). The proxy's own relay answers `502` the moment a
 /// target will not resolve; this is the B2BUA half of that.
 #[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. b2bua_send_b_leg_invite
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
@@ -18130,6 +18136,7 @@ fn collect_route_set(message: &SipMessage, header_name: &str) -> Vec<String> {
 const MAX_B2BUA_AUTH_RETRIES: u32 = 2;
 
 /// Handle a response to a B2BUA B-leg INVITE.
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_response: guards + a three-arm match; becomes dispatcher/b2bua/response/*
 fn handle_b2bua_response(
     call_id: &str,
     branch: &str,
@@ -26743,6 +26750,7 @@ fn reject_unanchorable_offer(
     );
 }
 
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_reinvite
 fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let sip_call_id = message
         .headers
@@ -27397,6 +27405,7 @@ fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &D
 /// Tracking uses the `update:` / `update_done:` target_uri prefixes so that
 /// concurrent re-INVITE and UPDATE on the same dialog don't collide on a
 /// single B-leg slot.
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_update
 fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let sip_call_id = message
         .headers
@@ -30537,6 +30546,7 @@ fn is_siprec_invite(message: &SipMessage) -> bool {
 /// Parses the multipart body, extracts SDP and recording metadata,
 /// creates an SRS session, optionally sets up RTPEngine recording,
 /// and sends 200 OK back to the SRC.
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_srs_invite
 fn handle_srs_invite(
     inbound: InboundMessage,
     message: SipMessage,

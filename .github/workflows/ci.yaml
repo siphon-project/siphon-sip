@@ -75,6 +75,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ── File-size gate ──────────────────────────────────────────────────────
+  # Production lines only (inline `#[cfg(test)]` stripped), so the gate cannot
+  # push tests out of a file to satisfy a number. Needs no toolchain at all —
+  # it reads the source, so it fails in seconds next to rustfmt.
+  file-size:
+    name: file size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/check_file_size.py
+      - run: scripts/check_too_many_lines_allows.py
+
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
   # are needed for the crate to compile at all). `-D warnings` turns any
