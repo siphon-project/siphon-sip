@@ -19,6 +19,9 @@ pub fn spawn_rtpengine_events(
                     crate::rtpengine::events::RtpEngineEvent::Dtmf(dtmf) => {
                         on_dtmf(&state_for_events, dtmf).await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::RecordingFinished(recording) => {
+                        on_recording_finished(recording);
+                    }
                     crate::rtpengine::events::RtpEngineEvent::MediaTimeout {
                         call_id,
                         from_tag,
@@ -830,4 +833,30 @@ async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::even
             li.take_x3_attachments(&ended.call_id);
         }
     }
+}
+
+/// A recording's file is closed. Tell the controller that owns the call.
+///
+/// The event exists because the *closed* file is what a controller can act on:
+/// attaching the audio to an email on the `record_stop` reply would race a
+/// half-written one. Forwarded to the channel owner, which is the only thing
+/// that knows what the recording was for.
+fn on_recording_finished(recording: crate::rtpengine::events::RecordingFinished) {
+    tracing::info!(
+        call_id = %recording.call_id,
+        recording_id = %recording.recording_id,
+        reason = recording.reason,
+        path = recording.path.as_deref().unwrap_or("<none>"),
+        "media engine finished a recording"
+    );
+    crate::control::notify_channel_event(
+        &recording.call_id,
+        "RecordingFinished",
+        serde_json::json!({
+            "recording_id": recording.recording_id,
+            "path": recording.path,
+            "reason": recording.reason,
+            "duration_ms": recording.duration_ms,
+        }),
+    );
 }

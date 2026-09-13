@@ -25,6 +25,7 @@ use tracing::debug;
 
 use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
+use super::events::RecordingRequest;
 use super::profile::{NgFlags, WsTeeDirection};
 use super::rtpproxy::RtpProxyClientSet;
 use super::siphon_rtp::{PlayMediaOutcome, SiphonRtpClientSet};
@@ -208,6 +209,54 @@ impl MediaBackend {
             ACTIVE_PLAYBACKS.insert((call_id.to_string(), from_tag.to_string()));
         }
         outcome
+    }
+
+    /// Start recording the call's decoded audio, returning the engine's
+    /// `recording_id`.
+    ///
+    /// Native backend only. rtpengine's `start recording` writes a pcap of the
+    /// wire and has no id to stop or correlate by, and rtpproxy has no
+    /// recording at all — so both refuse rather than produce an artefact that
+    /// is not the one asked for. `li.record()` remains the SIPREC path, which
+    /// is a different thing: a recording *server* gets its own leg.
+    pub async fn start_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: &RecordingRequest<'_>,
+    ) -> Result<String, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => set.start_recording(call_id, from_tag, request).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_start",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_start",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Stop one recording, or every recording on the call when `recording_id`
+    /// is `None`.
+    pub async fn stop_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => set.stop_recording(call_id, from_tag, recording_id).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_stop",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_stop",
+                backend: "rtpproxy",
+            }),
+        }
     }
 
     /// The backend dispatch behind [`Self::play_media`], split out so the
