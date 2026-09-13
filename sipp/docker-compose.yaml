@@ -6714,6 +6714,7 @@ services:
       - -trace_err
     profiles:
       - b2bua-fork
+      - b2bua-on-failure
 
   sipp-b2bua-fork-late-uas:
     image: ctaloi/sipp:latest
@@ -6739,6 +6740,7 @@ services:
       - -trace_err
     profiles:
       - b2bua-fork
+      - b2bua-on-failure
 
   sipp-b2bua-fork-early-uas:
     image: ctaloi/sipp:latest
@@ -6764,6 +6766,7 @@ services:
       - -trace_err
     profiles:
       - b2bua-fork
+      - b2bua-on-failure
 
   sipp-b2bua-fork-cancelled-uas:
     image: ctaloi/sipp:latest
@@ -6787,6 +6790,7 @@ services:
       - -trace_err
     profiles:
       - b2bua-fork
+      - b2bua-on-failure
 
   sipp-b2bua-fork-glare-uas:
     image: ctaloi/sipp:latest
@@ -6881,6 +6885,67 @@ services:
       - -trace_err
     profiles:
       - b2bua-fork
+
+  # ── B2BUA @b2bua.on_failure decisions ──────────────────────────────────────
+  # One siphon whose failure handler decides how each failed call ends, and a
+  # caller run once per case with `-s` naming it. The cases are in
+  # b2bua-on-failure/b2bua_on_failure.py. They reuse the busy, late, early and
+  # cancelled callees above, which carry this profile too, and run through
+  # b2bua-fork/run_case.sh with SIPP_PROFILE=b2bua-on-failure and
+  # SIPP_CALLER=sipp-b2bua-on-failure-uac.
+  #
+  # IP assignments:
+  #   172.20.0.191 — siphon-b2bua-on-failure
+  #   172.20.0.192 — caller
+  siphon-b2bua-on-failure:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-on-failure
+    volumes:
+      - ./b2bua-on-failure/siphon-b2bua-on-failure.yaml:/etc/siphon/siphon.yaml:ro
+      - ./b2bua-on-failure/b2bua_on_failure.py:/etc/siphon/scripts/b2bua_on_failure.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.191
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-on-failure
+
+  # The caller. run_case.sh replaces `command` with the case's scenario and name.
+  sipp-b2bua-on-failure-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-on-failure:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.192
+    entrypoint:
+      - sipp
+      - "172.20.0.191:5060"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    command:
+      - -sf
+      - /sipp/scenarios/b2bua_fork_uac.xml
+      - -s
+      - fail-redial
+    profiles:
+      - b2bua-on-failure
 
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:

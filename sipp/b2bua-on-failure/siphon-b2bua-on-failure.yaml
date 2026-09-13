@@ -1,0 +1,20 @@
+# siphon for the @b2bua.on_failure decision cases. The cases, and which callee
+# each first dial and each decision reaches, are in b2bua_on_failure.py next to
+# this file.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.191"
+
+advertised_address: "172.20.0.191"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_on_failure.py"
+  reload: auto
+
+log:
+  level: debug

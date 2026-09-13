@@ -414,6 +414,15 @@ impl CdrSession {
         self.answer_instant.is_some()
     }
 
+    /// Take back a recorded answer. The B-leg's 2xx arrived, but the call failed
+    /// before the caller was connected (`@b2bua.on_answer` raised or ended it),
+    /// so no answer happened: the record must not bill one, and a call that
+    /// `@b2bua.on_failure` routes somewhere else stamps its own answer time.
+    pub fn clear_answer(&mut self) {
+        self.answer_wall = None;
+        self.answer_instant = None;
+    }
+
     /// When this session was created — used by the orphan sweep.
     pub fn created_at(&self) -> Instant {
         self.created_at
@@ -1329,6 +1338,31 @@ mod tests {
         assert_eq!(cdr.disconnect_initiator.as_deref(), Some("error"));
         assert!(cdr.timestamp_answer.is_none());
         assert_eq!(cdr.duration_secs, 0.0);
+    }
+
+    #[test]
+    fn cdr_session_with_a_cleared_answer_finalizes_unanswered() {
+        // The B-leg answered, but the call failed before the caller was
+        // connected: the answer is taken back and the record bills nothing.
+        let mut session = sample_session();
+        session.mark_answered(200);
+        session.clear_answer();
+        assert!(!session.is_answered());
+        let cdr = session.finalize("error", Some(500), None);
+        assert_eq!(cdr.response_code, 500);
+        assert!(cdr.timestamp_answer.is_none());
+        assert_eq!(cdr.duration_secs, 0.0);
+
+        // A call routed again after that stamps the answer it does get.
+        let mut rerouted = sample_session();
+        rerouted.mark_answered(200);
+        rerouted.clear_answer();
+        rerouted.mark_answered(200);
+        assert!(rerouted.is_answered());
+        assert!(rerouted
+            .finalize("caller", None, None)
+            .timestamp_answer
+            .is_some());
     }
 
     #[test]

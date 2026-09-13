@@ -133,6 +133,30 @@ def route(request):
     authentication, routing — so they compose. Worth knowing all the same if you
     are porting a routing pattern between the two namespaces.
 
+### What `@b2bua.on_failure` decides
+
+A B2BUA call that could not be connected runs `@b2bua.on_failure(call, code,
+reason)` once, before the caller hears anything. `code` is what the call failed
+on: the best of its branches' failures (RFC 3261 §16.7), `408` for the ring
+timeout, `503` when the B-leg INVITE never left or no LCR carrier was routable,
+and `500` when `@b2bua.on_answer` raised or ended an answered call. The `Call`
+has the same single action slot, and its final value is carried out:
+
+| The handler leaves | What happens |
+|---|---|
+| nothing, or `call.terminate()` | the caller gets `code` |
+| `call.reject(code, reason)` | the caller gets that response instead (3xx-6xx) |
+| `call.dial()`, `call.fork()`, `call.route()` | the call is routed again, still unanswered, and the handler runs again if that fails too |
+| `call.handover(app)` | the unanswered call goes to a control app |
+| `call.answer()` | siphon answers the caller itself, and the call lives on |
+
+Re-routes are capped at 10 per call, so a handler that keeps dialling a target
+that keeps failing still ends the call. A decision that cannot apply (a
+`reject()` with a 1xx or 2xx, a REFER decision, anything on a call siphon placed
+itself) is logged at `warn`, and the call ends with its failure. So does a
+handler that raises: a decision taken by a failing handler is not one to route a
+call on.
+
 ## The blocking contract — what script authors must know
 
 A handler may call Rust APIs that block the worker thread on I/O:

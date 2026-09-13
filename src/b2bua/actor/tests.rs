@@ -1343,6 +1343,94 @@ fn a_branch_cancelled_on_ring_timeout_stays_answerable_after_the_call_ends() {
     assert!(store.cancel_ringing_branches("no-such-call").is_empty());
 }
 
+/// Routing a failed call again from `@b2bua.on_failure` clears what the failed
+/// routing left behind and counts the re-route. The failed B-legs stay settled,
+/// so their late retransmissions still find the call.
+#[test]
+fn a_failure_reroute_clears_the_failed_routing_and_counts_itself() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    call.answer_deadline = Some(std::time::Instant::now());
+    call.route_sequence = Some(crate::b2bua::actor::RouteSequenceState {
+        pending: Default::default(),
+        active: None,
+        attempts: Vec::new(),
+        active_since: None,
+        send_socket: None,
+        default_timeout: 30,
+    });
+
+    call.begin_failure_reroute(false);
+
+    assert_eq!(call.failure_reroutes, 1);
+    assert!(call.fork_best_failure.is_none());
+    assert!(call.answer_deadline.is_none());
+    assert!(
+        call.route_sequence.is_some(),
+        "call.route() starts a sequence of its own"
+    );
+    assert_eq!(call.b_leg_status[0], BLegStatus::Failed(486));
+
+    call.begin_failure_reroute(true);
+
+    assert_eq!(call.failure_reroutes, 2);
+    assert!(
+        call.route_sequence.is_none(),
+        "a dial or fork must not have its failure taken for an old carrier's"
+    );
+}
+
+/// An answer the call failed on before its caller was connected is taken back:
+/// no winner, no answer time, unanswered again, and the released leg counts as
+/// failed with the status the call concludes on.
+#[test]
+fn a_failed_answer_is_rewound_to_an_unanswered_call() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.set_winner(0);
+    assert_eq!(call.state, CallState::Answered);
+    assert!(call.answered_at.is_some());
+
+    call.rewind_failed_answer(Some(0), 500);
+
+    assert_eq!(call.state, CallState::Calling);
+    assert!(call.winner.is_none());
+    assert!(call.answered_at.is_none());
+    assert_eq!(call.b_leg_status[0], BLegStatus::Failed(500));
+
+    // The answer a re-route gets starts the duration cap from when it happens.
+    call.add_b_leg(make_sent_b_leg(1));
+    call.set_winner(1);
+    assert_eq!(call.state, CallState::Answered);
+    assert!(call.answered_at.is_some());
+}
+
+/// The store wrappers reach the call, and do nothing for a call that is gone.
+#[test]
+fn store_failure_wrappers_reach_the_call() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+    store.set_winner(&call_id, 0);
+
+    store.rewind_failed_answer(&call_id, Some(0), 500);
+    store.begin_failure_reroute(&call_id, true);
+
+    assert_eq!(
+        store
+            .get_call(&call_id)
+            .map(|call| (call.state.clone(), call.failure_reroutes)),
+        Some((CallState::Calling, 1))
+    );
+    store.rewind_failed_answer("no-such-call", None, 500);
+    store.begin_failure_reroute("no-such-call", false);
+}
+
 /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the
 /// call is answered; a late provisional reordered behind its 200 is then
 /// dropped and must NOT downgrade the confirmed dialog back to Ringing.

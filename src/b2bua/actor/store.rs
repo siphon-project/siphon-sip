@@ -16,6 +16,7 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod failure;
 mod fork;
 
 /// How long a torn-down call's SIP Call-IDs stay answerable with 481.

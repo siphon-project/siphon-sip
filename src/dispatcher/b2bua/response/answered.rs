@@ -197,16 +197,7 @@ pub fn b_leg_answered(
             } else {
                 "@b2bua.on_answer called call.terminate()"
             };
-            b2bua_fail_after_answer(
-                call_id,
-                cause,
-                &snapshot.a_leg,
-                snapshot.a_leg_invite.as_ref(),
-                snapshot.a_leg_local_addr,
-                snapshot.b_leg_index,
-                message,
-                state,
-            );
+            b2bua_fail_after_answer(call_id, cause, snapshot.b_leg_index, message, state);
             return;
         }
 

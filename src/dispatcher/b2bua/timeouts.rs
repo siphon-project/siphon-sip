@@ -146,11 +146,11 @@ pub fn check_pending_inbound_refer_timeouts(state: &DispatcherState) {
 /// un-answered — the B-leg never produced a final 2xx (dead/partitioned trunk,
 /// or a B-leg that silently went away).
 ///
-/// Mirrors the B-leg error teardown in [`handle_b2bua_response`]: CANCEL every
-/// pending B-leg (RFC 3261 §9.1), fire `@b2bua.on_failure(call, 408, …)`, send
-/// `408 Request Timeout` to the A-leg, then tear the call down via
-/// [`CallActorStore::remove_call_after_cancel`] (so a 2xx that raced our CANCEL
-/// is still ACK+BYEd). Driven from [`sweep_stale_entries`].
+/// CANCELs every B-leg still ringing (RFC 3261 §9.1), each kept answerable so a
+/// 2xx that raced the CANCEL is still ACK+BYEd, then concludes the call as a
+/// `408` like any other failure: `@b2bua.on_failure` decides whether the caller
+/// gets it or the call is routed somewhere else. Driven from
+/// [`check_b2bua_answer_timeouts`].
 pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // Control-plane handoff deadline: a call parked under external control whose
     // controller never accepted + acted in time. Apply the parked default action
@@ -191,58 +191,31 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     }
 
     // Snapshot everything needed, then drop the DashMap ref before the CANCEL
-    // sends, Python, and the A-leg response.
-    let (a_leg, a_leg_invite, a_leg_local_addr, cancel_targets, handle_txs) =
-        match state.call_actors.get_call(call_id) {
-            Some(call) => {
-                // Re-check under the lock: the call may have answered or started
-                // tearing down between take_timed_out_calls and here.
-                if !matches!(call.state, CallState::Calling | CallState::Ringing) {
-                    return;
-                }
-                let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> =
-                    Vec::new();
-                for (index, b_leg) in call.b_legs.iter().enumerate() {
-                    // We are giving up on this call, so stop retransmitting the
-                    // request that never drew a response. The CANCEL emitted
-                    // below covers the legs whose INVITE was stashed; this also
-                    // catches a leg whose stash never landed, which would
-                    // otherwise keep retransmitting until 64*T1.
-                    state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-                    // A fork branch that already failed, or was already
-                    // CANCELled, has nothing left to cancel (RFC 3261 §9.1).
-                    if !call.is_pending_branch(index) {
-                        continue;
-                    }
-                    if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
-                        if let Ok(invite) = invite_arc.lock() {
-                            if let Some(cancel_msg) = build_cancel_from_invite(&invite) {
-                                targets.push((
-                                    cancel_msg,
-                                    b_leg.transport.transport,
-                                    b_leg.transport.remote_addr,
-                                    b_leg.transport.local_addr,
-                                ));
-                            }
-                        }
-                    }
-                }
-                let handle_txs: Vec<_> = call
-                    .b_leg_handles
-                    .iter()
-                    .flatten()
-                    .map(|handle| handle.tx.clone())
-                    .collect();
-                (
-                    call.a_leg.clone(),
-                    call.a_leg_invite.clone(),
-                    call.a_leg_local_addr,
-                    targets,
-                    handle_txs,
-                )
+    // sends and Python.
+    let (a_leg, a_leg_invite, handle_txs) = match state.call_actors.get_call(call_id) {
+        Some(call) => {
+            // Re-check under the lock: the call may have answered or started
+            // tearing down between take_timed_out_calls and here.
+            if !matches!(call.state, CallState::Calling | CallState::Ringing) {
+                return;
             }
-            None => return,
-        };
+            // We are giving up on this ring, so stop retransmitting every B-leg
+            // INVITE that never drew a response. The CANCELs below cover the
+            // legs whose INVITE was stashed; this also catches a leg whose stash
+            // never landed, which would otherwise keep retransmitting until 64*T1.
+            for b_leg in &call.b_legs {
+                state.b2bua_retransmits.disarm_branch(&b_leg.branch);
+            }
+            let handle_txs: Vec<_> = call
+                .b_leg_handles
+                .iter()
+                .flatten()
+                .map(|handle| handle.tx.clone())
+                .collect();
+            (call.a_leg.clone(), call.a_leg_invite.clone(), handle_txs)
+        }
+        None => return,
+    };
 
     // LCR / sequential failover: the current carrier did not answer within its
     // ring timeout. If more carriers remain and 408 is a reroute cause for this
@@ -333,121 +306,24 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         "B2BUA: answer timeout — no final response from B-leg, failing call with 408",
     );
 
-    // CDR: the call timed out before answer (cdr.auto_emit).
-    cdr_finalize_b2bua_fail(state, call_id, 408);
-
-    // CANCEL each pending B-leg transaction (RFC 3261 §9.1).
-    for (cancel_msg, transport, dest, local) in cancel_targets {
-        send_b2bua_to_bleg(cancel_msg, transport, dest, local, state);
-    }
+    // CANCEL each B-leg still ringing (RFC 3261 §9.1), each kept answerable
+    // apart from the call: its 487, or a 2xx that crosses the CANCEL, is owed an
+    // ACK (and a BYE) whether @b2bua.on_failure ends the call or routes it
+    // somewhere else.
     for tx in &handle_txs {
         let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
+    let cancelled = state.call_actors.cancel_ringing_branches(call_id);
+    cancel_settled_branches(&cancelled, state);
 
-    // Fire @b2bua.on_failure(call, 408, "Request Timeout").
-    if let Some(invite_arc) = &a_leg_invite {
-        let engine_state = state.engine.state();
-        let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
-        if !handlers.is_empty() {
-            let py_call = PyCall::new(
-                call_id.to_string(),
-                Arc::clone(invite_arc),
-                a_leg.transport.remote_addr.ip().to_string(),
-                format!("{}", a_leg.transport.transport).to_lowercase(),
-            )
-            .with_flow(py_flow_from_leg(&a_leg.transport));
-            Python::attach(|python| {
-                let call_obj = match Py::new(python, py_call) {
-                    Ok(obj) => obj,
-                    Err(error) => {
-                        error!("failed to create PyCall for timeout on_failure: {error}");
-                        return;
-                    }
-                };
-                for handler in &handlers {
-                    let callable = handler.callable.bind(python);
-                    match callable.call1((call_obj.bind(python), 408u16, "Request Timeout")) {
-                        Ok(ret) => {
-                            if handler.is_async {
-                                if let Err(error) = run_coroutine(python, &ret) {
-                                    record_script_error("async B2BUA timeout on_failure", &error);
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            record_script_error("B2BUA timeout on_failure", &error);
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    // Send 408 Request Timeout to the A-leg (final response to its INVITE).
-    if let Some(invite_arc) = &a_leg_invite {
-        if let Ok(invite) = invite_arc.lock() {
-            let mut response = build_response(
-                &invite,
-                408,
-                "Request Timeout",
-                state.server_header.as_deref(),
-                &[],
-            );
-            // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
-            // on our 1xx) so the final response terminates the same dialog, and
-            // echo the caller's own From/To rather than the B-leg shaping the
-            // handler left on the stored INVITE (RFC 3261 §8.2.6.2).
-            stamp_uas_echo(
-                &mut response,
-                a_leg.stored_from.as_ref(),
-                a_leg.stored_to.as_ref(),
-                &a_leg.dialog.local_tag,
-            );
-            // Pin the A-leg's arrival socket so the 408 leaves the port the caller
-            // sent the INVITE to (multi-homed UDP symmetric signalling).
-            send_message_from(
-                response,
-                a_leg.transport.transport,
-                a_leg.transport.remote_addr,
-                a_leg.transport.connection_id,
-                a_leg_local_addr,
-                state,
-            );
-        }
-    }
-
-    // RTPEngine safety-net cleanup (mirrors the B-leg failure path).
-    let a_sip_call_id = a_leg.dialog.call_id.clone();
-    // Control plane: emit StasisEnd for a controlled call that failed (no-op
-    // otherwise), carrying the `408 Request Timeout` this path just sent the
-    // A-leg (RFC 3261 §16.8) — "failed" alone does not say whether nobody
-    // answered or the callee refused, and an app branches on the difference.
-    control_notify_terminated_with_cause(
-        &a_sip_call_id,
-        "failed",
-        Some(408),
-        Some("Request Timeout"),
+    // A ring that ran out is a 408 (RFC 3261 §16.8), and the call concludes on
+    // it like on any other failure.
+    conclude_failed_call(
+        call_id,
+        FailedCallEnd::Local {
+            status_code: 408,
+            reason: best_error_reason(408).to_string(),
+        },
+        state,
     );
-    if let (Some(rtpengine_set), Some(media_sessions)) =
-        (&state.rtpengine_set, &state.rtpengine_sessions)
-    {
-        if let Some(session) = media_sessions.remove(&a_sip_call_id) {
-            let set = Arc::clone(rtpengine_set);
-            tokio::spawn(async move {
-                if let Err(error) = set.delete(session.rtpengine_id(), &session.from_tag).await {
-                    if error.is_call_not_found() {
-                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete (timeout): call already gone ({error})");
-                    } else {
-                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed (timeout): {error}");
-                    }
-                }
-            });
-        }
-    }
-
-    // Tear down, preserving still-pending legs for a 2xx that races the CANCEL.
-    if state.call_actors.remove_call_after_cancel(call_id) {
-        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
-    }
-    state.call_event_receivers.remove(call_id);
 }
