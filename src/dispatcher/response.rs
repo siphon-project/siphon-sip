@@ -348,13 +348,10 @@ pub(super) fn handle_response(
     if (200..300).contains(&status_code) {
         if let Some(cseq_raw) = message.headers.get("CSeq") {
             if cseq_raw.contains("INVITE") {
-                if let Some(sip_call_id) = message.headers.call_id() {
-                    if let Some((leg, first_2xx)) =
-                        state.call_actors.zombie_cancelled_for_2xx(sip_call_id)
-                    {
-                        handle_zombie_cancelled_2xx(leg, first_2xx, &message, state);
-                        return;
-                    }
+                if let Some((leg, first_2xx)) = state.call_actors.zombie_cancelled_for_2xx(&branch)
+                {
+                    handle_zombie_cancelled_2xx(leg, first_2xx, &message, state);
+                    return;
                 }
             }
         }
@@ -372,7 +369,9 @@ pub(super) fn handle_response(
     //
     // Matched via the same `zombie_cancelled` capture as the glare 2xx, which
     // covers both shapes of pending leg: an ordinary B2BUA B-leg and the A-leg
-    // of a call siphon placed itself (`originate`).
+    // of a call siphon placed itself (`originate`). Keyed by the INVITE's Via
+    // branch, which the response carries, so forked branches sharing one
+    // Call-ID each resolve to their own leg.
     //
     // Gated on a CSeq of INVITE so the CANCEL's own final response — which
     // shares the INVITE's branch (§9.1) — is never ACKed: a non-INVITE
@@ -380,19 +379,17 @@ pub(super) fn handle_response(
     if status_code >= 300 {
         if let Some(cseq_raw) = message.headers.get("CSeq") {
             if cseq_raw.contains("INVITE") {
-                if let Some(sip_call_id) = message.headers.call_id() {
-                    if let Some((leg, invite_ruri)) =
-                        state.call_actors.zombie_cancelled_for_non2xx(sip_call_id)
-                    {
-                        handle_zombie_cancelled_non2xx(
-                            &leg,
-                            invite_ruri.as_deref(),
-                            &message,
-                            status_code,
-                            state,
-                        );
-                        return;
-                    }
+                if let Some((leg, invite_ruri)) =
+                    state.call_actors.zombie_cancelled_for_non2xx(&branch)
+                {
+                    handle_zombie_cancelled_non2xx(
+                        &leg,
+                        invite_ruri.as_deref(),
+                        &message,
+                        status_code,
+                        state,
+                    );
+                    return;
                 }
             }
         }

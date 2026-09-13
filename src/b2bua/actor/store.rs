@@ -1289,7 +1289,7 @@ impl CallActorStore {
             if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
                 if let Some(invite) = call.a_leg_invite.as_ref() {
                     self.zombie_cancelled.insert(
-                        call.a_leg.dialog.call_id.clone(),
+                        call.a_leg.branch.clone(),
                         ZombieCancelledLeg {
                             leg: call.a_leg.clone(),
                             invite_ruri: request_uri_of(invite),
@@ -1316,12 +1316,12 @@ impl CallActorStore {
     /// wire, so only such a leg can answer and only it is kept.
     ///
     /// Returns whether any leg was kept, so the caller can schedule the expiry.
-    fn keep_answerable<'a>(&self, legs: impl IntoIterator<Item = &'a Leg>) -> bool {
+    pub fn keep_answerable<'a>(&self, legs: impl IntoIterator<Item = &'a Leg>) -> bool {
         let mut kept = false;
         for leg in legs {
             if let Some(invite) = leg.b_leg_invite.as_ref() {
                 self.zombie_cancelled.insert(
-                    leg.dialog.call_id.clone(),
+                    leg.branch.clone(),
                     ZombieCancelledLeg {
                         leg: leg.clone(),
                         invite_ruri: request_uri_of(invite),
@@ -1335,25 +1335,19 @@ impl CallActorStore {
     }
 
     /// Whether `branch` is a leg siphon CANCELled and is keeping answerable.
-    ///
-    /// Matched on the branch as well as the Call-ID: under
-    /// `call.preserve_call_id()` every branch shares one Call-ID, and a response
-    /// on a live branch must not be taken for its cancelled sibling's.
-    pub fn is_cancelled_branch(&self, sip_call_id: &str, branch: &str) -> bool {
-        self.zombie_cancelled
-            .get(sip_call_id)
-            .is_some_and(|entry| entry.leg.branch == branch)
+    pub fn is_cancelled_branch(&self, branch: &str) -> bool {
+        self.zombie_cancelled.contains_key(branch)
     }
 
-    /// Resolve a racing 2xx to a CANCELled leg by SIP Call-ID.
+    /// Resolve a racing 2xx to a CANCELled leg by the Via branch it answers.
     ///
     /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
-    /// for a Call-ID returns `(leg, true)` so the caller sends ACK + BYE; later
+    /// on a branch returns `(leg, true)` so the caller sends ACK + BYE; later
     /// 200 OK retransmits return `(leg, false)` so the caller re-ACKs only (a
     /// lost ACK still gets retried) without a second BYE. The entry stays until
     /// the 32 s cleanup so retransmits keep matching.
-    pub fn zombie_cancelled_for_2xx(&self, sip_call_id: &str) -> Option<(Leg, bool)> {
-        self.zombie_cancelled.get_mut(sip_call_id).map(|mut entry| {
+    pub fn zombie_cancelled_for_2xx(&self, branch: &str) -> Option<(Leg, bool)> {
+        self.zombie_cancelled.get_mut(branch).map(|mut entry| {
             let first_2xx = !entry.byed;
             entry.byed = true;
             (entry.leg.clone(), first_2xx)
@@ -1362,7 +1356,7 @@ impl CallActorStore {
 
     /// Resolve a final non-2xx — in practice the `487 Request Terminated` that
     /// RFC 3261 §9.1 makes the ordinary outcome of a CANCEL — to a CANCELled
-    /// leg by SIP Call-ID.
+    /// leg by the Via branch it answers.
     ///
     /// Returns the captured leg and the CANCELled INVITE's Request-URI, so the
     /// caller can build the ACK §17.1.1.3 requires on the INVITE's own branch.
@@ -1373,9 +1367,9 @@ impl CallActorStore {
     /// retransmission of the response while it sits in `Completed`. Answering
     /// only the first would leave a peer whose ACK was lost retransmitting to
     /// Timer H regardless — the exact stall this entry exists to end.
-    pub fn zombie_cancelled_for_non2xx(&self, sip_call_id: &str) -> Option<(Leg, Option<String>)> {
+    pub fn zombie_cancelled_for_non2xx(&self, branch: &str) -> Option<(Leg, Option<String>)> {
         self.zombie_cancelled
-            .get(sip_call_id)
+            .get(branch)
             .map(|entry| (entry.leg.clone(), entry.invite_ruri.clone()))
     }
 

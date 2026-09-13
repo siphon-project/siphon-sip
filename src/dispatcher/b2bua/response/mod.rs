@@ -158,7 +158,7 @@ pub fn handle_b2bua_response(
         );
         return;
     }
-    if absorb_cancelled_branch_response(call_id, branch, message, status_code, state, &snapshot) {
+    if absorb_cancelled_branch_response(call_id, branch, message, status_code, state) {
         return;
     }
     auto_prack_b_leg(call_id, message, status_code, state, &snapshot);
