@@ -590,10 +590,18 @@ tell them apart without parsing prose:
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.
 
-**Known limitation.** While a pair is bridged, a re-INVITE *from* one of the
-endpoints (a hold from the handset, say) is answered `491 Request Pending`
-rather than relayed across the bridge. That is today's behaviour for every
-control-owned leg, bridged or not.
+On a call with **no second leg** — one siphon answered itself and anchored on
+the media engine, which is what an IVR, a queue or a voicemail box is — a
+re-INVITE or an UPDATE from the endpoint is answered here, from the engine. A
+hold arrives as a `sendonly` re-offer and is answered `recvonly` (RFC 3264
+§6.1); an offerless refresh is answered with the leg's current media, because
+RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE carry the offer. A call
+with no media backend takes a `200` with no body. Nothing is forwarded, because
+there is nowhere to forward it.
+
+**Known limitation.** While a pair is **bridged**, a re-INVITE *from* one of the
+endpoints is still answered `491 Request Pending` rather than relayed across the
+bridge.
 
 In-process, the same primitives are
 [`b2bua.bridge(...)` / `b2bua.unbridge(...)`](call.md#joining-two-calls-b2buabridge).

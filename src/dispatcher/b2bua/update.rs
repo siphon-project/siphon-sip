@@ -147,6 +147,19 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         )
     };
 
+    // A call with no second leg: siphon is the far party, so the UPDATE is
+    // answered here rather than forwarded. Before this the no-B-leg arm below
+    // returned after the `100 Trying` and sent no final response at all, so the
+    // originator's non-INVITE transaction ran to Timer F — and a session-timer
+    // refresh sent as an UPDATE (RFC 4028 §10) that is never answered ends the
+    // call when the refresher gives up.
+    if from_a_leg && winner_b_leg.is_none() {
+        crate::dispatcher::b2bua::answer_one_legged_reoffer(
+            &inbound, &message, &call_id, &a_leg, "UPDATE", state,
+        );
+        return;
+    }
+
     debug!(
         call_id = %call_id,
         from_a_leg = from_a_leg,
@@ -191,7 +204,25 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 b_leg.dialog.local_tag.clone(),
             ))
         } else {
+            // Unreachable since the one-legged arm above returns first, but a
+            // request must never be dropped in silence: the originator would
+            // retransmit to Timer F and learn nothing.
             warn!(call_id = %call_id, "B2BUA UPDATE: no winning B-leg");
+            let response = build_response(
+                &message,
+                500,
+                "Server Internal Error",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     } else {

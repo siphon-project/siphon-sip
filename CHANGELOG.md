@@ -125,6 +125,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   iFC profiles stay in memory, the same contract `sctp` and `ui` already have.
   CI lints that configuration now; it built only the default and `--all-features`
   before, which is why nothing said so.
+- **A re-INVITE on a call with no second leg is answered instead of refused.**
+  On a one-legged call — one siphon answered itself and anchored on the media
+  engine, so an IVR, a queue or a voicemail box — the glare check read the
+  absent B-leg's `initial_acked` as "not yet ACKed" and answered
+  `491 Request Pending` to every attempt. The endpoint backed off, retried, and
+  got `491` again, so pressing hold on such a call never completed. RFC 3261
+  §14.1 reserves `491` for a genuinely crossing offer/answer, and there is no
+  second offer on a one-legged call. The re-offer now goes to the media engine
+  and its answer is the body of the `200 OK`, so a `sendonly` hold comes back
+  `recvonly` (RFC 3264 §6.1). A bridged pair is unchanged.
+
+- **An UPDATE on a call with no second leg now gets a final response.** It was
+  answered `100 Trying` and then nothing at all, so the originator's non-INVITE
+  transaction ran to Timer F — and a session-timer refresh sent as an UPDATE
+  (RFC 4028 §10) that is never answered ends the call when the refresher gives
+  up. It takes the same engine-answered path as the re-INVITE above. Two
+  remaining no-B-leg arms that returned in silence now answer `500` rather than
+  dropping the request.
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the
