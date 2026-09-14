@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Early media anchored on the media engine, then answered:
+  INVITE -> 100 -> 183 (the ENGINE's SDP) -> [app plays] -> 200 OK (the same SDP)
+         -> ACK -> BYE -> 200
+
+  The controller sends an anchored `progress`, so the 183 carries the SDP the
+  engine synthesised for this leg — asserted on the mock engine's media address,
+  not the caller's own c= line echoed back and not the application's SDP. The
+  200 has to carry the same answer (RFC 3264 §4: the offer/answer exchange
+  completed when the 183 carried it). Both responses naming the engine address
+  is the SIP half; that the engine anchored this call exactly once — so the
+  200's media port is the 183's — is asserted on the engine's recorded commands
+  in CI, because a second anchor would still name the same address.
+-->
+<scenario name="Control-plane anchored early media UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:early@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550009@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:early@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/control-early-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The early-media 183, carrying the engine's SDP. -->
+  <recv response="183">
+    <action>
+      <ereg regexp="c=IN IP4 203\.0\.113\.1"
+            search_in="body"
+            check_it="true"
+            assign_to="early_anchored" />
+      <log message="183 carries the engine's SDP: [$early_anchored]" />
+    </action>
+  </recv>
+
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 203\.0\.113\.1"
+            search_in="body"
+            check_it="true"
+            assign_to="anchored" />
+      <log message="answer SDP anchored on the engine: [$anchored]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550009@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:early@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Hold the call while the application runs its play / stop round trip. -->
+  <pause milliseconds="1500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550009@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:early@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

@@ -641,6 +641,20 @@ impl CallActorStore {
             .and_then(|call| call.originate_anchor.clone())
     }
 
+    /// Record the early-media anchor an 18x opened, so the 2xx repeats its answer.
+    pub fn set_early_media_anchor(&self, call_id: &str, anchor: EarlyMediaAnchor) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.early_media_anchor = Some(anchor);
+        }
+    }
+
+    /// The early-media anchor of a call, if an anchored 18x opened one.
+    pub fn early_media_anchor(&self, call_id: &str) -> Option<EarlyMediaAnchor> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.early_media_anchor.clone())
+    }
+
     /// Attach one half of a bridge to a call. Overwrites any previous half —
     /// the caller has already refused a leg that is `AlreadyBridged`.
     pub fn set_bridge(&self, call_id: &str, context: crate::b2bua::bridge::BridgeContext) -> bool {

@@ -199,6 +199,46 @@ pub fn answer_first_anchor(
     ws_uri: Option<&str>,
     state: &DispatcherState,
 ) -> Result<(), String> {
+    // Anchored early media already put this leg on the engine and sent its SDP
+    // answer in an 18x. The 2xx repeats that answer (RFC 3264 §4: the exchange
+    // completed when the 18x carried it) and must not anchor a second time — a
+    // second `answer_local` hands the caller a new media port under an answer
+    // it has already accepted.
+    let answer_sdp = match state.call_actors.early_media_anchor(call_id) {
+        Some(anchor) => anchor.answer_sdp,
+        None => anchor_a_leg(invite, source_ip, profile, ws_uri, state)?.answer_sdp,
+    };
+
+    // Send the 2xx with the synthesized answer SDP (marks the A-leg Answered +
+    // stamps the CDR answer time).
+    if !b2bua_answer_call(
+        call_id,
+        invite,
+        code,
+        reason,
+        Some(answer_sdp.into_bytes()),
+        Some("application/sdp"),
+    ) {
+        return Err(format!(
+            "failed to send {code} {reason} (call gone / dispatcher down)"
+        ));
+    }
+    Ok(())
+}
+
+/// Anchor the A-leg on the media engine and return the engine's SDP answer.
+///
+/// The media half shared by the answer-first 2xx and the early-media 18x:
+/// resolve and validate the plan, `answer_local` the caller's offer, and record
+/// the media session so a later delete or control-app media verb finds it.
+/// Sends nothing — the caller decides which response carries the answer.
+pub fn anchor_a_leg(
+    invite: &SipMessage,
+    source_ip: std::net::IpAddr,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+    state: &DispatcherState,
+) -> Result<crate::b2bua::actor::EarlyMediaAnchor, String> {
     let Some(backend) = state.rtpengine_set.as_ref() else {
         return Err(
             "answer-first requires a media backend (media.backend), none configured".to_string(),
@@ -240,14 +280,46 @@ pub fn answer_first_anchor(
         });
     }
 
-    // Send the 2xx with the synthesized answer SDP (marks the A-leg Answered +
-    // stamps the CDR answer time).
-    if !b2bua_answer_call(
+    Ok(crate::b2bua::actor::EarlyMediaAnchor {
+        answer_sdp,
+        profile: plan.profile_name,
+    })
+}
+
+/// Open early media through the engine: anchor the A-leg (or reuse the anchor
+/// an earlier early response made) and send an 18x carrying the engine's SDP.
+///
+/// The answer is recorded on the call so the 2xx that follows repeats it rather
+/// than anchoring again (see [`answer_first_anchor`]). On a media failure
+/// nothing is sent and the call stays parked, like the answer path — never an
+/// 18x with no media behind it.
+#[allow(clippy::too_many_arguments)]
+pub fn early_media_anchor_progress(
+    call_id: &str,
+    invite: &SipMessage,
+    source_ip: std::net::IpAddr,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+    state: &DispatcherState,
+) -> Result<(), String> {
+    let anchor = match state.call_actors.early_media_anchor(call_id) {
+        Some(anchor) => anchor,
+        None => {
+            let anchor = anchor_a_leg(invite, source_ip, profile, ws_uri, state)?;
+            state
+                .call_actors
+                .set_early_media_anchor(call_id, anchor.clone());
+            anchor
+        }
+    };
+    if !b2bua_progress_call(
         call_id,
         invite,
         code,
         reason,
-        Some(answer_sdp.into_bytes()),
+        Some(anchor.answer_sdp.into_bytes()),
         Some("application/sdp"),
     ) {
         return Err(format!(

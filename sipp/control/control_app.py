@@ -746,6 +746,70 @@ async def case_record(app: App, session: Session, event: dict, verdict: Verdict)
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+async def case_early(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """Early media anchored on the engine, played into, then answered.
+
+    The 183 has to carry the engine's SDP and the 200 has to repeat it: a second
+    anchor would hand the caller a new media port under an answer it already
+    accepted. The SIPp scenario asserts both responses carry the engine's
+    address, and CI asserts the engine saw exactly one answer_local for this
+    call. This side asserts the rail: each verb reports what it did, an answer
+    body contradicting the early SDP is refused, and a 100 cannot be anchored.
+    """
+    channel = event.get("channel") or ""
+
+    refused = await session.command(
+        "progress", {"anchor": True, "code": 100}, target={"channel": channel}
+    )
+    verdict.check(
+        "anchored_100_is_refused",
+        refused.get("status") == "error"
+        and (refused.get("error") or {}).get("code") == "bad_request",
+        json.dumps(refused),
+    )
+
+    early = await session.command(
+        "progress", {"anchor": True, "profile": "voice_ai"}, target={"channel": channel}
+    )
+    result = early.get("result") or {}
+    verdict.check(
+        "anchored_progress_opens_early_media",
+        early.get("status") == "ok"
+        and result.get("code") == 183
+        and result.get("early_media") is True
+        and result.get("media") == "anchored",
+        json.dumps(early),
+    )
+
+    # The point of early media: the leg is on the engine before anyone answers,
+    # so a prompt can play into it.
+    play = await session.command("play", {"file": PROMPT_FILE}, target={"channel": channel})
+    verdict.check("play_runs_on_the_early_media_leg", play.get("status") == "ok", json.dumps(play))
+
+    contradicting = await session.command(
+        "answer",
+        {"code": 200, "body": ANSWER_SDP, "content_type": "application/sdp"},
+        target={"channel": channel},
+    )
+    verdict.check(
+        "answer_contradicting_the_early_sdp_is_refused",
+        contradicting.get("status") == "error"
+        and (contradicting.get("error") or {}).get("code") == "bad_request",
+        json.dumps(contradicting),
+    )
+
+    answered = await session.command("answer", {"code": 200}, target={"channel": channel})
+    verdict.check(
+        "answer_repeats_the_early_media_answer",
+        answered.get("status") == "ok"
+        and (answered.get("result") or {}).get("state") == "answered",
+        json.dumps(answered),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 async def case_owner(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Exactly-one-owner dispatch: with several connections of the same app up,
     exactly one is given the call and the others cannot command it."""
@@ -850,6 +914,7 @@ CASES = {
     "info": case_info,
     "inbound": case_inbound,
     "record": case_record,
+    "early": case_early,
     "owner": case_owner,
     "resync": case_resync,
 }

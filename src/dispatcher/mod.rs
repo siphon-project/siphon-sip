@@ -91,12 +91,13 @@ mod tests;
 // for 1.9.0 and `public_api_surface` pins them.
 pub use b2bua::{
     b2bua_accept_refer_call, b2bua_answer_call, b2bua_answer_call_anchored, b2bua_bridge_calls,
-    b2bua_cancel_originated_call, b2bua_local_tag, b2bua_media_set_ws_bridge_attached,
-    b2bua_media_set_ws_tee, b2bua_media_target, b2bua_originate, b2bua_originate_dial,
-    b2bua_originate_prepare, b2bua_progress_call, b2bua_refer_call, b2bua_reject_call,
-    b2bua_reject_refer_call, b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call,
-    b2bua_unbridge_call, BridgeAccepted, BridgeParams, OriginateError, OriginateMedia,
-    OriginateParams, PreparedOriginate, RouteError, RouteTarget,
+    b2bua_cancel_originated_call, b2bua_early_media_sdp, b2bua_local_tag,
+    b2bua_media_set_ws_bridge_attached, b2bua_media_set_ws_tee, b2bua_media_target,
+    b2bua_originate, b2bua_originate_dial, b2bua_originate_prepare, b2bua_progress_call,
+    b2bua_progress_call_anchored, b2bua_refer_call, b2bua_reject_call, b2bua_reject_refer_call,
+    b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call, b2bua_unbridge_call,
+    BridgeAccepted, BridgeParams, OriginateError, OriginateMedia, OriginateParams,
+    PreparedOriginate, RouteError, RouteTarget,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
