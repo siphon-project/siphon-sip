@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A-leg caller for fork-redirect (sipp/b2bua-fork/b2bua_fork.py).
+
+     One branch is busy and the other redirects. RFC 3261 §16.7 step 6 chooses the
+     lowest class present, so the caller gets the 302, and it has to carry the
+     redirect target the callee named. A 486 means the ranking chose wrong; a 302
+     whose Contact is siphon's own address sends the caller straight back to
+     siphon, which is what the ereg on the Contact catches. -->
+
+<scenario name="B2BUA parallel fork caller (a redirect keeps its target)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+
+  <recv response="302" rtd="true">
+    <action>
+      <ereg regexp="sip:elsewhere@198\.51\.100\.30"
+            search_in="hdr" header="Contact:" check_it="true" assign_to="redirect_target" />
+      <log message="redirect target: [$redirect_target]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

@@ -197,12 +197,13 @@ fn record_route_failure_keeps_highest_priority() {
     actor.route_sequence = Some(RouteSequenceState::default());
     actor.record_route_failure(486);
     assert_eq!(actor.best_route_error(), Some(486));
-    // 5xx outranks 4xx.
+    // RFC 3261 §16.7 step 6: the lowest class wins, so a later 503 does not
+    // displace the 486. This expected 503 under the old 5xx-over-4xx ranking.
     actor.record_route_failure(503);
-    assert_eq!(actor.best_route_error(), Some(503));
-    // A later lower-priority 404 does not displace the 503.
+    assert_eq!(actor.best_route_error(), Some(486));
+    // Within 4xx the higher code stays: a later 404 does not displace the 486.
     actor.record_route_failure(404);
-    assert_eq!(actor.best_route_error(), Some(503));
+    assert_eq!(actor.best_route_error(), Some(486));
     // 6xx outranks everything.
     actor.record_route_failure(603);
     assert_eq!(actor.best_route_error(), Some(603));
@@ -248,9 +249,11 @@ fn every_attempt_is_recorded_against_the_carrier_that_was_tried() {
         Some("c"),
         "the answering carrier is the winner, not an attempt"
     );
-    // Derived from the attempts, so the code the A-leg would get and the
-    // per-attempt record cannot disagree.
-    assert_eq!(actor.best_route_error(), Some(503));
+    // Derived from the attempts, so it and the per-attempt record cannot
+    // disagree. The ring timeout's 408 beats carrier a's 503 on class
+    // (RFC 3261 §16.7 step 6, §16.8); this expected 503 under the old
+    // 5xx-over-4xx ranking.
+    assert_eq!(actor.best_route_error(), Some(408));
 }
 
 /// A carrier siphon never reached is still an attempt — the sequence
@@ -285,10 +288,11 @@ fn a_carrier_that_was_never_dialled_is_recorded_but_not_blamed() {
     );
 
     // Both are on the list — the sequence burned both — and the list is
-    // still what best_route_error derives from, so an exhausted sequence of
-    // unroutable carriers still hands the caller a code.
+    // still what best_route_error derives from. The carrier's own 486 beats
+    // the undialled 503 on class (RFC 3261 §16.7 step 6); this expected 503
+    // under the old 5xx-over-4xx ranking.
     assert_eq!(actor.route_attempts().len(), 2);
-    assert_eq!(actor.best_route_error(), Some(503));
+    assert_eq!(actor.best_route_error(), Some(486));
 }
 
 /// A call with no failover sequence has nothing to report, and asking must
@@ -716,7 +720,9 @@ fn call_actor_all_failed() {
     call.mark_b_leg_failed(1, 503);
     assert!(call.all_b_legs_settled());
 
-    assert_eq!(call.best_error_code(), 503); // 5xx > 4xx
+    // RFC 3261 §16.7 step 6: the lowest class wins, so the 486 beats the 503.
+    // This expected 503 under the old 5xx-over-4xx ranking.
+    assert_eq!(call.best_error_code(), 486);
 }
 
 // --- Parallel fork settlement (RFC 3261 §16.7) ---
@@ -832,6 +838,80 @@ fn a_single_branch_settles_on_its_failure_even_before_its_invite_is_stashed() {
     let settlement = call.record_branch_failure(0, 503, &branch_failure(503, "down"));
 
     assert_eq!(settlement.failure.map(|best| best.status_code), Some(503));
+}
+
+/// RFC 3261 §16.7 step 6: a busy branch beats a sibling's 503 whichever arrives
+/// last, and it is the busy branch's own response that is kept for the caller.
+#[test]
+fn a_busy_branch_beats_a_sibling_503() {
+    for order in [[486, 503], [503, 486]] {
+        let mut call = CallActor::new(make_a_leg());
+        call.add_b_leg(make_sent_b_leg(0));
+        call.add_b_leg(make_sent_b_leg(1));
+        let tag = |code: u16| if code == 486 { "busy" } else { "down" };
+
+        assert!(call
+            .record_branch_failure(0, order[0], &branch_failure(order[0], tag(order[0])))
+            .failure
+            .is_none());
+        let best = call
+            .record_branch_failure(1, order[1], &branch_failure(order[1], tag(order[1])))
+            .failure
+            .expect("every branch has failed");
+
+        assert_eq!(best.status_code, 486, "arrival order {order:?}");
+        assert_eq!(extract_to_tag(&best.response).as_deref(), Some("busy"));
+    }
+}
+
+/// A redirect is a lower class than a client error, and a resubmission hint
+/// beats a higher 4xx (RFC 3261 §16.7 step 6).
+#[test]
+fn a_fork_prefers_a_redirect_then_a_resubmission_hint() {
+    let mut redirected = CallActor::new(make_a_leg());
+    redirected.add_b_leg(make_sent_b_leg(0));
+    redirected.add_b_leg(make_sent_b_leg(1));
+    redirected.record_branch_failure(0, 486, &branch_failure(486, "busy"));
+    let best = redirected
+        .record_branch_failure(1, 302, &branch_failure(302, "moved"))
+        .failure
+        .expect("every branch has failed");
+    assert_eq!(best.status_code, 302);
+
+    let mut challenged = CallActor::new(make_a_leg());
+    challenged.add_b_leg(make_sent_b_leg(0));
+    challenged.add_b_leg(make_sent_b_leg(1));
+    challenged.record_branch_failure(0, 407, &branch_failure(407, "auth"));
+    let best = challenged
+        .record_branch_failure(1, 486, &branch_failure(486, "busy"))
+        .failure
+        .expect("every branch has failed");
+    assert_eq!(best.status_code, 407);
+}
+
+/// A fork whose best failure is a 503 settles on that 503. What the caller is
+/// sent in its place is a 500 (RFC 3261 §16.7 step 6), which the relay path
+/// builds from the A-leg INVITE.
+#[test]
+fn a_fork_whose_best_failure_is_503_sends_500_upstream() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+
+    assert!(call
+        .record_branch_failure(0, 503, &branch_failure(503, "down-a"))
+        .failure
+        .is_none());
+    let best = call
+        .record_branch_failure(1, 503, &branch_failure(503, "down-b"))
+        .failure
+        .expect("every branch has failed");
+
+    assert_eq!(best.status_code, 503);
+    assert_eq!(
+        crate::sip::best_response::upstream_status(best.status_code),
+        500
+    );
 }
 
 /// Branches are added and sent one at a time, so the first can fail before the
@@ -1238,6 +1318,29 @@ fn a_ring_timeout_keeps_its_408_when_nothing_held_beats_it() {
         "404 does not beat the timeout's 408"
     );
     assert_eq!(call.b_leg_status[1], BLegStatus::Trying);
+}
+
+/// A carrier the ring timeout CANCELs stays answerable once the call is gone:
+/// the next carrier can fail, and end the call, before the timed-out one's 487
+/// arrives, and that 487 is still owed its ACK (RFC 3261 §17.1.1.3).
+#[test]
+fn a_branch_cancelled_on_ring_timeout_stays_answerable_after_the_call_ends() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store.add_b_leg(&call_id, make_sent_b_leg(0));
+
+    let cancelled = store.cancel_ringing_branches(&call_id);
+
+    assert_eq!(branches(&cancelled), vec!["z9hG4bK-bleg0"]);
+    assert_eq!(
+        store
+            .get_call(&call_id)
+            .map(|call| call.b_leg_status[0].clone()),
+        Some(BLegStatus::Cancelled)
+    );
+    store.remove_call(&call_id);
+    assert!(store.zombie_cancelled_for_non2xx("z9hG4bK-bleg0").is_some());
+    assert!(store.cancel_ringing_branches("no-such-call").is_empty());
 }
 
 /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the

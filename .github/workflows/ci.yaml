@@ -880,15 +880,27 @@ jobs:
       - name: A ring timeout relays the failure a branch already returned, not a bare 408
         run: bash sipp/b2bua-fork/run_case.sh fork-timeout b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-cancelled-uas
 
-      # Only fork-allfail and fork-timeout may fail, and @b2bua.on_failure must
-      # run once for each: a fork that fired it per failed branch would print
-      # more lines here, and one that failed an answerable call would add a line
-      # for that case too.
+      - name: The lower failure class wins (a 486 over a 503, RFC 3261 16.7)
+        run: bash sipp/b2bua-fork/run_case.sh fork-class b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-service-unavailable-uas
+
+      - name: A 503 that is all there is goes upstream as a 500
+        run: bash sipp/b2bua-fork/run_case.sh fork-503 b2bua_fork_500_uac.xml sipp-b2bua-fork-service-unavailable-uas
+
+      - name: A redirect wins and keeps the callee's Contact
+        run: bash sipp/b2bua-fork/run_case.sh fork-redirect b2bua_fork_redirect_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-redirect-uas
+
+      - name: An exhausted sequence sends its best attempt, not its last
+        run: bash sipp/b2bua-fork/run_case.sh fork-seqbest b2bua_fork_408_uac.xml sipp-b2bua-fork-cancelled-uas sipp-b2bua-fork-service-unavailable-uas
+
+      # Every case but fork-busy, fork-cancel and fork-glare fails, and
+      # @b2bua.on_failure must run once for each: a fork that fired it per
+      # failed branch would print more lines here, and one that failed an
+      # answerable call would add a line for that case too.
       - name: on_failure ran once for each case that failed
         run: |
           count="$(docker logs siphon-b2bua-fork 2>&1 | grep -c 'FORK-FAILURE' || true)"
-          if [ "$count" != "2" ]; then
-            echo "@b2bua.on_failure ran $count times, expected twice (once per failing case)"
+          if [ "$count" != "6" ]; then
+            echo "@b2bua.on_failure ran $count times, expected 6 (once per failing case)"
             docker logs siphon-b2bua-fork 2>&1 | grep 'FORK-FAILURE' || true
             exit 1
           fi

@@ -51,4 +51,20 @@ impl CallActorStore {
         self.keep_answerable(&settlement.cancelled);
         Some(settlement)
     }
+
+    /// Cancel every branch still ringing without ending the call, keeping each
+    /// answerable apart from it, and hand back the ones to CANCEL. See
+    /// [`CallActor::cancel_pending_branches`].
+    ///
+    /// For a call that goes on after its ring timeout, to the next LCR carrier:
+    /// that carrier can fail, and end the call, before the timed-out one's 487
+    /// arrives, and the 487 is owed its ACK (RFC 3261 §17.1.1.3) either way.
+    pub fn cancel_ringing_branches(&self, call_id: &str) -> Vec<Leg> {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return Vec::new();
+        };
+        let cancelled = call.cancel_pending_branches(None);
+        self.keep_answerable(&cancelled);
+        cancelled
+    }
 }

@@ -67,8 +67,12 @@ ACK-for-non-2xx automatically — you don't write routes for those.
 
 ## Aggregating fork results
 
-For a parallel fork, SIPhon aggregates the branches per RFC 3261 §16.7 (first 2xx
-wins, best error otherwise). To act when *all* branches fail:
+For a parallel fork, SIPhon aggregates the branches per RFC 3261 §16.7. The first
+2xx wins. When every branch fails, the caller gets one failure: a 6xx if there
+is one, otherwise the lowest class present (3xx, then 4xx, then 5xx), with
+401/407/415/420/484 preferred within 4xx. That branch's own response is
+forwarded, a 401/407 carrying every other branch's challenge too, and a 503 is
+sent as 500. To act when *all* branches fail:
 
 ```python
 @proxy.on_failure

@@ -1,5 +1,6 @@
 //! SIP protocol implementation — parser, message types, URI, headers, builder.
 
+pub mod best_response;
 pub mod builder;
 pub mod codec;
 pub mod headers;

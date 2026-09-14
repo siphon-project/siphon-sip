@@ -667,6 +667,58 @@ fn other_status_codes_are_forwarded_untouched() {
     }
 }
 
+/// RFC 3261 §16.7 step 6 on the B2BUA: the 500 that replaces a chosen B-leg
+/// 503 is generated from the caller's own INVITE. It carries the A-leg's Via,
+/// Call-ID and CSeq and the A-leg dialog's To-tag, and nothing from the B-leg
+/// (no Retry-After, no Contact).
+#[test]
+fn a_b2bua_failure_for_the_caller_is_built_from_its_invite() {
+    let (_, invite) = parse_sip_message(concat!(
+        "INVITE sip:bob@example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@example.com>;tag=caller\r\n",
+        "To: <sip:bob@example.com>\r\n",
+        "Call-ID: a-leg@192.0.2.10\r\n",
+        "CSeq: 7 INVITE\r\n",
+        "Contact: <sip:alice@192.0.2.10:5060>\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    ))
+    .expect("INVITE parses");
+
+    let upstream = crate::sip::best_response::upstream_status(503);
+    let response = build_a_leg_final_response(
+        &invite,
+        "siphon-a-tag",
+        upstream,
+        crate::sip::best_response::SERVER_INTERNAL_ERROR,
+        None,
+    );
+
+    assert_eq!(response.status_code(), Some(500));
+    let wire = String::from_utf8(response.to_bytes()).unwrap();
+    assert!(wire.starts_with("SIP/2.0 500 Server Internal Error\r\n"));
+    assert_eq!(
+        response.headers.via().map(String::as_str),
+        Some("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller")
+    );
+    assert_eq!(
+        response.headers.call_id().map(String::as_str),
+        Some("a-leg@192.0.2.10")
+    );
+    assert_eq!(
+        response.headers.cseq().map(String::as_str),
+        Some("7 INVITE")
+    );
+    assert_eq!(
+        response.headers.to().map(String::as_str),
+        Some("<sip:bob@example.com>;tag=siphon-a-tag")
+    );
+    assert!(!wire.contains("Retry-After"));
+    assert!(!wire.contains("Contact"));
+}
+
 // -----------------------------------------------------------------------
 // Media CDR from an end-of-call summary (media.backend: siphon-rtp)
 // -----------------------------------------------------------------------
@@ -7369,4 +7421,38 @@ fn expired_pending_refer_answers_603_decline() {
         response.headers.call_id().unwrap(),
         "refer-call@example.com"
     );
+}
+
+/// A 3xx is a redirect, and its Contact is the redirect target (RFC 3261
+/// §8.1.3.4, §21.3). Relayed to the A-leg it keeps that Contact; every other
+/// response gets siphon's own, so the dialog it creates runs through siphon.
+#[test]
+fn only_a_redirect_keeps_its_own_contact_when_relayed() {
+    for code in [300, 301, 302, 305, 380] {
+        assert!(
+            relayed_response_keeps_its_contact(Some(code)),
+            "{code} is a redirect"
+        );
+    }
+    for code in [180, 183, 200, 401, 486, 500, 603] {
+        assert!(
+            !relayed_response_keeps_its_contact(Some(code)),
+            "{code} is not a redirect"
+        );
+    }
+    assert!(!relayed_response_keeps_its_contact(None));
+}
+
+/// A failure siphon generates for the caller, rather than relays, carries the
+/// reason phrase the RFC gives its code, not a placeholder. Only a code the
+/// table does not know reads "Error".
+#[test]
+fn a_generated_failure_carries_its_rfc_reason_phrase() {
+    assert_eq!(best_error_reason(302), "Moved Temporarily");
+    assert_eq!(best_error_reason(407), "Proxy Authentication Required");
+    assert_eq!(best_error_reason(422), "Session Interval Too Small");
+    assert_eq!(best_error_reason(502), "Bad Gateway");
+    assert_eq!(best_error_reason(580), "Precondition Failure");
+    assert_eq!(best_error_reason(604), "Does Not Exist Anywhere");
+    assert_eq!(best_error_reason(499), "Error");
 }

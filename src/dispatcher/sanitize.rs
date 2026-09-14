@@ -9,7 +9,8 @@ use super::*;
 ///
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
 /// headers must not leak to the A-leg. This function:
-/// - Replaces Contact with siphon's own address (critical for dialog routing)
+/// - Replaces Contact with siphon's own address (critical for dialog routing),
+///   except on a 3xx, whose Contact is the redirect target
 /// - Strips User-Agent (UAC header — not for responses), sets Server
 /// - Strips the B-leg's Allow-Events/Supported/Require, and replaces Allow with
 ///   siphon's own supported methods (a B2BUA is a UA in its own right)
@@ -40,7 +41,9 @@ pub(super) fn sanitize_b2bua_response(
         a_leg_port,
         a_leg_transport.to_string().to_lowercase(),
     );
-    response.headers.set("Contact", contact_value);
+    if !relayed_response_keeps_its_contact(response.status_code()) {
+        response.headers.set("Contact", contact_value);
+    }
 
     // Framework-auto strip — `Record-Route` carries the B-leg dialog route
     // set; leaking it to the A-leg breaks RFC 3261 §16 dialog independence
@@ -111,6 +114,19 @@ pub(super) fn sanitize_b2bua_response(
             .headers
             .set("Content-Length", response.body.len().to_string());
     }
+}
+
+/// Whether a response relayed to the A-leg keeps the Contact the far end put on
+/// it, rather than siphon's own.
+///
+/// A 3xx creates no dialog. Its Contact lists where the callee can be reached
+/// instead (RFC 3261 §8.1.3.4, §21.3), which is the whole content of a redirect,
+/// and replacing it with siphon's address sends the caller straight back here.
+/// Every other response that reaches the A-leg either creates a dialog, whose
+/// in-dialog requests must come through siphon, or carries no target the caller
+/// acts on.
+pub(super) fn relayed_response_keeps_its_contact(status_code: Option<u16>) -> bool {
+    status_code.is_some_and(|code| (300..400).contains(&code))
 }
 
 /// Rewrite `o=` and `s=` lines in an SDP body to hide the remote endpoint's

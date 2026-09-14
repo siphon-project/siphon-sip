@@ -327,6 +327,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+- **A failed fork now sends the caller the failure RFC 3261 §16.7 picks.** The
+  proxy fork aggregator and the B2BUA ranked failures 6xx > 5xx > 4xx > 3xx,
+  highest code first, so a branch answering `486 Busy Here` lost to a sibling's
+  5xx. Both now share one ranking (§16.7 step 6): any 6xx, otherwise the lowest
+  class present, preferring 401/407/415/420/484 within 4xx, with 503 below every
+  other 5xx. A chosen 503 now reaches the caller as a generated 500 on the
+  B2BUA too (a `call.dial()`, a fork, or the last carrier of an exhausted route
+  sequence), and `@b2bua.on_failure` and the CDR report that 500; a 503 still
+  triggers LCR failover. The proxy forwards the chosen branch's own response
+  instead of a bare one built from the request, so a 3xx keeps its Contact and a
+  401/407 its challenge, with the challenges from every other 401/407 branch
+  added (step 7). A B2BUA relaying a 3xx now keeps the callee's Contact too,
+  where it used to put siphon's own address there and redirect the caller back
+  to siphon. An exhausted LCR or sequential-fork sequence sends the best of its
+  carriers' failures rather than the last one's, and Ro's Cause-Code reports the
+  status the caller was sent, like the CDR.
+
+- **A carrier CANCELled on an LCR ring timeout gets its 487 ACKed.** The
+  timed-out carrier was only marked cancelled on the call, so when the next
+  carrier failed first and ended the call, the 487 arrived for a call that was
+  gone and was never ACKed (RFC 3261 §17.1.1.3), leaving the carrier
+  retransmitting it until Timer H. It is now kept answerable apart from the
+  call, like a CANCELled fork branch.
+
 - **A fork's ring timeout relays the failure a branch already returned.** A
   `call.fork()` with one branch busy and the other ringing out answered the
   caller `408 Request Timeout`, discarding the busy. The timeout now relays the

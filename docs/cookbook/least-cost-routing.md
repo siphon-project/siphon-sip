@@ -91,8 +91,11 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
   carrier — a **fresh B-leg dialog** each time.
 - A `6xx` from a carrier stops the sequence (global rejection, RFC 3261 §16.7
   spirit).
-- The A-leg receives a failure only once **every** carrier is exhausted;
-  `@b2bua.on_failure` fires once, with the last carrier's response.
+- The A-leg receives a failure only once **every** carrier is exhausted, and it
+  is the best of the carriers' failures (RFC 3261 §16.7), not the last one:
+  a carrier that rang out (`408`) outranks a later one's `503`, which in turn
+  reaches the caller as a `500`. `@b2bua.on_failure` fires once, with that
+  code.
 - On answer, `call.active_route` is the carrier that won.
 - `call.route_attempts` lists the carriers it **burned** to get there — one
   entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`, `dialed`),

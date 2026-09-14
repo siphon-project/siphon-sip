@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::sip::best_response::ResponseRank;
 use crate::sip::message::SipMessage;
 use crate::transport::Transport;
 
@@ -582,22 +583,14 @@ impl CallActor {
         self.route_sequence.is_some()
     }
 
-    /// The best (highest-priority) error seen across exhausted attempts
-    /// (6xx > 5xx > 4xx), which is the code a fully-exhausted sequence surfaces
-    /// to the A-leg. Derived from [`RouteSequenceState::attempts`] rather than
-    /// accumulated, so the per-attempt record and the code the caller gets can
-    /// never disagree.
+    /// The best failure across the attempts so far, ranked per RFC 3261 §16.7
+    /// step 6 ([`crate::sip::best_response`]). Derived from
+    /// [`RouteSequenceState::attempts`] rather than accumulated, so it and the
+    /// per-attempt record can never disagree.
     pub fn best_route_error(&self) -> Option<u16> {
-        self.route_attempts()
-            .iter()
-            .map(|attempt| attempt.status)
-            .reduce(|best, status| {
-                if error_priority(best) >= error_priority(status) {
-                    best
-                } else {
-                    status
-                }
-            })
+        crate::sip::best_response::best_status(
+            self.route_attempts().iter().map(|attempt| attempt.status),
+        )
     }
 
     /// The carrier currently in flight / that won (for `call.active_route`).
@@ -851,16 +844,14 @@ impl CallActor {
         })
     }
 
-    /// Get the highest-priority error code among failed B-legs.
+    /// The best failure among failed B-legs, ranked per RFC 3261 §16.7 step 6
+    /// ([`crate::sip::best_response`]); 500 when none has failed.
     pub fn best_error_code(&self) -> u16 {
-        self.b_leg_status
-            .iter()
-            .filter_map(|s| match s {
-                BLegStatus::Failed(code) => Some(*code),
-                _ => None,
-            })
-            .max_by(|a, b| error_priority(*a).cmp(&error_priority(*b)))
-            .unwrap_or(500)
+        crate::sip::best_response::best_status(self.b_leg_status.iter().filter_map(|s| match s {
+            BLegStatus::Failed(code) => Some(*code),
+            _ => None,
+        }))
+        .unwrap_or(500)
     }
 
     /// Indices of non-winning B-legs that should be cancelled.
@@ -942,7 +933,7 @@ impl CallActor {
         }
         // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
         let improves = self.fork_best_failure.as_ref().map_or(true, |best| {
-            error_priority(status_code) > error_priority(best.status_code)
+            ResponseRank::of(status_code) > ResponseRank::of(best.status_code)
         });
         if improves {
             if let Some(leg) = self.b_legs.get(index) {
@@ -1017,7 +1008,7 @@ impl CallActor {
         let beats_timeout = self
             .fork_best_failure
             .as_ref()
-            .is_some_and(|best| error_priority(best.status_code) > error_priority(408));
+            .is_some_and(|best| ResponseRank::of(best.status_code) > ResponseRank::of(408));
         if !beats_timeout {
             return None;
         }
@@ -1062,17 +1053,6 @@ impl CallActor {
             let _ = handle.tx.try_send(LegMessage::Shutdown);
         }
     }
-}
-/// Priority score for error response codes.
-fn error_priority(code: u16) -> u32 {
-    let class_weight = match code {
-        600..=699 => 3000,
-        500..=599 => 2000,
-        400..=499 => 1000,
-        300..=399 => 0,
-        _ => 0,
-    };
-    class_weight + code as u32
 }
 
 // ---------------------------------------------------------------------------

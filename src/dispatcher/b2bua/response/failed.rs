@@ -143,7 +143,8 @@ pub fn fail_forked_call(
 
 /// The call fails on `message`, a B-leg's final failure: the LCR route sequence
 /// gets its chance first, then `@b2bua.on_failure`, the ACK (unless `acked`),
-/// the relayed failure and the teardown.
+/// the relayed failure (a generated 500 in place of a 503, RFC 3261 §16.7) and
+/// the teardown.
 fn fail_call_on_b_leg_failure(
     call_id: &str,
     branch: &str,
@@ -195,6 +196,51 @@ fn fail_call_on_b_leg_failure(
             return;
         };
 
+        // RFC 3261 §16.7 step 6: a 503 says one downstream element is
+        // unavailable, not that this call cannot be served, so the caller is
+        // sent a 500 generated from its own INVITE instead of the B-leg's 503
+        // and its Retry-After. This is the failure the call ends on, be it a
+        // single dial, a fork's best branch or the last carrier of an exhausted
+        // route sequence; the sequence has already had its chance to fail over
+        // on the 503 above. The CDR and @b2bua.on_failure report the 500 the
+        // caller gets, and the B-leg's own 503 is still what is ACKed. Without
+        // the A-leg INVITE (logged) no 500 can be built, and the B-leg's
+        // response is relayed as before.
+        //
+        // An exhausted route sequence ends on the best of its carriers' failures
+        // (§16.7 step 6 over every attempt, this one included), not on whichever
+        // carrier happened to be tried last. When that best came from an earlier
+        // carrier, only its status was kept, so the caller's failure is generated
+        // from the A-leg INVITE with that status. A relayed auth challenge is the
+        // caller's to answer and is never swapped for another attempt's failure.
+        let chosen_status = if relay_challenge {
+            status_code
+        } else {
+            state
+                .call_actors
+                .best_route_error(call_id)
+                .unwrap_or(status_code)
+        };
+        let generated_failure = {
+            let upstream = crate::sip::best_response::upstream_status(chosen_status);
+            (upstream != status_code)
+                .then(|| {
+                    a_leg_final_response(
+                        call_id,
+                        &snapshot.a_leg,
+                        snapshot.a_leg_invite.as_ref(),
+                        upstream,
+                        best_error_reason(upstream),
+                        state,
+                    )
+                })
+                .flatten()
+        };
+        let upstream_status = generated_failure
+            .as_ref()
+            .and_then(SipMessage::status_code)
+            .unwrap_or(status_code);
+
         // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
         // whether a @b2bua.on_failure handler is registered — the record must be
         // written for the failed call either way. Skipped for a relayed challenge
@@ -203,15 +249,15 @@ fn fail_call_on_b_leg_failure(
             // Every carrier tried, before the record is closed — an exhausted
             // sequence is exactly where the attempt list matters most.
             cdr_stamp_route_attempts(state, call_id);
-            cdr_finalize_b2bua_fail(state, call_id, status_code);
+            cdr_finalize_b2bua_fail(state, call_id, upstream_status);
         }
 
         // Error response — invoke @b2bua.on_failure with (PyCall, code, reason).
         // Skipped for a relayed challenge (not a failure — the caller authenticates).
         if run_failure_handlers(
             call_id,
-            message,
-            status_code,
+            generated_failure.as_ref().unwrap_or(message),
+            upstream_status,
             state,
             snapshot,
             relay_challenge,
@@ -244,43 +290,49 @@ fn fail_call_on_b_leg_failure(
             return;
         }
 
-        // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
-        if let Some((ref _b_cid, ref b_ftag)) = snapshot.b_leg_dialog {
-            crate::b2bua::actor::Dialog::rewrite_headers(
-                message,
-                &snapshot.a_leg.dialog.call_id,
-                b_ftag,
-                snapshot.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                Some(&snapshot.a_leg.dialog.local_tag),
-            );
-        }
-        // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
-        if let Some(invite_arc) = &snapshot.a_leg_invite {
-            if let Ok(invite) = invite_arc.lock() {
-                if let Some(vias) = invite.headers.get_all("Via") {
-                    message.headers.set_all("Via", vias.clone());
+        let upstream_message = match generated_failure {
+            Some(failure) => failure,
+            None => {
+                // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
+                if let Some((ref _b_cid, ref b_ftag)) = snapshot.b_leg_dialog {
+                    crate::b2bua::actor::Dialog::rewrite_headers(
+                        message,
+                        &snapshot.a_leg.dialog.call_id,
+                        b_ftag,
+                        snapshot.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                        Some(&snapshot.a_leg.dialog.local_tag),
+                    );
                 }
-                // Restore A-leg CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
-                // equal the request CSeq). B-leg has independent CSeq numbering.
-                if let Some(cseq) = invite.headers.cseq() {
-                    message.headers.set("CSeq", cseq.clone());
+                // Replace B-leg Via(s) with A-leg Via(s) from the stored INVITE.
+                if let Some(invite_arc) = &snapshot.a_leg_invite {
+                    if let Ok(invite) = invite_arc.lock() {
+                        if let Some(vias) = invite.headers.get_all("Via") {
+                            message.headers.set_all("Via", vias.clone());
+                        }
+                        // Restore A-leg CSeq (RFC 3261 §8.2.6.2 — response CSeq MUST
+                        // equal the request CSeq). B-leg has independent CSeq numbering.
+                        if let Some(cseq) = invite.headers.cseq() {
+                            message.headers.set("CSeq", cseq.clone());
+                        }
+                    }
                 }
+                // Sanitize B-leg headers before forwarding to A-leg
+                sanitize_b2bua_response(
+                    message,
+                    state,
+                    snapshot.a_leg.transport.transport,
+                    snapshot.a_leg_local_addr,
+                    snapshot.a_leg_supports_100rel,
+                    call_id,
+                );
+                message.clone()
             }
-        }
-        // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(
-            message,
-            state,
-            snapshot.a_leg.transport.transport,
-            snapshot.a_leg_local_addr,
-            snapshot.a_leg_supports_100rel,
-            call_id,
-        );
+        };
         // Pin the reply egress socket to the A-leg INVITE's arrival listener
         // (`snapshot.a_leg_local_addr`) so a multi-homed UDP host answers on the port it
         // received on. No-op for stream transports and single-listener hosts.
         send_message_from(
-            message.clone(),
+            upstream_message,
             snapshot.a_leg.transport.transport,
             snapshot.a_leg.transport.remote_addr,
             snapshot.a_leg.transport.connection_id,
@@ -320,13 +372,15 @@ fn fail_call_on_b_leg_failure(
         // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
         // the call has not failed and the reservation must survive the re-INVITE.
         if !relay_challenge {
-            // The B-leg's own final status is the cause: a busy reports -486, a
-            // ring timeout -408, and so on, which is what makes an unanswered
-            // call distinguishable from a normal hangup on the OCS side.
+            // The status the caller was sent is the cause: a busy reports -486,
+            // a ring timeout -408, and so on, which is what makes an unanswered
+            // call distinguishable from a normal hangup on the OCS side. It is
+            // the same status the CDR and @b2bua.on_failure report, so the three
+            // never disagree about why a call ended.
             spawn_ro_b2bua_stop(
                 state,
                 call_id,
-                crate::diameter::rf::sip_status_to_cause_code(status_code),
+                crate::diameter::rf::sip_status_to_cause_code(upstream_status),
             );
         }
 
@@ -930,11 +984,12 @@ pub fn advance_route_sequence(
     Some(b_leg_acked_for_reroute)
 }
 
-/// Run `@b2bua.on_failure`. Returns `true` when a handler re-routed the
-/// call, so nothing is relayed to the A-leg here.
+/// Run `@b2bua.on_failure` with `status_code` and the reason phrase of
+/// `message`, the failure the caller is sent. Returns `true` when a handler
+/// re-routed the call, so nothing is relayed to the A-leg here.
 pub fn run_failure_handlers(
     call_id: &str,
-    message: &mut SipMessage,
+    message: &SipMessage,
     status_code: u16,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,

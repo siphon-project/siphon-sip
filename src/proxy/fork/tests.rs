@@ -1,6 +1,7 @@
 //! Unit tests for proxy fork aggregation — RFC 3261 §16.7.
 
 use super::*;
+use crate::sip::builder::SipMessageBuilder;
 use crate::sip::uri::{Scheme, SipUri};
 
 /// Helper: build a `SipUri` from a user@host string.
@@ -122,13 +123,16 @@ fn test_parallel_all_fail_selects_best_error() {
 
     // Branch 2: 503
     let action = aggregator.on_branch_response(2, 503);
-    // All branches done — best error is 503 (5xx beats 4xx)
-    assert_eq!(action, ForkAction::ForwardBestError(503));
+    // All branches done.  RFC 3261 §16.7 step 6 chooses the lowest class
+    // present, so a 4xx beats the 503, and 486 beats 404 on the higher code.
+    // This expected 503 under the old 5xx-over-4xx ranking.
+    assert_eq!(action, ForkAction::ForwardBestError(486));
 }
 
 #[test]
 fn test_parallel_best_error_priority() {
-    // 6xx > 5xx > 4xx; within a class, highest code wins
+    // RFC 3261 §16.7 step 6: the lowest class present wins; within a class,
+    // the highest code (with 503 below every other 5xx).
     let mut aggregator = make_aggregator(4, ForkStrategy::Parallel);
     for index in 0..4 {
         aggregator.mark_trying(index);
@@ -139,12 +143,13 @@ fn test_parallel_best_error_priority() {
     aggregator.on_branch_response(2, 500);
 
     let action = aggregator.on_branch_response(3, 503);
-    // 503 wins over 500 (same class, higher code)
-    assert_eq!(action, ForkAction::ForwardBestError(503));
+    // The 4xx class beats both 5xx.  This expected 503 under the old ranking,
+    // which put 5xx above 4xx and the higher 503 above 500.
+    assert_eq!(action, ForkAction::ForwardBestError(486));
 }
 
 #[test]
-fn test_parallel_6xx_beats_5xx_in_best_error() {
+fn test_parallel_4xx_beats_5xx_in_best_error() {
     let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
     for index in 0..2 {
         aggregator.mark_trying(index);
@@ -152,10 +157,11 @@ fn test_parallel_6xx_beats_5xx_in_best_error() {
 
     aggregator.on_branch_response(0, 500);
     // Note: 6xx in on_branch_response returns Forward6xx immediately,
-    // so test the best_error fallback with only 4xx/5xx branches
-    // and verify 5xx outranks 4xx.
+    // so test the best-failure fallback with only 4xx/5xx branches.
+    // RFC 3261 §16.7 step 6 chooses the lowest class, so the 404 goes
+    // upstream.  This expected the 500 under the old 5xx-over-4xx ranking.
     let action = aggregator.on_branch_response(1, 404);
-    assert_eq!(action, ForkAction::ForwardBestError(500));
+    assert_eq!(action, ForkAction::ForwardBestError(404));
 }
 
 #[test]
@@ -252,10 +258,11 @@ fn test_sequential_all_fail_returns_best_error() {
     let action = aggregator.on_branch_response(1, 486);
     assert_eq!(action, ForkAction::TryNext(2));
 
-    // Branch 2: 503 — all exhausted
+    // Branch 2: 503 — all exhausted.  RFC 3261 §16.7 step 6: the 4xx class
+    // beats the 503.  This expected 503 under the old 5xx-over-4xx ranking.
     aggregator.mark_trying(2);
     let action = aggregator.on_branch_response(2, 503);
-    assert_eq!(action, ForkAction::ForwardBestError(503));
+    assert_eq!(action, ForkAction::ForwardBestError(486));
 }
 
 // -----------------------------------------------------------------------
@@ -358,10 +365,13 @@ fn local_failures_are_still_forwarded_when_they_are_all_there_is() {
     aggregator.on_branch_response(0, 503);
     aggregator.mark_local_failure(1);
 
+    // RFC 3261 §16.7 step 6 (and §16.8, a timeout is a 408 in the response
+    // context): the 4xx beats the 503.  This expected 503 under the old
+    // 5xx-over-4xx ranking.
     assert_eq!(
         aggregator.on_branch_response(1, 408),
-        ForkAction::ForwardBestError(503),
-        "with nothing real to prefer, normal class ordering applies"
+        ForkAction::ForwardBestError(408),
+        "with nothing real to prefer, the lowest class wins"
     );
 }
 
@@ -372,9 +382,11 @@ fn peer_responses_keep_their_class_ordering_among_themselves() {
     aggregator.mark_trying(1);
 
     aggregator.on_branch_response(0, 486);
+    // RFC 3261 §16.7 step 6: the lowest class present wins, so the 486 goes
+    // upstream.  This expected 503 under the old 5xx-over-4xx ranking.
     assert_eq!(
         aggregator.on_branch_response(1, 503),
-        ForkAction::ForwardBestError(503)
+        ForkAction::ForwardBestError(486)
     );
 }
 
@@ -403,4 +415,297 @@ fn branches_start_out_attributed_to_the_peer() {
         .branches
         .iter()
         .all(|branch| branch.origin == ResponseOrigin::Peer));
+}
+
+// -----------------------------------------------------------------------
+// RFC 3261 §16.7 steps 6 and 7 — the response that goes upstream
+// -----------------------------------------------------------------------
+
+/// Helper: a branch's final response, To-tagged so a test can tell whose
+/// response was chosen.
+fn branch_response(status_code: u16, to_tag: &str) -> SipMessage {
+    SipMessageBuilder::new()
+        .response(status_code, "Failed".to_string())
+        .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-uac".to_string())
+        .from("<sip:alice@example.com>;tag=uac".to_string())
+        .to(format!("<sip:bob@example.com>;tag={to_tag}"))
+        .call_id("fork-best@example.com".to_string())
+        .cseq("1 INVITE".to_string())
+        .content_length(0)
+        .build()
+        .unwrap()
+}
+
+/// Helper: the To-tag of a response.
+fn to_tag(response: &SipMessage) -> Option<String> {
+    response
+        .headers
+        .to()
+        .and_then(|to| to.split("tag=").nth(1))
+        .map(str::to_string)
+}
+
+/// Helper: every value of a header, in order.
+fn header_values(response: &SipMessage, name: &str) -> Vec<String> {
+    response.headers.get_all(name).cloned().unwrap_or_default()
+}
+
+#[test]
+fn a_redirect_beats_a_client_error() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.on_branch_response(0, 486);
+    assert_eq!(
+        aggregator.on_branch_response(1, 302),
+        ForkAction::ForwardBestError(302),
+        "3xx is a lower class than 4xx"
+    );
+}
+
+#[test]
+fn a_resubmission_hint_beats_a_higher_4xx() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.on_branch_response(0, 486);
+    assert_eq!(
+        aggregator.on_branch_response(1, 407),
+        ForkAction::ForwardBestError(407),
+        "a 407 tells the caller how to resubmit"
+    );
+}
+
+/// RFC 3261 §16.8: a timed-out branch is a 408 in the response context, so it
+/// competes as a 4xx.  The preference for a peer's answer only breaks ties
+/// within a class and cannot lift a peer's 5xx over it.
+#[test]
+fn a_timeout_the_proxy_invented_still_beats_a_server_error() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.mark_local_failure(0);
+    aggregator.on_branch_response(0, 408);
+    assert_eq!(
+        aggregator.on_branch_response(1, 500),
+        ForkAction::ForwardBestError(408)
+    );
+}
+
+#[test]
+fn the_chosen_branch_response_goes_upstream_with_its_own_headers() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    let mut redirect = branch_response(302, "moved");
+    redirect
+        .headers
+        .set("Contact", "<sip:bob@198.51.100.7>".to_string());
+
+    assert_eq!(
+        aggregator.on_response(0, 486, &branch_response(486, "busy")),
+        ForkAction::ContinueWaiting
+    );
+    assert_eq!(
+        aggregator.on_response(1, 302, &redirect),
+        ForkAction::ForwardBestError(302)
+    );
+
+    let chosen = aggregator
+        .take_best_response()
+        .expect("the chosen branch's response was fed");
+    assert_eq!(chosen.status_code(), Some(302));
+    assert_eq!(to_tag(&chosen).as_deref(), Some("moved"));
+    assert_eq!(
+        chosen.headers.get("Contact").map(String::as_str),
+        Some("<sip:bob@198.51.100.7>"),
+        "a redirect is useless without its Contact"
+    );
+    assert!(
+        aggregator.take_best_response().is_none(),
+        "the chosen response is handed over once"
+    );
+}
+
+#[test]
+fn a_sequential_fork_forwards_the_best_attempt_not_the_last() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Sequential);
+    aggregator.mark_trying(0);
+    assert_eq!(
+        aggregator.on_response(0, 404, &branch_response(404, "gone")),
+        ForkAction::TryNext(1)
+    );
+
+    aggregator.mark_trying(1);
+    assert_eq!(
+        aggregator.on_response(1, 503, &branch_response(503, "down")),
+        ForkAction::ForwardBestError(404)
+    );
+    let chosen = aggregator.take_best_response().expect("404 was fed");
+    assert_eq!(to_tag(&chosen).as_deref(), Some("gone"));
+}
+
+/// A fork of nothing but 503s settles on the 503.  It is the proxy core, not
+/// the aggregator, that sends a generated 500 in its place (§16.7 step 6).
+#[test]
+fn a_fork_of_only_503s_settles_on_503() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.on_response(0, 503, &branch_response(503, "down-a"));
+    assert_eq!(
+        aggregator.on_response(1, 503, &branch_response(503, "down-b")),
+        ForkAction::ForwardBestError(503)
+    );
+    assert_eq!(crate::sip::best_response::upstream_status(503), 500);
+}
+
+/// RFC 3261 §16.7 step 7: the forwarded 401/407 carries the challenges of
+/// every other 401/407 branch, values unmodified.
+#[test]
+fn a_forwarded_challenge_carries_every_other_branch_challenge() {
+    let mut aggregator = make_aggregator(4, ForkStrategy::Parallel);
+    for index in 0..4 {
+        aggregator.mark_trying(index);
+    }
+
+    let www_a = r#"Digest realm="a.example.com", nonce="n1", qop="auth""#;
+    let www_c = r#"Digest realm="c.example.com", nonce="n3", algorithm=SHA-256"#;
+    let proxy_b = r#"Digest realm="b.example.com", nonce="n2""#;
+
+    let mut unauthorized_a = branch_response(401, "realm-a");
+    unauthorized_a
+        .headers
+        .set("WWW-Authenticate", www_a.to_string());
+    let mut proxy_challenge_b = branch_response(407, "realm-b");
+    proxy_challenge_b
+        .headers
+        .set("Proxy-Authenticate", proxy_b.to_string());
+    let mut unauthorized_c = branch_response(401, "realm-c");
+    unauthorized_c
+        .headers
+        .set("WWW-Authenticate", www_c.to_string());
+
+    aggregator.on_response(0, 401, &unauthorized_a);
+    aggregator.on_response(1, 486, &branch_response(486, "busy"));
+    aggregator.on_response(2, 401, &unauthorized_c);
+    assert_eq!(
+        aggregator.on_response(3, 407, &proxy_challenge_b),
+        ForkAction::ForwardBestError(407),
+        "among the resubmission hints the highest code wins"
+    );
+
+    let chosen = aggregator.take_best_response().expect("407 was fed");
+    assert_eq!(to_tag(&chosen).as_deref(), Some("realm-b"));
+    assert_eq!(header_values(&chosen, "Proxy-Authenticate"), vec![proxy_b]);
+    assert_eq!(
+        header_values(&chosen, "WWW-Authenticate"),
+        vec![www_a, www_c],
+        "every other 401's challenge, in branch order"
+    );
+}
+
+#[test]
+fn a_chosen_401_keeps_its_own_challenge_first() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    let first = r#"Digest realm="first.example.com", nonce="n1""#;
+    let second = r#"Digest realm="second.example.com", nonce="n2""#;
+    let mut first_401 = branch_response(401, "first");
+    first_401.headers.set("WWW-Authenticate", first.to_string());
+    let mut second_401 = branch_response(401, "second");
+    second_401
+        .headers
+        .set("WWW-Authenticate", second.to_string());
+
+    aggregator.on_response(0, 401, &first_401);
+    assert_eq!(
+        aggregator.on_response(1, 401, &second_401),
+        ForkAction::ForwardBestError(401)
+    );
+
+    // Either 401 may be chosen (§16.7 step 6 leaves equal responses to the
+    // proxy); whichever it is keeps its own challenge first and gains the other.
+    let chosen = aggregator.take_best_response().expect("401 was fed");
+    let (own, other) = match to_tag(&chosen).as_deref() {
+        Some("first") => (first, second),
+        Some("second") => (second, first),
+        tag => panic!("chosen response is from neither branch: {tag:?}"),
+    };
+    assert_eq!(header_values(&chosen, "WWW-Authenticate"), vec![own, other]);
+}
+
+#[test]
+fn challenges_are_not_added_to_a_response_that_is_not_a_challenge() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    let mut unauthorized = branch_response(401, "auth");
+    unauthorized
+        .headers
+        .set("WWW-Authenticate", r#"Digest realm="a""#.to_string());
+    aggregator.on_response(0, 401, &unauthorized);
+    assert_eq!(
+        aggregator.on_response(1, 302, &branch_response(302, "moved")),
+        ForkAction::ForwardBestError(302)
+    );
+
+    let chosen = aggregator.take_best_response().expect("302 was fed");
+    assert!(header_values(&chosen, "WWW-Authenticate").is_empty());
+}
+
+/// Kept branch responses live only while the fork is open: every one is
+/// released the moment a final goes upstream, and nothing arriving after that
+/// is kept.  The per-fork analogue of a store draining to baseline.
+#[test]
+fn kept_branch_responses_are_released_once_a_final_goes_upstream() {
+    // A 2xx wins: the failure kept so far is released, and the straggler
+    // the CANCEL draws back is never kept.
+    let mut answered = make_aggregator(3, ForkStrategy::Parallel);
+    for index in 0..3 {
+        answered.mark_trying(index);
+    }
+    answered.on_response(0, 180, &branch_response(180, "ringing"));
+    assert_eq!(
+        answered.kept_response_count(),
+        0,
+        "a provisional is not kept"
+    );
+    answered.on_response(0, 486, &branch_response(486, "busy"));
+    assert_eq!(answered.kept_response_count(), 1);
+    assert_eq!(
+        answered.on_response(1, 200, &branch_response(200, "answered")),
+        ForkAction::Forward2xx
+    );
+    assert_eq!(answered.kept_response_count(), 0, "a 2xx went upstream");
+    answered.on_response(2, 487, &branch_response(487, "cancelled"));
+    assert_eq!(answered.kept_response_count(), 0, "a straggler is not kept");
+    assert!(answered.take_best_response().is_none());
+
+    // A 6xx ends the fork the same way.
+    let mut declined = make_aggregator(2, ForkStrategy::Parallel);
+    declined.mark_trying(0);
+    declined.mark_trying(1);
+    declined.on_response(0, 486, &branch_response(486, "busy"));
+    declined.on_response(1, 603, &branch_response(603, "decline"));
+    assert_eq!(declined.kept_response_count(), 0, "a 6xx went upstream");
+
+    // Every branch failing: the chosen response is handed over once and
+    // nothing else is left behind.
+    let mut failed = make_aggregator(2, ForkStrategy::Parallel);
+    failed.mark_trying(0);
+    failed.mark_trying(1);
+    failed.on_response(0, 486, &branch_response(486, "busy"));
+    failed.on_response(1, 480, &branch_response(480, "away"));
+    assert_eq!(failed.kept_response_count(), 0);
+    assert!(failed.take_best_response().is_some());
+    assert!(failed.take_best_response().is_none());
 }

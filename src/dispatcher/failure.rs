@@ -1,7 +1,8 @@
 //! What happens when every branch of a relayed request failed.
 //!
-//! Picks the best error (6xx > 5xx > 4xx), runs the script failure handler,
-//! and honours a retarget without letting it loop.
+//! Runs the script failure handler on the failure chosen per RFC 3261 §16.7
+//! step 6 (see [`crate::sip::best_response`]), and honours a retarget without
+//! letting it loop.
 
 use super::*;
 
@@ -297,12 +298,13 @@ pub(super) fn downgrade_503_for_upstream(
     status_code: u16,
     server_key: &TransactionKey,
 ) -> u16 {
-    if status_code != 503 {
+    let forwarded = crate::sip::best_response::upstream_status(status_code);
+    if forwarded == status_code {
         return status_code;
     }
     if let StartLine::Response(ref mut status_line) = message.start_line {
-        status_line.status_code = 500;
-        status_line.reason_phrase = "Server Internal Error".to_string();
+        status_line.status_code = forwarded;
+        status_line.reason_phrase = crate::sip::best_response::SERVER_INTERNAL_ERROR.to_string();
     }
     // Retry-After on a 503 is about the unavailable downstream, not about us.
     message.headers.remove("Retry-After");
@@ -310,7 +312,7 @@ pub(super) fn downgrade_503_for_upstream(
         key = %server_key,
         "forwarding 503 upstream as 500 (RFC 3261 §16.7)"
     );
-    500
+    forwarded
 }
 
 /// Answer a proxy client branch that will never be answered from the network,
@@ -369,10 +371,9 @@ pub(super) fn fail_branch_locally(
     };
 
     // Tell the aggregator this branch's answer is ours, not the callee's,
-    // *before* injecting it.  A sibling branch that actually reached an
-    // endpoint must win the best-error selection: without this a transport
-    // error (503, class 5xx) would outrank a real `486 Busy Here` (class 4xx)
-    // and the caller would hear "Server Internal Error" instead of "Busy".
+    // *before* injecting it.  Within the class RFC 3261 §16.7 step 6 chooses, a
+    // sibling branch that actually reached an endpoint must win: without this a
+    // local timeout 408 would outrank a real `404 Not Found` on the higher code.
     if let (Some(aggregator), Some(index)) = (&fork_aggregator, branch_index) {
         match aggregator.lock() {
             Ok(mut agg) => agg.mark_local_failure(index),

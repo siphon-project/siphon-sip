@@ -891,11 +891,16 @@ pub(super) fn handle_response(
 
             // --- Fork aggregator decision ---
             if let (Some(ref aggregator), Some(index)) = (&fork_agg, branch_index) {
-                let fork_action = match aggregator.lock() {
-                    Ok(mut agg) => agg.on_branch_response(index, status_code),
+                // Decided and taken under one lock, so a straggler cannot slip
+                // between the fork settling and its chosen response being read.
+                let (fork_action, chosen_response) = match aggregator.lock() {
+                    Ok(mut agg) => {
+                        let action = agg.on_response(index, status_code, &message);
+                        (action, agg.take_best_response())
+                    }
                     Err(_) => {
                         error!("fork aggregator lock poisoned");
-                        crate::proxy::fork::ForkAction::ContinueWaiting
+                        (crate::proxy::fork::ForkAction::ContinueWaiting, None)
                     }
                 };
 
@@ -925,34 +930,41 @@ pub(super) fn handle_response(
                     crate::proxy::fork::ForkAction::ForwardProvisional(_code) => {
                         // Forward provisional upstream (no cleanup)
                     }
-                    crate::proxy::fork::ForkAction::ForwardBestError(best_code) => {
-                        debug!(best_code = best_code, "fork: all branches failed");
+                    crate::proxy::fork::ForkAction::ForwardBestError(chosen_code) => {
+                        debug!(best_code = chosen_code, "fork: all branches failed");
                         // RFC 3261 §16.7 step 6 — the proxy does not pass a 503
-                        // upstream even when it is the best error it has (which
-                        // it will be whenever every branch hit a transport
-                        // error, §16.9).  This arm builds and sends its own
-                        // response, so it needs the rule applied at the source
-                        // rather than at the shared forward path below.
-                        let best_code = if best_code == 503 {
-                            debug!("fork: best error is 503 — forwarding 500 (RFC 3261 §16.7)");
-                            500
-                        } else {
-                            best_code
-                        };
-                        let reason = best_error_reason(best_code);
+                        // upstream even when it is the best failure it has
+                        // (which it is only when no branch did better, e.g. all
+                        // hit a transport error, §16.9).  A 500 is generated in
+                        // its place rather than the 503 relayed with its
+                        // Retry-After.  This arm sends its own response, so the
+                        // rule is applied here and not at the forward path below.
+                        let best_code = crate::sip::best_response::upstream_status(chosen_code);
+                        if best_code != chosen_code {
+                            debug!("fork: best failure is 503 — forwarding 500 (RFC 3261 §16.7)");
+                        }
                         let Ok(session) = session_arc.read() else {
                             error!("session_arc read lock poisoned");
                             return;
                         };
                         let original_request = session.original_request.clone();
-                        let best_response = build_response(
-                            &original_request,
-                            best_code,
-                            reason,
-                            state.server_header.as_deref(),
-                            &[],
-                        );
                         drop(session);
+                        // The chosen branch's own response goes upstream
+                        // (§16.7 steps 6-8), because its headers are the point:
+                        // a 3xx's Contact, a 401/407's challenges (with every
+                        // other branch's, step 7).  One is built from the
+                        // request only for a 503 replaced by 500.
+                        let best_response =
+                            match chosen_response.filter(|_| best_code == chosen_code) {
+                                Some(response) => response,
+                                None => build_response(
+                                    &original_request,
+                                    best_code,
+                                    best_error_reason(best_code),
+                                    state.server_header.as_deref(),
+                                    &[],
+                                ),
+                            };
 
                         // CDR: capture the dialog key before `original_request`
                         // may be moved into the on_failure PyRequest, so the
