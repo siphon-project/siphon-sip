@@ -316,44 +316,6 @@ fn default_udp_egress_addr_honours_extended_form() {
     );
 }
 
-/// A real-shaped TS 29.514 `EventsNotification` (the body a PCF POSTs to the
-/// AF callback) must reach the script with EVERY field intact. The old typed
-/// projection both dropped `evSubsUri`/`succResourcAllocReports` and `422`'d
-/// the whole callback because its `flows` model wanted `flowId` instead of
-/// the spec's `{medCompN, fNums}`.
-#[test]
-fn pcf_notification_body_is_passed_through_losslessly() {
-    let body = r#"{
-        "evSubsUri": "http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events",
-        "evNotifs": [
-            {
-                "event": "SUCCESSFUL_RESOURCES_ALLOCATION",
-                "flows": [ { "medCompN": 1, "fNums": [1, 2] } ]
-            }
-        ],
-        "succResourcAllocReports": [ { "medComponents": {} } ]
-    }"#;
-    let out = pcf_notification_body_to_json(body.as_bytes()).expect("well-formed JSON must decode");
-    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-
-    // evSubsUri — the correlation key — survives.
-    assert_eq!(
-        value["evSubsUri"].as_str(),
-        Some("http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events")
-    );
-    // The spec flow shape ({medCompN, fNums}) survives — would have 422'd before.
-    let flow = &value["evNotifs"][0]["flows"][0];
-    assert_eq!(flow["medCompN"].as_u64(), Some(1));
-    assert_eq!(flow["fNums"][1].as_u64(), Some(2));
-    // Fields outside the old typed model survive.
-    assert!(value.get("succResourcAllocReports").is_some());
-}
-
-#[test]
-fn pcf_notification_body_rejects_non_json() {
-    assert!(pcf_notification_body_to_json(b"not json at all").is_none());
-}
-
 #[test]
 fn register_task_records_in_order() {
     let server = SiphonServer::builder()

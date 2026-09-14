@@ -113,6 +113,9 @@ pub enum HandlerKind {
     DiameterOnRequestCompleted,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
+    /// `@sbi.on_terminate` — the PCF terminated an app session (N5
+    /// `TerminationInfo`). Separate from `SbiOnEvent`: the session is ending.
+    SbiOnTerminate,
     /// `@rtpengine.on_dtmf` — inbound DTMF event from rtpengine.
     ///
     /// ``call_id`` and ``from_tag`` are optional filters: when set, only
@@ -1241,6 +1244,7 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "diameter.on_reply" => HandlerKind::DiameterOnReply,
             "diameter.on_request_completed" => HandlerKind::DiameterOnRequestCompleted,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
+            "sbi.on_terminate" => HandlerKind::SbiOnTerminate,
             "timer.every" => {
                 let meta = metadata.as_ref().ok_or_else(|| {
                     SiphonError::Script("timer.every handler missing metadata".into())
@@ -1940,6 +1944,29 @@ async def on_cancel(request):
         assert_eq!(state.handlers[0].kind, HandlerKind::ProxyCancel);
         assert!(state.handlers[0].is_async);
         assert_eq!(state.handlers_for(&HandlerKind::ProxyCancel).len(), 1);
+    }
+
+    #[test]
+    fn sbi_on_terminate_decorator_registers_apart_from_on_event() {
+        let source = r#"
+from siphon import sbi
+
+@sbi.on_event
+def on_event(event):
+    pass
+
+@sbi.on_terminate
+async def on_terminate(termination):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        let terminate = state.handlers_for(&HandlerKind::SbiOnTerminate);
+        assert_eq!(terminate.len(), 1);
+        assert!(terminate[0].is_async);
+        let event = state.handlers_for(&HandlerKind::SbiOnEvent);
+        assert_eq!(event.len(), 1);
+        assert!(!event[0].is_async);
     }
 
     #[test]

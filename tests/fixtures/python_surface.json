@@ -2292,7 +2292,7 @@
       "create_session": {
         "doc": "Create an N5 app session for QoS policy authorization.",
         "kind": "method_descriptor",
-        "sig": "($self, af_app_id=\"IMS Services\", sip_call_id=None, supi=None, ue_ipv4=None, ue_ipv6=None, dnn=None, notif_uri=None, media_components=None, pcf_uri=None)"
+        "sig": "($self, af_app_id=\"IMS Services\", sip_call_id=None, supi=None, ue_ipv4=None, ue_ipv6=None, dnn=None, notif_uri=None, media_components=None, pcf_uri=None, events=None)"
       },
       "delete_session": {
         "doc": "Delete an N5 app session.",
@@ -2307,7 +2307,7 @@
       "update_session": {
         "doc": "Update an N5 app session \u2014 media renegotiation (re-INVITE / UPDATE).",
         "kind": "method_descriptor",
-        "sig": "($self, session_id, media_components=None)"
+        "sig": "($self, session_id, media_components=None, events=None, notif_uri=None)"
       }
     },
     "Sdp": {

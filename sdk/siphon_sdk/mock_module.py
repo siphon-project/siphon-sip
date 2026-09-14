@@ -7774,6 +7774,8 @@ class MockSbi:
         self._binding: Optional[dict] = None
         #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
         self._bsf_error: bool = False
+        #: when True, delete_session fails (returns False, keeps the session).
+        self._delete_failure: bool = False
 
     @staticmethod
     def _session_id(session_ref: str) -> str:
@@ -7781,6 +7783,38 @@ class MockSbi:
         if session_ref.startswith(("http://", "https://")):
             return session_ref.rstrip("/").rsplit("/", 1)[-1]
         return session_ref
+
+    @staticmethod
+    def _event_subscription(events: Optional[list], notif_uri: Optional[str],
+                            creating: bool) -> Optional[dict]:
+        """Validate ``events`` / ``notif_uri`` as siphon does and return the
+        ``evSubsc`` member siphon sends, or ``None`` when it sends none."""
+        if events is None:
+            if notif_uri is not None and not creating:
+                raise ValueError(
+                    "notif_uri is only sent inside the event subscription; "
+                    "pass events with it"
+                )
+            return None
+        if isinstance(events, str) or not isinstance(events, (list, tuple)) \
+                or not all(isinstance(event, str) for event in events):
+            raise TypeError("events must be a list of event names (str)")
+        if not events:
+            raise ValueError("events must name at least one event")
+        if creating and notif_uri is None:
+            raise ValueError(
+                "events requires notif_uri: the PCF posts events to "
+                "{notif_uri}/notify"
+            )
+        subscription: dict = {
+            "events": [
+                {"event": event, "notifMethod": "EVENT_DETECTION"}
+                for event in events
+            ]
+        }
+        if notif_uri is not None:
+            subscription["notifUri"] = notif_uri
+        return subscription
 
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
@@ -7790,7 +7824,8 @@ class MockSbi:
                        dnn: Optional[str] = None,
                        notif_uri: Optional[str] = None,
                        media_components: Optional[list] = None,
-                       pcf_uri: Optional[str] = None) -> Optional[dict]:
+                       pcf_uri: Optional[str] = None,
+                       events: Optional[list[str]] = None) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -7800,25 +7835,52 @@ class MockSbi:
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
-            notif_uri: Notification URI for PCF events.
+            notif_uri: base URI of siphon's PCF callback listener,
+                ``http://<sbi.notif_listen>/sbi/events``. Sent as ``notifUri``,
+                where the PCF posts a termination (``/terminate``, to
+                ``@sbi.on_terminate``), and with ``events`` also as the
+                subscription's ``notifUri``, where it posts events
+                (``/notify``, to ``@sbi.on_event``).
             media_components: list of media-component dicts (same shape as
                 ``diameter.rx_aar``'s ``media_components``).
             pcf_uri: per-call N5 target — address this session at the given PCF
                 base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
                 configured ``npcf_url``. ``None`` ⇒ configured PCF.
+            events: PCF events to subscribe to, by TS 29.514 ``AfEvent`` name
+                (e.g. ``"FAILED_RESOURCES_ALLOCATION"``,
+                ``"SUCCESSFUL_RESOURCES_ALLOCATION"``, ``"QOS_NOTIF"``). Each is
+                sent with ``notifMethod`` ``"EVENT_DETECTION"``. Names are passed
+                through unchecked, so events newer than siphon work. Requires
+                ``notif_uri``. ``None`` (default) subscribes to nothing, and the
+                PCF sends no events.
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
             (the absolute resource URI — persist it and hand it back to
             ``update_session`` / ``delete_session`` for replica-independent
             teardown), or ``None``.
+
+        Raises:
+            ValueError: ``events`` is empty, or given without ``notif_uri``.
+            TypeError: ``events`` is not a list of strings.
+
+        Example::
+
+            result = sbi.create_session(
+                sip_call_id=request.call_id,
+                ue_ipv4=request.source_ip,
+                notif_uri="http://192.0.2.10:8080/sbi/events",
+                events=["FAILED_RESOURCES_ALLOCATION"],
+            )
         """
+        subscription = self._event_subscription(events, notif_uri, creating=True)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
             "sip_call_id": sip_call_id,
             "ue_ipv4": ue_ipv4,
             "pcf_uri": pcf_uri,
+            "ev_subsc": subscription,
         }
         base = (pcf_uri or "http://mock-pcf").rstrip("/")
         app_session_uri = (
@@ -7833,31 +7895,74 @@ class MockSbi:
     def delete_session(self, session_id: str) -> bool:
         """Delete an N5 app session.
 
+        ``True`` means the session no longer exists on the PCF: siphon deleted
+        it (the PCF answered 2xx), or it was already gone (the PCF answered
+        404). The second is the usual answer to the delete an
+        ``@sbi.on_terminate`` handler makes with ``termination["resUri"]``. In
+        both cases siphon stops tracking the session, so
+        ``siphon_sbi_npcf_app_sessions_active`` comes back down.
+
+        ``False`` means the delete failed (a transport error or any other
+        non-2xx answer); siphon keeps tracking the session.
+
+        In this mock an unknown session is treated as the PCF's 404 and
+        returns ``True``; use ``set_delete_failure`` to exercise ``False``.
+
         Args:
             session_id: The app session id from ``create_session()`` **or** the
                 absolute ``app_session_uri`` (replica-independent teardown).
 
         Returns:
-            ``True`` on success, ``False`` if session not found.
+            ``True`` when the session is gone (deleted or already removed),
+            ``False`` when the delete failed.
+
+        Example::
+
+            @sbi.on_terminate
+            def handle_termination(termination):
+                if not sbi.delete_session(termination["resUri"]):
+                    log.warn("app session delete failed; PCF still holds it")
         """
-        return self._sessions.pop(self._session_id(session_id), None) is not None
+        if self._delete_failure:
+            return False
+        self._sessions.pop(self._session_id(session_id), None)
+        return True
 
     def update_session(self, session_id: str,
-                       media_components: Optional[list] = None) -> Optional[dict]:
-        """Update an N5 app session (media renegotiation).
+                       media_components: Optional[list] = None,
+                       events: Optional[list[str]] = None,
+                       notif_uri: Optional[str] = None) -> Optional[dict]:
+        """Update an N5 app session (media renegotiation, event subscription).
+
+        The modify is a JSON merge patch, so only what you pass is sent.
 
         Args:
             session_id: The app session id to update, or the absolute
                 ``app_session_uri`` from ``create_session``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
+            events: replace the subscribed PCF events with these (same names
+                as ``create_session``). ``None`` (default) sends no subscription
+                and leaves the one the PCF holds untouched. Removing the
+                subscription is not possible from here.
+            notif_uri: a new callback base for the subscription
+                (``http://<sbi.notif_listen>/sbi/events``). Only sent with
+                ``events``; ``None`` keeps the one the PCF holds.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
+
+        Raises:
+            ValueError: ``events`` is empty, or ``notif_uri`` is given without
+                ``events``.
+            TypeError: ``events`` is not a list of strings.
         """
+        subscription = self._event_subscription(events, notif_uri, creating=False)
         resolved = self._session_id(session_id)
         if resolved not in self._sessions:
             return None
+        if subscription is not None:
+            self._sessions[resolved]["ev_subsc"] = subscription
         return {"app_session_id": resolved, "authorized": self._authorized}
 
     def discover_pcf_binding(self, ue_ipv4: Optional[str] = None,
@@ -7896,13 +8001,81 @@ class MockSbi:
         for the per-event list. Each entry's ``flows`` carries ``medCompN`` +
         ``fNums`` (not flow descriptions).
 
+        siphon serves the callback on ``sbi.notif_listen`` at
+        ``POST /sbi/events/notify``: advertise
+        ``http://<notif_listen>/sbi/events`` as ``notif_uri`` and the PCF
+        appends ``/notify``. The PCF only sends events you subscribed to with
+        ``create_session(events=[...])`` or ``update_session(events=[...])``.
+
+        Sync and async handlers both work. A handler that raises is logged and
+        the PCF still gets ``204``: a retry would hit the same bug. When
+        siphon's Python executor is saturated and the handler cannot run, the
+        PCF gets ``503`` so it knows the notification was not taken.
+
+        ``POST /sbi/events`` (no suffix) also reaches this hook, for a PCF that
+        posts to the advertised URI as-is. It is deprecated and goes away in the
+        next minor release.
+
+        Args:
+            fn: ``def handler(event: dict) -> None`` or the ``async def``
+                equivalent. ``event`` is the ``EventsNotification`` dict.
+
+        Returns:
+            ``fn`` unchanged, so it stays callable from tests.
+
         Example::
 
             @sbi.on_event
             def handle_pcf_event(event):
                 session_events_uri = event.get("evSubsUri")
                 for notif in event.get("evNotifs", []):
-                    log.info(f"PCF event: {notif['event']}")
+                    if notif["event"] == "FAILED_RESOURCES_ALLOCATION":
+                        log.warn(f"PCF could not allocate resources: {session_events_uri}")
+        """
+        return fn
+
+    @staticmethod
+    def on_terminate(fn: Any) -> Any:
+        """Register a handler for PCF-initiated app-session termination (N5).
+
+        The PCF sends this when the PDU session behind an app session is
+        released (the N5 counterpart of a Diameter Rx ASR). The handler
+        receives the PCF's ``TerminationInfo`` document (TS 29.514) verbatim as
+        a dict:
+
+        - ``termCause``: why, e.g. ``"PDU_SESSION_TERMINATION"`` or
+          ``"ALL_SDF_DEACTIVATION"``.
+        - ``resUri``: the app-session resource URI, the same value
+          ``create_session`` returned as ``app_session_uri``. Use it to find the
+          call the session belonged to.
+
+        TS 29.514 has the AF acknowledge the termination and then delete the
+        app session, so a handler normally releases its per-call state and
+        calls ``sbi.delete_session(termination["resUri"])``. That also drops
+        siphon's own tracking of the session.
+
+        This is a separate hook from ``on_event`` on purpose: an event leaves
+        the session in place, a termination means it is ending. siphon serves
+        it on ``sbi.notif_listen`` at ``POST /sbi/events/terminate``; the PCF
+        appends ``/terminate`` to the ``notif_uri`` given to
+        ``create_session``, so the same ``http://<notif_listen>/sbi/events``
+        base serves both callbacks. Answers follow ``on_event``: ``204`` once the
+        handlers ran (a raising handler is logged), ``503`` when the executor
+        could not run them.
+
+        Args:
+            fn: ``def handler(termination: dict) -> None`` or the ``async def``
+                equivalent.
+
+        Returns:
+            ``fn`` unchanged, so it stays callable from tests.
+
+        Example::
+
+            @sbi.on_terminate
+            async def handle_termination(termination):
+                log.warn(f"PCF ended app session: {termination['termCause']}")
+                sbi.delete_session(termination["resUri"])
         """
         return fn
 
@@ -7930,10 +8103,23 @@ class MockSbi:
         """
         self._bsf_error = raise_error
 
+    def set_delete_failure(self, fail: bool) -> None:
+        """Make ``delete_session`` fail (test helper).
+
+        Stands in for a PCF that answers the delete with an error other than
+        404, or cannot be reached: ``delete_session`` returns ``False`` and the
+        session stays tracked.
+
+        Args:
+            fail: when True, ``delete_session`` returns ``False``.
+        """
+        self._delete_failure = fail
+
     def clear(self) -> None:
-        """Reset all mock sessions (test helper)."""
+        """Reset all mock sessions and failure switches (test helper)."""
         self._sessions.clear()
         self._next_session_id = 1
+        self._delete_failure = False
         self._authorized = True
         self._binding = None
         self._bsf_error = False

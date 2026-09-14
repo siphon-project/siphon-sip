@@ -17,6 +17,40 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   RAR at `@diameter.on_request`. A value TS 29.214 does not define, including
   the void 0 and 5, raises `ValueError` naming it. Leave the argument out and
   no Specific-Action AVP is sent, as before.
+- **siphon serves both N5 callbacks, and `@sbi.on_terminate` hands a PCF
+  termination to the script.** TS 29.514 has the PCF post events to
+  `{evSubsc.notifUri}/notify` and a termination to `{notifUri}/terminate`.
+  siphon only served the bare `/sbi/events`, so a script advertising that URI
+  had both callbacks answered 404. The termination, which a PCF sends when the
+  PDU session behind an app session is released (the N5 counterpart of an Rx
+  ASR), never reached a script at all, so the app session and whatever the
+  script held for the call stayed put.
+
+  `sbi.notif_listen` now serves `POST /sbi/events/notify` (to `@sbi.on_event`)
+  and `POST /sbi/events/terminate` (to the new `@sbi.on_terminate`); anything
+  else is 404. Scripts keep advertising `http://<notif_listen>/sbi/events` as
+  `notif_uri` and need no config change, since the PCF appends the suffix.
+  `@sbi.on_terminate` receives the `TerminationInfo` verbatim (`termCause`, and
+  `resUri`, which is the `app_session_uri` `create_session` returned). It is a
+  separate hook from `on_event` because an event leaves the session in place and
+  a termination ends it. TS 29.514 has the AF delete the app session afterwards,
+  so a handler normally ends with `sbi.delete_session(termination["resUri"])`.
+  Sync and async handlers both work.
+- **`sbi.create_session(events=[...])` subscribes to PCF events.**
+  `create_session` never sent an event subscription, so the PCF had nothing to
+  notify and `@sbi.on_event` did not fire for a session siphon created. Each
+  name goes out as an `AfEventSubscription` with `notifMethod`
+  `EVENT_DETECTION`, under `ascReqData.evSubsc`, with the existing `notif_uri`
+  as its `notifUri`. One listener serves both callbacks, because events go to
+  `/notify` and a termination to `/terminate`. Names pass through as strings
+  (`AfEvent` is extensible). `events` without `notif_uri`, or an empty list,
+  raises `ValueError` instead of creating a session the PCF cannot notify.
+
+  `sbi.update_session(events=[...], notif_uri=...)` replaces the subscription.
+  It is in the merge patch only when `events` is given (with `notifUri` only
+  when `notif_uri` is), and never as `null`, which would remove it; `notif_uri`
+  without `events` raises `ValueError` rather than being dropped.
+
 - **`cdr.backends` writes every call record to several sinks at once.** A file
   on the node and delivery to an HTTP collector was a choice before: picking
   `http` gave up the durable copy, and picking `file` gave up delivery, so a
@@ -241,6 +275,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the M-bit, which table 5.3.1 forbids on this AVP, and a PCRF that does not
   know the AVP has to reject an AAR carrying it that way (RFC 6733 §4.1)
   instead of skipping it.
+- **`sbi.delete_session()` releases a session the PCF has already removed.**
+  When the app session is already gone on the PCF, which is the usual case for
+  the `sbi.delete_session(termination["resUri"])` an `@sbi.on_terminate`
+  handler makes, the delete is answered 404. siphon treated that as a failed
+  delete: it returned `False` and kept its own tracking entry, so
+  `siphon_sbi_npcf_app_sessions_active` grew by one for every such session and
+  never came back down. A 404 now means the session no longer exists, which is
+  what the delete asked for: the entry is released as on a 204 and the call
+  returns `True` (`NpcfClient::delete_app_session` returns `Ok(())`). Any other
+  error answer still returns `False` and keeps the entry.
+
+- **`sbi.update_session()` nests the modify under `ascReqData`.** TS 29.514
+  types the PATCH body as `AppSessionContextUpdateDataPatch`, which carries the
+  update data under `ascReqData` the same way create does. siphon sent it flat,
+  so the media components of a re-INVITE or UPDATE sat at the top level, where a
+  PCF reading the body by the OpenAPI finds nothing to modify. It is still a
+  JSON merge patch (`application/merge-patch+json`), and the script API is
+  unchanged. For crate embedders, `NpcfClient::update_app_session` takes the new
+  `AppSessionContextUpdateData` instead of `AppSessionContextReqData`, which
+  also carried create-only members (`ueIpv4`, `supi`, `notifUri`) that have no
+  place in a modify.
+
+- **A PCF callback siphon could not run is answered 503, not 204.** The N5
+  listener acknowledged every notification whether or not a handler saw it, so
+  when the Python executor queue was full or closed the PCF was told the event
+  had been taken and had no reason to try again. It now gets a 503. A handler
+  that raises still gets its 204: a retry would only hit the same bug, and the
+  exception is in the log.
+
 - **`control.apps[].on_lost` is read.** It parsed and nothing ever looked at it:
   only a per-call value (`call.handover(on_lost=…)`, `originate`'s argument)
   reached a channel, so an operator who set the policy once for the app got the
@@ -358,6 +421,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `rx::encode_aar` is the AAR encoder `rx::send_aar` and `diameter.rx_aar` now
   share. The Rust crate API is outside the versioning contract, so this ships
   in a minor; the scripting API only gains the new argument.
+- **`siphon::sbi::npcf::EventSubscription` is replaced by `EventsSubscReqData`,
+  with an `AfEventSubscription` per event.** This affects crate embedders only.
+  The old type had the shape of a single `AfEventSubscription`, so putting it in
+  `AppSessionContextReqData::ev_subsc` would have sent a malformed `evSubsc`.
+  The field is now `Option<EventsSubscReqData>`, `AppSessionContextUpdateData`
+  carries one too, and `EventsSubscReqData::event_detection(events, notif_uri)`
+  builds what the script API sends. The Rust crate API is outside the versioning
+  contract, which is why this lands in a minor release.
+
 - **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
 
   - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip
@@ -540,6 +612,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   documented as a per-request timeout, and discarded, so every call waited the
   peer's fixed 10 s. Values below 100 ms are floored, matching `forward_to`, so
   a `timeout_ms=0` cannot mean "give up before the request can be answered".
+
+### Deprecated
+
+- **`POST /sbi/events` on `sbi.notif_listen`.** It still dispatches to
+  `@sbi.on_event` in this release, for a PCF that posts to the advertised URI
+  without the `/notify` suffix TS 29.514 defines, and is removed in the next
+  minor release. siphon logs a warning the first time a notification arrives on
+  it.
 
 ### Removed
 

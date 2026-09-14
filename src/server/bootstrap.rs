@@ -1041,25 +1041,6 @@ pub(super) fn default_udp_egress_addr(
         .find_map(|entry| entry.address().parse::<std::net::SocketAddr>().ok())
 }
 
-/// Decode a PCF event-notification callback body (TS 29.514 `EventsNotification`)
-/// into the JSON string handed verbatim to `@sbi.on_event`.
-///
-/// The body is passed through **losslessly** — never projected through a typed
-/// Rust struct. `EventsNotification` is large and evolving (`evSubsUri`,
-/// `qosMonReports`, `succResourcAllocReports`, `accessType`, `plmnId`, …); a
-/// typed model would silently drop every field it doesn't list — including the
-/// required `evSubsUri` the script needs to correlate the event with a session —
-/// and an unmodelled inner shape (e.g. `flows` = `{medCompN, fNums}`, not
-/// `{flowId, …}`) would fail deserialization and `422` the entire callback,
-/// dropping the event. Returns `None` only when the body is not well-formed
-/// JSON.
-pub(super) fn pcf_notification_body_to_json(raw: &[u8]) -> Option<String> {
-    // Validate it parses as JSON (rejecting genuine garbage with a 400), then
-    // re-emit — every key/value is preserved.
-    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    serde_json::to_string(&value).ok()
-}
-
 /// Work out which listen addresses are shared between two protocol lists, and
 /// reject the pairings that cannot share one socket.
 ///

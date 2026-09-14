@@ -841,7 +841,8 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
 
     // Inject optional SBI singleton onto the existing `_SbiNamespace` stub as
     // `_inner` (rather than replacing the module attribute), so the Python
-    // `@sbi.on_event` decorator survives (the Rust namespace has no on_event)
+    // `@sbi.on_event` / `@sbi.on_terminate` decorators survive (the Rust
+    // namespace has neither)
     // and a script that already imported the stub still forwards to the Rust
     // impl via the stub's __getattr__.
     if let Some(sbi_py) = SBI_SINGLETON.get() {

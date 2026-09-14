@@ -60,15 +60,56 @@ pub struct MediaComponent {
     pub med_sub_comps: Option<IndexMap<String, MediaSubComponent>>,
 }
 
-/// Event subscription for PCF notifications (TS 29.514).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `notifMethod` for an event reported each time it is detected.
+const EVENT_DETECTION: &str = "EVENT_DETECTION";
+
+/// One event an AF subscribes to (TS 29.514 `AfEventSubscription`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EventSubscription {
-    /// Event type (e.g. "UP_PATH_CH_EVENT", "PLMN_CH_EVENT", "QOS_NOTIF").
+pub struct AfEventSubscription {
+    /// Event name (`event`, required), e.g. "FAILED_RESOURCES_ALLOCATION" or
+    /// "QOS_NOTIF". A string rather than an enum because `AfEvent` is
+    /// extensible.
     pub event: String,
-    /// Notification method: "EVENT_DETECTION", "ONE_TIME", "PERIODIC".
+    /// When the PCF reports it (`notifMethod`): "EVENT_DETECTION", "ONE_TIME",
+    /// "PERIODIC".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_method: Option<String>,
+}
+
+/// The events an AF subscribes to and where the PCF posts them (TS 29.514
+/// `EventsSubscReqData`, carried as `evSubsc`).
+///
+/// The PCF posts each notification to `{notifUri}/notify`. `notifUri` is
+/// optional in the schema, but without it the PCF has nowhere to post. On
+/// modify the member is `EventsSubscReqDataRm`: present replaces the stored
+/// subscription and `null` removes it, which is why every `ev_subsc` field is
+/// skipped when `None` rather than serialized as `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsSubscReqData {
+    /// The subscribed events (`events`, required, at least one).
+    pub events: Vec<AfEventSubscription>,
+    /// Callback base the PCF appends `/notify` to (`notifUri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_uri: Option<String>,
+}
+
+impl EventsSubscReqData {
+    /// Subscribe to each of `events` with `notifMethod` `EVENT_DETECTION`,
+    /// posted to `notif_uri`.
+    pub fn event_detection(events: Vec<String>, notif_uri: Option<String>) -> Self {
+        Self {
+            events: events
+                .into_iter()
+                .map(|event| AfEventSubscription {
+                    event,
+                    notif_method: Some(EVENT_DETECTION.to_string()),
+                })
+                .collect(),
+            notif_uri,
+        }
+    }
 }
 
 /// Request data for an app-session create (TS 29.514 §5.6.2.3,
@@ -104,10 +145,12 @@ pub struct AppSessionContextReqData {
     /// Data Network Name (`dnn`, APN equivalent in 5GC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnn: Option<String>,
-    /// Event subscriptions for PCF notifications (`evSubsc`).
+    /// Event subscription (`evSubsc`); the PCF posts events to its
+    /// `notifUri` with `/notify` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ev_subsc: Option<EventSubscription>,
-    /// Notification URI (`notifUri`) — callback endpoint for PCF events.
+    pub ev_subsc: Option<EventsSubscReqData>,
+    /// Callback base (`notifUri`) the PCF posts a termination to, with
+    /// `/terminate` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_uri: Option<String>,
     /// Supported features (`suppFeat`, feature negotiation bitstring).
@@ -121,6 +164,34 @@ pub struct AppSessionContextReqData {
 struct AppSessionContextBody<'a> {
     #[serde(rename = "ascReqData")]
     asc_req_data: &'a AppSessionContextReqData,
+}
+
+/// Request data for an app-session modify (TS 29.514
+/// `AppSessionContextUpdateData`): the members a PATCH may change, which
+/// excludes create-only ones such as `ueIpv4`, `supi` or `notifUri`.
+///
+/// On the wire this is nested under `ascReqData` inside
+/// `AppSessionContextUpdateDataPatch`, the same envelope create uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSessionContextUpdateData {
+    /// Media components to modify (`medComponents`), a map keyed by each
+    /// component's `medCompN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_components: Option<IndexMap<String, MediaComponent>>,
+    /// Replacement event subscription (`evSubsc`). `None` leaves the member
+    /// out, so the PCF keeps the subscription it holds; it is never sent as
+    /// `null`, which would remove it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ev_subsc: Option<EventsSubscReqData>,
+}
+
+/// Top-level PATCH body for an app-session modify (TS 29.514
+/// `AppSessionContextUpdateDataPatch`), sent as `application/merge-patch+json`.
+#[derive(Debug, Serialize)]
+struct AppSessionContextUpdateDataPatch<'a> {
+    #[serde(rename = "ascReqData")]
+    asc_req_data: &'a AppSessionContextUpdateData,
 }
 
 // The inbound PCF event notification (TS 29.514 `EventsNotification`) is NOT
@@ -318,6 +389,10 @@ impl NpcfClient {
     /// `session_ref` is either a bare app-session id (resolved against
     /// `self.base_url`, the legacy behaviour) or an absolute resource URI
     /// (`http(s)://…`, used verbatim — the replica-independent teardown path).
+    ///
+    /// Returns `Ok(())` when the session no longer exists on the PCF: it was
+    /// deleted (`2xx`) or was already gone (`404`). Both release the local
+    /// tracking entry. Any other answer is `Err` and the entry stays.
     pub async fn delete_app_session(&self, session_ref: &str) -> Result<(), SbiError> {
         let (url, target_apiroot) = self.resolve_session_request(session_ref);
         // TS 29.514 §5.6.2.4: the Individual Application Session Context
@@ -334,8 +409,19 @@ impl NpcfClient {
             .await
             .map_err(|error| SbiError::Transport(error.to_string()))?;
 
-        if !response.status().is_success() && response.status().as_u16() != 204 {
-            return Err(SbiError::HttpError(response.status().as_u16()));
+        let status = response.status();
+        // 404: the Individual Application Session Context does not exist on the
+        // PCF. It already removed the session (the usual case after it sent a
+        // termination) or another replica deleted it. That is the state a delete
+        // asks for, so it releases the local entry like a 204; treating it as a
+        // failure would keep every PCF-removed session tracked forever.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!(
+                session_ref,
+                "app session already gone on the PCF (404 on delete)"
+            );
+        } else if !status.is_success() {
+            return Err(SbiError::HttpError(status.as_u16()));
         }
         // Session is gone PCF-side — drop the local tracking entry.
         self.sessions
@@ -350,19 +436,21 @@ impl NpcfClient {
     /// `session_ref` follows the same id-or-absolute-URI rule as
     /// [`delete_app_session`].
     ///
-    /// Per TS 29.514 §4.2.3.2 the modify operation is a JSON merge-patch
-    /// (`application/merge-patch+json`) whose body is the patchable subset of
-    /// the request data **flat** (no `ascReqData` envelope, unlike create).
-    /// Returns `Ok(())` on any `2xx`; the response body (the updated
-    /// `AppSessionContext`) is not parsed.
+    /// The modify operation is a JSON merge-patch
+    /// (`application/merge-patch+json`) whose body is TS 29.514
+    /// `AppSessionContextUpdateDataPatch`: the update data nested under
+    /// `ascReqData`, as on create. Returns `Ok(())` on any `2xx`; the response
+    /// body (the updated `AppSessionContext`) is not parsed.
     pub async fn update_app_session(
         &self,
         session_ref: &str,
-        request_data: &AppSessionContextReqData,
+        update_data: &AppSessionContextUpdateData,
     ) -> Result<(), SbiError> {
         let (url, target_apiroot) = self.resolve_session_request(session_ref);
-        let patch_body = serde_json::to_vec(request_data)
-            .map_err(|error| SbiError::Deserialization(error.to_string()))?;
+        let patch_body = serde_json::to_vec(&AppSessionContextUpdateDataPatch {
+            asc_req_data: update_data,
+        })
+        .map_err(|error| SbiError::Deserialization(error.to_string()))?;
         let mut request = self
             .client
             .patch(&url)
@@ -650,10 +738,10 @@ mod tests {
             supi: Some("imsi-001010000000001".to_string()),
             ue_ipv4: Some("10.0.0.1".to_string()),
             dnn: Some("ims".to_string()),
-            ev_subsc: Some(EventSubscription {
-                event: "UP_PATH_CH_EVENT".to_string(),
-                notif_method: Some("EVENT_DETECTION".to_string()),
-            }),
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["QOS_NOTIF".to_string()],
+                Some("http://pcscf:8080/sbi/events".to_string()),
+            )),
             notif_uri: Some("http://pcscf:8080/sbi/events".to_string()),
             supp_feat: Some("1".to_string()),
             ..Default::default()
@@ -795,6 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_posts_to_target_not_base_url() {
+        let _gauge = locked_gauge().await;
         let base = spawn_mock(create_router()).await;
         // Base URL is unroutable; only the per-call target is reachable. If
         // the call ignored `target` it would fail with a transport error.
@@ -819,6 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_none_target_posts_to_base_url() {
+        let _gauge = locked_gauge().await;
         let base = spawn_mock(create_router()).await;
         let client = NpcfClient::new(&base, reqwest::Client::new());
         let created = client
@@ -870,6 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_indirect_posts_to_scp_with_target_apiroot_header() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&scp, reqwest::Client::new())
@@ -894,6 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_direct_sends_no_target_apiroot_header() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let pcf = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
         // Direct by default.
@@ -939,6 +1031,7 @@ mod tests {
     /// object keyed by `medCompN`. Guards both reported symptoms at once.
     #[tokio::test]
     async fn create_wire_body_has_asc_req_data_and_med_components_map() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
         let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&pcf, reqwest::Client::new());
@@ -979,12 +1072,214 @@ mod tests {
         );
     }
 
+    // --- Event subscription (EventsSubscReqData) ---
+
+    const NOTIF_URI: &str = "http://pcscf.example.com:8080/sbi/events";
+
+    #[test]
+    fn event_detection_subscription_serializes_with_wire_names() {
+        let subscription = EventsSubscReqData::event_detection(
+            vec![
+                "FAILED_RESOURCES_ALLOCATION".to_string(),
+                "QOS_NOTIF".to_string(),
+            ],
+            Some(NOTIF_URI.to_string()),
+        );
+        assert_eq!(
+            serde_json::to_value(&subscription).unwrap(),
+            serde_json::json!({
+                "events": [
+                    {"event": "FAILED_RESOURCES_ALLOCATION", "notifMethod": "EVENT_DETECTION"},
+                    {"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}
+                ],
+                "notifUri": NOTIF_URI
+            })
+        );
+
+        // No notifUri is left out, never sent as null.
+        let without_uri = EventsSubscReqData::event_detection(vec!["QOS_NOTIF".to_string()], None);
+        assert_eq!(
+            serde_json::to_value(&without_uri).unwrap(),
+            serde_json::json!({
+                "events": [{"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}]
+            })
+        );
+    }
+
+    /// The PCF posts `/notify` to `ascReqData.evSubsc.notifUri`, so the
+    /// subscription has to arrive as `EventsSubscReqData` (an `events` array plus
+    /// `notifUri`), not as a single `{event, notifMethod}`.
+    #[tokio::test]
+    async fn create_wire_body_carries_the_event_subscription_only_when_given() {
+        let _gauge = locked_gauge().await;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        let subscribed = AppSessionContextReqData {
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["FAILED_RESOURCES_ALLOCATION".to_string()],
+                Some(NOTIF_URI.to_string()),
+            )),
+            notif_uri: Some(NOTIF_URI.to_string()),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &subscribed)
+            .await
+            .expect("create must succeed");
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        assert_eq!(
+            body["ascReqData"]["evSubsc"],
+            serde_json::json!({
+                "events": [
+                    {"event": "FAILED_RESOURCES_ALLOCATION", "notifMethod": "EVENT_DETECTION"}
+                ],
+                "notifUri": NOTIF_URI
+            }),
+            "{body}"
+        );
+
+        let unsubscribed = AppSessionContextReqData {
+            notif_uri: Some(NOTIF_URI.to_string()),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &unsubscribed)
+            .await
+            .expect("create must succeed");
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        let request_data = body["ascReqData"].as_object().expect("ascReqData object");
+        assert!(!request_data.contains_key("evSubsc"), "{body}");
+        assert_eq!(body["ascReqData"]["notifUri"], NOTIF_URI, "{body}");
+    }
+
+    // --- Modify (TS 29.514 ModAppSession: PATCH, AppSessionContextUpdateDataPatch) ---
+
+    /// Content type and JSON body of the one PATCH a modify router received.
+    type CapturedPatch = Arc<Mutex<Option<(Option<String>, serde_json::Value)>>>;
+
+    /// A present `evSubsc` in the merge patch replaces the subscription; an
+    /// absent one leaves it alone. siphon never sends `evSubsc: null`, which
+    /// would remove it.
+    #[tokio::test]
+    async fn update_wire_body_carries_the_event_subscription_only_when_given() {
+        let subscribed = AppSessionContextUpdateData {
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["QOS_NOTIF".to_string()],
+                None,
+            )),
+            ..Default::default()
+        };
+        let (content_type, body) = capture_update(&subscribed).await;
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/merge-patch+json")
+        );
+        assert_eq!(
+            body["ascReqData"]["evSubsc"],
+            serde_json::json!({
+                "events": [{"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}]
+            }),
+            "{body}"
+        );
+
+        let (_, body) = capture_update(&AppSessionContextUpdateData::default()).await;
+        let update_data = body["ascReqData"].as_object().expect("ascReqData object");
+        assert!(!update_data.contains_key("evSubsc"), "{body}");
+    }
+
+    /// A modify router on `.../app-sessions/sess-1` that records the PATCH.
+    fn patch_capturing_router(captured: CapturedPatch) -> axum::Router {
+        use axum::http::HeaderMap;
+        use axum::routing::patch;
+        axum::Router::new().route(
+            "/npcf-policyauthorization/v1/app-sessions/sess-1",
+            patch(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let content_type = headers
+                        .get("content-type")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string());
+                    let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    *captured.lock().unwrap() = Some((content_type, value));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        )
+    }
+
+    /// Send `update_data` as a modify and return what the PCF received.
+    async fn capture_update(
+        update_data: &AppSessionContextUpdateData,
+    ) -> (Option<String>, serde_json::Value) {
+        let captured: CapturedPatch = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(patch_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+        client
+            .update_app_session("sess-1", update_data)
+            .await
+            .expect("modify must succeed");
+        let received = captured.lock().unwrap().clone();
+        received.expect("PATCH captured")
+    }
+
+    /// ModAppSession takes an `AppSessionContextUpdateDataPatch`, which carries
+    /// the update data under `ascReqData` exactly as create does. A flat body
+    /// carries none of the members the PCF reads.
+    #[tokio::test]
+    async fn update_wire_body_nests_update_data_under_asc_req_data() {
+        let update_data = AppSessionContextUpdateData {
+            med_components: Some(components_map(vec![MediaComponent {
+                med_comp_n: 1,
+                med_type: "AUDIO".to_string(),
+                f_status: "ENABLED".to_string(),
+                codecs: None,
+                med_sub_comps: None,
+            }])),
+            ..Default::default()
+        };
+
+        let (content_type, body) = capture_update(&update_data).await;
+
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/merge-patch+json")
+        );
+        let members: Vec<&String> = body.as_object().expect("JSON object").keys().collect();
+        assert_eq!(members, vec!["ascReqData"], "{body}");
+        assert!(
+            body["ascReqData"]["medComponents"]["1"].is_object(),
+            "medComponents keyed by medCompN under ascReqData: {body}"
+        );
+    }
+
     // --- Delete (TS 29.514 §5.6.2.4: POST {resource}/delete → 204) ---
 
-    /// Router for the app-session leak test: each create mints a unique
-    /// app-session id (so the store can grow), and any `.../{id}/delete` returns
-    /// 204 — the spec-correct create (201 + Location) and custom-delete shapes.
-    fn leak_create_delete_router() -> axum::Router {
+    /// Serialises every test that writes `siphon_sbi_npcf_app_sessions_active`.
+    /// The gauge is process-wide and each client create/delete sets it, so a
+    /// test reading it must not interleave with another test's client. Any test
+    /// that calls `create_app_session` or `delete_app_session` takes this.
+    static APP_SESSION_GAUGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn locked_gauge() -> tokio::sync::MutexGuard<'static, ()> {
+        APP_SESSION_GAUGE.lock().await
+    }
+
+    /// The live `siphon_sbi_npcf_app_sessions_active` value.
+    fn app_sessions_gauge() -> i64 {
+        crate::metrics::try_metrics()
+            .expect("metrics initialised")
+            .sbi_npcf_app_sessions_active
+            .get()
+    }
+
+    /// Router for the app-session leak tests: each create mints a unique
+    /// app-session id (so the store can grow), and any `.../{id}/delete` answers
+    /// `delete_status` — 204 for the spec-correct removal, 404 for a session the
+    /// PCF has already removed.
+    fn leak_create_delete_router(delete_status: axum::http::StatusCode) -> axum::Router {
         use axum::routing::post;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1009,8 +1304,86 @@ mod tests {
             )
             .route(
                 "/npcf-policyauthorization/v1/app-sessions/{id}/delete",
-                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+                post(move || async move { delete_status }),
             )
+    }
+
+    /// Leak guard for the path an `@sbi.on_terminate` handler takes: the PCF has
+    /// already removed the session, so `delete_session(resUri)` is answered 404.
+    /// The session is gone either way, so the store and the gauge MUST drain
+    /// exactly as on a 204, or every PCF-terminated session strands one entry.
+    ///
+    /// The client's store starts empty, so its baseline is `len() == 0` and a
+    /// published gauge of 0 (the gauge holds the publishing client's `len()`).
+    #[tokio::test]
+    async fn app_session_store_drains_when_the_delete_finds_the_session_gone() {
+        crate::metrics::init().ok();
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(axum::http::StatusCode::NOT_FOUND)).await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let request = AppSessionContextReqData::default();
+        let baseline = client.active_app_sessions();
+        assert_eq!(baseline, 0);
+
+        // Created sessions are tracked and published.
+        let mut locations = Vec::new();
+        for _ in 0..50 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            locations.push(created.location.expect("create returns a Location"));
+        }
+        assert_eq!(client.active_app_sessions(), baseline + 50);
+        assert_eq!(app_sessions_gauge(), (baseline + 50) as i64);
+
+        // A 404 on each delete releases the entry like a 204 would.
+        for location in &locations {
+            client
+                .delete_app_session(location)
+                .await
+                .expect("a 404 delete means the session is already gone");
+        }
+        assert_eq!(
+            client.active_app_sessions(),
+            baseline,
+            "store must drain to baseline when the PCF answers 404"
+        );
+        assert_eq!(app_sessions_gauge(), baseline as i64);
+
+        // Repeated create -> 404-delete cycles stay flat.
+        for _ in 0..200 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            let location = created.location.expect("create returns a Location");
+            client.delete_app_session(&location).await.unwrap();
+        }
+        assert_eq!(client.active_app_sessions(), baseline);
+        assert_eq!(app_sessions_gauge(), baseline as i64);
+    }
+
+    /// Only a 404 means "already gone". Any other error answer leaves the
+    /// session on the PCF as far as siphon knows, so it stays tracked and the
+    /// delete reports the failure.
+    #[tokio::test]
+    async fn delete_error_other_than_not_found_keeps_the_session_tracked() {
+        crate::metrics::init().ok();
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let created = client
+            .create_app_session(None, &AppSessionContextReqData::default())
+            .await
+            .unwrap();
+        let location = created.location.expect("create returns a Location");
+
+        let error = client
+            .delete_app_session(&location)
+            .await
+            .expect_err("a 500 delete is a failure");
+
+        assert!(matches!(error, SbiError::HttpError(500)), "{error}");
+        assert_eq!(client.active_app_sessions(), 1);
+        assert_eq!(app_sessions_gauge(), 1);
     }
 
     /// Leak guard for the N5/Npcf app-session registry: `create_session` inserts,
@@ -1021,7 +1394,11 @@ mod tests {
     /// session the P-CSCF guards against). The store IS the leak surface here.
     #[tokio::test]
     async fn app_session_store_drains_on_create_delete() {
-        let base = spawn_mock(leak_create_delete_router()).await;
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(
+            axum::http::StatusCode::NO_CONTENT,
+        ))
+        .await;
         let client = NpcfClient::new(&base, reqwest::Client::new());
         let request = AppSessionContextReqData::default();
 
@@ -1086,6 +1463,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_posts_to_delete_subresource_and_accepts_204() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let pcf = spawn_mock(delete_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&pcf, reqwest::Client::new());
@@ -1109,6 +1487,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_indirect_sends_target_apiroot_on_delete_subresource() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(delete_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&scp, reqwest::Client::new())

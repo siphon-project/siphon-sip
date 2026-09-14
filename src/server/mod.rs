@@ -5,9 +5,12 @@
 
 mod bootstrap;
 mod event_clock;
+mod sbi_callbacks;
 
 #[cfg(test)]
 mod event_clock_tests;
+#[cfg(test)]
+mod sbi_callbacks_tests;
 #[cfg(test)]
 mod tests;
 
@@ -2262,7 +2265,8 @@ impl SiphonServer {
                 );
             }
 
-            // Start SBI notification listener for PCF events (N5 callback)
+            // N5 callback listener: TS 29.514 eventNotification and
+            // terminationRequest (see server::sbi_callbacks).
             if let Some(ref notif_listen) = sbi_config.notif_listen {
                 let notif_addr: std::net::SocketAddr =
                     notif_listen.parse().unwrap_or_else(|error| {
@@ -2272,98 +2276,7 @@ impl SiphonServer {
                         );
                         std::process::exit(1);
                     });
-                let engine_for_sbi = Arc::clone(&engine);
-                tokio::spawn(async move {
-                    use axum::{extract::State, routing::post, Router};
-
-                    #[derive(Clone)]
-                    struct SbiNotifState {
-                        engine: Arc<crate::script::engine::ScriptEngine>,
-                    }
-
-                    async fn handle_pcf_notification(
-                        State(state): State<SbiNotifState>,
-                        body: axum::body::Bytes,
-                    ) -> axum::http::StatusCode {
-                        // The full PCF document (TS 29.514 EventsNotification) is
-                        // handed to the script verbatim — never projected through a
-                        // typed struct (see pcf_notification_body_to_json).
-                        let json_str = match pcf_notification_body_to_json(&body) {
-                            Some(json_str) => json_str,
-                            None => {
-                                tracing::error!("PCF event notification body was not valid JSON");
-                                return axum::http::StatusCode::BAD_REQUEST;
-                            }
-                        };
-                        let _ = crate::script::py_executor::try_run(move || {
-                            pyo3::Python::attach(|python| {
-                                use pyo3::types::PyAnyMethods;
-                                let engine_state = state.engine.state();
-                                let handlers = engine_state.handlers_for(
-                                    &crate::script::engine::HandlerKind::SbiOnEvent
-                                );
-                                if handlers.is_empty() {
-                                    return;
-                                }
-
-                                let py_dict: pyo3::Py<pyo3::PyAny> = {
-                                    use pyo3::types::PyAnyMethods;
-                                    match python.import("json")
-                                        .and_then(|m| m.call_method1("loads", (&json_str,)))
-                                    {
-                                        Ok(d) => d.unbind(),
-                                        Err(error) => {
-                                            tracing::error!(%error, "failed to parse PCF event as Python dict");
-                                            return;
-                                        }
-                                    }
-                                };
-
-                                for handler in handlers {
-                                    let callable = handler.callable.bind(python);
-                                    let result = callable.call1((py_dict.bind(python),));
-                                    match result {
-                                        Ok(ret) => {
-                                            if handler.is_async {
-                                                if let Err(error) = crate::script::engine::run_coroutine(python, &ret) {
-                                                    tracing::error!(
-                                                        %error,
-                                                        "async sbi.on_event handler error"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(
-                                                %error,
-                                                "sbi.on_event handler failed"
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                        }).await;
-                        axum::http::StatusCode::NO_CONTENT
-                    }
-
-                    let app = Router::new()
-                        .route("/sbi/events", post(handle_pcf_notification))
-                        .with_state(SbiNotifState {
-                            engine: engine_for_sbi,
-                        });
-
-                    info!(addr = %notif_addr, "SBI notification listener started on /sbi/events");
-                    match tokio::net::TcpListener::bind(notif_addr).await {
-                        Ok(listener) => {
-                            if let Err(error) = axum::serve(listener, app).await {
-                                error!("SBI notification server failed: {error}");
-                            }
-                        }
-                        Err(error) => {
-                            error!(addr = %notif_addr, "failed to bind SBI notification listener: {error}");
-                        }
-                    }
-                });
+                sbi_callbacks::spawn_listener(notif_addr, engine.state_arc());
             }
         }
 
