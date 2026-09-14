@@ -204,6 +204,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   would end on the handoff default) and a `mode` that is neither `deferred` nor
   `answer` (which would otherwise fall back silently to the opposite of what was
   meant).
+- **`record_start` / `record_stop` on the control plane.** No verb started or
+  stopped a recording: `li.record()` is SIPREC toward a recording server, which
+  is a different thing, and the native backend sent no recording command at all.
+
+  `record_start` writes the call's decoded audio to a wav file and replies with
+  a `recording_id`; `record_stop` finishes one, or all of them.
+  `max_duration_ms` and `silence_ms` are the two stop conditions a voicemail
+  greeting announces, evaluated in the engine where the decoded audio already
+  is. `RecordingFinished {recording_id, path, reason, duration_ms}` arrives when
+  the file is **closed** — attaching the audio to an email on the stop reply
+  would race a half-written one.
+
+  Works on a single-leg engine-terminated call, which is what a voicemail box
+  is. `siphon-rtp` only: rtpengine's `start recording` writes a pcap of the wire
+  with no id to stop or correlate by, and rtpproxy has none, so both answer
+  `unsupported_verb` rather than produce a different artefact silently.
+
 ### Fixed
 
 - **An anchored answer no longer requires a WebSocket bridge.** `answer

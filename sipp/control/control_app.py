@@ -663,6 +663,89 @@ async def case_inbound(app: App, session: Session, event: dict, verdict: Verdict
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+async def case_record(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """Record the anchored call's audio, stop it, and wait for the closed file.
+
+    The two halves are separate checks on purpose. `record_stop` reports only
+    that the engine *accepted* the stop; the file is not written yet. The
+    `RecordingFinished` event is what says it is, and it carries the path an
+    application would attach to an email or hand to a transcriber. A rail that
+    answered the stop and never delivered the event looks identical to a working
+    one from SIPp's side, and from the stop reply's side too.
+
+    The channel here is anchored with no WebSocket bridge — a voicemail box is
+    one leg, the engine, and a file, and nothing streams anywhere.
+    """
+    channel = event.get("channel") or ""
+
+    # The negative first, and before any real recording, so a RecordingFinished
+    # seen later can only belong to the accepted one.
+    refused = await session.command(
+        "record_start", {"channels": "quadraphonic"}, target={"channel": channel}
+    )
+    verdict.check(
+        "record_start_validates_its_arguments",
+        refused.get("status") == "error"
+        and (refused.get("error") or {}).get("code") == "bad_request",
+        json.dumps(refused),
+    )
+
+    started = await session.command(
+        "record_start",
+        {"direction": "both", "channels": "stereo"},
+        target={"channel": channel},
+    )
+    result = started.get("result") or {}
+    recording_id = result.get("recording_id")
+    verdict.check(
+        "record_start_accepted",
+        started.get("status") == "ok"
+        and result.get("state") == "recording"
+        and bool(recording_id),
+        json.dumps(started),
+    )
+
+    await asyncio.sleep(0.2)
+
+    # With the id, not bare: the engine refuses an id it never issued, so a
+    # siphon that dropped or mangled the handle fails here rather than stopping
+    # every recording on the call and looking correct.
+    stop = await session.command(
+        "record_stop", {"recording_id": recording_id}, target={"channel": channel}
+    )
+    stop_result = stop.get("result") or {}
+    verdict.check(
+        "record_stop_accepted",
+        stop.get("status") == "ok" and stop_result.get("state") == "stopping",
+        json.dumps(stop),
+    )
+
+    finished = await session.wait_event(
+        lambda frame: frame.get("event") == "RecordingFinished"
+        and frame.get("channel") == channel,
+        timeout=10,
+    )
+    payload = finished.get("payload") or {}
+    verdict.check(
+        "recording_finished_correlates_with_the_accept",
+        payload.get("recording_id") == recording_id,
+        json.dumps({"accept": recording_id, "event": payload.get("recording_id")}),
+    )
+    verdict.check(
+        "recording_finished_names_the_closed_file",
+        bool(payload.get("path")) and payload.get("reason") == "stopped",
+        json.dumps(payload),
+    )
+    verdict.check(
+        "recording_finished_reports_a_duration",
+        isinstance(payload.get("duration_ms"), int) and payload["duration_ms"] > 0,
+        json.dumps(payload.get("duration_ms")),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 async def case_owner(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Exactly-one-owner dispatch: with several connections of the same app up,
     exactly one is given the call and the others cannot command it."""
@@ -766,6 +849,7 @@ CASES = {
     "media": case_media,
     "info": case_info,
     "inbound": case_inbound,
+    "record": case_record,
     "owner": case_owner,
     "resync": case_resync,
 }

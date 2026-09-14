@@ -44,9 +44,10 @@ use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
     BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent,
-    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RtpEngineEvent, TextEvent,
-    TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason, WsTeeEnded,
-    WsTeeStarted, X3EndedEvent, X3LossEvent, X3StartedEvent,
+    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RecordingChannels, RecordingDirection,
+    RecordingFinished, RecordingRequest, RtpEngineEvent, TextEvent, TextStreamStats,
+    WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason, WsTeeEnded, WsTeeStarted,
+    X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
@@ -447,6 +448,69 @@ impl SiphonRtpClient {
         let answer_sdp = expect_sdp(result)?;
         self.sessions.insert(call_id.to_string(), ());
         Ok(String::from_utf8_lossy(&answer_sdp).into_owned())
+    }
+
+    /// Start recording decoded audio to a wav file, returning the engine's
+    /// `recording_id`.
+    ///
+    /// Deliberately wav rather than the pcap `record_call` flag: a pcap is an
+    /// audit artefact of the wire, and a voicemail message is a product
+    /// artefact somebody plays back. It works on a single-leg
+    /// (`answer_local`) call, which is what a voicemail box is.
+    pub async fn start_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: &RecordingRequest<'_>,
+    ) -> Result<String, RtpEngineError> {
+        let result = self
+            .request(Command::StartRecording {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                recording_dir: None,
+                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                direction: Some(match request.direction {
+                    RecordingDirection::Ingress => siphon_rtp_proto::RecordingDirection::Ingress,
+                    RecordingDirection::Egress => siphon_rtp_proto::RecordingDirection::Egress,
+                    RecordingDirection::Both => siphon_rtp_proto::RecordingDirection::Both,
+                }),
+                channels: Some(match request.channels {
+                    RecordingChannels::Mono => siphon_rtp_proto::RecordingChannels::Mono,
+                    RecordingChannels::Stereo => siphon_rtp_proto::RecordingChannels::Stereo,
+                }),
+                max_duration_ms: request.max_duration_ms,
+                silence_ms: request.silence_ms,
+                path: request.path.map(str::to_string),
+            })
+            .await?;
+        match result {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => Ok(id),
+            // An accept with no id is not something to paper over: every later
+            // `record_stop` and the finished event key on it, so a caller left
+            // holding nothing could neither stop nor correlate the recording.
+            other => Err(unexpected_result("start recording", other)),
+        }
+    }
+
+    /// Stop a recording, or every recording on the call when `recording_id` is
+    /// `None` (which is what the NG front-end's `stop recording` means).
+    pub async fn stop_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        let result = self
+            .request(Command::StopRecording {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                recording_id: recording_id.map(str::to_string),
+            })
+            .await?;
+        expect_ok(result)
     }
 
     /// Send a `delete` to tear down a session and drop its active-session entry.
@@ -1178,6 +1242,30 @@ impl SiphonRtpClientSet {
         Ok(result)
     }
 
+    /// Start a recording on the instance already bound to this call.
+    pub async fn start_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: &RecordingRequest<'_>,
+    ) -> Result<String, RtpEngineError> {
+        self.select(call_id)
+            .start_recording(call_id, from_tag, request)
+            .await
+    }
+
+    /// Stop a recording on the instance already bound to this call.
+    pub async fn stop_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .stop_recording(call_id, from_tag, recording_id)
+            .await
+    }
+
     /// Send a `delete` and drop affinity.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let result = self.select(call_id).delete(call_id, from_tag).await;
@@ -1555,6 +1643,24 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             volume,
             source,
         }),
+        Event::RecordingFinished {
+            call_id,
+            from_tag,
+            recording_id,
+            path,
+            reason,
+            duration_ms,
+            // Room recording names a conference instead of a call; siphon-sip
+            // has no conference concept to map it onto yet.
+            ..
+        } => RtpEngineEvent::RecordingFinished(RecordingFinished {
+            call_id,
+            from_tag,
+            recording_id,
+            path,
+            reason: recording_end_reason_from_proto(reason),
+            duration_ms,
+        }),
         Event::MediaTimeout {
             call_id,
             from_tag,
@@ -1801,6 +1907,24 @@ fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
 /// the only reason that means the prompt was actually heard in full, and an app
 /// that queues its next step on that would take an unknown ending as a
 /// successful one.
+/// Why a recording ended, as a stable string for the scripting and control
+/// surfaces.
+///
+/// `RecordingEndReason` is `#[non_exhaustive]`, so a reason the engine adds
+/// later reads as `unknown` rather than failing the build — the recording still
+/// finished and its file is still there.
+fn recording_end_reason_from_proto(reason: siphon_rtp_proto::RecordingEndReason) -> &'static str {
+    use siphon_rtp_proto::RecordingEndReason;
+    match reason {
+        RecordingEndReason::Stopped => "stopped",
+        RecordingEndReason::MaxDuration => "max_duration",
+        RecordingEndReason::Silence => "silence",
+        RecordingEndReason::CallEnded => "call_ended",
+        RecordingEndReason::Error => "error",
+        _ => "unknown",
+    }
+}
+
 fn play_end_reason_from_proto(reason: PlayEndReason) -> SiphonPlayEndReason {
     match reason {
         PlayEndReason::Completed => SiphonPlayEndReason::Completed,

@@ -45,8 +45,20 @@ impl ControlAdapter for SipControlAdapter {
                 apply_bridge_verb(command).await
             } else if is_media_verb(&command.verb) {
                 apply_media_verb(command).await
-            } else {
+            } else if is_sip_verb(&command.verb) {
                 apply_sip(command)
+            } else {
+                // Refused at the door rather than by falling through into the
+                // SIP table. A verb that reaches the wrong table is answered
+                // `unsupported_verb` by accident, which reads exactly like this
+                // and is how `record_start` shipped dispatching nowhere.
+                ControlResult::error(
+                    ControlErrorCode::UnsupportedVerb,
+                    format!(
+                        "sip adapter does not implement verb '{}' in this build",
+                        command.verb
+                    ),
+                )
             }
         })
     }
@@ -77,6 +89,8 @@ impl ControlAdapter for SipControlAdapter {
                 verb("hold", "Hold the A-leg media via silence"),
                 verb("unhold", "Resume the A-leg media after a hold"),
                 verb("stream_start", "Stream the call's audio to a WebSocket server — siphon-rtp backend only (args: ws_uri, mode=tee|bridge, and for tee: direction, channels, sample_rate). mode=tee streams a copy while the call keeps relaying; mode=bridge is a takeover that makes the server the leg's far side, and re-points in place if one is already attached"),
+                verb("record_start", "Record the call's decoded audio to a wav file, replying with the recording_id a later record_stop and the RecordingFinished event carry (args: direction=ingress|egress|both, channels=mono|stereo, max_duration_ms, silence_ms, path). max_duration_ms and silence_ms are the two stop conditions a voicemail greeting announces, and RecordingFinished fires only once the file is closed — so an app can attach it to an email without racing a half-written one. siphon-rtp only"),
+                verb("record_stop", "Stop a recording (args: recording_id; absent stops every recording on the call)"),
                 verb("stream_stop", "Stop streaming the call's audio (args: mode=tee|bridge). A tee stop is idempotent; a bridge stop is refused where there is no relay to return the call to"),
             ],
             events: vec![
@@ -94,6 +108,10 @@ impl ControlAdapter for SipControlAdapter {
                 // deployment rather than a call, and only reaches an app that
                 // opted in with `control.apps[].events: [registration]`.
                 "RegistrationChanged".to_string(),
+                // Fired when the recording's file is CLOSED, which is the
+                // thing an app can act on — the `record_stop` reply would
+                // race a half-written file.
+                "RecordingFinished".to_string(),
                 // The accept of a `play`, on the event stream rather than only
                 // in the command reply, carrying the `play_id` a later `stop` /
                 // gain change addresses. "Started" is the media contract's
@@ -167,7 +185,15 @@ fn verb(name: &str, summary: &str) -> VerbSchema {
 fn is_media_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "play" | "stop" | "dtmf" | "hold" | "unhold" | "stream_start" | "stream_stop"
+        "play"
+            | "stop"
+            | "dtmf"
+            | "hold"
+            | "unhold"
+            | "stream_start"
+            | "stream_stop"
+            | "record_start"
+            | "record_stop"
     )
 }
 
@@ -176,6 +202,34 @@ fn is_media_verb(verb: &str) -> bool {
 /// with the backend before answering).
 fn is_bridge_verb(verb: &str) -> bool {
     matches!(verb, "bridge" | "unbridge")
+}
+
+/// The verbs [`apply_sip`] dispatches synchronously over the B2BUA rail — the
+/// arms of its own `match`, restated so the schema guard in the tests can prove
+/// every advertised verb is claimed by exactly one dispatch table.
+///
+/// That guard exists because of a failure mode that is invisible everywhere
+/// else: a verb added to `describe()` and to one dispatch table, but not to the
+/// classifier in [`ControlAdapter::apply`] that routes to it, falls through to
+/// the wrong table and answers `unsupported_verb` on the wire — while every unit
+/// test that calls the handler function directly still passes.
+fn is_sip_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "answer"
+            | "ring"
+            | "progress"
+            | "reject"
+            | "hangup"
+            | "refer"
+            | "accept_refer"
+            | "reject_refer"
+            | "replace_peer"
+            | "route"
+            | "set_header"
+            | "remove_header"
+            | "get_header"
+    )
 }
 
 /// Resolve the command's channel target and mark the controller as having acted
@@ -246,6 +300,8 @@ async fn apply_media_verb(command: AdapterCommand) -> ControlResult {
     match command.verb.as_str() {
         "play" => play(&channel, &command.args).await,
         "stop" => stop(&channel).await,
+        "record_start" => record_start(&channel, &command.args).await,
+        "record_stop" => record_stop(&channel, &command.args).await,
         "dtmf" => dtmf(&channel, &command.args).await,
         "hold" => hold(&channel, true).await,
         "unhold" => hold(&channel, false).await,
@@ -533,6 +589,86 @@ async fn stop(channel: &ChannelRef) -> ControlResult {
         Ok(()) => ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "state": "stopped" }),
         ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `record_start` — record the call's decoded audio to a wav file.
+///
+/// Not the same thing as `li.record()`, which is SIPREC: that hands a recording
+/// *server* its own leg. This writes a file, which is what a voicemail box is,
+/// and it works on a single-leg engine-terminated call.
+async fn record_start(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    use crate::rtpengine::events::{RecordingChannels, RecordingDirection, RecordingRequest};
+
+    let direction = match args.get("direction").and_then(|value| value.as_str()) {
+        None | Some("ingress") => RecordingDirection::Ingress,
+        Some("egress") => RecordingDirection::Egress,
+        Some("both") => RecordingDirection::Both,
+        Some(other) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("direction {other:?} is ingress, egress or both"),
+            )
+        }
+    };
+    let channels = match args.get("channels").and_then(|value| value.as_str()) {
+        None | Some("mono") => RecordingChannels::Mono,
+        Some("stereo") => RecordingChannels::Stereo,
+        Some(other) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("channels {other:?} is mono or stereo"),
+            )
+        }
+    };
+    let path = args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let request = RecordingRequest {
+        direction,
+        channels,
+        max_duration_ms: args.get("max_duration_ms").and_then(|v| v.as_u64()),
+        silence_ms: args.get("silence_ms").and_then(|v| v.as_u64()),
+        path: path.as_deref(),
+    };
+
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend.start_recording(&call_id, &from_tag, &request).await {
+        Ok(recording_id) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "recording",
+            "recording_id": recording_id,
+        })),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `record_stop` — finish a recording, or every recording on the call.
+async fn record_stop(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let recording_id = args
+        .get("recording_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend
+        .stop_recording(&call_id, &from_tag, recording_id.as_deref())
+        .await
+    {
+        // "stopped" is the accept, not the file: `RecordingFinished` is what
+        // says the write is done and names the path.
+        Ok(()) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "stopping",
+            "recording_id": recording_id,
+        })),
         Err(error) => media_error(error),
     }
 }
@@ -2694,6 +2830,47 @@ mod tests {
         }
     }
 
+    /// The direction and channel selectors are closed sets: an unknown value
+    /// silently defaulting would record the wrong audio, and nobody finds out
+    /// until they play the file back.
+    #[tokio::test]
+    async fn record_start_rejects_unknown_selectors() {
+        let channel = channel();
+        for (key, value) in [("direction", "inbound"), ("channels", "quad")] {
+            let result = record_start(&channel, &serde_json::json!({ key: value })).await;
+            match result {
+                ControlResult::Error { code, message } => {
+                    assert_eq!(
+                        code,
+                        ControlErrorCode::BadRequest,
+                        "{key}={value}: {message}"
+                    );
+                    assert!(message.contains(value), "{message}");
+                }
+                other => panic!("{key}={value} should be a bad request, got {other:?}"),
+            }
+        }
+    }
+
+    /// With no media session there is nothing to record; the typed `not_found`
+    /// is what tells an app to anchor the leg first rather than retry.
+    #[tokio::test]
+    async fn record_start_without_media_is_not_found() {
+        let channel = channel();
+        match record_start(&channel, &serde_json::json!({})).await {
+            ControlResult::Error { code, .. } => {
+                assert!(
+                    matches!(
+                        code,
+                        ControlErrorCode::NotFound | ControlErrorCode::Unavailable
+                    ),
+                    "unexpected code {code:?}"
+                );
+            }
+            other => panic!("expected a typed error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn ring_and_progress_are_separate_verbs_in_the_schema() {
         // The declared schema is the only thing an app can discover the surface
@@ -3180,6 +3357,69 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_verb_is_claimed_by_a_dispatch_table() {
+        // The wire-level version of the split test below: `apply` picks a table
+        // by classifier, so a verb the schema advertises that no classifier
+        // claims is answered `unsupported_verb` no matter how complete its
+        // handler is. Caught exactly that on `record_start` / `record_stop`.
+        for advertised in SipControlAdapter::new().describe().verbs {
+            let verb = advertised.verb.as_str();
+            assert!(
+                verb == "originate"
+                    || is_bridge_verb(verb)
+                    || is_media_verb(verb)
+                    || is_sip_verb(verb),
+                "describe() advertises '{verb}' but no dispatch table claims it — \
+                 apply() would answer unsupported_verb"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatchable_verb_is_advertised() {
+        // The other direction: a verb siphon implements but never describes is
+        // one an application cannot discover, so it may as well not exist.
+        let advertised: Vec<String> = SipControlAdapter::new()
+            .describe()
+            .verbs
+            .into_iter()
+            .map(|verb| verb.verb)
+            .collect();
+        for verb in [
+            "originate",
+            "bridge",
+            "unbridge",
+            "play",
+            "stop",
+            "dtmf",
+            "hold",
+            "unhold",
+            "stream_start",
+            "stream_stop",
+            "record_start",
+            "record_stop",
+            "answer",
+            "ring",
+            "progress",
+            "reject",
+            "hangup",
+            "refer",
+            "accept_refer",
+            "reject_refer",
+            "replace_peer",
+            "route",
+            "set_header",
+            "remove_header",
+            "get_header",
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == verb),
+                "'{verb}' dispatches but describe() never mentions it"
+            );
+        }
+    }
+
+    #[test]
     fn is_media_verb_splits_media_from_sip() {
         for verb in [
             "play",
@@ -3189,6 +3429,8 @@ mod tests {
             "unhold",
             "stream_start",
             "stream_stop",
+            "record_start",
+            "record_stop",
         ] {
             assert!(
                 is_media_verb(verb),

@@ -32,6 +32,8 @@ pub enum RtpEngineEvent {
     /// A call's media went silent past the timeout and the engine tore it down
     /// (dead-path detection).  Emitted by the `siphon-rtp` native backend; the
     /// rtpengine NG backend does not currently surface this.
+    /// A runtime recording finished and its file is closed.
+    RecordingFinished(RecordingFinished),
     MediaTimeout {
         call_id: String,
         from_tag: String,
@@ -803,4 +805,62 @@ mod tests {
         }
         assert_eq!(digits, vec!["1".to_string(), "2".to_string()]);
     }
+}
+
+/// A runtime recording finished and its file is closed
+/// ([`RtpEngineEvent::RecordingFinished`]).
+///
+/// The point of the event is the *closed* file: a controller that attached the
+/// audio to an email on the `stop` reply would race a half-written one. siphon
+/// learns about it only when the engine says the write is done.
+#[derive(Debug, Clone)]
+pub struct RecordingFinished {
+    pub call_id: String,
+    pub from_tag: String,
+    /// Correlates with the id the `record_start` accept returned.
+    pub recording_id: String,
+    /// The finished file. `None` only when the recording aborted before one
+    /// existed, which is why it is not a bare `String`.
+    pub path: Option<String>,
+    /// Why it ended: `stopped`, `max_duration`, `silence`, `call_ended` or
+    /// `error`. A voicemail box reads these differently — `silence` is a caller
+    /// who stopped talking, `error` is a message that may be unusable.
+    pub reason: &'static str,
+    /// Audio actually written, in milliseconds. Zero for a recording that
+    /// aborted before anything reached the file.
+    pub duration_ms: u64,
+}
+
+/// Which audio a recording captures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordingDirection {
+    /// What the parties sent — a voicemail message is this.
+    #[default]
+    Ingress,
+    /// What they were sent.
+    Egress,
+    /// Both.
+    Both,
+}
+
+/// One mixed track or two separated ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordingChannels {
+    #[default]
+    Mono,
+    Stereo,
+}
+
+/// What to record, and when to stop by itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecordingRequest<'a> {
+    pub direction: RecordingDirection,
+    pub channels: RecordingChannels,
+    /// Stop after this much audio. The limit a voicemail greeting announces.
+    pub max_duration_ms: Option<u64>,
+    /// Stop after this long without speech — the caller stopped talking, or
+    /// never spoke. Evaluated in the engine, where the decoded audio already is.
+    pub silence_ms: Option<u64>,
+    /// Explicit output path. The directory must already exist.
+    pub path: Option<&'a str>,
 }

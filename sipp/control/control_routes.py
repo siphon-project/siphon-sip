@@ -15,6 +15,9 @@ The dialled user selects the case, and the case is echoed into the handover's
               already-connected channel.
   info@     — deferred handover; the app answers, so the call stays one-legged and
               siphon is the party that answers the caller's in-dialog INFO.
+  record@   — answer-first handover with NO ws_uri: the engine terminates the
+              leg and nothing streams anywhere, which is the voicemail-box shape.
+              The app records the call, stops it, and waits for the closed file.
   deadline@ — deferred handover to an app that deliberately never acts, so the
               configured `control.limits.handoff_deadline_ms` is what ends the
               call. No `deadline_ms` here on purpose: the config value is what
@@ -89,6 +92,16 @@ def route(call):
             PER_CALL_CONNECT_APP,
             deadline_ms=GENEROUS_DEADLINE_MS,
             vars={"case": "info"},
+        )
+    elif user == "record":
+        # No ws_uri on purpose: a recorded leg is anchored on the engine and
+        # written to a file, and a controller should not have to open an AI
+        # audio bridge it does not want in order to get there.
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            answer=True,
+            profile="voice_ai",
+            vars={"case": "record"},
         )
     elif user == "deadline":
         # No deadline_ms: control.limits.handoff_deadline_ms is the thing under

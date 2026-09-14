@@ -347,6 +347,36 @@ same way every other verb does — never a hang:
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.
 
+### Recording
+
+```json
+{ "verb": "record_start", "target": {"channel": "ch1"},
+  "args": { "direction": "ingress", "max_duration_ms": 60000, "silence_ms": 4000 } }
+```
+
+Records the call's **decoded** audio to a wav file and replies with a
+`recording_id`. `record_stop {recording_id?}` finishes one, or every recording
+on the call when the id is absent.
+
+`max_duration_ms` and `silence_ms` are the two stop conditions a voicemail
+greeting announces — "you have sixty seconds" and "stop talking and we'll hang
+up" — and the engine evaluates both, where the decoded audio already is.
+`direction` is `ingress` (the default: what the parties *sent*, which is what a
+message is), `egress` or `both`; `channels` is `mono` or `stereo`.
+
+`RecordingFinished {recording_id, path, reason, duration_ms}` arrives when the
+file is **closed**, which is the event worth waiting for: attaching the audio to
+an email on the `record_stop` reply would race a half-written file. `reason` is
+`stopped`, `max_duration`, `silence`, `call_ended` or `error` — a voicemail box
+reads those differently.
+
+It works on a single-leg, engine-terminated call, which is what a voicemail box
+is. This is **not** `li.record()`: that is SIPREC, where a recording *server*
+gets its own leg. `siphon-rtp` only — rtpengine's `start recording` writes a
+pcap of the wire with no id to stop or correlate by, and rtpproxy has no
+recording at all, so both answer `unsupported_verb` rather than produce an
+artefact nobody asked for.
+
 Inbound in-band DTMF on a controlled call is pushed to the owning connection as
 a `ChannelDtmfReceived` event, payload `{digit, duration_ms, volume, from_tag}`
 (`from_tag` identifies which party pressed), so an IVR / AI app **collects digits
