@@ -127,6 +127,7 @@ pub fn fail_forked_call(
     state: &DispatcherState,
 ) {
     let Some(snapshot) = b_leg_response_snapshot(call_id, &best.branch, state) else {
+        warn!(call_id = %call_id, "B2BUA: response for unknown call");
         return;
     };
     let mut response = best.response;

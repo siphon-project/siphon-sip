@@ -180,11 +180,11 @@ pub fn b2bua_terminate_call_inner(
     state
         .call_actors
         .set_state(internal_call_id, CallState::Terminated);
-    // remove_call sends Shutdown to any remaining actors, cleans up registry,
-    // and moves re-INVITE tracking entries to the zombie map.
+    // remove_call sends Shutdown to any remaining actors and cleans up the
+    // registry. A 2xx to a re-INVITE still in flight is ACKed from the response
+    // itself when it arrives (`ack_late_2xx_after_teardown`).
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
-    schedule_zombie_reinvite_cleanup(&state.call_actors);
     true
 }
 
@@ -244,7 +244,6 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
         .set_state(internal_call_id, CallState::Terminated);
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
-    schedule_zombie_reinvite_cleanup(&state.call_actors);
 }
 
 /// Emit a control-plane `StasisEnd` for a controlled call at teardown (no-op

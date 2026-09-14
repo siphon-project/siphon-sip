@@ -156,6 +156,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   cannot be forwarded without being recognised on the way back.
 ### Fixed
 
+- **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
+  the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
+  §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon
+  dropped it instead ("response for unknown call"), so the far end kept
+  retransmitting its 200 and a strict UA failed the transaction. Most visible
+  when a REFER target hangs up while siphon is re-INVITEing the surviving party.
+  The ACK is built from the 2xx alone (its Contact as Request-URI, its
+  Record-Route reversed as the route set) and each retransmission is ACKed
+  again. No BYE goes with it, the call already sent one. Only a 2xx whose single
+  Via is siphon's own draws the ACK, so a relayed or stray 2xx is left alone.
+
+- **Calls that saw a re-INVITE no longer leave an entry behind for the life of
+  the process.** The store that re-ACKed a 200 retransmitted after teardown was
+  never emptied: its 32 s cleanup removed entries from a copy of the map, so
+  every call with a session refresh, hold/resume or transfer re-INVITE kept one,
+  and every B2BUA teardown copied all of them. The stateless ACK above replaces
+  it. siphon also no longer sends a siphon-originated re-INVITE on a call that
+  ended while the re-INVITE was being built.
+
 - **`control.apps[].on_lost` is read.** It parsed and nothing ever looked at it:
   only a per-call value (`call.handover(on_lost=…)`, `originate`'s argument)
   reached a channel, so an operator who set the policy once for the app got the
@@ -449,6 +468,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a `timeout_ms=0` cannot mean "give up before the request can be answered".
 
 ### Removed
+
+- **`CallActorStore::zombie_reinvites`, `get_zombie_reinvite()`,
+  `remove_zombie_reinvite()` and `ZombieReInviteEntry`** from the Rust API,
+  with the store behind them. It leaked (see Fixed), and a 2xx that arrives
+  after teardown is now ACKed without it.
 
 - **The `@diameter.on_rtr` / `on_rar` / `on_asr` / `on_pnr` decorators.** They
   registered handlers nothing dispatched: with `diameter:` configured they

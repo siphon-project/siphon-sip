@@ -145,7 +145,15 @@ pub fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // re-INVITE did (RFC 3261 §12.2.1.1), so carry the B-leg's dialog route set
     // on the tracking leg — the response arm reads it back off this leg.
     new_b_leg.dialog.route_set = b_leg.dialog.route_set.clone();
-    state.call_actors.add_b_leg(call_id, new_b_leg);
+    // Same race as `b2bua_send_reinvite_on_leg`: a call removed since it was read
+    // above has already sent this leg its BYE, so no refresh goes out.
+    if !state.call_actors.add_b_leg(call_id, new_b_leg) {
+        debug!(
+            call_id = %call_id,
+            "B2BUA refresh: call ended before the re-INVITE went out, not sending it"
+        );
+        return;
+    }
 
     // Reset timer preemptively (will be confirmed on 200 OK)
     state.call_actors.reset_session_timer(call_id);
@@ -295,7 +303,18 @@ pub fn b2bua_send_reinvite_on_leg(
     // builds its Route headers from the same dialog), kept on the tracking leg
     // so the ACK for the 200 follows the same path (RFC 3261 §12.2.1.1).
     tracking.dialog.route_set = surviving.dialog.route_set.clone();
-    state.call_actors.add_b_leg(call_id, tracking);
+    // The call can end between reading the leg above and registering this
+    // entry: the other party hangs up, the call is removed and the surviving
+    // leg is sent its BYE. A re-INVITE sent now lands in the dialog that BYE
+    // ends, so report the leg as gone, which every caller already handles.
+    if !state.call_actors.add_b_leg(call_id, tracking) {
+        debug!(
+            call_id = %call_id,
+            tracking = %tracking_target,
+            "B2BUA: call ended before its siphon-originated re-INVITE went out, not sending it"
+        );
+        return false;
+    }
 
     let (dest, transport) = resolve_in_dialog_destination(
         &surviving.dialog.route_set,

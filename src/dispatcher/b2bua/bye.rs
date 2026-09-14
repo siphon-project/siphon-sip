@@ -309,11 +309,11 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     b2bua_stop_siprec(&call_id, state);
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call sends Shutdown to any remaining actors, cleans up registry,
-    // and moves re-INVITE tracking entries to the zombie map
+    // remove_call sends Shutdown to any remaining actors and cleans up the
+    // registry. A 2xx to a re-INVITE still in flight is ACKed from the response
+    // itself when it arrives (`ack_late_2xx_after_teardown`).
     state.call_actors.remove_call(&call_id);
     state.call_event_receivers.remove(&call_id);
-    schedule_zombie_reinvite_cleanup(&state.call_actors);
 }
 
 /// Sweep all active calls for session timer expiry (RFC 4028).

@@ -135,32 +135,10 @@ pub fn b2bua_dispatch_route_failure(
     });
 }
 
-/// Schedule cleanup of zombie re-INVITE entries after Timer H (32 seconds).
-///
-/// Called after `remove_call()` which may have moved `reinvite_done:` or
-/// `reinvite:` B-leg entries to the zombie map. After 32 seconds the remote
-/// UAS stops retransmitting per RFC 3261 §17.2.1, so the entries are no longer needed.
-pub fn schedule_zombie_reinvite_cleanup(call_actors: &crate::b2bua::actor::CallActorStore) {
-    if call_actors.zombie_reinvites.is_empty() {
-        return;
-    }
-    let zombie_map = call_actors.zombie_reinvites.clone();
-    let zombie_keys: Vec<String> = zombie_map.iter().map(|entry| entry.key().clone()).collect();
-    if !zombie_keys.is_empty() {
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(32)).await;
-            for key in zombie_keys {
-                zombie_map.remove(&key);
-            }
-        });
-    }
-}
-
 /// Expire post-CANCEL glare entries after 32 s (Timer H / 64·T1).
 ///
-/// Unlike [`schedule_zombie_reinvite_cleanup`], this removes from the *shared*
-/// store via the `Arc` rather than from a `DashMap` clone, so entries that
-/// never see a racing 2xx (the CANCEL won the race) are still reaped.
+/// Removes from the *shared* store via the `Arc`, so entries that never see a
+/// racing 2xx (the CANCEL won the race) are still reaped.
 pub fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::CallActorStore>) {
     let keys: Vec<String> = call_actors
         .zombie_cancelled

@@ -5,6 +5,7 @@ use crate::dispatcher::*;
 mod answered;
 mod failed;
 mod guards;
+mod late_ack;
 mod provisional;
 mod reinvite;
 mod teardown;
@@ -14,6 +15,7 @@ mod update;
 pub use answered::*;
 pub use failed::*;
 pub use guards::*;
+pub use late_ack::*;
 pub use provisional::*;
 pub use reinvite::*;
 pub use teardown::*;
@@ -49,75 +51,75 @@ pub struct BLegResponseSnapshot {
 }
 
 /// Read the A-leg state and the matching B-leg off the call, or `None` when
-/// the call is already gone.
+/// the call is already gone. What a missing call means depends on the message
+/// in hand, so the callers log it, not this.
 pub fn b_leg_response_snapshot(
     call_id: &str,
     branch: &str,
     state: &DispatcherState,
 ) -> Option<BLegResponseSnapshot> {
-    match state.call_actors.get_call(call_id) {
-        Some(call) => {
-            let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
-            let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
-            let target = matching_b.map(|b| b.dialog.target_uri.clone().unwrap_or_default());
-            let remote_contact = matching_b.and_then(|b| b.dialog.remote_contact.clone());
-            let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
-            let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
-            // The socket this B-leg is anchored on — `Some` only when the leg
-            // was dialled over a captured flow (`call.dial(flow=…)`). Every
-            // siphon-originated request we put back on this leg (auto-PRACK,
-            // ACK, BYE, forwarded re-INVITE/UPDATE) has to leave from it.
-            let b_local_addr = matching_b.and_then(|b| b.transport.local_addr);
-            // The connection_id the original B-leg INVITE was sent on — reused
-            // by the 401/407 retry path so the credentialed re-INVITE stays on
-            // the same trunk member that issued the nonce (RFC 5923).
-            let connection_id = matching_b
-                .map(|b| b.transport.connection_id)
-                .unwrap_or_default();
-            let stored_vias = matching_b
-                .map(|b| b.stored_vias.clone())
-                .unwrap_or_default();
-            let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
-            let stored_from = matching_b.and_then(|b| b.stored_from.clone());
-            let stored_to = matching_b.and_then(|b| b.stored_to.clone());
-            let handle_tx = matching_b_idx
-                .and_then(|i| call.b_leg_handles.get(i))
-                .and_then(|h| h.as_ref())
-                .map(|h| h.tx.clone());
-            let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
-            let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            Some(BLegResponseSnapshot {
-                a_leg: call.a_leg.clone(),
-                a_leg_invite: call.a_leg_invite.clone(),
-                b_leg_target: target,
-                b_leg_remote_contact: remote_contact,
-                b_leg_dialog: dialog,
-                b_leg_dest: dest,
-                b_leg_local_addr: b_local_addr,
-                b_leg_connection_id: connection_id,
-                b_leg_index: matching_b_idx,
-                b_leg_stored_vias: stored_vias,
-                b_leg_stored_cseq: stored_cseq,
-                b_leg_stored_from: stored_from,
-                b_leg_stored_to: stored_to,
-                call_state: call.state.clone(),
-                outbound_credentials: call.outbound_credentials.clone(),
-                li_record: call.li_record,
-                b_leg_handle_tx: handle_tx,
-                b_leg_stored_invite: stored_invite,
-                b_leg_local_cseq: local_cseq,
-                a_leg_supports_100rel: call.a_leg_supports_100rel,
-                a_leg_local_addr: call.a_leg_local_addr,
-            })
-        }
-        None => {
-            warn!(call_id = %call_id, "B2BUA: response for unknown call");
-            None
-        }
-    }
+    let call = state.call_actors.get_call(call_id)?;
+    let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
+    let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
+    let target = matching_b.map(|b| b.dialog.target_uri.clone().unwrap_or_default());
+    let remote_contact = matching_b.and_then(|b| b.dialog.remote_contact.clone());
+    let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
+    let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
+    // The socket this B-leg is anchored on — `Some` only when the leg
+    // was dialled over a captured flow (`call.dial(flow=…)`). Every
+    // siphon-originated request we put back on this leg (auto-PRACK,
+    // ACK, BYE, forwarded re-INVITE/UPDATE) has to leave from it.
+    let b_local_addr = matching_b.and_then(|b| b.transport.local_addr);
+    // The connection_id the original B-leg INVITE was sent on — reused
+    // by the 401/407 retry path so the credentialed re-INVITE stays on
+    // the same trunk member that issued the nonce (RFC 5923).
+    let connection_id = matching_b
+        .map(|b| b.transport.connection_id)
+        .unwrap_or_default();
+    let stored_vias = matching_b
+        .map(|b| b.stored_vias.clone())
+        .unwrap_or_default();
+    let stored_cseq = matching_b.and_then(|b| b.stored_cseq.clone());
+    let stored_from = matching_b.and_then(|b| b.stored_from.clone());
+    let stored_to = matching_b.and_then(|b| b.stored_to.clone());
+    let handle_tx = matching_b_idx
+        .and_then(|i| call.b_leg_handles.get(i))
+        .and_then(|h| h.as_ref())
+        .map(|h| h.tx.clone());
+    let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
+    let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
+    Some(BLegResponseSnapshot {
+        a_leg: call.a_leg.clone(),
+        a_leg_invite: call.a_leg_invite.clone(),
+        b_leg_target: target,
+        b_leg_remote_contact: remote_contact,
+        b_leg_dialog: dialog,
+        b_leg_dest: dest,
+        b_leg_local_addr: b_local_addr,
+        b_leg_connection_id: connection_id,
+        b_leg_index: matching_b_idx,
+        b_leg_stored_vias: stored_vias,
+        b_leg_stored_cseq: stored_cseq,
+        b_leg_stored_from: stored_from,
+        b_leg_stored_to: stored_to,
+        call_state: call.state.clone(),
+        outbound_credentials: call.outbound_credentials.clone(),
+        li_record: call.li_record,
+        b_leg_handle_tx: handle_tx,
+        b_leg_stored_invite: stored_invite,
+        b_leg_local_cseq: local_cseq,
+        a_leg_supports_100rel: call.a_leg_supports_100rel,
+        a_leg_local_addr: call.a_leg_local_addr,
+    })
 }
 
 /// Handle a response to a B2BUA B-leg INVITE.
+///
+/// Returns `false` only when the call the branch named is already gone: a
+/// teardown removed it while the response was in flight, before it cleaned up
+/// the branch index. Nothing has been done with the response then, and the
+/// caller handles it as one for a call that ended (a 2xx to our own INVITE is
+/// still owed its ACK).
 pub fn handle_b2bua_response(
     call_id: &str,
     branch: &str,
@@ -125,7 +127,7 @@ pub fn handle_b2bua_response(
     status_code: u16,
     response_source: SocketAddr,
     state: &DispatcherState,
-) {
+) -> bool {
     debug!(
         call_id = %call_id,
         branch = %branch,
@@ -136,7 +138,7 @@ pub fn handle_b2bua_response(
     // Read the A-leg info and the matching B-leg out of the call and drop the
     // `DashMap` guard before entering Python.
     let Some(snapshot) = b_leg_response_snapshot(call_id, branch, state) else {
-        return;
+        return false;
     };
 
     // A `2xx` to a B-leg CANCEL shares the INVITE's top Via branch (RFC 3261
@@ -156,10 +158,10 @@ pub fn handle_b2bua_response(
             status = status_code,
             "B2BUA: absorbing 2xx/response to a B-leg CANCEL (not an INVITE answer)"
         );
-        return;
+        return true;
     }
     if absorb_cancelled_branch_response(call_id, branch, message, status_code, state) {
-        return;
+        return true;
     }
     auto_prack_b_leg(call_id, message, status_code, state, &snapshot);
 
@@ -178,22 +180,22 @@ pub fn handle_b2bua_response(
             call_id = %call_id,
             "B2BUA: absorbing B-leg 200 OK PRACK"
         );
-        return;
+        return true;
     }
     if absorb_completed_reinvite_retransmit(call_id, message, status_code, state, &snapshot) {
-        return;
+        return true;
     }
     if absorb_completed_update_retransmit(call_id, status_code, &snapshot) {
-        return;
+        return true;
     }
     if absorb_completed_forward_retransmit(call_id, status_code, &snapshot) {
-        return;
+        return true;
     }
     if dispatch_bridge_reinvite_response(call_id, branch, message, status_code, state, &snapshot) {
-        return;
+        return true;
     }
     if absorb_completed_bridge_retransmit(call_id, message, status_code, state, &snapshot) {
-        return;
+        return true;
     }
     if forward_reinvite_response(
         call_id,
@@ -204,7 +206,7 @@ pub fn handle_b2bua_response(
         state,
         &snapshot,
     ) {
-        return;
+        return true;
     }
     if forward_update_response(
         call_id,
@@ -214,10 +216,10 @@ pub fn handle_b2bua_response(
         state,
         &snapshot,
     ) {
-        return;
+        return true;
     }
     if forward_transfer_response(call_id, message, status_code, state, &snapshot) {
-        return;
+        return true;
     }
     feed_leg_actor_and_learn_dialog(call_id, message, status_code, state, &snapshot);
 
@@ -246,7 +248,7 @@ pub fn handle_b2bua_response(
     // its own state machine advances, and the event is still consumed so the
     // channel drains; only the classification no longer depends on it.
     let Some(class) = classify_b_leg_response(status_code) else {
-        return; // 100 Trying from B-leg — absorb
+        return true; // 100 Trying from B-leg — absorb
     };
 
     // siphon-terminated transfer: intercept EVERY response from a newly-dialed
@@ -298,7 +300,7 @@ pub fn handle_b2bua_response(
                     "B2BUA REFER (terminate): absorbing transfer-target provisional (not forwarded to the referrer)"
                 );
             }
-            return;
+            return true;
         }
     }
 
@@ -323,4 +325,5 @@ pub fn handle_b2bua_response(
             b_leg_failed(call_id, branch, message, status_code, state, &snapshot)
         }
     }
+    true
 }

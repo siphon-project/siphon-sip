@@ -250,94 +250,23 @@ pub(super) fn handle_response(
     }
 
     // Check if this response belongs to a B2BUA call
+    let mut torn_down_call = None;
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
-        handle_b2bua_response(
+        if handle_b2bua_response(
             &call_id,
             &branch,
             &mut message,
             status_code,
             inbound.remote_addr,
             state,
-        );
-        return;
-    }
-
-    // Post-teardown: re-ACK retransmitted re-INVITE 200 OKs for calls already
-    // torn down by BYE. The zombie map holds destination info for B-leg entries
-    // that had active re-INVITE tracking when the call was removed.
-    if (200..300).contains(&status_code) {
-        if let Some(cseq_raw) = message.headers.get("CSeq") {
-            if cseq_raw.contains("INVITE") {
-                if let Some(sip_call_id) = message.headers.call_id() {
-                    if let Some(zombie) = state.call_actors.get_zombie_reinvite(sip_call_id) {
-                        let transport_str = format!("{}", zombie.transport).to_uppercase();
-                        // Anchor the re-ACK Via to the zombie leg's socket (the A-leg's
-                        // arrival listener for a B→A re-INVITE) so it matches the source.
-                        let outbound_port = a_leg_advertised_port(
-                            zombie.local_addr,
-                            state
-                                .listen_addrs
-                                .get(&zombie.transport)
-                                .map(|a| a.port())
-                                .unwrap_or(state.local_addr.port()),
-                        );
-                        let cseq_num = cseq_raw
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("1")
-                            .to_string();
-                        let from = message.headers.from().cloned().unwrap_or_default();
-                        let to = message.headers.to().cloned().unwrap_or_default();
-                        let ack_uri = SipUri::new(zombie.destination.ip().to_string())
-                            .with_port(zombie.destination.port());
-                        let ack = match SipMessageBuilder::new()
-                            .request(Method::Ack, ack_uri)
-                            .via(format!(
-                                "SIP/2.0/{} {}:{};branch={}",
-                                transport_str,
-                                state.a_leg_advertised_host(zombie.local_addr, &zombie.transport),
-                                outbound_port,
-                                TransactionKey::generate_branch(),
-                            ))
-                            .from(from.to_string())
-                            .to(to.to_string())
-                            .call_id(sip_call_id.to_string())
-                            .cseq(format!("{} ACK", cseq_num))
-                            .header("Max-Forwards", "70".to_string())
-                            .content_length(0)
-                            .build()
-                        {
-                            Ok(ack) => ack,
-                            Err(error) => {
-                                error!("B2BUA zombie ACK build failed: {error}");
-                                return;
-                            }
-                        };
-                        // Source from the zombie leg's anchored socket (multi-homed
-                        // parity); reuse an established connection as before.
-                        let data = Bytes::from(ack.to_bytes());
-                        let target = RelayTarget {
-                            address: zombie.destination,
-                            transport: Some(zombie.transport),
-                            server_name: None,
-                        };
-                        send_to_target(
-                            data,
-                            &target,
-                            zombie.transport,
-                            ConnectionId::default(),
-                            zombie.local_addr,
-                            state,
-                        );
-                        debug!(
-                            call_id = sip_call_id,
-                            "B2BUA: zombie re-ACK for post-teardown re-INVITE 200 OK retransmission"
-                        );
-                        return;
-                    }
-                }
-            }
+        ) {
+            return;
         }
+        // The branch still resolved but its call is gone: a teardown removed the
+        // call while this response was in flight and cleans the branch index up
+        // right after. Handled below like any response for a call that already
+        // ended, so a 2xx to our own INVITE still gets its ACK.
+        torn_down_call = Some(call_id);
     }
 
     // Post-CANCEL glare (RFC 3261 §9.1): a 2xx that raced an outbound CANCEL.
@@ -1208,8 +1137,16 @@ pub(super) fn handle_response(
         }
     }
 
-    // No matching session or B2BUA call — response is not ours
-    debug!(branch = %branch, "response for unknown branch (not ours)");
+    // A 2xx to an INVITE siphon sent whose call has ended is owed its ACK all
+    // the same (RFC 3261 §13.2.2.4, RFC 5407 §3.1.3). Checked last, so a
+    // response a live transaction or session claims never pays for the check.
+    if ack_late_2xx_after_teardown(&inbound, &message, status_code, state) {
+        return;
+    }
+    match torn_down_call {
+        Some(call_id) => warn!(call_id = %call_id, "B2BUA: response for unknown call"),
+        None => debug!(branch = %branch, "response for unknown branch (not ours)"),
+    }
 }
 
 /// Run `@proxy.on_reply` Python handlers on a response message.
