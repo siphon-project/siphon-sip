@@ -53,6 +53,7 @@ fn offer_response() -> Response {
             to_tag: None,
             stats: None,
             play_id: None,
+            recording_id: None,
         },
     }
 }

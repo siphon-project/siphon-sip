@@ -181,6 +181,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
+
+  - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip
+    carries it through to the `@rtpengine.on_media_timeout` log line: `no_media`
+    (the path died or never formed) or `held_too_long` (every leg held past the
+    held-media timeout — nobody came back). They are different operational
+    events and only the first is worth alerting on; a single "media timeout"
+    could not tell them apart.
+  - `Command::PlayMedia.repeat_times` is a `PlayRepeat` — a count or `"inf"`.
+    siphon-sip's own API still takes a count; the endless form is what music on
+    hold and ringback need and is exposed with the play verb rather than here.
+  - `CmdResult::Ok` carries a `recording_id` and `Event::PlayFinished` a
+    `conference_id`. Neither has a siphon-sip concept to map onto yet — they
+    land with the recording and conference verbs.
+
+  `MediaTimeoutReason` is `#[non_exhaustive]`, so an unrecognised reason reads
+  as `unknown` rather than failing the build on the engine's next release.
+
 - **The IPsec runtime lookups moved from `script::api::ipsec` to
   `ipsec::runtime`.** They are Rust-side process state that the scripting API
   happens to populate, not part of the Python surface, and living in the PyO3

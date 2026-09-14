@@ -32,7 +32,15 @@ pub enum RtpEngineEvent {
     /// A call's media went silent past the timeout and the engine tore it down
     /// (dead-path detection).  Emitted by the `siphon-rtp` native backend; the
     /// rtpengine NG backend does not currently surface this.
-    MediaTimeout { call_id: String, from_tag: String },
+    MediaTimeout {
+        call_id: String,
+        from_tag: String,
+        /// Why the engine gave up: `no_media` (the path died or never formed)
+        /// or `held_too_long` (every leg held past the held-media timeout —
+        /// nobody came back to it). Carried because the two are different
+        /// operational events and the teardown this causes should say which.
+        reason: &'static str,
+    },
     /// End-of-call media summary (the structured twin of the `siphon_rtp::cdr`
     /// log block), emitted once when the engine tears a call down.  Carries the
     /// per-leg byte/packet counters and, when a userspace media actor measured

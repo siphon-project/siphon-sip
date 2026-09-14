@@ -50,6 +50,7 @@ async fn spawn_fake_siphon_rtp() -> std::net::SocketAddr {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                             Command::Delete { .. } => CmdResult::Ok {
                                 sdp: None,
@@ -57,6 +58,7 @@ async fn spawn_fake_siphon_rtp() -> std::net::SocketAddr {
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                             Command::Ping => CmdResult::Pong,
                             _ => CmdResult::Error {
@@ -183,6 +185,7 @@ async fn spawn_recording_siphon_rtp() -> (std::net::SocketAddr, mpsc::UnboundedR
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                             Command::Ping => CmdResult::Pong,
                             _ => CmdResult::Ok {
@@ -191,6 +194,7 @@ async fn spawn_recording_siphon_rtp() -> (std::net::SocketAddr, mpsc::UnboundedR
                                 to_tag: None,
                                 stats: None,
                                 play_id: None,
+                                recording_id: None,
                             },
                         };
                         let response = Response {
