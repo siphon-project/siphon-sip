@@ -434,7 +434,7 @@ const CARRIER: &str = "sip:10.0.0.1:5060";
 
 #[test]
 fn no_destination_keeps_the_dialled_number() {
-    let target = b2bua_carrier_ruri(&route_to(None), ACCESS_NUMBER, Some(CARRIER));
+    let target = b2bua_carrier_ruri(&route_to(None), ACCESS_NUMBER, Some(CARRIER), None);
     assert!(target.contains("+12025550100"), "{target}");
 }
 
@@ -447,6 +447,7 @@ fn a_destination_replaces_the_dialled_number_and_keeps_the_carrier_host() {
         &route_to(Some("+12025550199")),
         ACCESS_NUMBER,
         Some(CARRIER),
+        None,
     );
 
     assert!(target.contains("+12025550199"), "{target}");
@@ -468,6 +469,7 @@ fn a_destination_given_as_a_uri_contributes_only_its_userpart() {
         &route_to(Some("sip:+12025550199@somewhere-else.example.net")),
         ACCESS_NUMBER,
         Some(CARRIER),
+        None,
     );
 
     assert!(target.contains("+12025550199"), "{target}");
@@ -488,7 +490,7 @@ fn tech_prefix_applies_on_top_of_the_retargeted_number() {
         tech_prefix: Some("1010288".to_string()),
         ..Default::default()
     };
-    let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER));
+    let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER), None);
 
     assert!(target.contains("1010288+12025550199"), "{target}");
 }
@@ -502,7 +504,7 @@ fn an_explicit_ruri_still_gets_retargeted_but_keeps_its_own_host() {
         destination: Some("+12025550199".to_string()),
         ..Default::default()
     };
-    let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER));
+    let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER), None);
 
     assert!(target.contains("+12025550199"), "{target}");
     assert!(
@@ -513,7 +515,7 @@ fn an_explicit_ruri_still_gets_retargeted_but_keeps_its_own_host() {
 
 #[test]
 fn an_empty_destination_is_ignored_rather_than_blanking_the_number() {
-    let target = b2bua_carrier_ruri(&route_to(Some("")), ACCESS_NUMBER, Some(CARRIER));
+    let target = b2bua_carrier_ruri(&route_to(Some("")), ACCESS_NUMBER, Some(CARRIER), None);
     assert!(target.contains("+12025550100"), "{target}");
 }
 
@@ -526,7 +528,7 @@ fn a_retarget_survives_an_unparseable_base_uri() {
         tech_prefix: Some("99".to_string()),
         ..Default::default()
     };
-    let target = b2bua_carrier_ruri(&route, "not a uri", Some(CARRIER));
+    let target = b2bua_carrier_ruri(&route, "not a uri", Some(CARRIER), None);
     assert_eq!(target, "99+12025550199");
 }
 

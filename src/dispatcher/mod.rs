@@ -77,6 +77,8 @@ mod tasks;
 mod timers;
 
 #[cfg(test)]
+mod lcr_number_policy_tests;
+#[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
 mod public_api_surface;

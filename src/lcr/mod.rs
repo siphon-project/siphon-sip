@@ -200,7 +200,8 @@ pub struct Route {
     /// Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart for this
     /// carrier (e.g. `"1010288"` or `"#31#"`). Many carriers key routing/billing
     /// on a prefix in front of the E.164 number. Prepended to `ruri`'s userpart
-    /// when set, else the dialed number's.
+    /// when set, else the dialed number's, after `number_policy` has shaped that
+    /// number, so the prefix goes in front of the carrier's shape of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tech_prefix: Option<String>,
     /// Per-minute rate — carried into CDR/charging (not used for routing).
@@ -246,10 +247,13 @@ pub struct Route {
     /// while looking like it works — so the two always move together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_id_presentation: Option<String>,
-    /// Named `number_policies:` preset applied to *this carrier's* B-leg identity
-    /// headers (From / To / P-Asserted-Identity / P-Preferred-Identity) — so the
-    /// From/To shape can differ per carrier and a failover to a second carrier
-    /// reshapes independently. The R-URI is controlled by `tech_prefix` / `ruri`.
+    /// Named `number_policies:` preset applied to *this carrier's* B-leg: the
+    /// dialled number in the Request-URI and the identity headers (From / To /
+    /// P-Asserted-Identity / P-Preferred-Identity) get the same shape, and a
+    /// failover to a second carrier reshapes independently. `tech_prefix` is
+    /// prepended to the shaped number. When absent,
+    /// `b2bua.default_number_policy` applies, as it does for `call.dial()`; a
+    /// name that is not configured shapes nothing and is logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number_policy: Option<String>,
     /// Headers to inject on this carrier's B-leg INVITE (e.g. a carrier account

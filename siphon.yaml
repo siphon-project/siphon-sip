@@ -1764,7 +1764,8 @@ auth:
 #       respect_privacy: true           #   index/reason/cause/order preserved,
 #                                       #   privacy-restricted entries skipped.
 #
-# B2BUA default (applied when a call doesn't pass number_policy=):
+# B2BUA default (applied when a call doesn't pass number_policy=, and to an LCR
+# route that names no number_policy):
 # b2bua:
 #   default_number_policy: "ims-e164@2026"
 

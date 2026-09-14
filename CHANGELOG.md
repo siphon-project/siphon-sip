@@ -243,6 +243,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   of installing SAs that cannot work. Bind the protected ports to the address
   UEs send to, as `examples/ims_pcscf.yaml` now does; behind NAT that is the
   private address, not the public `advertised_address`.
+- **An LCR route's `number_policy` shapes the dialled number in the carrier
+  Request-URI too, not only From and To.** The policy reached the identity
+  headers while the Request-URI kept the number in whatever form it arrived in,
+  so a route naming a policy and no `tech_prefix` could send bare digits to a
+  carrier while From and To went out as `+E.164`. A carrier that screens the
+  dialled number refuses that attempt, and the refusal reads as the carrier
+  declining, so the call failed over to the next one. The Request-URI number is
+  now shaped with the route's policy, the way `call.dial()`, `call.fork()` and a
+  transfer already shape their targets, and `tech_prefix` is prepended to the
+  shaped number. A route that names no `number_policy` now falls back to
+  `b2bua.default_number_policy`, as `call.dial()` does, instead of getting no
+  shaping at all (which reshapes that route's From and To as well). A policy
+  name that is not configured still shapes nothing and is logged at warn.
+
+  This changes the Request-URI sent for routes that name a policy, or rely on
+  the default, whose dialled number did not already match it. An operator who
+  compensated with `tech_prefix: "+"` or a pre-shaped `ruri` should check those
+  routes: under an `e164` policy the former now sends `++`, and the number in a
+  pre-shaped `ruri` is reshaped to the policy.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

@@ -69,8 +69,8 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `next_hop` | string? | Explicit next-hop URI (when no group, or to pin the wire destination). |
 | `ruri` | string? | Full Request-URI override (carrier IMPU shape / number format). |
 | `destination` | string? | Retarget this carrier at a different destination number (RFC 3261 §16.5). Overrides the answer-level `destination`. Bare number or a URI (userpart only). |
-| `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`). |
-| `number_policy` | string? | Named `number_policies:` preset applied to this carrier's B-leg From/To/PAI (per-carrier CLI/identity shape). R-URI stays controlled by `tech_prefix`/`ruri`. |
+| `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`), after `number_policy` has shaped the number. |
+| `number_policy` | string? | Named `number_policies:` preset for this carrier's B-leg: shapes the dialled number in the R-URI and the From/To/PAI identity alike. Absent = `b2bua.default_number_policy`, as for `call.dial()`. A name that is not configured shapes nothing and is logged at warn. |
 | `caller_id` | string? | Calling number this carrier is presented (the CLI). Tag-preserving; also applied to PAI/PPI. |
 | `caller_id_presentation` | string? | `allowed` (default) or `restricted` — CLIR per RFC 3323 / TS 24.607. |
 | `rate` | number? | Per-minute rate (CDR/charging). |
@@ -142,8 +142,11 @@ Top-level:
   }
   ```
 
-  Carrier `a` is dialled as `1010288+12025550199` through a healthy member of
-  `carriers`; carrier `b` overrides the number with its own.
+  With no number policy in play, carrier `a` is dialled as
+  `1010288+12025550199` through a healthy member of `carriers`; carrier `b`
+  overrides the number with its own. Under a `plain` policy carrier `a` would be
+  dialled as `101028812025550199`: the policy shapes the retargeted number
+  first, and the prefix goes in front of the result.
 
   The `To` userpart follows the retarget, so the number the call was originally
   dialled on never reaches the carrier. The **tech prefix is not** applied to

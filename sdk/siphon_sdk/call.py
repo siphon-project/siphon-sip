@@ -968,9 +968,11 @@ class Call:
         The carriers (from ``await lcr.route(call)``, optionally filtered /
         reordered) are tried cheapest-first: dial the first routable carrier
         (a ``gateway_group`` resolved to a healthy member, else ``next_hop`` /
-        ``ruri``, with any ``tech_prefix`` prepended and ``headers`` injected),
-        and on a reroute cause advance to the next — each attempt a fresh B-leg
-        dialog. On answer, :attr:`active_route` is the carrier that won.
+        ``ruri``; the dialled number shaped by the route's ``number_policy``,
+        else ``b2bua.default_number_policy``, with any ``tech_prefix``
+        prepended to the shaped number and ``headers`` injected), and on a
+        reroute cause advance to the next — each attempt a fresh B-leg dialog.
+        On answer, :attr:`active_route` is the carrier that won.
 
         Args:
             routes: Ordered carriers (cheapest first).

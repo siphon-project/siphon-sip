@@ -430,9 +430,13 @@ pub fn b2bua_send_b_leg_invite(
         crate::sip::privacy::set_calling_number(&mut b_leg_invite, caller_id);
     }
 
-    // Per-carrier (LCR) number policy: reshape this B-leg's identity headers
-    // (From / To / P-Asserted-Identity / P-Preferred-Identity) to the carrier's
-    // format. The R-URI is owned by tech_prefix / ruri, so it is left untouched.
+    // Per-leg number policy (an LCR route's, or a transfer's): reshape this
+    // B-leg's identity headers (From / To / P-Asserted-Identity /
+    // P-Preferred-Identity) to the carrier's format. The Request-URI is not
+    // walked here: every caller that passes a policy has already shaped its
+    // target with it — an LCR route in `b2bua_carrier_ruri`, before the route's
+    // `tech_prefix` goes on, and a transfer in `reformat_dial_target`. Walking
+    // it again would read a tech prefix as part of the number.
     if let Some(policy) = number_policy {
         crate::script::api::numbers::apply_identity_headers(&mut b_leg_invite, policy);
     }

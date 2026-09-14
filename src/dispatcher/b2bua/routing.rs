@@ -123,14 +123,26 @@ pub fn py_flow_from_leg(
     })
 }
 
-/// Build the B-leg R-URI for a carrier route: base is the route's `ruri` (else
-/// the A-leg R-URI), with the carrier's tech-prefix prepended to the userpart.
-/// For a bare dialed-number route (no `ruri`) dialed via a carrier next-hop, the
-/// R-URI host is pointed at the carrier so it sees itself as the target.
+/// Build the B-leg R-URI for a carrier route.
+///
+/// In this order: the base is the route's `ruri` (else the A-leg R-URI); the
+/// route's `destination` replaces the number; the route's number policy
+/// reshapes that number to the policy's Request-URI format; the carrier's
+/// `tech_prefix` is prepended to the shaped number. For a bare dialed-number
+/// route (no `ruri`) dialed via a carrier next-hop, the R-URI host is then
+/// pointed at the carrier so it sees itself as the target.
+///
+/// `number_policy` is the route's resolved policy
+/// ([`b2bua_route_number_policy`]), the same one that shapes the identity
+/// headers when the INVITE is built, so the dialled number cannot go out in one
+/// shape while From and To carry another. It is applied here rather than there
+/// because once `tech_prefix` is on, the userpart no longer parses as the
+/// number the carrier is being asked to reach.
 pub fn b2bua_carrier_ruri(
     route: &crate::lcr::Route,
     a_leg_ruri: &str,
     next_hop: Option<&str>,
+    number_policy: Option<&crate::numbers::policy::NumberPolicy>,
 ) -> String {
     let base = route.ruri.as_deref().unwrap_or(a_leg_ruri);
     // Per-route destination beats the answer-level one; either replaces the
@@ -147,7 +159,8 @@ pub fn b2bua_carrier_ruri(
         Ok(uri) => uri,
         Err(_) => {
             // Unparseable base — best-effort string prefix so neither the
-            // retarget nor the prefix is silently dropped.
+            // retarget nor the prefix is silently dropped. There is no parsed
+            // userpart here for the number policy to shape.
             let base = match destination.as_deref() {
                 Some(destination) => destination,
                 None => base,
@@ -165,6 +178,17 @@ pub fn b2bua_carrier_ruri(
     // member selection and health checking.
     if let Some(destination) = destination {
         uri.user = Some(destination);
+    }
+
+    // Shape the number before the prefix goes on, through the helper a transfer
+    // shapes its target with, so a userpart that is not a number (`sip:alice@…`)
+    // is left alone. Only the userpart is taken back; host and parameters stay
+    // as the base wrote them.
+    if let Some(policy) = number_policy {
+        let shaped = crate::script::api::numbers::reformat_dial_target(&uri.to_string(), policy);
+        if let Ok(shaped) = parse_uri_standalone(&shaped) {
+            uri.user = shaped.user;
+        }
     }
 
     if let Some(prefix) = route.tech_prefix.as_deref().filter(|p| !p.is_empty()) {
@@ -211,17 +235,6 @@ pub fn lcr_destination_userpart(destination: &str) -> String {
     }
 }
 
-/// Dial the next routable carrier in a call's sequential-failover queue (LCR
-/// `call.route(...)` or `fork(strategy="sequential")`).
-///
-/// Pops carriers off the pending queue until one resolves — a `gateway_group`
-/// to a healthy member (skipping a group that is entirely down), an explicit
-/// `next_hop`, or an `ruri` — then sends its B-leg INVITE (a **fresh** dialog:
-/// `b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/CSeq) and arms the
-/// per-attempt answer deadline. Returns `true` if a carrier was dialed, `false`
-/// once the queue is exhausted. `original_request` is the stored A-leg INVITE
-/// (its R-URI is the default dial target when a route omits its own `ruri`);
-/// the caller passes the locked message so this never re-locks it.
 /// Outcome of one [`b2bua_advance_route`] pass.
 pub struct RouteAdvance {
     /// Whether a carrier's INVITE actually reached the transport.
@@ -257,10 +270,67 @@ impl RouteAdvance {
 /// never answered this — it is siphon's verdict on the route.
 pub const LCR_UNDIALED_STATUS: u16 = 503;
 
+/// The number policy an LCR route's attempt is shaped with: the route's own
+/// `number_policy`, else `b2bua.default_number_policy`, else none. That is the
+/// order `call.dial(number_policy=…)` resolves in, so a route that names no
+/// policy gets what a script dial naming none gets.
+///
+/// Resolved once per attempt, before the carrier target is built, and that one
+/// result shapes both the Request-URI ([`b2bua_carrier_ruri`]) and the identity
+/// headers ([`b2bua_send_b_leg_invite`]).
+///
+/// A name the configuration does not define shapes nothing, the default
+/// included: the routing backend asked for a specific shape, and putting a
+/// different one on the wire would hide its typo behind a call that still goes
+/// out. It is logged once per attempt, naming the carrier and the policy.
+pub fn b2bua_route_number_policy(
+    route: &crate::lcr::Route,
+    numbers: &crate::script::api::numbers::NumberRuntime,
+    call_id: &str,
+) -> Option<Arc<crate::numbers::policy::NumberPolicy>> {
+    match numbers.dial_policy(route.number_policy.as_deref()) {
+        Ok(policy) => policy,
+        Err(unknown) => {
+            warn!(
+                call_id = %call_id,
+                carrier = %route.carrier_id,
+                policy = %unknown.0,
+                "LCR: unknown number_policy on route, leaving the dialled number and identity headers unshaped"
+            );
+            None
+        }
+    }
+}
+
+/// Dial the next routable carrier in a call's sequential-failover queue (LCR
+/// `call.route(...)` or `fork(strategy="sequential")`).
+///
+/// Pops carriers off the pending queue until one resolves — a `gateway_group`
+/// to a healthy member (skipping a group that is entirely down), an explicit
+/// `next_hop`, or an `ruri` — then sends its B-leg INVITE (a **fresh** dialog:
+/// `b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/CSeq) and arms the
+/// per-attempt answer deadline. [`RouteAdvance::dialed`] says whether a carrier
+/// was dialled; it is `false` once the queue is exhausted. `original_request`
+/// is the stored A-leg INVITE (its R-URI is the default dial target when a route
+/// omits its own `ruri`); the caller passes the locked message so this never
+/// re-locks it.
 pub fn b2bua_advance_route(
     call_id: &str,
     original_request: &SipMessage,
     state: &DispatcherState,
+) -> RouteAdvance {
+    let numbers = crate::script::api::numbers::number_runtime();
+    b2bua_advance_route_with_numbers(call_id, original_request, state, &numbers)
+}
+
+/// [`b2bua_advance_route`] with the number policies passed in rather than read
+/// from the process-wide runtime, which is installed once per process (the
+/// first installer wins) and so cannot give a test a policy set of its own.
+pub fn b2bua_advance_route_with_numbers(
+    call_id: &str,
+    original_request: &SipMessage,
+    state: &DispatcherState,
+    numbers: &crate::script::api::numbers::NumberRuntime,
 ) -> RouteAdvance {
     let send_socket_str = state.call_actors.route_send_socket(call_id);
     let send_socket = state.resolve_send_socket(send_socket_str.as_deref());
@@ -309,10 +379,20 @@ pub fn b2bua_advance_route(
             b2bua_record_undialed_carrier(call_id, &route, &mut burned, state);
             continue;
         }
-        let target = b2bua_carrier_ruri(&route, &a_leg_ruri, next_hop.as_deref());
-        // The same value b2bua_carrier_ruri put in the R-URI userpart, so the
-        // To can be aligned with it. Resolved here rather than re-derived from
-        // the target, which by then carries the tech prefix too.
+        // The carrier's number shape, resolved before its target is built: the
+        // one policy shapes the dialled number in the R-URI here and the
+        // identity headers when the INVITE is built, so it has to exist first.
+        let carrier_number_policy = b2bua_route_number_policy(&route, numbers, call_id);
+        let target = b2bua_carrier_ruri(
+            &route,
+            &a_leg_ruri,
+            next_hop.as_deref(),
+            carrier_number_policy.as_deref(),
+        );
+        // The retarget number b2bua_carrier_ruri started from, so the To can be
+        // aligned with it. Resolved here rather than re-derived from the target,
+        // which by then carries the policy's shape and the tech prefix too; the
+        // To gets the policy's shape when the identity headers are reshaped.
         let retarget = route
             .destination
             .as_deref()
@@ -346,25 +426,6 @@ pub fn b2bua_advance_route(
             next_hop = ?next_hop,
             "LCR: dialing carrier",
         );
-        // The carrier's identity format, resolved here rather than inside the
-        // send path: that path now takes a policy, not a name, so the two
-        // callers that shape a B-leg (this one and the leg replacement) cannot
-        // disagree about how a selector turns into a policy.
-        let carrier_number_policy = match route.number_policy.as_deref() {
-            None => None,
-            Some(name) => match crate::script::api::numbers::resolve_dial_policy(Some(name)) {
-                Ok(policy) => policy,
-                Err(_) => {
-                    warn!(
-                        call_id = %call_id,
-                        carrier = %route.carrier_id,
-                        policy = %name,
-                        "LCR: unknown number_policy on route, skipping identity reshape"
-                    );
-                    None
-                }
-            },
-        };
         let sent = b2bua_send_b_leg_invite(
             call_id,
             &target,
