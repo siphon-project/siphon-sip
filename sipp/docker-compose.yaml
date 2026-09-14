@@ -6995,6 +6995,8 @@ services:
   #   172.20.0.202  caller
   #   172.20.0.203  ringing carrier (progress case: 183, then held until CANCEL)
   #   172.20.0.204  untried carrier (progress case: must never be dialled)
+  #   172.20.0.205  rejecting carrier (settled carrier case: 503, stale 183, never CANCELled)
+  #   172.20.0.206  trying carrier (settled carrier case: 100, then rings out)
   siphon-b2bua-lcr:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
@@ -7173,6 +7175,57 @@ services:
         fi
         echo "untried carrier: SIPp exited $$code, and only 97 (no INVITE in the window) passes"
         exit 1
+    profiles:
+      - b2bua-lcr
+
+  # The settled carrier case (b2bua_lcr_last_carrier_rings_out_uac.xml): the
+  # callee +15550100004 is routed over b2bua-lcr/routes.15550100004.json, both
+  # routes with timeout_secs 3, under a ring bound of 6 s (b2bua_lcr.py). The
+  # rejecting carrier sends a stale 183 after its ACK and then waits 10 s for a
+  # CANCEL that must not come, well inside its 30 s -timeout.
+  sipp-b2bua-lcr-rejecting-carrier-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-rejecting-carrier-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.205
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_rejecting_carrier_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-lcr
+
+  sipp-b2bua-lcr-trying-carrier-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-trying-carrier-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.206
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_trying_carrier_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
     profiles:
       - b2bua-lcr
 

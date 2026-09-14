@@ -9,17 +9,23 @@ so does the ring bound below:
 - +15550100003 (routes.15550100003.json): the ringing carrier answers 183 and
   holds, past its 3 s ``timeout_secs``, until the 8 s ring bound; the untried
   carrier after it must never be dialled.
+- +15550100004 (routes.15550100004.json): the rejecting carrier answers 503, so
+  the sequence moves on to the trying carrier, the last one, which answers only
+  100 and rings out at its 3 s ``timeout_secs``, inside a 6 s ring bound, and the
+  call fails 503. The rejecting carrier's later 183 must not reach the caller,
+  and the rejecting carrier must never be sent a CANCEL.
 
 ``@b2bua.on_failure`` decides nothing. A failure the sequence ends on is
 therefore relayed to the caller as the carrier sent it, or as siphon's own 408
-when the ring runs out, and that response is what the caller scenario checks.
+or 503 when the ring runs out, and that response is what the caller scenario
+checks.
 """
 
 from siphon import b2bua, lcr, log, proxy
 
 # call.route(timeout=...) by called number: how long a carrier that has shown
 # progress may keep the call. Any other number gets call.route()'s own default.
-RING_BOUND_SECS = {"+15550100003": 8}
+RING_BOUND_SECS = {"+15550100003": 8, "+15550100004": 6}
 DEFAULT_RING_BOUND_SECS = 30
 
 

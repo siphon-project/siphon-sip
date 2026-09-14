@@ -25,6 +25,15 @@ impl CallActorStore {
         Some(settlement)
     }
 
+    /// Whether the B-leg at `index` is a branch still waiting for its final
+    /// response. See [`CallActor::is_pending_branch`]. `false` when the call is
+    /// gone.
+    pub fn is_pending_branch(&self, call_id: &str, index: usize) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.is_pending_branch(index))
+    }
+
     /// Open a fork's dispatch window. See [`CallActor::fork_dispatching`].
     pub fn start_fork_dispatch(&self, call_id: &str) {
         if let Some(mut call) = self.calls.get_mut(call_id) {

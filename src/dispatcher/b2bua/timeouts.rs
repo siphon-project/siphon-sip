@@ -149,14 +149,38 @@ pub fn check_pending_inbound_refer_timeouts(state: &DispatcherState) {
     }
 }
 
+/// The status a call fails with when its ring timeout ends it.
+///
+/// A ring that ran out is a 408 (RFC 3261 §16.8): the callee was reached and did
+/// not answer in time. A route sequence that ends on the ring timeout of a
+/// carrier that never sent a 101-199 is a different failure. No carrier got as
+/// far as the callee, so nothing rang, and the caller is told `503 Service
+/// Unavailable`, as when no carrier can be dialled at all. That 503 is siphon's
+/// own answer as the caller's UAS, built from its INVITE, so the rewrite of an
+/// aggregated carrier 503 to 500 (RFC 3261 §16.7 step 6) never applies to it.
+///
+/// Progress is the carrier having sent a 101-199 at all, whether or not its
+/// route kept the call for it: a hunt, whose every target has
+/// `reroute_after_progress`, that ends on a phone that rang still reached a
+/// callee who did not answer. Any other ring timeout, a dial's or a parallel
+/// fork's, stays 408.
+pub fn ring_timeout_failure_status(route_sequence: bool, carrier_progressed: bool) -> u16 {
+    if route_sequence && !carrier_progressed {
+        503
+    } else {
+        408
+    }
+}
+
 /// Fail a B2BUA call whose answer deadline passed while it was still
 /// un-answered — the B-leg never produced a final 2xx (dead/partitioned trunk,
 /// or a B-leg that silently went away).
 ///
 /// CANCELs every B-leg still ringing (RFC 3261 §9.1), each kept answerable so a
-/// 2xx that raced the CANCEL is still ACK+BYEd, then concludes the call as a
-/// `408` like any other failure: `@b2bua.on_failure` decides whether the caller
-/// gets it or the call is routed somewhere else. Driven from
+/// 2xx that raced the CANCEL is still ACK+BYEd, then concludes the call like any
+/// other failure, with the status [`ring_timeout_failure_status`] picks:
+/// `@b2bua.on_failure` decides whether the caller gets it or the call is routed
+/// somewhere else. Driven from
 /// [`check_b2bua_answer_timeouts`].
 pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // Control-plane handoff deadline: a call parked under external control whose
@@ -224,9 +248,30 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         None => return,
     };
 
-    // LCR / sequential failover: the current carrier did not answer within its
-    // ring timeout. If more carriers remain and 408 is a reroute cause for this
-    // carrier, CANCEL this attempt and advance instead of failing the call.
+    // What the call fails with if this timeout ends it. Whether the carrier in
+    // flight sent a 101-199 is read here, before anything below can advance the
+    // sequence, which takes the next carrier and clears it.
+    let route_sequence = state.call_actors.is_route_sequence(call_id);
+    let failure_status = ring_timeout_failure_status(
+        route_sequence,
+        state.call_actors.route_attempt_progressed(call_id),
+    );
+
+    // LCR / sequential failover: the carrier in flight did not answer within its
+    // ring timeout. Its attempt is recorded as 408 before anything else, the way
+    // a carrier failing with a final response is recorded before its ACK: the
+    // call may advance, fail, or go back to a controller, and either way
+    // `@b2bua.on_route_failure` fires for this carrier once, and a
+    // `@b2bua.on_failure` that concludes the call finds it on
+    // `call.route_attempts`. Recording it only on the advance left the last
+    // carrier, and one kept by progress, off the attempt list altogether. The
+    // attempt is the carrier's outcome and stays 408 whatever the caller is told.
+    if route_sequence {
+        b2bua_record_carrier_failure(call_id, 408, &a_leg, a_leg_invite.as_ref(), state);
+    }
+
+    // If more carriers remain and 408 is a reroute cause for this carrier,
+    // CANCEL this attempt and advance instead of failing the call.
     //
     // Unless the carrier has shown progress. A 101-199 says it reached the far
     // end and is working on the call, so its route's timer bounded only the wait
@@ -252,21 +297,6 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         && state.call_actors.has_pending_routes(call_id)
         && b2bua_status_reroutes(call_id, 408, state)
     {
-        // A ring timeout is recorded as 408 — the code the attempt effectively
-        // ended on, and the one the A-leg would have seen had the queue been
-        // exhausted here.
-        let timed_out_route = state.call_actors.active_route(call_id);
-        if let Some(attempt) = state.call_actors.record_route_failure(call_id, 408) {
-            info!(
-                call_id = %call_id,
-                carrier = %attempt.carrier_id,
-                elapsed_ms = attempt.elapsed_ms,
-                "LCR: carrier ring-timeout"
-            );
-        }
-        if let Some(route) = &timed_out_route {
-            b2bua_dispatch_route_failure(call_id, route, 408, &a_leg, a_leg_invite.as_ref(), state);
-        }
         // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1), each
         // kept answerable apart from the call. The next carrier can fail, and end
         // the call, before this one's 487 arrives, and that 487 is owed its ACK
@@ -294,7 +324,8 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // are given up on — CANCEL them (RFC 3261 §9.1) — but the caller is not:
     // it stays unanswered and parked, and the controller decides what happens
     // next. "Nobody answered, go to voicemail" is the whole point of the verb,
-    // and failing the caller 408 here would take that decision away.
+    // and failing the caller here would take that decision away. A sequential
+    // dial reports the code a route sequence fails with, by the same rule.
     if state.call_actors.is_control_dial(call_id) {
         // Each CANCELled leg stays answerable apart from the call, as on the LCR
         // ring timeout above: its 487 is owed an ACK (RFC 3261 §17.1.1.3) even if
@@ -304,7 +335,13 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         }
         let cancelled = state.call_actors.cancel_ringing_branches(call_id);
         cancel_settled_branches(&cancelled, state);
-        if report_control_dial_failure(call_id, 408, "Request Timeout", true, state) {
+        if report_control_dial_failure(
+            call_id,
+            failure_status,
+            best_error_reason(failure_status),
+            true,
+            state,
+        ) {
             return;
         }
         // The dial was resolved by something else in between (answered, or the
@@ -334,7 +371,8 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
 
     warn!(
         call_id = %call_id,
-        "B2BUA: answer timeout — no final response from B-leg, failing call with 408",
+        status = failure_status,
+        "B2BUA: answer timeout — no final response from B-leg, failing the call",
     );
 
     // CANCEL each B-leg still ringing (RFC 3261 §9.1), each kept answerable
@@ -347,14 +385,30 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     let cancelled = state.call_actors.cancel_ringing_branches(call_id);
     cancel_settled_branches(&cancelled, state);
 
-    // A ring that ran out is a 408 (RFC 3261 §16.8), and the call concludes on
-    // it like on any other failure.
+    // A ring that ran out is a 408 (RFC 3261 §16.8), or a 503 for a route
+    // sequence no carrier of which reached the callee, and the call concludes on
+    // it like on any other failure. Built locally, so a 503 stays a 503.
     conclude_failed_call(
         call_id,
         FailedCallEnd::Local {
-            status_code: 408,
-            reason: best_error_reason(408).to_string(),
+            status_code: failure_status,
+            reason: best_error_reason(failure_status).to_string(),
         },
         state,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a route sequence whose carrier never sent a 101-199 fails 503. A
+    /// carrier that rang, and every ring timeout outside a sequence, stays 408.
+    #[test]
+    fn a_ring_timeout_fails_503_only_for_a_sequence_whose_carrier_showed_no_progress() {
+        assert_eq!(ring_timeout_failure_status(true, false), 503);
+        assert_eq!(ring_timeout_failure_status(true, true), 408);
+        assert_eq!(ring_timeout_failure_status(false, false), 408);
+        assert_eq!(ring_timeout_failure_status(false, true), 408);
+    }
 }

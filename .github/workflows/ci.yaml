@@ -1052,6 +1052,44 @@ jobs:
             exit 1
           fi
 
+      # The rejecting carrier answers 503 and the trying carrier, the last one,
+      # answers only 100 and rings out at its 3 s timeout_secs, so the caller gets
+      # siphon's 503. The rejecting carrier's transaction ended with its 503: the
+      # stale 183 it sends afterwards fails the caller if relayed, and it fails
+      # itself if a CANCEL, or anything else, reaches it later (RFC 3261 §9.1).
+      # The start time is kept so the next step reads this call's siphon lines
+      # only: the progress case above logged a failure too.
+      - name: A carrier that already failed is not CANCELled when the last carrier rings out
+        run: |
+          echo "LCR_SETTLED_CASE_SINCE=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" >> "$GITHUB_ENV"
+          bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_last_carrier_rings_out_uac.xml sipp-b2bua-lcr-rejecting-carrier-uas sipp-b2bua-lcr-trying-carrier-uas
+
+      # Each carrier's failure recorded once, in the order tried, through
+      # @b2bua.on_route_failure: the 503, then the ring timeout as 408, and only
+      # then the call's one @b2bua.on_failure.
+      - name: Both carriers' failures were recorded once, the ring timeout before on_failure
+        run: |
+          # The status and reason the call fails with, as @b2bua.on_failure sees
+          # them and the caller is sent; the carriers' own records stay as above.
+          call_failure="LCR-FAILURE 503 Service Unavailable"
+          events="$(docker logs --since "$LCR_SETTLED_CASE_SINCE" siphon-b2bua-lcr 2>&1 | grep -E 'LCR-(CARRIER-FAILED|FAILURE|NO-ROUTE)' || true)"
+          position=1
+          for expected in "LCR-CARRIER-FAILED carrier-rejecting 503" "LCR-CARRIER-FAILED carrier-trying 408" "$call_failure"; do
+            at="$(grep -n "$expected" <<<"$events" | cut -d: -f1 | paste -sd, - || true)"
+            if [ "$at" != "$position" ]; then
+              echo "expected one '$expected' line, line $position of this call's LCR lines, got line(s): ${at:-none}"
+              echo "$events"
+              exit 1
+            fi
+            position=$((position + 1))
+          done
+          total="$(grep -c . <<<"$events" || true)"
+          if [ "$total" != "3" ]; then
+            echo "expected three LCR lines for this call, got $total"
+            echo "$events"
+            exit 1
+          fi
+
       - name: Collect logs
         if: always()
         run: |

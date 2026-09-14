@@ -6,7 +6,7 @@ use crate::dispatcher::*;
 /// A 1xx on the B-leg: mark the call ringing and relay the provisional to
 /// the A-leg, anchoring early media when the response carries SDP. On an LCR
 /// attempt it is also the carrier's progress, which keeps the carrier past its
-/// ring timeout.
+/// ring timeout. A 1xx on a leg that has already ended is dropped.
 pub fn b_leg_provisional(
     call_id: &str,
     branch: &str,
@@ -18,6 +18,25 @@ pub fn b_leg_provisional(
 ) {
     // --- 1xx provisional handling ---
     {
+        // Drop a provisional on a leg that is no longer waiting for its final
+        // response: an LCR carrier settled by its failure, a fork branch that
+        // failed, a leg siphon CANCELled once it is no longer kept answerable
+        // apart from the call. Its INVITE transaction is over, so this is a
+        // straggler, reordered on the way or sent after the leg's own final
+        // response. Relaying it would show the caller an early dialog nothing
+        // will confirm, recording it could read as progress, and anchoring its
+        // SDP would open media that goes nowhere. A response takes no ACK, so it
+        // is only dropped. Checked before the call is marked ringing, so a
+        // straggler cannot move it to Ringing either.
+        if snapshot
+            .b_leg_index
+            .is_some_and(|index| !state.call_actors.is_pending_branch(call_id, index))
+        {
+            debug!(call_id = %call_id, branch = %branch, status = status_code,
+                "B2BUA: dropping a provisional from a leg that already ended");
+            return;
+        }
+
         // Drop a stray provisional that arrives after the call is already
         // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
         // fork branch's late 18x. A B2BUA must not forward a provisional after

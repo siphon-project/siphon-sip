@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "carrier_id": "carrier-rejecting",
+      "next_hop": "sip:172.20.0.205:5060",
+      "timeout_secs": 3
+    },
+    {
+      "carrier_id": "carrier-trying",
+      "next_hop": "sip:172.20.0.206:5060",
+      "timeout_secs": 3
+    }
+  ],
+  "cache_ttl_secs": 0
+}

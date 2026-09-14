@@ -313,7 +313,8 @@ the SIP status.** `reason` is always present and says why siphon ended the call
 (`bye`, `cancelled`, `failed`, `rejected`, `media_failed`, `transfer_failed`,
 `routed`, or a hangup reason the app supplied); `code` and `response` ride
 alongside it whenever a SIP final response was part of the teardown — `487` on a
-CANCEL either way round, `408` on the answer timeout, the callee's own status on
+CANCEL either way round, `408` on the answer timeout (`503` when a `route`
+sequence ends on it with no carrier having sent a 101-199), the callee's own status on
 a rejected originated leg, and the status siphon sent on a `reject` / an
 unanswered `hangup` / the handoff deadline (`503`). A teardown with no SIP
 response — an ordinary BYE, a script-driven terminate — omits both keys rather
@@ -679,7 +680,9 @@ answers the caller with the winner's SDP and the pair becomes an ordinary
 two-leg B2BUA call, with the app still owning it.
 
 A failure or a timeout arrives as `DialFailed {code, reason, timed_out}` with
-the caller **still ringing and still parked**. Nothing is forwarded to it, so
+the caller **still ringing and still parked**. A timeout is `code: 408`, except
+on a `sequential` dial whose last target never sent a 101-199: nothing rang, and
+it is `503`. Nothing is forwarded to it, so
 the app decides what happens next: dial somewhere else on the same channel,
 answer into voicemail, or reject with its own code. That is the difference from
 [`route`](#route), which hands the call back to siphon — the app gets

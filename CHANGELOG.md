@@ -280,6 +280,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   itself already got, and provisionals, answers and failures now restore the
   caller's identity through one path.
 
+- **An LCR carrier that already failed is no longer CANCELled.** When a carrier
+  answered with a reroute cause (a `503`, say), siphon ACKed it and dialled the
+  next carrier but left the failed one's leg pending. Everything that later
+  cancels a call's pending legs sent it a CANCEL too: the next carrier ringing
+  out, the caller hanging up, the next carrier answering, a re-route from
+  `@b2bua.on_failure`. RFC 3261 §9.1 says a CANCEL SHOULD NOT be sent once a
+  final response has been received, and a carrier whose transaction has already
+  ended answers it `481`. The leg is now settled the moment its final response
+  arrives. A retransmission of that response, when the ACK was lost, is ACKed
+  again and does nothing else. Before, it was recorded as a failure of the
+  carrier then in flight and moved the sequence past that carrier too.
+
+- **Every LCR carrier that rings out is recorded as a failed attempt.** A ring
+  timeout went on the attempt list as `408` only when the sequence moved on to
+  another carrier. The last carrier ringing out, a carrier that had shown
+  progress ringing out, and a carrier whose route does not reroute on `408` all
+  failed the call with nothing on `call.route_attempts` or the CDR's
+  `lcr_attempts`, and `@b2bua.on_route_failure` never fired for them, though it
+  is documented to fire for every failed attempt, the last one included. Every
+  ring timeout is now recorded once, as `408`, and fires the hook once, before
+  the carrier is CANCELled and before `@b2bua.on_failure` runs. That is the
+  order a carrier failing with a final response already had.
+
+- **A provisional response from a B-leg that already ended no longer reaches the
+  caller.** A 101-199 that arrived on a leg after its INVITE transaction was over
+  was relayed to the caller like any other: from an LCR carrier that had
+  answered `503` while the next carrier was being dialled, from a fork branch
+  that had failed while another still rang, or from a leg siphon had CANCELled
+  once it was no longer kept answerable. Such a response is a straggler,
+  reordered on the way or sent after the leg's own final response (RFC 3261
+  §17.1.1.2), and the caller was shown an early dialog nothing would ever
+  confirm. It also moved an unanswered call to Ringing. It is now dropped before
+  anything reads it: not relayed, no LCR progress recorded, no early media
+  anchored and no `@b2bua.on_early_media`. A provisional on a leg still waiting
+  for its final response is handled as before.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon
@@ -493,6 +529,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   (default) or `sequential`.
 
 ### Changed
+
+- **An LCR sequence that runs out on a ring timeout, with no carrier showing
+  progress, fails the call with `503 Service Unavailable` instead of `408`.**
+  When the carrier in flight rang out without ever sending a 101-199 and the
+  sequence ended there (it was the last carrier, the rest could not be dialled,
+  or its route does not reroute on `408`), the caller got `408 Request
+  Timeout`. That says the callee was reached and did not answer, and no carrier
+  had reached anyone. The caller now gets `503`, the code siphon already sends
+  when no carrier can be dialled at all, and `@b2bua.on_failure` gets `503` too.
+  It is siphon's own response, built from the caller's INVITE rather than a
+  carrier's `503` relayed on, so it is not turned into `500`. A carrier that
+  sent a `180` or `183` and then rang out still fails the call `408`. So does
+  the last target of a `call.fork(strategy="sequential")` or of a sequential
+  control-plane `dial` that rang, and that `dial` reports the same code in
+  `DialFailed`. The carrier's own attempt stays `408` on `call.route_attempts`,
+  in the CDR's `lcr_attempts` and in `@b2bua.on_route_failure`. A plain
+  `call.dial()` or a parallel fork that rings out is unchanged.
 
 - **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
   `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`

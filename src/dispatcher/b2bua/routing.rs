@@ -459,6 +459,45 @@ pub fn b2bua_advance_route_with_numbers(
     }
 }
 
+/// Record the failure of the carrier in flight, which was dialled, and fire
+/// `@b2bua.on_route_failure` for it.
+///
+/// Every dialled carrier that fails goes onto the attempt list here, once,
+/// whether it failed with a final response or rang out (a ring timeout is
+/// recorded as `408`, the code the attempt effectively ended on). That is what
+/// keeps `call.route_attempts`, the CDR's `lcr_attempts` and the hook in step.
+/// Both callers run it before the attempt's transaction is ended on the wire,
+/// by its ACK or its CANCEL, and before the sequence advances or the call
+/// concludes, so a `@b2bua.on_failure` that ends the call on this carrier
+/// already finds it on `call.route_attempts`.
+///
+/// **Call this only once the A-leg INVITE guard is released** — the handler
+/// re-locks it (see [`RouteAdvance::burned`]).
+pub fn b2bua_record_carrier_failure(
+    call_id: &str,
+    status_code: u16,
+    a_leg: &crate::b2bua::actor::Leg,
+    a_leg_invite: Option<&Arc<Mutex<SipMessage>>>,
+    state: &DispatcherState,
+) {
+    let failed_route = state.call_actors.active_route(call_id);
+    // A carrier failing is an operational event, so it is logged at info: an
+    // answered call that burned a carrier on the way has to leave something to
+    // alert on or trend.
+    if let Some(attempt) = state.call_actors.record_route_failure(call_id, status_code) {
+        info!(
+            call_id = %call_id,
+            carrier = %attempt.carrier_id,
+            status = status_code,
+            elapsed_ms = attempt.elapsed_ms,
+            "LCR: carrier attempt failed"
+        );
+    }
+    if let Some(route) = &failed_route {
+        b2bua_dispatch_route_failure(call_id, route, status_code, a_leg, a_leg_invite, state);
+    }
+}
+
 /// Record a carrier burned without ever being dialled, and queue it for the
 /// `@b2bua.on_route_failure` notification its caller will fire.
 ///

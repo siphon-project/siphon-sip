@@ -1145,9 +1145,11 @@ class MockB2bua:
 
         Runs once, before the caller hears anything. ``code`` is what the call
         failed on: the best of its branches' failures (RFC 3261 §16.7), ``408``
-        for the ring timeout, ``503`` when the B-leg INVITE never left or no LCR
-        carrier was routable, ``500`` when ``@b2bua.on_answer`` raised or ended
-        an answered call. What the handler leaves on ``call`` is carried out:
+        for the ring timeout, ``503`` when the B-leg INVITE never left, no LCR
+        carrier was routable, or an LCR sequence ended on the ring timeout of a
+        carrier that never sent a 101-199, ``500`` when ``@b2bua.on_answer``
+        raised or ended an answered call. What the handler leaves on ``call`` is
+        carried out:
 
         - nothing, or ``call.terminate()``: the caller gets ``code``
         - ``call.reject(code, reason)``: the caller gets that response instead

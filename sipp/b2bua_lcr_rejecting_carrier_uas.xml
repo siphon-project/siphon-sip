@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- LCR route sequence in sipp-b2bua-lcr, the rejecting carrier of the settled
+     carrier case (callee +15550100004, routes.15550100004.json): answers 503, a
+     reroute cause, with no provisional before it, so the sequence moves on to
+     the trying carrier, which then rings out.
+
+     This carrier's INVITE transaction ends with the 503 and the ACK siphon owes
+     it (RFC 3261 §17.1.1.3), which is mandatory. After that:
+       - it sends a stale 183 on the same dialog, as a carrier that reorders its
+         responses or gets its own transaction wrong does. Its leg has ended, so
+         siphon must drop it, and the caller fails the run if it is relayed;
+       - a CANCEL SHOULD NOT be sent once a final response has been received
+         (RFC 3261 §9.1), so it then pauses 10 s, past the trying carrier's 3 s
+         timeout_secs and the call's 6 s ring bound, expecting nothing. A CANCEL
+         arriving in that time matches no step: SIPp answers it itself and fails
+         the call. Any other request is unexpected and fails it too.
+     Only a pause that runs out with nothing arriving passes. (A receive with an
+     ontimeout jump would read more directly, but in this SIPp a call whose
+     receive times out onto a label never completes, and the run fails however
+     the call went.) -->
+
+<scenario name="B2BUA LCR rejecting carrier (503, a stale 183, then never CANCELled)">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="INVITE sip:[+]15550100004@" search_in="msg" check_it="true" assign_to="called_number" />
+      <ereg regexp="SIP/2\.0/.*" search_in="hdr" header="Via:" check_it="true" assign_to="invite_via" />
+      <ereg regexp="([0-9]+) INVITE" search_in="hdr" header="CSeq:" check_it="true" assign_to="invite_cseq_header,invite_cseq" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 503 Service Unavailable
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagA[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000" />
+
+  <!-- The ACK carries this dialog's From, its To with this carrier's tag, and
+       its Call-ID; the Via and CSeq are the INVITE's own. -->
+  <send>
+    <![CDATA[
+SIP/2.0 183 Session Progress
+Via: [$invite_via]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+CSeq: [$invite_cseq] INVITE
+Contact: <sip:carrier-rejecting@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Nothing may arrive in this window: see above. -->
+  <pause milliseconds="10000" />
+
+  <Reference variables="called_number,invite_cseq_header" />
+
+</scenario>
