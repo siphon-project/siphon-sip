@@ -877,14 +877,18 @@ jobs:
       - name: Every branch failing gives the caller one final response
         run: bash sipp/b2bua-fork/run_case.sh fork-allfail b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-unavailable-uas
 
-      # Only fork-allfail may fail, and @b2bua.on_failure must run for it once:
-      # a fork that fired it per failed branch would print it twice here, and
-      # one that failed an answerable call would add a line for that case too.
-      - name: on_failure ran once, for the one case that failed
+      - name: A ring timeout relays the failure a branch already returned, not a bare 408
+        run: bash sipp/b2bua-fork/run_case.sh fork-timeout b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-cancelled-uas
+
+      # Only fork-allfail and fork-timeout may fail, and @b2bua.on_failure must
+      # run once for each: a fork that fired it per failed branch would print
+      # more lines here, and one that failed an answerable call would add a line
+      # for that case too.
+      - name: on_failure ran once for each case that failed
         run: |
           count="$(docker logs siphon-b2bua-fork 2>&1 | grep -c 'FORK-FAILURE' || true)"
-          if [ "$count" != "1" ]; then
-            echo "@b2bua.on_failure ran $count times, expected once"
+          if [ "$count" != "2" ]; then
+            echo "@b2bua.on_failure ran $count times, expected twice (once per failing case)"
             docker logs siphon-b2bua-fork 2>&1 | grep 'FORK-FAILURE' || true
             exit 1
           fi

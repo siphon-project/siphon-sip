@@ -305,6 +305,27 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         // call went away); fall through to the ordinary teardown.
     }
 
+    // A parallel fork some of whose branches already failed is owed the best of
+    // those failures rather than a bare 408, whenever one of them outranks the
+    // 408 the timeout amounts to (RFC 3261 §16.7, §16.8). The branches still
+    // ringing are CANCELled as over, and the held response is relayed exactly as
+    // it would have been had they failed too.
+    if let Some(settlement) = state.call_actors.settle_fork_on_timeout(call_id) {
+        if let Some(best) = settlement.failure {
+            warn!(
+                call_id = %call_id,
+                status = best.status_code,
+                "B2BUA: answer timeout — relaying the best failure the fork's branches already returned",
+            );
+            for tx in &handle_txs {
+                let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+            }
+            cancel_settled_branches(&settlement.cancelled, state);
+            fail_forked_call(call_id, best, state);
+            return;
+        }
+    }
+
     warn!(
         call_id = %call_id,
         "B2BUA: answer timeout — no final response from B-leg, failing call with 408",

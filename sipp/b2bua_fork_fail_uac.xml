@@ -1,14 +1,20 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
-<!-- A-leg caller for the parallel call.fork() case where every branch fails
-     (fork-allfail in sipp/b2bua-fork/b2bua_fork.py).
+<!-- A-leg caller for the parallel call.fork() cases that end in a failure
+     (fork-allfail and fork-timeout in sipp/b2bua-fork/b2bua_fork.py).
 
-     The caller gets one final response, and only once the last branch has
-     failed. Both branches fail in the 4xx class, 486 at once and 480 two
-     seconds later, so the 486 is the answer whichever rule within the class
-     picks it. Whether each branch was ACKed is asserted by the callee
-     scenarios, and that on_failure ran once by the CI step reading the logs. -->
+     fork-allfail: the caller gets one final response, and only once the last
+     branch has failed. Both branches fail in the 4xx class, 486 at once and 480
+     two seconds later, so the 486 is the answer whichever rule within the class
+     picks it.
+
+     fork-timeout: one branch is busy at once and the other rings until the 3 s
+     ring timeout, which must relay that 486 rather than answer a bare 408.
+
+     Whether each branch was ACKed or CANCELled is asserted by the callee
+     scenarios, and that on_failure ran once per case by the CI step reading the
+     logs. -->
 
 <scenario name="B2BUA parallel fork caller (all branches fail)">
 

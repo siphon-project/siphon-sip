@@ -16,6 +16,8 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod fork;
+
 /// How long a torn-down call's SIP Call-IDs stay answerable with 481.
 ///
 /// 32 s = Timer H / 64·T1 (RFC 3261 §17), the same expiry the zombie re-INVITE
@@ -776,38 +778,6 @@ impl CallActorStore {
             self.keep_answerable(&cancelled);
             WinOutcome::FirstWin { cancelled }
         }
-    }
-
-    /// Record a B-leg's final failure and settle its fork, keeping any branch
-    /// that settlement cancels answerable. See
-    /// [`CallActor::record_branch_failure`]. `None` when the call is gone.
-    pub fn record_branch_failure(
-        &self,
-        call_id: &str,
-        index: usize,
-        status_code: u16,
-        response: &SipMessage,
-    ) -> Option<BranchSettlement> {
-        let mut call = self.calls.get_mut(call_id)?;
-        let settlement = call.record_branch_failure(index, status_code, response);
-        self.keep_answerable(&settlement.cancelled);
-        Some(settlement)
-    }
-
-    /// Open a fork's dispatch window. See [`CallActor::fork_dispatching`].
-    pub fn start_fork_dispatch(&self, call_id: &str) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.fork_dispatching = true;
-        }
-    }
-
-    /// Close a fork's dispatch window and settle it. See
-    /// [`CallActor::finish_fork_dispatch`]. `None` when the call is gone.
-    pub fn finish_fork_dispatch(&self, call_id: &str) -> Option<BranchSettlement> {
-        let mut call = self.calls.get_mut(call_id)?;
-        let settlement = call.finish_fork_dispatch();
-        self.keep_answerable(&settlement.cancelled);
-        Some(settlement)
     }
 
     /// Atomically decide whether a 1xx provisional should be forwarded to the

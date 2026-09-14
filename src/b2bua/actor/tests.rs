@@ -1193,6 +1193,53 @@ fn answering_drops_the_failure_held_for_the_fork() {
     assert!(call.fork_best_failure.is_none());
 }
 
+/// The ring timeout hands back the failure a fork already holds when it beats
+/// the 408 the timeout amounts to, with the branches still ringing cancelled: a
+/// caller whose other branch was busy hears busy, not a timeout.
+#[test]
+fn a_ring_timeout_relays_a_held_failure_that_beats_408() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+
+    let settlement = call
+        .settle_fork_on_timeout()
+        .expect("486 beats the timeout's 408");
+
+    assert_eq!(settlement.failure.map(|best| best.status_code), Some(486));
+    assert_eq!(branches(&settlement.cancelled), vec!["z9hG4bK-bleg1"]);
+    assert_eq!(call.b_leg_status[1], BLegStatus::Cancelled);
+}
+
+/// A held failure that does not beat 408 leaves the timeout's own 408 standing,
+/// and so does a fork none of whose branches has failed yet. Neither cancels
+/// anything: the ordinary timeout path does that.
+#[test]
+fn a_ring_timeout_keeps_its_408_when_nothing_held_beats_it() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(
+        call.settle_fork_on_timeout().is_none(),
+        "no branch has failed yet"
+    );
+
+    assert!(call
+        .record_branch_failure(0, 404, &branch_failure(404, "gone"))
+        .failure
+        .is_none());
+
+    assert!(
+        call.settle_fork_on_timeout().is_none(),
+        "404 does not beat the timeout's 408"
+    );
+    assert_eq!(call.b_leg_status[1], BLegStatus::Trying);
+}
+
 /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the
 /// call is answered; a late provisional reordered behind its 200 is then
 /// dropped and must NOT downgrade the confirmed dialog back to Ringing.
