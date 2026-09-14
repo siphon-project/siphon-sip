@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 
 use super::reply::PyReply;
 use super::request::PyRequest;
+use crate::registrar::update::ContactUpdate;
 use crate::registrar::{normalize_aor, reginfo, Contact, Registrar, RegistrarError};
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::SipMessage;
@@ -515,6 +516,18 @@ impl PyRegistrar {
     /// and `request.relay(flow=binding.flow)` to send the request over
     /// the captured flow without DNS-resolving the Contact URI
     /// (RFC 3327 §5 / TS 24.229 §5.2.7.2 — Path-token MT routing).
+    ///
+    /// When the registrar refuses the binding, `save()` answers the REGISTER
+    /// itself and returns `False`, so the script returns without replying:
+    ///
+    /// - `Expires` below `min_expires`: `423 Interval Too Brief` with
+    ///   `Min-Expires` (RFC 3261 §10.3 step 7).
+    /// - A new binding past `max_contacts`: `503 Service Unavailable` with
+    ///   `Retry-After`, the seconds until the soonest held binding expires.
+    /// - An AoR that is not a safe storage key: `404 Not Found`.
+    ///
+    /// A refused REGISTER stores nothing: none of its Contacts, and with
+    /// `force=True` the existing bindings stay.
     #[pyo3(signature = (request, force=false, aliases=Vec::new(), flow_token=None))]
     fn save(
         &self,
@@ -556,13 +569,12 @@ impl PyRegistrar {
             }
         }
 
-        if force {
-            self.inner.clear_bindings(&aor);
-        }
-
         // Check for wildcard Contact: *
         if let Some(contact_raw) = message.headers.get("Contact") {
             if contact_raw.trim() == "*" {
+                if force {
+                    self.inner.clear_bindings(&aor);
+                }
                 self.inner.remove_all(&aor);
                 message.headers.set("Expires", "0".to_string());
                 drop(message);
@@ -626,6 +638,7 @@ impl PyRegistrar {
 
         // Track the granted expires (capped by max_expires) for the response.
         let mut granted_expires = 0u32;
+        let mut updates = Vec::new();
 
         for raw in &contact_values {
             let nameaddrs = match NameAddr::parse_multi(raw) {
@@ -637,7 +650,7 @@ impl PyRegistrar {
                 let expires = nameaddr.expires.unwrap_or(default_expires);
                 let q = nameaddr.q.unwrap_or(1.0);
 
-                // The registrar caps expires at max_expires internally.
+                // This registrar owns the grant, so its max_expires cap applies.
                 let capped = std::cmp::min(expires, self.inner.config.max_expires);
                 granted_expires = std::cmp::max(granted_expires, capped);
 
@@ -665,38 +678,30 @@ impl PyRegistrar {
                     .cloned()
                     .collect();
 
-                self.inner
-                    .save_full(
-                        &aor,
-                        nameaddr.uri,
-                        expires,
-                        q,
-                        call_id.clone(),
-                        cseq_seq,
-                        source_addr,
-                        source_transport,
-                        sip_instance,
-                        reg_id,
-                        path.clone(),
-                        flow_capture.clone(),
-                        extra_params,
-                    )
-                    .map_err(|error| match error {
-                        RegistrarError::IntervalTooBrief { min_expires } => {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "423 Interval Too Brief (min: {min_expires}s)"
-                            ))
-                        }
-                        RegistrarError::TooManyContacts { max } => {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "too many contacts (max: {max})"
-                            ))
-                        }
-                        RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
-                            "invalid AoR (unsafe storage key)".to_string(),
-                        ),
-                    })?;
+                updates.push(ContactUpdate {
+                    uri: nameaddr.uri,
+                    expires_secs: capped,
+                    q,
+                    call_id: call_id.clone(),
+                    cseq: cseq_seq,
+                    source_addr,
+                    source_transport,
+                    sip_instance,
+                    reg_id,
+                    path: path.clone(),
+                    flow: flow_capture.clone(),
+                    params: extra_params,
+                });
             }
+        }
+
+        // Every Contact is stored or none is. A refusal leaves the AoR as it was
+        // (with `force`, its existing bindings too) and is answered here: raised,
+        // it would end the handler and the dispatcher would answer 500.
+        if let Err(refusal) = self.inner.apply_register(&aor, updates, force) {
+            drop(message);
+            answer_refusal(request, &self.inner, &aor, &refusal);
+            return Ok(false);
         }
 
         // Set the Expires header to the granted value so build_response()
@@ -1372,6 +1377,58 @@ impl PyRegistrar {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Answer a REGISTER the registrar refused, on the wire, and count it.
+///
+/// Raising instead would end the script's handler and leave the dispatcher to
+/// answer `500 Script Error`, which tells the UA the server is broken and gives
+/// it nothing to act on, and would count a policy decision as a script failure.
+fn answer_refusal(
+    request: &mut PyRequest,
+    registrar: &Registrar,
+    aor: &str,
+    refusal: &RegistrarError,
+) {
+    let limit = match refusal {
+        RegistrarError::IntervalTooBrief { min_expires } => Some(u64::from(*min_expires)),
+        RegistrarError::TooManyContacts { max } => u64::try_from(*max).ok(),
+        RegistrarError::InvalidAor => None,
+    };
+    tracing::warn!(
+        aor = %aor.escape_debug(),
+        reason = refusal.reason_label(),
+        limit = ?limit,
+        "refusing REGISTER"
+    );
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics
+            .registrar_refusals_total
+            .with_label_values(&[refusal.reason_label()])
+            .inc();
+    }
+    match refusal {
+        // RFC 3261 §10.3 step 7: too brief an interval is answered 423, with
+        // the shortest one this registrar accepts.
+        RegistrarError::IntervalTooBrief { min_expires } => {
+            request.push_reply_header_replace("Min-Expires", min_expires.to_string());
+            request.set_reply(423, "Interval Too Brief".to_string());
+        }
+        // 503 and not 403: a UA commonly takes a 403 to its REGISTER as a bad
+        // credential and fetches a new one, which cannot change this answer and
+        // only loops. Retry-After (RFC 3261 §21.5.4) is when the soonest held
+        // binding expires and frees a slot.
+        RegistrarError::TooManyContacts { .. } => {
+            request.push_reply_header_replace(
+                "Retry-After",
+                registrar.retry_after_secs(aor).to_string(),
+            );
+            request.set_reply(503, "Service Unavailable".to_string());
+        }
+        // RFC 3261 §10.3 step 3: an address-of-record this registrar cannot
+        // serve is answered 404.
+        RegistrarError::InvalidAor => request.set_reply(404, "Not Found".to_string()),
+    }
+}
 
 /// Extract the AoR (Address of Record) from the To header of a SIP message.
 fn extract_aor(message: &SipMessage) -> PyResult<String> {
@@ -2711,5 +2768,378 @@ mod tests {
             connection_id: 1,
         };
         assert!(flow.is_alive());
+    }
+
+    /// `registrar.save()` answers a REGISTER the registrar refuses, the same way
+    /// it answers one it accepts, rather than raising into the script.
+    mod refusals {
+        use super::*;
+        use crate::registrar::{backend, FlowCapture, RegistrationEvent};
+
+        const AOR: &str = "sip:001010000000001@ims.example.com";
+        const INSTANCE_A: &str = "\"<urn:uuid:00000000-0000-1000-8000-00000000000a>\"";
+        const INSTANCE_B: &str = "\"<urn:uuid:00000000-0000-1000-8000-00000000000b>\"";
+        const INSTANCE_C: &str = "\"<urn:uuid:00000000-0000-1000-8000-00000000000c>\"";
+
+        fn registrar_with(max_contacts: usize) -> Arc<Registrar> {
+            Arc::new(Registrar::new(RegistrarConfig {
+                default_expires: 3600,
+                max_expires: 7200,
+                min_expires: 60,
+                max_contacts,
+                ..Default::default()
+            }))
+        }
+
+        /// A REGISTER for [`AOR`] carrying one Contact header per entry.
+        fn register(contacts: &[String], expires: &str) -> PyRequest {
+            let mut builder = SipMessageBuilder::new()
+                .request(Method::Register, SipUri::new("ims.example.com".to_string()))
+                .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-refusal".to_string())
+                .to(format!("<{AOR}>"))
+                .from(format!("<{AOR}>;tag=refusal"))
+                .call_id("refusal@192.0.2.10".to_string())
+                .cseq("1 REGISTER".to_string());
+            for contact in contacts {
+                builder = builder.header("Contact", contact.clone());
+            }
+            let message = builder
+                .header("Expires", expires.to_string())
+                .content_length(0)
+                .build()
+                .unwrap();
+            PyRequest::new(
+                Arc::new(Mutex::new(message)),
+                "udp".to_string(),
+                "192.0.2.10".to_string(),
+                5060,
+            )
+        }
+
+        /// A Contact for one device: its address and its `+sip.instance`.
+        fn device(host_port: &str, instance: &str) -> String {
+            format!("<sip:001010000000001@{host_port}>;+sip.instance={instance}")
+        }
+
+        fn reply_of(request: &PyRequest) -> (u16, String) {
+            match request.action() {
+                RequestAction::Reply { code, reason, .. } => (*code, reason.clone()),
+                other => panic!("expected a reply, the request action is {other:?}"),
+            }
+        }
+
+        fn reply_header(request: &mut PyRequest, name: &str) -> Option<String> {
+            request
+                .take_reply_headers()
+                .into_iter()
+                .rev()
+                .find(|(_, header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, _, value)| value)
+        }
+
+        fn events(
+            receiver: &mut tokio::sync::broadcast::Receiver<RegistrationEvent>,
+        ) -> Vec<&'static str> {
+            let mut seen = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                seen.push(match event {
+                    RegistrationEvent::Registered { .. } => "registered",
+                    RegistrationEvent::Refreshed { .. } => "refreshed",
+                    RegistrationEvent::Deregistered { .. } => "deregistered",
+                    RegistrationEvent::Expired { .. } => "expired",
+                });
+            }
+            seen
+        }
+
+        fn saved(uris: &[&str]) -> String {
+            format!("save {AOR} {uris:?}")
+        }
+
+        #[test]
+        fn a_second_device_past_max_contacts_is_answered_503_with_retry_after() {
+            let registrar = registrar_with(1);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut held = register(&[device("192.0.2.10:5060", INSTANCE_A)], "3600");
+            assert!(py_registrar.save(&mut held, false, vec![], None).unwrap());
+
+            // The second device keeps refreshing; every attempt is answered.
+            for _ in 0..2 {
+                let mut second = register(&[device("192.0.2.11:5060", INSTANCE_B)], "3600");
+                let saved = py_registrar
+                    .save(&mut second, false, vec![], None)
+                    .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+                assert!(!saved);
+                assert_eq!(reply_of(&second), (503, "Service Unavailable".to_string()));
+                let retry_after: u64 = reply_header(&mut second, "Retry-After")
+                    .expect("the 503 carries Retry-After")
+                    .parse()
+                    .expect("Retry-After is delta-seconds");
+                assert!(
+                    (3590..=3600).contains(&retry_after),
+                    "Retry-After {retry_after} should be the held binding's remaining lifetime"
+                );
+            }
+
+            let bindings = registrar.lookup(AOR);
+            assert_eq!(bindings.len(), 1, "the held binding is untouched");
+            assert_eq!(bindings[0].uri.host, "192.0.2.10");
+            assert!(bindings[0]
+                .sip_instance
+                .as_deref()
+                .is_some_and(|instance| instance.contains("00000000000a")));
+        }
+
+        #[test]
+        fn an_interval_below_min_expires_is_answered_423_with_min_expires() {
+            let registrar = registrar_with(10);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut request = register(&[device("192.0.2.10:5060", INSTANCE_A)], "30");
+
+            let saved = py_registrar
+                .save(&mut request, false, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(reply_of(&request), (423, "Interval Too Brief".to_string()));
+            assert_eq!(
+                reply_header(&mut request, "Min-Expires").as_deref(),
+                Some("60")
+            );
+            assert!(registrar.bindings.is_empty(), "nothing is stored");
+        }
+
+        #[test]
+        fn a_register_with_more_new_contacts_than_allowed_stores_none_of_them() {
+            let registrar = registrar_with(1);
+            let (writer, mut writes) = backend::recording_writer();
+            registrar.set_backend_writer(writer);
+            let mut changes = registrar.subscribe_events();
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut request = register(
+                &[
+                    device("192.0.2.10:5060", INSTANCE_A),
+                    device("192.0.2.11:5060", INSTANCE_B),
+                ],
+                "3600",
+            );
+
+            let saved = py_registrar
+                .save(&mut request, false, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(reply_of(&request).0, 503);
+            // No binding is held, so none will expire to free a slot: the
+            // longest interval this registrar grants is the honest hint.
+            assert_eq!(
+                reply_header(&mut request, "Retry-After").as_deref(),
+                Some("7200")
+            );
+            assert!(
+                registrar.bindings.is_empty(),
+                "the contact that fitted must not be stored either"
+            );
+            assert_eq!(events(&mut changes), Vec::<&str>::new());
+            assert_eq!(writes.drain(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn force_on_a_refused_register_keeps_the_existing_bindings() {
+            let registrar = registrar_with(1);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut held = register(&[device("192.0.2.10:5060", INSTANCE_A)], "3600");
+            assert!(py_registrar.save(&mut held, false, vec![], None).unwrap());
+            let (writer, mut writes) = backend::recording_writer();
+            registrar.set_backend_writer(writer);
+            let mut changes = registrar.subscribe_events();
+
+            let mut forced = register(
+                &[
+                    device("192.0.2.11:5060", INSTANCE_B),
+                    device("192.0.2.12:5060", INSTANCE_C),
+                ],
+                "3600",
+            );
+            let saved = py_registrar
+                .save(&mut forced, true, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(reply_of(&forced).0, 503);
+            let bindings = registrar.lookup(AOR);
+            assert_eq!(bindings.len(), 1, "force must not clear before deciding");
+            assert_eq!(bindings[0].uri.host, "192.0.2.10");
+            assert_eq!(events(&mut changes), Vec::<&str>::new());
+            assert_eq!(writes.drain(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn an_aor_that_is_not_a_safe_storage_key_is_answered_404() {
+            let registrar = registrar_with(10);
+            registrar
+                .set_associated_uris("sip:unsafe\u{1}key@ims.example.com", vec![AOR.to_string()]);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut request = register(&[device("192.0.2.10:5060", INSTANCE_A)], "3600");
+
+            let saved = py_registrar
+                .save(&mut request, false, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(reply_of(&request), (404, "Not Found".to_string()));
+            assert!(registrar.bindings.is_empty(), "nothing is stored");
+        }
+
+        /// Pins what an accepted REGISTER does, so making the refusal atomic
+        /// cannot quietly change it: one change event and one backend write per
+        /// Contact, each write carrying the list as it stood after that Contact.
+        #[test]
+        fn accepted_registers_keep_their_events_and_backend_writes() {
+            let registrar = registrar_with(10);
+            let (writer, mut writes) = backend::recording_writer();
+            registrar.set_backend_writer(writer);
+            let mut changes = registrar.subscribe_events();
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let save = |contacts: &[String], force: bool| {
+                let mut request = register(contacts, "3600");
+                assert!(py_registrar
+                    .save(&mut request, force, vec![], None)
+                    .unwrap());
+                assert_eq!(reply_of(&request), (200, "OK".to_string()));
+            };
+            let moved = "sip:001010000000001@192.0.2.10:5070";
+            let second = "sip:001010000000001@192.0.2.11:5060";
+
+            save(&[device("192.0.2.10:5060", INSTANCE_A)], false);
+            assert_eq!(events(&mut changes), ["registered"]);
+            assert_eq!(
+                writes.drain(),
+                [saved(&["sip:001010000000001@192.0.2.10:5060"])]
+            );
+
+            // The same instance from a new port replaces its binding in place.
+            save(&[device("192.0.2.10:5070", INSTANCE_A)], false);
+            assert_eq!(events(&mut changes), ["refreshed"]);
+            assert_eq!(writes.drain(), [saved(&[moved])]);
+
+            // One new Contact and one refresh in a single REGISTER.
+            save(
+                &[format!("<{second}>"), device("192.0.2.10:5070", INSTANCE_A)],
+                false,
+            );
+            assert_eq!(events(&mut changes), ["registered", "refreshed"]);
+            assert_eq!(
+                writes.drain(),
+                [saved(&[moved, second]), saved(&[moved, second])]
+            );
+
+            // expires=0 removes that Contact alone.
+            save(&[format!("<{second}>;expires=0")], false);
+            assert_eq!(events(&mut changes), ["deregistered"]);
+            assert_eq!(writes.drain(), [saved(&[moved])]);
+
+            // force replaces the whole set.
+            save(&[format!("<{second}>")], true);
+            assert_eq!(events(&mut changes), ["registered"]);
+            assert_eq!(writes.drain(), [format!("remove {AOR}"), saved(&[second])]);
+            assert_eq!(registrar.lookup(AOR).len(), 1);
+
+            // And removing the last binding removes the AoR.
+            save(&[format!("<{second}>;expires=0")], false);
+            assert_eq!(events(&mut changes), ["deregistered"]);
+            assert_eq!(writes.drain(), [format!("remove {AOR}")]);
+            assert!(registrar.bindings.is_empty());
+        }
+
+        #[test]
+        fn retry_after_never_exceeds_max_expires() {
+            let registrar = registrar_with(1);
+            // A binding cached without the local cap outlives what this
+            // registrar would grant.
+            registrar
+                .save_full_uncapped(
+                    AOR,
+                    SipUri::new("192.0.2.10".to_string()).with_user("001010000000001".to_string()),
+                    9000,
+                    1.0,
+                    "held@192.0.2.10".to_string(),
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    FlowCapture::default(),
+                    Vec::new(),
+                )
+                .unwrap();
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut request = register(&[device("192.0.2.11:5060", INSTANCE_B)], "3600");
+
+            let saved = py_registrar
+                .save(&mut request, false, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(
+                reply_header(&mut request, "Retry-After").as_deref(),
+                Some("7200")
+            );
+        }
+
+        #[test]
+        fn retry_after_for_a_binding_about_to_expire_is_one_second() {
+            let registrar = registrar_with(1);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut held = register(&[device("192.0.2.10:5060", INSTANCE_A)], "3600");
+            assert!(py_registrar.save(&mut held, false, vec![], None).unwrap());
+            if let Some(mut entry) = registrar.bindings.get_mut(AOR) {
+                for contact in entry.value_mut().iter_mut() {
+                    contact.registered_at =
+                        std::time::Instant::now() - std::time::Duration::from_millis(3_599_200);
+                }
+            }
+            let mut request = register(&[device("192.0.2.11:5060", INSTANCE_B)], "3600");
+
+            let saved = py_registrar
+                .save(&mut request, false, vec![], None)
+                .unwrap_or_else(|_| panic!("a refused REGISTER must be answered, not raised"));
+
+            assert!(!saved);
+            assert_eq!(
+                reply_header(&mut request, "Retry-After").as_deref(),
+                Some("1")
+            );
+        }
+
+        /// What a script sees: the call a handler makes returns `False`, and
+        /// nothing raises for the dispatcher to turn into `500 Script Error`.
+        #[test]
+        fn save_called_from_python_returns_false_instead_of_raising() {
+            let registrar = registrar_with(1);
+            let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
+            let mut held = register(&[device("192.0.2.10:5060", INSTANCE_A)], "3600");
+            assert!(py_registrar.save(&mut held, false, vec![], None).unwrap());
+
+            Python::initialize();
+            Python::attach(|python| {
+                let namespace = Py::new(python, py_registrar).expect("registrar into Python");
+                let request = Py::new(
+                    python,
+                    register(&[device("192.0.2.11:5060", INSTANCE_B)], "3600"),
+                )
+                .expect("request into Python");
+
+                let returned = namespace
+                    .bind(python)
+                    .call_method1("save", (request.bind(python),))
+                    .unwrap_or_else(|_| panic!("a refusal must not raise into the script"));
+
+                assert!(!returned.extract::<bool>().expect("save returns a bool"));
+                assert_eq!(reply_of(&request.bind(python).borrow()).0, 503);
+            });
+        }
     }
 }

@@ -214,7 +214,7 @@ registrar:
   default_expires: 3600   # seconds; used when client omits Expires header
   max_expires: 7200        # reject/clamp registrations above this
   # min_expires: 60        # reject with 423 Interval Too Brief if below this
-  # max_contacts: 1        # evict existing contacts if above limit (omit = unlimited)
+  # max_contacts: 1        # refuse a new binding past this with 503 + Retry-After (omit = 10)
   # enforce_auth_aor_match: true
   #   Require the REGISTER's AoR (To-URI user) to equal the authenticated digest
   #   user, so a subscriber authenticated as A cannot bind a Contact under B's

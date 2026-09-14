@@ -859,6 +859,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "rate_limited_total": metrics.rate_limited_total.get(),
             "malformed_messages_total": metrics.malformed_messages_total.get(),
             "script_errors_total": metrics.script_errors_total.get(),
+            "registrar_refusals": crate::metrics::int_counter_vec_by_label(&metrics.registrar_refusals_total, "reason"),
         },
         "memory": {
             "allocated": metrics.memory_allocated_bytes.get(),

@@ -1373,6 +1373,43 @@ pub fn spawn_backend_writer<B: RegistrarBackend + 'static>(backend: B) -> Backen
     BackendWriter { tx }
 }
 
+/// A writer whose commands are recorded instead of applied, so a test can see
+/// exactly which write-throughs a registrar operation issued, and in what order.
+#[cfg(test)]
+pub(crate) fn recording_writer() -> (BackendWriter, RecordedWrites) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (BackendWriter { tx }, RecordedWrites(rx))
+}
+
+/// The receiving end of [`recording_writer`].
+#[cfg(test)]
+pub(crate) struct RecordedWrites(tokio::sync::mpsc::UnboundedReceiver<BackendCommand>);
+
+#[cfg(test)]
+impl RecordedWrites {
+    /// Every command issued since the last drain, one line each: the operation,
+    /// the AoR, and for a save the stored contact URIs in stored order.
+    pub(crate) fn drain(&mut self) -> Vec<String> {
+        let mut recorded = Vec::new();
+        while let Ok(command) = self.0.try_recv() {
+            recorded.push(match command {
+                BackendCommand::Save { aor, contacts } => {
+                    let uris: Vec<&str> = contacts
+                        .iter()
+                        .map(|contact| contact.uri.as_str())
+                        .collect();
+                    format!("save {aor} {uris:?}")
+                }
+                BackendCommand::Remove { aor } => format!("remove {aor}"),
+                BackendCommand::SaveAorState { aor, .. } => format!("save_state {aor}"),
+                BackendCommand::RemoveAorState { aor } => format!("remove_state {aor}"),
+                BackendCommand::CountAors { .. } => "count_aors".to_string(),
+            });
+        }
+        recorded
+    }
+}
+
 async fn backend_writer_loop<B: RegistrarBackend>(
     backend: B,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,

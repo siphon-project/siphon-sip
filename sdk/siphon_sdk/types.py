@@ -265,6 +265,11 @@ class Contact:
     reg-event NOTIFY bodies (TS 24.229 §5.4.2.1.2) but are excluded
     from routing lookups."""
 
+    _sip_instance: Optional[str] = field(default=None, repr=False, compare=False)
+    """RFC 5627 ``+sip.instance`` the binding was registered with.  Private to
+    the mock registrar, which replaces a binding by instance before URI the
+    way the engine does; the engine does not expose it to scripts."""
+
 
 @dataclass
 class Action:

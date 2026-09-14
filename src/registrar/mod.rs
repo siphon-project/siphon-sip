@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub mod reginfo;
+pub(crate) mod update;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -807,241 +808,24 @@ impl Registrar {
         flow: FlowCapture,
         params: Vec<(String, Option<String>)>,
     ) -> Result<(), RegistrarError> {
-        // Resolve alias → primary so a REGISTER arriving with a non-primary
-        // IMPU still attaches contacts to the implicit set's primary AoR.
-        let primary = self.resolve_alias(aor);
-        let aor = primary.as_str();
-
-        // Keyspace-safety invariant: never let a crafted AoR collide a contact
-        // binding into the reserved `state:` namespace or inject control chars
-        // into a storage key. See `is_aor_key_safe`.
-        if !is_aor_key_safe(aor) {
-            tracing::warn!(aor = %aor.escape_debug(), "rejecting REGISTER: unsafe AoR storage key");
-            return Err(RegistrarError::InvalidAor);
-        }
-
-        if expires_secs > 0 && expires_secs < self.config.min_expires {
-            return Err(RegistrarError::IntervalTooBrief {
-                min_expires: self.config.min_expires,
-            });
-        }
-
-        let instance = self.current_instance();
-        let FlowCapture {
-            flow_token,
-            inbound_local_addr,
-            inbound_connection_id,
-        } = flow;
-        // Captured before `source_transport` is moved into the Contact below;
-        // drive the stream-only connection reverse index (`inbound_connection_id`
-        // is `Copy`, so it stays usable after the struct takes it).
-        let new_connection_id = inbound_connection_id;
-        let new_is_stream = is_stream_transport(source_transport);
-        let contact = Contact {
-            uri: uri.clone(),
-            q,
-            registered_at: Instant::now(),
-            expires_secs,
-            call_id: call_id.into_boxed_str(),
-            cseq,
-            source_addr,
-            source_transport,
-            sip_instance: sip_instance.map(String::into_boxed_str),
-            reg_id,
-            path: path.into_iter().map(String::into_boxed_str).collect(),
-            pending: false,
-            instance,
-            flow_token: flow_token.as_deref().map(Box::from),
-            inbound_local_addr,
-            inbound_connection_id,
-            params,
-            kind: ContactKind::Ue,
-        };
-
-        let uri_string = uri.to_string();
-
-        let mut entry = self.bindings.entry(aor.to_string()).or_default();
-        let contacts = entry.value_mut();
-
-        // Tokens to remove from the reverse index — collected from contacts
-        // we drop in this critical section.  Applied after `drop(entry)` to
-        // keep the index update outside the bindings shard guard, but still
-        // before any await/IO so concurrent readers see a consistent view.
-        let mut tokens_to_remove: Vec<String> = Vec::new();
-        // Stream connection ids whose binding we drop in this critical section;
-        // pruned from `connection_index` after `drop(entry)` (same ordering as
-        // `tokens_to_remove`).
-        let mut conns_to_deindex: Vec<u64> = Vec::new();
-
-        // Remove expired contacts; harvest their tokens + connection ids.
-        contacts.retain(|c| {
-            if c.is_expired() {
-                if let Some(token) = &c.flow_token {
-                    tokens_to_remove.push(token.to_string());
-                }
-                if is_stream_transport(c.source_transport) {
-                    if let Some(id) = c.inbound_connection_id {
-                        conns_to_deindex.push(id);
-                    }
-                }
-                false
-            } else {
-                true
-            }
-        });
-
-        if expires_secs == 0 {
-            // Expires=0 means deregister this specific UE contact.  Only
-            // touches UE-kind entries — an AS-side capability record
-            // happens to share the same URI string only by coincidence
-            // and survives until the cascade-clear below decides
-            // otherwise.
-            contacts.retain(|c| {
-                if c.kind == ContactKind::Ue && c.uri.to_string() == uri_string {
-                    if let Some(token) = &c.flow_token {
-                        tokens_to_remove.push(token.to_string());
-                    }
-                    if is_stream_transport(c.source_transport) {
-                        if let Some(id) = c.inbound_connection_id {
-                            conns_to_deindex.push(id);
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            // Cascade-clear: AS contacts only make sense while the user
-            // is registered (TS 24.229 §5.4.2.1.2).  If the dereg
-            // emptied the last UE binding, drop any remaining AS
-            // capability records so the next reg-event NOTIFY emits a
-            // clean terminated registration with no stale contacts.
-            let any_ue_left = contacts
-                .iter()
-                .any(|c| c.kind == ContactKind::Ue && !c.is_expired());
-            if !any_ue_left {
-                contacts.clear();
-            }
-            let remaining: Vec<_> = contacts
-                .iter()
-                .map(backend::StoredContact::from_contact)
-                .collect();
-            let aor_empty = contacts.is_empty();
-            if aor_empty {
-                drop(entry);
-                self.bindings.remove(aor);
-            } else {
-                drop(entry);
-            }
-            for token in &tokens_to_remove {
-                self.tokens.remove(token);
-            }
-            for id in &conns_to_deindex {
-                self.deindex_connection(*id, aor);
-            }
-            self.persist_aor(aor, remaining);
-            if aor_empty {
-                // The last binding is gone, so the registration is over and
-                // its auxiliary state goes with it — service route, asserted
-                // identity, P-Associated-URI list and the implicit-set
-                // aliases. Same teardown `remove_all` performs; without it a
-                // de-REGISTER left four maps holding a dead AoR, invisible to
-                // `registrations_active` because that counts `bindings` only.
-                self.drop_aor_state(aor);
-                if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.registrations_active.dec();
-                }
-            }
-            self.emit_event(RegistrationEvent::Deregistered {
-                aor: aor.to_string(),
-            });
-            return Ok(());
-        }
-
-        // Replace existing contact with same URI, or same +sip.instance per RFC 5627 §4.2.
-        // When a UE re-registers with a different port (e.g. IPsec port rotation),
-        // the URI changes but the +sip.instance stays the same — match on instance first.
-        let instance_match = contact.sip_instance.as_ref().and_then(|inst| {
-            contacts
-                .iter()
-                .position(|c| c.sip_instance.as_ref().is_some_and(|ci| ci == inst))
-        });
-        let uri_match = contacts
-            .iter()
-            .position(|c| c.uri.to_string() == uri_string);
-        let replace_idx = instance_match.or(uri_match);
-
-        let is_refresh = replace_idx.is_some();
-        if let Some(idx) = replace_idx {
-            // Harvest the displaced contact's token + stream connection id so a
-            // re-REGISTER (possibly over a new connection) cleanly retires the
-            // old entry from both reverse indexes.  The new binding is
-            // re-indexed below; if the connection is unchanged the deindex +
-            // reindex nets to a no-op.
-            if let Some(old_token) = &contacts[idx].flow_token {
-                tokens_to_remove.push(old_token.to_string());
-            }
-            if is_stream_transport(contacts[idx].source_transport) {
-                if let Some(id) = contacts[idx].inbound_connection_id {
-                    conns_to_deindex.push(id);
-                }
-            }
-            contacts[idx] = contact;
-        } else {
-            // Check max_contacts
-            if contacts.len() >= self.config.max_contacts {
-                return Err(RegistrarError::TooManyContacts {
-                    max: self.config.max_contacts,
-                });
-            }
-            push_binding(contacts, contact);
-        }
-
-        // Sort by q-value descending
-        contacts.sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Write-through to backend before releasing the DashMap entry.
-        let stored: Vec<_> = contacts
-            .iter()
-            .map(backend::StoredContact::from_contact)
-            .collect();
-        let aor_owned = aor.to_string();
-        drop(entry);
-
-        // Update the token index: remove harvested tokens first (so a
-        // refresh that reuses the same token isn't accidentally deleted),
-        // then insert the new mapping.
-        for token in &tokens_to_remove {
-            // Don't drop the about-to-be-(re)inserted mapping if the
-            // script reused the same token on the refresh.
-            if Some(token.as_str()) != flow_token.as_deref() {
-                self.tokens.remove(token);
-            }
-        }
-        if let Some(token) = &flow_token {
-            self.tokens.insert(token.to_string(), aor_owned.clone());
-        }
-
-        // Maintain the stream connection reverse index: retire the ids of any
-        // contacts dropped above (expired/displaced), then index the new
-        // binding.  Order matters when a refresh reuses the same connection —
-        // deindex first, reindex second nets to the binding staying indexed.
-        for id in &conns_to_deindex {
-            self.deindex_connection(*id, &aor_owned);
-        }
-        self.index_connection(new_connection_id, new_is_stream, &aor_owned);
-
-        self.persist_aor(aor, stored);
-        if is_refresh {
-            self.emit_event(RegistrationEvent::Refreshed { aor: aor_owned });
-        } else {
-            if let Some(metrics) = crate::metrics::try_metrics() {
-                metrics.registrations_active.inc();
-            }
-            self.emit_event(RegistrationEvent::Registered { aor: aor_owned });
-        }
-
-        Ok(())
+        self.apply_register(
+            aor,
+            vec![update::ContactUpdate {
+                uri,
+                expires_secs,
+                q,
+                call_id,
+                cseq,
+                source_addr,
+                source_transport,
+                sip_instance,
+                reg_id,
+                path,
+                flow,
+                params,
+            }],
+            false,
+        )
     }
 
     /// Remove all contacts for an AoR (wildcard deregister, Contact: *).
@@ -1080,28 +864,15 @@ impl Registrar {
 
     /// Remove all contacts for an AoR **without** emitting a change event.
     ///
-    /// Used by `PyRegistrar::save(force=True)` to clear bindings before
-    /// re-processing contacts — the subsequent per-contact `save()` calls
-    /// emit the appropriate events themselves.
+    /// What `save(force=True)` does to an AoR once its REGISTER has been
+    /// accepted; the Contacts stored afterwards emit their own events.
     pub fn clear_bindings(&self, aor: &str) {
         let primary = self.resolve_alias(aor);
-        let aor = primary.as_str();
-        if let Some((_, contacts)) = self.bindings.remove(aor) {
-            for contact in contacts {
-                if let Some(token) = contact.flow_token {
-                    self.tokens.remove(token.as_ref());
-                }
-                if is_stream_transport(contact.source_transport) {
-                    if let Some(id) = contact.inbound_connection_id {
-                        self.deindex_connection(id, aor);
-                    }
-                }
-            }
-        }
-        if let Some(writer) = self.backend_writer.get() {
-            writer.remove(aor);
-        }
-        self.drop_aor_state(aor);
+        let removed = self
+            .bindings
+            .remove(primary.as_str())
+            .map(|(_, contacts)| contacts);
+        self.release_cleared(&primary, removed);
     }
 
     /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.

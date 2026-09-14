@@ -183,6 +183,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   and every B2BUA teardown copied all of them. The stateless ACK above replaces
   it. siphon also no longer sends a siphon-originated re-INVITE on a call that
   ended while the re-INVITE was being built.
+- **`registrar.save()` answers a REGISTER the registrar refuses instead of
+  raising.** A new binding past `max_contacts`, an `Expires` below
+  `min_expires` or an AoR that is not a safe storage key raised a bare
+  `ValueError`. The handler died on it and the dispatcher answered
+  `500 Script Error`, which tells the UA the server is broken and gives it
+  nothing to act on, and a device refused this way got that 500 again on every
+  refresh, each one counted as a script error. `save()` now sets the answer
+  itself and returns `False`: `423 Interval Too Brief` with `Min-Expires`
+  (RFC 3261 §10.3 step 7), `503 Service Unavailable` with `Retry-After` set to
+  the seconds until the soonest held binding expires (1 to `max_expires`), or
+  `404 Not Found` (§10.3 step 3). 503 and not 403 for too many contacts,
+  because UAs commonly read a 403 to REGISTER as a bad credential and fetch a
+  new one, which can only loop.
+
+  A refused REGISTER now stores nothing. Contacts were applied one at a time,
+  so the ones ahead of the refused Contact were already stored, and
+  `force=True` cleared the AoR before anything was checked. Every Contact now
+  goes onto a copy of the AoR's bindings under one lock, the copy is committed
+  only if all of them were accepted, and the force clear happens only then.
+  Backend writes and `@registrar.on_change` events fire for a committed change
+  only. An accepted REGISTER gets the same 200, bindings, writes and events as
+  before.
+
+  Refusals are logged at warn with the AoR, reason and limit, and counted in the
+  new `siphon_registrar_refusals_total{reason}` (`too_many_contacts`,
+  `interval_too_brief`, `invalid_aor`), since they no longer show up as script
+  errors. The SDK mock models them too: `MockRegistrar.save()` stores the
+  request's actual Contacts (by `+sip.instance`, then URI), honours
+  `max_contacts`, `min_expires` and `max_expires` (set with
+  `registrar.configure(...)`, engine defaults otherwise), and answers and
+  returns `False` the same way. A mock REGISTER with no Contact header still
+  binds its source address as before.
+
+  For script authors: a script that caught the `ValueError` now sees `save()`
+  return `False` instead. One that returned early on `False`, as documented,
+  needs no change.
 
 - **The Rx `SpecificAction` enum now has the TS 29.214 values.** `IpCanChange`
   was 7, which is INDICATION_OF_OUT_OF_CREDIT, and there was a variant on 6

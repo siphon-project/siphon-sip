@@ -97,8 +97,8 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | Memory backend | Implemented | `registrar.backend: memory` | Ephemeral |
 | PostgreSQL backend | Implemented | `registrar.backend: postgres` | |
 | Python custom backend | Implemented | `registrar.backend: python` | |
-| Expires control (default/min/max) | **Production** | `registrar.{default,min,max}_expires` | |
-| Max contacts per AoR | **Production** | `registrar.max_contacts` | |
+| Expires control (default/min/max) | **Production** | `registrar.{default,min,max}_expires` | An `Expires` below `min_expires` is answered `423 Interval Too Brief` with `Min-Expires` by `registrar.save()`, which returns `False` and stores nothing |
+| Max contacts per AoR | **Production** | `registrar.max_contacts` | A new binding past it is answered `503 Service Unavailable` with `Retry-After` (seconds until the soonest held binding expires) by `registrar.save()`, which returns `False`. The REGISTER is applied atomically: a refusal stores none of its Contacts, and `force=True` clears only once every Contact is accepted. Refusals count in `siphon_registrar_refusals_total{reason}`, not as script errors |
 | Bind AoR to authenticated user | Implemented | `registrar.enforce_auth_aor_match` | Rejects (403) a REGISTER whose AoR (To-URI user) ≠ the authenticated digest user — anti account-takeover / forced-deregister. Checked **before** the force-clear so a spoofed AoR can't first wipe the victim's bindings. Default off (IMS deployments authorize via the implicit registration set, where the public identity ≠ private auth identity). |
 | Redis TTL slack | **Production** | `registrar.redis.ttl_slack_secs` | Race condition buffer |
 | GRUU (RFC 5627) | Implemented | | |
