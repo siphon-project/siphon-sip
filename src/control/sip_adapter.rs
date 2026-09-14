@@ -83,7 +83,12 @@ impl ControlAdapter for SipControlAdapter {
                 "StasisStart".to_string(),
                 "StasisEnd".to_string(),
                 "ChannelStateChange".to_string(),
-                "ChannelHangupRequest".to_string(),
+                // No `ChannelHangupRequest`: it was advertised here and never
+                // emitted, so an app could wait on it for a teardown that
+                // announces itself as `StasisEnd` instead — which already
+                // carries the hangup cause and the SIP status. `describe` is
+                // the only place an app can discover the surface, so a name in
+                // it that nothing sends is worse than an absent one.
                 "ChannelDtmfReceived".to_string(),
                 // Application-level, not channel-level: it concerns the
                 // deployment rather than a call, and only reaches an app that
@@ -2678,7 +2683,6 @@ mod tests {
             "StasisStart",
             "StasisEnd",
             "ChannelStateChange",
-            "ChannelHangupRequest",
             "ChannelDtmfReceived",
             "PlayStarted",
             "TransferRequested",

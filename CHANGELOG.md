@@ -154,6 +154,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The set of forwarded request types is now one enum shared by the forward, the
   response relay, the tracking-leg check and a new retransmit guard, so a type
   cannot be forwarded without being recognised on the way back.
+### Fixed
+
+- **`control.apps[].on_lost` is read.** It parsed and nothing ever looked at it:
+  only a per-call value (`call.handover(on_lost=…)`, `originate`'s argument)
+  reached a channel, so an operator who set the policy once for the app got the
+  hardcoded `hangup` on every call with no indication. The order is now the
+  per-call value, then the app's configured policy, then `hangup`.
+
+- **`on_lost: "fallback"` is refused at config load instead of silently meaning
+  `hangup`.** It would re-dispatch the call through the Python handlers, which
+  was never built, so an operator who chose it to keep calls alive when a
+  controller dies got exactly the opposite. The error names the two that are
+  implemented.
+
+- **`describe` no longer advertises `ChannelHangupRequest`.** Nothing emitted
+  it, and `describe` is the only place an app can discover the surface — a name
+  in it that never arrives is something an app can wait on forever. `StasisEnd`
+  already carries the hangup cause and the SIP status.
+
+- **Documentation corrections.** The feature matrix named
+  `control.apps[].connect_to` and `control.apps[].deadline_ms`; the settings are
+  `per_call_connect` + `connect_url` and `control.limits.handoff_deadline_ms`.
+  `docker-compose.yaml` said `siphon.yaml` is hot-reloaded — only the scripts
+  are; the config is read once at start-up.
 
 ### Changed
 
