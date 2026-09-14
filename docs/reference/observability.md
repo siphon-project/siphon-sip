@@ -20,6 +20,40 @@ Call detail record writing from scripts.
 
 ::: siphon_sdk.mock_module.MockCdr
 
+### Writing to several sinks
+
+`cdr.backends` takes a list, and every record is written to every entry:
+
+```yaml
+cdr:
+  enabled: true
+  auto_emit: true
+  backends:
+    - type: file
+      path: /var/log/siphon/cdr.jsonl
+      rotate_size_mb: 100
+    - type: http
+      url: https://collector.example.com/v1/cdr
+      auth_header: "Bearer ..."
+```
+
+This is the usual shape: the file is the durable copy on the node, and the
+collector is what the billing or reporting side consumes. With one sink, a
+record the collector fails to take exists nowhere else, and until the collector
+exists the file is the only place records can go.
+
+Each sink gets its own channel and its own writer task, so a slow or failing
+sink cannot delay, block or drop another's records. `channel_size` applies per
+sink; a full channel drops for that sink alone, logged and counted under its
+name in `siphon_cdr_dropped_total{sink}`. Per-sink ordering is preserved.
+
+There is no retry or durable queue for the HTTP sink. A file sink beside it is
+how a deployment gets durability without one.
+
+The single form — `backend:` plus its matching `file:` / `syslog:` / `http:`
+block — is unchanged and means one sink of that kind. Setting both `backend` and
+`backends` is refused at config load rather than guessed at.
+
 ## `metrics` namespace
 
 Custom Prometheus counters, gauges, and histograms that appear on `/metrics`.

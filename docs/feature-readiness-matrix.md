@@ -212,7 +212,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| CDR generation | Implemented | `cdr:` | Auto-emit per call (`cdr.auto_emit`) — proxy + B2BUA, with duration + disconnect_initiator + Rf correlation; script `cdr.write(request)` (proxy) / `cdr.write(call)` (B2BUA) merges its `extra` fields into that record, and writes one of its own only when no auto-emit record is tracked |
+| CDR generation | Implemented | `cdr:` | Auto-emit per call (`cdr.auto_emit`) — proxy + B2BUA, with duration + disconnect_initiator + Rf correlation; script `cdr.write(request)` (proxy) / `cdr.write(call)` (B2BUA) merges its `extra` fields into that record, and writes one of its own only when no auto-emit record is tracked. `cdr.backends` writes every record to several sinks (file / syslog / http) at once — one channel and writer task per sink, so a slow or failing sink cannot delay, block or drop another's records; a full channel drops for that sink alone, counted in `siphon_cdr_dropped_total{sink}`. No retry or durable queue for the HTTP sink: a file sink beside it is how a deployment gets durability. |
 | REGISTER CDRs | Implemented | `cdr.include_register` | With `auto_emit`, one CDR per registrar state change (`reg_event`) |
 | File backend (JSON-lines) | Implemented | `cdr.backend: file` | With rotation |
 | Syslog backend | Implemented | `cdr.backend: syslog` | UDP syslog |

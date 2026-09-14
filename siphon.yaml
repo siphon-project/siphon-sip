@@ -1346,6 +1346,34 @@ auth:
 #   syslog:
 #     target: "10.0.0.5:514"
 #
+# Several sinks at once. A deployment usually wants both: the file is the
+# durable copy on the node, and the collector is what the billing or reporting
+# side consumes. With a single sink, a record the collector fails to take exists
+# nowhere else — and until the collector exists, the file is the only place
+# records can go.
+# cdr:
+#   enabled: true
+#   auto_emit: true
+#   backends:
+#     - type: file
+#       path: "/var/log/siphon/cdr.jsonl"
+#       rotate_size_mb: 100
+#     - type: http
+#       url: "https://collector.example.com/v1/cdr"
+#       auth_header: "Bearer tok123"
+#     # - type: syslog
+#     #   target: "10.0.0.5:514"
+#
+#   Every record goes to every sink. Each sink gets its own channel and writer
+#   task, so a slow or failing one cannot delay, block or drop another's
+#   records: a full channel drops for that sink alone, counted under its name in
+#   siphon_cdr_dropped_total{sink}. channel_size applies per sink, and per-sink
+#   order is preserved. There is no retry or durable queue for the HTTP sink —
+#   a file sink beside it is how a deployment gets durability.
+#
+#   `backend:` (with its block) and `backends:` are two spellings of the same
+#   setting; a config that sets both is refused at load rather than guessed at.
+#
 # Python usage (adds to / stacks on auto_emit):
 #   from siphon import cdr
 #   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})  # proxy

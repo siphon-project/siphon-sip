@@ -831,6 +831,9 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "uac_pending": metrics.uac_pending_requests.get(),
             "subscribe_dialogs": metrics.subscribe_dialogs.get(),
             "cdr_sessions": metrics.cdr_sessions.get(),
+            // Per sink: which one is losing records is the whole question when
+            // several are configured, so the roll-up would not answer it.
+            "cdr_dropped": crate::metrics::int_counter_vec_by_label(&metrics.cdr_dropped_total, "sink"),
             "connections": connections,
             "stream_connections": metrics.stream_connections_active.get(),
             "handshakes_in_flight": metrics.handshakes_in_flight.get(),

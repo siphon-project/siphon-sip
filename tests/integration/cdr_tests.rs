@@ -243,6 +243,9 @@ async fn file_backend_write_and_read_back() {
             path: temp_path.clone(),
             rotate_size_mb: 100,
         },
+        // Empty means "the single `backend` above", which is what a consumer
+        // building a `CdrConfig` by hand gets.
+        backends: Vec::new(),
         auto_emit: false,
         include_register: false,
         channel_size: 100,

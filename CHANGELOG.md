@@ -6,6 +6,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **`cdr.backends` writes every call record to several sinks at once.** A file
+  on the node and delivery to an HTTP collector was a choice before: picking
+  `http` gave up the durable copy, and picking `file` gave up delivery, so a
+  record the collector failed to take existed nowhere else.
+
+  ```yaml
+  cdr:
+    backends:
+      - type: file
+        path: /var/log/siphon/cdr.jsonl
+      - type: http
+        url: https://collector.example.com/cdr
+  ```
+
+  Each sink gets its own channel and writer task, so a slow or failing one
+  cannot delay, block or drop another's records; `channel_size` applies per
+  sink, a full channel drops for that sink alone and is counted under its name
+  in the new `siphon_cdr_dropped_total{sink}`, and per-sink ordering is
+  preserved. There is no retry or durable queue for the HTTP sink — a file sink
+  beside it is how a deployment gets durability without one.
+
+  The single form (`backend:` plus its block) is unchanged and means one sink.
+  Setting both `backend` and `backends` is refused at config load, naming both,
+  rather than siphon guessing which one was meant.
+
 ### Changed
 
 - **The IPsec runtime lookups moved from `script::api::ipsec` to

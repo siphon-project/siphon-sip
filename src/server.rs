@@ -2016,12 +2016,10 @@ impl SiphonServer {
 
         // --- CDR writer ---
         if let Some(ref cdr_yaml) = config.cdr {
+            // `init` starts one writer task per configured sink; the sinks
+            // are named in its own log line.
             let cdr_config = cdr_yaml.to_cdr_config();
-            if let Some(receiver) = crate::cdr::init(&cdr_config) {
-                let writer_config = cdr_config.clone();
-                tokio::spawn(crate::cdr::writer_task(receiver, writer_config));
-                info!("CDR writer started (backend: {})", cdr_yaml.backend);
-            }
+            crate::cdr::init(&cdr_config);
         }
 
         // --- RTPEngine event listener (DTMF, etc.) ---
