@@ -85,6 +85,10 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelStateChange".to_string(),
                 "ChannelHangupRequest".to_string(),
                 "ChannelDtmfReceived".to_string(),
+                // Application-level, not channel-level: it concerns the
+                // deployment rather than a call, and only reaches an app that
+                // opted in with `control.apps[].events: [registration]`.
+                "RegistrationChanged".to_string(),
                 // The accept of a `play`, on the event stream rather than only
                 // in the command reply, carrying the `play_id` a later `stop` /
                 // gain change addresses. "Started" is the media contract's
@@ -2341,6 +2345,7 @@ mod tests {
                 connect_url: None,
                 on_lost: Some("hangup".to_string()),
                 ca_file: None,
+                events: Vec::new(),
             }],
             64,
             crate::control::SlowConsumerPolicy::DropOldest,

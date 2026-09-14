@@ -1959,7 +1959,20 @@ log:
 #       # REPLACES the public roots rather than adding to them — a controller
 #       # behind a private CA should be the only certificate that works.
 #       ca_file: "/etc/siphon/control-ca.pem"
-#       on_lost: "hangup"           # owner-disconnect policy: hangup|continue|fallback
+#       on_lost: "hangup"           # owner-disconnect policy: hangup|continue
+#       events: [registration]      # app-level events this app wants, beyond the
+#                                   # per-call ones its own channels produce.
+#                                   # Opt-in and empty by default: these are not
+#                                   # about a call the app owns, so a registration
+#                                   # storm must not land on the queue of an app
+#                                   # that only places outbound calls.
+#                                   #   registration -> RegistrationChanged
+#                                   #     {aor, event, contacts} on every registrar
+#                                   #     state change (registered / refreshed /
+#                                   #     deregistered / expired). Goes to EVERY
+#                                   #     connection of the app, not one picked
+#                                   #     round robin: a dashboard behind two
+#                                   #     replicas needs both to see it.
 #   limits:
 #     event_queue_depth: 1024       # bounded per-connection outbound queue
 #     slow_consumer: drop_oldest    # drop_oldest | disconnect

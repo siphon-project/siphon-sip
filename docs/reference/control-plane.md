@@ -356,6 +356,37 @@ additive to the in-process `@rtpengine.on_dtmf` dispatch: the digit fires both,
 and it needs no extra configuration beyond the DTMF-log wiring the media engine
 already uses.
 
+### Application-level events
+
+Most events belong to a channel and reach its owner. `RegistrationChanged` does
+not: a registration concerns the deployment, and the app that wants it on a
+dashboard may own no channel at all.
+
+```yaml
+control:
+  apps:
+    - name: dashboard
+      token: "${DASHBOARD_TOKEN}"
+      events: [registration]
+```
+
+The frame carries no `channel`, `call_id` or `sip_call_id` — there is no call
+for it to be about — and its payload is
+`{aor, event, contacts: [{uri, expires, q}]}`, where `event` is `registered`,
+`refreshed`, `deregistered` or `expired`. It reaches **every** connection of a
+subscribed app rather than one picked round robin: a dashboard behind two
+replicas needs both to see it, and there is no call here whose ownership would
+decide which.
+
+Opt-in, and empty by default — a registration storm must not land on the event
+queue of an application that only places outbound calls. An `events` entry
+naming a class siphon does not publish is refused at config load, because the
+list is read at start-up and an app subscribed to a name nothing sends would
+wait forever with nothing to tell it.
+
+It fires whether or not a `@registrar.on_change` handler is registered: a
+dashboard should not depend on a script existing.
+
 An **inbound REFER on a controlled call** (a party asking to be transferred) is
 handed to the owning app rather than the in-process `@b2bua.on_refer` path: siphon
 holds the REFER un-answered and pushes a `TransferRequested` event, payload

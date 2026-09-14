@@ -403,6 +403,7 @@ mod tests {
             connect_url: Some(connect_url.to_string()),
             on_lost: Some("hangup".to_string()),
             ca_file: None,
+            events: Vec::new(),
         }
     }
 
