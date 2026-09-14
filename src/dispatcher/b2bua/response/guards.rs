@@ -4,6 +4,46 @@
 
 use crate::dispatcher::*;
 
+/// A response on a fork branch siphon has CANCELled because another branch
+/// answered, or one declined with a 6xx.
+///
+/// None of it may reach the call, which is answered or about to be torn down: a
+/// 1xx is dropped, the ordinary 487 is ACKed (RFC 3261 §17.1.1.3), and a 2xx
+/// that crossed the CANCEL is ACKed and its dialog released with a BYE
+/// (§13.2.2.4, §15). That is the handling the branch gets once the call is
+/// gone, so it is the same code. Returns `true` when the response was this.
+pub fn absorb_cancelled_branch_response(
+    call_id: &str,
+    branch: &str,
+    message: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) -> bool {
+    let Some((sip_call_id, _)) = snapshot.b_leg_dialog.as_ref() else {
+        return false;
+    };
+    if !state.call_actors.is_cancelled_branch(sip_call_id, branch) {
+        return false;
+    }
+    if status_code < 200 {
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            "B2BUA: dropping a provisional from a cancelled fork branch"
+        );
+    } else if status_code < 300 {
+        if let Some((leg, first_2xx)) = state.call_actors.zombie_cancelled_for_2xx(sip_call_id) {
+            handle_zombie_cancelled_2xx(leg, first_2xx, message, state);
+        }
+    } else if let Some((leg, invite_ruri)) =
+        state.call_actors.zombie_cancelled_for_non2xx(sip_call_id)
+    {
+        handle_zombie_cancelled_non2xx(&leg, invite_ruri.as_deref(), message, status_code, state);
+    }
+    true
+}
+
 /// RFC 3262 §3: answer a reliable provisional from the B-leg with a PRACK of
 /// our own, built from the B-leg dialog state. The A-leg never sees the
 /// `Require: 100rel` / `RSeq` markers unless it advertised 100rel itself.

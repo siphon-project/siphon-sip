@@ -898,7 +898,10 @@ class Call:
                 exists to route around, and two bindings of one AoR would share
                 the first one's route set.  Bare strings keep pure Request-URI
                 routing.
-            strategy: ``"parallel"`` (ring all, first answer wins) or
+            strategy: ``"parallel"`` (ring all, first answer wins, and the
+                      other branches are CANCELled when one answers; the call
+                      fails only once every branch has, with the best of their
+                      failures and a single ``@b2bua.on_failure``) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch ring timeout in seconds.
             max_duration: Cap on how long the call may stay answered, in

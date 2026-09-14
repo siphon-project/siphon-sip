@@ -202,13 +202,18 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 }
                 let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> =
                     Vec::new();
-                for b_leg in &call.b_legs {
+                for (index, b_leg) in call.b_legs.iter().enumerate() {
                     // We are giving up on this call, so stop retransmitting the
                     // request that never drew a response. The CANCEL emitted
                     // below covers the legs whose INVITE was stashed; this also
                     // catches a leg whose stash never landed, which would
                     // otherwise keep retransmitting until 64*T1.
                     state.b2bua_retransmits.disarm_branch(&b_leg.branch);
+                    // A fork branch that already failed, or was already
+                    // CANCELled, has nothing left to cancel (RFC 3261 §9.1).
+                    if !call.is_pending_branch(index) {
+                        continue;
+                    }
                     if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
                         if let Ok(invite) = invite_arc.lock() {
                             if let Some(cancel_msg) = build_cancel_from_invite(&invite) {

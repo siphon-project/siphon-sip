@@ -6621,6 +6621,219 @@ services:
     profiles:
       - bridge
 
+  # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ────────────────────
+  # One siphon, six callees each scripted for a single branch outcome, and one
+  # caller run once per case with `-s` naming it. The cases, and which two
+  # callees each forks to, are in b2bua-fork/b2bua_fork.py; b2bua-fork/run_case.sh
+  # runs one. The callees carry most of the assertions and run detached, so the
+  # runner checks their exit codes as well as the caller's.
+  #
+  # IP assignments:
+  #   172.20.0.183 — siphon-b2bua-fork
+  #   172.20.0.184 — caller
+  #   172.20.0.185 — busy callee (486 at once)
+  #   172.20.0.186 — late callee (answers at 2 s)
+  #   172.20.0.187 — early callee (answers at 1 s)
+  #   172.20.0.188 — cancelled callee (expects a CANCEL, answers 487)
+  #   172.20.0.189 — glare callee (answers the INVITE into the CANCEL)
+  #   172.20.0.190 — unavailable callee (480 at 2 s)
+  siphon-b2bua-fork:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-fork
+    volumes:
+      - ./b2bua-fork/siphon-b2bua-fork.yaml:/etc/siphon/siphon.yaml:ro
+      - ./b2bua-fork/b2bua_fork.py:/etc/siphon/scripts/b2bua_fork.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.183
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-fork
+
+  # The caller. run_case.sh replaces `command` with the case's scenario and name.
+  sipp-b2bua-fork-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-fork:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.184
+    entrypoint:
+      - sipp
+      - "172.20.0.183:5060"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    command:
+      - -sf
+      - /sipp/scenarios/b2bua_fork_uac.xml
+      - -s
+      - fork-busy
+    profiles:
+      - b2bua-fork
+
+  # Every callee runs with -timeout_error: without it a scenario still waiting
+  # for its ACK, CANCEL or BYE exits 0 on the global timeout, and the one
+  # assertion that case exists for passes vacuously.
+  sipp-b2bua-fork-busy-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-busy-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.185
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_busy_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-late-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-late-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.186
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_answer_uas.xml
+      - -d
+      - "2000"
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-early-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-early-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.187
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_answer_uas.xml
+      - -d
+      - "1000"
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-cancelled-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-cancelled-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.188
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_cancelled_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-glare-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-glare-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.189
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_glare_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
+  sipp-b2bua-fork-unavailable-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-fork-unavailable-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.190
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_unavailable_uas.xml
+      - -d
+      - "2000"
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-fork
+
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   # siphon's CDR file, shared with the assertion one-shot. Removed by

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A parallel-fork branch that rings, then gives up with 480 after `-d`
+     milliseconds, the last branch of a fork whose other branch already failed.
+     The ACK row fails if siphon settled the call on the first failure and
+     dropped this one as a response for an unknown call
+     (sipp/b2bua-fork/b2bua_fork.py). -->
+
+<scenario name="B2BUA fork branch that is unavailable">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:unavailable@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause />
+
+  <send>
+    <![CDATA[
+SIP/2.0 480 Temporarily Unavailable
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" crlf="true" />
+
+</scenario>

@@ -652,6 +652,8 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // bool would leave the next arm that sets this to invent one.
     let mut teardown_after_hooks: Option<u16> = None;
     let mut fail_undialed = false;
+    // What a parallel fork's branches settled while they were still being sent.
+    let mut fork_settlement: Option<crate::b2bua::actor::BranchSettlement> = None;
 
     match action {
         CallAction::None if handlers.is_empty() && state.control_inbound.is_some() => {
@@ -803,6 +805,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             let mut branches_sent = 0usize;
+            // Branches go out one at a time, and the first can fail (or answer)
+            // before the next one exists. Hold settlement until all are out.
+            state.call_actors.start_fork_dispatch(&call_id);
             for (index, target) in targets.iter().enumerate() {
                 // Each branch gets the route set of *its own* binding (RFC 3327
                 // §5.3), which also decides where the branch is sent.  A shared
@@ -832,6 +837,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                     branches_sent += 1;
                 }
             }
+            fork_settlement = state.call_actors.finish_fork_dispatch(&call_id);
             // A branch that could not be sent is simply not a branch (RFC 3261
             // §16.7 aggregates over the branches that exist), so one bad
             // contact among several does not fail the call. All of them failing
@@ -959,6 +965,14 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // outside their own guards.
     drop(message_guard);
     b2bua_dispatch_burned_routes(&call_id, &burned_routes, state);
+    // Out here, not in the fork arm: failing the call runs @b2bua.on_failure,
+    // which locks the A-leg INVITE the guard above was holding.
+    if let Some(settlement) = fork_settlement {
+        cancel_settled_branches(&settlement.cancelled, state);
+        if let Some(best) = settlement.failure {
+            fail_forked_call(&call_id, best, state);
+        }
+    }
     if fail_undialed {
         b2bua_fail_undialed_call(&call_id, &message_arc, &inbound, state);
     }

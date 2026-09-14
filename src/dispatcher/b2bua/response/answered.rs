@@ -402,7 +402,13 @@ pub fn absorb_answered_retransmit(
         .b_leg_index
         .map(|idx| state.call_actors.try_win(call_id, idx))
     {
-        Some(crate::b2bua::actor::WinOutcome::FirstWin) => None,
+        Some(crate::b2bua::actor::WinOutcome::FirstWin { cancelled }) => {
+            // This branch won, so the ones still ringing are over (RFC 3261
+            // §16.7). CANCEL them now rather than leave them ringing beside an
+            // answered call until each gives up on its own.
+            cancel_settled_branches(&cancelled, state);
+            None
+        }
         Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered { b_leg_acked }) => Some(b_leg_acked),
         None if snapshot.call_state == CallState::Answered => Some(true),
         None => {

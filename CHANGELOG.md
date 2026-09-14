@@ -327,6 +327,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+- **A parallel `call.fork()` no longer fails the call on its first failed
+  branch.** One branch answering busy while another still rang sent the caller
+  that busy and dropped the call, and the branch that went on to answer was never
+  ACKed. The call now fails only once no branch can still answer, with the best
+  of the branches' failures (RFC 3261 §16.7), and `@b2bua.on_failure` runs once,
+  at that point. A 6xx still ends the call at once, and CANCELs the rest.
+
+- **The losing branches of a parallel fork are CANCELled when one answers.**
+  They used to ring on beside the answered call until each gave up (RFC 3261
+  §9.1). The 487 each returns is ACKed without disturbing the call, and a branch
+  whose 2xx crosses the CANCEL is ACKed and released with a BYE (§13.2.2.4, §15).
+  That ACK and BYE now leave as one ordered unit: sent separately over UDP they
+  could reach the callee BYE first, which a strict UA drops, leaving the BYE
+  retransmitting unanswered. A caller's CANCEL and the ring timeout likewise stop
+  CANCELling branches that already have a final response.
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the

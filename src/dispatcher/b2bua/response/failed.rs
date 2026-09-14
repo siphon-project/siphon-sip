@@ -3,9 +3,8 @@
 
 use crate::dispatcher::*;
 
-/// A final failure on the B-leg: the 422 and 401/407 retries, the LCR route
-/// sequence, `@b2bua.on_failure`, and — when nothing retries — the ACK, the
-/// relayed failure and the teardown.
+/// A final failure on the B-leg: the 422 and 401/407 retries, then the fork
+/// it belongs to, which fails the call only once no branch can still answer.
 pub fn b_leg_failed(
     call_id: &str,
     branch: &str,
@@ -14,28 +13,147 @@ pub fn b_leg_failed(
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) {
-    // --- 3xx+ error handling ---
+    // RFC 4028: 422 "Session Interval Too Small" — retry with higher Session-Expires
+    if retry_after_422(call_id, message, status_code, state, snapshot) {
+        return;
+    }
+
+    // 401/407 — auto-retry with digest credentials if available.
+    //
+    // The retry MUST be built from the B-leg's last-sent INVITE, NOT the
+    // raw A-leg INVITE. The first B-leg INVITE went through the full
+    // hygiene chain in `b2bua_send_b_leg_invite` (strip Record-Route /
+    // Route / Authorization, replace Via / Contact / User-Agent, rewrite
+    // From / To / P-Asserted-Identity host, regenerate Call-ID, set
+    // CSeq=1, decrement Max-Forwards, sanitize SDP origin), plus any
+    // script-side mutations applied before send. Cloning the A-leg INVITE
+    // and only patching Via / RURI / Authorization (the old behaviour)
+    // leaks every other A-leg header back to the B-leg.
+    if retry_with_credentials(call_id, branch, message, status_code, state, snapshot) {
+        return;
+    }
+
+    // A parallel fork: one branch failing is not the call failing while another
+    // can still answer (RFC 3261 §16.7). The failure is recorded, the best one
+    // kept, and the call fails only once no branch is left. A plain dial is a
+    // fork of one and settles here at once. An LCR sequence keeps one carrier
+    // live at a time under its own failover rules, and a response matching no
+    // leg has no fork to settle, so both go straight on.
+    let fork_index = snapshot
+        .b_leg_index
+        .filter(|_| !state.call_actors.is_route_sequence(call_id));
+    let Some(index) = fork_index else {
+        fail_call_on_b_leg_failure(
+            call_id,
+            branch,
+            message,
+            status_code,
+            state,
+            snapshot,
+            false,
+        );
+        return;
+    };
+    let Some(settlement) =
+        state
+            .call_actors
+            .record_branch_failure(call_id, index, status_code, message)
+    else {
+        // The call went away underneath this response; it is still owed its ACK.
+        ack_b_leg_non2xx(branch, message, state, snapshot);
+        return;
+    };
+    cancel_settled_branches(&settlement.cancelled, state);
+    match settlement.failure {
+        None => {
+            ack_b_leg_non2xx(branch, message, state, snapshot);
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                "B2BUA: fork branch failed, another can still answer"
+            );
+        }
+        Some(best) if best.branch == branch => {
+            fail_call_on_b_leg_failure(
+                call_id,
+                branch,
+                message,
+                status_code,
+                state,
+                snapshot,
+                false,
+            );
+        }
+        Some(best) => {
+            ack_b_leg_non2xx(branch, message, state, snapshot);
+            fail_forked_call(call_id, best, state);
+        }
+    }
+}
+
+/// ACK a B-leg's final non-2xx (RFC 3261 §17.1.1.3). It belongs to the INVITE's
+/// client transaction, so it rides the INVITE's branch and leaves from the leg's
+/// own socket. Returns `false` when the leg's flow is unknown and nothing could
+/// be sent.
+pub fn ack_b_leg_non2xx(
+    branch: &str,
+    message: &SipMessage,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) -> bool {
+    let Some((b_dest, b_transport)) = snapshot.b_leg_dest else {
+        return false;
+    };
+    let (ack_via_host, ack_via_port) =
+        b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
+    let ack = build_b2bua_ack_for_non2xx(
+        message,
+        branch,
+        snapshot.b_leg_target.as_deref(),
+        b_transport,
+        &ack_via_host,
+        ack_via_port,
+    );
+    send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
+    true
+}
+
+/// Fail a parallel fork with the best failure its branches produced
+/// (RFC 3261 §16.7), relayed as the leg that sent it. That response was ACKed
+/// when it arrived, while a sibling could still answer.
+pub fn fail_forked_call(
+    call_id: &str,
+    best: crate::b2bua::actor::BranchFailure,
+    state: &DispatcherState,
+) {
+    let Some(snapshot) = b_leg_response_snapshot(call_id, &best.branch, state) else {
+        return;
+    };
+    let mut response = best.response;
+    fail_call_on_b_leg_failure(
+        call_id,
+        &best.branch,
+        &mut response,
+        best.status_code,
+        state,
+        &snapshot,
+        true,
+    );
+}
+
+/// The call fails on `message`, a B-leg's final failure: the LCR route sequence
+/// gets its chance first, then `@b2bua.on_failure`, the ACK (unless `acked`),
+/// the relayed failure and the teardown.
+fn fail_call_on_b_leg_failure(
+    call_id: &str,
+    branch: &str,
+    message: &mut SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+    acked: bool,
+) {
     {
-        // RFC 4028: 422 "Session Interval Too Small" — retry with higher Session-Expires
-        if retry_after_422(call_id, message, status_code, state, snapshot) {
-            return;
-        }
-
-        // 401/407 — auto-retry with digest credentials if available.
-        //
-        // The retry MUST be built from the B-leg's last-sent INVITE, NOT the
-        // raw A-leg INVITE. The first B-leg INVITE went through the full
-        // hygiene chain in `b2bua_send_b_leg_invite` (strip Record-Route /
-        // Route / Authorization, replace Via / Contact / User-Agent, rewrite
-        // From / To / P-Asserted-Identity host, regenerate Call-ID, set
-        // CSeq=1, decrement Max-Forwards, sanitize SDP origin), plus any
-        // script-side mutations applied before send. Cloning the A-leg INVITE
-        // and only patching Via / RURI / Authorization (the old behaviour)
-        // leaks every other A-leg header back to the B-leg.
-        if retry_with_credentials(call_id, branch, message, status_code, state, snapshot) {
-            return;
-        }
-
         // auth_passthrough: a B-leg 401/407 with no siphon-side credentials is a
         // NON-terminal challenge that we relay to the caller for end-to-end
         // authentication (RFC 3261 §22.3). We still ACK the B-leg and forward the
@@ -103,25 +221,11 @@ pub fn b_leg_failed(
 
         // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
         // The B2BUA must acknowledge non-2xx responses hop-by-hop.
-        // Use send_b2bua_to_bleg (not send_message) so TCP goes through the pool.
         // Skipped when the LCR reroute path already ACKed this carrier before
-        // trying (and failing to route) the next one — no double ACK.
-        if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
-            if !b_leg_acked_for_reroute {
-                // RFC 3261 §17.1.1.3 — same client transaction as the INVITE, so
-                // the same sent-by (the leg's flow socket when it has one).
-                let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
-                let ack = build_b2bua_ack_for_non2xx(
-                    message,
-                    branch,
-                    snapshot.b_leg_target.as_deref(),
-                    b_transport,
-                    &ack_via_host,
-                    ack_via_port,
-                );
-                send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
-            }
+        // trying (and failing to route) the next one, and for a fork's best
+        // failure, ACKed when it arrived — no double ACK.
+        if !b_leg_acked_for_reroute && !acked {
+            ack_b_leg_non2xx(branch, message, state, snapshot);
         }
 
         // A controller-issued `dial` owns this outcome: the caller is still
@@ -753,20 +857,7 @@ pub fn advance_route_sequence(
             })
             .is_some_and(|status| matches!(status, crate::b2bua::actor::BLegStatus::Cancelled));
         if already_cancelled || status_code == 487 || snapshot.call_state == CallState::Answered {
-            if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
-                // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
-                let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
-                let ack = build_b2bua_ack_for_non2xx(
-                    message,
-                    branch,
-                    snapshot.b_leg_target.as_deref(),
-                    b_transport,
-                    &ack_via_host,
-                    ack_via_port,
-                );
-                send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
-            }
+            ack_b_leg_non2xx(branch, message, state, snapshot);
             info!(call_id = %call_id, status = status_code,
     "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
             return None;

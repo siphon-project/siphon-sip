@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A parallel-fork branch whose answer crosses siphon's CANCEL on the wire
+     (sipp/b2bua-fork/b2bua_fork.py).
+
+     It rings, and when the CANCEL arrives it answers the CANCEL 200 and then
+     answers the INVITE 200 as well: its answer was already on its way. siphon
+     has CANCELled this branch because the sibling answered, and now holds a
+     second established dialog it does not want. RFC 3261 §13.2.2.4 says it must
+     still ACK that 2xx, and §15 that it must release the dialog with a BYE; the
+     ACK and BYE rows are those two MUSTs.
+
+     The CANCEL's 200 goes first because siphon ACKs the INVITE's 200 the moment
+     it arrives, and SIPp aborts the call on an ACK that lands while it is still
+     sending rather than waiting at the ACK row.
+
+     CSeq `1 INVITE` is hardcoded for the same reason as in
+     b2bua_fork_cancelled_uas.xml: `[last_CSeq:]` is the CANCEL's by then. -->
+
+<scenario name="B2BUA fork branch that answers into the CANCEL">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:glare@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Contact: <sip:glare@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=glare 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000" crlf="true" />
+
+  <recv request="BYE" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

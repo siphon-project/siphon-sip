@@ -1,0 +1,19 @@
+# siphon for the parallel call.fork() acceptance cases. The cases themselves,
+# and which callee each branch reaches, are in b2bua_fork.py next to this file.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.183"
+
+advertised_address: "172.20.0.183"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_fork.py"
+  reload: auto
+
+log:
+  level: debug
