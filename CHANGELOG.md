@@ -275,6 +275,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the M-bit, which table 5.3.1 forbids on this AVP, and a PCRF that does not
   know the AVP has to reject an AAR carrying it that way (RFC 6733 §4.1)
   instead of skipping it.
+- **`sbi.delete_session()` releases a session the PCF has already removed.**
+  When the app session is already gone on the PCF, which is the usual case for
+  the `sbi.delete_session(termination["resUri"])` an `@sbi.on_terminate`
+  handler makes, the delete is answered 404. siphon treated that as a failed
+  delete: it returned `False` and kept its own tracking entry, so
+  `siphon_sbi_npcf_app_sessions_active` grew by one for every such session and
+  never came back down. A 404 now means the session no longer exists, which is
+  what the delete asked for: the entry is released as on a 204 and the call
+  returns `True` (`NpcfClient::delete_app_session` returns `Ok(())`). Any other
+  error answer still returns `False` and keeps the entry.
+
 - **`sbi.update_session()` nests the modify under `ascReqData`.** TS 29.514
   types the PATCH body as `AppSessionContextUpdateDataPatch`, which carries the
   update data under `ascReqData` the same way create does. siphon sent it flat,

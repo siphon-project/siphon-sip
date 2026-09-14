@@ -1241,7 +1241,9 @@ class _SbiNamespace:
                 absolute ``app_session_uri`` for replica-independent teardown.
 
         Returns:
-            True on success, False on failure.
+            True when the session is gone: deleted (2xx) or already removed by
+            the PCF (404, e.g. after a termination).  False when the delete
+            failed; the session stays tracked.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:

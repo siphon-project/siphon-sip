@@ -83,11 +83,35 @@ def test_teardown_by_absolute_uri():
     uri = result["app_session_uri"]
     assert sbi.update_session(uri) is not None
     assert sbi.delete_session(uri) is True
-    # Already gone.
-    assert sbi.delete_session(uri) is False
+    # Already gone: the PCF answers 404, which siphon counts as deleted.
+    assert sbi.delete_session(uri) is True
 
 
 def test_teardown_by_bare_id_still_works():
     result = sbi.create_session(ue_ipv4="10.45.0.7")
     session_id = result["app_session_id"]
     assert sbi.delete_session(session_id) is True
+
+
+def test_delete_of_a_session_the_pcf_already_removed_is_true():
+    # The on_terminate flow: the PCF has dropped the session, so the delete
+    # finds nothing. The session no longer exists, which is what was asked.
+    unknown = "http://pcf01.5gc.example.org/npcf-policyauthorization/v1/app-sessions/gone"
+    assert sbi.delete_session(unknown) is True
+
+
+def test_delete_failure_returns_false_and_keeps_the_session():
+    uri = sbi.create_session(ue_ipv4="192.0.2.7")["app_session_uri"]
+    sbi.set_delete_failure(True)
+    assert sbi.delete_session(uri) is False
+    # Still tracked: a later update finds it.
+    assert sbi.update_session(uri) is not None
+    sbi.set_delete_failure(False)
+    assert sbi.delete_session(uri) is True
+
+
+def test_clear_resets_delete_failure():
+    sbi.set_delete_failure(True)
+    sbi.clear()
+    uri = sbi.create_session(ue_ipv4="192.0.2.7")["app_session_uri"]
+    assert sbi.delete_session(uri) is True

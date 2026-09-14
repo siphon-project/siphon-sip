@@ -229,7 +229,12 @@ impl PySbi {
     /// ``session_id`` is either the bare app-session id (resolved against
     /// ``npcf_url``) or the absolute ``app_session_uri`` returned by
     /// :func:`create_session` (sent verbatim — reaches the originating PCF from
-    /// any replica). Returns True on success, False on failure.
+    /// any replica).
+    ///
+    /// Returns True when the session no longer exists: the PCF deleted it (2xx)
+    /// or it was already gone (404, the usual answer after a PCF termination).
+    /// Either way siphon stops tracking it. Returns False when the delete
+    /// failed (transport error or any other non-2xx); the session stays tracked.
     fn delete_session(&self, session_id: &str) -> PyResult<bool> {
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();

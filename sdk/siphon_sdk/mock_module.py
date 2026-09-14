@@ -7774,6 +7774,8 @@ class MockSbi:
         self._binding: Optional[dict] = None
         #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
         self._bsf_error: bool = False
+        #: when True, delete_session fails (returns False, keeps the session).
+        self._delete_failure: bool = False
 
     @staticmethod
     def _session_id(session_ref: str) -> str:
@@ -7893,14 +7895,38 @@ class MockSbi:
     def delete_session(self, session_id: str) -> bool:
         """Delete an N5 app session.
 
+        ``True`` means the session no longer exists on the PCF: siphon deleted
+        it (the PCF answered 2xx), or it was already gone (the PCF answered
+        404). The second is the usual answer to the delete an
+        ``@sbi.on_terminate`` handler makes with ``termination["resUri"]``. In
+        both cases siphon stops tracking the session, so
+        ``siphon_sbi_npcf_app_sessions_active`` comes back down.
+
+        ``False`` means the delete failed (a transport error or any other
+        non-2xx answer); siphon keeps tracking the session.
+
+        In this mock an unknown session is treated as the PCF's 404 and
+        returns ``True``; use ``set_delete_failure`` to exercise ``False``.
+
         Args:
             session_id: The app session id from ``create_session()`` **or** the
                 absolute ``app_session_uri`` (replica-independent teardown).
 
         Returns:
-            ``True`` on success, ``False`` if session not found.
+            ``True`` when the session is gone (deleted or already removed),
+            ``False`` when the delete failed.
+
+        Example::
+
+            @sbi.on_terminate
+            def handle_termination(termination):
+                if not sbi.delete_session(termination["resUri"]):
+                    log.warn("app session delete failed; PCF still holds it")
         """
-        return self._sessions.pop(self._session_id(session_id), None) is not None
+        if self._delete_failure:
+            return False
+        self._sessions.pop(self._session_id(session_id), None)
+        return True
 
     def update_session(self, session_id: str,
                        media_components: Optional[list] = None,
@@ -8077,10 +8103,23 @@ class MockSbi:
         """
         self._bsf_error = raise_error
 
+    def set_delete_failure(self, fail: bool) -> None:
+        """Make ``delete_session`` fail (test helper).
+
+        Stands in for a PCF that answers the delete with an error other than
+        404, or cannot be reached: ``delete_session`` returns ``False`` and the
+        session stays tracked.
+
+        Args:
+            fail: when True, ``delete_session`` returns ``False``.
+        """
+        self._delete_failure = fail
+
     def clear(self) -> None:
-        """Reset all mock sessions (test helper)."""
+        """Reset all mock sessions and failure switches (test helper)."""
         self._sessions.clear()
         self._next_session_id = 1
+        self._delete_failure = False
         self._authorized = True
         self._binding = None
         self._bsf_error = False

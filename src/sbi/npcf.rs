@@ -389,6 +389,10 @@ impl NpcfClient {
     /// `session_ref` is either a bare app-session id (resolved against
     /// `self.base_url`, the legacy behaviour) or an absolute resource URI
     /// (`http(s)://…`, used verbatim — the replica-independent teardown path).
+    ///
+    /// Returns `Ok(())` when the session no longer exists on the PCF: it was
+    /// deleted (`2xx`) or was already gone (`404`). Both release the local
+    /// tracking entry. Any other answer is `Err` and the entry stays.
     pub async fn delete_app_session(&self, session_ref: &str) -> Result<(), SbiError> {
         let (url, target_apiroot) = self.resolve_session_request(session_ref);
         // TS 29.514 §5.6.2.4: the Individual Application Session Context
@@ -405,8 +409,19 @@ impl NpcfClient {
             .await
             .map_err(|error| SbiError::Transport(error.to_string()))?;
 
-        if !response.status().is_success() && response.status().as_u16() != 204 {
-            return Err(SbiError::HttpError(response.status().as_u16()));
+        let status = response.status();
+        // 404: the Individual Application Session Context does not exist on the
+        // PCF. It already removed the session (the usual case after it sent a
+        // termination) or another replica deleted it. That is the state a delete
+        // asks for, so it releases the local entry like a 204; treating it as a
+        // failure would keep every PCF-removed session tracked forever.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::debug!(
+                session_ref,
+                "app session already gone on the PCF (404 on delete)"
+            );
+        } else if !status.is_success() {
+            return Err(SbiError::HttpError(status.as_u16()));
         }
         // Session is gone PCF-side — drop the local tracking entry.
         self.sessions
@@ -868,6 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_posts_to_target_not_base_url() {
+        let _gauge = locked_gauge().await;
         let base = spawn_mock(create_router()).await;
         // Base URL is unroutable; only the per-call target is reachable. If
         // the call ignored `target` it would fail with a transport error.
@@ -892,6 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_none_target_posts_to_base_url() {
+        let _gauge = locked_gauge().await;
         let base = spawn_mock(create_router()).await;
         let client = NpcfClient::new(&base, reqwest::Client::new());
         let created = client
@@ -943,6 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_indirect_posts_to_scp_with_target_apiroot_header() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&scp, reqwest::Client::new())
@@ -967,6 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_direct_sends_no_target_apiroot_header() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let pcf = spawn_mock(capturing_create_router(Arc::clone(&captured))).await;
         // Direct by default.
@@ -1012,6 +1031,7 @@ mod tests {
     /// object keyed by `medCompN`. Guards both reported symptoms at once.
     #[tokio::test]
     async fn create_wire_body_has_asc_req_data_and_med_components_map() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
         let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&pcf, reqwest::Client::new());
@@ -1091,6 +1111,7 @@ mod tests {
     /// `notifUri`), not as a single `{event, notifMethod}`.
     #[tokio::test]
     async fn create_wire_body_carries_the_event_subscription_only_when_given() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
         let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&pcf, reqwest::Client::new());
@@ -1236,10 +1257,29 @@ mod tests {
 
     // --- Delete (TS 29.514 §5.6.2.4: POST {resource}/delete → 204) ---
 
-    /// Router for the app-session leak test: each create mints a unique
-    /// app-session id (so the store can grow), and any `.../{id}/delete` returns
-    /// 204 — the spec-correct create (201 + Location) and custom-delete shapes.
-    fn leak_create_delete_router() -> axum::Router {
+    /// Serialises every test that writes `siphon_sbi_npcf_app_sessions_active`.
+    /// The gauge is process-wide and each client create/delete sets it, so a
+    /// test reading it must not interleave with another test's client. Any test
+    /// that calls `create_app_session` or `delete_app_session` takes this.
+    static APP_SESSION_GAUGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn locked_gauge() -> tokio::sync::MutexGuard<'static, ()> {
+        APP_SESSION_GAUGE.lock().await
+    }
+
+    /// The live `siphon_sbi_npcf_app_sessions_active` value.
+    fn app_sessions_gauge() -> i64 {
+        crate::metrics::try_metrics()
+            .expect("metrics initialised")
+            .sbi_npcf_app_sessions_active
+            .get()
+    }
+
+    /// Router for the app-session leak tests: each create mints a unique
+    /// app-session id (so the store can grow), and any `.../{id}/delete` answers
+    /// `delete_status` — 204 for the spec-correct removal, 404 for a session the
+    /// PCF has already removed.
+    fn leak_create_delete_router(delete_status: axum::http::StatusCode) -> axum::Router {
         use axum::routing::post;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1264,8 +1304,86 @@ mod tests {
             )
             .route(
                 "/npcf-policyauthorization/v1/app-sessions/{id}/delete",
-                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+                post(move || async move { delete_status }),
             )
+    }
+
+    /// Leak guard for the path an `@sbi.on_terminate` handler takes: the PCF has
+    /// already removed the session, so `delete_session(resUri)` is answered 404.
+    /// The session is gone either way, so the store and the gauge MUST drain
+    /// exactly as on a 204, or every PCF-terminated session strands one entry.
+    ///
+    /// The client's store starts empty, so its baseline is `len() == 0` and a
+    /// published gauge of 0 (the gauge holds the publishing client's `len()`).
+    #[tokio::test]
+    async fn app_session_store_drains_when_the_delete_finds_the_session_gone() {
+        crate::metrics::init().ok();
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(axum::http::StatusCode::NOT_FOUND)).await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let request = AppSessionContextReqData::default();
+        let baseline = client.active_app_sessions();
+        assert_eq!(baseline, 0);
+
+        // Created sessions are tracked and published.
+        let mut locations = Vec::new();
+        for _ in 0..50 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            locations.push(created.location.expect("create returns a Location"));
+        }
+        assert_eq!(client.active_app_sessions(), baseline + 50);
+        assert_eq!(app_sessions_gauge(), (baseline + 50) as i64);
+
+        // A 404 on each delete releases the entry like a 204 would.
+        for location in &locations {
+            client
+                .delete_app_session(location)
+                .await
+                .expect("a 404 delete means the session is already gone");
+        }
+        assert_eq!(
+            client.active_app_sessions(),
+            baseline,
+            "store must drain to baseline when the PCF answers 404"
+        );
+        assert_eq!(app_sessions_gauge(), baseline as i64);
+
+        // Repeated create -> 404-delete cycles stay flat.
+        for _ in 0..200 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            let location = created.location.expect("create returns a Location");
+            client.delete_app_session(&location).await.unwrap();
+        }
+        assert_eq!(client.active_app_sessions(), baseline);
+        assert_eq!(app_sessions_gauge(), baseline as i64);
+    }
+
+    /// Only a 404 means "already gone". Any other error answer leaves the
+    /// session on the PCF as far as siphon knows, so it stays tracked and the
+    /// delete reports the failure.
+    #[tokio::test]
+    async fn delete_error_other_than_not_found_keeps_the_session_tracked() {
+        crate::metrics::init().ok();
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let created = client
+            .create_app_session(None, &AppSessionContextReqData::default())
+            .await
+            .unwrap();
+        let location = created.location.expect("create returns a Location");
+
+        let error = client
+            .delete_app_session(&location)
+            .await
+            .expect_err("a 500 delete is a failure");
+
+        assert!(matches!(error, SbiError::HttpError(500)), "{error}");
+        assert_eq!(client.active_app_sessions(), 1);
+        assert_eq!(app_sessions_gauge(), 1);
     }
 
     /// Leak guard for the N5/Npcf app-session registry: `create_session` inserts,
@@ -1276,7 +1394,11 @@ mod tests {
     /// session the P-CSCF guards against). The store IS the leak surface here.
     #[tokio::test]
     async fn app_session_store_drains_on_create_delete() {
-        let base = spawn_mock(leak_create_delete_router()).await;
+        let _gauge = locked_gauge().await;
+        let base = spawn_mock(leak_create_delete_router(
+            axum::http::StatusCode::NO_CONTENT,
+        ))
+        .await;
         let client = NpcfClient::new(&base, reqwest::Client::new());
         let request = AppSessionContextReqData::default();
 
@@ -1341,6 +1463,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_posts_to_delete_subresource_and_accepts_204() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let pcf = spawn_mock(delete_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&pcf, reqwest::Client::new());
@@ -1364,6 +1487,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_indirect_sends_target_apiroot_on_delete_subresource() {
+        let _gauge = locked_gauge().await;
         let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let scp = spawn_mock(delete_router(Arc::clone(&captured))).await;
         let client = NpcfClient::new(&scp, reqwest::Client::new())
