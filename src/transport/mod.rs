@@ -628,14 +628,13 @@ pub struct OutboundMessage {
     /// Further messages that MUST leave after `data`, to the same destination,
     /// without anything interleaving between them.
     ///
-    /// Enqueueing two `OutboundMessage`s back to back does **not** order them on
-    /// UDP: every UDP worker clones the same outbound receiver (flume is MPMC)
-    /// and owns a separate `SO_REUSEPORT` socket, so two messages are routinely
-    /// picked up by two workers and race to `send_to`. Anything that is only
-    /// correct in a specific order — RFC 3515 §2.4.4's `202 Accepted` before the
+    /// Two `OutboundMessage`s enqueued back to back for one destination already
+    /// leave in that order on UDP: [`udp::UdpOutbound`] routes a destination to
+    /// one worker. What that does not rule out is a message from another thread,
+    /// to the same destination, landing between the two. Anything that must be
+    /// adjacent as well as ordered — RFC 3515 §2.4.4's `202 Accepted` before the
     /// first `message/sipfrag` NOTIFY, where the 202 is what tells the referrer
-    /// the implicit subscription exists — must travel as one unit so a single
-    /// worker writes them in sequence.
+    /// the implicit subscription exists — travels as one unit instead.
     ///
     /// `None` on effectively every message, and empty then costs no allocation.
     /// Stream transports preserve order anyway (one distributor task per
@@ -671,12 +670,12 @@ impl OutboundMessage {
 /// to that listener's private channel.  Otherwise it falls back to
 /// the default UDP channel.
 pub struct OutboundRouter {
-    /// Default UDP sender — used for messages without a specific
+    /// Default UDP channels — used for messages without a specific
     /// `source_local_addr` and for any address not in `udp_by_local`.
-    pub udp: flume::Sender<OutboundMessage>,
+    pub udp: udp::UdpOutbound,
     /// Per-listener UDP channels keyed by local socket address.
     /// Populated at server startup; empty in test fixtures.
-    pub udp_by_local: std::collections::HashMap<SocketAddr, flume::Sender<OutboundMessage>>,
+    pub udp_by_local: std::collections::HashMap<SocketAddr, udp::UdpOutbound>,
     pub tcp: flume::Sender<OutboundMessage>,
     pub tls: flume::Sender<OutboundMessage>,
     pub ws: flume::Sender<OutboundMessage>,
@@ -1399,13 +1398,14 @@ mod tests {
         let addr_a = addr("10.0.0.1:5060");
         let addr_b = addr("192.168.1.1:5060");
 
-        let mut udp_by_local = std::collections::HashMap::new();
-        udp_by_local.insert(addr_a, listener_a.0.clone());
-        udp_by_local.insert(addr_b, listener_b.0.clone());
+        let mut udp_by_local: std::collections::HashMap<SocketAddr, udp::UdpOutbound> =
+            std::collections::HashMap::new();
+        udp_by_local.insert(addr_a, listener_a.0.clone().into());
+        udp_by_local.insert(addr_b, listener_b.0.clone().into());
 
         let (dummy, _) = flume::unbounded();
         let router = OutboundRouter {
-            udp: default.0.clone(),
+            udp: default.0.clone().into(),
             udp_by_local,
             tcp: dummy.clone(),
             tls: dummy.clone(),
@@ -1471,16 +1471,17 @@ mod tests {
         let port_uc = addr(&format!("{ue}:6100"));
         let port_us = addr(&format!("{ue}:6101"));
 
-        let mut udp_by_local = std::collections::HashMap::new();
-        udp_by_local.insert(plain_addr, plain.0.clone());
-        udp_by_local.insert(port_uc, protected_client.0.clone());
-        udp_by_local.insert(port_us, protected_server.0.clone());
+        let mut udp_by_local: std::collections::HashMap<SocketAddr, udp::UdpOutbound> =
+            std::collections::HashMap::new();
+        udp_by_local.insert(plain_addr, plain.0.clone().into());
+        udp_by_local.insert(port_uc, protected_client.0.clone().into());
+        udp_by_local.insert(port_us, protected_server.0.clone().into());
 
         let (dummy, _) = flume::unbounded();
         let router = OutboundRouter {
             // The first configured listener's channel doubles as the default —
             // exactly the socket a lost pin would silently fall back to.
-            udp: plain.0.clone(),
+            udp: plain.0.clone().into(),
             udp_by_local,
             tcp: dummy.clone(),
             tls: dummy.clone(),
@@ -1526,7 +1527,7 @@ mod tests {
         let default = flume::unbounded::<OutboundMessage>();
         let (dummy, _) = flume::unbounded();
         let router = OutboundRouter {
-            udp: default.0.clone(),
+            udp: default.0.clone().into(),
             udp_by_local: std::collections::HashMap::new(),
             tcp: dummy.clone(),
             tls: dummy.clone(),

@@ -677,7 +677,7 @@ mod tests {
         let (sctp_tx, sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx,
+            udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,
@@ -1006,7 +1006,7 @@ mod tests {
         let (sctp_tx, _sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx,
+            udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,
@@ -1049,7 +1049,7 @@ mod tests {
         let (sctp_tx, _sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx,
+            udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,
@@ -1279,7 +1279,7 @@ mod tests {
         let (wss_tx, _wss_rx) = flume::unbounded();
         let (sctp_tx, _sctp_rx) = flume::unbounded();
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx,
+            udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,

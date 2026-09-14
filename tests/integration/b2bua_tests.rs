@@ -3047,15 +3047,18 @@ fn soft_ue_router() -> (
     let protected_client = flume::unbounded();
     let protected_server = flume::unbounded();
 
-    let mut udp_by_local = std::collections::HashMap::new();
-    udp_by_local.insert(ue_plain(), plain.0.clone());
-    udp_by_local.insert(ue_port_uc(), protected_client.0.clone());
-    udp_by_local.insert(ue_port_us(), protected_server.0.clone());
+    let mut udp_by_local: std::collections::HashMap<
+        std::net::SocketAddr,
+        siphon::transport::udp::UdpOutbound,
+    > = std::collections::HashMap::new();
+    udp_by_local.insert(ue_plain(), plain.0.clone().into());
+    udp_by_local.insert(ue_port_uc(), protected_client.0.clone().into());
+    udp_by_local.insert(ue_port_us(), protected_server.0.clone().into());
 
     let (dummy, _dummy_rx) = flume::unbounded();
     let router = siphon::transport::OutboundRouter {
         // The default channel is the first-configured listener — the plain one.
-        udp: plain.0.clone(),
+        udp: plain.0.clone().into(),
         udp_by_local,
         tcp: dummy.clone(),
         tls: dummy.clone(),
