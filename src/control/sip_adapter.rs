@@ -227,6 +227,7 @@ fn is_sip_verb(verb: &str) -> bool {
             | "reject_refer"
             | "replace_peer"
             | "route"
+            | "dial"
             | "set_header"
             | "remove_header"
             | "get_header"
@@ -3594,6 +3595,7 @@ mod tests {
             "reject_refer",
             "replace_peer",
             "route",
+            "dial",
             "set_header",
             "remove_header",
             "get_header",
