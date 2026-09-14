@@ -1,0 +1,42 @@
+# siphon for the LCR route-sequence acceptance cases (sipp-b2bua-lcr).
+#
+# Every call asks the mock LCR API (lcr_mock_api.py, serving routes.json) for
+# its carriers. Both routes name the number policy below, so a carrier is sent
+# the caller's +E.164 numbers as plain digits: the B-leg From and To visibly
+# differ from the caller's own, which is what makes a leak of the B-leg
+# identity back to the caller show.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.196"
+
+advertised_address: "172.20.0.196"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_lcr.py"
+  reload: auto
+
+# Bare digits are country-code-first, so +15550100001 and 15550100001 are the
+# same number and the `plain` form of either is 15550100001.
+numbering:
+  country_code: "1"
+  assume: international
+
+number_policies:
+  "carrier-plain@2026":
+    default: plain
+
+lcr:
+  api_url: "http://172.20.0.197:8088/route"
+  timeout_ms: 2000
+  reroute_causes: [408, 500, 502, 503, 504]
+
+b2bua:
+  log_dial: true
+
+log:
+  level: debug

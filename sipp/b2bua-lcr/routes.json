@@ -1,0 +1,17 @@
+{
+  "routes": [
+    {
+      "carrier_id": "carrier-a",
+      "next_hop": "sip:172.20.0.198:5060",
+      "number_policy": "carrier-plain@2026",
+      "timeout_secs": 5
+    },
+    {
+      "carrier_id": "carrier-b",
+      "next_hop": "sip:172.20.0.199:5060",
+      "number_policy": "carrier-plain@2026",
+      "timeout_secs": 10
+    }
+  ],
+  "cache_ttl_secs": 0
+}

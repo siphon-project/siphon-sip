@@ -113,6 +113,59 @@ pub fn b_leg_response_snapshot(
     })
 }
 
+/// The To-tag a B-leg response carries once it is relayed to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayedToTag {
+    /// A provisional keeps the tag it has after its dialog tags are swapped: the
+    /// A-leg's early-dialog tag on an 18x that opened one, none on a plain 180.
+    AsRelayed,
+    /// A final response always carries the A-leg dialog's tag.
+    ALegDialog,
+}
+
+/// Put the caller's own From and To on a B-leg response relayed to it.
+///
+/// RFC 3261 §8.2.6.2: a response's From equals its request's, and its To is the
+/// request's To plus the UAS tag. A relayed response is the B-leg's message, so
+/// until this runs its From is siphon's B-leg identity, shaped for the far side,
+/// and its To is the far side's address, which
+/// [`crate::b2bua::actor::Dialog::rewrite_headers`] leaves in place when it swaps
+/// the tags. Every B-leg response relayed to the caller (provisional, answer,
+/// failure) comes through here, so an early dialog shows the caller one identity
+/// from its first 18x to its final response, and nothing of the far side leaks.
+///
+/// The URIs come from the A-leg's arrival snapshot, not from `invite`: the
+/// stored INVITE is the buffer a handler reshapes for the B-leg
+/// (`call.rewrite_identities()`, `set_from_user`, a route's number policy).
+/// `invite` is only the fallback for a call with no snapshot. A response siphon
+/// builds itself gets the same echo from [`stamp_uas_echo`], which this reuses.
+pub fn echo_caller_identity(
+    response: &mut SipMessage,
+    a_leg: &Leg,
+    invite: &SipMessage,
+    to_tag: RelayedToTag,
+) {
+    let relayed_tag;
+    let tag = match to_tag {
+        RelayedToTag::ALegDialog => a_leg.dialog.local_tag.as_str(),
+        RelayedToTag::AsRelayed => {
+            relayed_tag = response
+                .headers
+                .to()
+                .and_then(|to| crate::sip::headers::nameaddr::NameAddr::parse(to).ok())
+                .and_then(|name_addr| name_addr.tag);
+            // An empty tag adds none, which is what a tagless 180 needs.
+            relayed_tag.as_deref().unwrap_or_default()
+        }
+    };
+    stamp_uas_echo(
+        response,
+        a_leg.stored_from.as_ref().or(invite.headers.from()),
+        a_leg.stored_to.as_ref().or(invite.headers.to()),
+        tag,
+    );
+}
+
 /// Handle a response to a B2BUA B-leg INVITE.
 ///
 /// Returns `false` only when the call the branch named is already gone: a

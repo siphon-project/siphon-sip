@@ -6977,6 +6977,150 @@ services:
     profiles:
       - b2bua-on-failure
 
+  # ── B2BUA LCR route sequence (RFC 3261 §8.2.6.2, §16.7) ────────────────────
+  # One siphon routing every call with call.route() over the carriers a mock LCR
+  # API returns (b2bua-lcr/routes.json), two carriers and a caller.
+  # b2bua-lcr/run_case.sh places one call and grades every party; the carriers
+  # carry assertions of their own and run detached. Both routes name a number
+  # policy, so each carrier is sent the caller's numbers reshaped.
+  #
+  # The mock API runs on the siphon image's own python3.
+  #
+  # IP assignments (.200 and .201 stay unassigned: the B2BUA Path cases register
+  # contacts there that nothing may answer):
+  #   172.20.0.196  siphon-b2bua-lcr
+  #   172.20.0.197  b2bua-lcr-api (mock LCR API)
+  #   172.20.0.198  carrier A (503, no provisional)
+  #   172.20.0.199  carrier B (183, then 404)
+  #   172.20.0.202  caller
+  siphon-b2bua-lcr:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-lcr
+    volumes:
+      - ./b2bua-lcr/siphon-b2bua-lcr.yaml:/etc/siphon/siphon.yaml:ro
+      - ./b2bua-lcr/b2bua_lcr.py:/etc/siphon/scripts/b2bua_lcr.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.196
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-lcr
+
+  b2bua-lcr-api:
+    image: sipp-siphon   # the siphon image, for its python3; no siphon runs here
+    container_name: b2bua-lcr-api
+    volumes:
+      - ./b2bua-lcr:/lcr:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.197
+    entrypoint:
+      - python3
+      - /lcr/lcr_mock_api.py
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    profiles:
+      - b2bua-lcr
+
+  # The caller. run_case.sh names the scenario, and copies the files below out of
+  # the container once it exits: the screen dump holds the caller's per-message
+  # counts, which a scenario cannot branch on.
+  sipp-b2bua-lcr-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-lcr:
+        condition: service_healthy
+      b2bua-lcr-api:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.202
+    entrypoint:
+      - sipp
+      - "172.20.0.196:5060"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+      - -error_file
+      - /tmp/caller-errors.log
+      - -trace_logs
+      - -log_file
+      - /tmp/caller-logs.log
+      - -trace_screen
+      - -screen_file
+      - /tmp/caller-screen.log
+    command:
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_relay_identity_uac.xml
+    profiles:
+      - b2bua-lcr
+
+  # Every carrier runs with -timeout_error: without it a scenario still waiting
+  # for its ACK exits 0 on the global timeout, and passes vacuously.
+  sipp-b2bua-lcr-carrier-a-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-carrier-a-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.198
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_reject_503_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-lcr
+
+  sipp-b2bua-lcr-carrier-b-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-carrier-b-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.199
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_progress_404_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-lcr
+
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   # siphon's CDR file, shared with the assertion one-shot. Removed by

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- LCR route sequence in sipp-b2bua-lcr, carrier B: answers 183 Session
+     Progress, then 404 Not Found half a second later. 404 is no reroute cause
+     and carrier B is the last route, so the 404 ends the call and is relayed
+     to the caller.
+
+     Its responses carry the dialog siphon's B-leg INVITE formed: siphon's
+     B-leg From, and this carrier's own address in To. Neither may reach the
+     caller (b2bua_lcr_relay_identity_uac.xml checks that).
+
+     The INVITE must carry the route's number policy, as for carrier A, and the
+     ACK siphon owes the 404 (RFC 3261 §17.1.1.3) is mandatory. -->
+
+<scenario name="B2BUA LCR carrier B (183, then 404)">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="INVITE sip:15550100002@" search_in="msg" check_it="true" assign_to="shaped_request_uri" />
+      <ereg regexp="&lt;sip:15550100001@" search_in="hdr" header="From:" check_it="true" assign_to="shaped_from" />
+      <ereg regexp="&lt;sip:15550100002@" search_in="hdr" header="To:" check_it="true" assign_to="shaped_to" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagB[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carrier-b@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 404 Not Found
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagB[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000" />
+
+  <Reference variables="shaped_request_uri,shaped_from,shaped_to" />
+
+</scenario>
