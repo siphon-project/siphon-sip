@@ -292,13 +292,14 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // next. "Nobody answered, go to voicemail" is the whole point of the verb,
     // and failing the caller 408 here would take that decision away.
     if state.call_actors.is_control_dial(call_id) {
-        for (cancel_msg, transport, dest, local) in &cancel_targets {
-            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, *local, state);
-        }
+        // Each CANCELled leg stays answerable apart from the call, as on the LCR
+        // ring timeout above: its 487 is owed an ACK (RFC 3261 §17.1.1.3) even if
+        // the controller ends the call first.
         for tx in &handle_txs {
             let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
         }
-        state.call_actors.mark_active_b_legs_cancelled(call_id);
+        let cancelled = state.call_actors.cancel_ringing_branches(call_id);
+        cancel_settled_branches(&cancelled, state);
         if report_control_dial_failure(call_id, 408, "Request Timeout", true, state) {
             return;
         }
