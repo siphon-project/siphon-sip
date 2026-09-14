@@ -8,6 +8,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **`diameter.rx_aar(specific_actions=[...])` subscribes to PCRF event
+  reports.** An AF asks the PCRF to tell it about IP-CAN events by putting
+  Specific-Action AVPs in the AAR (TS 29.214 §5.3.13), and `rx_aar` had no way
+  to send one. So a P-CSCF could not find out that a dedicated bearer failed to
+  come up (`9`, INDICATION_OF_FAILED_RESOURCES_ALLOCATION), was lost (`2`) or
+  was released (`4`). Each int becomes one AVP, and the reports come back as an
+  RAR at `@diameter.on_request`. A value TS 29.214 does not define, including
+  the void 0 and 5, raises `ValueError` naming it. Leave the argument out and
+  no Specific-Action AVP is sent, as before.
 - **`cdr.backends` writes every call record to several sinks at once.** A file
   on the node and delivery to an HTTP collector was a choice before: picking
   `http` gave up the durable copy, and picking `file` gave up delivery, so a
@@ -175,6 +184,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it. siphon also no longer sends a siphon-originated re-INVITE on a call that
   ended while the re-INVITE was being built.
 
+- **The Rx `SpecificAction` enum now has the TS 29.214 values.** `IpCanChange`
+  was 7, which is INDICATION_OF_OUT_OF_CREDIT, and there was a variant on 6
+  for INDICATION_OF_ESTABLISHMENT_OF_BEARER, which TS 29.214 has voided (it was
+  5). An AAR subscribing to IP-CAN changes would have asked the PCRF for
+  out-of-credit reports instead. Out of credit and successful/failed resources
+  allocation (7, 8, 9) were missing, as was everything from 10 up. The unit
+  test checked every variant except the two that were wrong; it now checks all
+  of them, and integer conversion refuses a value TS 29.214 does not define.
+  **No deployed wire behaviour changes:** the enum was only used by an AAR
+  builder nothing called, and no script could send a Specific-Action at all
+  until `rx_aar(specific_actions=...)` above.
+- **AARs from `diameter.rx_aar` now carry Rx-Request-Type and the configured
+  Destination-Host.** The script API built its own AAR next to the crate's
+  `rx::send_aar`, and the two had drifted: the script one never sent the peer's
+  `destination_host`, so a DRA had only the realm to route on, and it sent no
+  Rx-Request-Type. There is one AAR encoder now. Rx-Request-Type is
+  INITIAL_REQUEST, or UPDATE_REQUEST when `session_id` reuses a session
+  (TS 29.214 §4.4.1, §4.4.2), and it goes out without the M-bit. `send_aar` set
+  the M-bit, which table 5.3.1 forbids on this AVP, and a PCRF that does not
+  know the AVP has to reject an AAR carrying it that way (RFC 6733 §4.1)
+  instead of skipping it.
 - **`control.apps[].on_lost` is read.** It parsed and nothing ever looked at it:
   only a per-call value (`call.handover(on_lost=…)`, `originate`'s argument)
   reached a channel, so an operator who set the policy once for the app got the
@@ -284,6 +314,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **Crate embedders: `diameter::rx::SpecificAction::IndicationOfEstablishmentOfBearer`
+  is gone and `SpecificAction::IpCanChange` is now 6.** Code matching on the
+  removed variant, or relying on the old discriminant of `IpCanChange`, has to
+  change. `SpecificAction` also gains the missing TS 29.214 values and
+  `TryFrom<u32>` (an undefined value is `UnknownSpecificAction`), and
+  `rx::encode_aar` is the AAR encoder `rx::send_aar` and `diameter.rx_aar` now
+  share. The Rust crate API is outside the versioning contract, so this ships
+  in a minor; the scripting API only gains the new argument.
 - **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
 
   - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip

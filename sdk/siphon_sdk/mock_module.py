@@ -5393,13 +5393,62 @@ class MockDiameter:
 
     # -- Rx: PCRF integration (P-CSCF) --
 
+    # Specific-Action values (TS 29.214 §5.3.13) by their spec names. 0 and 5
+    # are Void. Same set siphon accepts; anything else is a ValueError there.
+    _RX_SPECIFIC_ACTIONS: dict[int, str] = {
+        1: "CHARGING_CORRELATION_EXCHANGE",
+        2: "INDICATION_OF_LOSS_OF_BEARER",
+        3: "INDICATION_OF_RECOVERY_OF_BEARER",
+        4: "INDICATION_OF_RELEASE_OF_BEARER",
+        6: "IP-CAN_CHANGE",
+        7: "INDICATION_OF_OUT_OF_CREDIT",
+        8: "INDICATION_OF_SUCCESSFUL_RESOURCES_ALLOCATION",
+        9: "INDICATION_OF_FAILED_RESOURCES_ALLOCATION",
+        10: "INDICATION_OF_LIMITED_PCC_DEPLOYMENT",
+        11: "USAGE_REPORT",
+        12: "ACCESS_NETWORK_INFO_REPORT",
+        13: "INDICATION_OF_RECOVERY_FROM_LIMITED_PCC_DEPLOYMENT",
+        14: "INDICATION_OF_ACCESS_NETWORK_INFO_REPORTING_FAILURE",
+        15: "INDICATION_OF_TRANSFER_POLICY_EXPIRED",
+        16: "PLMN_CHANGE",
+        17: "EPS_FALLBACK",
+        18: "INDICATION_OF_REALLOCATION_OF_CREDIT",
+        19: "SUCCESSFUL_QOS_UPDATE",
+        20: "FAILED_QOS_UPDATE",
+        21: "CN_HEALTH_MONITOR",
+    }
+
+    @classmethod
+    def _check_specific_actions(cls, specific_actions: Any) -> None:
+        """Refuse what siphon refuses: TypeError for anything but a list (or
+        tuple) of int, OverflowError for an int past 64 bits, ValueError
+        naming the first value TS 29.214 does not define."""
+        if not isinstance(specific_actions, (list, tuple)):
+            raise TypeError("specific_actions must be a list of int")
+        for value in specific_actions:
+            if not isinstance(value, int):
+                raise TypeError("specific_actions must be a list of int")
+            if not -(2**63) <= value < 2**63:
+                raise OverflowError(f"specific_actions: {value} does not fit a 64-bit int")
+            if value not in cls._RX_SPECIFIC_ACTIONS:
+                raise ValueError(
+                    f"specific_actions: {value} is not a Specific-Action value "
+                    "TS 29.214 §5.3.13 defines (1-4, 6-21)"
+                )
+
     def rx_aar(self, session_id: Optional[str] = None,
                framed_ip: Optional[str] = None,
                framed_ipv6: Union[str, bytes, None] = None,
                media_components: Optional[list] = None,
                af_application_id: str = "IMS Services",
-               subscription_id: Optional[tuple] = None) -> Optional[dict]:
+               subscription_id: Optional[tuple] = None,
+               specific_actions: Optional[list[int]] = None) -> Optional[dict]:
         """Send an Rx AA-Request for QoS resource reservation.
+
+        Without ``session_id`` the AAR is sent as Rx-Request-Type
+        INITIAL_REQUEST; with one it is UPDATE_REQUEST (TS 29.214 §4.4.1,
+        §4.4.2). The Rx peer's configured ``destination_host``, if set, goes
+        out as Destination-Host.
 
         Args:
             session_id: Reuse an existing Rx session ID (modification AAR
@@ -5412,10 +5461,60 @@ class MockDiameter:
                 ``"IMS Services"``).
             subscription_id: Optional ``(data, type)`` tuple identifying
                 the IMS subscriber (RFC 4006 §8.47).
+            specific_actions: Events the PCRF should report back, as ints.
+                Each entry becomes one Specific-Action AVP
+                (TS 29.214 §5.3.13). ``None`` (the default) or ``[]``
+                subscribes to nothing and sends no Specific-Action AVP.
+                Defined values:
+
+                - ``1`` CHARGING_CORRELATION_EXCHANGE
+                - ``2`` INDICATION_OF_LOSS_OF_BEARER
+                - ``3`` INDICATION_OF_RECOVERY_OF_BEARER
+                - ``4`` INDICATION_OF_RELEASE_OF_BEARER
+                - ``6`` IP-CAN_CHANGE
+                - ``7`` INDICATION_OF_OUT_OF_CREDIT
+                - ``8`` INDICATION_OF_SUCCESSFUL_RESOURCES_ALLOCATION
+                - ``9`` INDICATION_OF_FAILED_RESOURCES_ALLOCATION
+                - ``10`` INDICATION_OF_LIMITED_PCC_DEPLOYMENT
+                - ``11`` USAGE_REPORT
+                - ``12`` ACCESS_NETWORK_INFO_REPORT
+                - ``13`` INDICATION_OF_RECOVERY_FROM_LIMITED_PCC_DEPLOYMENT
+                - ``14`` INDICATION_OF_ACCESS_NETWORK_INFO_REPORTING_FAILURE
+                - ``15`` INDICATION_OF_TRANSFER_POLICY_EXPIRED
+                - ``16`` PLMN_CHANGE
+                - ``17`` EPS_FALLBACK
+                - ``18`` INDICATION_OF_REALLOCATION_OF_CREDIT
+                - ``19`` SUCCESSFUL_QOS_UPDATE
+                - ``20`` FAILED_QOS_UPDATE
+                - ``21`` CN_HEALTH_MONITOR
+
+                ``0`` and ``5`` are void in TS 29.214. Most of these only
+                take effect in the initial AAR and then hold for the whole
+                Rx session (ACCESS_NETWORK_INFO_REPORT is one-time and may be
+                repeated), so subscribe on the first call. The PCRF reports
+                each event in an RAR carrying the matching Specific-Action,
+                which reaches ``@diameter.on_request``
+                (``request.command_name == "RAR"``).
 
         Returns:
             Dict with ``result_code`` and ``session_id``, or ``None``.
+
+        Raises:
+            ValueError: A ``specific_actions`` entry is not a defined value;
+                the message names it.
+            TypeError: ``specific_actions`` is not a list of int.
+
+        Example::
+
+            result = diameter.rx_aar(
+                framed_ip=request.source_ip,
+                media_components=components,
+                # loss of bearer, release of bearer, failed allocation
+                specific_actions=[2, 4, 9],
+            )
         """
+        if specific_actions is not None:
+            self._check_specific_actions(specific_actions)
         sid = session_id or f"mock-rx-{len(self._aar_responses) + 1}"
         if sid in self._aar_responses:
             return dict(self._aar_responses[sid])
