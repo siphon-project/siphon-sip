@@ -47,10 +47,132 @@ pub(crate) const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duratio
 /// builder. `server.rs` installs ring as the process default before any
 /// listener starts; the fallback keeps unit tests and library embedders that
 /// never installed one working instead of failing to load a valid key.
-fn crypto_provider() -> Arc<tokio_rustls::rustls::crypto::CryptoProvider> {
+pub(crate) fn crypto_provider() -> Arc<tokio_rustls::rustls::crypto::CryptoProvider> {
     tokio_rustls::rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
+}
+
+/// Build a rustls `ServerConfig` for a plain (non-SNI) HTTPS/WSS listener.
+///
+/// The SIP listener above resolves a certificate per SNI name and so needs the
+/// `CertifiedKey` shape; a management listener serves one identity, which is a
+/// different enough job to be worth its own entry point rather than a second
+/// resolver with one entry in it.
+///
+/// `client_ca` turns on mutual TLS: when set, a client presenting no
+/// certificate, or one no CA in the bundle signed, is refused at the handshake.
+/// An unreadable or empty bundle is an error, never a downgrade to accepting any
+/// client — the same fail-closed rule the rest of this module applies.
+///
+/// `field_prefix` names the config block in every error (`control.tls`, …), so
+/// a failure points at the key the operator has to fix rather than at "TLS".
+pub(crate) fn server_config(
+    certificate_path: &str,
+    private_key_path: &str,
+    client_ca_path: Option<&str>,
+    field_prefix: &str,
+) -> io::Result<tokio_rustls::rustls::ServerConfig> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls;
+
+    let certificates: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(certificate_path)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{field_prefix}.certificate '{certificate_path}': {error}"),
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("parsing {field_prefix}.certificate '{certificate_path}': {error}"),
+                )
+            })?;
+    if certificates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_prefix}.certificate '{certificate_path}' contains no certificates"),
+        ));
+    }
+
+    let key = PrivateKeyDer::from_pem_file(private_key_path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field_prefix}.private_key '{private_key_path}': {error}"),
+        )
+    })?;
+
+    // TLS 1.3 preferred, 1.2 as the floor — the same pair the X1 listener pins.
+    let builder = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{field_prefix}: no usable TLS protocol versions: {error}"),
+            )
+        })?;
+
+    let config = match client_ca_path {
+        Some(ca_path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let authorities: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{field_prefix}.client_ca '{ca_path}': {error}"),
+                    )
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("parsing {field_prefix}.client_ca '{ca_path}': {error}"),
+                    )
+                })?;
+            if authorities.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{field_prefix}.client_ca '{ca_path}' contains no certificates —                          mutual TLS would accept no client at all"
+                    ),
+                ));
+            }
+            for authority in authorities {
+                roots.add(authority).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("adding a CA from {field_prefix}.client_ca '{ca_path}': {error}"),
+                    )
+                })?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                crypto_provider(),
+            )
+            .build()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{field_prefix}: building the client certificate verifier: {error}"),
+                )
+            })?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    config.with_single_cert(certificates, key).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{field_prefix}: certificate and private key do not form a usable pair: {error}"
+            ),
+        )
+    })
 }
 
 /// Load one PEM certificate chain + private key into a rustls `CertifiedKey`.

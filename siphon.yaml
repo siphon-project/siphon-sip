@@ -1931,6 +1931,17 @@ log:
 #     the documented default for multi-pod controllers).
 # control:
 #   listen: "127.0.0.1:9092"        # inbound WebSocket listener (GET /control/ws)
+#   # Terminate TLS on `listen` — the applications then dial wss:// instead of
+#   # ws://. Absent leaves the listener plaintext, which is only safe on
+#   # loopback or a trusted segment: the bearer token is a replayable secret,
+#   # so anything that can read the wire can impersonate the application.
+#   tls:
+#     certificate: "/etc/siphon/control.pem"
+#     private_key: "/etc/siphon/control.key"
+#     # Turns on MUTUAL TLS: an application must also present a certificate one
+#     # of these CAs signed. Worth it for a rail crossing a network — the token
+#     # alone is one secret, and a leaked config file is then not enough.
+#     client_ca: "/etc/siphon/control-clients-ca.pem"
 #   # A parked call is held by the transaction layer's automatic 100 Trying;
 #   # siphon sends no synthesized provisional. The controller sends its own
 #   # ringback/early-media via the `progress` verb if it wants one.
