@@ -173,15 +173,22 @@ fn plain_binding_footprint() {
 #[test]
 fn contact_struct_size() {
     eprintln!("size_of::<Contact>() = {}", std::mem::size_of::<Contact>());
-    // 320 is a jemalloc size class, and `Contact` sits exactly on it. That is
-    // the whole point of the number: one byte over and every binding's
-    // allocation rounds up to the 384 class, so 8 bytes of struct silently
-    // costs 64 bytes of resident memory per contact. A field added here is not
-    // free even when it looks like it fits.
+    // `Contact` sat exactly on the 320-byte jemalloc size class until
+    // `auth_user` (16 bytes) took it to 336. That was paid knowingly: the
+    // binding has to remember which identity authenticated it, or an S-CSCF
+    // cannot tell a protected de-REGISTER from its owner apart from one sent
+    // by another subscriber with an SA of their own. The price is the size
+    // class, not the 16 bytes: a one-binding AoR's allocation now rounds to 384
+    // instead of 320, so 64 bytes of resident memory per such AoR. Getting back
+    // under 320 means folding the rarely-set optional strings (`sip_instance`,
+    // `flow_token`, `auth_user`) behind one box, not dropping the field.
+    //
+    // 384 is the next class boundary, but the ceiling stays at the measured
+    // size so the next field added here is still a deliberate act.
     assert!(
-        std::mem::size_of::<Contact>() <= 320,
-        "Contact is {} bytes — over the 320-byte jemalloc size class, so every \
-         binding's allocation now rounds up to 384",
+        std::mem::size_of::<Contact>() <= 336,
+        "Contact is {} bytes, past the 336 it was measured at; decide whether the \
+         field is worth it before raising this",
         std::mem::size_of::<Contact>()
     );
 }

@@ -714,6 +714,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         }
     }
@@ -1149,6 +1150,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: vec![("+g.3gpp.smsip".to_string(), None)],
+            auth_user: None,
             kind: ContactKind::As,
         };
         let body = build_full_reginfo("sip:alice@ims.example.com", &[as_only], 0, false);

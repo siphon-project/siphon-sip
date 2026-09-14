@@ -300,6 +300,7 @@ impl UeIpsec {
             expires_at: Instant::now(),
             created_at: Instant::now(),
             role: SaRole::Ue,
+            impi: None,
         })
     }
 }

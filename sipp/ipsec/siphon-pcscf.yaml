@@ -4,7 +4,7 @@
 #   siphon --config sipp/ipsec/siphon-pcscf.yaml
 #
 # Then run sipp_ipsec:
-#   sudo sipp 172.20.0.10:5060 \
+#   sudo sipp 172.20.0.35:5060 \
 #     -sf sipp/ipsec/volte_register.xml \
 #     -ipsec -ipsec_aalg hmac-sha-1-96 -ipsec_ealg null \
 #     -s 001010000000001 -key domain ims.test \
@@ -16,8 +16,12 @@
 listen:
   udp:
     - "0.0.0.0:5060"
-    - "0.0.0.0:5064"   # IPsec protected client port
-    - "0.0.0.0:5066"   # IPsec protected server port
+    # The protected ports are bound to the address the UE sends to: siphon
+    # programs it as the P-CSCF side of the IPsec SAs, and the kernel matches
+    # inbound ESP on the packet's real destination, so a 0.0.0.0 bind cannot
+    # be an SA address.
+    - "172.20.0.35:5064"   # IPsec protected client port
+    - "172.20.0.35:5066"   # IPsec protected server port
   tcp:
     - "0.0.0.0:5060"
 

@@ -3364,6 +3364,7 @@ mod tests {
             inbound_connection_id: None,
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         super::super::registrar::PyContact::from_rust_contact(&contact)
     }

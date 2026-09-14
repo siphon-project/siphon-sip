@@ -227,6 +227,14 @@ pub struct Contact {
     /// lookups so an MT INVITE never gets sent to the AS by mistake
     /// (TS 24.229 §5.4.2.1.2).
     pub kind: ContactKind,
+    /// Who the REGISTER that stored this binding authenticated as: its
+    /// `request.auth_user` (the IMPI, in IMS). `None` when it was saved without
+    /// one, and for `save_proxy` caches and AS records. A protected
+    /// re-/de-REGISTER is trusted without a challenge only from this identity
+    /// (`auth.verify_integrity_protected`), so `None` means it is challenged.
+    ///
+    /// `Box<str>` for the same reason as `call_id`.
+    pub auth_user: Option<Box<str>>,
 }
 
 /// Append a binding without letting `Vec` round the capacity up to four.
@@ -823,6 +831,8 @@ impl Registrar {
                 path,
                 flow,
                 params,
+                // A proxy cache of an upstream grant: siphon authenticated nobody.
+                auth_user: None,
             }],
             false,
         )
@@ -1039,6 +1049,21 @@ impl Registrar {
                 .any(|c| !c.is_expired() && c.kind == ContactKind::Ue),
             None => false,
         }
+    }
+
+    /// Whether a live UE binding of `aor` (implicit-set aliases resolved, as in
+    /// [`lookup`](Self::lookup)) was stored by a REGISTER that authenticated as
+    /// `auth_user`. What `auth.verify_integrity_protected` asks before it lets a
+    /// protected re-/de-REGISTER skip the challenge.
+    pub fn is_registered_by(&self, aor: &str, auth_user: &str) -> bool {
+        let primary = self.resolve_alias(aor);
+        self.bindings.get(primary.as_str()).is_some_and(|entry| {
+            entry.value().iter().any(|contact| {
+                contact.kind == ContactKind::Ue
+                    && !contact.is_expired()
+                    && contact.auth_user.as_deref() == Some(auth_user)
+            })
+        })
     }
 
     /// Reverse lookup: non-expired UE-side contacts whose stored **Contact**
@@ -1298,6 +1323,7 @@ impl Registrar {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params,
+            auth_user: None,
             kind: ContactKind::As,
         };
 
@@ -1812,6 +1838,7 @@ impl Registrar {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         };
 
@@ -3127,6 +3154,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         assert!(
@@ -3176,6 +3204,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         // Just registered — remaining should be very close to 3600
@@ -3206,6 +3235,7 @@ mod tests {
                 inbound_local_addr: None,
                 inbound_connection_id: None,
                 params: Vec::new(),
+                auth_user: None,
                 kind: ContactKind::Ue,
             };
             registrar
@@ -3263,6 +3293,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar
@@ -3391,6 +3422,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: Vec::new(),
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar
@@ -4852,6 +4884,7 @@ mod tests {
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(42),
             params: vec![],
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar
@@ -4890,6 +4923,7 @@ mod tests {
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
             params: vec![],
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar
@@ -4930,6 +4964,7 @@ mod tests {
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
             params: vec![],
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar.bindings.entry(aor).or_default().push(stale);
@@ -5023,6 +5058,7 @@ mod tests {
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(1),
             params: vec![],
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         registrar
@@ -5479,6 +5515,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: vec![],
+            auth_user: None,
             kind: ContactKind::Ue,
         };
         let live_as = Contact {
@@ -5499,6 +5536,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: vec![("+g.3gpp.smsip".to_string(), None)],
+            auth_user: None,
             kind: ContactKind::As,
         };
         registrar
@@ -5536,6 +5574,7 @@ mod tests {
             inbound_local_addr: None,
             inbound_connection_id: None,
             params: vec![],
+            auth_user: None,
             kind: ContactKind::As,
         };
         registrar.bindings.entry(aor).or_default().push(as_only);

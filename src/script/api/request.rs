@@ -395,7 +395,7 @@ impl PyRequest {
     /// registrar refresh re-pin (`protected_ue_flow`).  Returns `None` when
     /// the request did not arrive on a configured P-CSCF protected port or no
     /// active SA matches its source `(addr, port)`.
-    fn resolve_protected_sa(&self) -> Option<crate::ipsec::SecurityAssociationPair> {
+    pub(crate) fn resolve_protected_sa(&self) -> Option<crate::ipsec::SecurityAssociationPair> {
         let port = self.local_port?;
         if !super::ipsec::is_protected_local_port(port) {
             return None;
@@ -944,13 +944,10 @@ impl PyRequest {
     /// :func:`siphon.ipsec.allocate`.
     fn parse_security_client(&self) -> PyResult<Vec<super::ipsec::PySecurityOffer>> {
         let message = self.lock()?;
-        match message.headers.get("Security-Client") {
-            Some(value) => Ok(super::ipsec::parse_security_client_multi(
-                value,
-                &self.source_ip,
-            )),
-            None => Ok(Vec::new()),
-        }
+        Ok(super::ipsec::security_offers_for_register(
+            &message.headers,
+            &self.source_ip,
+        ))
     }
 
     /// Whether this request arrived over an IPsec-protected SA.
@@ -2036,6 +2033,7 @@ mod tests {
             inbound_connection_id: None,
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         super::super::registrar::PyContact::from_rust_contact(&contact)
     }

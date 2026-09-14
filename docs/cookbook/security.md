@@ -293,6 +293,21 @@ substantial flow — see [`examples/ims_pcscf.py`](https://github.com/siphon-pro
 and the `ipsec:` config block. The SA lifetime tracks the registration lifetime
 automatically.
 
+A re-REGISTER or de-REGISTER over the SA is not challenged again, and that
+rests on a chain of trust worth knowing. AKA nonces are single-use, so the UE
+cannot reuse its old `Authorization`. Instead the P-CSCF calls
+`auth.stamp_integrity_protected(request)` on every REGISTER it relays, which
+writes `integrity-protected="yes"` into the `Authorization` header only when
+the REGISTER came over an SA negotiated for that header's IMPI, and `"no"`
+otherwise, whatever the UE sent. The S-CSCF calls
+`auth.verify_integrity_protected(request)` before its AKA challenge and skips
+the challenge only when the header says protected and that IMPI is the one
+that registered the To IMPU (`contact.auth_user`). The first check stops a UE
+with a valid SA of its own from claiming another subscriber's IMPI; the second
+stops it de-registering someone else's IMPU. The S-CSCF takes the header on the
+P-CSCF's word, so only use `verify_integrity_protected` behind a P-CSCF that
+stamps every REGISTER.
+
 ## Checklist
 
 - [ ] `security.failed_auth_ban` + `scanner_block` on, infra in `trusted_cidrs`

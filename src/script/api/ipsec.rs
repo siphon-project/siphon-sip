@@ -107,6 +107,10 @@ pub struct PySecurityOffer {
     /// ``request.source_ip`` at parse time.
     #[pyo3(get)]
     pub ue_addr: String,
+    /// IMPI of the REGISTER the offer came on (its first `Authorization`
+    /// username), which `ipsec.allocate` records on the SA. Rust-only: not
+    /// part of the Python surface.
+    pub impi: Option<String>,
 }
 
 impl PySecurityOffer {
@@ -120,6 +124,7 @@ impl PySecurityOffer {
             port_c: client.port_c,
             port_s: client.port_s,
             ue_addr: ue_addr.to_string(),
+            impi: None,
         }
     }
 }
@@ -975,12 +980,14 @@ impl PyIpsec {
         // Pick the P-CSCF local address matching the UE's family.  The four SAs
         // and policies are keyed on (source, destination) of the same family;
         // a v4 P-CSCF address against a v6 UE (or vice-versa) programs a
-        // mixed-family selector the kernel silently never matches — so fail
-        // loudly rather than install a dead SA (3GPP TS 33.203 §7.2).
+        // mixed-family selector the kernel silently never matches, and so does
+        // a wildcard bind address (see `pcscf_sa_addresses`) — so fail loudly
+        // rather than install a dead SA (3GPP TS 33.203 §7.2).
         let pcscf_addr = self.pcscf_addr_for(ue_addr.is_ipv6()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "no {family} P-CSCF listener configured for {family} UE {ue_addr}; \
-                 cannot build a same-family IPsec SA selector (3GPP TS 33.203 §7.2)",
+                "no {family} P-CSCF address for {family} UE {ue_addr}: bind a {family} UDP \
+                 listener to a concrete address (a wildcard bind cannot be an IPsec SA \
+                 selector, and the selector must match the UE's family, 3GPP TS 33.203 §7.2)",
                 family = if ue_addr.is_ipv6() { "IPv6" } else { "IPv4" },
             ))
         })?;
@@ -1029,6 +1036,9 @@ impl PyIpsec {
                 created_at: std::time::Instant::now(),
                 // This namespace is the P-CSCF (network) side.
                 role: crate::ipsec::SaRole::PCscf,
+                // The IMPI the offer's REGISTER authenticated as, which a later
+                // protected REGISTER is checked against before it is trusted.
+                impi: offer.impi.clone(),
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -1248,16 +1258,196 @@ fn split_top_level_commas(value: &str) -> Vec<&str> {
     out
 }
 
+/// `raw` trimmed, with one pair of surrounding double quotes removed.
+fn unquote(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+/// `("Digest", "username=…, realm=…")` from an auth header value.
+fn auth_scheme_and_params(value: &str) -> (&str, &str) {
+    let value = value.trim_start();
+    value.split_once(char::is_whitespace).unwrap_or((value, ""))
+}
+
+/// Read one parameter from an `Authorization`-style header value: the name
+/// matched case-insensitively, the value unquoted.
+///
+/// Splits on top-level commas first, so a `name=` sitting inside another
+/// parameter's quoted value is never taken for the parameter itself.
+pub(crate) fn auth_header_param(value: &str, name: &str) -> Option<String> {
+    let (_, params) = auth_scheme_and_params(value);
+    split_top_level_commas(params)
+        .into_iter()
+        .find_map(|token| {
+            let (key, raw) = token.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| unquote(raw).to_string())
+        })
+}
+
+/// `value` rewritten to carry exactly one `integrity-protected="<protected>"`,
+/// last, whatever `integrity-protected` parameters it had before. Every other
+/// parameter is kept byte-for-byte (quoted commas included) and re-joined with
+/// `", "`, the shape [`strip_ck_ik`] produces.
+pub(crate) fn with_integrity_protected(value: &str, protected: &str) -> String {
+    let (scheme, params) = auth_scheme_and_params(value);
+    let stamp = format!("integrity-protected=\"{protected}\"");
+    let mut kept: Vec<&str> = split_top_level_commas(params)
+        .into_iter()
+        .map(str::trim)
+        .filter(|token| {
+            let name = token.split_once('=').map_or(*token, |(name, _)| name);
+            !token.is_empty() && !name.trim().eq_ignore_ascii_case("integrity-protected")
+        })
+        .collect();
+    kept.push(&stamp);
+    format!("{scheme} {}", kept.join(", "))
+}
+
+/// The `Security-Client` offers of a REGISTER, each tagged with the IMPI the
+/// REGISTER authenticates as (its first `Authorization` username), which
+/// `ipsec.allocate` records on the SA.
+pub(crate) fn security_offers_for_register(
+    headers: &crate::sip::headers::SipHeaders,
+    ue_addr: &str,
+) -> Vec<PySecurityOffer> {
+    let Some(value) = headers.get("Security-Client") else {
+        return Vec::new();
+    };
+    let impi = headers
+        .get("Authorization")
+        .and_then(|authorization| auth_header_param(authorization, "username"));
+    let mut offers = parse_security_client_multi(value, ue_addr);
+    for offer in &mut offers {
+        offer.impi.clone_from(&impi);
+    }
+    offers
+}
+
+/// The `integrity-protected` value a P-CSCF owes one `Authorization` header
+/// (3GPP TS 24.229).
+///
+/// `"yes"` only when the request came over an SA *and* that SA was negotiated
+/// for this header's IMPI. Without the second half, a UE holding a valid SA of
+/// its own could claim protection under another subscriber's private identity.
+/// An SA with no recorded IMPI matches nobody.
+pub(crate) fn integrity_protected_for(
+    sa: Option<&SecurityAssociationPair>,
+    username: Option<&str>,
+) -> &'static str {
+    match (sa.and_then(|sa| sa.impi.as_deref()), username) {
+        (Some(impi), Some(username)) if impi == username => "yes",
+        _ => "no",
+    }
+}
+
+/// `auth.stamp_integrity_protected`: stamp every `Authorization` header of a
+/// REGISTER the P-CSCF is about to relay, overwriting whatever the UE sent.
+///
+/// Returns the value stamped on the first header, or `None`, changing
+/// nothing, when the request has no `Authorization`.
+pub(crate) fn stamp_integrity_protected(
+    request: &super::request::PyRequest,
+) -> PyResult<Option<&'static str>> {
+    let sa = request.resolve_protected_sa();
+    let message = request.message();
+    let mut message = message.lock().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+    })?;
+    let Some(values) = message
+        .headers
+        .get_all("Authorization")
+        .filter(|values| !values.is_empty())
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let mut first = None;
+    let mut stamped = Vec::with_capacity(values.len());
+    for value in &values {
+        let username = auth_header_param(value, "username");
+        let protected = integrity_protected_for(sa.as_ref(), username.as_deref());
+        first.get_or_insert(protected);
+        stamped.push(with_integrity_protected(value, protected));
+    }
+    message.headers.set_all("Authorization", stamped);
+    debug!(
+        protected = ?first,
+        over_sa = sa.is_some(),
+        headers = values.len(),
+        "auth.stamp_integrity_protected"
+    );
+    Ok(first)
+}
+
+/// `integrity-protected` values meaning the P-CSCF received the REGISTER over a
+/// security association (3GPP TS 24.229).
+const PROTECTED_VALUES: [&str; 3] = ["yes", "tls-yes", "ip-assoc-yes"];
+
+/// `auth.verify_integrity_protected`: whether an S-CSCF may accept this
+/// re-/de-REGISTER without challenging it again.
+///
+/// True only when the first `Authorization` header carrying
+/// `integrity-protected` says protected *and* its username is the identity that
+/// authenticated a live binding of the To AoR. The first half is the P-CSCF's
+/// word; the second stops a UE with its own SA and IMPI from re-registering or
+/// de-registering somebody else's public identity. On true `request.auth_user`
+/// is set to that username; otherwise nothing changes.
+pub(crate) fn verify_integrity_protected(
+    request: &mut super::request::PyRequest,
+    registrar: Option<&crate::registrar::Registrar>,
+) -> PyResult<bool> {
+    let Some(registrar) = registrar else {
+        return Ok(false);
+    };
+    let (aor, username) = {
+        let message = request.message();
+        let message = message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let Some((header, protected)) =
+            message.headers.get_all("Authorization").and_then(|values| {
+                values.iter().find_map(|value| {
+                    auth_header_param(value, "integrity-protected").map(|found| (value, found))
+                })
+            })
+        else {
+            return Ok(false);
+        };
+        if !PROTECTED_VALUES.contains(&protected.as_str()) {
+            return Ok(false);
+        }
+        let (Some(username), Ok(aor)) = (
+            auth_header_param(header, "username").filter(|username| !username.is_empty()),
+            super::registrar::extract_aor(&message),
+        ) else {
+            return Ok(false);
+        };
+        (aor, username)
+    };
+    if !registrar.is_registered_by(&aor, &username) {
+        debug!(
+            aor = %aor.escape_debug(),
+            username = %username.escape_debug(),
+            "auth.verify_integrity_protected: not the identity that registered this AoR"
+        );
+        return Ok(false);
+    }
+    request.set_auth_user(username);
+    Ok(true)
+}
+
 /// Parse ``"hex…"`` or ``hex…`` into a 16-byte array.  Returns ``None``
 /// for any length other than 16 bytes (32 hex chars) — IMS-AKA AVs are
 /// always 128-bit.
 fn parse_hex_param(raw: &str) -> Option<[u8; 16]> {
-    let trimmed = raw.trim();
-    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
+    let unquoted = unquote(raw);
     if unquoted.len() != 32 {
         return None;
     }
@@ -1370,6 +1560,7 @@ mod tests {
                 port_c: 5060,
                 port_s: 5062,
                 ue_addr: "198.51.100.2".into(),
+                impi: None,
             };
             assert!(
                 transform.compatible_with(&offer),
@@ -1558,6 +1749,7 @@ mod tests {
             port_c: 3,
             port_s: 4,
             ue_addr: "10.0.0.1".into(),
+            impi: None,
         };
         assert!(PyTransform::HmacSha1_96Null.compatible_with(&offer));
         assert!(!PyTransform::HmacMd5_96Null.compatible_with(&offer));
@@ -1574,6 +1766,7 @@ mod tests {
             port_c: 3,
             port_s: 4,
             ue_addr: "10.0.0.1".into(),
+            impi: None,
         };
         assert!(PyTransform::HmacSha1_96Null.compatible_with(&offer));
     }
@@ -1723,6 +1916,7 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1777,6 +1971,7 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1827,6 +2022,7 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1867,10 +2063,239 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         };
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
         assert!(handle.__repr__().contains("protocol=\"tcp\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization parameters and integrity-protected (3GPP TS 24.229)
+    // -----------------------------------------------------------------------
+
+    const IMPI: &str = "001010000000001@ims.example.com";
+    const OTHER_IMPI: &str = "001010000000002@ims.example.com";
+
+    /// A REGISTER from the UE carrying one `Authorization` header per value.
+    fn register_with_authorization(values: &[&str]) -> super::super::request::PyRequest {
+        let message = crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Register,
+                crate::sip::uri::SipUri::new("ims.example.com".to_string()),
+            )
+            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-integrity".to_string())
+            .to("<sip:001010000000001@ims.example.com>".to_string())
+            .from("<sip:001010000000001@ims.example.com>;tag=integrity".to_string())
+            .call_id("integrity@192.0.2.10".to_string())
+            .cseq("2 REGISTER".to_string())
+            .content_length(0)
+            .build()
+            .expect("register builds");
+        let request = super::super::request::PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "192.0.2.10".to_string(),
+            5060,
+        );
+        {
+            let message = request.message();
+            let mut guard = message.lock().expect("lock");
+            for value in values {
+                guard.headers.add("Authorization", value.to_string());
+            }
+        }
+        request
+    }
+
+    fn authorization_values(request: &super::super::request::PyRequest) -> Vec<String> {
+        let message = request.message();
+        let guard = message.lock().expect("lock");
+        guard
+            .headers
+            .get_all("Authorization")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn auth_header_param_reads_quoted_bare_and_any_case() {
+        let value =
+            "Digest username=\"001010000000001@ims.example.com\", realm=ims.example.com, NC=00000001";
+        assert_eq!(auth_header_param(value, "username").as_deref(), Some(IMPI));
+        assert_eq!(auth_header_param(value, "USERNAME").as_deref(), Some(IMPI));
+        assert_eq!(
+            auth_header_param(value, "realm").as_deref(),
+            Some("ims.example.com")
+        );
+        assert_eq!(auth_header_param(value, "nc").as_deref(), Some("00000001"));
+        assert_eq!(auth_header_param(value, "nonce"), None);
+    }
+
+    /// The first `username=` in the text sits inside the realm's quoted value.
+    /// A substring scan would pick it up, and the P-CSCF would then judge
+    /// protection against an identity the UE never authenticated as.
+    #[test]
+    fn auth_header_param_ignores_a_name_inside_a_quoted_value() {
+        let value = "Digest realm=\"ims.example.com, username=victim, integrity-protected=yes\", \
+                     username=\"001010000000001@ims.example.com\"";
+        assert_eq!(auth_header_param(value, "username").as_deref(), Some(IMPI));
+        assert_eq!(auth_header_param(value, "integrity-protected"), None);
+    }
+
+    #[test]
+    fn with_integrity_protected_leaves_exactly_one_value() {
+        for input in [
+            "Digest username=\"a\", integrity-protected=\"yes\"",
+            "Digest integrity-protected=yes, username=\"a\", Integrity-Protected=\"tls-yes\"",
+            "Digest integrity-protected, username=\"a\"",
+            "Digest username=\"a\"",
+        ] {
+            let stamped = with_integrity_protected(input, "no");
+            assert_eq!(
+                stamped
+                    .to_ascii_lowercase()
+                    .matches("integrity-protected")
+                    .count(),
+                1,
+                "{stamped}"
+            );
+            assert_eq!(
+                auth_header_param(&stamped, "integrity-protected").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                auth_header_param(&stamped, "username").as_deref(),
+                Some("a")
+            );
+        }
+        assert_eq!(
+            with_integrity_protected("Digest", "yes"),
+            "Digest integrity-protected=\"yes\""
+        );
+    }
+
+    #[test]
+    fn with_integrity_protected_keeps_the_other_parameters_byte_for_byte() {
+        let value = "Digest username=\"001010000000001@ims.example.com\", \
+                     realm=\"ims.example.com, second\", nonce=\"dGVzdA==\", \
+                     uri=\"sip:ims.example.com\", response=\"0123abcd\", \
+                     algorithm=AKAv1-MD5, integrity-protected=\"yes\"";
+        assert_eq!(
+            with_integrity_protected(value, "no"),
+            "Digest username=\"001010000000001@ims.example.com\", \
+             realm=\"ims.example.com, second\", nonce=\"dGVzdA==\", \
+             uri=\"sip:ims.example.com\", response=\"0123abcd\", \
+             algorithm=AKAv1-MD5, integrity-protected=\"no\""
+        );
+    }
+
+    /// Both ways a P-CSCF could say "yes" wrongly: no SA at all, and an SA
+    /// negotiated for a different private identity than the header claims.
+    #[test]
+    fn integrity_protected_is_yes_only_over_an_sa_for_the_same_impi() {
+        let mut sa = ipsec_test_sa();
+        sa.impi = Some(IMPI.to_string());
+        assert_eq!(integrity_protected_for(Some(&sa), Some(IMPI)), "yes");
+        assert_eq!(integrity_protected_for(Some(&sa), Some(OTHER_IMPI)), "no");
+        assert_eq!(integrity_protected_for(Some(&sa), None), "no");
+        assert_eq!(integrity_protected_for(None, Some(IMPI)), "no");
+        sa.impi = None;
+        assert_eq!(
+            integrity_protected_for(Some(&sa), Some(IMPI)),
+            "no",
+            "an SA with no recorded IMPI matches nobody"
+        );
+    }
+
+    #[test]
+    fn stamp_without_authorization_returns_none_and_adds_nothing() {
+        let request = register_with_authorization(&[]);
+        assert_eq!(
+            stamp_integrity_protected(&request).expect("stamp runs"),
+            None
+        );
+        assert!(authorization_values(&request).is_empty());
+    }
+
+    #[test]
+    fn stamp_overwrites_a_forged_yes_on_an_unprotected_request() {
+        let forged = format!(
+            "Digest username=\"{IMPI}\", realm=\"ims.example.com\", integrity-protected=\"yes\""
+        );
+        let request = register_with_authorization(&[&forged]);
+
+        assert_eq!(
+            stamp_integrity_protected(&request).expect("stamp runs"),
+            Some("no")
+        );
+
+        let values = authorization_values(&request);
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0]
+                .to_ascii_lowercase()
+                .matches("integrity-protected")
+                .count(),
+            1
+        );
+        assert_eq!(
+            auth_header_param(&values[0], "integrity-protected").as_deref(),
+            Some("no")
+        );
+    }
+
+    #[test]
+    fn stamp_rewrites_every_authorization_header() {
+        let first = format!("Digest username=\"{IMPI}\", realm=\"ims.example.com\"");
+        let second = format!(
+            "Digest username=\"{OTHER_IMPI}\", realm=\"other.example.com\", integrity-protected=yes"
+        );
+        let request = register_with_authorization(&[&first, &second]);
+
+        assert_eq!(
+            stamp_integrity_protected(&request).expect("stamp runs"),
+            Some("no")
+        );
+
+        let values = authorization_values(&request);
+        assert_eq!(values.len(), 2);
+        for (value, username) in values.iter().zip([IMPI, OTHER_IMPI]) {
+            assert_eq!(
+                auth_header_param(value, "integrity-protected").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                auth_header_param(value, "username").as_deref(),
+                Some(username)
+            );
+        }
+    }
+
+    /// The offer is where `ipsec.allocate` learns which IMPI the SA is for, so
+    /// it has to carry the REGISTER's own `username`, read quote-aware.
+    #[test]
+    fn security_client_offers_carry_the_impi_of_the_register() {
+        let security_client =
+            "ipsec-3gpp;alg=hmac-sha-1-96;spi-c=1000;spi-s=1001;port-c=50000;port-s=50001";
+        let request = register_with_authorization(&[]);
+        let message = request.message();
+        let mut guard = message.lock().expect("lock");
+        guard
+            .headers
+            .add("Security-Client", security_client.to_string());
+        let unauthenticated = security_offers_for_register(&guard.headers, "192.0.2.10");
+        assert_eq!(unauthenticated.len(), 1);
+        assert_eq!(unauthenticated[0].impi, None);
+
+        guard.headers.add(
+            "Authorization",
+            format!("Digest realm=\"username=victim\", username=\"{IMPI}\", nonce=\"\""),
+        );
+        let offers = security_offers_for_register(&guard.headers, "192.0.2.10");
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].impi.as_deref(), Some(IMPI));
+        assert_eq!(offers[0].port_c, 50000);
     }
 
     fn ipsec_test_sa() -> SecurityAssociationPair {
@@ -1894,6 +2319,7 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         }
     }
 }

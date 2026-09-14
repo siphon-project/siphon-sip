@@ -9,7 +9,10 @@ Flow (3GPP TS 33.203 / TS 24.229):
      containing ck=/ik=
   3. P-CSCF strips ck=/ik= from the relayed 401, allocates IPsec SAs, injects
      Security-Server, forwards 401 to UE
-  4. UE establishes IPsec SAs, re-sends REGISTER over protected ports
+  4. UE establishes IPsec SAs, re-sends REGISTER over protected ports; the
+     P-CSCF stamps integrity-protected="yes" into its Authorization header
+     (the SA was negotiated for that IMPI) and "no" on any other REGISTER, so
+     the S-CSCF can accept a protected re-/de-REGISTER without a new challenge
   5. P-CSCF activates the SAs on the 200 OK from S-CSCF
   6. Subsequent requests flow over IPsec-protected ports
 
@@ -34,7 +37,7 @@ Config: examples/ims_pcscf.yaml
 """
 import secrets
 
-from siphon import proxy, registrar, ipsec, diameter, qos, cache, log, Transform
+from siphon import proxy, registrar, ipsec, auth, diameter, qos, cache, log, Transform
 
 REALM = "ims.example.com"
 PCSCF_URI = f"sip:{REALM};lr"
@@ -171,6 +174,18 @@ async def handle_register(request):
     # Route (3GPP TS 24.229 §5.1.1.2); consume it so relay() forwards to the
     # home domain (S-CSCF) instead of looping back to us. No-op when absent.
     request.loose_route()
+
+    # Tell the S-CSCF whether this REGISTER came over the UE's IPsec SA
+    # (TS 24.229): "yes" only over an SA negotiated for this IMPI, "no"
+    # otherwise, replacing whatever the UE sent. The S-CSCF accepts a
+    # protected re-/de-REGISTER without a new AKA challenge on the strength of
+    # it, so it must be written on every REGISTER, never passed through.
+    protected = auth.stamp_integrity_protected(request)
+    if protected is not None:
+        log.info(
+            f"REGISTER {request.call_id} cseq={request.cseq[0]}: "
+            f"integrity-protected={protected} matched_sa={request.matched_sa is not None}"
+        )
 
     # Relay to S-CSCF.  The 401 flow-back is handled by handle_register_reply.
     request.record_route()

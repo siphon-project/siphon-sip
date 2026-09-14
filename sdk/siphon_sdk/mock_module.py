@@ -1305,6 +1305,59 @@ def _header_values(request: Any, name: str) -> list[str]:
     return []
 
 
+# ``integrity-protected`` values meaning the P-CSCF received the REGISTER over
+# a security association (3GPP TS 24.229).  Mirrors the engine.
+_PROTECTED_VALUES = ("yes", "tls-yes", "ip-assoc-yes")
+
+
+def _auth_scheme_and_params(value: str) -> tuple[str, str]:
+    """``("Digest", "username=..., realm=...")`` from an auth header value."""
+    parts = str(value).strip().split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0], parts[1] if len(parts) > 1 else ""
+
+
+def _auth_param(value: str, name: str) -> Optional[str]:
+    """One parameter of an ``Authorization``-style header, unquoted.
+
+    Splits on top-level commas first, as the engine does, so a ``name=`` that
+    sits inside another parameter's quoted value never matches.
+    """
+    _, params = _auth_scheme_and_params(value)
+    for token in _split_outside_quotes(params, ","):
+        key, separator, raw = token.partition("=")
+        if separator and key.strip().lower() == name.lower():
+            raw = raw.strip()
+            if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"'):
+                raw = raw[1:-1]
+            return raw
+    return None
+
+
+def _with_integrity_protected(value: str, protected: str) -> str:
+    """``value`` carrying exactly one ``integrity-protected="<protected>"``."""
+    scheme, params = _auth_scheme_and_params(value)
+    kept = [
+        token.strip()
+        for token in _split_outside_quotes(params, ",")
+        if token.strip()
+        and token.partition("=")[0].strip().lower() != "integrity-protected"
+    ]
+    kept.append(f'integrity-protected="{protected}"')
+    return f"{scheme} {', '.join(kept)}"
+
+
+def _replace_header_values(request: Any, name: str, values: list[str]) -> None:
+    """Replace every value of a request header, keeping its spelling."""
+    headers = getattr(request, "_headers", None)
+    if isinstance(headers, dict):
+        key = next((held for held in headers if held.lower() == name.lower()), name)
+        headers[key] = list(values) if len(values) > 1 else values[0]
+        return
+    request.set_header(name, values[0])
+
+
 def _split_outside_quotes(value: str, separator: str) -> list[str]:
     """Split on ``separator`` wherever it is not inside ``"..."`` or ``<...>``."""
     parts: list[str] = []
@@ -1654,6 +1707,9 @@ class MockRegistrar:
                 received=_received_of(request),
                 params=params,
                 _sip_instance=instance,
+                # Whoever authenticated this REGISTER, and nobody else: no
+                # carry-over from the binding it replaces, as in the engine.
+                auth_user=getattr(request, "auth_user", None),
             )
             if flow_token is not None:
                 binding.flow_token = flow_token
@@ -1813,6 +1869,17 @@ class MockRegistrar:
         if aliases:
             self.set_associated_uris(aor, list(aliases))
         return True
+
+    def _is_registered_by(self, uri: str, auth_user: str) -> bool:
+        """Whether a live UE binding of ``uri`` was saved by ``auth_user``.
+
+        Mirrors the engine's ``Registrar::is_registered_by``, which
+        ``auth.verify_integrity_protected`` consults.
+        """
+        return any(
+            binding.auth_user == auth_user and binding.expires > 0
+            for binding in self.lookup(uri)
+        )
 
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
         """Look up routable contacts for an address-of-record.
@@ -2552,8 +2619,12 @@ class MockAuth:
 
         Uses locally-configured K/OP/AMF credentials (from ``auth.aka_credentials``
         in siphon.yaml) to generate AKA authentication vectors — no Diameter HSS
-        connection needed. The nonce contains base64(RAND || AUTN) per 3GPP TS 33.203,
-        and CK/IK are derived for IPsec SA creation.
+        connection needed. The nonce contains base64(RAND || AUTN) per 3GPP TS 33.203.
+
+        The 401 carries ``ck=`` and ``ik=`` in ``WWW-Authenticate``, exactly as
+        the HSS path does, so a P-CSCF in front can set up the IPsec SAs.  That
+        P-CSCF must strip them with ``reply.take_av()`` before relaying the 401
+        to the UE.
 
         Example::
 
@@ -2569,6 +2640,113 @@ class MockAuth:
         """
         self._reject_call_target(request, "require_aka_digest")
         return self.require_www_digest(request, realm=realm)
+
+    def stamp_integrity_protected(self, request: Any) -> Optional[str]:
+        """P-CSCF: stamp ``integrity-protected`` into every ``Authorization`` header.
+
+        3GPP TS 24.229 has the P-CSCF tell the S-CSCF whether a REGISTER came
+        in over the IPsec SA it set up with the UE, by writing
+        ``integrity-protected`` into the ``Authorization`` header.  The S-CSCF
+        then accepts a protected re-/de-REGISTER of a registered user without
+        a new AKA challenge (:meth:`verify_integrity_protected`).  So the
+        P-CSCF writes it on every REGISTER, overwriting whatever the UE sent:
+        a ``"yes"`` the UE forged is replaced, never passed through.
+
+        Each header gets ``"yes"`` only when the request arrived over an SA
+        (:attr:`Request.matched_sa`) **and** that SA was negotiated for the
+        header's ``username``, i.e. the private identity (IMPI) of the
+        REGISTER whose 401 keyed the SA.  Anything else gets ``"no"``.  The
+        IMPI check is what stops a UE holding a valid SA of its own from
+        claiming protection under another subscriber's IMPI.  Every other
+        parameter of the header is kept as it was.
+
+        Call it on every REGISTER, before relaying it::
+
+            @proxy.on_request("REGISTER")
+            def handle_register(request):
+                ...
+                auth.stamp_integrity_protected(request)
+                request.relay()
+
+        A REGISTER with no ``Authorization`` header is left alone.
+
+        Args:
+            request: The REGISTER ``Request``.
+
+        Returns:
+            ``"yes"`` or ``"no"`` as stamped on the first ``Authorization``
+            header, or ``None`` when the request has none.
+        """
+        self._reject_call_target(request, "stamp_integrity_protected")
+        values = _header_values(request, "Authorization")
+        if not values:
+            return None
+        matched = getattr(request, "matched_sa", None)
+        sa_impi = getattr(matched, "impi", None) if matched is not None else None
+        decisions = []
+        stamped = []
+        for value in values:
+            username = _auth_param(value, "username")
+            protected = "yes" if sa_impi is not None and sa_impi == username else "no"
+            decisions.append(protected)
+            stamped.append(_with_integrity_protected(value, protected))
+        _replace_header_values(request, "Authorization", stamped)
+        return decisions[0]
+
+    def verify_integrity_protected(self, request: Any) -> bool:
+        """S-CSCF: accept a protected re-/de-REGISTER without challenging it again.
+
+        The counterpart of :meth:`stamp_integrity_protected`.  3GPP TS 24.229
+        lets the S-CSCF skip the AKA challenge on a re-REGISTER or
+        de-REGISTER the P-CSCF received over the UE's IPsec SA.  Returns
+        ``True`` only when both of these hold:
+
+        - the first ``Authorization`` header carrying ``integrity-protected``
+          says ``"yes"``, ``"tls-yes"`` or ``"ip-assoc-yes"``, and
+        - that header's ``username`` is the identity that authenticated a
+          live binding of the ``To`` AoR (:attr:`Contact.auth_user`, with
+          implicit-set aliases resolved the way ``registrar.lookup`` does).
+
+        The second check is what stops a UE with its own SA and its own IMPI
+        from re-registering or de-registering someone else's public identity.
+        The first is only as good as the P-CSCF in front, so use this behind a
+        P-CSCF that always stamps the header.
+
+        On ``True`` it sets ``request.auth_user`` to that username, so the rest
+        of the handler reads it exactly as after a digest check.  On ``False``
+        nothing changes, and the handler falls back to the challenge::
+
+            @proxy.on_request("REGISTER")
+            def handle_register(request):
+                if not auth.verify_integrity_protected(request):
+                    if not auth.require_aka_digest(request, realm=REALM):
+                        return
+                registrar.save(request)
+
+        An initial REGISTER never passes: there is no binding for its IMPI
+        yet, so it is challenged.  Neither does one whose binding was saved
+        without an authenticated user.
+
+        Args:
+            request: The REGISTER ``Request``.
+
+        Returns:
+            ``True`` when the REGISTER may be accepted without a challenge.
+        """
+        self._reject_call_target(request, "verify_integrity_protected")
+        for value in _header_values(request, "Authorization"):
+            protected = _auth_param(value, "integrity-protected")
+            if protected is None:
+                continue
+            username = _auth_param(value, "username")
+            to_uri = getattr(request, "to_uri", None)
+            if protected not in _PROTECTED_VALUES or not username or to_uri is None:
+                return False
+            if not _registrar._is_registered_by(str(to_uri), username):
+                return False
+            request.auth_user = username
+            return True
+        return False
 
     @staticmethod
     def _reject_call_target(target: Any, method: str) -> None:
@@ -8337,6 +8515,11 @@ class MockSAHandle:
     """Mock :class:`SAHandle` — read-only view of an active SA returned by
     ``request.matched_sa``.  Tests can construct one directly and assign
     it to ``request._matched_sa``.
+
+    ``impi`` is a test double for what the engine keeps on the SA but does not
+    expose to scripts: the private identity (the ``Authorization`` username of
+    the REGISTER whose challenge keyed the SA).  :meth:`MockAuth.stamp_integrity_protected`
+    reads it the way the engine does; ``None`` never counts as a match.
     """
 
     def __init__(self, ue_addr: str = "10.0.0.1", pcscf_addr: str = "10.0.0.10",
@@ -8345,7 +8528,8 @@ class MockSAHandle:
                  spi_uc: int = 1000, spi_us: int = 1001,
                  spi_pc: int = 10000, spi_ps: int = 10001,
                  alg: str = "HMAC-SHA-1-96", ealg: str = "NULL",
-                 protocol: str = "udp") -> None:
+                 protocol: str = "udp", impi: Optional[str] = None) -> None:
+        self.impi = impi
         self.ue_addr = ue_addr
         self.pcscf_addr = pcscf_addr
         self.ue_port_c = ue_port_c

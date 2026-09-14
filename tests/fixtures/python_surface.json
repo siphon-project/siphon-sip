@@ -64,6 +64,11 @@
         "kind": "method_descriptor",
         "sig": "($self, target, realm=None, password=None, ha1=None)"
       },
+      "stamp_integrity_protected": {
+        "doc": "P-CSCF: stamp `integrity-protected` into every Authorization header.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
+      },
       "validate_nonce": {
         "doc": "Whether `nonce` is one this engine minted and still accepts.",
         "kind": "method_descriptor",
@@ -73,6 +78,11 @@
         "doc": "Verify credentials without sending a challenge.",
         "kind": "method_descriptor",
         "sig": "($self, target, realm=None, password=None, ha1=None)"
+      },
+      "verify_integrity_protected": {
+        "doc": "S-CSCF: accept a protected re-/de-REGISTER without a new challenge.",
+        "kind": "method_descriptor",
+        "sig": "($self, request)"
       }
     },
     "AuthVectorHandle": {},
@@ -439,6 +449,10 @@
     "Contact": {
       "age_secs": {
         "doc": "Seconds since this binding was created or last refreshed.",
+        "kind": "getset_descriptor"
+      },
+      "auth_user": {
+        "doc": "Identity the REGISTER that stored this binding authenticated as: its",
         "kind": "getset_descriptor"
       },
       "expires": {

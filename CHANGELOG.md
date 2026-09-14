@@ -8,6 +8,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **`auth.stamp_integrity_protected()` and `auth.verify_integrity_protected()`
+  let an S-CSCF accept a protected re-/de-REGISTER without a new AKA
+  challenge (3GPP TS 24.229).** AKA nonces are single-use, so a UE that
+  re-registers or de-registers over its IPsec SA cannot reuse the
+  `Authorization` it answered the 401 with, and was challenged again. A P-CSCF
+  now calls `stamp_integrity_protected(request)` on every REGISTER before
+  relaying it: each `Authorization` header gets `integrity-protected="yes"`
+  only when the REGISTER came over an SA negotiated for that header's
+  `username`, and `"no"` otherwise, replacing whatever the UE sent. An S-CSCF
+  calls `verify_integrity_protected(request)` before its challenge: `True`, with
+  `request.auth_user` set, only when the header says `yes`, `tls-yes` or
+  `ip-assoc-yes` and its `username` is the identity that authenticated a live
+  binding of the To AoR (implicit-set aliases resolved). Both identity checks
+  are there on purpose. Without the P-CSCF's, a UE holding a valid SA of its
+  own could claim protection under another IMPI. Without the S-CSCF's, a UE
+  with its own SA and IMPI could re-register or de-register someone else's
+  IMPU. `examples/ims_pcscf.py`, `ims_scscf.py` and `ims_scscf_aka_lab.py`
+  use the pair, and the SDK mocks both.
+- **`contact.auth_user`: the identity that authenticated the REGISTER which
+  stored a binding.** `registrar.save()` records `request.auth_user` on each
+  binding, from that REGISTER only. A save with no authenticated user records
+  `None` instead of inheriting the replaced binding's, so the next protected
+  refresh is challenged; `save_proxy()` caches record `None`. It is persisted
+  with the binding, and backend rows written before it load as `None`. The
+  IPsec SA pair likewise records the IMPI of the REGISTER whose 401 keyed it,
+  which is what `stamp_integrity_protected()` compares against; that one is not
+  exposed to scripts.
 - **`diameter.rx_aar(specific_actions=[...])` subscribes to PCRF event
   reports.** An AF asks the PCRF to tell it about IP-CAN events by putting
   Specific-Action AVPs in the AAR (TS 29.214 §5.3.13), and `rx_aar` had no way
@@ -199,6 +226,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   cannot be forwarded without being recognised on the way back.
 ### Fixed
 
+- **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
+  `auth.require_aka_digest()` can set up IPsec.** Only the HSS path
+  (`require_ims_digest`) put CK and IK into `WWW-Authenticate`. Behind local
+  AKA credentials the P-CSCF's `reply.take_av()` found nothing, no SA was
+  installed, and every REGISTER after the challenge arrived unprotected on the
+  plain port. Both paths now build the same header. As before, the P-CSCF has
+  to strip the keys with `reply.take_av()` before relaying the 401 to the UE.
+- **A P-CSCF no longer installs IPsec SAs with `0.0.0.0` as its own address.**
+  The P-CSCF side of the SA selectors came from the UDP listen address, and
+  when a family had only a wildcard bind siphon used the wildcard. The kernel
+  matches inbound ESP on the packet's real destination, so those SAs matched
+  nothing and every protected request was dropped (`XfrmInNoStates`), with no
+  error anywhere. A family whose only UDP listeners are wildcards now gets no SA
+  address: siphon logs an error at startup and `ipsec.allocate` raises instead
+  of installing SAs that cannot work. Bind the protected ports to the address
+  UEs send to, as `examples/ims_pcscf.yaml` now does; behind NAT that is the
+  private address, not the public `advertised_address`.
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon
@@ -413,6 +457,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
+  `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`
+  each gained a public field** (`auth_user`, `auth_user`, `impi`, `impi`).
+  Code that builds them as struct literals has to set it; `None` keeps the old
+  meaning. `Contact` grows from 320 to 336 bytes, which moves a one-binding
+  AoR's allocation from the 320 to the 384 byte jemalloc size class.
 - **Crate embedders: `diameter::rx::SpecificAction::IndicationOfEstablishmentOfBearer`
   is gone and `SpecificAction::IpCanChange` is now 6.** Code matching on the
   removed variant, or relying on the old discriminant of `IpCanChange`, has to

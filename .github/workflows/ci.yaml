@@ -2270,6 +2270,16 @@ jobs:
           echo "::group::P-CSCF (siphon-ipsec) log"; cat siphon-ipsec.log || true; echo "::endgroup::"
           echo "::group::S-CSCF (siphon-scscf) log"; cat siphon-scscf.log || true; echo "::endgroup::"
 
+      # SIPp exiting 0 does not prove IPsec ran. This job used to pass with no
+      # SA ever installed: the 401 carried no ck/ik and every REGISTER went out
+      # on the plain port. The P-CSCF activating the SAs is the proof.
+      - name: Assert the P-CSCF activated the IPsec SAs
+        run: |
+          if ! grep -q "ipsec.PendingSA: activated" siphon-ipsec.log; then
+            echo "::error::the P-CSCF never activated an IPsec SA, so the protected path did not run"
+            exit 1
+          fi
+
       - name: Teardown
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile ipsec down -v --remove-orphans
