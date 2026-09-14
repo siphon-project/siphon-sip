@@ -124,6 +124,22 @@ pub fn b_leg_failed(
             }
         }
 
+        // A controller-issued `dial` owns this outcome: the caller is still
+        // unanswered and still the controller's, so the failure is reported to
+        // it rather than forwarded to the caller and the call torn down. The
+        // B-leg has been ACKed above, which is all it is owed.
+        if !relay_challenge
+            && report_control_dial_failure(
+                call_id,
+                status_code,
+                response_reason_phrase(message),
+                false,
+                state,
+            )
+        {
+            return;
+        }
+
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg
         if let Some((ref _b_cid, ref b_ftag)) = snapshot.b_leg_dialog {
             crate::b2bua::actor::Dialog::rewrite_headers(

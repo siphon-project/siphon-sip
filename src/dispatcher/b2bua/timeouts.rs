@@ -280,6 +280,26 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         // else fall through to the normal 408 teardown (queue exhausted).
     }
 
+    // A controller-issued `dial` that nobody answered in time. The rung legs
+    // are given up on — CANCEL them (RFC 3261 §9.1) — but the caller is not:
+    // it stays unanswered and parked, and the controller decides what happens
+    // next. "Nobody answered, go to voicemail" is the whole point of the verb,
+    // and failing the caller 408 here would take that decision away.
+    if state.call_actors.is_control_dial(call_id) {
+        for (cancel_msg, transport, dest, local) in &cancel_targets {
+            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, *local, state);
+        }
+        for tx in &handle_txs {
+            let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+        }
+        state.call_actors.mark_active_b_legs_cancelled(call_id);
+        if report_control_dial_failure(call_id, 408, "Request Timeout", true, state) {
+            return;
+        }
+        // The dial was resolved by something else in between (answered, or the
+        // call went away); fall through to the ordinary teardown.
+    }
+
     warn!(
         call_id = %call_id,
         "B2BUA: answer timeout — no final response from B-leg, failing call with 408",

@@ -381,6 +381,17 @@ pub struct CallActor {
     /// out-of-process app decides, and the answer-deadline sweep applies the
     /// handoff default action (not the 408 path) if the app never acts.
     pub control_app: Option<String>,
+    /// Set while a controller-issued `dial` owns this call's outcome.
+    ///
+    /// A `dial` rings B-legs while the caller stays unanswered and parked, so
+    /// the controller — not siphon — decides what happens when nobody answers:
+    /// dial elsewhere, answer into voicemail, reject with its own code. Without
+    /// this the B-leg failure path would forward the error to the caller and
+    /// tear the call down, which is the opposite of keeping it.
+    ///
+    /// Cleared the moment the outcome is decided: a 2xx makes it an ordinary
+    /// two-leg call, and a reported failure hands the decision back.
+    pub control_dial: bool,
     /// Control-loss policy for a handed-over call ("hangup"/"continue"/
     /// "fallback"). Owned by the control plane on owner disconnect; stored here
     /// for observability.
@@ -472,6 +483,7 @@ impl CallActor {
             auth_passthrough: false,
             route_sequence: None,
             control_app: None,
+            control_dial: false,
             on_control_loss: None,
             handoff_pending: false,
             originated: false,

@@ -1249,6 +1249,9 @@ jobs:
       - name: Early media anchored on the engine, played into, then answered
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-early-uac sipp-control-early-uac
 
+      - name: dial — the caller survives a failed ring and the app answers it
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-dial-uac sipp-control-dial-uac
+
       - name: Exactly-one-owner dispatch across several app connections
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
 
@@ -1297,6 +1300,7 @@ jobs:
           assert_verdict owner    control-app-ivr.log
           assert_verdict resync   control-app-ivr.log
           assert_verdict inbound  control-app-inbound.log
+          assert_verdict dial     control-app-edge.log
           assert_performed play_media
           assert_performed stop_media
           assert_performed start_recording

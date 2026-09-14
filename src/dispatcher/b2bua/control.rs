@@ -581,3 +581,363 @@ pub fn b2bua_progress_call(
         false,
     )
 }
+
+// ---------------------------------------------------------------------------
+// dial — ring B-legs while the caller stays unanswered and controller-owned
+// ---------------------------------------------------------------------------
+
+/// One `dial` target: a URI to ring, or an AoR resolved against the registrar.
+#[derive(Debug, Clone, Default)]
+pub struct DialTarget {
+    /// Request-URI for the B-leg.
+    pub uri: String,
+    /// Routing destination, when it differs from `uri` (a trunk, an outbound
+    /// proxy). The R-URI keeps `uri`'s shape either way.
+    pub next_hop: Option<String>,
+    /// Captured inbound flow for a registered contact (RFC 5626 §5.3). The only
+    /// way to reach a phone that registered over TCP, TLS or WebSocket behind
+    /// NAT, which is why an AoR target resolves to one per contact.
+    pub flow: Option<crate::script::api::registrar::PyFlow>,
+    /// Route set for this branch, from the binding's Path (RFC 3327 §5.3).
+    pub route: Vec<String>,
+    /// Per-target headers, layered over the command's.
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// Why a `dial` could not be started.
+#[derive(Debug)]
+pub enum DialError {
+    /// No target survived resolution.
+    NoTargets,
+    /// A strategy siphon does not implement.
+    UnsupportedStrategy(String),
+    /// The call is already answered, so there is no unanswered caller to hold.
+    AlreadyAnswered,
+    /// An AoR with no registered contact.
+    NoContacts(String),
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialError::NoTargets => write!(formatter, "dial requires at least one target"),
+            DialError::UnsupportedStrategy(strategy) => {
+                write!(formatter, "unsupported dial strategy '{strategy}'")
+            }
+            DialError::AlreadyAnswered => write!(
+                formatter,
+                "the call is already answered — dial rings a caller that is still waiting"
+            ),
+            DialError::NoContacts(aor) => {
+                write!(formatter, "no registered contact for {aor}")
+            }
+        }
+    }
+}
+
+/// Resolve an AoR to one dial target per registered contact, each carrying its
+/// own flow and Path route set.
+///
+/// This is what makes a phone on TCP, TLS or WSS reachable: such a contact is
+/// only reachable over the connection it registered on, so DNS-resolving its
+/// Contact URI (what `originate` does with a bare URI) reaches nothing. Mirrors
+/// what a script gets from `call.fork(registrar.lookup(aor))`.
+pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
+    let Some(registrar) = crate::script::api::registrar_arc() else {
+        return Err(DialError::NoContacts(aor.to_string()));
+    };
+    let contacts = registrar.lookup(aor);
+    if contacts.is_empty() {
+        return Err(DialError::NoContacts(aor.to_string()));
+    }
+    Ok(contacts
+        .into_iter()
+        .map(|contact| {
+            // Each branch carries the route set of its *own* binding (RFC 3327
+            // §5.3); a shared one would put every branch through the first
+            // binding's proxy chain.
+            let path: Vec<String> = contact.path.iter().map(|value| value.to_string()).collect();
+            let route = crate::proxy::core::route_set_from_path(&path)
+                .map(|value| vec![value])
+                .unwrap_or_default();
+            // The captured inbound flow, same view the scripting API hands to
+            // `call.fork` — `None` for a binding whose socket has gone, which
+            // then falls back to resolving the Contact URI.
+            let flow = contact
+                .flow()
+                .map(|flow| crate::script::api::registrar::PyFlow {
+                    transport: flow.transport.as_scheme().to_string(),
+                    source_addr: flow.source_addr,
+                    local_addr: flow.local_addr,
+                    connection_id: flow.connection_id,
+                });
+            DialTarget {
+                uri: contact.uri.to_string(),
+                next_hop: None,
+                flow,
+                route,
+                headers: std::collections::HashMap::new(),
+            }
+        })
+        .collect())
+}
+
+/// Ring `targets` as B-legs of a controlled call, keeping the caller unanswered
+/// and the call with its controller.
+///
+/// This is the verb form of a script's `call.dial()` / `call.fork()`, and the
+/// difference from [`b2bua_route_call`] is ownership: `route` hands the call
+/// back to siphon (the controller gets `StasisEnd{reason: routed}` and loses
+/// it), which is no use to an application that wants "ring the extension, and
+/// if nobody answers, voicemail". Here the controller keeps the channel
+/// throughout: provisional responses and early media reach the caller as usual,
+/// the first 2xx answers it and the pair becomes an ordinary two-leg call, and
+/// a failure or timeout is reported as `DialFailed` with the caller still
+/// ringing and still parked.
+pub fn b2bua_dial_call(
+    sip_call_id: &str,
+    targets: Vec<DialTarget>,
+    strategy: &str,
+    timeout_secs: u32,
+    extra_headers: &[(String, String)],
+) -> Result<bool, DialError> {
+    let parallel = if strategy.eq_ignore_ascii_case("parallel") {
+        true
+    } else if strategy.eq_ignore_ascii_case("sequential") || strategy.eq_ignore_ascii_case("single")
+    {
+        false
+    } else {
+        return Err(DialError::UnsupportedStrategy(strategy.to_string()));
+    };
+    if targets.is_empty() {
+        return Err(DialError::NoTargets);
+    }
+
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Ok(false);
+    };
+    let state = &control.state;
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        warn!(%sip_call_id, "b2bua_dial_call: no such call");
+        return Ok(false);
+    };
+
+    // Answering first is what `dial` exists to avoid — it starts billing before
+    // anyone picks up and denies the caller the callee's own ringback — so a
+    // call that is already answered is a caller error, not something to paper
+    // over by dialling anyway.
+    if state
+        .call_actors
+        .get_call(&internal_call_id)
+        .map(|call| matches!(call.state, CallState::Answered))
+        .unwrap_or(false)
+    {
+        return Err(DialError::AlreadyAnswered);
+    }
+
+    let template = {
+        let Some(invite_arc) = state
+            .call_actors
+            .get_call(&internal_call_id)
+            .and_then(|call| call.a_leg_invite.clone())
+        else {
+            warn!(call_id = %internal_call_id, "b2bua_dial_call: no stored A-leg INVITE to dial from");
+            return Ok(false);
+        };
+        let Ok(invite) = invite_arc.lock() else {
+            error!(call_id = %internal_call_id, "b2bua_dial_call: invite lock poisoned");
+            return Ok(false);
+        };
+        invite.clone()
+    };
+
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread.
+    let _enter = control.runtime.enter();
+
+    // The controller has acted, so the handoff deadline no longer applies: what
+    // bounds the call now is the dial's own timeout.
+    state.call_actors.mark_controller_acted(&internal_call_id);
+    // Ownership is deliberately NOT released — that is the whole difference
+    // from `route`.
+    state.call_actors.set_control_dial(&internal_call_id, true);
+
+    let sent = if parallel {
+        dial_parallel(&internal_call_id, &targets, extra_headers, &template, state)
+    } else {
+        dial_sequential(
+            &internal_call_id,
+            targets,
+            timeout_secs,
+            extra_headers,
+            &template,
+            state,
+        )
+    };
+
+    if sent == 0 {
+        // Nothing reached the wire, so nothing will ever answer. Report it now
+        // rather than leaving the caller in ringback for the full timeout.
+        state.call_actors.set_control_dial(&internal_call_id, false);
+        warn!(call_id = %internal_call_id, "control plane: dial — no branch could be sent");
+        control_notify_channel_event(
+            sip_call_id,
+            "DialFailed",
+            serde_json::json!({
+                "code": 503,
+                "reason": "no branch could be sent",
+                "timed_out": false,
+            }),
+        );
+        return Ok(true);
+    }
+
+    set_b2bua_answer_deadline(&internal_call_id, timeout_secs, state);
+    info!(
+        call_id = %internal_call_id,
+        branches = sent,
+        strategy = if parallel { "parallel" } else { "sequential" },
+        "control plane: dial — ringing while the caller stays unanswered"
+    );
+    Ok(true)
+}
+
+/// Ring every target at once (RFC 3261 §16.7 aggregation applies as it does for
+/// a script's `call.fork`). Returns how many branches reached the wire.
+fn dial_parallel(
+    call_id: &str,
+    targets: &[DialTarget],
+    extra_headers: &[(String, String)],
+    template: &SipMessage,
+    state: &DispatcherState,
+) -> usize {
+    let mut sent = 0usize;
+    for target in targets {
+        let headers = merged_headers(extra_headers, &target.headers);
+        if b2bua_send_b_leg_invite(
+            call_id,
+            &target.uri,
+            target.next_hop.as_deref(),
+            target.flow.as_ref(),
+            &target.route,
+            None,
+            None,
+            template,
+            None,
+            None,
+            None,
+            None,
+            &headers,
+            state,
+        ) {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// Try the targets in order, advancing on failure, via the same failover engine
+/// the LCR path uses — but with the call still owned by its controller, so the
+/// exhausted sequence reports `DialFailed` rather than failing the caller.
+fn dial_sequential(
+    call_id: &str,
+    targets: Vec<DialTarget>,
+    timeout_secs: u32,
+    extra_headers: &[(String, String)],
+    template: &SipMessage,
+    state: &DispatcherState,
+) -> usize {
+    let routes: Vec<crate::lcr::Route> = targets
+        .into_iter()
+        .map(|target| crate::lcr::Route {
+            ruri: Some(target.uri),
+            next_hop: target.next_hop,
+            timeout_secs: Some(timeout_secs),
+            headers: merged_headers(extra_headers, &target.headers)
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .collect();
+    state.call_actors.start_route_sequence(
+        call_id,
+        crate::b2bua::actor::RouteSequenceState {
+            pending: routes.into(),
+            active: None,
+            attempts: Vec::new(),
+            active_since: None,
+            send_socket: None,
+            default_timeout: timeout_secs,
+        },
+    );
+    let advanced = b2bua_advance_route(call_id, template, state);
+    b2bua_dispatch_burned_routes(call_id, &advanced.burned, state);
+    usize::from(advanced.dialed)
+}
+
+/// Command headers, with the target's own overriding on a key collision.
+fn merged_headers(
+    extra_headers: &[(String, String)],
+    target_headers: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut merged: std::collections::HashMap<String, String> =
+        extra_headers.iter().cloned().collect();
+    merged.extend(target_headers.clone());
+    merged.into_iter().collect()
+}
+
+/// Report a controller-owned dial outcome and hand the decision back.
+///
+/// Returns `true` when the failure was the controller's to act on, which is the
+/// caller's signal to stop: the caller is left unanswered, parked and owned, so
+/// nothing may be forwarded to it and the call must not be torn down.
+pub fn report_control_dial_failure(
+    call_id: &str,
+    status_code: u16,
+    reason: &str,
+    timed_out: bool,
+    state: &DispatcherState,
+) -> bool {
+    if !state.call_actors.is_control_dial(call_id) {
+        return false;
+    }
+    // An answered call is past the point a dial outcome means anything.
+    if state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| matches!(call.state, CallState::Answered))
+        .unwrap_or(false)
+    {
+        state.call_actors.set_control_dial(call_id, false);
+        return false;
+    }
+
+    state.call_actors.set_control_dial(call_id, false);
+    // The rung legs are done; the caller is not. Dropping them here is what
+    // lets the controller dial again on the same channel.
+    state.call_actors.clear_b_legs(call_id);
+
+    let Some(sip_call_id) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return false;
+    };
+    info!(
+        call_id = %call_id,
+        status_code,
+        timed_out,
+        "control plane: dial failed — the caller stays unanswered and parked"
+    );
+    control_notify_channel_event(
+        &sip_call_id,
+        "DialFailed",
+        serde_json::json!({
+            "code": status_code,
+            "reason": reason,
+            "timed_out": timed_out,
+        }),
+    );
+    true
+}

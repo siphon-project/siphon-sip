@@ -99,6 +99,11 @@ pub use b2bua::{
     BridgeAccepted, BridgeParams, OriginateError, OriginateMedia, OriginateParams,
     PreparedOriginate, RouteError, RouteTarget,
 };
+// Crate-internal, not published: only the SIP control adapter calls these, so
+// they are deliberately not part of `siphon::dispatcher`'s API. Counted by
+// `public_api_surface` all the same — the point of the count is that the module
+// does not grow a surface by accident, published or not.
+pub(crate) use b2bua::{b2bua_dial_call, dial_targets_for_aor, DialError, DialTarget};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};

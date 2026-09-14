@@ -243,6 +243,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   WebSocket, and none of it was reachable over the control rail. A profile with
   no `ws_uri` now anchors the leg on the engine with no bridge, and `play`, DTMF
   and recording run on it.
+- **A `dial` verb on the control plane: ring a phone while the caller waits.**
+  The only way to ring a target from a controller was to answer the caller
+  first, originate separately and bridge on answer — which starts billing before
+  anyone picks up, records an unanswered call as answered, and denies the caller
+  the callee's own ringback and early media. The other candidate, `route`, hands
+  the call back to siphon, so the app loses it and cannot act on failure.
+
+  `dial` rings its targets as B-legs while the caller stays unanswered and the
+  app keeps the channel. The first 2xx answers the caller and the pair becomes
+  an ordinary two-leg call; a failure or timeout arrives as
+  `DialFailed {code, reason, timed_out}` with the caller **still ringing and
+  still parked**, so the app decides what happens next. That is what makes
+  "ring the extension, and if nobody answers, voicemail" expressible.
+
+  A target is a URI, `{uri, next_hop?, headers?}` or `{aor}`. An AoR forks to
+  every registered contact over that contact's own flow and Path route set,
+  which is the only way to reach a phone registered over TCP, TLS or WSS behind
+  NAT — DNS-resolving its Contact URI reaches nothing. `strategy` is `parallel`
+  (default) or `sequential`.
 
 ### Changed
 
