@@ -263,6 +263,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   routes: under an `e164` policy the former now sends `++`, and the number in a
   pre-shaped `ruri` is reshaped to the policy.
 
+- **A B-leg failure relayed to the caller carries the caller's own From and
+  To.** When the far side's final failure went to the caller as it was sent (a
+  `call.dial()` or a fork whose chosen branch failed, the last carrier of an LCR
+  sequence, a challenge passed through with `auth_passthrough`), only the dialog
+  tags were swapped back. The caller got siphon's B-leg From, in whatever shape
+  a number policy or `call.rewrite_identities()` gave it for the far side, and
+  the far side's own address in To, so the response leaked the carrier's address
+  and the number shaping done for it. RFC 3261 §8.2.6.2 requires a response's
+  From to equal its request's and its To to be the request's To plus the tag.
+  The 18x before it already carried the caller's own URIs, so one early dialog
+  also changed its To URI under the same tag, and the caller's ACK echoed the
+  far side's address back. The relayed failure now carries the caller's From and
+  To as they arrived, with the A-leg dialog's tag; its status, reason phrase and
+  body stay the far side's. This completes the echo that failures siphon builds
+  itself already got, and provisionals, answers and failures now restore the
+  caller's identity through one path.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

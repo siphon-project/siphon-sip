@@ -779,32 +779,8 @@ pub fn prepare_a_leg_answer(
             if let Some(cseq) = invite.headers.cseq() {
                 response.headers.set("CSeq", cseq.clone());
             }
-            // RFC 3261 §8.2.6.2: the response From MUST equal the request
-            // From, and the response To MUST equal the request To plus the
-            // dialog tag. The cloned B-leg 2xx carries the B-leg dialog's
-            // From/To URIs (siphon's B-leg identity and the B-leg contact
-            // host) — restore the A-leg caller's own From verbatim and its
-            // To with siphon's A-leg tag (the rewrite_headers tag-swap above
-            // only fixed the tags, not the URIs).
-            //
-            // From the arrival snapshot, not this INVITE: the stored INVITE
-            // is the buffer the script reshapes for the B-leg, so echoing it
-            // returned the caller a rewritten form of its own identity. It
-            // stays the fallback for a call with no snapshot.
-            if let Some(from) = snapshot
-                .a_leg
-                .stored_from
-                .as_ref()
-                .or(invite.headers.from())
-            {
-                response.headers.set("From", from.clone());
-            }
-            if let Some(to) = snapshot.a_leg.stored_to.as_ref().or(invite.headers.to()) {
-                response.headers.set(
-                    "To",
-                    crate::b2bua::actor::ensure_tag(to, Some(&snapshot.a_leg.dialog.local_tag)),
-                );
-            }
+            // The caller's own From and To, with siphon's A-leg tag.
+            echo_caller_identity(response, &snapshot.a_leg, &invite, RelayedToTag::ALegDialog);
         }
     }
 

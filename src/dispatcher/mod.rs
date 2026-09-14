@@ -83,7 +83,11 @@ mod originate_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod relayed_identity_tests;
+#[cfg(test)]
 mod ro_orphan_backstop_tests;
+#[cfg(test)]
+mod test_dispatcher;
 #[cfg(test)]
 mod tests;
 

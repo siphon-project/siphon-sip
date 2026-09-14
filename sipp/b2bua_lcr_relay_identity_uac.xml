@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A-leg caller for the LCR route sequence in sipp-b2bua-lcr
+     (sipp/b2bua-lcr/, run by run_case.sh).
+
+     Carrier A answers 503 and the sequence fails over; carrier B answers 183 and
+     then 404, and the 404 ends the call. Both carriers were sent this caller's
+     numbers reshaped by the route's number policy, so their responses carry
+     siphon's B-leg identity and the carrier's address in From and To.
+
+     What the caller must get instead (RFC 3261 §8.2.6.2), on the 183 and the
+     404 alike:
+       - From exactly as it sent it, its own tag included;
+       - To as it sent it, plus a tag;
+       - one tag for both, since they belong to the same early dialog.
+     Its ACK echoes the 404's To ([last_To:]), and siphon has to absorb it:
+     run_case.sh fails the run if the 404 reached this caller more than once.
+
+     This SIPp build never matches a `^` anchor in a header regexp, and cannot
+     put a captured variable into one. So each check is an end-anchored regexp
+     whose match is compared with the whole header value: they differ when
+     anything precedes the expected form, a display name for instance. A
+     mismatch jumps to identity_mismatch, whose receive times out and fails the
+     call. -->
+
+<scenario name="B2BUA LCR caller (relayed failure identity)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:+15550100002@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+To: <sip:+15550100002@example.com>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:+15550100001@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="183">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="From:" assign_to="from_183" />
+      <ereg regexp="[[:space:]]*&lt;sip:[+]15550100001@example[.]com&gt;;tag=[0-9]+SIPpTag001[[:space:]]*$"
+            search_in="hdr" header="From:" check_it="true" assign_to="from_183_own" />
+      <strcmp assign_to="from_183_compared" variable="from_183" variable2="from_183_own" />
+      <test assign_to="from_183_differs" variable="from_183_compared" compare="not_equal" value="0" />
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="to_183" />
+      <ereg regexp="[[:space:]]*&lt;sip:[+]15550100002@example[.]com&gt;;tag=([^;&gt;[:space:]]+)[[:space:]]*$"
+            search_in="hdr" header="To:" check_it="true" assign_to="to_183_own,tag_183" />
+      <strcmp assign_to="to_183_compared" variable="to_183" variable2="to_183_own" />
+      <test assign_to="to_183_differs" variable="to_183_compared" compare="not_equal" value="0" />
+      <log message="183 From=[$from_183] To=[$to_183]" />
+    </action>
+  </recv>
+  <nop next="identity_mismatch" test="from_183_differs" />
+  <nop next="identity_mismatch" test="to_183_differs" />
+
+  <recv response="404">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="From:" assign_to="from_404" />
+      <ereg regexp="[[:space:]]*&lt;sip:[+]15550100001@example[.]com&gt;;tag=[0-9]+SIPpTag001[[:space:]]*$"
+            search_in="hdr" header="From:" check_it="true" assign_to="from_404_own" />
+      <strcmp assign_to="from_404_compared" variable="from_404" variable2="from_404_own" />
+      <test assign_to="from_404_differs" variable="from_404_compared" compare="not_equal" value="0" />
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="to_404" />
+      <ereg regexp="[[:space:]]*&lt;sip:[+]15550100002@example[.]com&gt;;tag=([^;&gt;[:space:]]+)[[:space:]]*$"
+            search_in="hdr" header="To:" check_it="true" assign_to="to_404_own,tag_404" />
+      <strcmp assign_to="to_404_compared" variable="to_404" variable2="to_404_own" />
+      <test assign_to="to_404_differs" variable="to_404_compared" compare="not_equal" value="0" />
+      <!-- The 183 opened the early dialog the 404 ends. -->
+      <strcmp assign_to="tag_compared" variable="tag_183" variable2="tag_404" />
+      <test assign_to="tag_differs" variable="tag_compared" compare="not_equal" value="0" />
+      <log message="404 From=[$from_404] To=[$to_404]" />
+    </action>
+  </recv>
+  <nop next="identity_mismatch" test="from_404_differs" />
+  <nop next="identity_mismatch" test="to_404_differs" />
+  <nop next="identity_mismatch" test="tag_differs" />
+
+  <!-- RFC 3261 §17.1.1.3: the ACK's To is the response's, tag included. -->
+  <send>
+    <![CDATA[
+ACK sip:+15550100002@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Stay in the call past the first three Timer G retransmissions (0.5 s,
+       1.5 s and 3.5 s after the 404, RFC 3261 §17.2.1): an ACK siphon did not
+       absorb shows as a retransmitted 404 in this caller's counts. -->
+  <pause milliseconds="4000" />
+  <nop next="done" />
+
+  <label id="identity_mismatch" />
+  <nop>
+    <action>
+      <log message="IDENTITY MISMATCH: From/To not the caller's own, or the To-tag changed" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="IDENTITY_MISMATCH" timeout="100" />
+
+  <label id="done" />
+
+  <Reference variables="from_183_own,to_183_own,from_404_own,to_404_own" />
+
+</scenario>

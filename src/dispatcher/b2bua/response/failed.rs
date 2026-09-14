@@ -254,8 +254,9 @@ fn fail_call_on_b_leg_failure(
 
 /// Relay a B-leg's final failure to the caller: the A-leg's own dialog
 /// identifiers, Via and CSeq (RFC 3261 §8.2.6.2 — a response echoes its
-/// request's CSeq, and the B-leg numbers its own), sanitised like every B-leg
-/// response that crosses to the A-leg.
+/// request's CSeq, and the B-leg numbers its own), the caller's own From and To
+/// with the A-leg dialog's tag, sanitised like every B-leg response that crosses
+/// to the A-leg. The status, reason phrase and body stay the B-leg's.
 pub fn relay_failure_to_a_leg(
     call_id: &str,
     message: &mut SipMessage,
@@ -279,6 +280,7 @@ pub fn relay_failure_to_a_leg(
             if let Some(cseq) = invite.headers.cseq() {
                 message.headers.set("CSeq", cseq.clone());
             }
+            echo_caller_identity(message, &snapshot.a_leg, &invite, RelayedToTag::ALegDialog);
         }
     }
     sanitize_b2bua_response(

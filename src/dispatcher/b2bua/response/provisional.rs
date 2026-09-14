@@ -124,37 +124,9 @@ pub fn b_leg_provisional(
                 if let Some(cseq) = invite.headers.cseq() {
                     message.headers.set("CSeq", cseq.clone());
                 }
-                // RFC 3261 §8.2.6.2: response From/To URIs MUST echo the A-leg
-                // request's, not the cloned B-leg dialog's. Restore the A-leg
-                // From verbatim; restore the A-leg To URI while preserving
-                // whatever early-dialog To-tag the rewrite above established (a
-                // plain 180 has none, an early-dialog 18x carries siphon's tag).
-                //
-                // From the arrival snapshot for the same reason as the 2xx path:
-                // the stored INVITE is the script's B-leg shaping buffer, so a
-                // provisional echoed the caller a rewritten form of its own
-                // identity — and inconsistently with the 2xx that followed.
-                if let Some(from) = snapshot
-                    .a_leg
-                    .stored_from
-                    .as_ref()
-                    .or(invite.headers.from())
-                {
-                    message.headers.set("From", from.clone());
-                }
-                if let Some(to) = snapshot.a_leg.stored_to.as_ref().or(invite.headers.to()) {
-                    let existing_tag = message
-                        .headers
-                        .to()
-                        .and_then(|value| {
-                            crate::sip::headers::nameaddr::NameAddr::parse(value).ok()
-                        })
-                        .and_then(|name_addr| name_addr.tag);
-                    message.headers.set(
-                        "To",
-                        crate::b2bua::actor::ensure_tag(to, existing_tag.as_deref()),
-                    );
-                }
+                // The caller's own From and To, keeping whatever early-dialog
+                // To-tag the rewrite above established.
+                echo_caller_identity(message, &snapshot.a_leg, &invite, RelayedToTag::AsRelayed);
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg

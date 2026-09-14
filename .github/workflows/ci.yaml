@@ -997,6 +997,64 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-on-failure down --remove-orphans 2>/dev/null || true
 
+  # ── B2BUA LCR route sequence ────────────────────────────────────────────
+  # call.route() over the carriers a mock LCR API returns (sipp/b2bua-lcr/),
+  # each sent the caller's numbers reshaped by the route's number policy.
+  # Carrier A answers 503 and the sequence fails over; carrier B answers 183
+  # and then 404, which ends the call. The caller checks that both responses
+  # carry its own From and To (RFC 3261 §8.2.6.2) under one To-tag, and that its
+  # ACK echoes that To; run_case.sh checks that the 404 reached it only once, so
+  # the ACK was absorbed. The loopback scripts/lcr_sipp_test.sh stays a local
+  # tool.
+  sipp-b2bua-lcr:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-lcr and the mock LCR API
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-lcr up -d --wait siphon-b2bua-lcr b2bua-lcr-api
+
+      - name: The last carrier's failure reaches the caller with the caller's own From and To
+        run: bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_relay_identity_uac.xml sipp-b2bua-lcr-carrier-a-uas sipp-b2bua-lcr-carrier-b-uas
+
+      # The route sequence itself: one line per failed carrier, in the order they
+      # were tried, and one @b2bua.on_failure for the call, on carrier B's 404.
+      - name: Carrier A failed over, carrier B's 404 ended the call
+        run: |
+          logs="$(docker logs siphon-b2bua-lcr 2>&1)"
+          for expected in "LCR-CARRIER-FAILED carrier-a 503" "LCR-CARRIER-FAILED carrier-b 404" "LCR-FAILURE 404 Not Found"; do
+            count="$(grep -c "$expected" <<<"$logs" || true)"
+            if [ "$count" != "1" ]; then
+              echo "expected one '$expected' line, got $count"
+              grep 'LCR-' <<<"$logs" || true
+              exit 1
+            fi
+          done
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker logs siphon-b2bua-lcr > siphon-b2bua-lcr.log 2>&1 || true
+          docker logs b2bua-lcr-api > b2bua-lcr-api.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-lcr-logs
+          path: |
+            siphon-b2bua-lcr.log
+            b2bua-lcr-api.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-lcr down -v --remove-orphans 2>/dev/null || true
+
   # ── B2BUA REFER / call-transfer functional tests ────────────────────────
   # In-dialog REFER on a tracked B2BUA call: transparent forward, loop-safe
   # 603 reject, siphon-terminated transfer (non-anchored), and the terminated
