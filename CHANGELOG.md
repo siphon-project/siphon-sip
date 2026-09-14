@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-09-15
+
 ### Added
 
 - **`auth.stamp_integrity_protected()` and `auth.verify_integrity_protected()`
@@ -26,6 +28,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   with its own SA and IMPI could re-register or de-register someone else's
   IMPU. `examples/ims_pcscf.py`, `ims_scscf.py` and `ims_scscf_aka_lab.py`
   use the pair, and the SDK mocks both.
+
 - **`contact.auth_user`: the identity that authenticated the REGISTER which
   stored a binding.** `registrar.save()` records `request.auth_user` on each
   binding, from that REGISTER only. A save with no authenticated user records
@@ -35,6 +38,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   IPsec SA pair likewise records the IMPI of the REGISTER whose 401 keyed it,
   which is what `stamp_integrity_protected()` compares against; that one is not
   exposed to scripts.
+
 - **`diameter.rx_aar(specific_actions=[...])` subscribes to PCRF event
   reports.** An AF asks the PCRF to tell it about IP-CAN events by putting
   Specific-Action AVPs in the AAR (TS 29.214 §5.3.13), and `rx_aar` had no way
@@ -44,6 +48,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   RAR at `@diameter.on_request`. A value TS 29.214 does not define, including
   the void 0 and 5, raises `ValueError` naming it. Leave the argument out and
   no Specific-Action AVP is sent, as before.
+
 - **siphon serves both N5 callbacks, and `@sbi.on_terminate` hands a PCF
   termination to the script.** TS 29.514 has the PCF post events to
   `{evSubsc.notifUri}/notify` and a termination to `{notifUri}/terminate`.
@@ -63,6 +68,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a termination ends it. TS 29.514 has the AF delete the app session afterwards,
   so a handler normally ends with `sbi.delete_session(termination["resUri"])`.
   Sync and async handlers both work.
+
 - **`sbi.create_session(events=[...])` subscribes to PCF events.**
   `create_session` never sent an event subscription, so the PCF had nothing to
   notify and `@sbi.on_event` did not fire for a session siphon created. Each
@@ -102,6 +108,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The single form (`backend:` plus its block) is unchanged and means one sink.
   Setting both `backend` and `backends` is refused at config load, naming both,
   rather than siphon guessing which one was meant.
+
 - **`originate` is now a typed method on both the Rust and TypeScript control
   SDKs** (`SipClient::originate` / `client.originate()`). It was the only verb
   with no typed helper, so placing a call meant hand-building JSON through the
@@ -112,6 +119,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   server's "names no plan" and "names two plans" refusals unrepresentable rather
   than discovered at runtime. Returns the channel id, siphon's call id and the
   SIP Call-ID; the call is `calling`, and the answer still arrives as an event.
+
 - **`auth.backend: database` is implemented.** A SQL credential source under
   `auth.database`: a libpq `url`, a `query` that binds the digest username to
   `$1` (and the realm to `$2` when the statement references it), and `ha1` to
@@ -140,6 +148,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `auth.database` block, a `query` that never binds `$1` (which would return one
   row for every subscriber), and a binary built without the `postgres-backend`
   feature.
+
 - **The inbound control listener can terminate TLS** (`control.tls` with
   `certificate` / `private_key`), so applications dial `wss://` instead of
   `ws://`. The rail was plaintext-only, which made the bearer token — a single
@@ -156,6 +165,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   let one peer that connects and then stalls hold up every other application's
   connection; completed streams arrive over a bounded channel instead. Handshakes
   are bounded by the same timeout the SIP TLS listeners use.
+
 - **A per-call-connect control app can now be dialed over `wss://`.**
   `control.apps[].connect_url` accepted only `ws://` in practice — the `wss://`
   form the config reference has always shown failed at dial time, so the control
@@ -175,6 +185,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   than the CDR and HEP clients. The TLS half is built with the `tokio-rustls`
   already present, and the CDR and HEP clients now share that one root store
   too.
+
 - **`RegistrationChanged` on the control plane.** Registration changes reached
   Python and the CDR only, so a controller could not show which phones are
   registered without a script forwarding them — and every other event belongs to
@@ -198,6 +209,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an application that only places outbound calls. An unknown class in `events`
   is refused at config load — the list is read at start-up, so a typo would
   otherwise leave the app waiting for events that never come.
+
 - **In-dialog INFO on a B2BUA call is handled as part of the call.** INFO was
   not one of the methods the B2BUA intercepted, so it took the proxy path: a
   B2BUA script with no `@proxy.on_request` covering INFO got
@@ -224,6 +236,129 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The set of forwarded request types is now one enum shared by the forward, the
   response relay, the tracking-leg check and a new retransmit guard, so a type
   cannot be forwarded without being recognised on the way back.
+
+### Changed
+
+- **An LCR sequence that runs out on a ring timeout, with no carrier showing
+  progress, fails the call with `503 Service Unavailable` instead of `408`.**
+  When the carrier in flight rang out without ever sending a 101-199 and the
+  sequence ended there (it was the last carrier, the rest could not be dialled,
+  or its route does not reroute on `408`), the caller got `408 Request
+  Timeout`. That says the callee was reached and did not answer, and no carrier
+  had reached anyone. The caller now gets `503`, the code siphon already sends
+  when no carrier can be dialled at all, and `@b2bua.on_failure` gets `503` too.
+  It is siphon's own response, built from the caller's INVITE rather than a
+  carrier's `503` relayed on, so it is not turned into `500`. A carrier that
+  sent a `180` or `183` and then rang out still fails the call `408`. So does
+  the last target of a `call.fork(strategy="sequential")` or of a sequential
+  control-plane `dial` that rang, and that `dial` reports the same code in
+  `DialFailed`. The carrier's own attempt stays `408` on `call.route_attempts`,
+  in the CDR's `lcr_attempts` and in `@b2bua.on_route_failure`. A plain
+  `call.dial()` or a parallel fork that rings out is unchanged.
+
+- **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
+  `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`
+  each gained a public field** (`auth_user`, `auth_user`, `impi`, `impi`).
+  Code that builds them as struct literals has to set it; `None` keeps the old
+  meaning. `Contact` grows from 320 to 336 bytes, which moves a one-binding
+  AoR's allocation from the 320 to the 384 byte jemalloc size class.
+
+- **An LCR carrier that has shown progress keeps the call past its
+  `timeout_secs`.** A route's ring timeout used to CANCEL the carrier and dial
+  the next one whatever the carrier had sent, so a carrier already ringing the
+  callee was failed over exactly like one that never answered. Every callee
+  slower to pick up than `timeout_secs` was cut off mid-ring and handed to a
+  carrier that had to start again, and the only lever was a long `timeout_secs`
+  on every carrier, which gave up fast failover from a carrier that is down.
+
+  A route's timer now bounds the wait for progress, the line RFC 3261 §16.7
+  step 2 draws for a proxy's Timer C: any provisional from 101 to 199 from the
+  carrier in flight (not a 100, which is hop by hop). Before progress nothing
+  changes. After it, the attempt's deadline moves to the later of the route's
+  own `timeout_secs` and the sequence's ring bound (`call.route(timeout=…)`,
+  30 s by default), both counted from that carrier's dial. If that passes,
+  siphon CANCELs the carrier and fails the call with 408 without trying the
+  rest, and `@b2bua.on_failure` runs as for any other failure. A final failure
+  after progress still fails over as before, and with `call.route(timeout=0)` a
+  carrier that has shown progress rings unbounded.
+
+  A carrier that answers 183 with its own ringback before it has reached anyone
+  can have the old behaviour back: `reroute_after_progress: true` on its route,
+  in the LCR API answer or on a control-plane `route` target (default `false`,
+  also on the SDK `Route` and the script `Route`). The control-plane client SDKs
+  send it on a `route` target too, and only when it is true:
+  `RouteTarget::reroute_after_progress` in Rust (a new public field, so a struct
+  literal needs it or `..RouteTarget::default()`), a `"reroute_after_progress"`
+  key in a Python target dict (anything but a bool raises `TypeError`), and
+  `rerouteAfterProgress` in TypeScript. `call.fork(strategy="sequential")`
+  and a sequential control-plane `dial` keep moving to the next target when one
+  rings out, since a hunt through phones is exactly that.
+
+- **Crate embedders: `diameter::rx::SpecificAction::IndicationOfEstablishmentOfBearer`
+  is gone and `SpecificAction::IpCanChange` is now 6.** Code matching on the
+  removed variant, or relying on the old discriminant of `IpCanChange`, has to
+  change. `SpecificAction` also gains the missing TS 29.214 values and
+  `TryFrom<u32>` (an undefined value is `UnknownSpecificAction`), and
+  `rx::encode_aar` is the AAR encoder `rx::send_aar` and `diameter.rx_aar` now
+  share. The Rust crate API is outside the versioning contract, so this ships
+  in a minor; the scripting API only gains the new argument.
+
+- **`siphon::sbi::npcf::EventSubscription` is replaced by `EventsSubscReqData`,
+  with an `AfEventSubscription` per event.** This affects crate embedders only.
+  The old type had the shape of a single `AfEventSubscription`, so putting it in
+  `AppSessionContextReqData::ev_subsc` would have sent a malformed `evSubsc`.
+  The field is now `Option<EventsSubscReqData>`, `AppSessionContextUpdateData`
+  carries one too, and `EventsSubscReqData::event_detection(events, notif_uri)`
+  builds what the script API sends. The Rust crate API is outside the versioning
+  contract, which is why this lands in a minor release.
+
+- **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
+
+  - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip
+    carries it through to the `@rtpengine.on_media_timeout` log line: `no_media`
+    (the path died or never formed) or `held_too_long` (every leg held past the
+    held-media timeout — nobody came back). They are different operational
+    events and only the first is worth alerting on; a single "media timeout"
+    could not tell them apart.
+  - `Command::PlayMedia.repeat_times` is a `PlayRepeat` — a count or `"inf"`.
+    siphon-sip's own API still takes a count; the endless form is what music on
+    hold and ringback need and is exposed with the play verb rather than here.
+  - `CmdResult::Ok` carries a `recording_id` and `Event::PlayFinished` a
+    `conference_id`. Neither has a siphon-sip concept to map onto yet — they
+    land with the recording and conference verbs.
+
+  `MediaTimeoutReason` is `#[non_exhaustive]`, so an unrecognised reason reads
+  as `unknown` rather than failing the build on the engine's next release.
+
+- **The IPsec runtime lookups moved from `script::api::ipsec` to
+  `ipsec::runtime`.** They are Rust-side process state that the scripting API
+  happens to populate, not part of the Python surface, and living in the PyO3
+  binding layer meant `transport::stream` imported from it — a transport module
+  reaching into the Python bindings for a kernel-level question. Every existing
+  path still resolves: `script::api::ipsec` re-exports them and remains the only
+  thing that installs them. No scripting-API change.
+
+### Deprecated
+
+- **`POST /sbi/events` on `sbi.notif_listen`.** It still dispatches to
+  `@sbi.on_event` in this release, for a PCF that posts to the advertised URI
+  without the `/notify` suffix TS 29.514 defines, and is removed in the next
+  minor release. siphon logs a warning the first time a notification arrives on
+  it.
+
+### Removed
+
+- **`CallActorStore::zombie_reinvites`, `get_zombie_reinvite()`,
+  `remove_zombie_reinvite()` and `ZombieReInviteEntry`** from the Rust API,
+  with the store behind them. It leaked (see Fixed), and a 2xx that arrives
+  after teardown is now ACKed without it.
+
+- **The `@diameter.on_rtr` / `on_rar` / `on_asr` / `on_pnr` decorators.** They
+  registered handlers nothing dispatched: with `diameter:` configured they
+  raised `AttributeError` at import, and without it they registered a handler
+  that never fired. Use `@diameter.on_request` and match on
+  `req.command_name`. Not present in the SDK or the docs.
+
 ### Fixed
 
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
@@ -233,6 +368,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   installed, and every REGISTER after the challenge arrived unprotected on the
   plain port. Both paths now build the same header. As before, the P-CSCF has
   to strip the keys with `reply.take_av()` before relaying the 401 to the UE.
+
 - **A P-CSCF no longer installs IPsec SAs with `0.0.0.0` as its own address.**
   The P-CSCF side of the SA selectors came from the UDP listen address, and
   when a family had only a wildcard bind siphon used the wildcard. The kernel
@@ -243,6 +379,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   of installing SAs that cannot work. Bind the protected ports to the address
   UEs send to, as `examples/ims_pcscf.yaml` now does; behind NAT that is the
   private address, not the public `advertised_address`.
+
 - **An LCR route's `number_policy` shapes the dialled number in the carrier
   Request-URI too, not only From and To.** The policy reached the identity
   headers while the Request-URI kept the number in whatever form it arrived in,
@@ -334,6 +471,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   and every B2BUA teardown copied all of them. The stateless ACK above replaces
   it. siphon also no longer sends a siphon-originated re-INVITE on a call that
   ended while the re-INVITE was being built.
+
 - **`registrar.save()` answers a REGISTER the registrar refuses instead of
   raising.** A new binding past `max_contacts`, an `Expires` below
   `min_expires` or an AoR that is not a safe storage key raised a bare
@@ -382,6 +520,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   **No deployed wire behaviour changes:** the enum was only used by an AAR
   builder nothing called, and no script could send a Specific-Action at all
   until `rx_aar(specific_actions=...)` above.
+
 - **AARs from `diameter.rx_aar` now carry Rx-Request-Type and the configured
   Destination-Host.** The script API built its own AAR next to the crate's
   `rx::send_aar`, and the two had drifted: the script one never sent the peer's
@@ -392,6 +531,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the M-bit, which table 5.3.1 forbids on this AVP, and a PCRF that does not
   know the AVP has to reject an AAR carrying it that way (RFC 6733 §4.1)
   instead of skipping it.
+
 - **`sbi.delete_session()` releases a session the PCF has already removed.**
   When the app session is already gone on the PCF, which is the usual case for
   the `sbi.delete_session(termination["resUri"])` an `@sbi.on_terminate`
@@ -443,6 +583,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `per_call_connect` + `connect_url` and `control.limits.handoff_deadline_ms`.
   `docker-compose.yaml` said `siphon.yaml` is hot-reloaded — only the scripts
   are; the config is read once at start-up.
+
 - **`control.inbound` hands every inbound call to a control application with no
   script.** The only way into the control plane was a script calling
   `call.handover(...)`, and B2BUA mode itself only switched on when a Python
@@ -469,6 +610,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   would end on the handoff default) and a `mode` that is neither `deferred` nor
   `answer` (which would otherwise fall back silently to the opposite of what was
   meant).
+
 - **`record_start` / `record_stop` on the control plane.** No verb started or
   stopped a recording: `li.record()` is SIPREC toward a recording server, which
   is a different thing, and the native backend sent no recording command at all.
@@ -485,6 +627,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   is. `siphon-rtp` only: rtpengine's `start recording` writes a pcap of the wire
   with no id to stop or correlate by, and rtpproxy has none, so both answer
   `unsupported_verb` rather than produce a different artefact silently.
+
 - **A control application can anchor early media on the media engine**
   (`progress {anchor: true}`, or a `profile` / `ws_uri`, which imply it). The
   18x carries the engine's SDP, so ringback or an announcement can play to a
@@ -494,8 +637,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   following `answer` repeats it instead of anchoring a second time (RFC 3264
   §4); an `answer` whose own body contradicts it is refused, and a `100` cannot
   be anchored. `progress` with those arguments was previously refused outright.
-
-### Fixed
 
 - **An anchored answer no longer requires a WebSocket bridge.** `answer
   {anchor: true}` (and `call.handover(answer=True)`) refused any profile that
@@ -508,6 +649,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   WebSocket, and none of it was reachable over the control rail. A profile with
   no `ws_uri` now anchors the leg on the engine with no bridge, and `play`, DTMF
   and recording run on it.
+
 - **A `dial` verb on the control plane: ring a phone while the caller waits.**
   The only way to ring a target from a controller was to answer the caller
   first, originate separately and bridge on answer — which starts billing before
@@ -528,107 +670,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   NAT — DNS-resolving its Contact URI reaches nothing. `strategy` is `parallel`
   (default) or `sequential`.
 
-### Changed
-
-- **An LCR sequence that runs out on a ring timeout, with no carrier showing
-  progress, fails the call with `503 Service Unavailable` instead of `408`.**
-  When the carrier in flight rang out without ever sending a 101-199 and the
-  sequence ended there (it was the last carrier, the rest could not be dialled,
-  or its route does not reroute on `408`), the caller got `408 Request
-  Timeout`. That says the callee was reached and did not answer, and no carrier
-  had reached anyone. The caller now gets `503`, the code siphon already sends
-  when no carrier can be dialled at all, and `@b2bua.on_failure` gets `503` too.
-  It is siphon's own response, built from the caller's INVITE rather than a
-  carrier's `503` relayed on, so it is not turned into `500`. A carrier that
-  sent a `180` or `183` and then rang out still fails the call `408`. So does
-  the last target of a `call.fork(strategy="sequential")` or of a sequential
-  control-plane `dial` that rang, and that `dial` reports the same code in
-  `DialFailed`. The carrier's own attempt stays `408` on `call.route_attempts`,
-  in the CDR's `lcr_attempts` and in `@b2bua.on_route_failure`. A plain
-  `call.dial()` or a parallel fork that rings out is unchanged.
-
-- **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
-  `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`
-  each gained a public field** (`auth_user`, `auth_user`, `impi`, `impi`).
-  Code that builds them as struct literals has to set it; `None` keeps the old
-  meaning. `Contact` grows from 320 to 336 bytes, which moves a one-binding
-  AoR's allocation from the 320 to the 384 byte jemalloc size class.
-- **An LCR carrier that has shown progress keeps the call past its
-  `timeout_secs`.** A route's ring timeout used to CANCEL the carrier and dial
-  the next one whatever the carrier had sent, so a carrier already ringing the
-  callee was failed over exactly like one that never answered. Every callee
-  slower to pick up than `timeout_secs` was cut off mid-ring and handed to a
-  carrier that had to start again, and the only lever was a long `timeout_secs`
-  on every carrier, which gave up fast failover from a carrier that is down.
-
-  A route's timer now bounds the wait for progress, the line RFC 3261 §16.7
-  step 2 draws for a proxy's Timer C: any provisional from 101 to 199 from the
-  carrier in flight (not a 100, which is hop by hop). Before progress nothing
-  changes. After it, the attempt's deadline moves to the later of the route's
-  own `timeout_secs` and the sequence's ring bound (`call.route(timeout=…)`,
-  30 s by default), both counted from that carrier's dial. If that passes,
-  siphon CANCELs the carrier and fails the call with 408 without trying the
-  rest, and `@b2bua.on_failure` runs as for any other failure. A final failure
-  after progress still fails over as before, and with `call.route(timeout=0)` a
-  carrier that has shown progress rings unbounded.
-
-  A carrier that answers 183 with its own ringback before it has reached anyone
-  can have the old behaviour back: `reroute_after_progress: true` on its route,
-  in the LCR API answer or on a control-plane `route` target (default `false`,
-  also on the SDK `Route` and the script `Route`). The control-plane client SDKs
-  send it on a `route` target too, and only when it is true:
-  `RouteTarget::reroute_after_progress` in Rust (a new public field, so a struct
-  literal needs it or `..RouteTarget::default()`), a `"reroute_after_progress"`
-  key in a Python target dict (anything but a bool raises `TypeError`), and
-  `rerouteAfterProgress` in TypeScript. `call.fork(strategy="sequential")`
-  and a sequential control-plane `dial` keep moving to the next target when one
-  rings out, since a hunt through phones is exactly that.
-
-- **Crate embedders: `diameter::rx::SpecificAction::IndicationOfEstablishmentOfBearer`
-  is gone and `SpecificAction::IpCanChange` is now 6.** Code matching on the
-  removed variant, or relying on the old discriminant of `IpCanChange`, has to
-  change. `SpecificAction` also gains the missing TS 29.214 values and
-  `TryFrom<u32>` (an undefined value is `UnknownSpecificAction`), and
-  `rx::encode_aar` is the AAR encoder `rx::send_aar` and `diameter.rx_aar` now
-  share. The Rust crate API is outside the versioning contract, so this ships
-  in a minor; the scripting API only gains the new argument.
-- **`siphon::sbi::npcf::EventSubscription` is replaced by `EventsSubscReqData`,
-  with an `AfEventSubscription` per event.** This affects crate embedders only.
-  The old type had the shape of a single `AfEventSubscription`, so putting it in
-  `AppSessionContextReqData::ev_subsc` would have sent a malformed `evSubsc`.
-  The field is now `Option<EventsSubscReqData>`, `AppSessionContextUpdateData`
-  carries one too, and `EventsSubscReqData::event_detection(events, notif_uri)`
-  builds what the script API sends. The Rust crate API is outside the versioning
-  contract, which is why this lands in a minor release.
-
-- **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
-
-  - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip
-    carries it through to the `@rtpengine.on_media_timeout` log line: `no_media`
-    (the path died or never formed) or `held_too_long` (every leg held past the
-    held-media timeout — nobody came back). They are different operational
-    events and only the first is worth alerting on; a single "media timeout"
-    could not tell them apart.
-  - `Command::PlayMedia.repeat_times` is a `PlayRepeat` — a count or `"inf"`.
-    siphon-sip's own API still takes a count; the endless form is what music on
-    hold and ringback need and is exposed with the play verb rather than here.
-  - `CmdResult::Ok` carries a `recording_id` and `Event::PlayFinished` a
-    `conference_id`. Neither has a siphon-sip concept to map onto yet — they
-    land with the recording and conference verbs.
-
-  `MediaTimeoutReason` is `#[non_exhaustive]`, so an unrecognised reason reads
-  as `unknown` rather than failing the build on the engine's next release.
-
-- **The IPsec runtime lookups moved from `script::api::ipsec` to
-  `ipsec::runtime`.** They are Rust-side process state that the scripting API
-  happens to populate, not part of the Python surface, and living in the PyO3
-  binding layer meant `transport::stream` imported from it — a transport module
-  reaching into the Python bindings for a kernel-level question. Every existing
-  path still resolves: `script::api::ipsec` re-exports them and remains the only
-  thing that installs them. No scripting-API change.
-
-### Fixed
-
 - **`cargo build --no-default-features` compiles again.** The
   `RegistrarBackendType::Redis` arm called `init_ifc_redis_backend`, which is
   behind the `redis-backend` feature, from code that is not — so turning the
@@ -636,6 +677,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   iFC profiles stay in memory, the same contract `sctp` and `ui` already have.
   CI lints that configuration now; it built only the default and `--all-features`
   before, which is why nothing said so.
+
 - **A re-INVITE on a call with no second leg is answered instead of refused.**
   On a one-legged call — one siphon answered itself and anchored on the media
   engine, so an IVR, a queue or a voicemail box — the glare check read the
@@ -654,6 +696,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   up. It takes the same engine-answered path as the re-INVITE above. Two
   remaining no-B-leg arms that returned in silence now answer `500` rather than
   dropping the request.
+
 - **A transfer target that hangs up the moment it answers no longer gets a 481.**
   On a siphon-terminated transfer (`accept_refer(mode="terminate")`,
   `replace_peer`) siphon ACKed the target's 200 before promoting the target into
@@ -663,6 +706,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+
 - **What `@b2bua.on_failure` decides is carried out.** A failure handler that
   re-dialled (`call.dial()`, `call.fork()`, `call.route()`), rejected with a
   response of its own (`call.reject()`), handed the call over or answered the
@@ -737,6 +781,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   could reach the callee BYE first, which a strict UA drops, leaving the BYE
   retransmitting unanswered. A caller's CANCEL and the ring timeout likewise stop
   CANCELling branches that already have a final response.
+
 - **Messages siphon sends to one UDP peer now leave in the order they were
   sent.** Every UDP worker owns its own `SO_REUSEPORT` socket, and all of them
   drained one shared outbound channel, so two messages sent back to back to the
@@ -793,29 +838,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   documented as a per-request timeout, and discarded, so every call waited the
   peer's fixed 10 s. Values below 100 ms are floored, matching `forward_to`, so
   a `timeout_ms=0` cannot mean "give up before the request can be answered".
-
-### Deprecated
-
-- **`POST /sbi/events` on `sbi.notif_listen`.** It still dispatches to
-  `@sbi.on_event` in this release, for a PCF that posts to the advertised URI
-  without the `/notify` suffix TS 29.514 defines, and is removed in the next
-  minor release. siphon logs a warning the first time a notification arrives on
-  it.
-
-### Removed
-
-- **`CallActorStore::zombie_reinvites`, `get_zombie_reinvite()`,
-  `remove_zombie_reinvite()` and `ZombieReInviteEntry`** from the Rust API,
-  with the store behind them. It leaked (see Fixed), and a 2xx that arrives
-  after teardown is now ACKed without it.
-
-- **The `@diameter.on_rtr` / `on_rar` / `on_asr` / `on_pnr` decorators.** They
-  registered handlers nothing dispatched: with `diameter:` configured they
-  raised `AttributeError` at import, and without it they registered a handler
-  that never fired. Use `@diameter.on_request` and match on
-  `req.command_name`. Not present in the SDK or the docs.
-
-### Fixed
 
 - **A `backend:` selector nothing dispatches to is now rejected at config
   load.** `registrar.backend: python` named `@registrar.on_save` /
