@@ -203,6 +203,8 @@ pub struct PyContact {
     /// UE-side binding (default) vs application-server capability
     /// record captured from a 3PR 200 OK.
     kind_value: crate::registrar::ContactKind,
+    /// Identity the REGISTER that stored this binding authenticated as.
+    auth_user_value: Option<String>,
 }
 
 #[pymethods]
@@ -356,6 +358,17 @@ impl PyContact {
         self.params_value.clone()
     }
 
+    /// Identity the REGISTER that stored this binding authenticated as: its
+    /// `request.auth_user` when `registrar.save()` ran (the IMPI, in IMS).
+    ///
+    /// ``None`` when that REGISTER was saved without an authenticated user, and
+    /// for `registrar.save_proxy()` caches. `auth.verify_integrity_protected`
+    /// trusts a protected re-/de-REGISTER only from this identity.
+    #[getter]
+    fn auth_user(&self) -> Option<&str> {
+        self.auth_user_value.as_deref()
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -436,6 +449,7 @@ impl PyContact {
             flow_value,
             params_value: contact.params.clone(),
             kind_value: contact.kind,
+            auth_user_value: contact.auth_user.as_deref().map(str::to_string),
         }
     }
 }
@@ -691,6 +705,8 @@ impl PyRegistrar {
                     path: path.clone(),
                     flow: flow_capture.clone(),
                     params: extra_params,
+                    // This REGISTER's authenticated user only, never carried over.
+                    auth_user: request.get_auth_user().map(str::to_string),
                 });
             }
         }
@@ -1431,7 +1447,7 @@ fn answer_refusal(
 }
 
 /// Extract the AoR (Address of Record) from the To header of a SIP message.
-fn extract_aor(message: &SipMessage) -> PyResult<String> {
+pub(crate) fn extract_aor(message: &SipMessage) -> PyResult<String> {
     let to_raw = message
         .headers
         .to()
@@ -1530,6 +1546,169 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    /// The registrar half of the re-/de-REGISTER trust chain: a binding records
+    /// who authenticated it, and `verify_integrity_protected` trusts a
+    /// protected REGISTER only from that identity.
+    mod integrity_protected {
+        use super::*;
+
+        const IMPI: &str = "001010000000001@ims.example.com";
+        const OTHER_IMPI: &str = "001010000000002@ims.example.com";
+        const IMPU: &str = "sip:001010000000001@ims.example.com";
+        const ALIAS: &str = "sip:+15550100001@ims.example.com";
+        const CONTACT: &str = "<sip:001010000000001@192.0.2.10:5060>";
+
+        fn authorization(username: &str, protected: Option<&str>) -> String {
+            let mut value = format!(
+                "Digest username=\"{username}\", realm=\"ims.example.com\", nonce=\"\", \
+                 uri=\"sip:ims.example.com\", response=\"\""
+            );
+            if let Some(protected) = protected {
+                value.push_str(&format!(", integrity-protected=\"{protected}\""));
+            }
+            value
+        }
+
+        fn register_to(
+            registrar: &Arc<Registrar>,
+            to: &str,
+            authorization: Option<&str>,
+        ) -> (PyRequest, PyRegistrar) {
+            let (request, py_reg) = make_register_request(&format!("<{to}>"), CONTACT, registrar);
+            if let Some(value) = authorization {
+                let message = request.message();
+                let mut guard = message.lock().unwrap();
+                guard.headers.add("Authorization", value.to_string());
+            }
+            (request, py_reg)
+        }
+
+        /// Save `IMPU` the way a REGISTER that authenticated as `auth_user` does.
+        fn register_authenticated_as(registrar: &Arc<Registrar>, auth_user: Option<&str>) {
+            let (mut request, py_reg) = register_to(registrar, IMPU, None);
+            if let Some(user) = auth_user {
+                request.set_auth_user(user.to_string());
+            }
+            assert!(py_reg.save(&mut request, false, vec![], None).unwrap());
+        }
+
+        fn verify(registrar: &Arc<Registrar>, request: &mut PyRequest) -> bool {
+            crate::script::api::ipsec::verify_integrity_protected(request, Some(registrar.as_ref()))
+                .expect("verify runs")
+        }
+
+        #[test]
+        fn save_records_the_authenticated_user_on_the_binding() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+
+            let bindings = registrar.lookup(IMPU);
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].auth_user.as_deref(), Some(IMPI));
+            let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+            assert_eq!(py_reg.lookup_str(IMPU)[0].auth_user(), Some(IMPI));
+        }
+
+        /// No carry-over from the binding a save replaces: one that authenticated
+        /// nobody must not inherit the previous REGISTER's identity, or the next
+        /// protected refresh would skip a challenge it is owed.
+        #[test]
+        fn save_without_an_authenticated_user_records_none_over_a_prior_binding() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            register_authenticated_as(&registrar, None);
+
+            let bindings = registrar.lookup(IMPU);
+            assert_eq!(bindings.len(), 1, "the second save replaced the binding");
+            assert_eq!(bindings[0].auth_user, None);
+        }
+
+        #[test]
+        fn verify_accepts_the_impi_that_registered_and_sets_auth_user() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            let (mut request, _) =
+                register_to(&registrar, IMPU, Some(&authorization(IMPI, Some("yes"))));
+
+            assert!(verify(&registrar, &mut request));
+            assert_eq!(request.get_auth_user(), Some(IMPI));
+        }
+
+        #[test]
+        fn verify_resolves_the_implicit_registration_set() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            registrar.set_associated_uris(IMPU, vec![IMPU.to_string(), ALIAS.to_string()]);
+            let (mut request, _) =
+                register_to(&registrar, ALIAS, Some(&authorization(IMPI, Some("yes"))));
+
+            assert!(verify(&registrar, &mut request));
+        }
+
+        /// A UE with its own SA and its own IMPI must not be able to re-register
+        /// or de-register somebody else's public identity.
+        #[test]
+        fn verify_refuses_another_impi_even_when_protected() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            let (mut request, _) = register_to(
+                &registrar,
+                IMPU,
+                Some(&authorization(OTHER_IMPI, Some("yes"))),
+            );
+
+            assert!(!verify(&registrar, &mut request));
+            assert_eq!(request.get_auth_user(), None);
+        }
+
+        #[test]
+        fn verify_refuses_an_unregistered_impu() {
+            let registrar = make_registrar();
+            let (mut request, _) =
+                register_to(&registrar, IMPU, Some(&authorization(IMPI, Some("yes"))));
+
+            assert!(!verify(&registrar, &mut request));
+        }
+
+        #[test]
+        fn verify_refuses_no_absent_and_unauthenticated_bindings() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            for header in [
+                Some(authorization(IMPI, Some("no"))),
+                Some(authorization(IMPI, None)),
+                None,
+            ] {
+                let (mut request, _) = register_to(&registrar, IMPU, header.as_deref());
+                assert!(!verify(&registrar, &mut request), "{header:?}");
+                assert_eq!(request.get_auth_user(), None);
+            }
+
+            let unauthenticated = make_registrar();
+            register_authenticated_as(&unauthenticated, None);
+            let (mut request, _) = register_to(
+                &unauthenticated,
+                IMPU,
+                Some(&authorization(IMPI, Some("yes"))),
+            );
+            assert!(!verify(&unauthenticated, &mut request));
+        }
+
+        #[test]
+        fn verify_accepts_tls_yes_and_ip_assoc_yes() {
+            let registrar = make_registrar();
+            register_authenticated_as(&registrar, Some(IMPI));
+            for protected in ["tls-yes", "ip-assoc-yes"] {
+                let (mut request, _) = register_to(
+                    &registrar,
+                    IMPU,
+                    Some(&authorization(IMPI, Some(protected))),
+                );
+                assert!(verify(&registrar, &mut request), "{protected}");
+            }
+        }
     }
 
     #[test]
@@ -2041,6 +2220,7 @@ mod tests {
             flow_value: None,
             params_value: vec![],
             kind_value: crate::registrar::ContactKind::Ue,
+            auth_user_value: None,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));
@@ -2547,6 +2727,7 @@ mod tests {
             inbound_connection_id: Some(0xc0ffee),
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let py = PyContact::from_rust_contact(&contact);
         let flow = py.flow().expect("flow should be present");
@@ -2605,6 +2786,7 @@ mod tests {
             inbound_connection_id: Some(0xc0ffee),
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let mut py = PyContact::from_rust_contact(&contact);
 
@@ -2652,6 +2834,7 @@ mod tests {
             inbound_connection_id: Some(7),
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let mut py = PyContact::from_rust_contact(&contact);
 
@@ -2689,6 +2872,7 @@ mod tests {
             inbound_connection_id: None,
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let py = PyContact::from_rust_contact(&contact);
         let flow = py.flow().expect("UDP flow should reconstitute");
@@ -2722,6 +2906,7 @@ mod tests {
             inbound_connection_id: None,
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let py = PyContact::from_rust_contact(&contact);
         assert!(py.flow().is_none());
@@ -2751,6 +2936,7 @@ mod tests {
             inbound_connection_id: Some(42),
             params: Vec::new(),
             kind: crate::registrar::ContactKind::Ue,
+            auth_user: None,
         };
         let py = PyContact::from_rust_contact(&contact);
         assert!(py.flow().is_none());

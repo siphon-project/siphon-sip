@@ -265,6 +265,19 @@ class Contact:
     reg-event NOTIFY bodies (TS 24.229 §5.4.2.1.2) but are excluded
     from routing lookups."""
 
+    auth_user: Optional[str] = None
+    """Authenticated identity that stored this binding: what
+    ``request.auth_user`` held when ``registrar.save()`` ran, which in IMS is
+    the private identity (IMPI).  ``None`` when the REGISTER was saved without
+    an authenticated user, and on every ``registrar.save_proxy()`` cache.
+
+    ``auth.verify_integrity_protected()`` trusts a protected re-/de-REGISTER
+    only when its IMPI is this one, so a binding saved without it is
+    challenged on its next protected refresh::
+
+        bindings = registrar.lookup("sip:001010000000001@ims.example.com")
+        owners = {c.auth_user for c in bindings}"""
+
     _sip_instance: Optional[str] = field(default=None, repr=False, compare=False)
     """RFC 5627 ``+sip.instance`` the binding was registered with.  Private to
     the mock registrar, which replaces a binding by instance before URI the

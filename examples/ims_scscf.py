@@ -8,6 +8,8 @@ The S-CSCF is the central registrar and call controller in IMS:
     2. S-CSCF sends Cx MAR to HSS -> gets AKA auth vectors
     3. S-CSCF challenges UE with 401 (AKAv1-MD5)
     4. UE re-sends REGISTER with credentials
+       (a re-/de-REGISTER the P-CSCF stamped integrity-protected, from the
+       IMPI that registered this IMPU, is accepted without steps 2-4)
     5. S-CSCF verifies, sends Cx SAR to HSS (server assignment)
     6. HSS returns user profile with iFCs and public identities
     7. S-CSCF stores registration, returns 200 with Service-Route + P-Associated-URI
@@ -49,10 +51,15 @@ SAT_USER_DEREGISTRATION = 5
 def handle_register(request):
     log.info(f"S-CSCF REGISTER from {request.from_uri}")
 
+    # A re-/de-REGISTER the P-CSCF received over the UE's IPsec SA, from the
+    # IMPI that registered this IMPU, needs no new challenge (TS 24.229); it
+    # sets request.auth_user as the digest check would.
+    if auth.verify_integrity_protected(request):
+        log.info(f"accepted integrity-protected REGISTER from {request.auth_user}")
     # Authenticate with AKA digest.
     # In production IMS this triggers Cx MAR to the HSS for auth vectors.
     # In lab mode, uses local Milenage credentials from aka_credentials config.
-    if not auth.require_aka_digest(request, realm=REALM):
+    elif not auth.require_aka_digest(request, realm=REALM):
         log.info(f"sent 401 AKA challenge to {request.from_uri}")
         return
 

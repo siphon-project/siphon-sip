@@ -238,6 +238,7 @@ fn fixture_offer(alg: &str, ealg: &str) -> PySecurityOffer {
         port_c: 3,
         port_s: 4,
         ue_addr: "10.0.0.1".to_string(),
+        impi: None,
     }
 }
 

@@ -506,6 +506,10 @@ pub struct SecurityAssociationPair {
     /// Determines the four policy directions in `create_sa_pair` /
     /// `delete_sa_pair`; the SA states are identical either way.
     pub role: SaRole,
+    /// Private user identity (IMPI) the pair was negotiated for: the
+    /// `Authorization` username of the REGISTER whose challenge keyed it.
+    /// `None` when unknown, which never counts as a match.
+    pub impi: Option<String>,
 }
 
 /// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
@@ -2444,6 +2448,7 @@ mod tests {
             expires_at: Instant::now(),
             created_at: Instant::now(),
             role: SaRole::PCscf,
+            impi: None,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -2639,6 +2644,7 @@ mod tests {
             expires_at: compute_sa_expires_at(Some(3600)),
             created_at: Instant::now(),
             role: SaRole::PCscf,
+            impi: None,
         }
     }
 

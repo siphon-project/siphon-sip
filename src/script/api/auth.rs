@@ -290,6 +290,9 @@ pub struct PyAuth {
     nonce_secret: Option<Arc<Vec<u8>>>,
     /// Max age (seconds) of a digest nonce before it is rejected as stale.
     nonce_ttl_secs: u64,
+    /// Registrar whose bindings record who authenticated them, consulted by
+    /// `verify_integrity_protected`. `None` until the dispatcher wires one.
+    registrar: Option<Arc<crate::registrar::Registrar>>,
 }
 
 impl PyAuth {
@@ -310,6 +313,7 @@ impl PyAuth {
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
+            registrar: None,
         }
     }
 
@@ -327,6 +331,7 @@ impl PyAuth {
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
+            registrar: None,
         }
     }
 
@@ -379,6 +384,11 @@ impl PyAuth {
     /// Set AKA credentials for local Milenage auth.
     pub fn set_aka_credentials(&mut self, credentials: HashMap<String, AkaCredential>) {
         self.aka_credentials = Arc::new(credentials);
+    }
+
+    /// Wire the registrar `verify_integrity_protected` checks bindings against.
+    pub fn set_registrar(&mut self, registrar: Arc<crate::registrar::Registrar>) {
+        self.registrar = Some(registrar);
     }
 
     /// Configure the digest-nonce anti-replay policy.
@@ -723,8 +733,9 @@ impl PyAuth {
     /// authentication vectors. No Diameter HSS connection needed.
     ///
     /// The nonce in the 401 challenge contains base64(RAND || AUTN) per
-    /// 3GPP TS 33.203. The UE derives CK/IK from RAND+AUTN using the
-    /// shared key K. CK/IK are stored for IPsec SA creation.
+    /// 3GPP TS 33.203. The 401 also carries `ck=`/`ik=`, as the HSS path does,
+    /// for the P-CSCF: it must strip them with `reply.take_av()` before
+    /// relaying the 401 to the UE, and sets up the IPsec SAs from them.
     ///
     /// Returns True if credentials are valid, False if a 401 challenge was sent.
     #[pyo3(signature = (request, realm=None))]
@@ -848,6 +859,26 @@ impl PyAuth {
                 Ok(false)
             }
         }
+    }
+
+    /// P-CSCF: stamp `integrity-protected` into every Authorization header.
+    ///
+    /// `"yes"` only when the REGISTER arrived over an IPsec SA negotiated for
+    /// that header's `username` (IMPI), `"no"` otherwise, replacing whatever
+    /// the UE sent (3GPP TS 24.229). Returns the value stamped on the first
+    /// header, or `None` (changing nothing) when there is no Authorization.
+    fn stamp_integrity_protected(&self, request: &PyRequest) -> PyResult<Option<&'static str>> {
+        super::ipsec::stamp_integrity_protected(request)
+    }
+
+    /// S-CSCF: accept a protected re-/de-REGISTER without a new challenge.
+    ///
+    /// True only when the P-CSCF stamped it protected (`yes`, `tls-yes` or
+    /// `ip-assoc-yes`) and its `username` is the identity that registered the
+    /// To AoR; `request.auth_user` is then set to it. False otherwise, with no
+    /// side effects, and always False when no registrar is wired.
+    fn verify_integrity_protected(&self, request: &mut PyRequest) -> PyResult<bool> {
+        super::ipsec::verify_integrity_protected(request, self.registrar.as_deref())
     }
 
     /// Verify credentials without sending a challenge.
@@ -1253,20 +1284,17 @@ impl PyAuth {
 
         // The verification REGISTER has to check against *this* vector: a fresh
         // one would carry a different RAND, so its XRES could never match.
-        store_auth_vector(nonce.clone(), vector.xres.clone());
+        store_auth_vector(nonce, vector.xres.clone());
 
-        request.set_reply(401, "Unauthorized".to_string());
-
-        let header_value = format!(
-            "Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=AKAv1-MD5, qop=\"auth\""
-        );
-
-        let message = request.message();
-        let mut message_guard = message.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-        })?;
-        message_guard.headers.set("WWW-Authenticate", header_value);
-        Ok(())
+        // Same header as the HSS path, CK/IK included, so a P-CSCF in front of
+        // this S-CSCF can take them off the 401 and set up the SAs.
+        self.send_ims_challenge(
+            request,
+            realm,
+            Some(&nonce_bytes),
+            Some(&vector.ck),
+            Some(&vector.ik),
+        )
     }
 
     /// Extract auth vector from MAA AVPs, store XRES for later verification,
@@ -3510,6 +3538,107 @@ mod tests {
         for index in 0..=AUTH_VECTOR_PRUNE_EVERY {
             store.remove(&format!("aka-nonce-prune-{index}"));
         }
+    }
+
+    /// The local Milenage 401 has to hand CK/IK to the P-CSCF the way the HSS
+    /// path does (3GPP TS 33.203). Without them `reply.take_av()` finds
+    /// nothing, no SA is set up, and every REGISTER after the challenge
+    /// arrives unprotected. The keys are checked against a vector recomputed
+    /// from the RAND carried in the nonce, not against the generator's output.
+    #[test]
+    fn local_aka_challenge_carries_ck_ik_for_the_pcscf() {
+        let (k_hex, op_hex, amf_hex, _) = aka_test_set_1();
+        let auth = aka_auth_with_credentials("alice");
+        let mut request = make_register_request();
+        assert!(!auth
+            .require_aka_digest(&mut request, Some("example.com"))
+            .expect("challenge runs"));
+
+        let challenge = request
+            .message()
+            .lock()
+            .expect("lock")
+            .headers
+            .get("WWW-Authenticate")
+            .cloned()
+            .expect("401 carries WWW-Authenticate");
+        let (stripped, keys) = super::super::ipsec::strip_ck_ik(&challenge);
+        let (ck, ik) = keys.expect("ck= and ik= present and 128-bit");
+
+        let nonce = extract_nonce_field(&stripped).expect("nonce survives the strip");
+        let nonce_bytes = base64_decode(&nonce).expect("nonce is base64");
+        let rand: [u8; 16] = nonce_bytes[..16].try_into().expect("RAND leads the nonce");
+        let key = |hex: &str| crate::ipsec::milenage::hex_to_bytes(hex).expect("test set hex");
+        let k: [u8; 16] = key(&k_hex).try_into().expect("K");
+        let op: [u8; 16] = key(&op_hex).try_into().expect("OP");
+        let amf: [u8; 2] = key(&amf_hex).try_into().expect("AMF");
+        let sqn: [u8; 6] = [0, 0, 0, 0, 0, 1];
+        let expected =
+            crate::ipsec::milenage::generate_vector_with_rand(&k, &op, &sqn, &amf, &rand);
+        assert_eq!(ck, expected.ck, "CK must be the one derived from this RAND");
+        assert_eq!(ik, expected.ik, "IK must be the one derived from this RAND");
+
+        for kept in [
+            "realm=\"example.com\"",
+            "algorithm=AKAv1-MD5",
+            "qop=\"auth\"",
+        ] {
+            assert!(stripped.contains(kept), "{kept} lost from {stripped}");
+        }
+        assert!(stripped.contains(&format!("nonce=\"{nonce}\"")));
+        let _ = take_auth_vector(&nonce);
+    }
+
+    /// With no registrar wired nothing can vouch for the IMPI, so a stamped
+    /// `yes` on its own must never let a REGISTER skip the challenge.
+    #[test]
+    fn verify_integrity_protected_without_a_registrar_refuses() {
+        let auth = PyAuth::empty();
+        let mut request = aka_request_with(
+            "Digest username=\"001010000000001\", realm=\"example.com\", integrity-protected=\"yes\"",
+        );
+        assert!(!auth
+            .verify_integrity_protected(&mut request)
+            .expect("verify runs"));
+        assert_eq!(request.get_auth_user(), None);
+    }
+
+    /// `set_registrar` is how the dispatcher wires the namespace; through it the
+    /// wrapper reaches the bindings the registrar recorded.
+    #[test]
+    fn verify_integrity_protected_uses_the_wired_registrar() {
+        let registrar = Arc::new(crate::registrar::Registrar::default());
+        registrar
+            .apply_register(
+                "sip:alice@example.com",
+                vec![crate::registrar::update::ContactUpdate {
+                    uri: SipUri::new("192.0.2.10".to_string()).with_user("alice".to_string()),
+                    expires_secs: 3600,
+                    q: 1.0,
+                    call_id: "wired@192.0.2.10".to_string(),
+                    cseq: 1,
+                    source_addr: None,
+                    source_transport: None,
+                    sip_instance: None,
+                    reg_id: None,
+                    path: vec![],
+                    flow: crate::registrar::FlowCapture::default(),
+                    params: Vec::new(),
+                    auth_user: Some("001010000000001".to_string()),
+                }],
+                false,
+            )
+            .expect("binding stored");
+        let mut auth = PyAuth::empty();
+        auth.set_registrar(registrar);
+
+        let mut request = aka_request_with(
+            "Digest username=\"001010000000001\", realm=\"example.com\", integrity-protected=\"yes\"",
+        );
+        assert!(auth
+            .verify_integrity_protected(&mut request)
+            .expect("verify runs"));
+        assert_eq!(request.get_auth_user(), Some("001010000000001"));
     }
 
     /// A backend siphon cannot dispatch to is an operator error. Nothing about

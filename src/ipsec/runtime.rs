@@ -14,7 +14,7 @@
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::config::IpsecConfig;
 use crate::ipsec::{IpsecManager, SaProtocol, SecurityAssociationPair};
@@ -26,6 +26,49 @@ use crate::ipsec::{IpsecManager, SaProtocol, SecurityAssociationPair};
 pub fn install(manager: Arc<IpsecManager>, config: Arc<IpsecConfig>) {
     let _ = IPSEC_MANAGER_REF.set(manager);
     let _ = IPSEC_CONFIG_REF.set(config);
+}
+
+/// The P-CSCF address to program as the local side of the IPsec SAs, one per
+/// address family, taken from the UDP listen addresses.
+///
+/// The first concrete bind of a family wins. An unspecified bind (`0.0.0.0` /
+/// `[::]`) is never returned: the kernel matches inbound ESP on the packet's
+/// real destination, so an SA installed with the wildcard matches no packet and
+/// every protected request is dropped. A family whose only listeners are
+/// wildcards gets `None`, so `ipsec.allocate` refuses rather than installing
+/// SAs that cannot work, and an error at startup says why.
+pub fn pcscf_sa_addresses<'a>(
+    listen: impl IntoIterator<Item = &'a str>,
+) -> (Option<IpAddr>, Option<IpAddr>) {
+    let (mut v4, mut v6) = (None, None);
+    let (mut wildcard_v4, mut wildcard_v6) = (false, false);
+    for address in listen {
+        let Ok(socket) = address.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        let ip = socket.ip();
+        let (slot, wildcard) = if ip.is_ipv6() {
+            (&mut v6, &mut wildcard_v6)
+        } else {
+            (&mut v4, &mut wildcard_v4)
+        };
+        if ip.is_unspecified() {
+            *wildcard = true;
+        } else if slot.is_none() {
+            *slot = Some(ip);
+        }
+    }
+    for (family, address, wildcard) in [("IPv4", v4, wildcard_v4), ("IPv6", v6, wildcard_v6)] {
+        if address.is_none() && wildcard {
+            error!(
+                family,
+                "ipsec: every {family} UDP listener is bound to an unspecified address, so no \
+                 {family} IPsec SA can be installed; bind the protected ports to the address \
+                 UEs send to"
+            );
+        }
+    }
+    (v4, v6)
 }
 
 /// Whether a manager has been wired, for tests that must not assume either way.
@@ -319,6 +362,34 @@ mod tests {
         EncryptionAlgorithm, IntegrityAlgorithm, SaProtocol, SecurityAssociationPair,
     };
 
+    /// What kept the sipp-ipsec harness from ever passing a protected REGISTER:
+    /// with the protected ports bound to `0.0.0.0`, the SAs went in with
+    /// `0.0.0.0` as the P-CSCF address, the kernel found no inbound SA for the
+    /// packet's real destination, and dropped every one as `XfrmInNoStates`.
+    /// A wildcard bind must never become a selector address.
+    #[test]
+    fn sa_address_is_never_a_wildcard_bind() {
+        assert_eq!(
+            pcscf_sa_addresses(["0.0.0.0:5060", "0.0.0.0:5064", "[::]:5066"]),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn sa_address_takes_the_first_concrete_bind_of_each_family() {
+        let v4: IpAddr = "192.0.2.10".parse().expect("v4");
+        let v6: IpAddr = "2001:db8::10".parse().expect("v6");
+        assert_eq!(
+            pcscf_sa_addresses(["0.0.0.0:5060", "192.0.2.10:5064", "192.0.2.11:5066"]),
+            (Some(v4), None)
+        );
+        assert_eq!(
+            pcscf_sa_addresses(["[::]:5060", "[2001:db8::10]:5064", "192.0.2.10:5066"]),
+            (Some(v4), Some(v6))
+        );
+        assert_eq!(pcscf_sa_addresses(["not-an-address"]), (None, None));
+    }
+
     /// A P-CSCF-side SA pair with the TS 33.203 §6.3 asymmetric port layout.
     fn ipsec_test_sa() -> SecurityAssociationPair {
         SecurityAssociationPair {
@@ -341,6 +412,7 @@ mod tests {
             expires_at: std::time::Instant::now(),
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
+            impi: None,
         }
     }
 

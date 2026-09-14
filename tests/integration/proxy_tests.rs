@@ -789,6 +789,7 @@ fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contac
         inbound_connection_id: None,
         params: Vec::new(),
         kind: siphon::registrar::ContactKind::Ue,
+        auth_user: None,
     }
 }
 

@@ -490,13 +490,16 @@ pub fn inject_python_singletons(config: &Config) {
         enforce_auth_aor_match: config.registrar.enforce_auth_aor_match,
     };
     let registrar = Arc::new(Registrar::new(registrar_config));
-    let py_registrar = PyRegistrar::new(registrar);
+    let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
 
     // Build PyAuth from config
     let mut realm_users = std::collections::HashMap::new();
     realm_users.insert(config.auth.realm.clone(), config.auth.users.clone());
     let mut py_auth = PyAuth::new(realm_users, config.auth.realm.clone());
     py_auth.set_backend_type(config.auth.backend.clone());
+    // The same registrar scripts save into: `auth.verify_integrity_protected`
+    // trusts a protected REGISTER only from the identity that saved the binding.
+    py_auth.set_registrar(registrar);
 
     // Digest-nonce anti-replay policy (RFC 7616 §3.3). The shared secret, when
     // set, MUST be identical across instances behind the same SIP domain.

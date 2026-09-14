@@ -46,6 +46,10 @@ pub(crate) struct ContactUpdate {
     pub flow: FlowCapture,
     /// The remaining Contact parameters (RFC 3840 feature tags and the like).
     pub params: Vec<(String, Option<String>)>,
+    /// Who this REGISTER authenticated as (`request.auth_user`). Recorded on
+    /// the binding from this REGISTER only, never carried over from the one it
+    /// replaces.
+    pub auth_user: Option<String>,
 }
 
 /// What one staged Contact owes once the new binding list is committed.
@@ -225,6 +229,7 @@ impl Registrar {
             path,
             flow,
             params,
+            auth_user,
         } = update;
 
         if expires_secs > 0 && expires_secs < self.config.min_expires {
@@ -300,6 +305,7 @@ impl Registrar {
             inbound_connection_id,
             params,
             kind: ContactKind::Ue,
+            auth_user: auth_user.map(String::into_boxed_str),
         };
 
         // Replace the binding with the same +sip.instance first (RFC 5627 §4.2:
@@ -511,7 +517,59 @@ mod tests {
             path: vec![],
             flow: FlowCapture::default(),
             params: Vec::new(),
+            auth_user: None,
         }
+    }
+
+    /// A binding remembers the identity that authenticated the REGISTER which
+    /// stored it, and `is_registered_by` vouches only for that identity,
+    /// through the implicit set, and only while the binding is live.
+    #[test]
+    fn a_binding_answers_only_for_the_identity_that_stored_it() {
+        let registrar = Registrar::default();
+        let aor = "sip:001010000000001@ims.example.com";
+        let alias = "sip:+15550100001@ims.example.com";
+        let impi = "001010000000001@ims.example.com";
+        let mut authenticated = update("192.0.2.10", 3600);
+        authenticated.auth_user = Some(impi.to_string());
+        registrar
+            .apply_register(aor, vec![authenticated], false)
+            .unwrap();
+        registrar.set_associated_uris(aor, vec![aor.to_string(), alias.to_string()]);
+
+        assert_eq!(registrar.lookup(aor)[0].auth_user.as_deref(), Some(impi));
+        assert!(registrar.is_registered_by(aor, impi));
+        assert!(registrar.is_registered_by(alias, impi));
+        assert!(!registrar.is_registered_by(aor, "001010000000002@ims.example.com"));
+        assert!(!registrar.is_registered_by("sip:001010000000003@ims.example.com", impi));
+
+        if let Some(mut entry) = registrar.bindings.get_mut(aor) {
+            for contact in entry.value_mut().iter_mut() {
+                contact.registered_at = Instant::now() - Duration::from_secs(7200);
+            }
+        }
+        assert!(
+            !registrar.is_registered_by(aor, impi),
+            "an expired binding vouches for nobody"
+        );
+    }
+
+    #[test]
+    fn a_refresh_without_an_authenticated_user_forgets_the_previous_one() {
+        let registrar = Registrar::default();
+        let aor = "sip:001010000000001@ims.example.com";
+        let impi = "001010000000001@ims.example.com";
+        let mut authenticated = update("192.0.2.10", 3600);
+        authenticated.auth_user = Some(impi.to_string());
+        registrar
+            .apply_register(aor, vec![authenticated], false)
+            .unwrap();
+        registrar
+            .apply_register(aor, vec![update("192.0.2.10", 3600)], false)
+            .unwrap();
+
+        assert_eq!(registrar.lookup(aor)[0].auth_user, None);
+        assert!(!registrar.is_registered_by(aor, impi));
     }
 
     /// A refused save must leave the AoR exactly as it found it. Pruning the

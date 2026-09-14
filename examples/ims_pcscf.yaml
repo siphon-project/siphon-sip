@@ -15,14 +15,21 @@
 #   siphon --config examples/ims_pcscf.yaml
 
 listen:
+  # Bind the protected ports to the local address the UEs send to, not a
+  # wildcard. siphon programs the UDP bind address as the P-CSCF side of every
+  # IPsec SA, and the kernel matches inbound ESP on the packet's real
+  # destination, so an SA with 0.0.0.0 matches nothing. With only wildcard
+  # binds siphon refuses to install the SAs (ipsec.allocate raises) rather than
+  # install dead ones. Behind NAT this is the private address, not the public
+  # advertised_address.
   udp:
     - "0.0.0.0:5060"        # Unprotected SIP (initial REGISTER)
-    - "0.0.0.0:5064"        # IPsec protected client port
-    - "0.0.0.0:5066"        # IPsec protected server port
+    - "10.0.0.10:5064"      # IPsec protected client port
+    - "10.0.0.10:5066"      # IPsec protected server port
   tcp:
     - "0.0.0.0:5060"
-    - "0.0.0.0:5064"        # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
-    - "0.0.0.0:5066"        # IPsec protected server port (ESP-over-TCP)
+    - "10.0.0.10:5064"      # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
+    - "10.0.0.10:5066"      # IPsec protected server port (ESP-over-TCP)
 
   # --- Dual-stack Gm (IPv4 + IPv6) ---------------------------------------
   # A P-CSCF serving VoLTE UEs on both IPv4 and IPv6 bearers binds an

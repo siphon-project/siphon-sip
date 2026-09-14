@@ -90,6 +90,8 @@ pub struct StoredContact {
     /// written before this field existed.
     #[serde(default = "default_contact_kind")]
     pub kind: String,
+    /// Identity that authenticated the binding; a row written before it loads as `None`.
+    pub auth_user: Option<String>,
 }
 
 fn default_contact_kind() -> String {
@@ -127,6 +129,7 @@ impl StoredContact {
             inbound_connection_id: contact.inbound_connection_id,
             params: contact.params.clone(),
             kind: contact.kind.as_str().to_string(),
+            auth_user: contact.auth_user.as_deref().map(str::to_string),
         }
     }
 
@@ -227,6 +230,7 @@ impl StoredContact {
                 "as" => super::ContactKind::As,
                 _ => super::ContactKind::Ue,
             },
+            auth_user: self.auth_user.as_deref().map(Box::from),
         })
     }
 }
@@ -239,12 +243,10 @@ impl StoredContact {
 /// must survive registrar restarts; without them, terminating routing breaks
 /// until each user re-REGISTERs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct StoredAorState {
-    #[serde(default)]
     pub service_routes: Vec<String>,
-    #[serde(default)]
     pub asserted_identity: Option<String>,
-    #[serde(default)]
     pub associated_uris: Vec<String>,
 }
 
@@ -1556,7 +1558,41 @@ mod tests {
             inbound_connection_id: None,
             params: vec![],
             kind: "ue".to_string(),
+            auth_user: None,
         }
+    }
+
+    /// The identity that authenticated a binding has to survive a restart, or
+    /// every restored IMS binding is challenged on its next protected refresh.
+    #[test]
+    fn stored_contact_carries_auth_user_both_ways() {
+        let mut stored = sample_stored_contact();
+        stored.auth_user = Some("001010000000001@ims.example.com".to_string());
+
+        let contact = stored.to_contact().expect("non-expired");
+        assert_eq!(
+            contact.auth_user.as_deref(),
+            Some("001010000000001@ims.example.com")
+        );
+        assert_eq!(
+            StoredContact::from_contact(&contact).auth_user,
+            stored.auth_user
+        );
+    }
+
+    /// Rows written before the field existed carry no `auth_user` key. Redis
+    /// and Postgres store the JSON, so such a row must still load, as `None`.
+    #[test]
+    fn legacy_stored_contact_without_auth_user_loads_as_none() {
+        let mut row = serde_json::to_value(sample_stored_contact()).expect("serializes");
+        row.as_object_mut()
+            .expect("a JSON object")
+            .remove("auth_user");
+
+        let stored: StoredContact =
+            serde_json::from_value(row).expect("a row without auth_user still loads");
+        assert_eq!(stored.auth_user, None);
+        assert_eq!(stored.to_contact().expect("non-expired").auth_user, None);
     }
 
     #[test]
@@ -1767,6 +1803,7 @@ mod tests {
             inbound_connection_id: Some(7777),
             params: vec![],
             kind: "ue".to_string(),
+            auth_user: None,
         };
         backend
             .save("sip:alice@example.com", &[stored])
@@ -1974,6 +2011,7 @@ mod tests {
                     inbound_connection_id: None,
                     params: vec![],
                     kind: "ue".to_string(),
+                    auth_user: None,
                 }],
             )
             .await
@@ -2002,6 +2040,7 @@ mod tests {
                         inbound_connection_id: None,
                         params: vec![],
                         kind: "ue".to_string(),
+                        auth_user: None,
                     },
                     StoredContact {
                         uri: "sip:bob@10.0.0.3".to_string(),
@@ -2023,6 +2062,7 @@ mod tests {
                         inbound_connection_id: None,
                         params: vec![],
                         kind: "ue".to_string(),
+                        auth_user: None,
                     },
                 ],
             )
@@ -2182,6 +2222,7 @@ mod tests {
                     inbound_connection_id: None,
                     params: vec![],
                     kind: "ue".to_string(),
+                    auth_user: None,
                 }],
             )
             .await
@@ -2227,6 +2268,7 @@ mod tests {
                     inbound_connection_id: None,
                     params: vec![],
                     kind: "ue".to_string(),
+                    auth_user: None,
                 }],
             )
             .await
