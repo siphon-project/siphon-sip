@@ -18,6 +18,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **`cargo build --no-default-features` compiles again.** The
+  `RegistrarBackendType::Redis` arm called `init_ifc_redis_backend`, which is
+  behind the `redis-backend` feature, from code that is not — so turning the
+  default features off failed to build outright. It has a stub now, warning that
+  iFC profiles stay in memory, the same contract `sctp` and `ui` already have.
+  CI lints that configuration now; it built only the default and `--all-features`
+  before, which is why nothing said so.
+
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the
   request actually carried. The HSS-backed path (`auth.require_ims_digest()`)

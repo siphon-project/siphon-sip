@@ -787,13 +787,20 @@ mod redis_real {
 pub use redis_real::RedisBackend;
 
 /// Stub Redis backend when the `redis-backend` feature is not enabled.
+/// Stub Redis backend when the `redis-backend` feature is not enabled.
+///
+/// The config and key helper are kept so the stub has the same shape as the
+/// real one and a caller cannot tell them apart at the type level; nothing in
+/// this build reads them.
 #[cfg(not(feature = "redis-backend"))]
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RedisBackend {
     config: RedisBackendConfig,
 }
 
 #[cfg(not(feature = "redis-backend"))]
+#[allow(dead_code)]
 impl RedisBackend {
     pub fn new(config: RedisBackendConfig) -> Self {
         Self { config }

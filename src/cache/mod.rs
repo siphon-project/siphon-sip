@@ -161,6 +161,10 @@ impl NamedCache {
     }
 
     /// Store a value: write to local LRU and Redis.
+    ///
+    /// `ttl_secs` is the Redis expiry; the local LRU bounds itself by size, so
+    /// without `redis-backend` there is nothing to apply it to.
+    #[cfg_attr(not(feature = "redis-backend"), allow(unused_variables))]
     async fn store(&self, key: &str, value: &str, ttl_secs: Option<u64>) {
         // Write to local LRU
         if let Some(local) = &self.local {

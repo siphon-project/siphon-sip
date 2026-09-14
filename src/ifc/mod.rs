@@ -35,6 +35,7 @@ impl BytesTextExt for quick_xml::events::BytesText<'_> {
     }
 }
 use tokio::sync::mpsc;
+#[cfg(feature = "redis-backend")]
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -799,6 +800,11 @@ impl From<&InitialFilterCriteria> for MatchedApplicationServer {
 // ---------------------------------------------------------------------------
 
 /// Commands sent to the iFC backend writer task.
+///
+/// The writer that reads these fields is behind `redis-backend`; without it the
+/// commands are still constructed and dropped, so the fields are dead rather
+/// than absent.
+#[cfg_attr(not(feature = "redis-backend"), allow(dead_code))]
 enum IfcBackendCommand {
     Save { aor: String, xml: String },
     Remove { aor: String },

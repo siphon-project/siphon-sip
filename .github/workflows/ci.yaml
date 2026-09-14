@@ -111,14 +111,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Lint both feature configs: the default build (SCTP off — guards against
-      # unused imports/variables that only surface when the feature is disabled)
-      # and `--all-features` (SCTP on — compiles the gated libsctp code).
+      # Lint three feature configs. The default build (SCTP off) and
+      # `--all-features` (SCTP on, compiling the gated libsctp code) catch the
+      # code that is in or out with those. `--no-default-features` is the one
+      # nothing covered: it turns off `redis-backend` and `postgres-backend`,
+      # which is where the stub halves of the registrar, cache, iFC and auth
+      # backends live. That configuration had stopped compiling entirely — a
+      # call into a `#[cfg(feature = "redis-backend")]` function from an arm
+      # that was not gated — and no job built it, so nothing said so.
       - name: Run clippy (default features)
         run: PYO3_PYTHON=python3.14 cargo clippy --all-targets -- -D warnings
 
       - name: Run clippy (all features)
         run: PYO3_PYTHON=python3.14 cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run clippy (no default features)
+        run: PYO3_PYTHON=python3.14 cargo clippy --no-default-features --all-targets -- -D warnings
 
   # ── Criterion bench compile gate ─────────────────────────────────────────
   # Keep the per-message hot-path criterion benches (benches/sip_hot_path.rs)
