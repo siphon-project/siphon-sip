@@ -128,6 +128,18 @@ impl PyRoute {
         self.inner.reroute_causes.clone()
     }
 
+    /// Whether this carrier fails over at `timeout_secs` even after it has shown progress.
+    ///
+    /// Progress is a 101-199. By default a carrier that has shown it keeps the
+    /// call until the later of its `timeout_secs` and the `call.route(timeout=…)`
+    /// ring bound, and the call then fails with 408 rather than going to the next
+    /// carrier. `True` is for a carrier that plays its own ringback before it has
+    /// reached anyone.
+    #[getter]
+    fn reroute_after_progress(&self) -> bool {
+        self.inner.reroute_after_progress
+    }
+
     /// Per-minute rate (for CDR / charging).
     #[getter]
     fn rate(&self) -> Option<f64> {

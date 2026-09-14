@@ -49,9 +49,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// per-target overrides.
 ///
 /// A bare URI (no overrides) serializes to a plain string on the wire; a target
-/// carrying any override serializes to `{uri, next_hop?, headers?, timeout?}` —
-/// both shapes the server's `route` verb accepts. Build a bare-URI target with
-/// [`RouteTarget::uri`], or from a `&str` / `String`.
+/// carrying any override serializes to
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}` — both shapes
+/// the server's `route` verb accepts. Build a bare-URI target with
+/// [`RouteTarget::uri`], or from a `&str` / `String`, and set overrides with
+/// struct-update syntax: `RouteTarget { timeout_secs: Some(6), ..RouteTarget::uri(uri) }`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteTarget {
     /// The B-leg request URI to dial.
@@ -60,8 +62,17 @@ pub struct RouteTarget {
     pub next_hop: Option<String>,
     /// Headers injected on this attempt's B-leg INVITE (optional).
     pub headers: Vec<(String, String)>,
-    /// Per-target ring timeout in seconds (optional).
+    /// Per-target ring timeout in seconds (optional). It bounds the wait for
+    /// this carrier to show progress (a 101-199), not the wait for its answer.
     pub timeout_secs: Option<u32>,
+    /// Fail this carrier over at its ring timeout even after it has shown
+    /// progress.
+    ///
+    /// By default a carrier that has sent a 180/183 keeps the call past its
+    /// timeout, and the call then fails with 408 rather than trying the next
+    /// target. `true` is for a carrier that plays its own ringback before it has
+    /// reached anyone. Default `false`, which is never sent.
+    pub reroute_after_progress: bool,
 }
 
 impl RouteTarget {
@@ -72,12 +83,16 @@ impl RouteTarget {
             next_hop: None,
             headers: Vec::new(),
             timeout_secs: None,
+            reroute_after_progress: false,
         }
     }
 
     /// True when this target carries no overrides (serializes as a bare string).
     fn is_bare(&self) -> bool {
-        self.next_hop.is_none() && self.headers.is_empty() && self.timeout_secs.is_none()
+        self.next_hop.is_none()
+            && self.headers.is_empty()
+            && self.timeout_secs.is_none()
+            && !self.reroute_after_progress
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -94,6 +109,10 @@ impl RouteTarget {
         }
         if let Some(timeout) = self.timeout_secs {
             object.insert("timeout".to_string(), json!(timeout));
+        }
+        // Off is the server's default, so only `true` goes on the wire.
+        if self.reroute_after_progress {
+            object.insert("reroute_after_progress".to_string(), json!(true));
         }
         serde_json::Value::Object(object)
     }
@@ -901,7 +920,8 @@ impl Call {
     ///
     /// `targets` is a non-empty ordered list of carriers tried cheapest-first: a
     /// bare URI ([`RouteTarget::uri`] / a `&str`) or a [`RouteTarget`] carrying
-    /// `next_hop` / `headers` / `timeout_secs` overrides. `strategy` defaults to
+    /// `next_hop` / `headers` / `timeout_secs` / `reroute_after_progress`
+    /// overrides. `strategy` defaults to
     /// `"sequential"` when `None` (the server's default; v1 supports only
     /// `sequential`/`single` — anything else resolves to
     /// [`ControlError::is_unsupported_verb`]). `headers` is applied to every
@@ -1775,6 +1795,7 @@ mod tests {
                         next_hop: Some("sip:1.2.3.4:5060".to_string()),
                         headers: vec![("X-Foo".to_string(), "bar".to_string())],
                         timeout_secs: Some(30),
+                        reroute_after_progress: false,
                     },
                 ],
                 Some("sequential"),
@@ -1806,6 +1827,51 @@ mod tests {
                 ],
                 "strategy": "sequential",
                 "headers": { "X-Trace": "abc" }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_sends_reroute_after_progress_only_when_set() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "routing", "targets": 3 }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.route(
+            vec![
+                RouteTarget {
+                    timeout_secs: Some(6),
+                    reroute_after_progress: true,
+                    ..RouteTarget::uri("sip:carrier1@gw1")
+                },
+                RouteTarget {
+                    reroute_after_progress: true,
+                    ..RouteTarget::uri("sip:carrier2@gw2")
+                },
+                RouteTarget {
+                    timeout_secs: Some(6),
+                    ..RouteTarget::uri("sip:carrier3@gw3")
+                },
+            ],
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("route ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(
+            recorded[0].args,
+            json!({
+                "targets": [
+                    { "uri": "sip:carrier1@gw1", "timeout": 6, "reroute_after_progress": true },
+                    // The flag alone is an override, so the target is an object.
+                    { "uri": "sip:carrier2@gw2", "reroute_after_progress": true },
+                    // Off is the server's default and stays off the wire.
+                    { "uri": "sip:carrier3@gw3", "timeout": 6 }
+                ]
             })
         );
     }

@@ -77,10 +77,11 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `currency` | string? | ISO 4217. |
 | `billing_increment` | int? | Seconds (60 = per-minute, 1 = per-second). |
 | `min_duration` | int? | Minimum billable seconds. |
-| `timeout_secs` | int? | Per-attempt ring timeout (else the call-level default). |
+| `timeout_secs` | int? | Per-attempt ring timeout (else the call-level default). Bounds the wait for the carrier to show progress, not for its answer. See [ring timeout and progress](#behavior-notes). |
 | `headers` | object? | Headers to inject on this carrier's B-leg INVITE (applied after the header policy). Dialog headers are refused — see below. |
 | `cdr_fields` | object? | Fields siphon auto-stamps onto the CDR when this carrier wins (no per-field script). |
 | `reroute_causes` | int[]? | SIP codes from this carrier that fail over to the next (overrides per-gateway + global). |
+| `reroute_after_progress` | bool? | `true` fails this carrier over at `timeout_secs` even after it has sent a 101-199, for a carrier that plays its own ringback before it has reached anyone. Default `false`. Omitted when `false`. |
 
 Top-level:
 
@@ -104,6 +105,29 @@ Top-level:
   `gateway.groups[].reroute_causes` > global `lcr.reroute_causes`, default
   `[408, 500, 502, 503, 504]`). A definitive response (486, 603) is forwarded to
   the caller.
+- **Ring timeout and progress**: `timeout_secs` bounds how long siphon waits
+  for a carrier to show progress, not how long it waits for the answer.
+  Progress is any provisional from 101 to 199 from the carrier in flight. A
+  `100 Trying` is hop by hop and does not count. It is the line RFC 3261 §16.7
+  step 2 draws for a proxy's Timer C.
+
+  A carrier that has shown nothing by `timeout_secs` is CANCELled and the next
+  one is dialled. A carrier that has sent a `180` or `183` is ringing the
+  callee, so it keeps the call: its deadline moves to the later of its own
+  `timeout_secs` and the sequence's ring bound (`call.route(timeout=…)`, 30 s by
+  default), both counted from when that carrier was dialled. If that passes too,
+  siphon CANCELs the carrier and fails the call with `408` without trying the
+  rest, and `@b2bua.on_failure` runs as for any other failure. A final failure
+  after progress (a `503`, say) still fails over as usual.
+
+  Some carriers answer `183` with ringback they generate themselves before they
+  have reached anyone. Give such a carrier `reroute_after_progress: true` and it
+  fails over at `timeout_secs` whatever it has sent:
+
+  ```json
+  { "carrier_id": "carrier-x", "gateway_group": "carrier-x",
+    "timeout_secs": 6, "reroute_after_progress": true }
+  ```
 - **`headers` cannot forge a dialog header** — siphon owns the B-leg dialog, so
   `Via`, `Call-ID`, `CSeq`, `Max-Forwards`, `Content-Length`, `From`, `To`,
   `Contact`, `Record-Route` and `Route` are refused from a route's `headers` and

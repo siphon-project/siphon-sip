@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A-leg caller for the progress case in sipp-b2bua-lcr
+     (sipp/b2bua-lcr/, run by run_case.sh).
+
+     The callee +15550100003 is routed over routes.15550100003.json: a ringing
+     carrier and then an untried one, each with timeout_secs 3, under a ring
+     bound of 8 s (b2bua_lcr.py). The ringing carrier answers 183 and holds.
+
+     A 183 is progress (RFC 3261 §16.7 step 2), so the ringing carrier keeps the
+     call past its own 3 s and siphon ends the ring at the 8 s bound, without
+     dialling the untried carrier. What this caller must see:
+       - the 183;
+       - then a 408, with nothing else in between: any other response is
+         unexpected here and fails the call;
+       - that 408 no earlier than 7 s and no later than 10 s after the INVITE.
+         Failing the ringing carrier over at its 3 s would put the untried
+         carrier's own 3 s on top, and the 408 here at about 6 s.
+     Its ACK echoes the 408's To, and siphon has to absorb it: run_case.sh
+     fails the run if the 408 reached this caller more than once. -->
+
+<scenario name="B2BUA LCR caller (a ringing carrier keeps the call past its timeout)">
+
+  <nop>
+    <action>
+      <gettimeofday assign_to="invited_seconds,invited_microseconds" />
+    </action>
+  </nop>
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:+15550100003@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+To: <sip:+15550100003@example.com>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:+15550100001@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="183" />
+
+  <recv response="408" timeout="11000">
+    <action>
+      <gettimeofday assign_to="answered_seconds,answered_microseconds" />
+      <assign assign_to="elapsed" variable="answered_seconds" />
+      <subtract assign_to="elapsed" variable="invited_seconds" />
+      <assign assign_to="fraction" variable="answered_microseconds" />
+      <subtract assign_to="fraction" variable="invited_microseconds" />
+      <divide assign_to="fraction" value="1000000" />
+      <add assign_to="elapsed" variable="fraction" />
+      <test assign_to="too_early" variable="elapsed" compare="less_than" value="7" />
+      <test assign_to="too_late" variable="elapsed" compare="greater_than" value="10" />
+      <log message="408 after [$elapsed] s" />
+    </action>
+  </recv>
+  <nop next="wrong_time" test="too_early" />
+  <nop next="wrong_time" test="too_late" />
+
+  <!-- RFC 3261 §17.1.1.3: the ACK's To is the response's, tag included. -->
+  <send>
+    <![CDATA[
+ACK sip:+15550100003@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Stay in the call past the first three Timer G retransmissions (0.5 s,
+       1.5 s and 3.5 s after the 408, RFC 3261 §17.2.1): an ACK siphon did not
+       absorb shows as a retransmitted 408 in this caller's counts. -->
+  <pause milliseconds="4000" />
+  <nop next="done" />
+
+  <label id="wrong_time" />
+  <nop>
+    <action>
+      <log message="WRONG TIME: the 408 came [$elapsed] s after the INVITE, expected 7 to 10 s" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_TIME" timeout="100" />
+
+  <label id="done" />
+
+</scenario>

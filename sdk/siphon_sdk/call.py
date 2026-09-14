@@ -977,7 +977,12 @@ class Call:
         Args:
             routes: Ordered carriers (cheapest first).
             timeout: Default ring timeout (seconds) for a route without its own
-                ``timeout_secs``.
+                ``timeout_secs``.  Also the ring bound for a carrier that has
+                shown progress (a 101-199): such a carrier keeps the call to the
+                later of its own ``timeout_secs`` and this, counted from its
+                dial, and the call then fails with 408 rather than going to the
+                next carrier (unless the route sets
+                ``reroute_after_progress``).  ``0`` leaves that ring unbounded.
             max_duration: Cap on how long the call may stay answered, in
                 seconds — same semantics as :meth:`dial`.  Per call, not per
                 attempt: ``timeout`` bounds each carrier's ring, but the

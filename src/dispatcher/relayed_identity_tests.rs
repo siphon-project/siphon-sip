@@ -366,6 +366,7 @@ async fn a_relayed_provisional_echoes_the_callers_identity_and_keeps_its_own_to_
     let mut ringing = b_leg_response(180, "Ringing", None, "");
     b_leg_provisional(
         &call_id,
+        B_LEG_BRANCH,
         &mut ringing,
         180,
         carrier,
@@ -377,6 +378,7 @@ async fn a_relayed_provisional_echoes_the_callers_identity_and_keeps_its_own_to_
     let mut progress = b_leg_response(183, "Session Progress", Some("carrier-tag"), "");
     b_leg_provisional(
         &call_id,
+        B_LEG_BRANCH,
         &mut progress,
         183,
         carrier,

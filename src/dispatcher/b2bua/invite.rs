@@ -815,6 +815,8 @@ pub fn apply_routing_action(
                     active: None,
                     attempts: Vec::new(),
                     active_since: None,
+                    active_progressed: false,
+                    active_legs_start: 0,
                     send_socket,
                     default_timeout,
                 },

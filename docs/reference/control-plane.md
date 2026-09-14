@@ -278,7 +278,13 @@ chunk, so logs join Homer and billing with no mapping table.
 `route` is the consult-and-return flow: an app parks a call (deferred handover),
 decides routing out-of-process (LCR / rating / business logic), then hands
 control back to siphon with the decision. `targets` is a non-empty array of
-either bare URI strings or objects `{uri, next_hop?, headers?, timeout?}`;
+either bare URI strings or objects
+`{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`. A target's
+`timeout` bounds the wait for that carrier to show progress (a 101-199); a
+carrier that has keeps the call to the later of its `timeout` and 30 s, then
+the call fails with `408` rather than trying the next target, unless the target
+sets `reroute_after_progress: true` (see
+[ring timeout and progress](../cookbook/least-cost-routing.md#ring-timeout-and-progress)).
 `strategy` defaults to `"sequential"` (v1 runs the LCR sequential-failover
 engine only, so anything else is a typed `unsupported_verb`, never a silent
 sequential); `headers` is an optional object applied to every attempt's B-leg

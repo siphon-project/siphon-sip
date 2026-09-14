@@ -150,8 +150,19 @@ export interface RouteTargetObject {
   nextHop?: string;
   /** Headers injected on this attempt's B-leg INVITE. */
   headers?: Record<string, string>;
-  /** Per-target ring timeout in seconds. */
+  /**
+   * Per-target ring timeout in seconds. It bounds the wait for this carrier to
+   * show progress (a 101-199), not the wait for its answer.
+   */
   timeout?: number;
+  /**
+   * Fail this carrier over at its ring timeout even after it has shown
+   * progress. By default a carrier that has sent a 180/183 keeps the call past
+   * `timeout`, and the call then fails with 408 rather than trying the next
+   * target; `true` is for a carrier that plays its own ringback before it has
+   * reached anyone. Default `false`, which is never sent.
+   */
+  rerouteAfterProgress?: boolean;
 }
 
 /**
@@ -173,6 +184,10 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   if (target.timeout !== undefined) {
     object.timeout = target.timeout;
+  }
+  // Off is the server's default, so only `true` goes on the wire.
+  if (target.rerouteAfterProgress === true) {
+    object.reroute_after_progress = true;
   }
   return object;
 }
@@ -526,7 +541,9 @@ export class Call {
    *
    * `targets` is a non-empty list of carriers tried cheapest-first: each entry
    * is a bare URI string or a {@link RouteTargetObject}
-   * (`{uri, nextHop?, headers?, timeout?}`). `strategy` defaults to
+   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?}`). A target
+   * that has shown progress keeps the call past its `timeout` unless it sets
+   * `rerouteAfterProgress`. `strategy` defaults to
    * `"sequential"` (v1 supports only sequential/single — anything else rejects
    * with `code === "unsupported_verb"`). `headers` is applied to every
    * attempt's B-leg INVITE.

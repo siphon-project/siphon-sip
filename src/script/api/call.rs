@@ -1833,6 +1833,9 @@ impl PyCall {
                     let routing = crate::proxy::core::branch_routing(path, &uri);
                     let mut route = crate::lcr::Route {
                         ruri: Some(uri),
+                        // A hunt: every phone that rings sends a 180, so each
+                        // target moves on at its timeout, rung or not.
+                        reroute_after_progress: true,
                         ..Default::default()
                     };
                     if let Some(routing) = routing {
@@ -3491,6 +3494,9 @@ mod tests {
                     assert_eq!(routes[1].ruri.as_deref(), Some("sip:carol@10.0.0.4"));
                     assert!(routes[1].next_hop.is_none());
                     assert!(routes[1].headers.is_empty());
+                    // A hunt through phones, each of which sends a 180 when it
+                    // rings: every target moves on at its timeout, rung or not.
+                    assert!(routes.iter().all(|route| route.reroute_after_progress));
                 }
                 other => panic!("expected RouteSequence, got {other:?}"),
             }

@@ -87,8 +87,10 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
 
 - Dials the first routable carrier and arms its ring timeout (`timeout_secs`,
   else `call.route(timeout=…)`, else 30s).
-- On a carrier **reject** (4xx/5xx) or **ring-timeout**, advances to the next
-  carrier — a **fresh B-leg dialog** each time.
+- On a carrier **reject** (4xx/5xx), or a **ring-timeout** before the carrier
+  has shown progress, advances to the next carrier, a **fresh B-leg dialog**
+  each time. A carrier that has sent a `180`/`183` keeps the call past its
+  `timeout_secs`; see [ring timeout and progress](#ring-timeout-and-progress).
 - A `6xx` from a carrier stops the sequence (global rejection, RFC 3261 §16.7
   spirit).
 - The A-leg receives a failure only once **every** carrier is exhausted, and it
@@ -171,7 +173,55 @@ billing pipeline instead of only in the log.
 `call.fork(strategy="sequential")` uses the same engine for a bare target list
 (this now actually fails over — previously the strategy was ignored). Captured
 inbound flows (WebSocket connection reuse) are not carried on the sequential
-path; use `strategy="parallel"` for WebSocket callees.
+path; use `strategy="parallel"` for WebSocket callees. A sequential fork is a
+hunt through phones, and every phone that rings sends a `180`, so its targets
+move on when their `timeout` passes whether they rang or not: the progress rule
+below applies to LCR carriers, not to fork targets. A sequential `dial` on the
+control plane hunts the same way.
+
+## Ring timeout and progress
+
+A route's `timeout_secs` bounds how long siphon waits for the carrier to **show
+progress**, not how long it waits for the answer. Progress is any provisional
+from 101 to 199 from the carrier in flight. A `100 Trying` is hop by hop and
+does not count. That is the same line RFC 3261 §16.7 step 2 draws for a proxy's
+Timer C: once the next hop sends something past a 100, it is working on the
+request.
+
+- **No progress by `timeout_secs`**: siphon CANCELs the carrier and dials the
+  next one, fast failover for a carrier that is down or black-holing calls.
+- **Progress before it**: the carrier is ringing the callee, and cutting it off
+  would drop the caller mid-ring onto a carrier that has to start again. Its
+  deadline moves to the later of its own `timeout_secs` and the sequence's ring
+  bound (`call.route(timeout=…)`, 30 s by default), both counted from when that
+  carrier was dialled, so progress never shortens a ring. If that deadline
+  passes too, siphon CANCELs the carrier and fails the call with `408` without
+  trying the remaining carriers. `@b2bua.on_failure` runs as for any other
+  failure and can still route the call somewhere else.
+- A **final failure** after progress (a `503`, say) still fails over as usual.
+  Only the timeout changes.
+- With `call.route(timeout=0)` there is no ring bound, so a carrier that has
+  shown progress rings until it answers, fails or the caller hangs up.
+
+```python
+call.route(decision.routes, timeout=45)   # a ringing carrier gets up to 45 s
+```
+
+```json
+{ "carrier_id": "carrier-a", "gateway_group": "carrier-a", "timeout_secs": 6 }
+```
+
+Here carrier-a has 6 s to send a `180`/`183`. If it does, it rings for up to 45 s
+from its dial before the call fails with `408`.
+
+Some carriers answer `183` with ringback they generate themselves, before they
+have reached anyone. That reads as progress it does not have, so the API can put
+one carrier back on failing over at `timeout_secs` whatever it has sent:
+
+```json
+{ "carrier_id": "carrier-x", "gateway_group": "carrier-x",
+  "timeout_secs": 6, "reroute_after_progress": true }
+```
 
 ## Gateway integration
 

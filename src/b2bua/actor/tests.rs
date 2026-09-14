@@ -95,6 +95,181 @@ fn lcr_route(carrier: &str) -> crate::lcr::Route {
 
 // --- LCR sequential-failover state tests ---
 
+/// A sequence of two carriers, each with `timeout_secs`, under a ring bound of
+/// `ring_bound_secs` (what `call.route(timeout=…)` sets).
+fn ringing_sequence(timeout_secs: u32, ring_bound_secs: u32) -> CallActor {
+    let mut actor = CallActor::new(make_a_leg());
+    actor.route_sequence = Some(RouteSequenceState {
+        pending: ["a", "b"]
+            .into_iter()
+            .map(|carrier| crate::lcr::Route {
+                timeout_secs: Some(timeout_secs),
+                ..lcr_route(carrier)
+            })
+            .collect(),
+        default_timeout: ring_bound_secs,
+        ..Default::default()
+    });
+    actor
+}
+
+/// Dial the next carrier the way the dispatcher does: take it, put its B-leg
+/// on the call, and arm its own ring timeout from the dial. Returns the leg's
+/// Via branch and the instant the attempt counts from.
+fn dial_next_carrier(actor: &mut CallActor, leg_index: usize) -> (String, Instant) {
+    let route = actor.take_next_route().expect("a carrier to dial");
+    let leg = make_sent_b_leg(leg_index);
+    let branch = leg.branch.clone();
+    actor.add_b_leg(leg);
+    let dialled = actor
+        .route_sequence
+        .as_ref()
+        .and_then(|sequence| sequence.active_since)
+        .expect("the attempt's dial time");
+    actor.answer_deadline =
+        Some(dialled + Duration::from_secs(u64::from(route.timeout_secs.unwrap_or(30))));
+    (branch, dialled)
+}
+
+/// Progress is a 101-199 on the attempt in flight (RFC 3261 §16.7 step 2), and
+/// only the first one moves the deadline: to the sequence's ring bound, counted
+/// from the dial.
+#[test]
+fn progress_is_a_101_to_199_on_the_attempt_in_flight() {
+    let mut actor = ringing_sequence(2, 5);
+    let (branch, dialled) = dial_next_carrier(&mut actor, 0);
+    let own_deadline = actor.answer_deadline;
+
+    assert!(
+        !actor.record_route_progress(&branch, 100),
+        "100 is hop-by-hop"
+    );
+    assert!(
+        !actor.record_route_progress(&branch, 200),
+        "a 2xx is no provisional"
+    );
+    assert!(!actor.route_kept_by_progress());
+    assert_eq!(actor.answer_deadline, own_deadline);
+
+    assert!(actor.record_route_progress(&branch, 180));
+    assert!(actor.route_kept_by_progress());
+    assert_eq!(
+        actor.answer_deadline,
+        Some(dialled + Duration::from_secs(5))
+    );
+
+    assert!(
+        !actor.record_route_progress(&branch, 183),
+        "only the first provisional is the attempt's progress"
+    );
+    assert_eq!(
+        actor.answer_deadline,
+        Some(dialled + Duration::from_secs(5))
+    );
+}
+
+#[test]
+fn progress_never_shortens_a_ring() {
+    let mut actor = ringing_sequence(8, 5);
+    let (branch, dialled) = dial_next_carrier(&mut actor, 0);
+
+    assert!(actor.record_route_progress(&branch, 183));
+    assert_eq!(
+        actor.answer_deadline,
+        Some(dialled + Duration::from_secs(8)),
+        "the route's own timeout is longer than the ring bound, and stands"
+    );
+}
+
+/// A leg from an earlier attempt, whether CANCELled or not, cannot mark the
+/// carrier in flight: its provisional says nothing about that carrier.
+#[test]
+fn a_provisional_on_an_earlier_attempts_leg_is_not_progress() {
+    let mut actor = ringing_sequence(2, 5);
+    let (first_branch, _) = dial_next_carrier(&mut actor, 0);
+    actor.cancel_pending_branches(None);
+    let (second_branch, _) = dial_next_carrier(&mut actor, 1);
+
+    assert!(!actor.record_route_progress(&first_branch, 183));
+    assert!(!actor.route_kept_by_progress());
+
+    // Nor while the earlier leg is still pending: a carrier that answered a
+    // final response on the failover path is not marked settled, and its leg
+    // is the newest one until the next carrier's is added.
+    let mut actor = ringing_sequence(2, 5);
+    let (first_branch, _) = dial_next_carrier(&mut actor, 0);
+    actor.take_next_route().expect("the second carrier");
+    assert!(!actor.record_route_progress(&first_branch, 183));
+    assert!(!actor.route_kept_by_progress());
+
+    let mut actor = ringing_sequence(2, 5);
+    dial_next_carrier(&mut actor, 0);
+    let (second_branch_again, _) = dial_next_carrier(&mut actor, 1);
+    assert_eq!(second_branch, second_branch_again);
+    assert!(actor.record_route_progress(&second_branch_again, 183));
+    assert!(actor.route_kept_by_progress());
+}
+
+#[test]
+fn taking_the_next_carrier_clears_the_progress_of_the_last() {
+    let mut actor = ringing_sequence(2, 5);
+    let (branch, _) = dial_next_carrier(&mut actor, 0);
+    assert!(actor.record_route_progress(&branch, 180));
+    assert!(actor.route_kept_by_progress());
+
+    dial_next_carrier(&mut actor, 1);
+    assert!(!actor.route_kept_by_progress());
+}
+
+/// The opt-out still records that the carrier showed progress, but its ring
+/// timeout stands and it is not kept.
+#[test]
+fn a_route_that_reroutes_after_progress_keeps_its_own_deadline() {
+    let mut actor = CallActor::new(make_a_leg());
+    actor.route_sequence = Some(RouteSequenceState {
+        pending: [crate::lcr::Route {
+            timeout_secs: Some(2),
+            reroute_after_progress: true,
+            ..lcr_route("a")
+        }]
+        .into_iter()
+        .collect(),
+        default_timeout: 5,
+        ..Default::default()
+    });
+    let (branch, _) = dial_next_carrier(&mut actor, 0);
+    let own_deadline = actor.answer_deadline;
+
+    assert!(actor.record_route_progress(&branch, 183));
+    assert!(!actor.route_kept_by_progress());
+    assert_eq!(actor.answer_deadline, own_deadline);
+}
+
+/// `timeout=0` is no ring bound, as it is for a dial.
+#[test]
+fn a_ring_bound_of_zero_leaves_a_progressed_ring_unbounded() {
+    let mut actor = ringing_sequence(2, 0);
+    let (branch, _) = dial_next_carrier(&mut actor, 0);
+
+    assert!(actor.record_route_progress(&branch, 183));
+    assert!(actor.route_kept_by_progress());
+    assert!(actor.answer_deadline.is_none());
+}
+
+#[test]
+fn a_call_without_a_route_sequence_records_no_progress() {
+    let mut actor = CallActor::new(make_a_leg());
+    let leg = make_sent_b_leg(0);
+    let branch = leg.branch.clone();
+    actor.add_b_leg(leg);
+    assert!(!actor.record_route_progress(&branch, 180));
+    assert!(!actor.route_kept_by_progress());
+
+    let store = CallActorStore::new();
+    assert!(!store.record_route_progress("no-such-call", &branch, 180));
+    assert!(!store.route_kept_by_progress("no-such-call"));
+}
+
 #[test]
 fn route_sequence_pops_in_order_and_drains() {
     let mut actor = CallActor::new(make_a_leg());
@@ -1361,6 +1536,8 @@ fn a_failure_reroute_clears_the_failed_routing_and_counts_itself() {
         active: None,
         attempts: Vec::new(),
         active_since: None,
+        active_progressed: false,
+        active_legs_start: 0,
         send_socket: None,
         default_timeout: 30,
     });

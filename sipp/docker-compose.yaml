@@ -6993,6 +6993,8 @@ services:
   #   172.20.0.198  carrier A (503, no provisional)
   #   172.20.0.199  carrier B (183, then 404)
   #   172.20.0.202  caller
+  #   172.20.0.203  ringing carrier (progress case: 183, then held until CANCEL)
+  #   172.20.0.204  untried carrier (progress case: must never be dialled)
   siphon-b2bua-lcr:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
@@ -7118,6 +7120,59 @@ services:
       - "30"
       - -timeout_error
       - -trace_err
+    profiles:
+      - b2bua-lcr
+
+  # The progress case (b2bua_lcr_progress_ring_bound_uac.xml): the callee
+  # +15550100003 is routed over b2bua-lcr/routes.15550100003.json, both routes
+  # with timeout_secs 3, under a ring bound of 8 s (b2bua_lcr.py).
+  sipp-b2bua-lcr-ringing-carrier-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-ringing-carrier-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.203
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_progress_held_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-lcr
+
+  # Graded by SIPp's exit code (see b2bua_lcr_untried_carrier_uas.xml): 97, the
+  # -timeout window ending with no call, is the only pass. No -timeout_error,
+  # which turns that same outcome into 255. The 20 s window outlasts the call,
+  # whose 408 reaches the caller within 10 s of its INVITE.
+  sipp-b2bua-lcr-untried-carrier-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-untried-carrier-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.204
+    entrypoint:
+      - sh
+      - -c
+      - |
+        sipp -sf /sipp/scenarios/b2bua_lcr_untried_carrier_uas.xml -p 5060 -m 1 -timeout 20 -trace_err
+        code=$$?
+        if [ "$$code" = "97" ]; then
+          echo "untried carrier: no INVITE within the 20 s window"
+          exit 0
+        fi
+        echo "untried carrier: SIPp exited $$code, and only 97 (no INVITE in the window) passes"
+        exit 1
     profiles:
       - b2bua-lcr
 

@@ -34,6 +34,22 @@ class TestContract:
         assert "tech_prefix" not in data
         assert "headers" not in data
         assert "reroute_causes" not in data
+        assert "reroute_after_progress" not in data
+
+    def test_reroute_after_progress_defaults_off(self):
+        # A carrier that has shown progress keeps the call unless the API
+        # says otherwise, and an API that never sets the field sends nothing.
+        assert Route(carrier_id="c", next_hop="sip:h").reroute_after_progress is False
+        assert Route.from_dict({"carrier_id": "c"}).reroute_after_progress is False
+
+    def test_reroute_after_progress_round_trips(self):
+        route = Route(
+            carrier_id="carrier-a", gateway_group="pool-a", timeout_secs=6,
+            reroute_after_progress=True,
+        )
+        data = route.to_dict()
+        assert data["reroute_after_progress"] is True
+        assert Route.from_dict(data) == route
 
     def test_request_from_to_aliasing(self):
         request = LcrRequest(

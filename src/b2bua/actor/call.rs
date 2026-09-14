@@ -206,6 +206,16 @@ pub struct RouteSequenceState {
     pub attempts: Vec<RouteAttempt>,
     /// When the in-flight attempt was dialled, for its elapsed time.
     pub active_since: Option<std::time::Instant>,
+    /// Whether the in-flight attempt has shown progress: a 101-199 on its own
+    /// B-leg. Cleared when the next carrier is taken, so one carrier's progress
+    /// never keeps the carrier after it. See
+    /// [`CallActor::record_route_progress`].
+    pub active_progressed: bool,
+    /// Where the in-flight attempt's legs start in [`CallActor::b_legs`]; the
+    /// legs before it belong to carriers already tried. Taken with the carrier,
+    /// before its INVITE exists, so a late provisional from an earlier carrier
+    /// never reads as this one's progress.
+    pub active_legs_start: usize,
     /// Call-level send-socket egress pin applied to every attempt.
     pub send_socket: Option<String>,
     /// Ring timeout (seconds) for a route that omits its own `timeout_secs`.
@@ -521,11 +531,84 @@ impl CallActor {
     /// a clone. `None` when this is not a sequential call or the queue is empty
     /// (all carriers exhausted).
     pub fn take_next_route(&mut self) -> Option<crate::lcr::Route> {
+        let legs_so_far = self.b_legs.len();
         let sequence = self.route_sequence.as_mut()?;
         let route = sequence.pending.pop_front()?;
         sequence.active = Some(route.clone());
         sequence.active_since = Some(std::time::Instant::now());
+        sequence.active_progressed = false;
+        sequence.active_legs_start = legs_so_far;
         Some(route)
+    }
+
+    /// Note a provisional `status_code` on the B-leg `branch` of a sequential
+    /// failover call. Returns whether it was the in-flight attempt's first
+    /// progress.
+    ///
+    /// Progress is a 101-199. RFC 3261 §16.7 step 2 resets a proxy's Timer C on
+    /// any provisional but a 100, which is hop-by-hop and says nothing about the
+    /// far end. It counts only on a still-pending leg of the attempt in flight,
+    /// so a late provisional from a carrier already tried, CANCELled or not,
+    /// cannot mark the carrier after it.
+    ///
+    /// The first one moves the answer deadline to the later of the route's own
+    /// and the sequence's ring bound, both counted from the dial, so progress
+    /// never shortens a ring. A ring bound of 0 is no bound, as `timeout=0` is
+    /// for a dial; a deadline that was never armed stays unarmed. A route with
+    /// `reroute_after_progress` is recorded as having shown progress but keeps
+    /// its own deadline, and [`route_kept_by_progress`](Self::route_kept_by_progress)
+    /// stays false for it.
+    pub fn record_route_progress(&mut self, branch: &str, status_code: u16) -> bool {
+        if !(101..=199).contains(&status_code) {
+            return false;
+        }
+        let Some(index) = self.b_legs.iter().position(|leg| leg.branch == branch) else {
+            return false;
+        };
+        if !self.is_pending_branch(index) {
+            return false;
+        }
+        let answer_deadline = self.answer_deadline;
+        let Some(sequence) = self.route_sequence.as_mut() else {
+            return false;
+        };
+        if sequence.active_progressed || index < sequence.active_legs_start {
+            return false;
+        }
+        let Some(reroute_after_progress) = sequence
+            .active
+            .as_ref()
+            .map(|route| route.reroute_after_progress)
+        else {
+            return false;
+        };
+        sequence.active_progressed = true;
+        if reroute_after_progress {
+            return true;
+        }
+        let ring_bound = sequence.default_timeout;
+        if let (Some(deadline), Some(dialled)) = (answer_deadline, sequence.active_since) {
+            self.answer_deadline = match ring_bound {
+                0 => None,
+                seconds => {
+                    Some(deadline.max(dialled + std::time::Duration::from_secs(u64::from(seconds))))
+                }
+            };
+        }
+        true
+    }
+
+    /// Whether the carrier in flight has shown progress and so keeps the call
+    /// past its ring timeout: when its deadline fires the call fails rather than
+    /// advancing. See [`record_route_progress`](Self::record_route_progress).
+    pub fn route_kept_by_progress(&self) -> bool {
+        self.route_sequence.as_ref().is_some_and(|sequence| {
+            sequence.active_progressed
+                && sequence
+                    .active
+                    .as_ref()
+                    .is_some_and(|route| !route.reroute_after_progress)
+        })
     }
 
     /// Record a failed attempt against the carrier that was in flight. No-op for

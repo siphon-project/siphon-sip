@@ -1,7 +1,7 @@
 //! A [`DispatcherState`] for tests that drive the dispatcher's own send paths
 //! and read back what went on the wire.
 //!
-//! Configured with no more than a B2BUA call needs: no script handlers, no media
+//! Configured with no more than a B2BUA call needs: no script handlers unless the test passes a script, no media
 //! engine, no charging. Its UDP egress is a channel the test reads, so a test
 //! asserts on the bytes a peer would have been sent rather than on an
 //! intermediate value.
@@ -17,6 +17,12 @@ pub(super) struct TestDispatcher {
 
 /// Build a [`TestDispatcher`] bound to `192.0.2.1:5060`.
 pub(super) fn test_dispatcher() -> TestDispatcher {
+    test_dispatcher_with_script("")
+}
+
+/// [`test_dispatcher`] running `source` as its script, for a test that needs a
+/// handler (`@b2bua.on_failure`, say) to run.
+pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
     // The connection pool's TLS client config needs a process-wide provider.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
@@ -47,7 +53,7 @@ pub(super) fn test_dispatcher() -> TestDispatcher {
         .expect("an outbound TLS config"),
     ));
     let state = DispatcherState {
-        engine: Arc::new(ScriptEngine::new_embedded("").expect("an empty script compiles")),
+        engine: Arc::new(ScriptEngine::new_embedded(source).expect("the test script compiles")),
         outbound: Arc::clone(&outbound),
         local_domains: Arc::new(vec!["siphon.example.com".to_string()]),
         self_identity: Arc::new(crate::proxy::core::SelfIdentity::new()),

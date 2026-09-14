@@ -283,6 +283,19 @@ pub struct Route {
     /// then global set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reroute_causes: Vec<u16>,
+    /// Fail this carrier over when `timeout_secs` passes, even after it has
+    /// shown progress.
+    ///
+    /// A route's `timeout_secs` bounds the wait for the carrier to show
+    /// progress: any provisional from 101 to 199, the line RFC 3261 §16.7 step
+    /// 2 draws for a proxy's Timer C. Once a carrier has, it keeps the call
+    /// until the later of its own timeout and the sequence's ring bound, both
+    /// counted from its dial, and the call then fails with 408 instead of going
+    /// to the next carrier. A carrier that answers 183 with ringback of its own
+    /// before it has reached anyone shows progress it does not have; `true`
+    /// puts that one carrier back on failing over at `timeout_secs`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reroute_after_progress: bool,
 }
 
 impl Route {
@@ -701,8 +714,9 @@ mod tests {
         let json = r#"{ "carrier_id": "carrier-a", "gateway_group": "pool-a",
             "tech_prefix": "1010288", "number_policy": "pstn-national@2026",
             "headers": { "X-Account": "42" }, "cdr_fields": { "billing_id": "B-9" },
-            "reroute_causes": [404, 503] }"#;
+            "reroute_causes": [404, 503], "reroute_after_progress": true }"#;
         let route: Route = serde_json::from_str(json).expect("parse route");
+        assert!(route.reroute_after_progress);
         assert_eq!(route.tech_prefix.as_deref(), Some("1010288"));
         assert_eq!(route.number_policy.as_deref(), Some("pstn-national@2026"));
         assert_eq!(
@@ -725,9 +739,14 @@ mod tests {
         assert!(minimal.tech_prefix.is_none());
         assert!(minimal.headers.is_empty());
         assert!(minimal.reroute_causes.is_empty());
+        assert!(
+            !minimal.reroute_after_progress,
+            "a carrier that has shown progress keeps the call unless the API says otherwise"
+        );
         let wire = serde_json::to_string(&minimal).unwrap();
         assert!(!wire.contains("tech_prefix"));
         assert!(!wire.contains("reroute_causes"));
+        assert!(!wire.contains("reroute_after_progress"));
     }
 
     #[test]

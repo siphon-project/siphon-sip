@@ -335,6 +335,32 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("route — sends reroute_after_progress only when true", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 3 });
+    const call = makeCall(transport);
+    await call.route([
+      { uri: "sip:carrier1@gw1", timeout: 6, rerouteAfterProgress: true },
+      { uri: "sip:carrier2@gw2", rerouteAfterProgress: false },
+      { uri: "sip:carrier3@gw3", timeout: 6 },
+    ]);
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "route",
+        target: { channel: "ch1" },
+        args: {
+          targets: [
+            { uri: "sip:carrier1@gw1", timeout: 6, reroute_after_progress: true },
+            // Off is the server's default and stays off the wire.
+            { uri: "sip:carrier2@gw2" },
+            { uri: "sip:carrier3@gw3", timeout: 6 },
+          ],
+          strategy: "sequential",
+        },
+      },
+    ]);
+  });
+
   it("route — defaults strategy to sequential, omits headers when unset", async () => {
     const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
     const call = makeCall(transport);

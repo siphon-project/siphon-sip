@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "carrier_id": "carrier-ringing",
+      "next_hop": "sip:172.20.0.203:5060",
+      "timeout_secs": 3
+    },
+    {
+      "carrier_id": "carrier-untried",
+      "next_hop": "sip:172.20.0.204:5060",
+      "timeout_secs": 3
+    }
+  ],
+  "cache_ttl_secs": 0
+}

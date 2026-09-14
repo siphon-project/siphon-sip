@@ -24,7 +24,14 @@ pub fn set_b2bua_answer_deadline(call_id: &str, timeout_secs: u32, state: &Dispa
 /// carrier, or 408 to the A-leg when the list is exhausted) — see
 /// [`fail_b2bua_call_on_timeout`].
 pub fn check_b2bua_answer_timeouts(state: &DispatcherState) {
-    let now = std::time::Instant::now();
+    check_b2bua_answer_timeouts_at(state, std::time::Instant::now());
+}
+
+/// [`check_b2bua_answer_timeouts`] as of `now`.
+///
+/// The deadlines are `std::time::Instant`s, which a paused tokio clock does not
+/// move, so this is how a test steps past one without waiting it out.
+pub fn check_b2bua_answer_timeouts_at(state: &DispatcherState, now: std::time::Instant) {
     for timed_out in state.call_actors.take_timed_out_calls(now) {
         fail_b2bua_call_on_timeout(&timed_out, state);
     }
@@ -220,7 +227,31 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // LCR / sequential failover: the current carrier did not answer within its
     // ring timeout. If more carriers remain and 408 is a reroute cause for this
     // carrier, CANCEL this attempt and advance instead of failing the call.
-    if state.call_actors.has_pending_routes(call_id) && b2bua_status_reroutes(call_id, 408, state) {
+    //
+    // Unless the carrier has shown progress. A 101-199 says it reached the far
+    // end and is working on the call, so its route's timer bounded only the wait
+    // for that (RFC 3261 §16.7 step 2, a proxy's Timer C), and the deadline that
+    // fired is the ring bound it was given instead. The callee has rung as long
+    // as this call allows, so it fails 408 here rather than going to a carrier
+    // that would start ringing again. `reroute_after_progress` on a route keeps
+    // the old rule for a carrier that fakes progress with its own ringback.
+    let kept_by_progress = state.call_actors.route_kept_by_progress(call_id);
+    if kept_by_progress && state.call_actors.has_pending_routes(call_id) {
+        let carrier = state
+            .call_actors
+            .active_route(call_id)
+            .map(|route| route.carrier_id)
+            .unwrap_or_default();
+        info!(
+            call_id = %call_id,
+            carrier = %carrier,
+            "LCR: carrier showed progress and rang out, failing the call 408 without trying the remaining carriers"
+        );
+    }
+    if !kept_by_progress
+        && state.call_actors.has_pending_routes(call_id)
+        && b2bua_status_reroutes(call_id, 408, state)
+    {
         // A ring timeout is recorded as 408 — the code the attempt effectively
         // ended on, and the one the A-leg would have seen had the queue been
         // exhausted here.

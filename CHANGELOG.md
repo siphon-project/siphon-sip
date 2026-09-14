@@ -500,6 +500,37 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   Code that builds them as struct literals has to set it; `None` keeps the old
   meaning. `Contact` grows from 320 to 336 bytes, which moves a one-binding
   AoR's allocation from the 320 to the 384 byte jemalloc size class.
+- **An LCR carrier that has shown progress keeps the call past its
+  `timeout_secs`.** A route's ring timeout used to CANCEL the carrier and dial
+  the next one whatever the carrier had sent, so a carrier already ringing the
+  callee was failed over exactly like one that never answered. Every callee
+  slower to pick up than `timeout_secs` was cut off mid-ring and handed to a
+  carrier that had to start again, and the only lever was a long `timeout_secs`
+  on every carrier, which gave up fast failover from a carrier that is down.
+
+  A route's timer now bounds the wait for progress, the line RFC 3261 §16.7
+  step 2 draws for a proxy's Timer C: any provisional from 101 to 199 from the
+  carrier in flight (not a 100, which is hop by hop). Before progress nothing
+  changes. After it, the attempt's deadline moves to the later of the route's
+  own `timeout_secs` and the sequence's ring bound (`call.route(timeout=…)`,
+  30 s by default), both counted from that carrier's dial. If that passes,
+  siphon CANCELs the carrier and fails the call with 408 without trying the
+  rest, and `@b2bua.on_failure` runs as for any other failure. A final failure
+  after progress still fails over as before, and with `call.route(timeout=0)` a
+  carrier that has shown progress rings unbounded.
+
+  A carrier that answers 183 with its own ringback before it has reached anyone
+  can have the old behaviour back: `reroute_after_progress: true` on its route,
+  in the LCR API answer or on a control-plane `route` target (default `false`,
+  also on the SDK `Route` and the script `Route`). The control-plane client SDKs
+  send it on a `route` target too, and only when it is true:
+  `RouteTarget::reroute_after_progress` in Rust (a new public field, so a struct
+  literal needs it or `..RouteTarget::default()`), a `"reroute_after_progress"`
+  key in a Python target dict (anything but a bool raises `TypeError`), and
+  `rerouteAfterProgress` in TypeScript. `call.fork(strategy="sequential")`
+  and a sequential control-plane `dial` keep moving to the next target when one
+  rings out, since a hunt through phones is exactly that.
+
 - **Crate embedders: `diameter::rx::SpecificAction::IndicationOfEstablishmentOfBearer`
   is gone and `SpecificAction::IpCanChange` is now 6.** Code matching on the
   removed variant, or relying on the old discriminant of `IpCanChange`, has to

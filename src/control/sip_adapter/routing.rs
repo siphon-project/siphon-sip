@@ -9,7 +9,7 @@ use crate::control::registry::ChannelRef;
 /// failover; siphon owns the call thereafter and the control app is released.
 ///
 /// `args.targets` is a non-empty array of either bare URI strings or objects
-/// `{uri, next_hop?, headers?, timeout?}`; `args.strategy` defaults to
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`; `args.strategy` defaults to
 /// `"sequential"` (v1 supports only sequential/single — anything else is a typed
 /// error, never a silent sequential); `args.headers` is an optional object
 /// applied to every attempt's B-leg INVITE.
@@ -205,7 +205,7 @@ pub(super) fn parse_dial_target(
 }
 
 /// Parse one `targets[]` entry: a bare URI string, or an object
-/// `{uri, next_hop?, headers?, timeout?}`.
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`.
 pub(super) fn parse_route_target(
     item: &serde_json::Value,
 ) -> Result<crate::dispatcher::RouteTarget, String> {
@@ -215,6 +215,7 @@ pub(super) fn parse_route_target(
             next_hop: None,
             headers: Vec::new(),
             timeout_secs: None,
+            reroute_after_progress: false,
         });
     }
     let Some(object) = item.as_object() else {
@@ -238,11 +239,20 @@ pub(super) fn parse_route_target(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .map(|t| t as u32);
+    // A policy flag: a value that is not a boolean is refused rather than read
+    // as `false`, which would quietly keep the carrier on the default rule.
+    let reroute_after_progress = match object.get("reroute_after_progress") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
+    };
     Ok(crate::dispatcher::RouteTarget {
         uri: uri.to_string(),
         next_hop,
         headers,
         timeout_secs,
+        reroute_after_progress,
     })
 }
 
