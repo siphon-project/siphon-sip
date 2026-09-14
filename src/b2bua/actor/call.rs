@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::sip::best_response::ResponseRank;
 use crate::sip::message::SipMessage;
-use crate::transport::Transport;
 
 use super::*;
 
@@ -1100,22 +1099,6 @@ impl CallActor {
 // CallActorStore — manages all active calls
 // ---------------------------------------------------------------------------
 
-/// Lightweight state kept after call teardown so retransmitted re-INVITE
-/// 200 OKs can still be ACKed (RFC 3261 §13.2.2.4).
-///
-/// When BYE removes a call, any `reinvite_done:` B-leg entries are moved
-/// here. Entries auto-expire after 32 seconds (Timer H).
-#[derive(Debug, Clone)]
-pub struct ZombieReInviteEntry {
-    /// Where to send the ACK.
-    pub destination: SocketAddr,
-    /// Transport protocol for the ACK.
-    pub transport: Transport,
-    /// Local listener the ACK must leave from (the anchored leg's socket), when
-    /// known. Preserves multi-homed source-port parity for the post-teardown
-    /// re-ACK; `None` falls back to the default egress (single-listener hosts).
-    pub local_addr: Option<SocketAddr>,
-}
 /// Post-teardown state for a leg whose INVITE was CANCELled but is still owed a
 /// final response.
 ///

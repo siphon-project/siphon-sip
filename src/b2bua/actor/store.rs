@@ -52,8 +52,6 @@ pub struct CallActorStore {
     calls: DashMap<String, Box<CallActor>>,
     /// SIP identifier routing table.
     pub registry: LegRegistry,
-    /// Post-teardown re-INVITE ACK absorber, keyed by B-leg SIP Call-ID.
-    pub zombie_reinvites: DashMap<String, ZombieReInviteEntry>,
     /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
     /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
     pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
@@ -76,7 +74,6 @@ impl CallActorStore {
         Self {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
-            zombie_reinvites: DashMap::new(),
             zombie_cancelled: DashMap::new(),
             terminated: DashMap::new(),
             terminated_order: Mutex::new(VecDeque::new()),
@@ -1161,8 +1158,9 @@ impl CallActorStore {
     /// Remove a call and clean up all registry entries.
     ///
     /// Sends `Shutdown` to all active B-leg actor handles before removing.
-    /// B-leg entries with `reinvite_done:` or `reinvite:` target_uri are moved
-    /// to `zombie_reinvites` so retransmitted 200 OKs can still be ACKed.
+    /// Nothing is kept for a re-INVITE still in flight: its 2xx carries
+    /// everything its ACK needs, and the dispatcher ACKs it from the response
+    /// alone when it arrives.
     ///
     /// Every leg's SIP Call-ID is remembered as terminated on the way out, so an
     /// in-dialog request that arrives after the teardown — the BYE glare where
@@ -1192,36 +1190,13 @@ impl CallActorStore {
             self.registry.remove_call_id(&call.a_leg.dialog.call_id);
             self.registry.remove_branch(&call.a_leg.branch);
             self.remember_terminated(&call.a_leg.dialog.call_id);
-            // Clean up B-leg registry entries, preserving re-INVITE state
+            // Clean up B-leg registry entries
             for b_leg in &call.b_legs {
                 self.registry.remove_call_id(&b_leg.dialog.call_id);
                 self.registry.remove_branch(&b_leg.branch);
                 self.remember_terminated(&b_leg.dialog.call_id);
-                // Move re-INVITE tracking entries to zombie map
-                if let Some(ref target) = b_leg.dialog.target_uri {
-                    if target.starts_with("reinvite_done:") || target.starts_with("reinvite:") {
-                        self.zombie_reinvites.insert(
-                            b_leg.dialog.call_id.clone(),
-                            ZombieReInviteEntry {
-                                destination: b_leg.transport.remote_addr,
-                                transport: b_leg.transport.transport,
-                                local_addr: b_leg.transport.local_addr,
-                            },
-                        );
-                    }
-                }
             }
         }
-    }
-
-    /// Look up a zombie re-INVITE entry by SIP Call-ID.
-    pub fn get_zombie_reinvite(&self, sip_call_id: &str) -> Option<ZombieReInviteEntry> {
-        self.zombie_reinvites.get(sip_call_id).map(|e| e.clone())
-    }
-
-    /// Remove a zombie re-INVITE entry.
-    pub fn remove_zombie_reinvite(&self, sip_call_id: &str) {
-        self.zombie_reinvites.remove(sip_call_id);
     }
 
     /// Tear down a CANCELled call, but first preserve every still-pending
