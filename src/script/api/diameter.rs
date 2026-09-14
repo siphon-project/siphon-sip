@@ -324,6 +324,99 @@ fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
     Ok((data, type_num))
 }
 
+/// `rx_aar`'s Python arguments, parsed and owned so the borrowed
+/// [`crate::diameter::rx::RxSessionRequest`] for the shared encoder can outlive them.
+struct RxAarRequest {
+    session_id: Option<String>,
+    af_application_id: String,
+    media_components: Vec<crate::diameter::rx::MediaComponent>,
+    specific_actions: Vec<crate::diameter::rx::SpecificAction>,
+    framed_ip: Option<[u8; 4]>,
+    framed_ipv6: Option<Vec<u8>>,
+    subscription_id: Option<(String, u32)>,
+}
+
+impl RxAarRequest {
+    /// Validates in the order `rx_aar` always has, so a bad call raises what it did.
+    fn parse(
+        session_id: Option<&str>,
+        framed_ip: Option<&str>,
+        framed_ipv6: Option<&Bound<'_, PyAny>>,
+        media_components: Option<&Bound<'_, PyAny>>,
+        af_application_id: &str,
+        subscription_id: Option<&Bound<'_, PyAny>>,
+        specific_actions: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let media_components = media_components.map(parse_media_components).transpose()?;
+        let framed_ipv6 = framed_ipv6.map(extract_ipv6_prefix).transpose()?;
+        let subscription_id = subscription_id.map(extract_subscription_id).transpose()?;
+        let framed_ip = framed_ip
+            .map(|ip| {
+                ip.parse::<std::net::Ipv4Addr>()
+                    .map(|addr| addr.octets())
+                    .map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "framed_ip is not a valid IPv4 address: {ip}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let specific_actions = specific_actions.map(parse_specific_actions).transpose()?;
+        Ok(Self {
+            session_id: session_id.map(String::from),
+            af_application_id: af_application_id.to_string(),
+            media_components: media_components.unwrap_or_default(),
+            specific_actions: specific_actions.unwrap_or_default(),
+            framed_ip,
+            framed_ipv6,
+            subscription_id,
+        })
+    }
+
+    fn params(&self) -> crate::diameter::rx::RxSessionRequest<'_> {
+        use crate::diameter::rx::RxRequestType::{InitialRequest, UpdateRequest};
+        crate::diameter::rx::RxSessionRequest {
+            session_id: self.session_id.as_deref(),
+            af_application_id: self.af_application_id.as_bytes(),
+            media_components: &self.media_components,
+            specific_actions: &self.specific_actions,
+            // A reused Session-Id modifies an existing Rx session.
+            rx_request_type: self
+                .session_id
+                .as_ref()
+                .map_or(InitialRequest, |_| UpdateRequest),
+            framed_ip: self.framed_ip.as_ref().map(|octets| octets.as_slice()),
+            framed_ipv6: self.framed_ipv6.as_deref(),
+            subscription_id: self
+                .subscription_id
+                .as_ref()
+                .map(|(data, kind)| (data.as_str(), *kind)),
+        }
+    }
+}
+
+/// `specific_actions` → Specific-Action values: `TypeError` unless a sequence of
+/// int, `ValueError` naming the first value TS 29.214 §5.3.13 does not define.
+fn parse_specific_actions(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Vec<crate::diameter::rx::SpecificAction>> {
+    let values: Vec<i64> = obj.extract()?;
+    values
+        .into_iter()
+        .map(|value| {
+            u32::try_from(value)
+                .ok()
+                .and_then(|value| crate::diameter::rx::SpecificAction::try_from(value).ok())
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "specific_actions: {value} is not a Specific-Action value \
+                         TS 29.214 §5.3.13 defines (1-4, 6-21)"
+                    ))
+                })
+        })
+        .collect()
+}
+
 /// Shell-style glob matcher supporting `*` (any run) and `?` (one char).
 /// Iterative with backtracking — no allocation, no regex dependency.
 fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
@@ -1237,6 +1330,10 @@ impl PyDiameter {
     ///
     /// Used by the P-CSCF when SDP is negotiated during session setup
     /// (INVITE / 200 OK / UPDATE) to request dedicated bearer resources.
+    /// Without ``session_id`` the AAR carries Rx-Request-Type
+    /// INITIAL_REQUEST, with one UPDATE_REQUEST (TS 29.214 §4.4.1 / §4.4.2);
+    /// the peer's configured ``destination_host`` goes out as
+    /// Destination-Host.
     ///
     /// Args:
     ///     session_id: Reuse an existing Rx session ID (modification AAR per
@@ -1252,6 +1349,12 @@ impl PyDiameter {
     ///         int per RFC 4006 §8.47 — 0=E.164, 1=IMSI, 2=SIP_URI, 3=NAI,
     ///         4=PRIVATE — or a string alias (``"sip_uri"`` / ``"e164"`` /
     ///         ``"imsi"`` / ``"nai"`` / ``"private"``).
+    ///     specific_actions: List of Specific-Action values (TS 29.214
+    ///         §5.3.13), the events the PCRF should report in an RAR, e.g.
+    ///         ``[2, 9]`` for INDICATION_OF_LOSS_OF_BEARER and
+    ///         INDICATION_OF_FAILED_RESOURCES_ALLOCATION. One AVP per entry;
+    ///         ``None`` sends none. A value TS 29.214 does not define (0 and
+    ///         5 are void) raises ``ValueError`` naming it.
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``session_id`` (str),
@@ -1263,6 +1366,7 @@ impl PyDiameter {
         media_components=None,
         af_application_id="IMS Services",
         subscription_id=None,
+        specific_actions=None,
     ))]
     fn rx_aar<'py>(
         &self,
@@ -1273,14 +1377,8 @@ impl PyDiameter {
         media_components: Option<&Bound<'py, PyAny>>,
         af_application_id: &str,
         subscription_id: Option<&Bound<'py, PyAny>>,
+        specific_actions: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        use crate::diameter::codec::{
-            encode_avp_grouped, encode_avp_octet, encode_avp_octet_3gpp, encode_avp_u32,
-            encode_avp_utf8, encode_diameter_message, FLAG_PROXIABLE, FLAG_REQUEST,
-        };
-        use crate::diameter::dictionary::{self, avp};
-        use crate::diameter::rx::MediaComponent;
-
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Rx, None)
@@ -1292,94 +1390,26 @@ impl PyDiameter {
             }
         };
 
-        let components: Vec<MediaComponent> = match media_components {
-            Some(obj) => parse_media_components(obj)?,
-            None => Vec::new(),
-        };
+        let request = RxAarRequest::parse(
+            session_id,
+            framed_ip,
+            framed_ipv6,
+            media_components,
+            af_application_id,
+            subscription_id,
+            specific_actions,
+        )?;
 
-        let framed_ipv6_bytes: Option<Vec<u8>> = match framed_ipv6 {
-            Some(obj) => Some(extract_ipv6_prefix(obj)?),
-            None => None,
-        };
-
-        let subscription_parsed: Option<(String, u32)> = match subscription_id {
-            Some(obj) => Some(extract_subscription_id(obj)?),
-            None => None,
-        };
-
-        let peer = client.peer();
-        let hbh = peer.next_hbh();
-        let e2e = peer.next_e2e();
-        let session = session_id
-            .map(String::from)
-            .unwrap_or_else(|| peer.new_session_id());
-        let config = peer.config();
-
-        let mut payload = Vec::with_capacity(512);
-        payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session));
-        payload.extend_from_slice(&encode_avp_u32(
-            avp::AUTH_APPLICATION_ID,
-            dictionary::RX_APP_ID,
+        let answer = crate::script::detach_block_on(crate::diameter::rx::send_aar(
+            client.peer(),
+            &request.params(),
         ));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        payload.extend_from_slice(&encode_avp_utf8(
-            avp::DESTINATION_REALM,
-            &config.destination_realm,
-        ));
-
-        // AF-Application-Identifier — TS 29.214 §5.3.4
-        payload.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::AF_APPLICATION_IDENTIFIER,
-            af_application_id.as_bytes(),
-        ));
-
-        // One Media-Component-Description per SDP m= section
-        for component in &components {
-            payload.extend_from_slice(&component.encode());
-        }
-
-        if let Some(ip) = framed_ip {
-            match ip.parse::<std::net::Ipv4Addr>() {
-                Ok(addr) => payload
-                    .extend_from_slice(&encode_avp_octet(avp::FRAMED_IP_ADDRESS, &addr.octets())),
-                Err(_) => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "framed_ip is not a valid IPv4 address: {ip}"
-                    )));
-                }
-            }
-        }
-
-        if let Some(bytes) = framed_ipv6_bytes.as_deref() {
-            payload.extend_from_slice(&encode_avp_octet(avp::FRAMED_IPV6_PREFIX, bytes));
-        }
-
-        if let Some((data, type_num)) = subscription_parsed.as_ref() {
-            let mut sub_inner = Vec::new();
-            sub_inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, *type_num));
-            sub_inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, data));
-            payload.extend_from_slice(&encode_avp_grouped(avp::SUBSCRIPTION_ID, &sub_inner));
-        }
-
-        let wire = encode_diameter_message(
-            FLAG_REQUEST | FLAG_PROXIABLE,
-            dictionary::CMD_AA,
-            dictionary::RX_APP_ID,
-            hbh,
-            e2e,
-            &payload,
-        );
-
-        let answer = crate::script::detach_block_on(peer.send_request(wire));
 
         match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-
+            Ok(answer) => {
                 let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                dict.set_item("session_id", &session)?;
+                dict.set_item("result_code", answer.result_code)?;
+                dict.set_item("session_id", answer.session_id)?;
                 Ok(Some(dict))
             }
             Err(error) => {
@@ -3538,9 +3568,385 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .rx_aar(python, None, None, None, None, "IMS Services", None)
+                .rx_aar(python, None, None, None, None, "IMS Services", None, None)
                 .unwrap();
             assert!(result.is_none());
+        });
+    }
+
+    fn rx_test_peer_config(destination_host: Option<&str>) -> crate::diameter::peer::PeerConfig {
+        crate::diameter::peer::PeerConfig {
+            host: "pcrf1.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            port: 3868,
+            origin_host: "pcscf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            origin_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            destination_host: destination_host.map(String::from),
+            destination_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_ip: "192.0.2.10".parse().unwrap(),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    /// The AAR `rx_aar` sends for `request`: the same encoder `rx::send_aar`
+    /// calls, with a fixed Session-Id and identifiers instead of the peer's.
+    fn rx_aar_wire(request: &RxAarRequest, destination_host: Option<&str>) -> Vec<u8> {
+        crate::diameter::rx::encode_aar(
+            &rx_test_peer_config(destination_host),
+            1,
+            1,
+            "pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;1",
+            &request.params(),
+        )
+    }
+
+    fn avps_with_code(wire: &[u8], code: u32) -> Vec<Vec<u8>> {
+        crate::diameter::rx::raw_top_level_avps(wire)
+            .into_iter()
+            .filter(|(avp_code, _)| *avp_code == code)
+            .map(|(_, bytes)| bytes.to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn rx_aar_rejects_unknown_specific_action() {
+        pyo3::Python::initialize();
+        // A live peer, so the call gets past peer selection to the arguments.
+        let manager = Arc::new(DiameterManager::new());
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel(4);
+        let peer = Arc::new(crate::diameter::peer::DiameterPeer::new_for_test(
+            rx_test_peer_config(None),
+            write_tx,
+        ));
+        manager.register(
+            "pcrf1".to_string(),
+            Arc::new(crate::diameter::DiameterClient::new(peer)),
+        );
+        let py_diameter = PyDiameter::new(manager);
+
+        pyo3::Python::attach(|python| {
+            for bad in [5i64, 0, 22, -1, 4_294_967_296] {
+                let actions = pyo3::types::PyList::new(python, [6i64, bad]).unwrap();
+                let error = py_diameter
+                    .rx_aar(
+                        python,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "IMS Services",
+                        None,
+                        Some(actions.as_any()),
+                    )
+                    .unwrap_err();
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{error}"
+                );
+                assert!(error.to_string().contains(&format!(" {bad} ")), "{error}");
+            }
+
+            // Not a list of int, or an int past 64 bits: each entry is read as
+            // an i64 first, which the SDK mock mirrors.
+            let strings = pyo3::types::PyList::new(python, ["6"]).unwrap();
+            let bare_string = "6".into_pyobject(python).unwrap();
+            for bad in [strings.as_any(), bare_string.as_any()] {
+                let error = py_diameter
+                    .rx_aar(
+                        python,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "IMS Services",
+                        None,
+                        Some(bad),
+                    )
+                    .unwrap_err();
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                    "{error}"
+                );
+            }
+            let huge = pyo3::types::PyList::new(python, [1u128 << 70]).unwrap();
+            let error = py_diameter
+                .rx_aar(
+                    python,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "IMS Services",
+                    None,
+                    Some(huge.as_any()),
+                )
+                .unwrap_err();
+            assert!(
+                error.is_instance_of::<pyo3::exceptions::PyOverflowError>(python),
+                "{error}"
+            );
+        });
+    }
+
+    #[test]
+    fn rx_aar_specific_actions_known_answer() {
+        // The three AVPs below were fed to tshark 4.6.4 inside a whole AAR
+        // (`scripts/validate_rx_aar.sh`), which decoded them as IP-CAN_CHANGE,
+        // INDICATION_OF_OUT_OF_CREDIT and
+        // INDICATION_OF_FAILED_RESOURCES_ALLOCATION: flags M+V, 3GPP vendor.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let actions = pyo3::types::PyList::new(python, [6i64, 7, 9]).unwrap();
+            let request = RxAarRequest::parse(
+                None,
+                None,
+                None,
+                None,
+                "IMS Services",
+                None,
+                Some(actions.as_any()),
+            )
+            .unwrap();
+            let wire = rx_aar_wire(&request, None);
+            let avp = |value: u8| {
+                vec![
+                    0x00, 0x00, 0x02, 0x01, 0xC0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xAF, 0x00,
+                    0x00, 0x00, value,
+                ]
+            };
+            assert_eq!(
+                avps_with_code(&wire, avp::SPECIFIC_ACTION),
+                [avp(6), avp(7), avp(9)]
+            );
+        });
+    }
+
+    #[test]
+    fn rx_aar_without_specific_actions_emits_no_avp_513() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|_python| {
+            let request =
+                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None).unwrap();
+            let wire = rx_aar_wire(&request, None);
+            assert!(avps_with_code(&wire, avp::SPECIFIC_ACTION).is_empty());
+        });
+    }
+
+    /// `rx_aar`'s arguments with every optional one set.
+    fn full_rx_aar_request(python: Python<'_>, specific_actions: &[i64]) -> RxAarRequest {
+        use pyo3::types::{PyList, PyTuple};
+
+        let flow = PyDict::new(python);
+        flow.set_item("number", 1u32).unwrap();
+        flow.set_item(
+            "descriptions",
+            vec!["permit out 17 from 192.0.2.1 50000 to 198.51.100.7 30000"],
+        )
+        .unwrap();
+        let component = PyDict::new(python);
+        component.set_item("number", 1u32).unwrap();
+        component.set_item("media_type", "audio").unwrap();
+        component.set_item("flows", vec![flow]).unwrap();
+        let components = PyList::new(python, [component]).unwrap();
+        let subscription = PyTuple::new(
+            python,
+            [
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
+                    .into_pyobject(python)
+                    .unwrap()
+                    .into_any(),
+                "sip_uri".into_pyobject(python).unwrap().into_any(),
+            ],
+        )
+        .unwrap();
+        let ipv6 = "2001:db8::1".into_pyobject(python).unwrap();
+        let actions = PyList::new(python, specific_actions).unwrap();
+
+        RxAarRequest::parse(
+            None,
+            Some("192.0.2.1"),
+            Some(ipv6.as_any()),
+            Some(components.as_any()),
+            "IMS Services",
+            Some(subscription.as_any()),
+            Some(actions.as_any()),
+        )
+        .unwrap()
+    }
+
+    /// Emit a full `rx_aar` AAR as hex for [`scripts/validate_rx_aar.sh`] to
+    /// feed to tshark.
+    ///
+    /// The known-answer tests here pin bytes we chose, so they share whatever
+    /// we misread of TS 29.214. That is how two wrong Specific-Action values
+    /// survived. tshark decodes the same bytes with its own dictionary.
+    #[test]
+    fn emit_rx_aar_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_RX_AAR_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        pyo3::Python::initialize();
+        let wire = pyo3::Python::attach(|python| {
+            let request = full_rx_aar_request(python, &[6, 7, 9]);
+            rx_aar_wire(&request, Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"))
+        });
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets.
+        let mut dump = String::new();
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
+    }
+
+    #[test]
+    fn rx_aar_request_carries_every_avp() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let request = full_rx_aar_request(python, &[2, 9]);
+            let wire = rx_aar_wire(&request, Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"));
+
+            // Everything rx_aar put on the wire before, plus the configured
+            // Destination-Host and Rx-Request-Type, in TS 29.214 §5.6.1 order.
+            let codes: Vec<u32> = crate::diameter::rx::raw_top_level_avps(&wire)
+                .iter()
+                .map(|(code, _)| *code)
+                .collect();
+            assert_eq!(
+                codes,
+                [
+                    avp::SESSION_ID,
+                    avp::AUTH_APPLICATION_ID,
+                    avp::ORIGIN_HOST,
+                    avp::ORIGIN_REALM,
+                    avp::DESTINATION_REALM,
+                    avp::DESTINATION_HOST,
+                    avp::AF_APPLICATION_IDENTIFIER,
+                    avp::MEDIA_COMPONENT_DESCRIPTION,
+                    avp::SPECIFIC_ACTION,
+                    avp::SPECIFIC_ACTION,
+                    avp::SUBSCRIPTION_ID,
+                    avp::FRAMED_IP_ADDRESS,
+                    avp::FRAMED_IPV6_PREFIX,
+                    avp::RX_REQUEST_TYPE,
+                ]
+            );
+
+            let decoded = crate::diameter::codec::decode_diameter(&wire).unwrap();
+            let text = |name: &str| decoded.avps.get(name).and_then(|v| v.as_str());
+            assert_eq!(
+                text("Session-Id"),
+                Some("pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;1")
+            );
+            assert_eq!(
+                decoded
+                    .avps
+                    .get("Auth-Application-Id")
+                    .and_then(|v| v.as_u64()),
+                Some(u64::from(dictionary::RX_APP_ID))
+            );
+            assert_eq!(
+                text("Origin-Host"),
+                Some("pcscf.ims.mnc001.mcc001.3gppnetwork.org")
+            );
+            assert_eq!(
+                text("Origin-Realm"),
+                Some("ims.mnc001.mcc001.3gppnetwork.org")
+            );
+            assert_eq!(
+                text("Destination-Realm"),
+                Some("ims.mnc001.mcc001.3gppnetwork.org")
+            );
+            assert_eq!(
+                text("Destination-Host"),
+                Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org")
+            );
+
+            // Raw bytes for the octet-typed AVPs: header, then data.
+            let af = &avps_with_code(&wire, avp::AF_APPLICATION_IDENTIFIER)[0];
+            assert_eq!(af[4], 0xC0);
+            assert_eq!(&af[12..24], b"IMS Services");
+            let framed_ip = &avps_with_code(&wire, avp::FRAMED_IP_ADDRESS)[0];
+            assert_eq!(
+                framed_ip.as_slice(),
+                [0x00, 0x00, 0x00, 0x08, 0x40, 0x00, 0x00, 0x0C, 192, 0, 2, 1]
+            );
+            let framed_ipv6 = &avps_with_code(&wire, avp::FRAMED_IPV6_PREFIX)[0];
+            assert_eq!(framed_ipv6[4], 0x40);
+            assert_eq!(
+                &framed_ipv6[8..26],
+                [0, 128, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+            );
+            let subscription = decoded.avps.get("Subscription-Id").unwrap();
+            assert_eq!(
+                subscription
+                    .get("Subscription-Id-Type")
+                    .and_then(|v| v.as_u64()),
+                Some(2)
+            );
+            assert_eq!(
+                subscription
+                    .get("Subscription-Id-Data")
+                    .and_then(|v| v.as_str()),
+                Some("sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org")
+            );
+            let component = decoded.avps.get("Media-Component-Description").unwrap();
+            assert_eq!(
+                component
+                    .get("Media-Component-Number")
+                    .and_then(|v| v.as_u64()),
+                Some(1)
+            );
+            let rule = b"permit out 17 from 192.0.2.1 50000 to 198.51.100.7 30000";
+            assert!(wire.windows(rule.len()).any(|window| window == rule));
+            // No Session-Id passed: an initial request, V-bit only.
+            assert_eq!(
+                avps_with_code(&wire, avp::RX_REQUEST_TYPE)[0],
+                [
+                    0x00, 0x00, 0x02, 0x15, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xAF, 0, 0,
+                    0, 0
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn rx_aar_reused_session_is_an_update_request() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|_python| {
+            let initial =
+                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None).unwrap();
+            assert_eq!(
+                initial.params().rx_request_type,
+                crate::diameter::rx::RxRequestType::InitialRequest
+            );
+            let update = RxAarRequest::parse(
+                Some("pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;7"),
+                None,
+                None,
+                None,
+                "IMS Services",
+                None,
+                None,
+            )
+            .unwrap();
+            let params = update.params();
+            assert_eq!(
+                params.rx_request_type,
+                crate::diameter::rx::RxRequestType::UpdateRequest
+            );
+            assert_eq!(
+                params.session_id,
+                Some("pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;7")
+            );
         });
     }
 

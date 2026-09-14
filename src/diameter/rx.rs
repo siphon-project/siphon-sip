@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::diameter::codec::*;
 use crate::diameter::dictionary::{self, avp};
-use crate::diameter::peer::{DiameterPeer, IncomingRequest};
+use crate::diameter::peer::{DiameterPeer, IncomingRequest, PeerConfig};
 
 // ── Media Type (TS 29.214 §7.3.2) ──────────────────────────────────────
 
@@ -99,9 +99,14 @@ impl FlowUsage {
     }
 }
 
-// ── Specific-Action (TS 29.214 §7.3.13) ────────────────────────────────
+// ── Specific-Action (TS 29.214 §5.3.13) ────────────────────────────────
 
-/// Events the AF subscribes to via Specific-Action in AAR.
+/// Events the AF subscribes to with Specific-Action in an AAR, and the PCRF
+/// reports back with it in an RAR.
+///
+/// Values 0 and 5 are Void in TS 29.214 and have no variant. 5 used to be
+/// INDICATION_OF_ESTABLISHMENT_OF_BEARER; this enum once carried that on 6
+/// and IP-CAN_CHANGE on 7, which is INDICATION_OF_OUT_OF_CREDIT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum SpecificAction {
@@ -109,14 +114,69 @@ pub enum SpecificAction {
     IndicationOfLossOfBearer = 2,
     IndicationOfRecoveryOfBearer = 3,
     IndicationOfReleaseOfBearer = 4,
-    IndicationOfEstablishmentOfBearer = 6,
-    IpCanChange = 7,
+    IpCanChange = 6,
+    IndicationOfOutOfCredit = 7,
+    IndicationOfSuccessfulResourcesAllocation = 8,
+    IndicationOfFailedResourcesAllocation = 9,
+    IndicationOfLimitedPccDeployment = 10,
+    UsageReport = 11,
     AccessNetworkInfoReport = 12,
+    IndicationOfRecoveryFromLimitedPccDeployment = 13,
+    IndicationOfAccessNetworkInfoReportingFailure = 14,
+    IndicationOfTransferPolicyExpired = 15,
+    PlmnChange = 16,
+    EpsFallback = 17,
+    IndicationOfReallocationOfCredit = 18,
+    SuccessfulQosUpdate = 19,
+    FailedQosUpdate = 20,
+    CnHealthMonitor = 21,
 }
 
 impl SpecificAction {
+    /// Every variant, in value order. Integer conversion searches this, so a
+    /// variant missing here cannot be produced from its wire value.
+    const ALL: [SpecificAction; 20] = [
+        SpecificAction::ChargingCorrelationExchange,
+        SpecificAction::IndicationOfLossOfBearer,
+        SpecificAction::IndicationOfRecoveryOfBearer,
+        SpecificAction::IndicationOfReleaseOfBearer,
+        SpecificAction::IpCanChange,
+        SpecificAction::IndicationOfOutOfCredit,
+        SpecificAction::IndicationOfSuccessfulResourcesAllocation,
+        SpecificAction::IndicationOfFailedResourcesAllocation,
+        SpecificAction::IndicationOfLimitedPccDeployment,
+        SpecificAction::UsageReport,
+        SpecificAction::AccessNetworkInfoReport,
+        SpecificAction::IndicationOfRecoveryFromLimitedPccDeployment,
+        SpecificAction::IndicationOfAccessNetworkInfoReportingFailure,
+        SpecificAction::IndicationOfTransferPolicyExpired,
+        SpecificAction::PlmnChange,
+        SpecificAction::EpsFallback,
+        SpecificAction::IndicationOfReallocationOfCredit,
+        SpecificAction::SuccessfulQosUpdate,
+        SpecificAction::FailedQosUpdate,
+        SpecificAction::CnHealthMonitor,
+    ];
+
     fn as_u32(self) -> u32 {
         self as u32
+    }
+}
+
+/// An integer TS 29.214 §5.3.13 does not define as a Specific-Action value,
+/// including the two Void ones (0 and 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Specific-Action value {0} is not defined by TS 29.214 §5.3.13")]
+pub struct UnknownSpecificAction(pub u32);
+
+impl TryFrom<u32> for SpecificAction {
+    type Error = UnknownSpecificAction;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_u32() == value)
+            .ok_or(UnknownSpecificAction(value))
     }
 }
 
@@ -267,16 +327,39 @@ pub async fn send_aar(
     peer: &Arc<DiameterPeer>,
     params: &RxSessionRequest<'_>,
 ) -> Result<RxSessionAnswer, String> {
-    let config = peer.config();
     let hbh = peer.next_hbh();
     let e2e = peer.next_e2e();
     let session_id = params
         .session_id
         .map(String::from)
         .unwrap_or_else(|| peer.new_session_id());
+    let wire = encode_aar(peer.config(), hbh, e2e, &session_id, params);
 
+    info!(session = %session_id, "Rx: sending AAR");
+    let answer = peer.send_request(wire).await?;
+
+    Ok(RxSessionAnswer {
+        result_code: extract_result_code(&answer.avps),
+        session_id: Some(session_id),
+    })
+}
+
+/// Encode an AA-Request (TS 29.214 §5.6.1). The only AAR encoder: both
+/// [`send_aar`] and the scripting API's `diameter.rx_aar` go through it.
+///
+/// `session_id` is the Session-Id actually sent: `params.session_id`, or
+/// the one [`send_aar`] allocated when that is `None`. AVPs follow the
+/// command's ABNF order; only Session-Id's position is significant
+/// (RFC 6733 §3.2), but a strict peer then has nothing to object to.
+pub fn encode_aar(
+    config: &PeerConfig,
+    hbh: u32,
+    e2e: u32,
+    session_id: &str,
+    params: &RxSessionRequest<'_>,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(512);
-    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
     payload.extend_from_slice(&encode_avp_u32(
         avp::AUTH_APPLICATION_ID,
         dictionary::RX_APP_ID,
@@ -291,27 +374,29 @@ pub async fn send_aar(
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
 
-    // AF-Application-Identifier
+    // AF-Application-Identifier (§5.3.5)
     payload.extend_from_slice(&encode_avp_octet_3gpp(
         avp::AF_APPLICATION_IDENTIFIER,
         params.af_application_id,
     ));
 
-    // Media-Component-Description (one per SDP m= line)
+    // Media-Component-Description, one per SDP m= line (§5.3.16)
     for component in params.media_components {
         payload.extend_from_slice(&component.encode());
     }
 
-    // Specific-Action subscriptions
+    // Specific-Action subscriptions (§5.3.13)
     for action in params.specific_actions {
         payload.extend_from_slice(&encode_avp_u32_3gpp(avp::SPECIFIC_ACTION, action.as_u32()));
     }
 
-    // Rx-Request-Type
-    payload.extend_from_slice(&encode_avp_u32_3gpp(
-        avp::RX_REQUEST_TYPE,
-        params.rx_request_type.as_u32(),
-    ));
+    // Subscription-Id identifies the IMS subscriber (RFC 4006 §8.46)
+    if let Some((id_data, id_type)) = params.subscription_id {
+        let mut sub_inner = Vec::new();
+        sub_inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, id_type));
+        sub_inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, id_data));
+        payload.extend_from_slice(&encode_avp_grouped(avp::SUBSCRIPTION_ID, &sub_inner));
+    }
 
     // Framed-IP-Address / Framed-IPv6-Prefix (subscriber addressing)
     if let Some(ip) = params.framed_ip {
@@ -321,30 +406,50 @@ pub async fn send_aar(
         payload.extend_from_slice(&encode_avp_octet(avp::FRAMED_IPV6_PREFIX, ipv6));
     }
 
-    // Subscription-Id (identifies the IMS subscriber)
-    if let Some((id_data, id_type)) = params.subscription_id {
-        let mut sub_inner = Vec::new();
-        sub_inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, id_type));
-        sub_inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, id_data));
-        payload.extend_from_slice(&encode_avp_grouped(avp::SUBSCRIPTION_ID, &sub_inner));
-    }
+    // Rx-Request-Type (§5.3.31). Table 5.3.1 forbids the M-bit on it, so a
+    // PCRF that predates the AVP skips it instead of failing the whole AAR
+    // with DIAMETER_AVP_UNSUPPORTED (RFC 6733 §4.1).
+    payload.extend_from_slice(&encode_avp_vendor(
+        avp::RX_REQUEST_TYPE,
+        0,
+        dictionary::VENDOR_3GPP,
+        &params.rx_request_type.as_u32().to_be_bytes(),
+    ));
 
-    let wire = encode_diameter_message(
+    encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
         dictionary::CMD_AA,
         dictionary::RX_APP_ID,
         hbh,
         e2e,
         &payload,
-    );
+    )
+}
 
-    info!(session = %session_id, "Rx: sending AAR");
-    let answer = peer.send_request(wire).await?;
-
-    Ok(RxSessionAnswer {
-        result_code: extract_result_code(&answer.avps),
-        session_id: Some(session_id),
-    })
+/// Each top-level AVP of an encoded message as `(code, bytes)`, the bytes
+/// being header, data and padding exactly as they sit on the wire. For tests
+/// that pin an encoding byte for byte.
+#[cfg(test)]
+pub(crate) fn raw_top_level_avps(wire: &[u8]) -> Vec<(u32, &[u8])> {
+    let mut avps = Vec::new();
+    let mut offset = 20;
+    while offset + 8 <= wire.len() {
+        let code = u32::from_be_bytes([
+            wire[offset],
+            wire[offset + 1],
+            wire[offset + 2],
+            wire[offset + 3],
+        ]);
+        let length =
+            u32::from_be_bytes([0, wire[offset + 5], wire[offset + 6], wire[offset + 7]]) as usize;
+        if length < 8 {
+            break;
+        }
+        let end = (offset + ((length + 3) & !3)).min(wire.len());
+        avps.push((code, &wire[offset..end]));
+        offset = end;
+    }
+    avps
 }
 
 /// Send a Session-Termination-Request to tear down an Rx session.
@@ -551,13 +656,230 @@ mod tests {
         assert_eq!(AbortCause::SponsoredDataConnectivityDisallowed.as_u32(), 4);
     }
 
+    /// Every variant with its TS 29.214 §5.3.13 value (V17.3.0 and V19.3.0
+    /// agree; 0 and 5 are Void).
+    const SPECIFIC_ACTION_VALUES: [(SpecificAction, u32); 20] = [
+        (SpecificAction::ChargingCorrelationExchange, 1),
+        (SpecificAction::IndicationOfLossOfBearer, 2),
+        (SpecificAction::IndicationOfRecoveryOfBearer, 3),
+        (SpecificAction::IndicationOfReleaseOfBearer, 4),
+        (SpecificAction::IpCanChange, 6),
+        (SpecificAction::IndicationOfOutOfCredit, 7),
+        (SpecificAction::IndicationOfSuccessfulResourcesAllocation, 8),
+        (SpecificAction::IndicationOfFailedResourcesAllocation, 9),
+        (SpecificAction::IndicationOfLimitedPccDeployment, 10),
+        (SpecificAction::UsageReport, 11),
+        (SpecificAction::AccessNetworkInfoReport, 12),
+        (
+            SpecificAction::IndicationOfRecoveryFromLimitedPccDeployment,
+            13,
+        ),
+        (
+            SpecificAction::IndicationOfAccessNetworkInfoReportingFailure,
+            14,
+        ),
+        (SpecificAction::IndicationOfTransferPolicyExpired, 15),
+        (SpecificAction::PlmnChange, 16),
+        (SpecificAction::EpsFallback, 17),
+        (SpecificAction::IndicationOfReallocationOfCredit, 18),
+        (SpecificAction::SuccessfulQosUpdate, 19),
+        (SpecificAction::FailedQosUpdate, 20),
+        (SpecificAction::CnHealthMonitor, 21),
+    ];
+
     #[test]
     fn specific_action_3gpp_values() {
-        assert_eq!(SpecificAction::ChargingCorrelationExchange.as_u32(), 1);
-        assert_eq!(SpecificAction::IndicationOfLossOfBearer.as_u32(), 2);
-        assert_eq!(SpecificAction::IndicationOfRecoveryOfBearer.as_u32(), 3);
-        assert_eq!(SpecificAction::IndicationOfReleaseOfBearer.as_u32(), 4);
-        assert_eq!(SpecificAction::AccessNetworkInfoReport.as_u32(), 12);
+        // No wildcard arm: a variant added without a row above stops this
+        // test from compiling instead of slipping past it.
+        let listed = |action: SpecificAction| {
+            SPECIFIC_ACTION_VALUES
+                .iter()
+                .any(|(listed, _)| *listed == action)
+        };
+        for (action, value) in SPECIFIC_ACTION_VALUES {
+            match action {
+                SpecificAction::ChargingCorrelationExchange
+                | SpecificAction::IndicationOfLossOfBearer
+                | SpecificAction::IndicationOfRecoveryOfBearer
+                | SpecificAction::IndicationOfReleaseOfBearer
+                | SpecificAction::IpCanChange
+                | SpecificAction::IndicationOfOutOfCredit
+                | SpecificAction::IndicationOfSuccessfulResourcesAllocation
+                | SpecificAction::IndicationOfFailedResourcesAllocation
+                | SpecificAction::IndicationOfLimitedPccDeployment
+                | SpecificAction::UsageReport
+                | SpecificAction::AccessNetworkInfoReport
+                | SpecificAction::IndicationOfRecoveryFromLimitedPccDeployment
+                | SpecificAction::IndicationOfAccessNetworkInfoReportingFailure
+                | SpecificAction::IndicationOfTransferPolicyExpired
+                | SpecificAction::PlmnChange
+                | SpecificAction::EpsFallback
+                | SpecificAction::IndicationOfReallocationOfCredit
+                | SpecificAction::SuccessfulQosUpdate
+                | SpecificAction::FailedQosUpdate
+                | SpecificAction::CnHealthMonitor => assert!(listed(action)),
+            }
+            assert_eq!(action.as_u32(), value, "{action:?}");
+            assert_eq!(SpecificAction::try_from(value), Ok(action), "{value}");
+        }
+        assert_eq!(
+            SpecificAction::ALL,
+            SPECIFIC_ACTION_VALUES.map(|(action, _)| action)
+        );
+    }
+
+    #[test]
+    fn specific_action_from_integer_rejects_unknown_values() {
+        for value in [0, 5, 22, 513, u32::MAX] {
+            assert_eq!(
+                SpecificAction::try_from(value),
+                Err(UnknownSpecificAction(value))
+            );
+        }
+        for value in 0..=64u32 {
+            let defined = (1..=4).contains(&value) || (6..=21).contains(&value);
+            assert_eq!(
+                SpecificAction::try_from(value).is_ok(),
+                defined,
+                "value {value}"
+            );
+        }
+        assert!(UnknownSpecificAction(5).to_string().contains(" 5 "));
+    }
+
+    // ── AAR encoding ────────────────────────────────────────────────────
+
+    fn test_peer_config(destination_host: Option<&str>) -> PeerConfig {
+        PeerConfig {
+            host: "pcrf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            port: 3868,
+            origin_host: "pcscf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            origin_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            destination_host: destination_host.map(String::from),
+            destination_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_ip: "192.0.2.10".parse().unwrap(),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    fn bare_aar(specific_actions: &[SpecificAction], rx_request_type: RxRequestType) -> Vec<u8> {
+        let params = RxSessionRequest {
+            session_id: None,
+            af_application_id: b"IMS Services",
+            media_components: &[],
+            specific_actions,
+            rx_request_type,
+            framed_ip: None,
+            framed_ipv6: None,
+            subscription_id: None,
+        };
+        encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
+    }
+
+    #[test]
+    fn aar_header_and_base_avps() {
+        let config = test_peer_config(Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"));
+        let params = RxSessionRequest {
+            session_id: None,
+            af_application_id: b"IMS Services",
+            media_components: &[],
+            specific_actions: &[],
+            rx_request_type: RxRequestType::InitialRequest,
+            framed_ip: None,
+            framed_ipv6: None,
+            subscription_id: None,
+        };
+        let wire = encode_aar(&config, 7, 9, "pcscf;1;1", &params);
+
+        assert_eq!(wire[4], FLAG_REQUEST | FLAG_PROXIABLE);
+        let decoded = decode_diameter(&wire).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_AA);
+        assert_eq!(decoded.application_id, dictionary::RX_APP_ID);
+        assert_eq!(decoded.hop_by_hop, 7);
+        assert_eq!(decoded.end_to_end, 9);
+
+        // RFC 6733 §8.8: Session-Id leads.
+        let avps = raw_top_level_avps(&wire);
+        assert_eq!(avps[0].0, avp::SESSION_ID);
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Host")
+                .and_then(|v| v.as_str()),
+            Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org")
+        );
+        assert_eq!(
+            decoded.avps.get("Session-Id").and_then(|v| v.as_str()),
+            Some("pcscf;1;1")
+        );
+    }
+
+    #[test]
+    fn aar_omits_destination_host_when_not_configured() {
+        let wire = bare_aar(&[], RxRequestType::InitialRequest);
+        assert!(raw_top_level_avps(&wire)
+            .iter()
+            .all(|(code, _)| *code != avp::DESTINATION_HOST));
+    }
+
+    #[test]
+    fn aar_rx_request_type_known_answer() {
+        // TS 29.214 table 5.3.1: Rx-Request-Type is must V, may P, must not
+        // M, so flags 0x80, never 0xC0. A PCRF without the AVP then ignores
+        // it (RFC 6733 §4.1) instead of failing the AAR with 5001.
+        let initial = bare_aar(&[], RxRequestType::InitialRequest);
+        let update = bare_aar(&[], RxRequestType::UpdateRequest);
+        let find = |wire: &[u8]| -> Vec<u8> {
+            raw_top_level_avps(wire)
+                .into_iter()
+                .find(|(code, _)| *code == avp::RX_REQUEST_TYPE)
+                .map(|(_, bytes)| bytes.to_vec())
+                .unwrap()
+        };
+        assert_eq!(
+            find(&initial),
+            [
+                0x00, 0x00, 0x02, 0x15, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xAF, 0x00, 0x00,
+                0x00, 0x00
+            ]
+        );
+        assert_eq!(
+            find(&update),
+            [
+                0x00, 0x00, 0x02, 0x15, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xAF, 0x00, 0x00,
+                0x00, 0x01
+            ]
+        );
+    }
+
+    #[test]
+    fn aar_without_specific_actions_has_no_avp_513() {
+        let wire = bare_aar(&[], RxRequestType::InitialRequest);
+        assert!(raw_top_level_avps(&wire)
+            .iter()
+            .all(|(code, _)| *code != avp::SPECIFIC_ACTION));
+    }
+
+    #[test]
+    fn aar_emits_one_specific_action_per_entry_in_order() {
+        let wire = bare_aar(
+            &[
+                SpecificAction::IndicationOfLossOfBearer,
+                SpecificAction::IndicationOfFailedResourcesAllocation,
+            ],
+            RxRequestType::InitialRequest,
+        );
+        let values: Vec<u32> = raw_top_level_avps(&wire)
+            .into_iter()
+            .filter(|(code, _)| *code == avp::SPECIFIC_ACTION)
+            .map(|(_, bytes)| u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]))
+            .collect();
+        assert_eq!(values, [2, 9]);
     }
 
     #[test]

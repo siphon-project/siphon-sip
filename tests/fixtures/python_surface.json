@@ -710,7 +710,7 @@
       "rx_aar": {
         "doc": "Send an Rx AA-Request to authorize an IMS media session.",
         "kind": "method_descriptor",
-        "sig": "($self, session_id=None, framed_ip=None, framed_ipv6=None, media_components=None, af_application_id=\"IMS Services\", subscription_id=None)"
+        "sig": "($self, session_id=None, framed_ip=None, framed_ipv6=None, media_components=None, af_application_id=\"IMS Services\", subscription_id=None, specific_actions=None)"
       },
       "rx_str": {
         "kind": "method_descriptor",
