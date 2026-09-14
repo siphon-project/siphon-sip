@@ -1382,6 +1382,9 @@ jobs:
       - name: Deferred handover — siphon parks the INVITE, the app answers it
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-handover-uac sipp-control-handover-uac
 
+      - name: Handover from on_failure — the dial fails, the failure handler hands the call over, the app answers it
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-failure-handover-uac sipp-control-failure-handover-uac
+
       - name: Handoff deadline — the controller never acts, siphon applies its default
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-deadline-uac sipp-control-deadline-uac
 
@@ -1446,6 +1449,7 @@ jobs:
             echo "ok: media engine performed '$verb'"
           }
           assert_verdict handover control-app-edge.log
+          assert_verdict failure-handover control-app-edge.log
           assert_verdict deadline control-app-ivr.log
           assert_verdict media    control-app-edge.log
           assert_verdict info     control-app-edge.log

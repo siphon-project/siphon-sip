@@ -32,6 +32,9 @@ The dialled user selects the case, and the case is echoed into the handover's
               the point is what happens next: the caller is STILL unanswered and
               still the app's, so the app answers it itself. That is the whole
               reason `dial` exists and the thing `route` cannot express.
+  failure-handover@ — dialled at a name that never resolves, so the call fails
+              503 before anything answers; `@b2bua.on_failure` hands the failed
+              call to the per-call-connect app, which answers it.
 
 The non-deadline cases pass a generous explicit `deadline_ms` so a slow CI box
 cannot turn a controller round trip into a spurious 503 — the deadline is a
@@ -137,9 +140,26 @@ def route(call):
             deadline_ms=GENEROUS_DEADLINE_MS,
             vars={"case": "resync"},
         )
+    elif user == "failure-handover":
+        # A name under RFC 6761's .invalid never resolves, so the B-leg INVITE
+        # never leaves and the call fails 503 at once. @b2bua.on_failure below
+        # decides what happens to it.
+        call.dial("sip:nobody@unroutable.invalid", timeout=15)
     else:
         log.warn(f"[{call.id}] control harness: no case for {user!r}")
         call.reject(404, "Not Found")
+
+
+@b2bua.on_failure
+def failed(call, code, reason):
+    user = dialled_user(call)
+    log.info(f"[{call.id}] control harness: {user!r} failed {code} {reason}")
+    if user == "failure-handover":
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            deadline_ms=GENEROUS_DEADLINE_MS,
+            vars={"case": "failure-handover", "failed_with": str(code)},
+        )
 
 
 @b2bua.on_bye

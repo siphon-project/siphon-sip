@@ -6061,6 +6061,36 @@ services:
     profiles:
       - control
 
+  # Handover decided by @b2bua.on_failure: the dial fails, the failure handler
+  # hands the call to the per-call-connect app, and the app answers it.
+  sipp-control-failure-handover-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.195
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_failure_handover_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
   # The app rings, holds the ring on its own clock, then opens early media:
   # a body-less 180 and a 183-with-SDP must be two separate responses.
   sipp-control-progress-uac:
