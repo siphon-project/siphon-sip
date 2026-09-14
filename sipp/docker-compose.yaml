@@ -5828,6 +5828,7 @@ services:
   #   172.20.0.166 — SIPp UAC, media verb round trip
   #   172.20.0.167 — SIPp UAC, exactly-one-owner dispatch
   #   172.20.0.168 — SIPp UAC, resync after a controller reconnect
+  #   172.20.0.181 — SIPp UAC, hold/resume/refresh on a one-legged call
   #   172.20.0.169 — SIPp UAC, ring then early media (two verbs, two responses)
   #
   # There is no UAS anywhere in this profile: every call is answered (or refused)
@@ -6082,6 +6083,37 @@ services:
       - "172.20.0.160:5060"
       - -sf
       - /sipp/scenarios/control_media_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # Hold, resume and a session refresh on a one-legged, engine-anchored call.
+  sipp-control-hold-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+      mock-control-rtp:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.181
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_hold_uac.xml
       - -m
       - "1"
       - -l

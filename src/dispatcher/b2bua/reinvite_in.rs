@@ -146,6 +146,20 @@ pub fn handle_b2bua_reinvite(
         )
     };
 
+    // A call with no second leg: siphon *is* the far party — an IVR, a queue,
+    // voicemail, or a call a controller answered and anchored. There is nothing
+    // to forward to and no glare to have, so this must be answered here.
+    //
+    // Before this, the glare check below read the absent winning B-leg's
+    // `initial_acked` as `false` and answered `491 Request Pending`, so a hold
+    // from the handset retried, got `491` again, and never completed. RFC 3261
+    // §14.1 reserves `491` for a genuinely crossing offer/answer; there is no
+    // second offer here to cross with.
+    if from_a_leg && winner_b_leg.is_none() {
+        answer_one_legged_reoffer(&inbound, &message, &call_id, &a_leg, "re-INVITE", state);
+        return;
+    }
+
     // Glare prevention (RFC 3261 §14.1):
     //  (a) Don't forward a re-INVITE if the target hasn't ACKed the initial
     //      INVITE yet — the offer/answer from the initial transaction is
@@ -263,7 +277,25 @@ pub fn handle_b2bua_reinvite(
                 b_leg.dialog.local_tag.clone(),
             ))
         } else {
+            // Unreachable since the one-legged arm above returns first, but a
+            // request must never be dropped in silence: the originator would
+            // retransmit to Timer F and learn nothing.
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
+            let response = build_response(
+                &message,
+                500,
+                "Server Internal Error",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     } else {
@@ -644,4 +676,139 @@ pub fn handle_b2bua_reinvite(
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
     // via handle_b2bua_response which calls set_state — we reset the timer there)
+}
+
+/// Answer an in-dialog re-offer on a call siphon terminates itself.
+///
+/// Shared by the re-INVITE and UPDATE paths, which owe the same answer: the
+/// offer goes to the media engine as a re-offer siphon answers locally
+/// (`answer_local`), and the engine's answer is the body of the `200 OK`. The
+/// engine decides the direction, so a `sendonly` hold comes back `recvonly`
+/// (RFC 3264 §6.1) and a resume comes back `sendrecv`.
+///
+/// An offerless refresh (RFC 4028 §10) is answered with the leg's current media
+/// instead, because RFC 3261 §13.2.1 makes the 2xx to an offerless INVITE carry
+/// the offer. Without a media session there is nothing truthful to answer with,
+/// so it is refused rather than answered with an SDP that describes no path.
+pub fn answer_one_legged_reoffer(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    a_leg: &Leg,
+    what: &str,
+    state: &DispatcherState,
+) {
+    let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
+        state.rtpengine_set.as_ref(),
+        state.rtpengine_sessions.as_ref(),
+        state.rtpengine_profiles.as_ref(),
+    ) else {
+        // No media backend at all: the leg carries whatever SDP the peer and
+        // siphon agreed at answer, and there is nothing to re-negotiate. A
+        // refresh is still a refresh, so accept it without a body.
+        debug!(call_id = %call_id, what, "B2BUA: one-legged re-offer with no media backend — 200 without a body");
+        send_one_legged_ok(inbound, message, Vec::new(), state);
+        return;
+    };
+
+    let session = media_sessions.get(&a_leg.dialog.call_id);
+    let profile = session
+        .as_ref()
+        .and_then(|session| profiles.get(&session.profile));
+    let (Some(session), Some(profile)) = (session.as_ref(), profile) else {
+        warn!(
+            call_id = %call_id,
+            what,
+            "B2BUA: one-legged re-offer on a call with no media session — 488 rather than an \
+             answer describing a media path that does not exist"
+        );
+        reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
+        return;
+    };
+
+    // The A-leg is the offering party on a one-legged call, so its own tag is
+    // what identifies it to the engine.
+    let Some(offer_tag) = session.offer_tag(true) else {
+        warn!(call_id = %call_id, what, "B2BUA: one-legged re-offer with no recorded offerer tag — 488");
+        reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
+        return;
+    };
+
+    // An offerless refresh asks us for the offer; answer from the media the leg
+    // last described, which is what the engine is already wired to.
+    let offer = if message.body.is_empty() {
+        match a_leg.last_sdp.as_ref() {
+            Some(sdp) => sdp.clone(),
+            None => {
+                warn!(
+                    call_id = %call_id,
+                    what,
+                    "B2BUA: offerless one-legged re-offer with no stored media to offer back — 488"
+                );
+                reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
+                return;
+            }
+        }
+    } else {
+        message.body.clone()
+    };
+
+    let mut answer_flags = profile.answer.clone();
+    // Pin media ingress where this request actually came from, as the offer path
+    // does: a handset that changed network re-offers from a new public address.
+    if answer_flags.carry_received_from {
+        answer_flags.received_from = Some(inbound.remote_addr.ip());
+    }
+
+    let answer_sdp = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(rtpengine_set.answer_local(
+            session.rtpengine_id(),
+            offer_tag,
+            &String::from_utf8_lossy(&offer),
+            &answer_flags,
+        ))
+    });
+
+    match answer_sdp {
+        Ok(sdp) => {
+            debug!(call_id = %call_id, what, "B2BUA: answered a one-legged re-offer from the media engine");
+            send_one_legged_ok(inbound, message, sdp.into_bytes(), state);
+        }
+        Err(error) => {
+            error!(
+                call_id = %call_id,
+                what,
+                "B2BUA: the media engine refused a one-legged re-offer: {error} — 488 rather than \
+                 an answer it will not honour"
+            );
+            reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
+        }
+    }
+}
+
+/// Send the `200 OK` for a one-legged re-offer, with `body` as its SDP.
+fn send_one_legged_ok(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    body: Vec<u8>,
+    state: &DispatcherState,
+) {
+    let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    if !body.is_empty() {
+        response
+            .headers
+            .set("Content-Type", "application/sdp".to_string());
+        response
+            .headers
+            .set("Content-Length", body.len().to_string());
+        response.body = body;
+    }
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
 }

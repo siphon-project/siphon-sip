@@ -1214,6 +1214,9 @@ jobs:
       - name: Media verbs on an answer-first channel
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-media-uac sipp-control-media-uac
 
+      - name: Hold, resume and a session refresh on a one-legged anchored call
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-hold-uac sipp-control-hold-uac
+
       - name: Exactly-one-owner dispatch across several app connections
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
 
