@@ -963,6 +963,8 @@ pub struct AuthConfig {
     #[serde(default)]
     pub aka_credentials: std::collections::HashMap<String, AkaCredential>,
     pub http: Option<HttpAuthConfig>,
+    /// SQL credential source for `backend: database`.
+    pub database: Option<DatabaseAuthConfig>,
     pub diameter: Option<DiameterCxConfig>,
     /// Shared secret for stateless digest-nonce HMAC integrity (RFC 7616 §3.3).
     /// When set, a digest response carrying a nonce the cluster never issued is
@@ -1000,6 +1002,7 @@ impl Default for AuthConfig {
             users: Default::default(),
             aka_credentials: Default::default(),
             http: None,
+            database: None,
             diameter: None,
             nonce_secret: None,
             nonce_ttl_secs: None,
@@ -1425,6 +1428,50 @@ pub struct HttpAuthConfig {
     /// production setting; a change propagates after at most `cache_ttl_secs`.
     #[serde(default)]
     pub cache_ttl_secs: u64,
+}
+
+/// SQL credential source for `auth.backend: database`.
+///
+/// The query is the operator's, not siphon's: schemas differ and a fixed one
+/// would mean every deployment maintaining a view. It is passed to PostgreSQL
+/// as a prepared statement with `$1` bound to the digest username and, when the
+/// query references it, `$2` bound to the realm — so the username never reaches
+/// the database as SQL text.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DatabaseAuthConfig {
+    /// libpq connection URI, e.g. `postgresql://siphon@db.internal/siphon`.
+    pub url: String,
+    /// Statement returning one row, one column: the credential for `$1`
+    /// (and `$2`, the realm, when the statement references it).
+    #[serde(default = "default_auth_query")]
+    pub query: String,
+    /// If true, the column is a pre-hashed H(A1) hex string. If false, it is a
+    /// plaintext password and siphon hashes it with the algorithm the client
+    /// advertised.
+    ///
+    /// An H(A1) is algorithm-specific by construction (RFC 7616 §3.4.3), so a
+    /// stored one only verifies for clients answering with the algorithm it was
+    /// computed for.
+    #[serde(default)]
+    pub ha1: bool,
+    /// TTL (seconds) for caching a successful lookup, keyed by username. `0`
+    /// (the default) disables caching, so every digest verification performs a
+    /// blocking query and a registration storm translates 1:1 into queries on
+    /// the fixed Python executor pool. Credentials rarely change, so a non-zero
+    /// TTL is the production setting; a change propagates within it.
+    #[serde(default)]
+    pub cache_ttl_secs: u64,
+    /// Per-query deadline in milliseconds, connection included.
+    #[serde(default = "default_auth_query_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_auth_query() -> String {
+    "SELECT password FROM subscribers WHERE username = $1 AND realm = $2".to_string()
+}
+
+fn default_auth_query_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_http_timeout_ms() -> u64 {
@@ -4620,12 +4667,7 @@ impl Config {
 
         match self.auth.backend {
             AuthBackendType::Static | AuthBackendType::Http => Ok(()),
-            AuthBackendType::Database => Err(SiphonError::Config(
-                "auth.backend: database is not implemented — every credential check would \
-                 fail closed, so no subscriber could register. Use \"static\" with \
-                 `auth.users`, or \"http\" with an `auth.http` lookup endpoint."
-                    .to_string(),
-            )),
+            AuthBackendType::Database => self.validate_database_auth(),
             AuthBackendType::DiameterCx => Err(SiphonError::Config(
                 "auth.backend: diameter_cx is not a dispatchable backend — Cx MAR/MAA \
                  authentication is reachable from a script through \
@@ -4654,6 +4696,41 @@ impl Config {
                  Keep `backends` for several sinks, or `backend` for one.",
                 cdr.backend.as_deref().unwrap_or(""),
                 cdr.backends.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reject a `database` auth backend that cannot answer a credential lookup.
+    ///
+    /// Both failures here fail *closed* at runtime — no credential source means
+    /// every digest check is `Unavailable`, so no subscriber registers — and a
+    /// box that comes up healthy and rejects every REGISTER is worse than one
+    /// that refuses to start.
+    fn validate_database_auth(&self) -> Result<()> {
+        let Some(database) = &self.auth.database else {
+            return Err(SiphonError::Config(
+                "auth.backend: database needs an `auth.database` block naming the \
+                 connection URL and the query that returns the credential. Without one \
+                 there is no credential source, so every digest check would fail and no \
+                 subscriber could register."
+                    .to_string(),
+            ));
+        };
+        if !cfg!(feature = "postgres-backend") {
+            return Err(SiphonError::Config(
+                "auth.backend: database needs the `postgres-backend` cargo feature, which \
+                 this binary was built without. Rebuild with it (it is on by default), or \
+                 use \"static\" with `auth.users` or \"http\" with an `auth.http` endpoint."
+                    .to_string(),
+            ));
+        }
+        if !database.query.contains("$1") {
+            return Err(SiphonError::Config(format!(
+                "auth.database.query does not reference $1, so the digest username is never \
+                 bound and the same credential would be returned for every subscriber. \
+                 Query: {:?}",
+                database.query
             )));
         }
         Ok(())
@@ -7440,19 +7517,67 @@ media:
 
     #[test]
     fn rejects_undispatched_auth_backends() {
-        for (value, expected) in [
-            ("database", "auth.backend: database"),
-            // The serde name has no underscore; `siphon.yaml` documented
-            // `diameter_cx`, which never parsed in the first place.
-            ("diametercx", "auth.backend: diameter_cx"),
-        ] {
-            let error = Config::from_str(&backend_yaml(&format!("auth:\n  backend: {value}\n")))
-                .expect_err("undispatched auth backend must be rejected");
-            assert!(
-                error.to_string().contains(expected),
-                "error should name the setting: {error}"
-            );
-        }
+        // The serde name has no underscore; `siphon.yaml` documented
+        // `diameter_cx`, which never parsed in the first place.
+        let error = Config::from_str(&backend_yaml("auth:\n  backend: diametercx\n"))
+            .expect_err("undispatched auth backend must be rejected");
+        assert!(
+            error.to_string().contains("auth.backend: diameter_cx"),
+            "error should name the setting: {error}"
+        );
+    }
+
+    /// `backend: database` with no `auth.database` block has no credential
+    /// source, so every digest check would come back `Unavailable` and nobody
+    /// could register. A box that boots healthy and rejects every REGISTER is
+    /// worse than one that refuses to start.
+    #[test]
+    fn rejects_database_auth_without_a_source() {
+        let error = Config::from_str(&backend_yaml("auth:\n  backend: database\n"))
+            .expect_err("database auth with no source must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("auth.database"),
+            "error should name the missing block: {message}"
+        );
+    }
+
+    /// A query that never binds `$1` returns the same row for every subscriber,
+    /// which authenticates all of them against one credential.
+    #[test]
+    fn rejects_database_auth_query_that_ignores_the_username() {
+        let error = Config::from_str(&backend_yaml(
+            "auth:\n  backend: database\n  database:\n    url: \"postgresql://db/siphon\"\n    \
+             query: \"SELECT password FROM subscribers LIMIT 1\"\n",
+        ))
+        .expect_err("a query that ignores the username must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("$1"),
+            "error should say which parameter is missing: {message}"
+        );
+    }
+
+    /// The happy path: a source with a username-bound query loads, and the
+    /// defaults fill in.
+    #[test]
+    fn accepts_database_auth_with_a_source() {
+        let config = Config::from_str(&backend_yaml(
+            "auth:\n  backend: database\n  database:\n    url: \"postgresql://db/siphon\"\n",
+        ))
+        .expect("database auth with a source must load");
+        let database = config
+            .auth
+            .database
+            .as_ref()
+            .expect("the database block should be parsed");
+        assert!(
+            database.query.contains("$1"),
+            "the default query must bind the username: {}",
+            database.query
+        );
+        assert!(!database.ha1, "default is a plaintext password column");
+        assert_eq!(database.cache_ttl_secs, 0, "caching is opt-in");
     }
 
     #[test]

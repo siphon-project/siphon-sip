@@ -3,8 +3,8 @@
 //! Exposes `auth.require_www_digest()`, `auth.require_proxy_digest()`,
 //! and `auth.verify_digest()` to Python scripts.
 //!
-//! Currently implements a static-user backend. The `Http` and `Database`
-//! backends are stubs for later phases.
+//! Credentials come from `auth.users` (static), an HTTP lookup, or SQL —
+//! see [`crate::auth::server`] for the SQL source.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -15,7 +15,8 @@ use tracing::{debug, warn};
 
 use super::call::PyCall;
 use super::request::PyRequest;
-use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
+use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials};
+use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 
 /// Expected response, cached between the 401 challenge and the verification
@@ -272,7 +273,9 @@ pub struct PyAuth {
     http_config: Option<HttpAuthConfig>,
     /// Shared reqwest client for HTTP auth lookups.
     http_client: Option<reqwest::Client>,
-    /// In-process TTL cache of successful HTTP credential lookups, keyed by
+    /// SQL credential source for `auth.backend: database`.
+    database: Option<Arc<DatabaseCredentials>>,
+    /// In-process TTL cache of successful credential lookups, keyed by
     /// username. `Some` only when `auth.http.cache_ttl_secs > 0`. Flattens a
     /// registration storm: repeated REGISTERs for the same subscriber reuse the
     /// cached HA1/password instead of each making a blocking backend fetch that
@@ -304,6 +307,7 @@ impl PyAuth {
             http_config: None,
             http_client: None,
             http_ha1_cache: None,
+            database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
@@ -320,6 +324,7 @@ impl PyAuth {
             http_config: None,
             http_client: None,
             http_ha1_cache: None,
+            database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
@@ -350,6 +355,20 @@ impl PyAuth {
         self.http_config = Some(config);
         self.http_client = Some(client);
         Ok(())
+    }
+
+    /// Wire the SQL credential source for `auth.backend: database`.
+    ///
+    /// Shares the TTL cache with the HTTP backend: both answer the same
+    /// question (the credential for a username) and only one is ever the
+    /// configured backend, so a second cache would be dead weight.
+    pub fn set_database_config(&mut self, config: DatabaseAuthConfig) {
+        self.http_ha1_cache = if config.cache_ttl_secs > 0 {
+            Some(Arc::new(DashMap::new()))
+        } else {
+            None
+        };
+        self.database = Some(Arc::new(DatabaseCredentials::new(config)));
     }
 
     /// Set the Diameter manager for IMS authentication (Cx MAR).
@@ -1029,15 +1048,6 @@ impl CredentialCheck {
 /// "the backend said this user does not exist" and "the backend did not answer"
 /// are opposite signals, and collapsing them made an outage indistinguishable
 /// from an attack.
-enum CredentialLookup {
-    /// The backend returned a credential body (HA1 hex or plaintext password).
-    Found(String),
-    /// The backend answered with a non-success status: no such user.
-    NotFound,
-    /// The request failed outright — connection refused, timeout, read error.
-    Unavailable,
-}
-
 impl PyAuth {
     fn require_digest_inner(
         &self,
@@ -1390,6 +1400,7 @@ impl PyAuth {
                 CredentialCheck::from_verified(self.validate_static(auth_value, realm, method))
             }
             AuthBackendType::Http => self.validate_http(auth_value, realm, method),
+            AuthBackendType::Database => self.validate_database(auth_value, realm, method),
             _ => {
                 // A backend siphon cannot dispatch to is an operator error, not
                 // a peer's: nothing here is evidence about the source, so it
@@ -1535,6 +1546,84 @@ impl PyAuth {
 
         let valid = fields.verify(&ha1, method);
         debug!(username = %fields.username, valid, "HTTP auth digest verification");
+        CredentialCheck::from_verified(valid)
+    }
+
+    /// Database backend: look the credential up in SQL, then verify the digest.
+    ///
+    /// Same shape as [`Self::validate_http`] — the two differ only in where the
+    /// credential comes from — so the username bound, the TTL cache and the
+    /// `Unavailable`-is-not-evidence rule all behave identically.
+    fn validate_database(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
+        let fields = match DigestFields::parse(auth_value) {
+            Some(f) => f,
+            None => return CredentialCheck::Rejected,
+        };
+
+        // Bound the attacker-controlled username before it becomes a cache key:
+        // a flood of distinct crafted usernames must not grow the cache without
+        // limit. It reaches the database as a bound parameter either way.
+        if fields.username.is_empty() || fields.username.len() > MAX_AUTH_USERNAME_LEN {
+            warn!(
+                username_len = fields.username.len(),
+                "rejecting database auth: username empty or exceeds length limit"
+            );
+            return CredentialCheck::Rejected;
+        }
+
+        let Some(database) = &self.database else {
+            // Misconfiguration, not a credential decision — config load refuses
+            // this combination, so reaching here means the namespace was built
+            // without the backend being wired.
+            warn!("auth backend is database but no database config set");
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.auth_backend_errors_total.inc();
+            }
+            return CredentialCheck::Unavailable;
+        };
+
+        // With one H(A1) column per hash (RFC 8760) the row holds a different
+        // credential per algorithm, so the cache has to be keyed by both or a
+        // SHA-256 phone would be served the MD5 phone's cached hash.
+        let ha1_column = ha1_column_for(fields.algorithm);
+        let cache_key = if database.stores_ha1() {
+            format!("{}|{ha1_column}", fields.username)
+        } else {
+            fields.username.clone()
+        };
+
+        let credential = match self.cached_credential(&cache_key, database.cache_ttl_secs()) {
+            Some(cached) => {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_ha1_cache_hits_total.inc();
+                }
+                debug!(username = %fields.username, "database auth: credential cache hit");
+                cached
+            }
+            None => match database.lookup(&fields.username, realm, ha1_column) {
+                CredentialLookup::Found(credential) => {
+                    self.store_credential(&cache_key, &credential);
+                    credential
+                }
+                CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
+            },
+        };
+
+        let ha1 = if database.stores_ha1() {
+            // Already H(A1). Algorithm-specific by construction (RFC 7616
+            // §3.4.3), so it verifies only for clients answering with the
+            // algorithm it was computed for.
+            credential
+        } else {
+            crate::auth::hash_hex_public(
+                fields.algorithm,
+                format!("{}:{}:{}", fields.username, realm, credential).as_bytes(),
+            )
+        };
+
+        let valid = fields.verify(&ha1, method);
+        debug!(username = %fields.username, valid, "database auth digest verification");
         CredentialCheck::from_verified(valid)
     }
 
@@ -3428,6 +3517,51 @@ mod tests {
     #[test]
     fn unsupported_backend_is_unavailable() {
         let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::DiameterCx);
+        assert_eq!(
+            auth.validate_credentials(
+                &well_formed_authorization("alice"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Unavailable
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Database backend (`auth.backend: database`)
+    // -----------------------------------------------------------------------
+
+    fn database_config(query: &str, ha1: bool) -> DatabaseAuthConfig {
+        DatabaseAuthConfig {
+            url: "postgresql://127.0.0.1/siphon".to_string(),
+            query: query.to_string(),
+            ha1,
+            cache_ttl_secs: 300,
+            timeout_ms: 2000,
+        }
+    }
+
+    /// Build an Authorization header whose response is correct for `password`.
+    fn digest_for(username: &str, realm: &str, password: &str) -> String {
+        let nonce = format!("{:016x}.test", now_unix_secs());
+        let digest_uri = "sip:example.com";
+        let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
+        let ha2 = md5_hex(&format!("REGISTER:{digest_uri}"));
+        let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+        format!(
+            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+             uri=\"{digest_uri}\", response=\"{response}\""
+        )
+    }
+
+    /// The backend is selected but never wired. That is our mistake, not the
+    /// peer's, so it must not weigh on the source (see
+    /// `unreachable_auth_backend_is_unavailable_not_rejected` for the same rule
+    /// on the HTTP path).
+    #[test]
+    fn database_backend_without_a_source_is_unavailable() {
+        let mut auth = PyAuth::empty();
         auth.set_backend_type(AuthBackendType::Database);
         assert_eq!(
             auth.validate_credentials(
@@ -3437,6 +3571,185 @@ mod tests {
             ),
             CredentialCheck::Unavailable
         );
+    }
+
+    /// A stored plaintext password is hashed with the algorithm the client
+    /// advertised (RFC 7616 §3.4.3) and the digest verifies.
+    ///
+    /// Driven through the TTL cache rather than a live database: the cache is
+    /// the seam that lets the verification half be tested without one, and it
+    /// is the path a registration storm actually takes.
+    #[test]
+    fn database_backend_verifies_a_stored_password() {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Database);
+        auth.set_database_config(database_config(
+            "SELECT password FROM subscribers WHERE username = $1 AND realm = $2",
+            false,
+        ));
+        auth.store_credential("alice", "pass123");
+
+        assert_eq!(
+            auth.validate_credentials(
+                &digest_for("alice", "example.com", "pass123"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Valid
+        );
+        assert_eq!(
+            auth.validate_credentials(
+                &digest_for("alice", "example.com", "not-the-password"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Rejected,
+            "a wrong password must be rejected, not accepted"
+        );
+    }
+
+    /// `ha1: true` means the column is already H(A1) and is used verbatim.
+    #[test]
+    fn database_backend_verifies_a_stored_ha1() {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Database);
+        auth.set_database_config(database_config(
+            "SELECT ha1 FROM subscribers WHERE username = $1",
+            true,
+        ));
+        auth.store_credential("bob|ha1_md5", &md5_hex("bob:example.com:secret"));
+
+        assert_eq!(
+            auth.validate_credentials(
+                &digest_for("bob", "example.com", "secret"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Valid
+        );
+        assert_eq!(
+            auth.validate_credentials(
+                &digest_for("bob", "example.com", "wrong"),
+                "example.com",
+                "REGISTER"
+            ),
+            CredentialCheck::Rejected
+        );
+    }
+
+    /// The username is attacker-controlled and becomes a cache key, so an
+    /// empty or absurd one is refused before it is ever looked up.
+    #[test]
+    fn database_backend_bounds_the_username() {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Database);
+        auth.set_database_config(database_config(
+            "SELECT password FROM subscribers WHERE username = $1",
+            false,
+        ));
+        for username in ["", &"a".repeat(MAX_AUTH_USERNAME_LEN + 1)] {
+            assert_eq!(
+                auth.validate_credentials(
+                    &well_formed_authorization(username),
+                    "example.com",
+                    "REGISTER"
+                ),
+                CredentialCheck::Rejected,
+                "username of length {} must be refused",
+                username.len()
+            );
+        }
+    }
+
+    /// The realm is bound only when the operator's statement asks for it —
+    /// PostgreSQL errors on a parameter the statement does not use, so passing
+    /// `$2` unconditionally would break every realm-less schema.
+    #[test]
+    fn database_backend_binds_the_realm_only_when_the_query_uses_it() {
+        let with_realm = DatabaseCredentials::new(database_config(
+            "SELECT p FROM s WHERE u = $1 AND r = $2",
+            false,
+        ));
+        let without_realm =
+            DatabaseCredentials::new(database_config("SELECT p FROM s WHERE u = $1", false));
+        assert!(with_realm.binds_realm_for_test());
+        assert!(!without_realm.binds_realm_for_test());
+    }
+
+    /// RFC 8760: one H(A1) column per hash, and the client's algorithm picks
+    /// the column. Getting this wrong verifies a SHA-256 response against an
+    /// MD5 hash, which rejects every SHA-256 phone while MD5 keeps working —
+    /// the kind of failure that looks like a handset bug.
+    ///
+    /// Driven through the cache, whose key carries the column for the same
+    /// reason the query does: one cache entry per username would serve the
+    /// first algorithm's hash to every other.
+    #[test]
+    fn database_backend_selects_the_ha1_for_the_clients_algorithm() {
+        use crate::auth::DigestAlgorithm;
+
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Database);
+        auth.set_database_config(database_config(
+            "SELECT ha1_md5, ha1_sha256 FROM sip_credentials WHERE username = $1 AND realm = $2",
+            true,
+        ));
+
+        let realm = "example.com";
+        let password = "s3cret";
+        auth.store_credential(
+            "carol|ha1_md5",
+            &md5_hex(&format!("carol:{realm}:{password}")),
+        );
+        auth.store_credential(
+            "carol|ha1_sha256",
+            &crate::auth::hash_hex_public(
+                DigestAlgorithm::Sha256,
+                format!("carol:{realm}:{password}").as_bytes(),
+            ),
+        );
+
+        for algorithm in ["MD5", "SHA-256"] {
+            assert_eq!(
+                auth.validate_credentials(
+                    &digest_with_algorithm("carol", realm, password, algorithm),
+                    realm,
+                    "REGISTER"
+                ),
+                CredentialCheck::Valid,
+                "{algorithm} should verify against its own column"
+            );
+            assert_eq!(
+                auth.validate_credentials(
+                    &digest_with_algorithm("carol", realm, "wrong", algorithm),
+                    realm,
+                    "REGISTER"
+                ),
+                CredentialCheck::Rejected,
+                "{algorithm} with a wrong password must still be rejected"
+            );
+        }
+    }
+
+    /// Build an Authorization header for `algorithm`, response computed with
+    /// that algorithm throughout (RFC 7616 §3.4.3).
+    fn digest_with_algorithm(
+        username: &str,
+        realm: &str,
+        password: &str,
+        algorithm: &str,
+    ) -> String {
+        let parsed = parse_algorithm(Some(algorithm));
+        let nonce = format!("{:016x}.test", now_unix_secs());
+        let digest_uri = "sip:example.com";
+        let hash = |input: String| crate::auth::hash_hex_public(parsed, input.as_bytes());
+        let ha1 = hash(format!("{username}:{realm}:{password}"));
+        let ha2 = hash(format!("REGISTER:{digest_uri}"));
+        let response = hash(format!("{ha1}:{nonce}:{ha2}"));
+        format!(
+            "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+             uri=\"{digest_uri}\", algorithm={algorithm}, response=\"{response}\""
+        )
     }
 
     #[test]

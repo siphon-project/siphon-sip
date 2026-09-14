@@ -5,7 +5,10 @@
 //! a 401/407 challenge on outbound requests (REGISTER, INVITE, etc.).
 //!
 //! The *server* side (challenging incoming requests) lives in
-//! `crate::script::api::auth`.
+//! `crate::script::api::auth`; the credential sources it verifies against are
+//! in [`server`].
+
+pub(crate) mod server;
 
 use std::fmt;
 use std::sync::Mutex;

@@ -17,7 +17,7 @@ src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a 
 src/metrics/mod.rs          1850  # metric registry: one struct field + one registration per metric
 
 # ── Scheduled for the 1.9.0 module split ────────────────────────────────────
-src/config.rs                5150  # splits by YAML top-level key into src/config/**; +48 for the cdr.backends sink list and its validator
+src/config.rs                5150  # splits by YAML top-level key into src/config/**; +48 for the cdr.backends sink list and its validator, +35 for the auth.database block and its validator
 src/server.rs                3900  # run_async is one 2,214-line fn; splits into src/server/**
 
 # ── PyO3 binding layer ──────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ src/script/api/diameter.rs   3350  # single #[pymethods] block; kwargs marshalli
 src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    1950  # same
-src/script/api/auth.rs       2050  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0
+src/script/api/auth.rs       2150  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0; +49 for the database backend's validate/cache path
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 thin delegations
