@@ -17,7 +17,7 @@ pub fn b2bua_forward_indialog_request(
     call_id: &str,
     from_a_leg: bool,
     method: Method,
-    marker: &str,
+    marker: crate::b2bua::actor::ForwardedMarker,
     state: &DispatcherState,
 ) {
     let method_str = method.as_str().to_string();
@@ -269,9 +269,9 @@ pub fn b2bua_forward_indialog_request(
         resolve_in_dialog_destination(&target_route_set, state, destination, transport);
 
     let direction = if from_a_leg {
-        format!("{marker}:a2b")
+        marker.tracking_target("a2b")
     } else {
-        format!("{marker}:b2a")
+        marker.tracking_target("b2a")
     };
     let originator_vias = message
         .headers
@@ -484,7 +484,7 @@ pub fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: 
         &call_id,
         from_a_leg,
         Method::Notify,
-        "notify",
+        crate::b2bua::actor::ForwardedMarker::Notify,
         state,
     );
 }

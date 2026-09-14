@@ -183,6 +183,9 @@ pub fn handle_b2bua_response(
     if absorb_completed_update_retransmit(call_id, status_code, &snapshot) {
         return;
     }
+    if absorb_completed_forward_retransmit(call_id, status_code, &snapshot) {
+        return;
+    }
     if dispatch_bridge_reinvite_response(call_id, branch, message, status_code, state, &snapshot) {
         return;
     }

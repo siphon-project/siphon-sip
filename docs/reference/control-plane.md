@@ -356,6 +356,13 @@ additive to the in-process `@rtpengine.on_dtmf` dispatch: the digit fires both,
 and it needs no extra configuration beyond the DTMF-log wiring the media engine
 already uses.
 
+A digit signalled as **SIP INFO** rather than in the media (RFC 2976 / RFC 6086
+`application/dtmf-relay`, which some handsets and trunks send instead of
+RFC 4733) produces the same event, from the same code path — an app collecting
+digits does not have to know which wire carried them. The INFO itself is relayed
+to the far leg on a two-leg call and answered `200` on a one-legged one; an INFO
+body that is not DTMF is relayed or answered but produces no event.
+
 ### Application-level events
 
 Most events belong to a channel and reach its owner. `RegistrationChanged` does

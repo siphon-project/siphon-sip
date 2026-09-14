@@ -13,6 +13,8 @@ The dialled user selects the case, and the case is echoed into the handover's
               183-with-SDP are two separate verbs on the wire.
   media@    — answer-first (AI-park) handover; the app drives media verbs on the
               already-connected channel.
+  info@     — deferred handover; the app answers, so the call stays one-legged and
+              siphon is the party that answers the caller's in-dialog INFO.
   deadline@ — deferred handover to an app that deliberately never acts, so the
               configured `control.limits.handoff_deadline_ms` is what ends the
               call. No `deadline_ms` here on purpose: the config value is what
@@ -81,6 +83,12 @@ def route(call):
             profile="voice_ai",
             ws_uri=AI_WS_URI,
             vars={"case": "media"},
+        )
+    elif user == "info":
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            deadline_ms=GENEROUS_DEADLINE_MS,
+            vars={"case": "info"},
         )
     elif user == "deadline":
         # No deadline_ms: control.limits.handoff_deadline_ms is the thing under

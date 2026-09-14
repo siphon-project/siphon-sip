@@ -4,8 +4,8 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    generate_call_id, generate_tag, CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor,
-    LegSide, ReferSubscription, SessionTimerState, TransportInfo,
+    generate_call_id, generate_tag, CallActor, CallActorStore, CallEvent, CallState,
+    ForwardedMarker, Leg, LegActor, LegSide, ReferSubscription, SessionTimerState, TransportInfo,
 };
 use siphon::b2bua::header_policy::{
     apply_to_request, apply_to_response, build_registry, builtin_presets, validate_preset,
@@ -2397,6 +2397,8 @@ fn is_tracking_leg_recognizes_transfer_markers() {
         "refer_done:b2a",
         "notify:a2b",
         "notify_done:b2a",
+        "info:a2b",
+        "info_done:b2a",
         "refer_out:a",
     ] {
         let mut leg = make_b_leg("10.0.0.2:5060");
@@ -2407,6 +2409,71 @@ fn is_tracking_leg_recognizes_transfer_markers() {
     // dialog-identity direction matching.
     let real = make_b_leg("10.0.0.2:5060");
     assert!(!real.is_tracking_leg());
+}
+
+#[test]
+fn every_forwarded_marker_is_recognised_by_every_check_that_routes_it() {
+    // The drift guard. INFO was tagged `info:` by the forward and recognised by
+    // none of the checks that route its response back, because each restated the
+    // set as strings. Iterating `ALL` here means a new marker cannot be added to
+    // the enum without every one of these holding for it.
+    for marker in ForwardedMarker::ALL {
+        for direction in ["a2b", "b2a"] {
+            let tracking = marker.tracking_target(direction);
+            let done = marker.done_target(direction);
+
+            assert_eq!(
+                ForwardedMarker::from_tracking_target(&tracking),
+                Some((marker, direction)),
+                "{tracking} must round-trip to its marker and direction"
+            );
+            // A completed forward's response was already relayed: a second one
+            // is a retransmission to absorb, never another response to relay.
+            assert_eq!(
+                ForwardedMarker::from_tracking_target(&done),
+                None,
+                "{done} must not read as an in-flight forward"
+            );
+            assert!(
+                ForwardedMarker::is_done_target(&done),
+                "{done} is a completed forward"
+            );
+            assert!(
+                !ForwardedMarker::is_done_target(&tracking),
+                "{tracking} is not a completed forward"
+            );
+
+            for target in [&tracking, &done] {
+                let mut leg = make_b_leg("10.0.0.2:5060");
+                leg.dialog.target_uri = Some(target.clone());
+                assert!(leg.is_tracking_leg(), "{target} must be a tracking leg");
+            }
+        }
+    }
+}
+
+#[test]
+fn forwarded_markers_do_not_swallow_neighbouring_markers() {
+    // `refer_out:` shares a prefix with `refer` but is a different pseudo-leg with
+    // its own response arm; reading it as a forwarded REFER would relay a response
+    // to the wrong originator. A real dialed URI is none of them.
+    for target in [
+        "refer_out:a",
+        "refer_out_done:a",
+        "reinvite:a2b",
+        "update_done:b2a",
+        "sip:bob@10.0.0.2:5060",
+    ] {
+        assert_eq!(
+            ForwardedMarker::from_tracking_target(target),
+            None,
+            "{target} is not a forwarded in-dialog request"
+        );
+        assert!(
+            !ForwardedMarker::is_done_target(target),
+            "{target} is not a completed forwarded request"
+        );
+    }
 }
 
 #[test]

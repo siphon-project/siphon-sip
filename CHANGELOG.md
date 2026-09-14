@@ -128,6 +128,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an application that only places outbound calls. An unknown class in `events`
   is refused at config load — the list is read at start-up, so a typo would
   otherwise leave the app waiting for events that never come.
+- **In-dialog INFO on a B2BUA call is handled as part of the call.** INFO was
+  not one of the methods the B2BUA intercepted, so it took the proxy path: a
+  B2BUA script with no `@proxy.on_request` covering INFO got
+  `405 Method Not Allowed`, and one with such a handler sent it to proxy routing
+  instead. Either way it never crossed a two-leg call, which is how a peer that
+  signals DTMF only as SIP INFO (RFC 2976 / RFC 6086 `application/dtmf-relay`,
+  still common on handsets and trunks) had its digits dropped.
+
+  It is relayed to the far leg on a two-leg call, and answered `200` on a
+  one-legged one. A DTMF payload — `application/dtmf-relay`'s `Signal=` /
+  `Duration=`, or a bare `application/dtmf` digit, including RFC 2833's `10` and
+  `11` for `*` and `#` — is surfaced through the same path an RFC 4733 digit
+  takes, so `@rtpengine.on_dtmf` and a controller's `ChannelDtmfReceived` see it
+  without knowing which wire carried it. A body that is not DTMF is left alone.
+
+- **A forwarded REFER, NOTIFY or INFO no longer draws an ACK for its response.**
+  Each is relayed across a two-leg call through one path that tags a
+  response-tracking pseudo-leg, but the response side recognised only `refer:`
+  and `notify:`. INFO's first `200` therefore fell into the INVITE-answer path,
+  which took it for a retransmitted INVITE 2xx: it never reached the caller, and
+  siphon sent the far leg an ACK — which a non-INVITE transaction never takes
+  (RFC 3261 §17.1.2) — with the tracking marker as its Request-URI. A
+  retransmitted final response to a completed REFER or NOTIFY hit the same path.
+  The set of forwarded request types is now one enum shared by the forward, the
+  response relay, the tracking-leg check and a new retransmit guard, so a type
+  cannot be forwarded without being recognised on the way back.
 
 ### Changed
 

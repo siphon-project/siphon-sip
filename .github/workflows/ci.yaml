@@ -718,6 +718,17 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true
 
+      # RFC 6086 in-dialog INFO relayed across a two-leg call with its body
+      # intact. `--exit-code-from` names the UAS: it carries the body
+      # assertion and answers last, and a UAC that got the old 405 aborts the
+      # run, which fails the UAS too.
+      - name: B2BUA in-dialog INFO relayed to the far leg (RFC 6086)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-info up --abort-on-container-exit --exit-code-from sipp-b2bua-info-uas sipp-b2bua-info-uac sipp-b2bua-info-uas
+
+      - name: Cleanup info containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-info rm -sf sipp-b2bua-info-uac sipp-b2bua-info-uas 2>/dev/null || true
+
       - name: B2BUA re-INVITE from the B-leg (Via branch correctness)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-bleg up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
 
@@ -1217,6 +1228,9 @@ jobs:
       - name: Hold, resume and a session refresh on a one-legged anchored call
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-hold-uac sipp-control-hold-uac
 
+      - name: In-dialog INFO on a one-legged call — answered, digits surfaced
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-info-uac sipp-control-info-uac
+
       - name: Exactly-one-owner dispatch across several app connections
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
 
@@ -1258,6 +1272,7 @@ jobs:
           assert_verdict handover control-app-edge.log
           assert_verdict deadline control-app-ivr.log
           assert_verdict media    control-app-edge.log
+          assert_verdict info     control-app-edge.log
           assert_verdict owner    control-app-ivr.log
           assert_verdict resync   control-app-ivr.log
           assert_performed play_media

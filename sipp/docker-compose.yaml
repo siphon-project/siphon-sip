@@ -919,6 +919,7 @@ services:
       - b2bua-early-media
       - b2bua-topology
       - b2bua-refer
+      - b2bua-info
 
   # --- B2BUA basic call test ---
 
@@ -2288,6 +2289,61 @@ services:
       - -trace_err
     profiles:
       - b2bua-failure
+
+  # --- B2BUA in-dialog INFO relay (RFC 6086) ---
+  # The A-leg sends INFO with a DTMF body mid-call; the UAS asserts it arrives
+  # with the body intact and answers, and the UAC asserts the 200 comes back.
+
+  sipp-b2bua-info-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_info_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-info
+
+  sipp-b2bua-info-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-info-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_info_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-info
 
   # --- B2BUA re-INVITE test (hold/resume) ---
 
@@ -6114,6 +6170,35 @@ services:
       - "172.20.0.160:5060"
       - -sf
       - /sipp/scenarios/control_hold_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # In-dialog INFO on a one-legged call: siphon answers it, and surfaces its digits.
+  sipp-control-info-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.182
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_info_uac.xml
       - -m
       - "1"
       - -l

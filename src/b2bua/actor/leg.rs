@@ -404,23 +404,90 @@ impl Leg {
         }
     }
 
-    /// True for the re-INVITE/UPDATE/REFER/NOTIFY response-tracking pseudo-legs
-    /// the dispatcher inserts as B-legs. Their `target_uri` is a direction
-    /// marker (`reinvite:`/`update:`/`refer:`/`notify:`/`refer_out:`/`…_done:`)
-    /// and they deliberately reuse another leg's Call-ID for response routing,
-    /// so they must be excluded from dialog-identity direction matching.
+    /// True for the re-INVITE/UPDATE/REFER/NOTIFY/INFO response-tracking
+    /// pseudo-legs the dispatcher inserts as B-legs. Their `target_uri` is a
+    /// direction marker (`reinvite:`/`update:`/`refer_out:`, a
+    /// [`ForwardedMarker`] target, or any of those `…_done:`) and they
+    /// deliberately reuse another leg's Call-ID for response routing, so they
+    /// must be excluded from dialog-identity direction matching.
     pub fn is_tracking_leg(&self) -> bool {
         self.dialog.target_uri.as_deref().is_some_and(|target| {
             target.starts_with("reinvite:")
                 || target.starts_with("reinvite_done:")
                 || target.starts_with("update:")
                 || target.starts_with("update_done:")
-                || target.starts_with("refer:")
-                || target.starts_with("refer_done:")
-                || target.starts_with("notify:")
-                || target.starts_with("notify_done:")
+                || ForwardedMarker::from_tracking_target(target).is_some()
+                || ForwardedMarker::is_done_target(target)
                 || target.starts_with("refer_out:")
                 || target.starts_with("refer_out_done:")
+        })
+    }
+}
+
+/// A non-INVITE in-dialog request siphon relays across a two-leg call, naming
+/// the response-tracking pseudo-leg that routes the far leg's answer back.
+///
+/// An enum rather than the string it was, because four places have to agree on
+/// the set: the forward that tags the pseudo-leg, the response arm that
+/// recognises the tag, [`Leg::is_tracking_leg`], and the guard that absorbs a
+/// completed forward's retransmitted response. As a string, INFO was tagged
+/// `info:` by the forward and recognised by none of the other three — its 200
+/// fell into the INVITE-answer path, was swallowed as a 2xx retransmission, and
+/// drew an ACK, which a non-INVITE transaction never takes (RFC 3261 §17.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardedMarker {
+    /// Transparent-transfer REFER (RFC 3515).
+    Refer,
+    /// Transparent-transfer sipfrag NOTIFY (RFC 3515 §2.4.5).
+    Notify,
+    /// INFO (RFC 6086).
+    Info,
+}
+
+impl ForwardedMarker {
+    /// Every marker, so a check that must cover the set iterates it rather than
+    /// restating it.
+    pub const ALL: [ForwardedMarker; 3] = [Self::Refer, Self::Notify, Self::Info];
+
+    /// The marker's name as it appears in a pseudo-leg target.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refer => "refer",
+            Self::Notify => "notify",
+            Self::Info => "info",
+        }
+    }
+
+    /// The pseudo-leg target while the forward is in flight, e.g. `info:a2b`.
+    pub fn tracking_target(self, direction: &str) -> String {
+        format!("{}:{direction}", self.as_str())
+    }
+
+    /// The pseudo-leg target once a final 2xx has been relayed, e.g.
+    /// `info_done:a2b`.
+    pub fn done_target(self, direction: &str) -> String {
+        format!("{}_done:{direction}", self.as_str())
+    }
+
+    /// Recognise an in-flight target, returning its marker and direction.
+    ///
+    /// A `…_done:` target is deliberately not matched: its response was already
+    /// relayed, so another one is a retransmission to absorb, not to relay.
+    pub fn from_tracking_target(target: &str) -> Option<(Self, &str)> {
+        Self::ALL.into_iter().find_map(|marker| {
+            target
+                .strip_prefix(marker.as_str())?
+                .strip_prefix(':')
+                .map(|direction| (marker, direction))
+        })
+    }
+
+    /// Whether `target` is a completed forward of any marker.
+    pub fn is_done_target(target: &str) -> bool {
+        Self::ALL.into_iter().any(|marker| {
+            target
+                .strip_prefix(marker.as_str())
+                .is_some_and(|rest| rest.starts_with("_done:"))
         })
     }
 }

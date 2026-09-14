@@ -73,6 +73,18 @@ pub fn spawn_rtpengine_events(
     }
 }
 
+/// Fan one DTMF digit out to the control plane and the script handlers.
+///
+/// Shared with the SIP INFO path (RFC 6086 `application/dtmf-relay`), so a
+/// digit reaches a handler the same way whichever wire carried it — a script
+/// reading `@rtpengine.on_dtmf` should not have to know.
+pub async fn dispatch_dtmf_event(
+    state: Arc<DispatcherState>,
+    dtmf: crate::rtpengine::events::DtmfEvent,
+) {
+    on_dtmf(&state, dtmf).await
+}
+
 async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::DtmfEvent) {
     // Additive control-plane forward: a controlled channel
     // gets the digit as a ChannelDtmfReceived event too, so an
