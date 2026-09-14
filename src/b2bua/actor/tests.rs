@@ -1093,14 +1093,10 @@ fn try_win_cancels_the_branches_still_ringing() {
         store.get_call(&call_id).unwrap().b_leg_status[1],
         BLegStatus::Cancelled
     );
-    assert!(store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-bleg1"));
-    assert!(
-        !store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-elsewhere"),
-        "a leg sharing the Call-ID on another branch is a different transaction"
-    );
-    assert!(!store.is_cancelled_branch("b2b-bleg2", "z9hG4bK-bleg2"));
+    assert!(store.is_cancelled_branch("z9hG4bK-bleg1"));
+    assert!(!store.is_cancelled_branch("z9hG4bK-bleg2"));
     let (leg, first_2xx) = store
-        .zombie_cancelled_for_2xx("b2b-bleg1")
+        .zombie_cancelled_for_2xx("z9hG4bK-bleg1")
         .expect("the cancelled branch is kept for its final response");
     assert_eq!(leg.branch, "z9hG4bK-bleg1");
     assert!(first_2xx);
@@ -1120,10 +1116,40 @@ fn a_6xx_keeps_the_branches_it_cancelled_answerable() {
         .expect("the call exists");
 
     assert_eq!(branches(&settlement.cancelled), vec!["z9hG4bK-bleg1"]);
-    assert!(store.is_cancelled_branch("b2b-bleg1", "z9hG4bK-bleg1"));
+    assert!(store.is_cancelled_branch("z9hG4bK-bleg1"));
     assert!(store
         .record_branch_failure("no-such-call", 0, 486, &branch_failure(486, "busy"))
         .is_none());
+}
+
+/// Branches of a fork that share one Call-ID (`call.preserve_call_id()`) are
+/// kept answerable separately. The entry is keyed by the INVITE's Via branch,
+/// which is what the 487 and a crossing 2xx carry; keyed by Call-ID, the second
+/// cancelled branch overwrote the first, whose final response then went
+/// unanswered.
+#[test]
+fn cancelled_branches_sharing_a_call_id_stay_answerable_apart() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    let mut first = make_sent_b_leg(0);
+    let mut second = make_sent_b_leg(1);
+    first.dialog.call_id = "shared-call-id".to_string();
+    second.dialog.call_id = "shared-call-id".to_string();
+    store.add_b_leg(&call_id, make_sent_b_leg(2));
+    store.add_b_leg(&call_id, first);
+    store.add_b_leg(&call_id, second);
+
+    let WinOutcome::FirstWin { cancelled } = store.try_win(&call_id, 0) else {
+        panic!("the first 2xx wins");
+    };
+
+    assert_eq!(branches(&cancelled), vec!["z9hG4bK-bleg0", "z9hG4bK-bleg1"]);
+    for branch in ["z9hG4bK-bleg0", "z9hG4bK-bleg1"] {
+        let (leg, _) = store
+            .zombie_cancelled_for_non2xx(branch)
+            .expect("each cancelled branch resolves on its own");
+        assert_eq!(leg.branch, branch);
+    }
 }
 
 /// The dispatch window is opened and closed through the store, and closing it
@@ -1590,6 +1616,7 @@ fn store_remove_call_after_cancel_zombifies_pending_legs() {
 
     let mut sent_leg = make_b_leg(0);
     let sent_cid = sent_leg.dialog.call_id.clone();
+    let sent_branch = sent_leg.branch.clone();
     let invite = crate::sip::builder::SipMessageBuilder::new()
         .request(
             crate::sip::message::Method::Invite,
@@ -1608,7 +1635,7 @@ fn store_remove_call_after_cancel_zombifies_pending_legs() {
 
     // A second B-leg whose INVITE never went on the wire (no stash).
     let unsent_leg = make_b_leg(1);
-    let unsent_cid = unsent_leg.dialog.call_id.clone();
+    let unsent_branch = unsent_leg.branch.clone();
     store.add_b_leg(&call_id, unsent_leg);
 
     let captured = store.remove_call_after_cancel(&call_id);
@@ -1617,15 +1644,15 @@ fn store_remove_call_after_cancel_zombifies_pending_legs() {
 
     // The sent leg resolves as a zombie; the unsent one does not.
     let (leg, first) = store
-        .zombie_cancelled_for_2xx(&sent_cid)
+        .zombie_cancelled_for_2xx(&sent_branch)
         .expect("zombie present for the sent leg");
     assert!(first, "the first racing 2xx triggers ACK + BYE");
     assert_eq!(leg.dialog.call_id, sent_cid);
-    assert!(store.zombie_cancelled_for_2xx(&unsent_cid).is_none());
+    assert!(store.zombie_cancelled_for_2xx(&unsent_branch).is_none());
 
-    // A retransmitted 2xx for the same Call-ID re-ACKs only (no second BYE).
+    // A retransmitted 2xx on the same branch re-ACKs only (no second BYE).
     let (_leg, second) = store
-        .zombie_cancelled_for_2xx(&sent_cid)
+        .zombie_cancelled_for_2xx(&sent_branch)
         .expect("entry stays until the 32s cleanup");
     assert!(!second, "a retransmit must not trigger a second BYE");
 }
@@ -1664,26 +1691,26 @@ fn store_zombie_captures_the_invite_ruri_so_the_487_can_be_acked() {
     // A leg whose INVITE never went on the wire draws no final response, so
     // it is not captured and nothing is owed an ACK.
     let unsent_leg = make_b_leg(1);
-    let unsent_cid = unsent_leg.dialog.call_id.clone();
+    let unsent_branch = unsent_leg.branch.clone();
     store.add_b_leg(&call_id, unsent_leg);
 
     assert!(store.remove_call_after_cancel(&call_id));
 
     let (leg, ruri) = store
-        .zombie_cancelled_for_non2xx(&sent_cid)
+        .zombie_cancelled_for_non2xx("z9hG4bK-bleg0")
         .expect("the CANCELled leg must still resolve for its 487");
     assert_eq!(leg.dialog.call_id, sent_cid);
     // The ACK goes out on the INVITE's own branch (§17.1.1.3), which is the
     // leg's branch — not a fresh one.
     assert_eq!(leg.branch, "z9hG4bK-bleg0");
     assert_eq!(ruri.as_deref(), Some("sip:bob@198.51.100.20:5060"));
-    assert!(store.zombie_cancelled_for_non2xx(&unsent_cid).is_none());
+    assert!(store.zombie_cancelled_for_non2xx(&unsent_branch).is_none());
 
     // §17.1.1.3 has the client transaction re-pass the ACK to the transport
     // on EVERY retransmission of the final response while it sits in
     // Completed — so the lookup must keep resolving, not consume the entry.
     assert!(
-        store.zombie_cancelled_for_non2xx(&sent_cid).is_some(),
+        store.zombie_cancelled_for_non2xx("z9hG4bK-bleg0").is_some(),
         "a retransmitted 487 must still be ACKable"
     );
 
@@ -1691,7 +1718,7 @@ fn store_zombie_captures_the_invite_ruri_so_the_487_can_be_acked() {
     // 487 followed by a raced 2xx (both are possible on a forked downstream)
     // must still produce ACK + BYE for the 2xx.
     let (_leg, first_2xx) = store
-        .zombie_cancelled_for_2xx(&sent_cid)
+        .zombie_cancelled_for_2xx("z9hG4bK-bleg0")
         .expect("the glare entry survives a 487 lookup");
     assert!(
         first_2xx,
@@ -3051,7 +3078,7 @@ mod originate_tests {
         );
 
         let (leg, ruri) = store
-            .zombie_cancelled_for_non2xx(&sip_call_id)
+            .zombie_cancelled_for_non2xx("z9hG4bK-orig1")
             .expect("the CANCELled originate must still resolve for its 487");
         // RFC 3261 §17.1.1.3 — the ACK rides the INVITE's own branch and
         // Request-URI.

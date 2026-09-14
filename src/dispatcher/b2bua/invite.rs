@@ -883,7 +883,13 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
             );
             let advanced = b2bua_advance_route(&call_id, &message_guard, state);
             burned_routes = advanced.burned;
-            if !advanced.dialed {
+            if !advanced.dialed && state.call_actors.get_call(&call_id).is_none() {
+                // Every carrier was refused because the call ended while the
+                // sequence was being dialled (a CANCEL during resolution). That
+                // path already answered the A-leg; a 503 would be a second final
+                // response on its INVITE transaction (RFC 3261 §17.2.1).
+                debug!(call_id = %call_id, "B2BUA: LCR — call ended before any carrier was dialled");
+            } else if !advanced.dialed {
                 // No carrier was routable (e.g. every gateway group down and no
                 // explicit next-hop) — answer the A-leg 503 instead of stalling.
                 debug!(call_id = %call_id, "B2BUA: LCR — no routable carrier");
@@ -1011,6 +1017,15 @@ pub fn b2bua_fail_undialed_call(
     state: &DispatcherState,
 ) {
     const REASON: &str = "Destination Unreachable";
+
+    // A B-leg send refuses a call that ended while it was being built. Whatever
+    // ended it — the caller's CANCEL, the ring timeout — has already answered
+    // the A-leg and cleaned up, so a 503 here would be a second final response
+    // on the same INVITE server transaction (RFC 3261 §17.2.1).
+    if state.call_actors.get_call(call_id).is_none() {
+        debug!(call_id = %call_id, "B2BUA: undialled call already ended — nothing left to answer");
+        return;
+    }
 
     let response = match invite_arc.lock() {
         Ok(invite) => {

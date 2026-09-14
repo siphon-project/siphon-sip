@@ -562,7 +562,17 @@ pub fn b2bua_send_b_leg_invite(
             .headers
             .set("Content-Length", b_leg_invite.body.len().to_string());
     }
-    state.call_actors.add_b_leg(call_id, b_leg.clone());
+    // A call that ended while this INVITE was being built — a CANCEL or the ring
+    // timeout landing during destination resolution — has nothing left to dial
+    // for. Sending anyway rang the callee for a call nobody was on, with no
+    // CANCEL ever coming.
+    if !state.call_actors.add_b_leg(call_id, b_leg.clone()) {
+        debug!(
+            call_id = %call_id,
+            "B2BUA: the call ended before its B-leg INVITE went out — not sending it"
+        );
+        return false;
+    }
     spawn_b_leg_actor(call_id, &b_leg, state);
 
     let data = Bytes::from(b_leg_invite.to_bytes());
@@ -677,45 +687,69 @@ pub fn b2bua_send_b_leg_invite(
     // initial INVITE (CSeq 1 is now used); subsequent requests (re-INVITE,
     // BYE, 401/407 retry) use CSeq >= 2.
     //
-    // Also drain a deferred CANCEL on this leg, if one was queued by
-    // handle_b2bua_cancel while the INVITE was still being assembled
-    // (RFC 3261 §9.1 — CANCEL must share the INVITE's Via branch + CSeq
-    // seq, so we can only emit it after the INVITE is on the wire and
-    // its hygiene-processed form is stashed).
+    // Also CANCEL this INVITE right away when it is owed one (RFC 3261 §9.1 —
+    // a CANCEL copies the INVITE's Via branch and CSeq, so it can only be built
+    // once the INVITE is on the wire and its hygiene-processed form stashed):
+    //  * a CANCEL was deferred onto the leg while the INVITE was being built —
+    //    the caller's CANCEL, or a sibling fork branch answering; or
+    //  * the call is gone — torn down between the send above and here — so no
+    //    CANCEL path can still reach the leg at all.
+    // The leg is found by its branch rather than taken as the last one, since
+    // another leg (a fork sibling, a re-INVITE tracker) can be added meanwhile.
     let stored_invite = Arc::new(Mutex::new(b_leg_invite));
-    let deferred_cancel: Option<(SipMessage, Transport, SocketAddr)> = if let Some(mut call) =
-        state.call_actors.get_call_mut(call_id)
-    {
-        let result = if let Some(b_leg) = call.b_legs.last_mut() {
-            b_leg.dialog.local_cseq += 1;
-            b_leg.b_leg_invite = Some(stored_invite.clone());
-            if b_leg.pending_cancel {
-                b_leg.pending_cancel = false;
-                match stored_invite.lock() {
-                    Ok(guard) => build_cancel_from_invite(&guard)
-                        .map(|c| (c, b_leg.transport.transport, b_leg.transport.remote_addr)),
-                    Err(_) => {
-                        warn!(call_id = %call_id, "B2BUA: pending CANCEL drain — stored INVITE mutex poisoned");
-                        None
-                    }
+    let cancel_now: Option<Leg> = match state.call_actors.get_call_mut(call_id) {
+        Some(mut call) => call
+            .find_b_leg_by_branch_mut(&branch)
+            .and_then(|(_, stashed)| {
+                stashed.dialog.local_cseq += 1;
+                stashed.b_leg_invite = Some(stored_invite.clone());
+                if stashed.pending_cancel {
+                    stashed.pending_cancel = false;
+                    Some(stashed.clone())
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        result
-    } else {
-        None
+            }),
+        None => {
+            let mut orphan = b_leg.clone();
+            orphan.dialog.local_cseq += 1;
+            orphan.b_leg_invite = Some(stored_invite.clone());
+            Some(orphan)
+        }
     };
 
-    if let Some((cancel_msg, b_transport, b_dest)) = deferred_cancel {
-        debug!(call_id = %call_id, "B2BUA: draining deferred CANCEL after INVITE stash");
-        // Same egress socket as the INVITE it cancels — RFC 3261 §9.1 puts the
-        // CANCEL on the INVITE's own hop, and on a flow-pinned leg that hop is
-        // the flow's socket.
-        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, flow_local_addr, state);
+    if let Some(leg) = cancel_now {
+        let cancel = stored_invite
+            .lock()
+            .ok()
+            .and_then(|invite| build_cancel_from_invite(&invite));
+        match cancel {
+            Some(cancel_msg) => {
+                debug!(
+                    call_id = %call_id,
+                    branch = %leg.branch,
+                    "B2BUA: CANCELling a B-leg INVITE as soon as it is stashed"
+                );
+                // Kept answerable first, so the 487 this draws is ACKed and a 2xx
+                // crossing it is ACKed and BYEd even though the call may be gone.
+                state.call_actors.keep_answerable(std::iter::once(&leg));
+                // Same egress socket as the INVITE it cancels — RFC 3261 §9.1
+                // puts the CANCEL on the INVITE's own hop, and on a flow-pinned
+                // leg that hop is the flow's socket.
+                send_b2bua_to_bleg(
+                    cancel_msg,
+                    leg.transport.transport,
+                    leg.transport.remote_addr,
+                    flow_local_addr,
+                    state,
+                );
+                schedule_zombie_cancelled_expiry(state.call_actors.clone(), vec![leg.branch]);
+            }
+            None => warn!(
+                call_id = %call_id,
+                "B2BUA: cannot build the CANCEL a B-leg INVITE is owed from its stored copy — it rings until it answers or times out"
+            ),
+        }
     }
 
     true

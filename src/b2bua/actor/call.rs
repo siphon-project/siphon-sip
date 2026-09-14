@@ -1090,7 +1090,11 @@ pub struct ZombieReInviteEntry {
 ///    arrived (§9.1). That 2xx still establishes a dialog, which the B2BUA MUST
 ///    ACK (§13.2.2.4) and then BYE (§15) to release.
 ///
-/// Keyed by the leg's SIP Call-ID. Auto-expires after 32 seconds (Timer H).
+/// Keyed by the Via branch of the CANCELled INVITE, which every final response
+/// to it carries (RFC 3261 §17.1.3). Not by the Call-ID: under
+/// `call.preserve_call_id()` every branch of a fork shares one, and a key per
+/// Call-ID kept only the last cancelled branch answerable. Auto-expires after 32
+/// seconds (Timer H).
 #[derive(Debug, Clone)]
 pub struct ZombieCancelledLeg {
     /// The cancelled leg's dialog + transport, used to build the ACK and BYE.

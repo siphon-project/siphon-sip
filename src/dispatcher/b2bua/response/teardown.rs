@@ -152,7 +152,7 @@ pub fn cancel_settled_branches(legs: &[crate::b2bua::actor::Leg], state: &Dispat
             continue;
         };
         // The store kept exactly the legs with a stashed INVITE, under this key.
-        kept.push(leg.dialog.call_id.clone());
+        kept.push(leg.branch.clone());
         let cancel = match invite_arc.lock() {
             Ok(invite) => build_cancel_from_invite(&invite),
             Err(_) => None,

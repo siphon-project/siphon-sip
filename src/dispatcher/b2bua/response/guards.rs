@@ -18,12 +18,8 @@ pub fn absorb_cancelled_branch_response(
     message: &SipMessage,
     status_code: u16,
     state: &DispatcherState,
-    snapshot: &BLegResponseSnapshot,
 ) -> bool {
-    let Some((sip_call_id, _)) = snapshot.b_leg_dialog.as_ref() else {
-        return false;
-    };
-    if !state.call_actors.is_cancelled_branch(sip_call_id, branch) {
+    if !state.call_actors.is_cancelled_branch(branch) {
         return false;
     }
     if status_code < 200 {
@@ -33,12 +29,10 @@ pub fn absorb_cancelled_branch_response(
             "B2BUA: dropping a provisional from a cancelled fork branch"
         );
     } else if status_code < 300 {
-        if let Some((leg, first_2xx)) = state.call_actors.zombie_cancelled_for_2xx(sip_call_id) {
+        if let Some((leg, first_2xx)) = state.call_actors.zombie_cancelled_for_2xx(branch) {
             handle_zombie_cancelled_2xx(leg, first_2xx, message, state);
         }
-    } else if let Some((leg, invite_ruri)) =
-        state.call_actors.zombie_cancelled_for_non2xx(sip_call_id)
-    {
+    } else if let Some((leg, invite_ruri)) = state.call_actors.zombie_cancelled_for_non2xx(branch) {
         handle_zombie_cancelled_non2xx(&leg, invite_ruri.as_deref(), message, status_code, state);
     }
     true

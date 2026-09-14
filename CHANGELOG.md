@@ -327,6 +327,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+- **Every cancelled fork branch now gets its final response answered, even
+  under `call.preserve_call_id()`.** The record that keeps a CANCELled leg's
+  487 ACKed and a crossing 2xx ACKed and BYEd was keyed by SIP Call-ID, which
+  every branch shares under `preserve_call_id()`, so the last branch cancelled
+  overwrote the rest. It is keyed by the INVITE's Via branch now, which the
+  response carries (RFC 3261 §17.1.3).
+
+- **A B-leg INVITE is no longer sent for a call that ended while it was being
+  built,** and one whose call ends between being sent and being stored is
+  CANCELled at once. A caller's CANCEL, or the ring timeout, landing while the
+  destination resolved used to leave the callee ringing for a call nobody was
+  on, with no CANCEL ever coming (RFC 3261 §9.1).
+
 - **A parallel `call.fork()` no longer fails the call on its first failed
   branch.** One branch answering busy while another still rang sent the caller
   that busy and dropped the call, and the branch that went on to answer was never
