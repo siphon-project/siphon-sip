@@ -81,6 +81,8 @@ mod lcr_number_policy_tests;
 #[cfg(test)]
 mod lcr_ring_timeout_tests;
 #[cfg(test)]
+mod lcr_route_bookkeeping_tests;
+#[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
 mod public_api_surface;

@@ -280,6 +280,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   itself already got, and provisionals, answers and failures now restore the
   caller's identity through one path.
 
+- **An LCR carrier that already failed is no longer CANCELled.** When a carrier
+  answered with a reroute cause (a `503`, say), siphon ACKed it and dialled the
+  next carrier but left the failed one's leg pending. Everything that later
+  cancels a call's pending legs sent it a CANCEL too: the next carrier ringing
+  out, the caller hanging up, the next carrier answering, a re-route from
+  `@b2bua.on_failure`. RFC 3261 §9.1 says a CANCEL SHOULD NOT be sent once a
+  final response has been received, and a carrier whose transaction has already
+  ended answers it `481`. The leg is now settled the moment its final response
+  arrives. A retransmission of that response, when the ACK was lost, is ACKed
+  again and does nothing else. Before, it was recorded as a failure of the
+  carrier then in flight and moved the sequence past that carrier too.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

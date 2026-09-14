@@ -941,6 +941,35 @@ fn branches(legs: &[Leg]) -> Vec<&str> {
     legs.iter().map(|leg| leg.branch.as_str()).collect()
 }
 
+/// An LCR carrier's leg is settled by its final failure, once. A leg that has
+/// failed or been CANCELled is waiting for nothing, so a later response on it
+/// is a straggler, and no sweep of pending branches CANCELs it again.
+#[test]
+fn a_route_branch_settles_once_on_its_final_failure() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+
+    assert!(call.settle_route_branch(0, 503));
+    assert_eq!(call.b_leg_status[0], BLegStatus::Failed(503));
+    assert!(
+        !call.settle_route_branch(0, 503),
+        "a retransmitted failure settles nothing"
+    );
+
+    assert_eq!(
+        branches(&call.cancel_pending_branches(None)),
+        vec!["z9hG4bK-bleg1"],
+        "the failed carrier is not CANCELled"
+    );
+    assert!(
+        !call.settle_route_branch(1, 487),
+        "a CANCELled leg is already settled"
+    );
+    assert_eq!(call.b_leg_status[1], BLegStatus::Cancelled);
+    assert!(!call.settle_route_branch(7, 503), "no such leg");
+}
+
 /// One branch failing is not the call failing while another still rings: the
 /// caller must keep ringing, which is the whole point of forking.
 #[test]

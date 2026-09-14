@@ -611,6 +611,29 @@ impl CallActor {
         })
     }
 
+    /// Settle the B-leg at `index` of a sequential failover call on its final
+    /// failure `status_code`, before the sequence moves on. Returns whether the
+    /// leg was still waiting for one: `false` for a leg already settled, failed
+    /// or CANCELled, which makes the response a retransmission or a straggler.
+    ///
+    /// A parallel fork settles a branch through
+    /// [`record_branch_failure`](Self::record_branch_failure), which also ranks
+    /// it against its siblings. A sequence ranks its carriers on its attempt
+    /// list instead, so this only marks the leg failed. Without it a carrier
+    /// that had failed and been ACKed stayed pending, and every later sweep of
+    /// pending branches (the next carrier's ring timeout, a caller CANCEL, an
+    /// answer, a re-route from `@b2bua.on_failure`) sent it a CANCEL, which
+    /// RFC 3261 §9.1 says SHOULD NOT follow a final response.
+    pub fn settle_route_branch(&mut self, index: usize, status_code: u16) -> bool {
+        if !self.is_pending_branch(index) {
+            return false;
+        }
+        if let Some(status) = self.b_leg_status.get_mut(index) {
+            *status = BLegStatus::Failed(status_code);
+        }
+        true
+    }
+
     /// Record a failed attempt against the carrier that was in flight. No-op for
     /// a non-sequential call.
     ///

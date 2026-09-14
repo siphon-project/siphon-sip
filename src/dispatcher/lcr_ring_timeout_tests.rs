@@ -15,10 +15,10 @@ use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use std::time::{Duration, Instant};
 
-const FIRST_CARRIER: &str = "198.51.100.7:5060";
-const SECOND_CARRIER: &str = "198.51.100.8:5060";
-const THIRD_CARRIER: &str = "198.51.100.9:5060";
-const CALLER: &str = "192.0.2.10:5060";
+pub(super) const FIRST_CARRIER: &str = "198.51.100.7:5060";
+pub(super) const SECOND_CARRIER: &str = "198.51.100.8:5060";
+pub(super) const THIRD_CARRIER: &str = "198.51.100.9:5060";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
 
 /// Leaves a mark on the A-leg INVITE each time `@b2bua.on_failure` runs, so a
 /// test can tell how many times it ran, and with which code, without the
@@ -32,7 +32,7 @@ def failed(call, code, reason):
     call.set_header("X-Test-Failures", seen + str(code) + ";")
 "#;
 
-fn carrier(carrier_id: &str, address: &str, timeout_secs: u32) -> crate::lcr::Route {
+pub(super) fn carrier(carrier_id: &str, address: &str, timeout_secs: u32) -> crate::lcr::Route {
     crate::lcr::Route {
         carrier_id: carrier_id.to_string(),
         next_hop: Some(format!("sip:{address}")),
@@ -42,7 +42,7 @@ fn carrier(carrier_id: &str, address: &str, timeout_secs: u32) -> crate::lcr::Ro
 }
 
 /// One message siphon put on the wire.
-struct Sent {
+pub(super) struct Sent {
     destination: SocketAddr,
     message: SipMessage,
 }
@@ -67,12 +67,12 @@ impl Sent {
     }
 }
 
-fn summaries(sent: &[Sent]) -> Vec<String> {
+pub(super) fn summaries(sent: &[Sent]) -> Vec<String> {
     sent.iter().map(Sent::summary).collect()
 }
 
 /// The INVITE among `sent` that went to `address`.
-fn invite_to(sent: Vec<Sent>, address: &str) -> SipMessage {
+pub(super) fn invite_to(sent: Vec<Sent>, address: &str) -> SipMessage {
     let listed = summaries(&sent);
     sent.into_iter()
         .find(|sent| sent.summary() == format!("INVITE to {address}"))
@@ -120,10 +120,10 @@ fn carrier_response(invite: &SipMessage, status_code: u16, reason: &str) -> SipM
 }
 
 /// A caller's call running an LCR sequence through a real dispatcher.
-struct Sequence {
-    dispatcher: TestDispatcher,
-    call_id: String,
-    invite: Arc<Mutex<SipMessage>>,
+pub(super) struct Sequence {
+    pub(super) dispatcher: TestDispatcher,
+    pub(super) call_id: String,
+    pub(super) invite: Arc<Mutex<SipMessage>>,
     /// Taken just after the most recent carrier was dialled, so no earlier than
     /// that attempt's own dial: a deadline counted from the dial has passed by
     /// `dialled` plus its length.
@@ -134,7 +134,17 @@ impl Sequence {
     /// Start `routes` with `ring_bound_secs` as the sequence's ring bound (what
     /// `call.route(timeout=…)` sets), and dial the first carrier.
     fn start(routes: Vec<crate::lcr::Route>, ring_bound_secs: u32) -> Sequence {
-        let dispatcher = test_dispatcher_with_script(MARK_FAILURES);
+        Sequence::start_with_script(routes, ring_bound_secs, MARK_FAILURES)
+    }
+
+    /// [`Sequence::start`] with `script` as the dispatcher's script instead of
+    /// one that only marks `@b2bua.on_failure`.
+    pub(super) fn start_with_script(
+        routes: Vec<crate::lcr::Route>,
+        ring_bound_secs: u32,
+        script: &str,
+    ) -> Sequence {
+        let dispatcher = test_dispatcher_with_script(script);
         let call_id = dispatcher.state.call_actors.create_call(Leg::new_a_leg(
             "lcr-policy@192.0.2.10".to_string(),
             "caller-tag".to_string(),
@@ -173,7 +183,7 @@ impl Sequence {
     }
 
     /// Everything siphon has put on the wire since the last look, in order.
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         let mut sent = Vec::new();
         while let Ok(outbound) = self.dispatcher.udp.try_recv() {
             sent.push(Sent {
@@ -186,7 +196,13 @@ impl Sequence {
     }
 
     /// The carrier at `address` answers its INVITE with `status_code`.
-    fn carrier_answers(&self, address: &str, invite: &SipMessage, status_code: u16, reason: &str) {
+    pub(super) fn carrier_answers(
+        &self,
+        address: &str,
+        invite: &SipMessage,
+        status_code: u16,
+        reason: &str,
+    ) {
         let mut response = carrier_response(invite, status_code, reason);
         let handled = handle_b2bua_response(
             &self.call_id,
@@ -203,18 +219,18 @@ impl Sequence {
     }
 
     /// Run the answer-timeout sweep `after` the most recent dial.
-    fn ring_for(&self, after: Duration) {
+    pub(super) fn ring_for(&self, after: Duration) {
         check_b2bua_answer_timeouts_at(&self.dispatcher.state, self.dialled + after);
     }
 
     /// A carrier was just dialled: later deadlines count from now.
-    fn redialled(&mut self) {
+    pub(super) fn redialled(&mut self) {
         self.dialled = Instant::now();
     }
 
     /// The codes `@b2bua.on_failure` ran with, in order, or `None` if it never
     /// ran.
-    fn failures_seen(&self) -> Option<String> {
+    pub(super) fn failures_seen(&self) -> Option<String> {
         self.invite
             .lock()
             .expect("the A-leg INVITE lock")
@@ -223,7 +239,7 @@ impl Sequence {
             .map(|value| value.to_string())
     }
 
-    fn call_is_gone(&self) -> bool {
+    pub(super) fn call_is_gone(&self) -> bool {
         self.dispatcher
             .state
             .call_actors

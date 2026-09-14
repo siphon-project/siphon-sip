@@ -810,22 +810,28 @@ pub fn advance_route_sequence(
 ) -> Option<bool> {
     let mut b_leg_acked_for_reroute = false;
     if !relay_challenge && state.call_actors.is_route_sequence(call_id) {
-        // Absorb a straggler that must NEVER reach the A-leg: a leg we
-        // cancelled during a failover-advance (its `487 Request Terminated`),
-        // or ANY non-2xx arriving after another carrier already answered.
-        // Without this, a cancelled carrier's 487 tears down the bridged
-        // call. We still ACK it (RFC 3261 §17.1.1.3) so the carrier stops
-        // retransmitting, then drop it — no forward, no teardown, no advance.
-        let already_cancelled = snapshot
-            .b_leg_index
-            .and_then(|idx| {
-                state
-                    .call_actors
-                    .get_call(call_id)
-                    .and_then(|call| call.b_leg_status.get(idx).cloned())
-            })
-            .is_some_and(|status| matches!(status, crate::b2bua::actor::BLegStatus::Cancelled));
-        if already_cancelled || status_code == 487 || snapshot.call_state == CallState::Answered {
+        // Settle this carrier's leg on its final response before anything else
+        // looks at the call, so nothing later takes it for a carrier still
+        // ringing and CANCELs it (RFC 3261 §9.1).
+        //
+        // A leg that was already settled makes this a straggler that must
+        // NEVER reach the A-leg or the sequence: a retransmission of this
+        // carrier's own final response (our ACK was lost), or a response from a
+        // leg we cancelled during a failover-advance. So is a `487 Request
+        // Terminated`, and ANY non-2xx arriving after another carrier already
+        // answered. Without this a cancelled carrier's 487 tears down the
+        // bridged call, and a retransmitted 503 is recorded against the carrier
+        // now in flight and advances the sequence past it. We still ACK it
+        // (RFC 3261 §17.1.1.3) so the carrier stops retransmitting, then drop it
+        // — no forward, no teardown, no advance.
+        //
+        // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
+        let newly_settled = snapshot.b_leg_index.map_or(true, |index| {
+            state
+                .call_actors
+                .settle_route_branch(call_id, index, status_code)
+        });
+        if !newly_settled || status_code == 487 || snapshot.call_state == CallState::Answered {
             ack_b_leg_non2xx(branch, message, state, snapshot);
             info!(call_id = %call_id, status = status_code,
     "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
