@@ -290,6 +290,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   up. It takes the same engine-answered path as the re-INVITE above. Two
   remaining no-B-leg arms that returned in silence now answer `500` rather than
   dropping the request.
+- **A transfer target that hangs up the moment it answers no longer gets a 481.**
+  On a siphon-terminated transfer (`accept_refer(mode="terminate")`,
+  `replace_peer`) siphon ACKed the target's 200 before promoting the target into
+  the call, so a target that sent BYE as soon as that ACK arrived could reach
+  siphon first: the BYE matched no dialog and was answered
+  `481 Call/Transaction Does Not Exist`, and the surviving party was never sent a
+  BYE and stayed up alone. The ACK now goes out only once the target is the
+  surviving party's peer and the transfer's subscription is cleared, so the
+  target's BYE always finds its dialog and ends the call.
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the

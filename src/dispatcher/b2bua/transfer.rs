@@ -997,28 +997,24 @@ pub fn b2bua_complete_terminated_transfer(
     // for the survivor↔target anchor (forced in Phase 1 when anchored).
     let cid_new = target_leg.dialog.call_id.clone();
 
-    // ACK the target's 2xx — siphon is the UAC for this leg (RFC 3261 §13.2.2.4).
-    if let Some(ack) = build_ack_for_owned_leg(
+    // The ACK for the target's 2xx — siphon is the UAC for this leg (RFC 3261
+    // §13.2.2.4). Built here, from the leg as it answered, but not sent until the
+    // target is the surviving party's peer: see where it goes out, below.
+    let target_ack = build_ack_for_owned_leg(
         &target_leg,
         response,
         &TransactionKey::generate_branch(),
         state,
-    ) {
+    )
+    .map(|ack| {
         let (dest, transport) = resolve_in_dialog_destination(
             &target_leg.dialog.route_set,
             state,
             target_leg.transport.remote_addr,
             target_leg.transport.transport,
         );
-        send_message_from(
-            ack,
-            transport,
-            dest,
-            target_leg.transport.connection_id,
-            target_leg.transport.local_addr,
-            state,
-        );
-    }
+        (ack, transport, dest)
+    });
 
     // Terminating NOTIFY (sipfrag 200 OK) and then BYE, both to the referrer.
     //
@@ -1169,6 +1165,25 @@ pub fn b2bua_complete_terminated_transfer(
         .call_actors
         .clear_refer_subscriptions_on_leg(call_id, referrer_on_a_leg);
     state.call_actors.set_state(call_id, CallState::Answered);
+
+    // Only now ACK the target. A target may hang up the moment its ACK arrives,
+    // and its BYE is handled on another thread. Sent any earlier, that BYE could
+    // land before the promotion, when the target's Call-ID matches no dialog leg
+    // and it is answered 481 while the surviving party is never released; or
+    // after the promotion but before the subscription is cleared, when a BYE from
+    // the referrer's side is taken for the referrer leaving mid-transfer and the
+    // call is kept for a target that has already gone. The target cannot send
+    // that BYE before it has the ACK, so ACKing last closes both.
+    if let Some((ack, transport, dest)) = target_ack {
+        send_message_from(
+            ack,
+            transport,
+            dest,
+            target_leg.transport.connection_id,
+            target_leg.transport.local_addr,
+            state,
+        );
+    }
 
     // Re-point the surviving party's media at the transfer target (RFC 3261 §14).
     // The referrer is gone, so without this the surviving leg still holds the
