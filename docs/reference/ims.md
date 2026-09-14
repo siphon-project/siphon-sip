@@ -15,6 +15,26 @@ Initial Filter Criteria evaluation (3GPP TS 29.228 / IMS Service Control).
 5G Service-Based Interface — N5/Npcf policy authorization plus Nbsf_Management
 PCF discovery.
 
+### PCF callbacks
+
+The PCF calls back over HTTP on the address in `sbi.notif_listen`. Advertise
+`http://<notif_listen>/sbi/events` as `notif_uri`; the PCF appends the
+TS 29.514 suffix for each callback, so one listener serves both.
+
+| Route | Body (verbatim dict) | Hook |
+|---|---|---|
+| `POST /sbi/events/notify` | `EventsNotification` | `@sbi.on_event` |
+| `POST /sbi/events/terminate` | `TerminationInfo` | `@sbi.on_terminate` |
+
+Both answer `204` once the handlers ran (a handler that raises is logged and
+still acknowledged), `400` for a body that is not JSON, and `503` when siphon's
+Python executor could not take the job, so the PCF knows the callback was not
+handled. Any other path is `404`.
+
+`POST /sbi/events` without a suffix still reaches `@sbi.on_event` for a PCF
+that posts to the advertised URI as-is. It is deprecated and will be removed in
+the next minor release.
+
 ::: siphon_sdk.mock_module.MockSbi
 
 ### `BsfError`

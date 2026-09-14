@@ -1282,17 +1282,35 @@ class _SbiNamespace:
     def on_event(fn):
         """Register handler for incoming PCF event notifications (N5).
 
-        Handler receives a dict with event notification data.
+        Handler receives the PCF's ``EventsNotification`` verbatim as a dict
+        (3GPP wire names), posted to ``{notif_uri}/notify``.
 
         Usage:
             @sbi.on_event
             def handle_pcf_event(event):
-                for notif in event.get("ev_notifs", []):
-                    if notif["event"] == "UP_PATH_CH_EVENT":
-                        log.warn("Bearer path changed")
+                for notif in event.get("evNotifs", []):
+                    if notif["event"] == "FAILED_RESOURCES_ALLOCATION":
+                        log.warn("PCF could not allocate the media resources")
         """
         is_async = _asyncio.iscoroutinefunction(fn)
         _registry.register("sbi.on_event", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_terminate(fn):
+        """Register handler for PCF app-session termination (N5).
+
+        Handler receives the PCF's ``TerminationInfo`` verbatim as a dict
+        (``termCause``, ``resUri``), posted to ``{notif_uri}/terminate``.
+        ``resUri`` is the ``app_session_uri`` ``create_session`` returned.
+
+        Usage:
+            @sbi.on_terminate
+            def handle_termination(termination):
+                sbi.delete_session(termination["resUri"])
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("sbi.on_terminate", None, fn, is_async)
         return fn
 
 

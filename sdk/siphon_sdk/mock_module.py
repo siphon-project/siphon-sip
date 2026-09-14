@@ -7896,13 +7896,81 @@ class MockSbi:
         for the per-event list. Each entry's ``flows`` carries ``medCompN`` +
         ``fNums`` (not flow descriptions).
 
+        siphon serves the callback on ``sbi.notif_listen`` at
+        ``POST /sbi/events/notify``: advertise
+        ``http://<notif_listen>/sbi/events`` as ``notif_uri`` and the PCF
+        appends ``/notify``. The PCF only sends events you subscribed to with
+        ``create_session(events=[...])`` or ``update_session(events=[...])``.
+
+        Sync and async handlers both work. A handler that raises is logged and
+        the PCF still gets ``204``: a retry would hit the same bug. When
+        siphon's Python executor is saturated and the handler cannot run, the
+        PCF gets ``503`` so it knows the notification was not taken.
+
+        ``POST /sbi/events`` (no suffix) also reaches this hook, for a PCF that
+        posts to the advertised URI as-is. It is deprecated and goes away in the
+        next minor release.
+
+        Args:
+            fn: ``def handler(event: dict) -> None`` or the ``async def``
+                equivalent. ``event`` is the ``EventsNotification`` dict.
+
+        Returns:
+            ``fn`` unchanged, so it stays callable from tests.
+
         Example::
 
             @sbi.on_event
             def handle_pcf_event(event):
                 session_events_uri = event.get("evSubsUri")
                 for notif in event.get("evNotifs", []):
-                    log.info(f"PCF event: {notif['event']}")
+                    if notif["event"] == "FAILED_RESOURCES_ALLOCATION":
+                        log.warn(f"PCF could not allocate resources: {session_events_uri}")
+        """
+        return fn
+
+    @staticmethod
+    def on_terminate(fn: Any) -> Any:
+        """Register a handler for PCF-initiated app-session termination (N5).
+
+        The PCF sends this when the PDU session behind an app session is
+        released (the N5 counterpart of a Diameter Rx ASR). The handler
+        receives the PCF's ``TerminationInfo`` document (TS 29.514) verbatim as
+        a dict:
+
+        - ``termCause``: why, e.g. ``"PDU_SESSION_TERMINATION"`` or
+          ``"ALL_SDF_DEACTIVATION"``.
+        - ``resUri``: the app-session resource URI, the same value
+          ``create_session`` returned as ``app_session_uri``. Use it to find the
+          call the session belonged to.
+
+        TS 29.514 has the AF acknowledge the termination and then delete the
+        app session, so a handler normally releases its per-call state and
+        calls ``sbi.delete_session(termination["resUri"])``. That also drops
+        siphon's own tracking of the session.
+
+        This is a separate hook from ``on_event`` on purpose: an event leaves
+        the session in place, a termination means it is ending. siphon serves
+        it on ``sbi.notif_listen`` at ``POST /sbi/events/terminate``; the PCF
+        appends ``/terminate`` to the ``notif_uri`` given to
+        ``create_session``, so the same ``http://<notif_listen>/sbi/events``
+        base serves both callbacks. Answers follow ``on_event``: ``204`` once the
+        handlers ran (a raising handler is logged), ``503`` when the executor
+        could not run them.
+
+        Args:
+            fn: ``def handler(termination: dict) -> None`` or the ``async def``
+                equivalent.
+
+        Returns:
+            ``fn`` unchanged, so it stays callable from tests.
+
+        Example::
+
+            @sbi.on_terminate
+            async def handle_termination(termination):
+                log.warn(f"PCF ended app session: {termination['termCause']}")
+                sbi.delete_session(termination["resUri"])
         """
         return fn
 

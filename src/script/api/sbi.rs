@@ -826,7 +826,7 @@ mod tests {
             let script = r#"
 # 1. Pre-injection surface parity with the Rust PySbi.
 expected = ('create_session', 'delete_session', 'update_session',
-            'discover_pcf_binding', 'on_event', 'BsfError')
+            'discover_pcf_binding', 'on_event', 'on_terminate', 'BsfError')
 for name in expected:
     assert hasattr(sbi, name), f"sbi facade missing {name!r}"
 assert issubclass(sbi.BsfError, RuntimeError), "sbi.BsfError must be a RuntimeError"
