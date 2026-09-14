@@ -261,6 +261,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the M-bit, which table 5.3.1 forbids on this AVP, and a PCRF that does not
   know the AVP has to reject an AAR carrying it that way (RFC 6733 §4.1)
   instead of skipping it.
+- **`sbi.update_session()` nests the modify under `ascReqData`.** TS 29.514
+  types the PATCH body as `AppSessionContextUpdateDataPatch`, which carries the
+  update data under `ascReqData` the same way create does. siphon sent it flat,
+  so the media components of a re-INVITE or UPDATE sat at the top level, where a
+  PCF reading the body by the OpenAPI finds nothing to modify. It is still a
+  JSON merge patch (`application/merge-patch+json`), and the script API is
+  unchanged. For crate embedders, `NpcfClient::update_app_session` takes the new
+  `AppSessionContextUpdateData` instead of `AppSessionContextReqData`, which
+  also carried create-only members (`ueIpv4`, `supi`, `notifUri`) that have no
+  place in a modify.
+
 - **A PCF callback siphon could not run is answered 503, not 204.** The N5
   listener acknowledged every notification whether or not a handler saw it, so
   when the Python executor queue was full or closed the PCF was told the event

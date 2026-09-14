@@ -123,6 +123,29 @@ struct AppSessionContextBody<'a> {
     asc_req_data: &'a AppSessionContextReqData,
 }
 
+/// Request data for an app-session modify (TS 29.514
+/// `AppSessionContextUpdateData`): the members a PATCH may change, which
+/// excludes create-only ones such as `ueIpv4`, `supi` or `notifUri`.
+///
+/// On the wire this is nested under `ascReqData` inside
+/// `AppSessionContextUpdateDataPatch`, the same envelope create uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSessionContextUpdateData {
+    /// Media components to modify (`medComponents`), a map keyed by each
+    /// component's `medCompN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_components: Option<IndexMap<String, MediaComponent>>,
+}
+
+/// Top-level PATCH body for an app-session modify (TS 29.514
+/// `AppSessionContextUpdateDataPatch`), sent as `application/merge-patch+json`.
+#[derive(Debug, Serialize)]
+struct AppSessionContextUpdateDataPatch<'a> {
+    #[serde(rename = "ascReqData")]
+    asc_req_data: &'a AppSessionContextUpdateData,
+}
+
 // The inbound PCF event notification (TS 29.514 `EventsNotification`) is NOT
 // modelled as a typed struct here. It is a large, evolving document
 // (`evSubsUri`, `evNotifs`, `qosMonReports`, `succResourcAllocReports`,
@@ -350,19 +373,21 @@ impl NpcfClient {
     /// `session_ref` follows the same id-or-absolute-URI rule as
     /// [`delete_app_session`].
     ///
-    /// Per TS 29.514 §4.2.3.2 the modify operation is a JSON merge-patch
-    /// (`application/merge-patch+json`) whose body is the patchable subset of
-    /// the request data **flat** (no `ascReqData` envelope, unlike create).
-    /// Returns `Ok(())` on any `2xx`; the response body (the updated
-    /// `AppSessionContext`) is not parsed.
+    /// The modify operation is a JSON merge-patch
+    /// (`application/merge-patch+json`) whose body is TS 29.514
+    /// `AppSessionContextUpdateDataPatch`: the update data nested under
+    /// `ascReqData`, as on create. Returns `Ok(())` on any `2xx`; the response
+    /// body (the updated `AppSessionContext`) is not parsed.
     pub async fn update_app_session(
         &self,
         session_ref: &str,
-        request_data: &AppSessionContextReqData,
+        update_data: &AppSessionContextUpdateData,
     ) -> Result<(), SbiError> {
         let (url, target_apiroot) = self.resolve_session_request(session_ref);
-        let patch_body = serde_json::to_vec(request_data)
-            .map_err(|error| SbiError::Deserialization(error.to_string()))?;
+        let patch_body = serde_json::to_vec(&AppSessionContextUpdateDataPatch {
+            asc_req_data: update_data,
+        })
+        .map_err(|error| SbiError::Deserialization(error.to_string()))?;
         let mut request = self
             .client
             .patch(&url)
@@ -976,6 +1001,76 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(1),
             "component keyed by medCompN: {body}"
+        );
+    }
+
+    // --- Modify (TS 29.514 ModAppSession: PATCH, AppSessionContextUpdateDataPatch) ---
+
+    /// Content type and JSON body of the one PATCH a modify router received.
+    type CapturedPatch = Arc<Mutex<Option<(Option<String>, serde_json::Value)>>>;
+
+    /// A modify router on `.../app-sessions/sess-1` that records the PATCH.
+    fn patch_capturing_router(captured: CapturedPatch) -> axum::Router {
+        use axum::http::HeaderMap;
+        use axum::routing::patch;
+        axum::Router::new().route(
+            "/npcf-policyauthorization/v1/app-sessions/sess-1",
+            patch(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let content_type = headers
+                        .get("content-type")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string());
+                    let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    *captured.lock().unwrap() = Some((content_type, value));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        )
+    }
+
+    /// Send `update_data` as a modify and return what the PCF received.
+    async fn capture_update(
+        update_data: &AppSessionContextUpdateData,
+    ) -> (Option<String>, serde_json::Value) {
+        let captured: CapturedPatch = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(patch_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+        client
+            .update_app_session("sess-1", update_data)
+            .await
+            .expect("modify must succeed");
+        let received = captured.lock().unwrap().clone();
+        received.expect("PATCH captured")
+    }
+
+    /// ModAppSession takes an `AppSessionContextUpdateDataPatch`, which carries
+    /// the update data under `ascReqData` exactly as create does. A flat body
+    /// carries none of the members the PCF reads.
+    #[tokio::test]
+    async fn update_wire_body_nests_update_data_under_asc_req_data() {
+        let update_data = AppSessionContextUpdateData {
+            med_components: Some(components_map(vec![MediaComponent {
+                med_comp_n: 1,
+                med_type: "AUDIO".to_string(),
+                f_status: "ENABLED".to_string(),
+                codecs: None,
+                med_sub_comps: None,
+            }])),
+        };
+
+        let (content_type, body) = capture_update(&update_data).await;
+
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/merge-patch+json")
+        );
+        let members: Vec<&String> = body.as_object().expect("JSON object").keys().collect();
+        assert_eq!(members, vec!["ascReqData"], "{body}");
+        assert!(
+            body["ascReqData"]["medComponents"]["1"].is_object(),
+            "medComponents keyed by medCompN under ascReqData: {body}"
         );
     }
 

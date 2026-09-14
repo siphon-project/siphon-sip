@@ -11,8 +11,8 @@ use indexmap::IndexMap;
 
 use crate::sbi::nbsf::{BindingQuery, BsfClient, PcfBinding, Scheme};
 use crate::sbi::npcf::{
-    app_session_id_from_location, AppSessionContextReqData, MediaComponent, MediaSubComponent,
-    NpcfClient,
+    app_session_id_from_location, AppSessionContextReqData, AppSessionContextUpdateData,
+    MediaComponent, MediaSubComponent, NpcfClient,
 };
 
 pyo3::create_exception!(
@@ -255,14 +255,13 @@ impl PySbi {
             None => Vec::new(),
         };
 
-        let request_data = AppSessionContextReqData {
+        let update_data = AppSessionContextUpdateData {
             med_components: components_to_map(components),
-            ..Default::default()
         };
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = crate::script::detach_block_on(client.update_app_session(&sid, &request_data));
+        let result = crate::script::detach_block_on(client.update_app_session(&sid, &update_data));
 
         match result {
             Ok(()) => {
