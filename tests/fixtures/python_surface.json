@@ -2067,7 +2067,7 @@
         "kind": "getset_descriptor"
       },
       "number_policy": {
-        "doc": "Named number policy applied to this carrier's B-leg identity headers.",
+        "doc": "Named number policy shaping this carrier's dialled number and identity headers.",
         "kind": "getset_descriptor"
       },
       "rate": {

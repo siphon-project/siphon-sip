@@ -193,16 +193,20 @@ groups are fixed at boot.
 
 Carriers want the number in different shapes:
 
-- **`tech_prefix`** — a dial/tech-prefix prepended to the R-URI userpart
-  (`"1010288"`, `"#31#"`). Many carriers route or bill on a prefix in front of
-  the E.164 number. siphon prepends it per carrier, so `+12025550123` becomes
-  `1010288+12025550123` toward that carrier only.
-- **`ruri`** — full Request-URI override when a carrier wants a specific number
-  format or its own host.
-- **`number_policy`** — a named `number_policies:` preset applied to *this*
-  carrier's From/To/PAI, so the CLI/identity shape can differ per carrier (a
-  failover to a second carrier reshapes independently). The R-URI stays owned by
-  `tech_prefix`/`ruri`.
+- **`number_policy`** — a named `number_policies:` preset for *this* carrier.
+  It shapes the dialled number in the Request-URI and the identity headers
+  (From/To/PAI) alike, so the two never disagree, and a failover to a second
+  carrier reshapes independently. A route that names none gets
+  `b2bua.default_number_policy`, the same as `call.dial()`. A name that is not
+  configured shapes nothing and is logged at warn with the carrier.
+- **`tech_prefix`** — a dial/tech-prefix (`"1010288"`, `"#31#"`) prepended to
+  the Request-URI userpart per carrier, *after* `number_policy` has shaped the
+  number. Many carriers route or bill on a prefix in front of the number: under
+  a `plain` policy `+12025550123` goes to that carrier as `101028812025550123`,
+  and with no policy at all it keeps the shape it arrived in
+  (`1010288+12025550123`). The prefix never reaches `To`.
+- **`ruri`** — full Request-URI override when a carrier wants its own host. The
+  number in it is still shaped by the route's policy, when there is one.
 - **`headers`** — per-carrier headers injected on the B-leg INVITE (an account
   token, a routing tag), applied after the header policy so they always land.
 - **`cdr_fields`** — key/value fields siphon **auto-stamps onto the CDR** when

@@ -62,6 +62,9 @@ impl PyRoute {
     }
 
     /// Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart.
+    ///
+    /// Prepended after `number_policy` has shaped the dialled number, and never
+    /// applied to `To`.
     #[getter]
     fn tech_prefix(&self) -> Option<&str> {
         self.inner.tech_prefix.as_deref()
@@ -97,7 +100,11 @@ impl PyRoute {
         self.inner.caller_id_presentation.as_deref()
     }
 
-    /// Named number policy applied to this carrier's B-leg identity headers.
+    /// Named number policy shaping this carrier's dialled number and identity headers.
+    ///
+    /// The dialled number in the R-URI and the From / To / P-Asserted-Identity /
+    /// P-Preferred-Identity get the same shape, and `tech_prefix` is prepended
+    /// to the shaped number. `None` means `b2bua.default_number_policy` applies.
     #[getter]
     fn number_policy(&self) -> Option<&str> {
         self.inner.number_policy.as_deref()

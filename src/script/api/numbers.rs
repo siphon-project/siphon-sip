@@ -35,6 +35,34 @@ pub struct NumberRuntime {
     pub default_b2bua_policy: Option<Arc<NumberPolicy>>,
 }
 
+/// A `number_policy` named a policy that `number_policies:` does not define.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown number policy {0:?}")]
+pub struct UnknownNumberPolicy(pub String);
+
+impl NumberRuntime {
+    /// The policy a dialled B2BUA leg is shaped with: the named policy, else
+    /// `b2bua.default_number_policy`, else none.
+    ///
+    /// The one resolution order behind every dialled leg: `call.dial()`,
+    /// `call.fork()` and a transfer reach it through [`resolve_dial_policy`],
+    /// an LCR route's `number_policy` directly. A route and a script dial that
+    /// name the same policy, or none, therefore come out in the same shape.
+    pub fn dial_policy(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Option<Arc<NumberPolicy>>, UnknownNumberPolicy> {
+        match name {
+            Some(name) => self
+                .registry
+                .get(name)
+                .map(Some)
+                .ok_or_else(|| UnknownNumberPolicy(name.to_string())),
+            None => Ok(self.default_b2bua_policy.clone()),
+        }
+    }
+}
+
 static NUMBER_RUNTIME: OnceLock<Arc<NumberRuntime>> = OnceLock::new();
 
 /// Install the process-wide number runtime. Idempotent — the first install
@@ -133,8 +161,9 @@ pub fn apply_to_message(message: &mut SipMessage, policy: &NumberPolicy) -> usiz
 
 /// Reshape only the identity headers (From / To / P-Asserted-Identity /
 /// P-Preferred-Identity) of a message, leaving the Request-URI untouched. Used
-/// by the LCR per-carrier `number_policy` so a carrier's From/To shape can
-/// differ while `tech_prefix` / `ruri` own the R-URI.
+/// where the B-leg Request-URI was shaped separately, before the INVITE was
+/// built: an LCR route's carrier target and a transfer target, both through
+/// [`reformat_dial_target`].
 pub fn apply_identity_headers(message: &mut SipMessage, policy: &NumberPolicy) {
     apply_headers_only(message, policy);
 }
@@ -158,7 +187,8 @@ pub fn apply_for_fork(message: &mut SipMessage, policy: &NumberPolicy, targets: 
     }
 }
 
-/// B2BUA transfer path: reshape a REFER / leg-replacement target URI to the
+/// B2BUA transfer and LCR route paths: reshape a REFER / leg-replacement target
+/// URI, or an LCR carrier's target before its `tech_prefix` goes on, to the
 /// policy's Request-URI format.
 ///
 /// Split out from [`apply_for_dial`] because a transfer decides its target
@@ -228,16 +258,9 @@ pub fn resolve_dial_shape(shape: Option<&NumberShape>) -> PyResult<Option<Arc<Nu
 /// Resolve a `number_policy=` argument for the B2BUA dial/fork path: an explicit
 /// named policy, else the `b2bua.default_number_policy`, else `None`.
 pub fn resolve_dial_policy(name: Option<&str>) -> PyResult<Option<Arc<NumberPolicy>>> {
-    match name {
-        Some(name) => number_runtime()
-            .registry
-            .get(name)
-            .map(Some)
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("unknown number policy {name:?}"))
-            }),
-        None => Ok(default_b2bua_policy()),
-    }
+    number_runtime()
+        .dial_policy(name)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +538,57 @@ mod tests {
     #[test]
     fn unresolvable_named_policy_still_errors_through_the_shape() {
         assert!(resolve_dial_shape(Some(&NumberShape::Named("nope@2026".to_string()))).is_err());
+    }
+
+    /// A runtime holding two named policies and optionally a default, built
+    /// without the process-wide install.
+    fn runtime(default: Option<&str>) -> NumberRuntime {
+        let mut registry = NumberRegistry::default();
+        registry
+            .policies
+            .insert("carrier-plain@test".to_string(), Arc::new(policy("plain")));
+        registry
+            .policies
+            .insert("carrier-e164@test".to_string(), Arc::new(policy("e164")));
+        let default_b2bua_policy =
+            default.map(|name| registry.get(name).expect("the default is configured"));
+        NumberRuntime {
+            registry,
+            default_b2bua_policy,
+        }
+    }
+
+    #[test]
+    fn dial_policy_prefers_the_named_policy_over_the_default() {
+        let resolved = runtime(Some("carrier-e164@test"))
+            .dial_policy(Some("carrier-plain@test"))
+            .unwrap()
+            .expect("a policy");
+        assert_eq!(resolved.default_format, NumberFormat::Plain);
+    }
+
+    #[test]
+    fn dial_policy_without_a_name_is_the_default() {
+        let resolved = runtime(Some("carrier-e164@test"))
+            .dial_policy(None)
+            .unwrap()
+            .expect("the default");
+        assert_eq!(resolved.default_format, NumberFormat::E164);
+    }
+
+    #[test]
+    fn dial_policy_without_a_name_or_a_default_is_none() {
+        assert!(runtime(None).dial_policy(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn dial_policy_refuses_an_unknown_name_rather_than_using_the_default() {
+        let error = runtime(Some("carrier-e164@test"))
+            .dial_policy(Some("nope@test"))
+            .unwrap_err();
+        assert_eq!(error, UnknownNumberPolicy("nope@test".to_string()));
+        // The message `call.dial(number_policy=…)` has always raised with.
+        assert_eq!(error.to_string(), "unknown number policy \"nope@test\"");
     }
 
     #[test]

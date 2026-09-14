@@ -159,7 +159,8 @@ class Route:
     tech_prefix: Optional[str] = None
     """Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart for this
     carrier (e.g. ``"1010288"``). Many carriers key routing/billing on a prefix
-    in front of the E.164 number."""
+    in front of the E.164 number. Prepended after :attr:`number_policy` has
+    shaped the number, and never applied to ``To``."""
 
     rate: Optional[float] = None
     """Per-minute rate — carried into CDR/charging, not used for routing."""
@@ -205,9 +206,12 @@ class Route:
     while looking like it works — so the two always move together."""
 
     number_policy: Optional[str] = None
-    """Named ``number_policies:`` preset applied to this carrier's B-leg identity
-    headers (From/To/PAI) so the From/To shape can differ per carrier. The R-URI
-    is controlled by ``tech_prefix`` / ``ruri``."""
+    """Named ``number_policies:`` preset applied to this carrier's B-leg: the
+    dialled number in the R-URI and the identity headers (From/To/PAI) get the
+    same shape, and :attr:`tech_prefix` is prepended to the shaped number.  When
+    ``None``, ``b2bua.default_number_policy`` applies, as it does for
+    ``call.dial()``.  A name that is not configured shapes nothing and is
+    logged."""
 
     headers: Dict[str, str] = field(default_factory=dict)
     """Headers to inject on this carrier's B-leg INVITE (account token, routing

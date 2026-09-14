@@ -105,4 +105,7 @@ inline `format` with an optional `headers` list and `home` override. See
 On the B2BUA, `call.dial(number_policy="<name>")` / `call.fork(number_policy=…)`
 (or the `b2bua.default_number_policy` config default) normalize the A-leg
 identity headers that flow to the B-leg plus the dial/fork target as the final
-step before the INVITE is built.
+step before the INVITE is built. An LCR route's `number_policy` (or the same
+default, when a route names none) does the same for that carrier's attempt: the
+dialled number in its Request-URI and its identity headers, with the route's
+`tech_prefix` prepended to the shaped number.
