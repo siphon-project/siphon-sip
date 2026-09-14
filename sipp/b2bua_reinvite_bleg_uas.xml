@@ -107,9 +107,11 @@ Content-Length: 0
 ]]>
   </send>
 
-  <pause milliseconds="200" />
-
-  <!-- Receive BYE from B2BUA (forwarded from UAC) -->
+  <!-- Receive BYE from B2BUA (forwarded from UAC). No pause before it: the UAC
+       sends that BYE 200 ms after its own ACK, which is about when this side's
+       ACK goes out, so a pause of the same length here ends just as the BYE
+       lands, and SIPp aborts a call on a message that arrives mid-pause. The
+       recv waits anyway. -->
   <recv request="BYE" />
 
   <!-- Send 200 OK for BYE -->
