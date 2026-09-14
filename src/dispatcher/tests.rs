@@ -667,6 +667,51 @@ fn other_status_codes_are_forwarded_untouched() {
     }
 }
 
+/// A failure siphon builds for the caller answers the INVITE the caller sent
+/// (RFC 3261 §8.2.6.2), not the B-leg shape a handler gave the stored copy: the
+/// caller's own From, and its own To with the A-leg dialog's tag. A failure
+/// `@b2bua.on_failure` chooses with `call.reject()` comes this way, from a
+/// handler that has often reshaped the numbers for the dial plan first.
+#[test]
+fn a_b2bua_failure_for_the_caller_echoes_the_callers_own_from_and_to() {
+    // The stored INVITE as a handler left it, numbers reshaped for the dial plan.
+    let (_, invite) = parse_sip_message(concat!(
+        "INVITE sip:+0010100000002@example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:+0010100000001@example.com>;tag=caller\r\n",
+        "To: <sip:+0010100000002@example.com>\r\n",
+        "Call-ID: a-leg@192.0.2.10\r\n",
+        "CSeq: 7 INVITE\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    ))
+    .expect("INVITE parses");
+    // From and To as the caller sent them.
+    let arrived_from = "<sip:0100000001@example.com>;tag=caller".to_string();
+    let arrived_to = "<sip:0100000002@example.com>".to_string();
+
+    let response = build_a_leg_final_response(
+        &invite,
+        "siphon-a-tag",
+        Some(&arrived_from),
+        Some(&arrived_to),
+        480,
+        "Temporarily Unavailable",
+        None,
+    );
+
+    assert_eq!(response.status_code(), Some(480));
+    assert_eq!(
+        response.headers.from().map(String::as_str),
+        Some("<sip:0100000001@example.com>;tag=caller")
+    );
+    assert_eq!(
+        response.headers.to().map(String::as_str),
+        Some("<sip:0100000002@example.com>;tag=siphon-a-tag")
+    );
+}
+
 /// RFC 3261 §16.7 step 6 on the B2BUA: the 500 that replaces a chosen B-leg
 /// 503 is generated from the caller's own INVITE. It carries the A-leg's Via,
 /// Call-ID and CSeq and the A-leg dialog's To-tag, and nothing from the B-leg
@@ -691,6 +736,8 @@ fn a_b2bua_failure_for_the_caller_is_built_from_its_invite() {
     let response = build_a_leg_final_response(
         &invite,
         "siphon-a-tag",
+        None,
+        None,
         upstream,
         crate::sip::best_response::SERVER_INTERNAL_ERROR,
         None,

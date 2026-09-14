@@ -167,10 +167,12 @@ unconditionally — they fire only when a carrier fails, not on every call.)
 A call has two clocks, and they measure different things.
 
 `timeout=` bounds the **ring**. If nothing answers in that many seconds siphon
-CANCELs the outstanding legs, fires `@b2bua.on_failure`, and answers the caller
-`408`. On a `call.fork()` where another branch already failed with something
-that outranks a timeout (a `486`, say), the caller gets that failure instead
-(RFC 3261 §16.7, §16.8). It stops mattering the moment a `2xx` lands.
+CANCELs the outstanding legs and fires `@b2bua.on_failure` with `408`. Unless
+the handler routes the call somewhere else or rejects it with a response of its
+own, the caller gets that `408`. On a `call.fork()` where another branch already
+failed with something that outranks a timeout (a `486`, say), the caller gets
+that failure instead (RFC 3261 §16.7, §16.8). It stops mattering the moment a
+`2xx` lands.
 
 `max_duration=` bounds the **talk**. The clock starts at the answer, so a call
 that rang for 25 seconds still gets its full talk time. When it expires siphon

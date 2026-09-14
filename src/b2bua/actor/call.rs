@@ -433,6 +433,10 @@ pub struct CallActor {
     /// The best final failure this call's branches have produced so far, which
     /// is what the A-leg is sent once no branch is left ringing (RFC 3261 §16.7).
     pub fork_best_failure: Option<BranchFailure>,
+    /// How many times `@b2bua.on_failure` has routed this call again. Capped, so
+    /// a handler that keeps re-dialling a target that keeps failing cannot hold
+    /// the call, or the thread, forever.
+    pub failure_reroutes: u32,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -503,6 +507,7 @@ impl CallActor {
             bridge: None,
             fork_dispatching: false,
             fork_best_failure: None,
+            failure_reroutes: 0,
         }
     }
 
@@ -1016,6 +1021,42 @@ impl CallActor {
             cancelled: self.cancel_pending_branches(None),
             failure: self.fork_best_failure.take(),
         })
+    }
+
+    /// Ready the call to be routed again from `@b2bua.on_failure`, and count
+    /// the re-route against the cap.
+    ///
+    /// What the failed routing left behind goes: the failure its fork held (the
+    /// new branches are ranked on their own) and its ring deadline (the new
+    /// routing arms its own). Its route sequence goes too when the handler dials
+    /// or forks instead (`replaces_route_sequence`), or the new B-leg's failure
+    /// would be taken for one of the old carriers'; `call.route()` starts a
+    /// sequence of its own. The B-legs that failed stay, settled, so a late
+    /// retransmission from one still finds its call.
+    pub fn begin_failure_reroute(&mut self, replaces_route_sequence: bool) {
+        self.failure_reroutes = self.failure_reroutes.saturating_add(1);
+        self.fork_best_failure = None;
+        self.answer_deadline = None;
+        if replaces_route_sequence {
+            self.route_sequence = None;
+        }
+    }
+
+    /// Take back an answer the call failed on before its caller was connected:
+    /// the B-leg at `b_leg_index` answered, `@b2bua.on_answer` raised or ended
+    /// the call, and that leg has been released.
+    ///
+    /// The call is unanswered again, with no winner and no answer time, so
+    /// `@b2bua.on_failure` can route it somewhere else and a later answer starts
+    /// the duration cap from when it happens. The released leg counts as failed
+    /// with `status_code`, the status the call concludes on.
+    pub fn rewind_failed_answer(&mut self, b_leg_index: Option<usize>, status_code: u16) {
+        if let Some(status) = b_leg_index.and_then(|index| self.b_leg_status.get_mut(index)) {
+            *status = BLegStatus::Failed(status_code);
+        }
+        self.winner = None;
+        self.answered_at = None;
+        self.transition_to(CallState::Calling);
     }
 
     /// Check if the message came from the A-leg (by source address).

@@ -327,6 +327,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   BYE and stayed up alone. The ACK now goes out only once the target is the
   surviving party's peer and the transfer's subscription is cleared, so the
   target's BYE always finds its dialog and ends the call.
+- **What `@b2bua.on_failure` decides is carried out.** A failure handler that
+  re-dialled (`call.dial()`, `call.fork()`, `call.route()`), rejected with a
+  response of its own (`call.reject()`), handed the call over or answered the
+  caller itself was run and then ignored: the call ended with its failure
+  regardless. The handler now runs once, before the caller hears anything, on
+  every path a call fails on (every branch failed, the ring timeout, a B-leg
+  INVITE that never left, no LCR carrier routable, an answer `@b2bua.on_answer`
+  refused), and what it leaves on the `Call` decides how the call ends or where
+  it goes next. Re-routes are capped at 10 per call. The failed B-leg's non-2xx
+  is ACKed before the handler runs, and a failed answer is taken back (no winner,
+  no CDR answer time) so the call can be routed again. An LCR sequence with no
+  routable carrier now runs `@b2bua.on_failure` and closes its CDR too, and every
+  failure siphon builds for the caller echoes the caller's own From and To
+  (RFC 3261 §8.2.6.2).
+
 - **A failed fork now sends the caller the failure RFC 3261 §16.7 picks.** The
   proxy fork aggregator and the B2BUA ranked failures 6xx > 5xx > 4xx > 3xx,
   highest code first, so a branch answering `486 Busy Here` lost to a sibling's

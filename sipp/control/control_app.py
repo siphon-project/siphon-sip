@@ -394,6 +394,34 @@ async def case_handover(app: App, session: Session, event: dict, verdict: Verdic
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+async def case_failure_handover(
+    app: App, session: Session, event: dict, verdict: Verdict
+) -> None:
+    """Handover from `@b2bua.on_failure`: the call's dial failed before anything
+    answered, and the failure handler handed the call here instead of ending it.
+    The app gets the caller's INVITE and answers it, which a handover decision
+    that was run and then dropped could never let happen."""
+    channel = event.get("channel") or ""
+    assert_sip_context(verdict, event, "failure-handover")
+    handover_vars = (event.get("payload") or {}).get("vars") or {}
+    verdict.check(
+        "handed_over_by_on_failure_with_the_503",
+        handover_vars.get("failed_with") == "503",
+        json.dumps(handover_vars),
+    )
+
+    reply = await answer_with_our_sdp(session, channel)
+    result = reply.get("result") or {}
+    verdict.check(
+        "answer_accepted",
+        reply.get("status") == "ok" and result.get("state") == "answered",
+        json.dumps(reply),
+    )
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 async def case_progress(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Ringing and early media are two verbs, driven on the app's own clock.
 
@@ -971,6 +999,7 @@ async def case_dial(app: App, session: Session, event: dict, verdict: Verdict) -
 
 CASES = {
     "handover": case_handover,
+    "failure-handover": case_failure_handover,
     "progress": case_progress,
     "deadline": case_deadline,
     "media": case_media,

@@ -285,8 +285,10 @@ sequential); `headers` is an optional object applied to every attempt's B-leg
 INVITE. On success siphon replies `{state: "routing", targets: N}`, emits a
 `StasisEnd{reason: "routed"}` on the owning connection (control returned, the
 call lives on), then owns the call: it dials the first carrier and advances
-through the rest on reject/timeout, with `@b2bua.on_failure` handling carrier
-failover. `continue` (bare hand-back, siphon re-decides routing through the
+through the rest on reject/timeout. Once every carrier has failed,
+`@b2bua.on_failure` runs and decides how the call ends, or routes it somewhere
+else (see [the handler model](../handler-execution-model.md)). `continue` (bare
+hand-back, siphon re-decides routing through the
 script's `@b2bua.on_*` handlers) is a follow-up, pending the control-loss
 `fallback` re-dispatch path.
 

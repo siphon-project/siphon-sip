@@ -921,6 +921,82 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-fork down --remove-orphans 2>/dev/null || true
 
+  # ── B2BUA @b2bua.on_failure decisions ───────────────────────────────────
+  # A failure handler that re-dialled, rejected with its own status or answered
+  # the caller itself was run and then ignored: the call ended with its failure
+  # regardless. Each case fails a call one way (a callee's 486, the ring timeout,
+  # an INVITE that never left, an answer @b2bua.on_answer refused) and asserts
+  # the caller got what the handler decided. The callees are the fork job's.
+  sipp-b2bua-on-failure:
+    runs-on: ubuntu-latest
+    needs: build-image
+    env:
+      SIPP_PROFILE: b2bua-on-failure
+      SIPP_CALLER: sipp-b2bua-on-failure-uac
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-on-failure
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-on-failure up -d --wait siphon-b2bua-on-failure
+
+      - name: on_failure re-dials a call its callee rejected
+        run: bash sipp/b2bua-fork/run_case.sh fail-redial b2bua_fork_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-early-uas
+
+      - name: on_failure's reject replaces the callee's failure
+        run: bash sipp/b2bua-fork/run_case.sh fail-reject b2bua_on_failure_reject_uac.xml sipp-b2bua-fork-busy-uas
+
+      - name: on_failure re-dials after the ring timeout, and the timed-out callee is CANCELled
+        run: bash sipp/b2bua-fork/run_case.sh timeout-redial b2bua_fork_uac.xml sipp-b2bua-fork-cancelled-uas sipp-b2bua-fork-early-uas
+
+      - name: on_failure re-dials a call whose first INVITE never left
+        run: bash sipp/b2bua-fork/run_case.sh undialed-redial b2bua_fork_uac.xml sipp-b2bua-fork-early-uas
+
+      - name: on_failure re-dials a call whose answer on_answer refused
+        run: bash sipp/b2bua-fork/run_case.sh answer-fail-redial b2bua_fork_uac.xml sipp-b2bua-fork-early-uas sipp-b2bua-fork-late-uas
+
+      - name: on_failure answers the caller itself
+        run: bash sipp/b2bua-fork/run_case.sh fail-answer b2bua_fork_uac.xml sipp-b2bua-fork-busy-uas
+
+      # Each case fails once, on the status its first attempt ended with. A
+      # second line would be a decision's own routing failing, or a cancelled
+      # leg's 487 taken for a failure of the call.
+      - name: on_failure ran once per case, with the status each case failed on
+        run: |
+          logs="$(docker logs siphon-b2bua-on-failure 2>&1)"
+          for expected in "fail-redial 486" "fail-reject 486" "timeout-redial 408" "undialed-redial 503" "answer-fail-redial 500" "fail-answer 486"; do
+            count="$(grep -c "ON-FAILURE $expected " <<<"$logs" || true)"
+            if [ "$count" != "1" ]; then
+              echo "expected one 'ON-FAILURE $expected' line, got $count"
+              grep 'ON-FAILURE ' <<<"$logs" || true
+              exit 1
+            fi
+          done
+          total="$(grep -c 'ON-FAILURE ' <<<"$logs" || true)"
+          if [ "$total" != "6" ]; then
+            echo "@b2bua.on_failure ran $total times, expected 6 (once per case)"
+            grep 'ON-FAILURE ' <<<"$logs" || true
+            exit 1
+          fi
+
+      - name: Collect siphon logs
+        if: always()
+        run: docker logs siphon-b2bua-on-failure > siphon-b2bua-on-failure.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-on-failure-logs
+          path: siphon-b2bua-on-failure.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-on-failure down --remove-orphans 2>/dev/null || true
+
   # ── B2BUA REFER / call-transfer functional tests ────────────────────────
   # In-dialog REFER on a tracked B2BUA call: transparent forward, loop-safe
   # 603 reject, siphon-terminated transfer (non-anchored), and the terminated
@@ -1306,6 +1382,9 @@ jobs:
       - name: Deferred handover — siphon parks the INVITE, the app answers it
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-handover-uac sipp-control-handover-uac
 
+      - name: Handover from on_failure — the dial fails, the failure handler hands the call over, the app answers it
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-failure-handover-uac sipp-control-failure-handover-uac
+
       - name: Handoff deadline — the controller never acts, siphon applies its default
         run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-deadline-uac sipp-control-deadline-uac
 
@@ -1370,6 +1449,7 @@ jobs:
             echo "ok: media engine performed '$verb'"
           }
           assert_verdict handover control-app-edge.log
+          assert_verdict failure-handover control-app-edge.log
           assert_verdict deadline control-app-ivr.log
           assert_verdict media    control-app-edge.log
           assert_verdict info     control-app-edge.log

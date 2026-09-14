@@ -6,9 +6,10 @@ use crate::dispatcher::*;
 
 /// A final response for the caller generated from the stored A-leg INVITE,
 /// rather than a B-leg response relayed back: it already carries the A-leg's
-/// own Via / From / To / Call-ID / CSeq, and needs none of the B-leg
-/// sanitisation a relayed failure does. `None`, logged, when the INVITE is not
-/// available.
+/// own Via / Call-ID / CSeq, and needs none of the B-leg sanitisation a relayed
+/// failure does. From and To are the caller's own as they arrived (RFC 3261
+/// §8.2.6.2), not the B-leg shaping a handler may have left on the stored
+/// INVITE. `None`, logged, when the INVITE is not available.
 pub fn a_leg_final_response(
     call_id: &str,
     a_leg: &crate::b2bua::actor::Leg,
@@ -28,6 +29,8 @@ pub fn a_leg_final_response(
         Ok(invite) => Some(build_a_leg_final_response(
             &invite,
             &a_leg.dialog.local_tag,
+            a_leg.stored_from.as_ref(),
+            a_leg.stored_to.as_ref(),
             status_code,
             reason,
             state.server_header.as_deref(),
@@ -42,23 +45,21 @@ pub fn a_leg_final_response(
     }
 }
 
-/// [`a_leg_final_response`] from the INVITE itself. The To-tag is the A-leg
-/// dialog's own (RFC 3261 §8.2.6.2 — a UAS tags every response bar 100), the
-/// same tag its 2xx would have carried.
+/// [`a_leg_final_response`] from the INVITE itself. From and To are the
+/// caller's own, `stored_from` / `stored_to` as the INVITE arrived, and the
+/// To-tag is the A-leg dialog's (RFC 3261 §8.2.6.2 — a UAS tags every response
+/// bar 100), the same tag its 2xx would have carried.
 pub fn build_a_leg_final_response(
     invite: &SipMessage,
     a_leg_local_tag: &str,
+    stored_from: Option<&String>,
+    stored_to: Option<&String>,
     status_code: u16,
     reason: &str,
     server_header: Option<&str>,
 ) -> SipMessage {
     let mut response = build_response(invite, status_code, reason, server_header, &[]);
-    if let Some(to) = response.headers.to().cloned() {
-        response.headers.set(
-            "To",
-            crate::b2bua::actor::ensure_tag(&to, Some(a_leg_local_tag)),
-        );
-    }
+    stamp_uas_echo(&mut response, stored_from, stored_to, a_leg_local_tag);
     response
 }
 
@@ -445,43 +446,25 @@ pub fn classify_answer_action(action: Option<CallAction>) -> AnswerAction {
 /// instead, which is the whole point: no dialog is created toward the caller and
 /// nothing downstream treats the call as connected.
 ///
-/// This mirrors the ordinary B-leg-failure teardown at the end of that function
-/// (script `on_failure`, CDR, the media safety-net, the Ro release), because the
-/// call has failed in exactly the sense those steps exist for. The one asymmetry
-/// worth knowing when writing a handler: `@b2bua.on_failure` fires here for a
-/// call whose B-leg *did* answer and has already been BYEd.
-#[allow(clippy::too_many_arguments)]
+/// The call then concludes like any other that failed before the caller was
+/// answered, as a `500`: `@b2bua.on_failure` runs and can route it somewhere
+/// else, and otherwise the caller gets the 500 and the CDR, media and Ro are
+/// released. The one asymmetry worth knowing when writing a handler: it fires
+/// here for a call whose B-leg *did* answer and has already been BYEd.
 pub fn b2bua_fail_after_answer(
     call_id: &str,
     cause: &str,
-    a_leg: &crate::b2bua::actor::Leg,
-    a_leg_invite: Option<&Arc<std::sync::Mutex<SipMessage>>>,
-    a_leg_local_addr: Option<SocketAddr>,
     b_leg_index: Option<usize>,
     response: &SipMessage,
     state: &DispatcherState,
 ) {
     const STATUS: u16 = 500;
-    const REASON: &str = "Server Internal Error";
 
     error!(
         call_id = %call_id,
         cause = %cause,
-        "B2BUA: failing a call whose B-leg answered — the caller gets {STATUS} and the answered B-leg is released"
+        "B2BUA: failing a call whose B-leg answered — the answered B-leg is released and the call concludes as a {STATUS}"
     );
-
-    // The caller's final response, built from the stored A-leg INVITE.
-    if let Some(failure) = a_leg_final_response(call_id, a_leg, a_leg_invite, STATUS, REASON, state)
-    {
-        send_message_from(
-            failure,
-            a_leg.transport.transport,
-            a_leg.transport.remote_addr,
-            a_leg.transport.connection_id,
-            a_leg_local_addr,
-            state,
-        );
-    }
 
     // Release the answered B-leg dialog. The leg is re-read here rather than
     // carried in: `handle_b2bua_response` drops its actor reference before running
@@ -502,85 +485,24 @@ pub fn b2bua_fail_after_answer(
         ),
     }
 
-    // @b2bua.on_failure — the script's per-call teardown hook. Fired before the
-    // actor is removed so a handler can still read the call.
-    let engine_state = state.engine.state();
-    let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
-    if !handlers.is_empty() {
-        match a_leg_invite {
-            Some(invite_arc) => {
-                let py_call = PyCall::new(
-                    call_id.to_string(),
-                    Arc::clone(invite_arc),
-                    a_leg.transport.remote_addr.ip().to_string(),
-                    format!("{}", a_leg.transport.transport).to_lowercase(),
-                )
-                .with_flow(py_flow_from_leg(&a_leg.transport));
+    // The caller never got the 2xx, so the call is not answered after all: back
+    // to unanswered, where @b2bua.on_failure can route it somewhere else, and the
+    // CDR answer stamp taken when the 2xx arrived no longer stands. The Ro
+    // answer-time CCR-UPDATE and Rf ACR-START are only sent past the gate that
+    // brought the call here, so neither has anything to take back.
+    state
+        .call_actors
+        .rewind_failed_answer(call_id, b_leg_index, STATUS);
+    cdr_clear_b2bua_answer(state, call_id);
 
-                Python::attach(|python| {
-                    let call_obj = match Py::new(python, py_call) {
-                        Ok(obj) => obj,
-                        Err(error) => {
-                            error!("failed to create PyCall for on_failure: {error}");
-                            return;
-                        }
-                    };
-                    for handler in &handlers {
-                        let callable = handler.callable.bind(python);
-                        match callable.call1((call_obj.bind(python), STATUS, REASON)) {
-                            Ok(ret) => {
-                                if handler.is_async {
-                                    if let Err(error) = run_coroutine(python, &ret) {
-                                        record_script_error("async B2BUA on_failure", &error);
-                                    }
-                                }
-                            }
-                            Err(error) => record_script_error("B2BUA on_failure", &error),
-                        }
-                    }
-                });
-            }
-            None => warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_failure"),
-        }
-    }
-
-    // CDR: the answer stamp was already taken when the 2xx arrived, so finalise as
-    // a failure to correct it — the call never connected.
-    cdr_finalize_b2bua_fail(state, call_id, STATUS);
-
-    // Safety-net media release. `@b2bua.on_bye` never runs for this call (no BYE
-    // arrives from a caller that was never answered), so without this the media
-    // session outlives the call it belonged to.
-    let a_sip_call_id = a_leg.dialog.call_id.clone();
-    if let (Some(rtpengine_set), Some(media_sessions)) =
-        (&state.rtpengine_set, &state.rtpengine_sessions)
-    {
-        if let Some(session) = media_sessions.remove(&a_sip_call_id) {
-            let set = Arc::clone(rtpengine_set);
-            tokio::spawn(async move {
-                if let Err(error) = set.delete(session.rtpengine_id(), &session.from_tag).await {
-                    if error.is_call_not_found() {
-                        debug!(call_id = %session.call_id, "media delete after a failed answer: call already gone ({error})");
-                    } else {
-                        warn!(call_id = %session.call_id, "media delete after a failed answer failed: {error}");
-                    }
-                }
-            });
-        }
-    }
-
-    // Release any Ro reservation `call.ro_authorize()` made before the B-leg was
-    // dialed. The answer-time CCR-UPDATE is deliberately never sent on this path,
-    // so the OCS sees a reservation that opened and closed without a chargeable
-    // clock ever starting.
-    spawn_ro_b2bua_stop(
-        state,
+    conclude_failed_call(
         call_id,
-        crate::diameter::rf::sip_status_to_cause_code(STATUS),
+        FailedCallEnd::Local {
+            status_code: STATUS,
+            reason: best_error_reason(STATUS).to_string(),
+        },
+        state,
     );
-
-    state.call_actors.remove_call(call_id);
-    state.call_event_receivers.remove(call_id);
 }
 
 /// ACK the final non-2xx that a CANCELled INVITE draws — in practice the

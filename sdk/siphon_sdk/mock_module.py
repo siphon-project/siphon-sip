@@ -1139,9 +1139,33 @@ class MockB2bua:
 
     @staticmethod
     def on_failure(fn: Callable) -> Callable:
-        """Register handler for B-leg failure.
+        """Register handler for a call that could not be connected.
 
         Handler signature: ``(call, code, reason) -> None``
+
+        Runs once, before the caller hears anything. ``code`` is what the call
+        failed on: the best of its branches' failures (RFC 3261 §16.7), ``408``
+        for the ring timeout, ``503`` when the B-leg INVITE never left or no LCR
+        carrier was routable, ``500`` when ``@b2bua.on_answer`` raised or ended
+        an answered call. What the handler leaves on ``call`` is carried out:
+
+        - nothing, or ``call.terminate()``: the caller gets ``code``
+        - ``call.reject(code, reason)``: the caller gets that response instead
+          (3xx-6xx)
+        - ``call.dial()``, ``call.fork()``, ``call.route()``: the call is routed
+          again, and this handler runs again if that fails too (at most 10
+          re-routes per call)
+        - ``call.handover(app)``: the unanswered call goes to a control app
+        - ``call.answer()``: siphon answers the caller itself
+
+        A handler that raises decides nothing, and the call ends with ``code``.
+
+        Example::
+
+            @b2bua.on_failure
+            def failed(call, code, reason):
+                if code in (408, 480, 486):
+                    call.dial("sip:voicemail@198.51.100.20")
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_failure", None, fn, is_async)

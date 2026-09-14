@@ -797,7 +797,7 @@ pub fn handle_originated_call_response(
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, internal_call_id, status_code);
     }
-    b2bua_fire_failure_handlers(internal_call_id, &leg, status_code, &reason_phrase, state);
+    run_originated_failure_handlers(internal_call_id, status_code, &reason_phrase, state);
     control_notify_terminated_with_cause(
         &sip_call_id,
         "rejected",
@@ -1015,61 +1015,6 @@ pub fn originate_fire_answer_handlers(
                     }
                 }
                 Err(error) => record_script_error("originate on_answer", &error),
-            }
-        }
-    });
-}
-
-/// Fire `@b2bua.on_failure(call, code, reason)` for a call that failed before it
-/// was ever answered — an originated call the callee rejected, or one whose
-/// B-leg INVITE never reached the transport at all.
-///
-/// The caller must hold no lock on the A-leg INVITE: the `Call` handed to the
-/// handler locks it, and handlers run inline on this thread.
-pub fn b2bua_fire_failure_handlers(
-    internal_call_id: &str,
-    leg: &crate::b2bua::actor::Leg,
-    status_code: u16,
-    reason: &str,
-    state: &DispatcherState,
-) {
-    let engine_state = state.engine.state();
-    let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
-    if handlers.is_empty() {
-        return;
-    }
-    let Some(invite_arc) = state
-        .call_actors
-        .get_call(internal_call_id)
-        .and_then(|call| call.a_leg_invite.clone())
-    else {
-        return;
-    };
-    let py_call = PyCall::new(
-        internal_call_id.to_string(),
-        invite_arc,
-        leg.transport.remote_addr.ip().to_string(),
-        format!("{}", leg.transport.transport).to_lowercase(),
-    );
-    Python::attach(|python| {
-        let call_obj = match Py::new(python, py_call) {
-            Ok(obj) => obj,
-            Err(error) => {
-                error!("failed to create PyCall for originate on_failure: {error}");
-                return;
-            }
-        };
-        for handler in &handlers {
-            let callable = handler.callable.bind(python);
-            match callable.call1((call_obj.bind(python), status_code, reason)) {
-                Ok(returned) => {
-                    if handler.is_async {
-                        if let Err(error) = run_coroutine(python, &returned) {
-                            record_script_error("async originate on_failure", &error);
-                        }
-                    }
-                }
-                Err(error) => record_script_error("originate on_failure", &error),
             }
         }
     });

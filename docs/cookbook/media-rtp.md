@@ -147,8 +147,9 @@ A-leg Call-ID that matched the offer (see [the SBC recipe](sbc.md)).
 
 !!! note "A failed `answer` in `@b2bua.on_answer` fails the call"
     If `rtpengine.answer()` raises there, siphon does not connect the call: the
-    caller gets a `500`, the answered B-leg is ACKed and BYEd, `on_failure`
-    fires, and no answer-time charging is reported. That is deliberate — the
+    answered B-leg is ACKed and BYEd, `on_failure` fires with `500`, and no
+    answer-time charging is reported. Unless the failure handler routes the call
+    somewhere else, the caller gets that `500`. That is deliberate — the
     B-leg has answered but the A-leg has not yet, so this is the last point at
     which a call with no media path can still be stopped rather than billed.
     Catch the exception yourself only if you can actually recover; swallowing it

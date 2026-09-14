@@ -94,6 +94,14 @@ pub(super) fn cdr_mark_answer(state: &DispatcherState, key: &str, response_code:
     }
 }
 
+/// Take back the answer stamped on a B2BUA call whose answer failed before the
+/// caller was connected. No-op if untracked. See [`crate::cdr::CdrSession::clear_answer`].
+pub(super) fn cdr_clear_b2bua_answer(state: &DispatcherState, internal_call_id: &str) {
+    if let Some(mut session) = state.cdr_sessions.get_mut(internal_call_id) {
+        session.clear_answer();
+    }
+}
+
 /// Finalize a tracked CDR session (write the record + drop it). No-op if the
 /// call was never tracked (auto-emit off, or not an INVITE dialog).
 ///
