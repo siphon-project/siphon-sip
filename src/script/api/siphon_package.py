@@ -1205,17 +1205,26 @@ class _SbiNamespace:
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
-            notif_uri: Notification URI for PCF events.
+            notif_uri: base URI of the PCF callback listener,
+                ``http://<sbi.notif_listen>/sbi/events``.  The PCF posts a
+                termination to ``{notif_uri}/terminate`` and, with ``events``,
+                events to ``{notif_uri}/notify``.
             media_components: list of media-component dicts.  See the
                 project docs for the full shape (mirrors
                 ``diameter.rx_aar``).
             pcf_uri: per-call N5 target — the discovered PCF.  In ``indirect``
                 communication mode it becomes the ``3gpp-Sbi-Target-apiRoot``
                 routed via the SCP; in ``direct`` mode it is the POST base.
+            events: PCF events to subscribe to (``AfEvent`` names such as
+                ``"FAILED_RESOURCES_ALLOCATION"``), each with ``notifMethod``
+                ``EVENT_DETECTION``.  Requires ``notif_uri``.
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and
             ``app_session_uri``, or None.
+
+        Raises:
+            ValueError: ``events`` is empty, or given without ``notif_uri``.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:
@@ -1242,16 +1251,23 @@ class _SbiNamespace:
         return inner.delete_session(*args, **kwargs)
 
     def update_session(self, *args, **kwargs):
-        """Update an N5 app session (media renegotiation).
+        """Update an N5 app session (media renegotiation, event subscription).
 
         Args:
             session_id: The app session id to update, or the absolute
                 ``app_session_uri``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
+            events: replace the subscribed PCF events.  ``None`` sends no
+                subscription and leaves the PCF's untouched.
+            notif_uri: new callback base for the subscription; only sent
+                with ``events``.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
+
+        Raises:
+            ValueError: ``events`` is empty, or ``notif_uri`` without ``events``.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:

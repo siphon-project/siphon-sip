@@ -7782,6 +7782,38 @@ class MockSbi:
             return session_ref.rstrip("/").rsplit("/", 1)[-1]
         return session_ref
 
+    @staticmethod
+    def _event_subscription(events: Optional[list], notif_uri: Optional[str],
+                            creating: bool) -> Optional[dict]:
+        """Validate ``events`` / ``notif_uri`` as siphon does and return the
+        ``evSubsc`` member siphon sends, or ``None`` when it sends none."""
+        if events is None:
+            if notif_uri is not None and not creating:
+                raise ValueError(
+                    "notif_uri is only sent inside the event subscription; "
+                    "pass events with it"
+                )
+            return None
+        if isinstance(events, str) or not isinstance(events, (list, tuple)) \
+                or not all(isinstance(event, str) for event in events):
+            raise TypeError("events must be a list of event names (str)")
+        if not events:
+            raise ValueError("events must name at least one event")
+        if creating and notif_uri is None:
+            raise ValueError(
+                "events requires notif_uri: the PCF posts events to "
+                "{notif_uri}/notify"
+            )
+        subscription: dict = {
+            "events": [
+                {"event": event, "notifMethod": "EVENT_DETECTION"}
+                for event in events
+            ]
+        }
+        if notif_uri is not None:
+            subscription["notifUri"] = notif_uri
+        return subscription
+
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
                        supi: Optional[str] = None,
@@ -7790,7 +7822,8 @@ class MockSbi:
                        dnn: Optional[str] = None,
                        notif_uri: Optional[str] = None,
                        media_components: Optional[list] = None,
-                       pcf_uri: Optional[str] = None) -> Optional[dict]:
+                       pcf_uri: Optional[str] = None,
+                       events: Optional[list[str]] = None) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -7800,25 +7833,52 @@ class MockSbi:
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
-            notif_uri: Notification URI for PCF events.
+            notif_uri: base URI of siphon's PCF callback listener,
+                ``http://<sbi.notif_listen>/sbi/events``. Sent as ``notifUri``,
+                where the PCF posts a termination (``/terminate``, to
+                ``@sbi.on_terminate``), and with ``events`` also as the
+                subscription's ``notifUri``, where it posts events
+                (``/notify``, to ``@sbi.on_event``).
             media_components: list of media-component dicts (same shape as
                 ``diameter.rx_aar``'s ``media_components``).
             pcf_uri: per-call N5 target — address this session at the given PCF
                 base URL (e.g. a BSF-discovered ``pcf_uri``) instead of the
                 configured ``npcf_url``. ``None`` ⇒ configured PCF.
+            events: PCF events to subscribe to, by TS 29.514 ``AfEvent`` name
+                (e.g. ``"FAILED_RESOURCES_ALLOCATION"``,
+                ``"SUCCESSFUL_RESOURCES_ALLOCATION"``, ``"QOS_NOTIF"``). Each is
+                sent with ``notifMethod`` ``"EVENT_DETECTION"``. Names are passed
+                through unchecked, so events newer than siphon work. Requires
+                ``notif_uri``. ``None`` (default) subscribes to nothing, and the
+                PCF sends no events.
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
             (the absolute resource URI — persist it and hand it back to
             ``update_session`` / ``delete_session`` for replica-independent
             teardown), or ``None``.
+
+        Raises:
+            ValueError: ``events`` is empty, or given without ``notif_uri``.
+            TypeError: ``events`` is not a list of strings.
+
+        Example::
+
+            result = sbi.create_session(
+                sip_call_id=request.call_id,
+                ue_ipv4=request.source_ip,
+                notif_uri="http://192.0.2.10:8080/sbi/events",
+                events=["FAILED_RESOURCES_ALLOCATION"],
+            )
         """
+        subscription = self._event_subscription(events, notif_uri, creating=True)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
             "sip_call_id": sip_call_id,
             "ue_ipv4": ue_ipv4,
             "pcf_uri": pcf_uri,
+            "ev_subsc": subscription,
         }
         base = (pcf_uri or "http://mock-pcf").rstrip("/")
         app_session_uri = (
@@ -7843,21 +7903,40 @@ class MockSbi:
         return self._sessions.pop(self._session_id(session_id), None) is not None
 
     def update_session(self, session_id: str,
-                       media_components: Optional[list] = None) -> Optional[dict]:
-        """Update an N5 app session (media renegotiation).
+                       media_components: Optional[list] = None,
+                       events: Optional[list[str]] = None,
+                       notif_uri: Optional[str] = None) -> Optional[dict]:
+        """Update an N5 app session (media renegotiation, event subscription).
+
+        The modify is a JSON merge patch, so only what you pass is sent.
 
         Args:
             session_id: The app session id to update, or the absolute
                 ``app_session_uri`` from ``create_session``.
             media_components: list of media-component dicts (same shape as
                 ``create_session``).
+            events: replace the subscribed PCF events with these (same names
+                as ``create_session``). ``None`` (default) sends no subscription
+                and leaves the one the PCF holds untouched. Removing the
+                subscription is not possible from here.
+            notif_uri: a new callback base for the subscription
+                (``http://<sbi.notif_listen>/sbi/events``). Only sent with
+                ``events``; ``None`` keeps the one the PCF holds.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
+
+        Raises:
+            ValueError: ``events`` is empty, or ``notif_uri`` is given without
+                ``events``.
+            TypeError: ``events`` is not a list of strings.
         """
+        subscription = self._event_subscription(events, notif_uri, creating=False)
         resolved = self._session_id(session_id)
         if resolved not in self._sessions:
             return None
+        if subscription is not None:
+            self._sessions[resolved]["ev_subsc"] = subscription
         return {"app_session_id": resolved, "authorized": self._authorized}
 
     def discover_pcf_binding(self, ue_ipv4: Optional[str] = None,

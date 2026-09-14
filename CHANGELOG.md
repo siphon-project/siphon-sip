@@ -36,6 +36,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a termination ends it. TS 29.514 has the AF delete the app session afterwards,
   so a handler normally ends with `sbi.delete_session(termination["resUri"])`.
   Sync and async handlers both work.
+- **`sbi.create_session(events=[...])` subscribes to PCF events.**
+  `create_session` never sent an event subscription, so the PCF had nothing to
+  notify and `@sbi.on_event` did not fire for a session siphon created. Each
+  name goes out as an `AfEventSubscription` with `notifMethod`
+  `EVENT_DETECTION`, under `ascReqData.evSubsc`, with the existing `notif_uri`
+  as its `notifUri`. One listener serves both callbacks, because events go to
+  `/notify` and a termination to `/terminate`. Names pass through as strings
+  (`AfEvent` is extensible). `events` without `notif_uri`, or an empty list,
+  raises `ValueError` instead of creating a session the PCF cannot notify.
+
+  `sbi.update_session(events=[...], notif_uri=...)` replaces the subscription.
+  It is in the merge patch only when `events` is given (with `notifUri` only
+  when `notif_uri` is), and never as `null`, which would remove it; `notif_uri`
+  without `events` raises `ValueError` rather than being dropped.
 
 - **`cdr.backends` writes every call record to several sinks at once.** A file
   on the node and delivery to an HTTP collector was a choice before: picking
@@ -396,6 +410,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `rx::encode_aar` is the AAR encoder `rx::send_aar` and `diameter.rx_aar` now
   share. The Rust crate API is outside the versioning contract, so this ships
   in a minor; the scripting API only gains the new argument.
+- **`siphon::sbi::npcf::EventSubscription` is replaced by `EventsSubscReqData`,
+  with an `AfEventSubscription` per event.** This affects crate embedders only.
+  The old type had the shape of a single `AfEventSubscription`, so putting it in
+  `AppSessionContextReqData::ev_subsc` would have sent a malformed `evSubsc`.
+  The field is now `Option<EventsSubscReqData>`, `AppSessionContextUpdateData`
+  carries one too, and `EventsSubscReqData::event_detection(events, notif_uri)`
+  builds what the script API sends. The Rust crate API is outside the versioning
+  contract, which is why this lands in a minor release.
+
 - **`siphon-rtp-proto` 0.6.0.** Three wire changes reach siphon-sip:
 
   - `Event::MediaTimeout` now says **why** the engine gave up, and siphon-sip

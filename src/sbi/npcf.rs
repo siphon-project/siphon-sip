@@ -60,15 +60,56 @@ pub struct MediaComponent {
     pub med_sub_comps: Option<IndexMap<String, MediaSubComponent>>,
 }
 
-/// Event subscription for PCF notifications (TS 29.514).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `notifMethod` for an event reported each time it is detected.
+const EVENT_DETECTION: &str = "EVENT_DETECTION";
+
+/// One event an AF subscribes to (TS 29.514 `AfEventSubscription`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EventSubscription {
-    /// Event type (e.g. "UP_PATH_CH_EVENT", "PLMN_CH_EVENT", "QOS_NOTIF").
+pub struct AfEventSubscription {
+    /// Event name (`event`, required), e.g. "FAILED_RESOURCES_ALLOCATION" or
+    /// "QOS_NOTIF". A string rather than an enum because `AfEvent` is
+    /// extensible.
     pub event: String,
-    /// Notification method: "EVENT_DETECTION", "ONE_TIME", "PERIODIC".
+    /// When the PCF reports it (`notifMethod`): "EVENT_DETECTION", "ONE_TIME",
+    /// "PERIODIC".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_method: Option<String>,
+}
+
+/// The events an AF subscribes to and where the PCF posts them (TS 29.514
+/// `EventsSubscReqData`, carried as `evSubsc`).
+///
+/// The PCF posts each notification to `{notifUri}/notify`. `notifUri` is
+/// optional in the schema, but without it the PCF has nowhere to post. On
+/// modify the member is `EventsSubscReqDataRm`: present replaces the stored
+/// subscription and `null` removes it, which is why every `ev_subsc` field is
+/// skipped when `None` rather than serialized as `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsSubscReqData {
+    /// The subscribed events (`events`, required, at least one).
+    pub events: Vec<AfEventSubscription>,
+    /// Callback base the PCF appends `/notify` to (`notifUri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_uri: Option<String>,
+}
+
+impl EventsSubscReqData {
+    /// Subscribe to each of `events` with `notifMethod` `EVENT_DETECTION`,
+    /// posted to `notif_uri`.
+    pub fn event_detection(events: Vec<String>, notif_uri: Option<String>) -> Self {
+        Self {
+            events: events
+                .into_iter()
+                .map(|event| AfEventSubscription {
+                    event,
+                    notif_method: Some(EVENT_DETECTION.to_string()),
+                })
+                .collect(),
+            notif_uri,
+        }
+    }
 }
 
 /// Request data for an app-session create (TS 29.514 §5.6.2.3,
@@ -104,10 +145,12 @@ pub struct AppSessionContextReqData {
     /// Data Network Name (`dnn`, APN equivalent in 5GC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnn: Option<String>,
-    /// Event subscriptions for PCF notifications (`evSubsc`).
+    /// Event subscription (`evSubsc`); the PCF posts events to its
+    /// `notifUri` with `/notify` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ev_subsc: Option<EventSubscription>,
-    /// Notification URI (`notifUri`) — callback endpoint for PCF events.
+    pub ev_subsc: Option<EventsSubscReqData>,
+    /// Callback base (`notifUri`) the PCF posts a termination to, with
+    /// `/terminate` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_uri: Option<String>,
     /// Supported features (`suppFeat`, feature negotiation bitstring).
@@ -136,6 +179,11 @@ pub struct AppSessionContextUpdateData {
     /// component's `medCompN`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub med_components: Option<IndexMap<String, MediaComponent>>,
+    /// Replacement event subscription (`evSubsc`). `None` leaves the member
+    /// out, so the PCF keeps the subscription it holds; it is never sent as
+    /// `null`, which would remove it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ev_subsc: Option<EventsSubscReqData>,
 }
 
 /// Top-level PATCH body for an app-session modify (TS 29.514
@@ -675,10 +723,10 @@ mod tests {
             supi: Some("imsi-001010000000001".to_string()),
             ue_ipv4: Some("10.0.0.1".to_string()),
             dnn: Some("ims".to_string()),
-            ev_subsc: Some(EventSubscription {
-                event: "UP_PATH_CH_EVENT".to_string(),
-                notif_method: Some("EVENT_DETECTION".to_string()),
-            }),
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["QOS_NOTIF".to_string()],
+                Some("http://pcscf:8080/sbi/events".to_string()),
+            )),
             notif_uri: Some("http://pcscf:8080/sbi/events".to_string()),
             supp_feat: Some("1".to_string()),
             ..Default::default()
@@ -1004,10 +1052,121 @@ mod tests {
         );
     }
 
+    // --- Event subscription (EventsSubscReqData) ---
+
+    const NOTIF_URI: &str = "http://pcscf.example.com:8080/sbi/events";
+
+    #[test]
+    fn event_detection_subscription_serializes_with_wire_names() {
+        let subscription = EventsSubscReqData::event_detection(
+            vec![
+                "FAILED_RESOURCES_ALLOCATION".to_string(),
+                "QOS_NOTIF".to_string(),
+            ],
+            Some(NOTIF_URI.to_string()),
+        );
+        assert_eq!(
+            serde_json::to_value(&subscription).unwrap(),
+            serde_json::json!({
+                "events": [
+                    {"event": "FAILED_RESOURCES_ALLOCATION", "notifMethod": "EVENT_DETECTION"},
+                    {"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}
+                ],
+                "notifUri": NOTIF_URI
+            })
+        );
+
+        // No notifUri is left out, never sent as null.
+        let without_uri = EventsSubscReqData::event_detection(vec!["QOS_NOTIF".to_string()], None);
+        assert_eq!(
+            serde_json::to_value(&without_uri).unwrap(),
+            serde_json::json!({
+                "events": [{"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}]
+            })
+        );
+    }
+
+    /// The PCF posts `/notify` to `ascReqData.evSubsc.notifUri`, so the
+    /// subscription has to arrive as `EventsSubscReqData` (an `events` array plus
+    /// `notifUri`), not as a single `{event, notifMethod}`.
+    #[tokio::test]
+    async fn create_wire_body_carries_the_event_subscription_only_when_given() {
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        let subscribed = AppSessionContextReqData {
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["FAILED_RESOURCES_ALLOCATION".to_string()],
+                Some(NOTIF_URI.to_string()),
+            )),
+            notif_uri: Some(NOTIF_URI.to_string()),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &subscribed)
+            .await
+            .expect("create must succeed");
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        assert_eq!(
+            body["ascReqData"]["evSubsc"],
+            serde_json::json!({
+                "events": [
+                    {"event": "FAILED_RESOURCES_ALLOCATION", "notifMethod": "EVENT_DETECTION"}
+                ],
+                "notifUri": NOTIF_URI
+            }),
+            "{body}"
+        );
+
+        let unsubscribed = AppSessionContextReqData {
+            notif_uri: Some(NOTIF_URI.to_string()),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &unsubscribed)
+            .await
+            .expect("create must succeed");
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        let request_data = body["ascReqData"].as_object().expect("ascReqData object");
+        assert!(!request_data.contains_key("evSubsc"), "{body}");
+        assert_eq!(body["ascReqData"]["notifUri"], NOTIF_URI, "{body}");
+    }
+
     // --- Modify (TS 29.514 ModAppSession: PATCH, AppSessionContextUpdateDataPatch) ---
 
     /// Content type and JSON body of the one PATCH a modify router received.
     type CapturedPatch = Arc<Mutex<Option<(Option<String>, serde_json::Value)>>>;
+
+    /// A present `evSubsc` in the merge patch replaces the subscription; an
+    /// absent one leaves it alone. siphon never sends `evSubsc: null`, which
+    /// would remove it.
+    #[tokio::test]
+    async fn update_wire_body_carries_the_event_subscription_only_when_given() {
+        let subscribed = AppSessionContextUpdateData {
+            ev_subsc: Some(EventsSubscReqData::event_detection(
+                vec!["QOS_NOTIF".to_string()],
+                None,
+            )),
+            ..Default::default()
+        };
+        let (content_type, body) = capture_update(&subscribed).await;
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/merge-patch+json")
+        );
+        assert_eq!(
+            body["ascReqData"]["evSubsc"],
+            serde_json::json!({
+                "events": [{"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}]
+            }),
+            "{body}"
+        );
+
+        let (_, body) = capture_update(&AppSessionContextUpdateData::default()).await;
+        let update_data = body["ascReqData"].as_object().expect("ascReqData object");
+        assert!(!update_data.contains_key("evSubsc"), "{body}");
+    }
 
     /// A modify router on `.../app-sessions/sess-1` that records the PATCH.
     fn patch_capturing_router(captured: CapturedPatch) -> axum::Router {
@@ -1058,6 +1217,7 @@ mod tests {
                 codecs: None,
                 med_sub_comps: None,
             }])),
+            ..Default::default()
         };
 
         let (content_type, body) = capture_update(&update_data).await;

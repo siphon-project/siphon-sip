@@ -144,11 +144,17 @@ impl PySbi {
     ///         is the POST base (instead of ``npcf_url``); in ``indirect`` mode
     ///         it becomes the ``3gpp-Sbi-Target-apiRoot`` header while the POST
     ///         goes to the SCP (``npcf_url``).  ``None`` ⇒ ``npcf_url``.
+    ///     events: PCF events to subscribe to, by ``AfEvent`` name (e.g.
+    ///         ``"FAILED_RESOURCES_ALLOCATION"``).  Each goes out under
+    ///         ``evSubsc`` with ``notifMethod`` ``EVENT_DETECTION`` and
+    ///         ``notif_uri`` as its ``notifUri``.  Requires ``notif_uri``.
     ///
     /// Returns a dict with ``app_session_id``, ``authorized``, and
     /// ``app_session_uri`` (the absolute resource URI — persist it and pass it
     /// back to ``update_session`` / ``delete_session`` so teardown reaches the
     /// same PCF from any replica), or ``None`` on failure.
+    ///
+    /// Raises ``ValueError`` when ``events`` is empty or has no ``notif_uri``.
     #[pyo3(signature = (
         af_app_id="IMS Services",
         sip_call_id=None,
@@ -159,6 +165,7 @@ impl PySbi {
         notif_uri=None,
         media_components=None,
         pcf_uri=None,
+        events=None,
     ))]
     fn create_session<'py>(
         &self,
@@ -172,24 +179,27 @@ impl PySbi {
         notif_uri: Option<&str>,
         media_components: Option<&Bound<'py, PyAny>>,
         pcf_uri: Option<&str>,
+        events: Option<Vec<String>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
             None => Vec::new(),
         };
 
-        let request_data = AppSessionContextReqData {
-            af_app_id: Some(af_app_id.to_string()),
-            med_components: components_to_map(components),
-            sip_call_id: sip_call_id.map(String::from),
-            supi: supi.map(String::from),
-            ue_ipv4: ue_ipv4.map(String::from),
-            ue_ipv6: ue_ipv6.map(String::from),
-            dnn: dnn.map(String::from),
-            ev_subsc: None,
-            notif_uri: notif_uri.map(String::from),
-            supp_feat: None,
-        };
+        let request_data = create_request_data(CreateSessionArguments {
+            af_app_id,
+            sip_call_id,
+            supi,
+            ue_ipv4,
+            ue_ipv6,
+            dnn,
+            notif_uri,
+            media_components: components,
+            events,
+        })
+        .map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("sbi.create_session: {error}"))
+        })?;
 
         let client = Arc::clone(&self.client);
         let target = pcf_uri.map(String::from);
@@ -240,24 +250,35 @@ impl PySbi {
     /// fields the PCF already holds from the original create. ``session_id``
     /// accepts a bare id or the absolute ``app_session_uri`` from
     /// :func:`create_session` (same id-or-URI rule as :func:`delete_session`).
+    ///
+    /// ``events`` replaces the subscribed PCF events; ``None`` leaves the
+    /// subscription the PCF holds alone (the member is left out of the merge
+    /// patch, never sent as ``null``, which would remove it).  ``notif_uri``
+    /// changes where the PCF posts them and is only sent with ``events``.
+    /// Raises ``ValueError`` when ``events`` is empty or ``notif_uri`` comes
+    /// without ``events``.
     #[pyo3(signature = (
         session_id,
         media_components=None,
+        events=None,
+        notif_uri=None,
     ))]
     fn update_session<'py>(
         &self,
         python: Python<'py>,
         session_id: &str,
         media_components: Option<&Bound<'py, PyAny>>,
+        events: Option<Vec<String>>,
+        notif_uri: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
             None => Vec::new(),
         };
 
-        let update_data = AppSessionContextUpdateData {
-            med_components: components_to_map(components),
-        };
+        let update_data = update_request_data(components, events, notif_uri).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("sbi.update_session: {error}"))
+        })?;
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
@@ -412,6 +433,90 @@ fn flow_usage_to_sbi(s: &str) -> PyResult<String> {
         }
     }
     .to_string())
+}
+
+/// Why an `events` / `notif_uri` combination was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum EventsArgumentError {
+    /// `events=[]`: a subscription needs at least one event.
+    #[error("events must name at least one event")]
+    Empty,
+    /// `events` on create without `notif_uri`: the PCF would have nowhere to
+    /// post them.
+    #[error("events requires notif_uri: the PCF posts events to {{notif_uri}}/notify")]
+    MissingNotifUri,
+    /// `notif_uri` on update without `events`: on modify `notifUri` only exists
+    /// inside the subscription, so it would be sent nowhere.
+    #[error("notif_uri is only sent inside the event subscription; pass events with it")]
+    NotifUriWithoutEvents,
+}
+
+/// `sbi.create_session` keyword arguments, after Python extraction.
+struct CreateSessionArguments<'a> {
+    af_app_id: &'a str,
+    sip_call_id: Option<&'a str>,
+    supi: Option<&'a str>,
+    ue_ipv4: Option<&'a str>,
+    ue_ipv6: Option<&'a str>,
+    dnn: Option<&'a str>,
+    notif_uri: Option<&'a str>,
+    media_components: Vec<MediaComponent>,
+    events: Option<Vec<String>>,
+}
+
+/// The create request data for `sbi.create_session`'s arguments.
+///
+/// `notif_uri` is the callback base for both callbacks: it goes out as
+/// `notifUri` (the PCF appends `/terminate`) and, when `events` are given, as
+/// the subscription's `notifUri` (the PCF appends `/notify`).
+fn create_request_data(
+    arguments: CreateSessionArguments<'_>,
+) -> Result<AppSessionContextReqData, EventsArgumentError> {
+    let ev_subsc = match arguments.events {
+        None => None,
+        Some(events) if events.is_empty() => return Err(EventsArgumentError::Empty),
+        Some(_) if arguments.notif_uri.is_none() => {
+            return Err(EventsArgumentError::MissingNotifUri)
+        }
+        Some(events) => Some(crate::sbi::npcf::EventsSubscReqData::event_detection(
+            events,
+            arguments.notif_uri.map(String::from),
+        )),
+    };
+    Ok(AppSessionContextReqData {
+        af_app_id: Some(arguments.af_app_id.to_string()),
+        med_components: components_to_map(arguments.media_components),
+        sip_call_id: arguments.sip_call_id.map(String::from),
+        supi: arguments.supi.map(String::from),
+        ue_ipv4: arguments.ue_ipv4.map(String::from),
+        ue_ipv6: arguments.ue_ipv6.map(String::from),
+        dnn: arguments.dnn.map(String::from),
+        ev_subsc,
+        notif_uri: arguments.notif_uri.map(String::from),
+        supp_feat: None,
+    })
+}
+
+/// The modify update data for `sbi.update_session`'s arguments. Without
+/// `events` there is no `evSubsc` member at all.
+fn update_request_data(
+    media_components: Vec<MediaComponent>,
+    events: Option<Vec<String>>,
+    notif_uri: Option<&str>,
+) -> Result<AppSessionContextUpdateData, EventsArgumentError> {
+    let ev_subsc = match events {
+        None if notif_uri.is_some() => return Err(EventsArgumentError::NotifUriWithoutEvents),
+        None => None,
+        Some(events) if events.is_empty() => return Err(EventsArgumentError::Empty),
+        Some(events) => Some(crate::sbi::npcf::EventsSubscReqData::event_detection(
+            events,
+            notif_uri.map(String::from),
+        )),
+    };
+    Ok(AppSessionContextUpdateData {
+        med_components: components_to_map(media_components),
+        ev_subsc,
+    })
 }
 
 /// Collect parsed media components into the `medComponents` map keyed by each
@@ -797,6 +902,127 @@ mod tests {
             let pcf_uri = dict.get_item("pcf_uri").unwrap().unwrap();
             assert!(pcf_uri.is_none());
         });
+    }
+
+    // --- kwargs -> request data (events / notif_uri) ---
+
+    const NOTIF_URI: &str = "http://pcscf.example.com:8080/sbi/events";
+
+    fn create_arguments(
+        events: Option<Vec<&str>>,
+        notif_uri: Option<&'static str>,
+    ) -> CreateSessionArguments<'static> {
+        CreateSessionArguments {
+            af_app_id: "IMS Services",
+            sip_call_id: Some("call-1@example.com"),
+            supi: Some("imsi-001010000000001"),
+            ue_ipv4: Some("192.0.2.7"),
+            ue_ipv6: None,
+            dnn: Some("ims"),
+            notif_uri,
+            media_components: Vec::new(),
+            events: events.map(|events| events.into_iter().map(String::from).collect()),
+        }
+    }
+
+    fn event_names(events: &[&str]) -> Option<Vec<String>> {
+        Some(events.iter().map(|event| event.to_string()).collect())
+    }
+
+    #[test]
+    fn create_request_data_subscribes_every_event_at_notif_uri() {
+        let request_data = create_request_data(create_arguments(
+            Some(vec!["FAILED_RESOURCES_ALLOCATION"]),
+            Some(NOTIF_URI),
+        ))
+        .expect("events with notif_uri are accepted");
+
+        let value = serde_json::to_value(&request_data).unwrap();
+        assert_eq!(
+            value["evSubsc"],
+            serde_json::json!({
+                "events": [
+                    {"event": "FAILED_RESOURCES_ALLOCATION", "notifMethod": "EVENT_DETECTION"}
+                ],
+                "notifUri": NOTIF_URI
+            }),
+            "{value}"
+        );
+        // The termination callback base stays where it was.
+        assert_eq!(value["notifUri"], NOTIF_URI, "{value}");
+        assert_eq!(value["afAppId"], "IMS Services", "{value}");
+        assert_eq!(value["ueIpv4"], "192.0.2.7", "{value}");
+    }
+
+    #[test]
+    fn create_request_data_without_events_has_no_subscription() {
+        let request_data = create_request_data(create_arguments(None, Some(NOTIF_URI)))
+            .expect("no events is accepted");
+
+        let value = serde_json::to_value(&request_data).unwrap();
+        assert!(value.get("evSubsc").is_none(), "{value}");
+        assert_eq!(value["notifUri"], NOTIF_URI, "{value}");
+    }
+
+    #[test]
+    fn create_request_data_rejects_empty_events() {
+        let error = create_request_data(create_arguments(Some(vec![]), Some(NOTIF_URI)))
+            .expect_err("an empty events list subscribes to nothing");
+        assert_eq!(error, EventsArgumentError::Empty);
+    }
+
+    #[test]
+    fn create_request_data_rejects_events_without_notif_uri() {
+        let error = create_request_data(create_arguments(
+            Some(vec!["FAILED_RESOURCES_ALLOCATION"]),
+            None,
+        ))
+        .expect_err("the PCF would have nowhere to post the events");
+        assert_eq!(error, EventsArgumentError::MissingNotifUri);
+        assert!(error.to_string().contains("notif_uri"), "{error}");
+    }
+
+    #[test]
+    fn update_request_data_carries_events_and_optional_notif_uri() {
+        let update_data = update_request_data(Vec::new(), event_names(&["QOS_NOTIF"]), None)
+            .expect("events without notif_uri are accepted on update");
+        let value = serde_json::to_value(&update_data).unwrap();
+        assert_eq!(
+            value["evSubsc"],
+            serde_json::json!({
+                "events": [{"event": "QOS_NOTIF", "notifMethod": "EVENT_DETECTION"}]
+            }),
+            "{value}"
+        );
+
+        let update_data =
+            update_request_data(Vec::new(), event_names(&["QOS_NOTIF"]), Some(NOTIF_URI))
+                .expect("events with notif_uri are accepted on update");
+        let value = serde_json::to_value(&update_data).unwrap();
+        assert_eq!(value["evSubsc"]["notifUri"], NOTIF_URI, "{value}");
+    }
+
+    #[test]
+    fn update_request_data_without_events_has_no_subscription() {
+        let update_data =
+            update_request_data(Vec::new(), None, None).expect("no events is accepted");
+        let value = serde_json::to_value(&update_data).unwrap();
+        // Absent, not null: a null evSubsc in a merge patch removes it.
+        assert!(value.get("evSubsc").is_none(), "{value}");
+    }
+
+    #[test]
+    fn update_request_data_rejects_empty_events() {
+        let error = update_request_data(Vec::new(), Some(Vec::new()), None)
+            .expect_err("an empty events list is refused");
+        assert_eq!(error, EventsArgumentError::Empty);
+    }
+
+    #[test]
+    fn update_request_data_rejects_notif_uri_without_events() {
+        let error = update_request_data(Vec::new(), None, Some(NOTIF_URI))
+            .expect_err("notif_uri alone would be sent nowhere");
+        assert_eq!(error, EventsArgumentError::NotifUriWithoutEvents);
     }
 
     /// Façade-drift regression (the live blocker): the embedded `_SbiNamespace`

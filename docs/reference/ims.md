@@ -31,6 +31,11 @@ still acknowledged), `400` for a body that is not JSON, and `503` when siphon's
 Python executor could not take the job, so the PCF knows the callback was not
 handled. Any other path is `404`.
 
+A termination can arrive for any app session created with `notif_uri`. Events
+only arrive for what the session subscribed to, with
+`create_session(events=[...], notif_uri=...)` or
+`update_session(events=[...])`.
+
 `POST /sbi/events` without a suffix still reaches `@sbi.on_event` for a PCF
 that posts to the advertised URI as-is. It is deprecated and will be removed in
 the next minor release.
