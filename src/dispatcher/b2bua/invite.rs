@@ -654,6 +654,39 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let mut fail_undialed = false;
 
     match action {
+        CallAction::None if handlers.is_empty() && state.control_inbound.is_some() => {
+            // No `@b2bua.on_invite` handler exists to decide, and
+            // `control.inbound` says where an undecided call goes. This is the
+            // script-free path: the controller is the policy, so there is no
+            // script to write one in.
+            //
+            // Deliberately gated on there being no handler at all rather than
+            // on the action: a script that ran and returned nothing chose the
+            // silent drop below, and overriding that would take a decision away
+            // from the thing that made it.
+            let policy = state.control_inbound.clone().unwrap_or_default();
+            debug!(
+                call_id = %call_id,
+                app = %policy.app,
+                answer = policy.answer_first(),
+                "B2BUA: handing over to the control plane (control.inbound, no script)"
+            );
+            control_handover(
+                &call_id,
+                &message_guard,
+                &inbound,
+                ControlHandoverParams {
+                    app: &policy.app,
+                    on_lost: None,
+                    deadline_ms: policy.deadline_ms,
+                    vars: std::collections::HashMap::new(),
+                    answer: policy.answer_first(),
+                    profile: policy.profile.as_deref(),
+                    ws_uri: policy.ws_uri.as_deref(),
+                },
+                state,
+            );
+        }
         CallAction::None => {
             debug!(call_id = %call_id, "B2BUA: silent drop (no action from script)");
             state.call_actors.remove_call(&call_id);

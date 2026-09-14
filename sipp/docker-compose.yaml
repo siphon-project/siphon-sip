@@ -6210,6 +6210,96 @@ services:
     profiles:
       - control
 
+  # ── The script-free path (`control.inbound`) ──────────────────────────────
+  # A second siphon and a third application, because what is under test is the
+  # ABSENCE of a routing decision: the main harness registers @b2bua.on_invite,
+  # and a registered handler is exactly what makes control.inbound stand down.
+
+  # Per-call-connect application for the script-free instance. CONTROL_DEFAULT_CASE
+  # is what gives it a case at all: control.inbound has no script to seed vars in,
+  # so its StasisStart carries none.
+  control-app-inbound:
+    image: python:3.12-slim
+    container_name: control-app-inbound
+    volumes:
+      - ./control:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 control_app.py"]
+    environment:
+      CONTROL_MODE: "outbound"
+      CONTROL_APP: "inbound-app"
+      CONTROL_TOKEN: "inbound-app-token"
+      CONTROL_LISTEN_PORT: "8090"
+      CONTROL_DEFAULT_CASE: "inbound"
+      CONTROL_READY_FILE: "/tmp/control-app-ready"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.178
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/control-app-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 6
+      start_period: 25s
+    profiles:
+      - control
+
+  # siphon with no routing script, no media engine and no control listener: the
+  # only way a call reaches anything is control.inbound dialing the app.
+  siphon-control-inbound:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-control-inbound-test
+    depends_on:
+      control-app-inbound:
+        condition: service_healthy
+    volumes:
+      - ./control/siphon-control-inbound.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.176
+    healthcheck:
+      # SIP only — this instance binds no control port by design, so probing one
+      # would report unhealthy forever.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:control.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@control.test>;tag=hc\\r\\nTo: <sip:control.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    profiles:
+      - control
+
+  # No script decided this call: control.inbound did.
+  sipp-control-inbound-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control-inbound:
+        condition: service_healthy
+      control-app-inbound:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.177
+    entrypoint:
+      - sipp
+      - "172.20.0.176:5060"
+      - -sf
+      - /sipp/scenarios/control_inbound_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
   # One call, several app connections — exactly one must own it.
   sipp-control-owner-uac:
     image: ctaloi/sipp:latest

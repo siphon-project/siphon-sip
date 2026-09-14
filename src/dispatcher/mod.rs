@@ -362,6 +362,10 @@ pub async fn run(
         rtpengine_set,
         rtpengine_sessions,
         rtpengine_profiles,
+        control_inbound: config
+            .control
+            .as_ref()
+            .and_then(|control| control.inbound.clone()),
         session_timer_config: config.session_timer.clone(),
         mtu: config.listen.mtu,
         header_policy_registry,

@@ -1978,6 +1978,31 @@ log:
 #     slow_consumer: drop_oldest    # drop_oldest | disconnect
 #     reattach_grace_secs: 10       # window for a reconnecting app to `resync`
 #     handoff_deadline_ms: 3000     # default deadline before the parked call degrades
+#
+#   # Hand EVERY out-of-dialog INVITE to an app, with no script. Without this
+#   # the only way into the control plane is a script calling call.handover(),
+#   # so a deployment whose policy lives entirely in its controller still has to
+#   # ship a routing script that does nothing but forward — a second place for
+#   # policy to live and a second thing to version against siphon.
+#   inbound:
+#     app: "ivr-app"                # must name one of control.apps above
+#     mode: deferred                # deferred (default) | answer
+#                                   #   deferred: the INVITE is held unanswered
+#                                   #     on the automatic 100 Trying, exactly as
+#                                   #     call.handover() does. The controller
+#                                   #     answers, progresses or dials.
+#                                   #   answer:   siphon answers and anchors the
+#                                   #     media first, as call.handover(answer=True)
+#                                   #     does — for an app that wants an already
+#                                   #     connected channel.
+#     deadline_ms: 5000             # optional; else limits.handoff_deadline_ms
+#     # profile: "voice_ai"         # answer mode only
+#     # ws_uri: "wss://.../{call_id}"  # answer mode only
+#
+#   A script, when one is configured, still runs first and may hand over itself;
+#   control.inbound is what happens when no @b2bua.on_invite handler exists to
+#   decide. Setting it also turns B2BUA mode on by itself, the way a registered
+#   @b2bua.* handler does.
 
 # ---------------------------------------------------------------------------
 # Extensions — protocols beyond SIP

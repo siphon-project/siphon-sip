@@ -1,0 +1,46 @@
+# siphon config for the script-free control-plane path (`control.inbound`), the
+# deployment shape where the controller IS the policy: no routing script decides
+# anything, and no media engine is configured either.
+#
+# It is a second siphon instance rather than another case on the first one,
+# because the thing under test is the absence of a decision. The main harness's
+# control_routes.py registers @b2bua.on_invite, and a registered handler is
+# exactly what makes `control.inbound` stand down — so the two cannot share a
+# process.
+#
+# control.listen is deliberately absent: this instance only ever dials out to a
+# per_call_connect app, which is the multi-pod controller shape, and it proves
+# the script-free path needs no inbound rail of its own.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "control.test"
+    - "172.20.0.176"
+
+advertised_address: "172.20.0.176"
+
+script:
+  # Answers the healthcheck's OPTIONS and nothing else — see the file.
+  path: "/etc/siphon/scripts/control_inbound_routes.py"
+
+control:
+  apps:
+    - name: "inbound-app"
+      token: "inbound-app-token"
+      per_call_connect: true
+      connect_url: "ws://172.20.0.178:8090/siphon"
+      on_lost: "hangup"
+  limits:
+    handoff_deadline_ms: 20000
+  # The whole point: every out-of-dialog INVITE goes to the app, decided here
+  # rather than by a script.
+  inbound:
+    app: "inbound-app"
+    mode: deferred
+
+log:
+  level: info
