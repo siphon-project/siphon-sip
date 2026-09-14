@@ -522,7 +522,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   A carrier that answers 183 with its own ringback before it has reached anyone
   can have the old behaviour back: `reroute_after_progress: true` on its route,
   in the LCR API answer or on a control-plane `route` target (default `false`,
-  also on the SDK `Route` and the script `Route`). `call.fork(strategy="sequential")`
+  also on the SDK `Route` and the script `Route`). The control-plane client SDKs
+  send it on a `route` target too, and only when it is true:
+  `RouteTarget::reroute_after_progress` in Rust (a new public field, so a struct
+  literal needs it or `..RouteTarget::default()`), a `"reroute_after_progress"`
+  key in a Python target dict (anything but a bool raises `TypeError`), and
+  `rerouteAfterProgress` in TypeScript. `call.fork(strategy="sequential")`
   and a sequential control-plane `dial` keep moving to the next target when one
   rings out, since a hunt through phones is exactly that.
 

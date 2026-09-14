@@ -267,10 +267,24 @@ def test_route_verb_roundtrip():
                             "headers": {"X-Foo": "bar"},
                             "timeout": 30,
                         },
+                        {
+                            "uri": "sip:carrier3@gw3",
+                            "timeout": 6,
+                            "reroute_after_progress": True,
+                        },
+                        {"uri": "sip:carrier4@gw4", "reroute_after_progress": False},
                     ],
                     strategy="sequential",
                     headers={"X-Trace": "abc"},
                 )
+                # A policy flag that is not a bool is refused before anything
+                # is sent, as the server refuses it.
+                try:
+                    call.route(
+                        [{"uri": "sip:carrier5@gw5", "reroute_after_progress": "yes"}]
+                    )
+                except TypeError as error:
+                    recorded["refused"] = str(error)
                 if not done.done():
                     done.set_result(result)
 
@@ -295,10 +309,19 @@ def test_route_verb_roundtrip():
                         "headers": {"X-Foo": "bar"},
                         "timeout": 30,
                     },
+                    {
+                        "uri": "sip:carrier3@gw3",
+                        "timeout": 6,
+                        "reroute_after_progress": True,
+                    },
+                    # Off is the server's default and stays off the wire, so a
+                    # target with nothing else set goes out as a bare URI.
+                    "sip:carrier4@gw4",
                 ],
                 "strategy": "sequential",
                 "headers": {"X-Trace": "abc"},
             }
+            assert "reroute_after_progress" in recorded.get("refused", ""), recorded
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

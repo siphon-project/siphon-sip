@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
@@ -210,7 +210,7 @@ fn to_pyerr(error: ClientError) -> PyErr {
 }
 
 /// Extract one `route` target: a bare URI `str`, or a dict
-/// `{uri, next_hop?, headers?, timeout?}`.
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`.
 fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
     if let Ok(uri) = item.extract::<String>() {
         return Ok(RouteTarget::uri(uri));
@@ -240,11 +240,20 @@ fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
         Some(value) if !value.is_none() => Some(value.extract::<u32>()?),
         _ => None,
     };
+    // A policy flag: anything but a real bool is refused, as the server refuses
+    // it, rather than read as false and quietly left on the default rule.
+    let reroute_after_progress = match dict.get_item("reroute_after_progress")? {
+        Some(value) if !value.is_none() => value.extract::<bool>().map_err(|_| {
+            PyTypeError::new_err("route target 'reroute_after_progress' must be a bool")
+        })?,
+        _ => false,
+    };
     Ok(RouteTarget {
         uri,
         next_hop,
         headers,
         timeout_secs,
+        reroute_after_progress,
     })
 }
 
@@ -653,7 +662,12 @@ impl Call {
     /// sequential-failover engine, returning control to siphon.
     ///
     /// `targets` is a non-empty list of carriers tried cheapest-first: each entry
-    /// is a bare URI `str` or a dict `{"uri", "next_hop"?, "headers"?, "timeout"?}`.
+    /// is a bare URI `str` or a dict
+    /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?}`.
+    /// A target's `timeout` bounds the wait for it to show progress (a 101-199);
+    /// one that has keeps the call past it, and the call then fails with 408,
+    /// unless it sets `"reroute_after_progress": True`. That flag must be a
+    /// `bool` (anything else raises `TypeError`) and is sent only when true.
     /// `strategy` defaults to `"sequential"` (v1 supports only sequential/single —
     /// anything else raises `ControlError` with `code == "unsupported_verb"`).
     /// `headers` is an optional dict applied to every attempt's B-leg INVITE.
