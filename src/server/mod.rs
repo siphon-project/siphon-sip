@@ -1256,17 +1256,19 @@ impl SiphonServer {
         let (sctp_outbound_tx, _sctp_outbound_rx) =
             flume::unbounded::<transport::OutboundMessage>();
 
-        // UDP listeners get a dedicated outbound channel each — required
-        // for IPsec sec-agree on the P-CSCF role (3GPP TS 33.203 §7.4)
-        // where a reply must egress on the same local socket the request
-        // arrived on.  The first *configured* listener's channel doubles as
-        // the default fallback for messages without a `source_local_addr`
-        // (see `default_udp_egress_addr`).
+        // UDP listeners get a dedicated set of outbound channels each, one per
+        // worker — per listener because IPsec sec-agree on the P-CSCF role
+        // (3GPP TS 33.203 §7.4) needs a reply to egress on the same local
+        // socket the request arrived on, and per worker so one peer's messages
+        // leave in the order they were enqueued (see `UdpOutbound`).  The first
+        // *configured* listener's channels double as the default fallback for
+        // messages without a `source_local_addr` (see `default_udp_egress_addr`).
+        let udp_workers = num_cpus::get();
         let mut udp_listener_channels: std::collections::HashMap<
             std::net::SocketAddr,
             (
-                flume::Sender<transport::OutboundMessage>,
-                flume::Receiver<transport::OutboundMessage>,
+                transport::udp::UdpOutbound,
+                Vec<flume::Receiver<transport::OutboundMessage>>,
             ),
         > = std::collections::HashMap::new();
         for entry in &config.listen.udp {
@@ -1276,20 +1278,19 @@ impl SiphonServer {
             };
             udp_listener_channels
                 .entry(addr)
-                .or_insert_with(flume::unbounded);
+                .or_insert_with(|| transport::udp::UdpOutbound::channels(udp_workers));
         }
         // Per-listener routing is only needed for the IPsec sec-agree
         // path (TS 33.203 §7.4 — replies must egress on the same SA's
         // local socket).  For non-P-CSCF deployments the per-listener
         // map adds a HashMap lookup to every UDP response (~15-20 % CPU
         // bump at 10 kcps in the README scale baseline), so leave it
-        // empty unless `ipsec` is configured.  All listeners then share
-        // the `udp_default` sender — the legacy shared-receiver
-        // behaviour of the original design, which the no-ipsec scale
-        // baseline was tuned against.
+        // empty unless `ipsec` is configured.  Every send then takes the
+        // `udp_default` listener's channels, which is what the no-ipsec scale
+        // baseline runs on.
         let mut udp_by_local: std::collections::HashMap<
             std::net::SocketAddr,
-            flume::Sender<transport::OutboundMessage>,
+            transport::udp::UdpOutbound,
         > = std::collections::HashMap::new();
         let ipsec_enabled = config.ipsec.is_some();
         // Populate the per-listener UDP channel map when IPsec is enabled OR the
@@ -1314,7 +1315,7 @@ impl SiphonServer {
         // different socket than its Via advertised and flip between restarts.
         let udp_default = default_udp_egress_addr(&config.listen.udp)
             .and_then(|addr| udp_listener_channels.get(&addr).map(|(tx, _)| tx.clone()))
-            .unwrap_or_else(|| flume::unbounded().0);
+            .unwrap_or_else(|| transport::udp::UdpOutbound::channels(1).0);
 
         let outbound_senders = Arc::new(transport::OutboundRouter {
             udp: udp_default,
@@ -1385,14 +1386,14 @@ impl SiphonServer {
             ));
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
-            // Use this listener's dedicated outbound channel (TS 33.203
+            // Use this listener's dedicated outbound channels (TS 33.203
             // §7.4 — replies to IPsec-protected requests must egress on
             // the same socket they arrived on; sharing one channel makes
             // that impossible because any listener can pick up any send).
             let listener_rx = udp_listener_channels
                 .get(&addr)
                 .map(|(_, rx)| rx.clone())
-                .unwrap_or_else(|| flume::unbounded().1);
+                .unwrap_or_else(|| transport::udp::UdpOutbound::channels(udp_workers).1);
             transport::udp::listen(
                 addr,
                 inbound_tx.clone(),

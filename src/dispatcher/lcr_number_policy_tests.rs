@@ -144,7 +144,7 @@ fn dispatcher() -> Dispatcher {
     let (udp_sender, udp) = flume::unbounded();
     let (stream_sender, _) = flume::unbounded();
     let outbound = Arc::new(OutboundRouter {
-        udp: udp_sender,
+        udp: udp_sender.into(),
         udp_by_local: HashMap::new(),
         tcp: stream_sender.clone(),
         tls: stream_sender.clone(),

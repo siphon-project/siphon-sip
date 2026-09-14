@@ -636,6 +636,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   could reach the callee BYE first, which a strict UA drops, leaving the BYE
   retransmitting unanswered. A caller's CANCEL and the ring timeout likewise stop
   CANCELling branches that already have a final response.
+- **Messages siphon sends to one UDP peer now leave in the order they were
+  sent.** Every UDP worker owns its own `SO_REUSEPORT` socket, and all of them
+  drained one shared outbound channel, so two messages sent back to back to the
+  same peer could be picked up by two workers and reach it inverted: a BYE ahead
+  of the ACK confirming its dialog, a 487 ahead of the 200 to its CANCEL, a 200
+  ahead of the 183 before it. A strict peer rejects or drops the one that arrives
+  out of turn. Each worker now has its own channel and every destination is
+  routed to one of them, so a peer's traffic stays in order from every call site
+  while distinct peers still spread across all the workers. A worker that cannot
+  open its socket has its channel drained through another worker's.
 
 - **`auth.require_aka_digest()` now verifies the digest response** against the
   expected value derived at challenge time (RFC 3310 §3.3), using the method the

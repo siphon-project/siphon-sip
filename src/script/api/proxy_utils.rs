@@ -1595,7 +1595,7 @@ mod tests {
         let (sctp_tx, _sctp_rx) = flume::unbounded();
 
         let router = Arc::new(OutboundRouter {
-            udp: udp_tx,
+            udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
             tcp: tcp_tx,
             tls: tls_tx,

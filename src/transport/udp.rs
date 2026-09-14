@@ -3,14 +3,16 @@
 //! Each worker:
 //!   1. Receives a datagram (heap-allocated Bytes, not a fixed stack buffer)
 //!   2. Sends an InboundMessage to the core via `inbound_tx`
-//!   3. Checks `outbound_rx` for any pending replies and sends them
+//!   3. Sends what its own outbound channel carries — [`UdpOutbound`] routes
+//!      every destination to one worker, so a peer's messages leave in the order
+//!      they were enqueued
 //!
 //! Connection IDs for UDP are derived by hashing (local_addr, remote_addr) so
 //! that responses can always be routed back to the right socket.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -21,130 +23,258 @@ use tracing::{debug, error, info, warn};
 use crate::transport::acl::TransportAcl;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport};
 
-/// Spawn `num_cpus::get()` UDP listener workers, all sharing the same port
-/// via SO_REUSEPORT. Each worker sends inbound messages to `inbound_tx` and
-/// drains `outbound_rx` to send replies.
+/// The outbound side of one UDP listener: one channel per worker, with every
+/// destination always routed to the same one.
+///
+/// Each worker owns its own `SO_REUSEPORT` socket. Were they all to drain one
+/// shared channel, two messages enqueued back to back for one peer would be
+/// picked up by two workers and race to the wire: a BYE ahead of the ACK that
+/// confirms its dialog, a 487 ahead of the 200 to its CANCEL, a 200 ahead of the
+/// 183 before it. Routing by destination keeps each peer's traffic on one worker,
+/// in the order it was enqueued, from every call site at once, while distinct
+/// peers still spread across all the workers.
+#[derive(Clone, Debug)]
+pub struct UdpOutbound {
+    shards: Arc<[flume::Sender<OutboundMessage>]>,
+}
+
+impl UdpOutbound {
+    /// A listener's outbound channels, one per worker (at least one), and the
+    /// receivers to hand to [`listen`].
+    pub fn channels(workers: usize) -> (Self, Vec<flume::Receiver<OutboundMessage>>) {
+        let (senders, receivers): (Vec<_>, Vec<_>) =
+            (0..workers.max(1)).map(|_| flume::unbounded()).unzip();
+        (
+            Self {
+                shards: senders.into(),
+            },
+            receivers,
+        )
+    }
+
+    /// Enqueue `message` on the channel of the worker that owns its destination.
+    // flume's `SendError<T>` hands the message back by design; see
+    // `OutboundRouter::send`.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
+        let shard = shard_for(message.destination, self.shards.len());
+        match self.shards.get(shard) {
+            Some(sender) => sender.send(message),
+            // `shard_for` stays below the channel count, and there is always at
+            // least one channel, so this is never taken.
+            None => Err(flume::SendError(message)),
+        }
+    }
+}
+
+impl From<flume::Sender<OutboundMessage>> for UdpOutbound {
+    /// A single channel: one worker's worth, or a test reading what was sent.
+    fn from(sender: flume::Sender<OutboundMessage>) -> Self {
+        Self {
+            shards: Arc::from([sender]),
+        }
+    }
+}
+
+/// Which of `shards` channels carries traffic to `destination`.
+///
+/// FNV-1a over the address and port, with the high half folded into the low
+/// bits the modulo keeps: deterministic, so a peer always lands on the same
+/// worker, and a few nanoseconds per datagram.
+fn shard_for(destination: SocketAddr, shards: usize) -> usize {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    if shards <= 1 {
+        return 0;
+    }
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    };
+    match destination.ip() {
+        IpAddr::V4(ip) => mix(&ip.octets()),
+        IpAddr::V6(ip) => mix(&ip.octets()),
+    }
+    mix(&destination.port().to_be_bytes());
+    let folded = hash ^ (hash >> 32);
+    (folded % shards as u64) as usize
+}
+
+/// Spawn one UDP listener worker per channel in `outbound_rx`, all sharing the
+/// same port via SO_REUSEPORT. Each worker sends inbound messages to
+/// `inbound_tx` and sends what its own channel carries (see [`UdpOutbound`]).
 pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
-    outbound_rx: flume::Receiver<OutboundMessage>,
+    outbound_rx: Vec<flume::Receiver<OutboundMessage>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
     recv_buffer_bytes: usize,
 ) {
-    let worker_count = num_cpus::get();
+    let worker_count = outbound_rx.len();
     info!("Starting {} UDP workers on {}", worker_count, local_addr);
 
-    for worker_index in 0..worker_count {
-        let inbound_tx = inbound_tx.clone();
-        let outbound_rx = outbound_rx.clone();
-        let acl = Arc::clone(&acl);
-
-        tokio::spawn(async move {
-            let socket = match create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes) {
-                Ok(socket) => Arc::new(socket),
+    let sockets: Vec<Option<Arc<UdpSocket>>> = (0..worker_count)
+        .map(
+            |worker_index| match create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes) {
+                Ok(socket) => Some(Arc::new(socket)),
                 Err(error) => {
                     error!(
                         "[udp-worker-{}] failed to create socket: {}",
                         worker_index, error
                     );
-                    return;
+                    None
                 }
-            };
+            },
+        )
+        .collect();
+    let Some(fallback) = sockets.iter().flatten().next().cloned() else {
+        error!(
+            "[udp {}] no worker could open a socket — nothing is sent or received on this listener",
+            local_addr
+        );
+        return;
+    };
 
-            loop {
-                // Use a reasonably large initial buffer; we'll grow it if needed.
-                // SIP messages with SDP can exceed 1500 bytes easily.
-                let mut buffer = BytesMut::zeroed(8192);
+    for (worker_index, (socket, outbound_rx)) in sockets.into_iter().zip(outbound_rx).enumerate() {
+        match socket {
+            Some(socket) => {
+                tokio::spawn(run_worker(
+                    worker_index,
+                    local_addr,
+                    socket,
+                    inbound_tx.clone(),
+                    outbound_rx,
+                    Arc::clone(&acl),
+                ));
+            }
+            // The destinations routed to this channel stay routed to it, so a
+            // worker with no socket must not leave it undrained: those messages
+            // would queue for good. They leave another worker's socket instead,
+            // still in the order they were enqueued.
+            None => {
+                tokio::spawn(drain_outbound(
+                    worker_index,
+                    Arc::clone(&fallback),
+                    outbound_rx,
+                ));
+            }
+        }
+    }
+}
 
-                tokio::select! {
-                    recv_result = socket.recv_from(&mut buffer) => {
-                        match recv_result {
-                            Ok((size, remote_addr)) => {
-                                if !acl.is_allowed(remote_addr.ip()) {
-                                    continue;
-                                }
-                                if size == buffer.len() {
-                                    // `recv_from` reports the bytes it copied,
-                                    // not the datagram's length, so a datagram
-                                    // that exactly fills the buffer is
-                                    // indistinguishable from one the kernel
-                                    // truncated. Say so rather than leaving an
-                                    // operator to work backwards from a parse
-                                    // error: RFC 3261 §18.1.1 requires a UAC to
-                                    // move to a congestion-controlled transport
-                                    // well below this size, so either way the
-                                    // peer is doing something it should not.
-                                    // The message is still processed — a
-                                    // genuinely truncated one is refused by the
-                                    // parser's Content-Length check (RFC 4475
-                                    // §3.1.2.2) rather than acted on.
-                                    warn!(
-                                        remote = %remote_addr,
-                                        bytes = size,
-                                        "UDP datagram filled the receive buffer — it may have been \
-                                         truncated by the kernel; the peer should be using TCP \
-                                         (RFC 3261 §18.1.1)"
-                                    );
-                                    if let Some(metrics) = crate::metrics::try_metrics() {
-                                        metrics.udp_datagrams_at_buffer_limit_total.inc();
-                                    }
-                                }
-                                buffer.truncate(size);
-                                let data = buffer.freeze();
+/// One listener worker: receive on `socket`, and send what `outbound_rx` carries.
+async fn run_worker(
+    worker_index: usize,
+    local_addr: SocketAddr,
+    socket: Arc<UdpSocket>,
+    inbound_tx: flume::Sender<InboundMessage>,
+    outbound_rx: flume::Receiver<OutboundMessage>,
+    acl: Arc<TransportAcl>,
+) {
+    loop {
+        // Use a reasonably large initial buffer; we'll grow it if needed.
+        // SIP messages with SDP can exceed 1500 bytes easily.
+        let mut buffer = BytesMut::zeroed(8192);
 
-                                let connection_id = udp_connection_id(local_addr, remote_addr);
-
-                                let message = InboundMessage {
-                                    connection_id,
-                                    transport: Transport::Udp,
-                                    local_addr,
-                                    remote_addr,
-                                    data,
-                                };
-
-                                if let Err(e) = inbound_tx.send_async(message).await {
-                                    error!("[udp-worker-{}] Failed to enqueue inbound message: {}", worker_index, e);
-                                }
+        tokio::select! {
+            recv_result = socket.recv_from(&mut buffer) => {
+                match recv_result {
+                    Ok((size, remote_addr)) => {
+                        if !acl.is_allowed(remote_addr.ip()) {
+                            continue;
+                        }
+                        if size == buffer.len() {
+                            // `recv_from` reports the bytes it copied, not the
+                            // datagram's length, so a datagram that exactly fills
+                            // the buffer is indistinguishable from one the kernel
+                            // truncated. Say so rather than leaving an operator to
+                            // work backwards from a parse error: RFC 3261 §18.1.1
+                            // requires a UAC to move to a congestion-controlled
+                            // transport well below this size, so either way the
+                            // peer is doing something it should not. The message
+                            // is still processed — a genuinely truncated one is
+                            // refused by the parser's Content-Length check
+                            // (RFC 4475 §3.1.2.2) rather than acted on.
+                            warn!(
+                                remote = %remote_addr,
+                                bytes = size,
+                                "UDP datagram filled the receive buffer — it may have been \
+                                 truncated by the kernel; the peer should be using TCP \
+                                 (RFC 3261 §18.1.1)"
+                            );
+                            if let Some(metrics) = crate::metrics::try_metrics() {
+                                metrics.udp_datagrams_at_buffer_limit_total.inc();
                             }
-                            Err(e) => {
-                                error!("[udp-worker-{}] recv_from error: {}", worker_index, e);
-                            }
+                        }
+                        buffer.truncate(size);
+                        let data = buffer.freeze();
+
+                        let connection_id = udp_connection_id(local_addr, remote_addr);
+
+                        let message = InboundMessage {
+                            connection_id,
+                            transport: Transport::Udp,
+                            local_addr,
+                            remote_addr,
+                            data,
+                        };
+
+                        if let Err(e) = inbound_tx.send_async(message).await {
+                            error!("[udp-worker-{}] Failed to enqueue inbound message: {}", worker_index, e);
                         }
                     }
-
-                    outbound_result = outbound_rx.recv_async() => {
-                        match outbound_result {
-                            Ok(outbound) => {
-                                let dest = SockAddr::from(outbound.destination);
-                                let Some(dest_addr) = dest.as_socket() else {
-                                    warn!("[udp-worker-{}] invalid destination: {}", worker_index, outbound.destination);
-                                    continue;
-                                };
-                                // Every frame of this message goes out from THIS
-                                // worker's socket, in order, before the worker
-                                // takes another message off the shared channel.
-                                // That is the only ordering guarantee available
-                                // on UDP here: workers share the receiver
-                                // MPMC-style, so two separately-enqueued
-                                // messages can leave from two sockets in either
-                                // order (see `OutboundMessage::followups`).
-                                for frame in outbound.frames() {
-                                    if let Err(e) = socket.send_to(frame, &dest_addr).await {
-                                        warn!("[udp-worker-{}] send_to {} failed: {}", worker_index, outbound.destination, e);
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // Outbound channel closed — clean shutdown
-                                break;
-                            }
-                        }
+                    Err(e) => {
+                        error!("[udp-worker-{}] recv_from error: {}", worker_index, e);
                     }
                 }
             }
-        });
+
+            outbound_result = outbound_rx.recv_async() => {
+                match outbound_result {
+                    Ok(outbound) => send_frames(worker_index, &socket, &outbound).await,
+                    // Outbound channel closed — clean shutdown
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+/// Send every frame of `outbound` from `socket`, in order, before the caller
+/// takes anything else off its channel.
+async fn send_frames(worker_index: usize, socket: &UdpSocket, outbound: &OutboundMessage) {
+    let dest = SockAddr::from(outbound.destination);
+    let Some(dest_addr) = dest.as_socket() else {
+        warn!(
+            "[udp-worker-{}] invalid destination: {}",
+            worker_index, outbound.destination
+        );
+        return;
+    };
+    for frame in outbound.frames() {
+        if let Err(e) = socket.send_to(frame, &dest_addr).await {
+            warn!(
+                "[udp-worker-{}] send_to {} failed: {}",
+                worker_index, outbound.destination, e
+            );
+            break;
+        }
+    }
+}
+
+/// Drain the channel of a worker that could not open its socket, sending from a
+/// working worker's socket instead.
+async fn drain_outbound(
+    worker_index: usize,
+    socket: Arc<UdpSocket>,
+    outbound_rx: flume::Receiver<OutboundMessage>,
+) {
+    while let Ok(outbound) = outbound_rx.recv_async().await {
+        send_frames(worker_index, &socket, &outbound).await;
     }
 }
 
@@ -409,19 +539,16 @@ mod tests {
     }
 
     /// Frames of one `OutboundMessage` must reach the peer in the order they
-    /// were queued, however many workers are draining the shared channel.
+    /// were queued, however many workers the listener runs.
     ///
-    /// This is the regression guard for the REFER `202`/`NOTIFY` inversion:
-    /// every worker clones the same outbound receiver and owns its own
-    /// `SO_REUSEPORT` socket, so two *separately enqueued* messages race and can
-    /// land inverted (RFC 3515 §2.4.4 requires the 202 first). Grouping them
-    /// into one message pins them to a single worker, which sends them in
-    /// sequence.
+    /// This is the regression guard for the REFER `202`/`NOTIFY` inversion
+    /// (RFC 3515 §2.4.4 requires the 202 first): a worker sends every frame of
+    /// one message before it takes the next message off its channel. Separately
+    /// enqueued messages to one peer are ordered too, by destination routing;
+    /// see `separately_enqueued_messages_to_one_peer_keep_their_order`.
     ///
-    /// The guarantee is per-group ordering, NOT adjacency on the wire: another
-    /// worker may be sending a different group concurrently, so groups legitimately
-    /// interleave with each other. Many groups are driven through so a within-group
-    /// inversion has room to show up rather than passing by luck on one attempt.
+    /// Many groups are driven through so a within-group inversion has room to
+    /// show up rather than passing by luck on one attempt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordered_frames_are_not_reordered_across_workers() {
         const GROUPS: usize = 100;
@@ -467,7 +594,7 @@ mod tests {
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (inbound_tx, _inbound_rx) = flume::unbounded::<InboundMessage>();
-        let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let (outbound, outbound_rx) = UdpOutbound::channels(8);
 
         listen(
             listen_addr,
@@ -481,7 +608,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         for group in 0..GROUPS {
-            outbound_tx
+            outbound
                 .send(OutboundMessage {
                     connection_id: ConnectionId::default(),
                     transport: Transport::Udp,
@@ -519,5 +646,182 @@ mod tests {
             );
             next_expected[group] += 1;
         }
+    }
+
+    /// Messages enqueued separately to one peer reach it in the order they were
+    /// enqueued, however many workers the listener runs.
+    ///
+    /// Two messages siphon sends back to back to one peer are often only right in
+    /// that order: the ACK that confirms a dialog and the BYE that ends it, the
+    /// 200 to a CANCEL and the 487 to its INVITE, a 183 and the 200 after it.
+    /// Grouping a pair into one message (`OutboundMessage::followups`) covers
+    /// only the call sites that remember to; this holds for all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn separately_enqueued_messages_to_one_peer_keep_their_order() {
+        const MESSAGES: usize = 400;
+
+        let peer = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        peer.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.bind(&SockAddr::from(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        ))
+        .unwrap();
+        let peer = tokio::net::UdpSocket::from_std(peer.into()).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(MESSAGES);
+            let mut buffer = [0u8; 64];
+            while received.len() < MESSAGES {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    peer.recv_from(&mut buffer),
+                )
+                .await
+                {
+                    Ok(Ok((size, _))) => received.push(
+                        String::from_utf8_lossy(&buffer[..size])
+                            .parse::<usize>()
+                            .expect("message index"),
+                    ),
+                    Ok(Err(error)) => panic!("recv failed: {error}"),
+                    Err(_) => break,
+                }
+            }
+            received
+        });
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (inbound_tx, _inbound_rx) = flume::unbounded::<InboundMessage>();
+        let (outbound, outbound_rx) = UdpOutbound::channels(8);
+
+        listen(
+            listen_addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            0,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        for index in 0..MESSAGES {
+            outbound
+                .send(OutboundMessage {
+                    connection_id: ConnectionId::default(),
+                    transport: Transport::Udp,
+                    destination: peer_addr,
+                    data: Bytes::from(index.to_string()),
+                    source_local_addr: None,
+                    server_name: None,
+                    followups: None,
+                })
+                .unwrap();
+        }
+
+        let received = reader.await.unwrap();
+        assert_eq!(
+            received.len(),
+            MESSAGES,
+            "expected every message to arrive; got {}",
+            received.len()
+        );
+        if let Some(position) = received.windows(2).position(|pair| pair[0] > pair[1]) {
+            panic!(
+                "message {} arrived after message {} — separately enqueued messages to one \
+                 peer were reordered",
+                received[position + 1],
+                received[position]
+            );
+        }
+    }
+
+    fn message_to(destination: SocketAddr) -> OutboundMessage {
+        OutboundMessage {
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            destination,
+            data: Bytes::from_static(b"OPTIONS"),
+            source_local_addr: None,
+            server_name: None,
+            followups: None,
+        }
+    }
+
+    /// A destination always maps to the same worker, so all its messages share
+    /// one queue, while distinct peers still spread across the workers.
+    #[test]
+    fn a_destination_always_maps_to_one_worker_and_peers_spread() {
+        let peer: SocketAddr = "198.51.100.7:5060".parse().unwrap();
+        let first = shard_for(peer, 8);
+        assert!(first < 8);
+        for _ in 0..100 {
+            assert_eq!(shard_for(peer, 8), first);
+        }
+        assert_eq!(shard_for(peer, 1), 0);
+        assert_eq!(shard_for(peer, 0), 0);
+        let v6: SocketAddr = "[2001:db8::1]:5060".parse().unwrap();
+        assert!(shard_for(v6, 8) < 8);
+
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let used: std::collections::HashSet<usize> = (0..64u16)
+            .map(|offset| shard_for(SocketAddr::new(loopback, 5061 + offset), 8))
+            .collect();
+        assert!(
+            used.len() >= 6,
+            "64 peers landed on only {} of 8 workers",
+            used.len()
+        );
+    }
+
+    /// Sends go to the channel of the worker that owns the destination, and a
+    /// single sender converts into a one-channel outbound.
+    #[test]
+    fn udp_outbound_sends_each_destination_down_its_own_channel() {
+        let (outbound, receivers) = UdpOutbound::channels(4);
+        assert_eq!(receivers.len(), 4);
+        let peer: SocketAddr = "198.51.100.7:5060".parse().unwrap();
+        for _ in 0..3 {
+            outbound.send(message_to(peer)).unwrap();
+        }
+        assert_eq!(receivers[shard_for(peer, 4)].len(), 3);
+        assert_eq!(receivers.iter().map(flume::Receiver::len).sum::<usize>(), 3);
+
+        assert_eq!(UdpOutbound::channels(0).1.len(), 1);
+
+        let (sender, receiver) = flume::unbounded();
+        let single = UdpOutbound::from(sender);
+        single.send(message_to(peer)).unwrap();
+        assert_eq!(receiver.len(), 1);
+    }
+
+    /// The channel of a worker that could not open its socket is still drained,
+    /// through another worker's socket.
+    #[tokio::test]
+    async fn an_orphaned_worker_channel_is_drained_through_another_socket() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (sender, receiver) = flume::unbounded();
+        tokio::spawn(drain_outbound(3, socket, receiver));
+
+        sender.send(message_to(peer_addr)).unwrap();
+
+        let mut buffer = [0u8; 64];
+        let (size, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.recv_from(&mut buffer),
+        )
+        .await
+        .expect("the orphaned channel was never drained")
+        .unwrap();
+        assert_eq!(&buffer[..size], b"OPTIONS");
     }
 }
