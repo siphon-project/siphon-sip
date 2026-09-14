@@ -4,9 +4,10 @@
 #   docker compose logs -f        # follow logs
 #   docker compose down           # stop
 #
-# It bind-mounts your config and scripts from this directory, so you edit
-# siphon.yaml / scripts/*.py on the host and SIPhon hot-reloads them — no
-# rebuild, no restart. The repo ships a working siphon.yaml and
+# It bind-mounts your config and scripts from this directory. Edit
+# scripts/*.py on the host and SIPhon hot-reloads them — no rebuild, no
+# restart. siphon.yaml is read once at start, so a config change takes
+# `docker compose restart siphon`. The repo ships a working siphon.yaml and
 # scripts/proxy_default.py, so a fresh clone runs a working proxy out of the box.
 #
 # See docs/getting-started.md and docs/deployment.md for the full story.
@@ -32,8 +33,9 @@ services:
     #   - "5061:5061/tcp"     # SIP over TLS
 
     volumes:
-      # Your config and routing scripts — edited on the host, hot-reloaded in
-      # the container. Read-only in the container; SIPhon only reads them.
+      # Your config and routing scripts, edited on the host. Scripts hot-reload
+      # in the container; siphon.yaml is read at start and needs a restart.
+      # Read-only in the container; SIPhon only reads them.
       - ./siphon.yaml:/etc/siphon/siphon.yaml:ro
       - ./scripts:/etc/siphon/scripts:ro
       # Optional: mount TLS certs / persisted state as needed, e.g.
