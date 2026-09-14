@@ -1,5 +1,6 @@
 //! What an LCR sequence keeps about the carriers it has been through: a carrier
-//! that failed is settled, and is never CANCELled after its final response.
+//! that failed is settled, and is never CANCELled after its final response, and
+//! every failed attempt, a ring timeout included, is recorded once.
 //!
 //! Driven through the dispatcher with the harness of
 //! [`super::lcr_ring_timeout_tests`]: carriers answer through
@@ -284,5 +285,158 @@ async fn a_retransmitted_failure_from_a_carrier_that_failed_is_absorbed() {
             format!("INVITE to {THIRD_CARRIER}")
         ],
         "the second carrier was still the one in flight"
+    );
+}
+
+/// The last carrier ringing out is a failed attempt like the one before it:
+/// recorded as 408 and reported to `@b2bua.on_route_failure` once, before
+/// `@b2bua.on_failure` runs, once, with it on the attempt list.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_carrier_ringing_out_is_recorded_as_a_failed_attempt() {
+    let (sequence, _) = first_carrier_fails(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            carrier("carrier-b", SECOND_CARRIER, 2),
+        ],
+        RECORD_EVENTS,
+    );
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {SECOND_CARRIER}"),
+            format!("408 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:503;route:carrier-b:408;failure:408:carrier-a=503,carrier-b=408;"
+    );
+    assert!(sequence.call_is_gone());
+}
+
+/// A carrier kept past its ring timeout by progress, which then rings out and
+/// fails the call with carriers still left, is recorded the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ringing_carrier_that_rings_out_is_recorded_as_a_failed_attempt() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            carrier("carrier-b", SECOND_CARRIER, 2),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 183, "Session Progress");
+    assert_eq!(summaries(&sequence.wire()), [format!("183 to {CALLER}")]);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        events(&sequence),
+        "",
+        "nothing is recorded while progress keeps the carrier"
+    );
+
+    sequence.ring_for(Duration::from_secs(5));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("408 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;failure:408:carrier-a=408;"
+    );
+}
+
+/// A carrier whose route does not reroute on 408 ends the call when it rings
+/// out, with carriers still left, and is recorded like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_that_rings_out_without_rerouting_is_recorded_as_a_failed_attempt() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            crate::lcr::Route {
+                reroute_causes: vec![503],
+                ..carrier("carrier-a", FIRST_CARRIER, 2)
+            },
+            carrier("carrier-b", SECOND_CARRIER, 2),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    invite_to(sequence.wire(), FIRST_CARRIER);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("408 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;failure:408:carrier-a=408;"
+    );
+}
+
+/// A carrier that rings out while the sequence moves on is recorded once, not
+/// once for the ring timeout and again for the advance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_that_rings_out_and_is_failed_over_is_recorded_once() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            carrier("carrier-b", SECOND_CARRIER, 2),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    invite_to(sequence.wire(), FIRST_CARRIER);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("INVITE to {SECOND_CARRIER}")
+        ]
+    );
+    assert_eq!(attempts(&sequence), ["carrier-a=408"]);
+    assert_eq!(events(&sequence), "route:carrier-a:408;");
+}
+
+/// A ring timeout whose advance finds no routable carrier left records the
+/// carrier that rang out once, then each carrier burned once, and then fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_that_rings_out_onto_unroutable_carriers_is_recorded_once() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            crate::lcr::Route {
+                carrier_id: "carrier-b".to_string(),
+                ..Default::default()
+            },
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    invite_to(sequence.wire(), FIRST_CARRIER);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("408 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;route:carrier-b:503;failure:408:carrier-a=408,carrier-b=503;"
     );
 }

@@ -837,30 +837,15 @@ pub fn advance_route_sequence(
     "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
             return None;
         }
-        // Record the attempt against the carrier that was in flight, then
-        // report it. A carrier failing is an operational event — it used to
-        // be visible only at debug, so an answered call that burned a
-        // carrier on the way left nothing to alert on or trend.
-        let failed_route = state.call_actors.active_route(call_id);
-        if let Some(attempt) = state.call_actors.record_route_failure(call_id, status_code) {
-            info!(
-                call_id = %call_id,
-                carrier = %attempt.carrier_id,
-                status = status_code,
-                elapsed_ms = attempt.elapsed_ms,
-                "LCR: carrier attempt failed"
-            );
-        }
-        if let Some(route) = &failed_route {
-            b2bua_dispatch_route_failure(
-                call_id,
-                route,
-                status_code,
-                &snapshot.a_leg,
-                snapshot.a_leg_invite.as_ref(),
-                state,
-            );
-        }
+        // Record the attempt against the carrier that was in flight, and report
+        // it, before this carrier is ACKed and the sequence advances or ends.
+        b2bua_record_carrier_failure(
+            call_id,
+            status_code,
+            &snapshot.a_leg,
+            snapshot.a_leg_invite.as_ref(),
+            state,
+        );
         // Fail over only on a configured reroute cause (per-route from the
         // API > per-gateway override > global set). A definitive response
         // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —

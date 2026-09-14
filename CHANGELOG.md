@@ -292,6 +292,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   again and does nothing else. Before, it was recorded as a failure of the
   carrier then in flight and moved the sequence past that carrier too.
 
+- **Every LCR carrier that rings out is recorded as a failed attempt.** A ring
+  timeout went on the attempt list as `408` only when the sequence moved on to
+  another carrier. The last carrier ringing out, a carrier that had shown
+  progress ringing out, and a carrier whose route does not reroute on `408` all
+  failed the call with nothing on `call.route_attempts` or the CDR's
+  `lcr_attempts`, and `@b2bua.on_route_failure` never fired for them, though it
+  is documented to fire for every failed attempt, the last one included. Every
+  ring timeout is now recorded once, as `408`, and fires the hook once, before
+  the carrier is CANCELled and before `@b2bua.on_failure` runs. That is the
+  order a carrier failing with a final response already had.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

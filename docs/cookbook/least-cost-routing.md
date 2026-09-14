@@ -196,8 +196,10 @@ request.
   bound (`call.route(timeout=…)`, 30 s by default), both counted from when that
   carrier was dialled, so progress never shortens a ring. If that deadline
   passes too, siphon CANCELs the carrier and fails the call with `408` without
-  trying the remaining carriers. `@b2bua.on_failure` runs as for any other
-  failure and can still route the call somewhere else.
+  trying the remaining carriers. The attempt goes on `call.route_attempts` as
+  `408` and `@b2bua.on_route_failure` fires for it first, as for any carrier
+  that rings out. Then `@b2bua.on_failure` runs as for any other failure and can
+  still route the call somewhere else.
 - A **final failure** after progress (a `503`, say) still fails over as usual.
   Only the timeout changes.
 - With `call.route(timeout=0)` there is no ring bound, so a carrier that has

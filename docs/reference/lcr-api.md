@@ -120,6 +120,11 @@ Top-level:
   rest, and `@b2bua.on_failure` runs as for any other failure. A final failure
   after progress (a `503`, say) still fails over as usual.
 
+  Every ring timeout is a failed attempt, whether the sequence goes on or ends
+  on it: it is recorded once as `408` on `call.route_attempts` (and the CDR's
+  `lcr_attempts`), and `@b2bua.on_route_failure` fires once for it, before
+  `@b2bua.on_failure` when the call fails there.
+
   Some carriers answer `183` with ringback they generate themselves before they
   have reached anyone. Give such a carrier `reroute_after_progress: true` and it
   fails over at `timeout_secs` whatever it has sent:

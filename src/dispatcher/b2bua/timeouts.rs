@@ -224,9 +224,20 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         None => return,
     };
 
-    // LCR / sequential failover: the current carrier did not answer within its
-    // ring timeout. If more carriers remain and 408 is a reroute cause for this
-    // carrier, CANCEL this attempt and advance instead of failing the call.
+    // LCR / sequential failover: the carrier in flight did not answer within its
+    // ring timeout. Its attempt is recorded as 408 before anything else, the way
+    // a carrier failing with a final response is recorded before its ACK: the
+    // call may advance, fail, or go back to a controller, and either way
+    // `@b2bua.on_route_failure` fires for this carrier once, and a
+    // `@b2bua.on_failure` that concludes the call finds it on
+    // `call.route_attempts`. Recording it only on the advance left the last
+    // carrier, and one kept by progress, off the attempt list altogether.
+    if state.call_actors.is_route_sequence(call_id) {
+        b2bua_record_carrier_failure(call_id, 408, &a_leg, a_leg_invite.as_ref(), state);
+    }
+
+    // If more carriers remain and 408 is a reroute cause for this carrier,
+    // CANCEL this attempt and advance instead of failing the call.
     //
     // Unless the carrier has shown progress. A 101-199 says it reached the far
     // end and is working on the call, so its route's timer bounded only the wait
@@ -252,21 +263,6 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         && state.call_actors.has_pending_routes(call_id)
         && b2bua_status_reroutes(call_id, 408, state)
     {
-        // A ring timeout is recorded as 408 — the code the attempt effectively
-        // ended on, and the one the A-leg would have seen had the queue been
-        // exhausted here.
-        let timed_out_route = state.call_actors.active_route(call_id);
-        if let Some(attempt) = state.call_actors.record_route_failure(call_id, 408) {
-            info!(
-                call_id = %call_id,
-                carrier = %attempt.carrier_id,
-                elapsed_ms = attempt.elapsed_ms,
-                "LCR: carrier ring-timeout"
-            );
-        }
-        if let Some(route) = &timed_out_route {
-            b2bua_dispatch_route_failure(call_id, route, 408, &a_leg, a_leg_invite.as_ref(), state);
-        }
         // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1), each
         // kept answerable apart from the call. The next carrier can fail, and end
         // the call, before this one's 487 arrives, and that 487 is owed its ACK
