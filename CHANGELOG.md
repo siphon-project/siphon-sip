@@ -779,6 +779,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   challenge no longer retains it for the life of the process. Affects both AKA
   paths.
 
+### Security
+
+- **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3
+  handshake messages sent at the wrong encryption level. siphon's TLS and WSS
+  listeners, its outbound TLS connections and its HTTP clients (LCR, SBI,
+  auth) all use rustls, so the `siphon-sip`, `siphon-bin` and control SDK
+  lockfiles now carry 0.23.45. The upgrade brings `rustls-webpki` 0.103.15 and
+  the `aws-lc-rs` 1.18.1 / `aws-lc-sys` 0.45.0 backend it requires.
+
 ## [1.8.7] — 2026-09-12
 
 ### Added
