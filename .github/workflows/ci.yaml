@@ -1035,6 +1035,23 @@ jobs:
             fi
           done
 
+      # The ringing carrier answers 183 and holds: it keeps the call past its 3 s
+      # timeout_secs, is CANCELled at the 8 s ring bound, and the untried carrier
+      # after it never receives an INVITE.
+      - name: A carrier that shows progress keeps the call past its ring timeout
+        run: bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_progress_ring_bound_uac.xml sipp-b2bua-lcr-ringing-carrier-uas sipp-b2bua-lcr-untried-carrier-uas
+
+      - name: The ring bound's 408 ended the call once
+        run: |
+          logs="$(docker logs siphon-b2bua-lcr 2>&1)"
+          expected="LCR-FAILURE 408 Request Timeout"
+          count="$(grep -c "$expected" <<<"$logs" || true)"
+          if [ "$count" != "1" ]; then
+            echo "expected one '$expected' line, got $count"
+            grep 'LCR-' <<<"$logs" || true
+            exit 1
+          fi
+
       - name: Collect logs
         if: always()
         run: |

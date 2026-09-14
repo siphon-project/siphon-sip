@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- LCR route sequence in sipp-b2bua-lcr, the ringing carrier of the progress
+     case (callee +15550100003, routes.15550100003.json): answers 183 Session
+     Progress at once and then sends nothing, as a carrier ringing a callee who
+     is slow to pick up does.
+
+     Its route's timeout_secs is 3 and the call's ring bound is 8 s. The 183 is
+     progress (RFC 3261 §16.7 step 2), so siphon keeps this carrier past its own
+     3 s and CANCELs it at the ring bound, 8 s after dialling it:
+       - a CANCEL less than 7 s after the INVITE fails this carrier: that is the
+         route's timer still bounding the answer instead of the wait for
+         progress;
+       - no CANCEL within 12 s of the 183 fails it too, on the receive's own
+         timeout.
+     It then answers as its INVITE server transaction owes (RFC 3261 §9.2): 200
+     to the CANCEL and 487 to the INVITE, with the INVITE's CSeq. The ACK siphon
+     owes the 487 (RFC 3261 §17.1.1.3) is mandatory. -->
+
+<scenario name="B2BUA LCR ringing carrier (183, then held until CANCEL)">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <gettimeofday assign_to="invited_seconds,invited_microseconds" />
+      <ereg regexp="INVITE sip:[+]15550100003@" search_in="msg" check_it="true" assign_to="called_number" />
+      <ereg regexp="([0-9]+) INVITE" search_in="hdr" header="CSeq:" check_it="true" assign_to="invite_cseq_header,invite_cseq" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagR[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carrier-ringing@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="12000">
+    <action>
+      <gettimeofday assign_to="cancelled_seconds,cancelled_microseconds" />
+      <assign assign_to="rang_for" variable="cancelled_seconds" />
+      <subtract assign_to="rang_for" variable="invited_seconds" />
+      <assign assign_to="fraction" variable="cancelled_microseconds" />
+      <subtract assign_to="fraction" variable="invited_microseconds" />
+      <divide assign_to="fraction" value="1000000" />
+      <add assign_to="rang_for" variable="fraction" />
+      <test assign_to="cancelled_early" variable="rang_for" compare="less_than" value="7" />
+    </action>
+  </recv>
+  <nop next="cancelled_early" test="cancelled_early" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagR[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- A CANCEL carries its INVITE's Via (RFC 3261 §9.1), so the last Via is
+       still the INVITE's; only the CSeq has to be the INVITE's own. -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagR[call_number]
+[last_Call-ID:]
+CSeq: [$invite_cseq] INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000" />
+  <nop next="done" />
+
+  <label id="cancelled_early" />
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="CANCELLED_EARLY" timeout="100" />
+
+  <label id="done" />
+
+  <Reference variables="called_number,invite_cseq_header" />
+
+</scenario>
