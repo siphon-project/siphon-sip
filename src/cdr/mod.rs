@@ -935,28 +935,17 @@ async fn write_http_cdr(cdr: &Cdr, state: &HttpState) {
     }
 }
 
-/// Establish a TLS connection.
+/// Establish a TLS connection to the collector.
+///
+/// The public roots, via the shared client-TLS helper — a collector behind a
+/// private CA belongs on `hep.tls_ca` / a future `cdr.http.ca_file` rather than
+/// on a second root store here.
 async fn connect_tls(
     address: &str,
     server_name: &str,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-    use std::sync::Arc;
-    use tokio_rustls::TlsConnector;
-
-    let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = tokio_rustls::rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(config));
-    let stream = tokio::net::TcpStream::connect(address).await?;
-
-    let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(server_name.to_string())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-
-    connector.connect(domain, stream).await
+    let config = std::sync::Arc::new(crate::transport::client_tls::client_config(None)?);
+    crate::transport::client_tls::connect(address, server_name, config).await
 }
 
 /// Check the HTTP response status line.

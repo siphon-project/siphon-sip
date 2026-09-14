@@ -279,7 +279,7 @@ async fn tls_sender_loop(
     use tokio_rustls::rustls;
     use tokio_rustls::TlsConnector;
 
-    let tls_config = match build_tls_client_config(ca_cert) {
+    let tls_config = match crate::transport::client_tls::client_config(ca_cert) {
         Ok(config) => config,
         Err(error) => {
             error!("failed to build HEP TLS config: {error}");
@@ -341,39 +341,6 @@ async fn tls_sender_loop(
             break;
         }
     }
-}
-
-/// Build a rustls `ClientConfig` for HEP TLS connections.
-fn build_tls_client_config(
-    ca_cert: Option<&str>,
-) -> io::Result<tokio_rustls::rustls::ClientConfig> {
-    use tokio_rustls::rustls;
-
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if let Some(ca_path) = ca_cert {
-        // Load custom CA certificate
-        let ca_data = std::fs::read(ca_path)?;
-        let mut cursor = io::Cursor::new(ca_data);
-        use rustls_pki_types::pem::PemObject;
-        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        for cert in certs {
-            root_store
-                .add(cert)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        }
-    } else {
-        // Use Mozilla root CAs via webpki-roots
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(config)
 }
 
 #[cfg(test)]
