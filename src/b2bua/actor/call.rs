@@ -611,6 +611,17 @@ impl CallActor {
         })
     }
 
+    /// Whether the carrier in flight has sent a 101-199, whatever its route does
+    /// with it. Unlike [`route_kept_by_progress`](Self::route_kept_by_progress)
+    /// this holds for a route with `reroute_after_progress` too: it says the
+    /// carrier got as far as the callee, which is what decides the status a
+    /// call fails with when that carrier's ring timeout ends the sequence.
+    pub fn route_attempt_progressed(&self) -> bool {
+        self.route_sequence
+            .as_ref()
+            .is_some_and(|sequence| sequence.active_progressed)
+    }
+
     /// Settle the B-leg at `index` of a sequential failover call on its final
     /// failure `status_code`, before the sequence moves on. Returns whether the
     /// leg was still waiting for one: `false` for a leg already settled, failed

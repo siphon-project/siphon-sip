@@ -517,6 +517,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **An LCR sequence that runs out on a ring timeout, with no carrier showing
+  progress, fails the call with `503 Service Unavailable` instead of `408`.**
+  When the carrier in flight rang out without ever sending a 101-199 and the
+  sequence ended there (it was the last carrier, the rest could not be dialled,
+  or its route does not reroute on `408`), the caller got `408 Request
+  Timeout`. That says the callee was reached and did not answer, and no carrier
+  had reached anyone. The caller now gets `503`, the code siphon already sends
+  when no carrier can be dialled at all, and `@b2bua.on_failure` gets `503` too.
+  It is siphon's own response, built from the caller's INVITE rather than a
+  carrier's `503` relayed on, so it is not turned into `500`. A carrier that
+  sent a `180` or `183` and then rang out still fails the call `408`. So does
+  the last target of a `call.fork(strategy="sequential")` or of a sequential
+  control-plane `dial` that rang, and that `dial` reports the same code in
+  `DialFailed`. The carrier's own attempt stays `408` on `call.route_attempts`,
+  in the CDR's `lcr_attempts` and in `@b2bua.on_route_failure`. A plain
+  `call.dial()` or a parallel fork that rings out is unchanged.
+
 - **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
   `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`
   each gained a public field** (`auth_user`, `auth_user`, `impi`, `impi`).

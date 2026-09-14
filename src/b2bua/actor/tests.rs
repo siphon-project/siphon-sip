@@ -941,6 +941,32 @@ fn branches(legs: &[Leg]) -> Vec<&str> {
     legs.iter().map(|leg| leg.branch.as_str()).collect()
 }
 
+/// A carrier that sends 180 has progressed whatever its route does with it: a
+/// hunt target with `reroute_after_progress` is not kept by it, and still
+/// reached the callee. A 100 is not progress.
+#[test]
+fn a_route_attempt_progresses_on_a_ringing_response_even_when_it_does_not_keep_the_call() {
+    let mut call = CallActor::new(make_a_leg());
+    call.route_sequence = Some(crate::b2bua::actor::RouteSequenceState {
+        pending: vec![crate::lcr::Route {
+            carrier_id: "phone".to_string(),
+            reroute_after_progress: true,
+            ..Default::default()
+        }]
+        .into(),
+        ..Default::default()
+    });
+    assert!(call.take_next_route().is_some());
+    call.add_b_leg(make_sent_b_leg(0));
+
+    assert!(!call.record_route_progress("z9hG4bK-bleg0", 100));
+    assert!(!call.route_attempt_progressed());
+
+    assert!(call.record_route_progress("z9hG4bK-bleg0", 180));
+    assert!(call.route_attempt_progressed());
+    assert!(!call.route_kept_by_progress());
+}
+
 /// An LCR carrier's leg is settled by its final failure, once. A leg that has
 /// failed or been CANCELled is waiting for nothing, so a later response on it
 /// is a straggler, and no sweep of pending branches CANCELs it again.

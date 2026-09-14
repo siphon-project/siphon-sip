@@ -112,7 +112,9 @@ Top-level:
   step 2 draws for a proxy's Timer C.
 
   A carrier that has shown nothing by `timeout_secs` is CANCELled and the next
-  one is dialled. A carrier that has sent a `180` or `183` is ringing the
+  one is dialled. When there is no next one to dial, or the route does not
+  reroute on `408`, the call fails with `503 Service Unavailable` instead: no
+  carrier reached the callee. A carrier that has sent a `180` or `183` is ringing the
   callee, so it keeps the call: its deadline moves to the later of its own
   `timeout_secs` and the sequence's ring bound (`call.route(timeout=…)`, 30 s by
   default), both counted from when that carrier was dialled. If that passes too,
@@ -123,7 +125,8 @@ Top-level:
   Every ring timeout is a failed attempt, whether the sequence goes on or ends
   on it: it is recorded once as `408` on `call.route_attempts` (and the CDR's
   `lcr_attempts`), and `@b2bua.on_route_failure` fires once for it, before
-  `@b2bua.on_failure` when the call fails there.
+  `@b2bua.on_failure` when the call fails there. That `408` is the carrier's
+  outcome; the caller and `@b2bua.on_failure` get `503` or `408` as above.
 
   Some carriers answer `183` with ringback they generate themselves before they
   have reached anyone. Give such a carrier `reroute_after_progress: true` and it

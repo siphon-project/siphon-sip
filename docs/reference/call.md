@@ -177,7 +177,9 @@ that failure instead (RFC 3261 §16.7, §16.8). It stops mattering the moment a
 On `call.route()` each carrier has its own timer, and it bounds the wait for
 that carrier to show progress (a 101-199) rather than for its answer. A carrier
 that has rung keeps the call up to `timeout=`, then the call fails with `408`
-instead of going to the next carrier. See
+instead of going to the next carrier. A sequence that ends on the ring timeout
+of a carrier that never sent a 101-199 fails with `503` instead, and
+`@b2bua.on_failure` gets `503`: no carrier reached the callee. See
 [ring timeout and progress](../cookbook/least-cost-routing.md#ring-timeout-and-progress).
 
 `max_duration=` bounds the **talk**. The clock starts at the answer, so a call

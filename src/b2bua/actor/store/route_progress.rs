@@ -21,6 +21,14 @@ impl CallActorStore {
             .is_some_and(|mut call| call.record_route_progress(branch, status_code))
     }
 
+    /// Whether a call's carrier in flight has sent a 101-199. See
+    /// [`CallActor::route_attempt_progressed`]. `false` when the call is gone.
+    pub fn route_attempt_progressed(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.route_attempt_progressed())
+    }
+
     /// Whether a call's carrier in flight keeps the call past its ring timeout.
     /// See [`CallActor::route_kept_by_progress`]. `false` when the call is gone.
     pub fn route_kept_by_progress(&self, call_id: &str) -> bool {

@@ -100,6 +100,13 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
   code, and what it decides is carried out: `call.reject()` picks the caller's
   response, and `call.dial()` or a fresh `call.route()` tries somewhere else (a
   backup trunk, voicemail).
+- When the sequence ends on a **ring timeout** instead (the last carrier rang
+  out, or one whose route does not reroute on `408`), siphon answers the caller
+  itself. If that carrier never sent a `180`/`183`, no carrier got as far as
+  the callee and the caller gets `503 Service Unavailable`, a `503` of siphon's
+  own that is not turned into `500`. If it had, the callee was reached and did
+  not answer, and the caller gets `408`. `@b2bua.on_failure` gets the same code.
+  The attempt itself is recorded as `408` either way.
 - On answer, `call.active_route` is the carrier that won.
 - `call.route_attempts` lists the carriers it **burned** to get there — one
   entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`, `dialed`),
@@ -189,7 +196,10 @@ Timer C: once the next hop sends something past a 100, it is working on the
 request.
 
 - **No progress by `timeout_secs`**: siphon CANCELs the carrier and dials the
-  next one, fast failover for a carrier that is down or black-holing calls.
+  next one, fast failover for a carrier that is down or black-holing calls. With
+  no next carrier to dial, or a route that does not reroute on `408`, the call
+  fails with `503`, since no carrier reached the callee. The attempt is still a
+  `408`.
 - **Progress before it**: the carrier is ringing the callee, and cutting it off
   would drop the caller mid-ring onto a carrier that has to start again. Its
   deadline moves to the later of its own `timeout_secs` and the sequence's ring
