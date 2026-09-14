@@ -15,6 +15,39 @@ pub struct RouteTarget {
     pub headers: Vec<(String, String)>,
     /// Per-attempt ring timeout (seconds); falls back to the call default.
     pub timeout_secs: Option<u32>,
+    /// Fail this carrier over at its ring timeout even after it has shown
+    /// progress. See [`crate::lcr::Route::reroute_after_progress`].
+    pub reroute_after_progress: bool,
+}
+
+/// The failover queue a `route` verb's targets become: R-URI carriers, as
+/// `call.route()` gets them. The command's `extra_headers` apply to every
+/// attempt, and a target's own header overrides one on a key collision.
+///
+/// These are carriers from an out-of-process routing decision, so the LCR rule
+/// applies: a carrier that has shown progress keeps the call past its ring
+/// timeout, unless its target sets `reroute_after_progress`.
+fn route_verb_routes(
+    targets: Vec<RouteTarget>,
+    extra_headers: &[(String, String)],
+    default_timeout: u32,
+) -> Vec<crate::lcr::Route> {
+    targets
+        .into_iter()
+        .map(|target| {
+            let mut headers: std::collections::HashMap<String, String> =
+                extra_headers.iter().cloned().collect();
+            headers.extend(target.headers);
+            crate::lcr::Route {
+                ruri: Some(target.uri),
+                next_hop: target.next_hop,
+                timeout_secs: Some(target.timeout_secs.unwrap_or(default_timeout)),
+                headers,
+                reroute_after_progress: target.reroute_after_progress,
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Why [`b2bua_route_call`] could not accept a return-control routing decision —
@@ -97,26 +130,9 @@ pub fn b2bua_route_call(
     // non-tokio thread — establish the runtime.
     let _enter = control.runtime.enter();
 
-    // Build the failover queue from the targets (R-URI-only carriers, mirroring
-    // call.rs's call.route() / fork(strategy="sequential") construction). A
-    // command-level `extra_headers` set applies to every attempt; a per-target
-    // header overrides it on key collision.
+    // Build the failover queue from the targets (R-URI-only carriers).
     let default_timeout = 30u32;
-    let routes: Vec<crate::lcr::Route> = targets
-        .into_iter()
-        .map(|target| {
-            let mut headers: std::collections::HashMap<String, String> =
-                extra_headers.iter().cloned().collect();
-            headers.extend(target.headers);
-            crate::lcr::Route {
-                ruri: Some(target.uri),
-                next_hop: target.next_hop,
-                timeout_secs: Some(target.timeout_secs.unwrap_or(default_timeout)),
-                headers,
-                ..Default::default()
-            }
-        })
-        .collect();
+    let routes = route_verb_routes(targets, extra_headers, default_timeout);
 
     // Release control ownership: drain the ControlBus channel + emit
     // StasisEnd{reason:"routed"} so the app knows control returned (leak-critical),
@@ -138,6 +154,8 @@ pub fn b2bua_route_call(
             active: None,
             attempts: Vec::new(),
             active_since: None,
+            active_progressed: false,
+            active_legs_start: 0,
             send_socket: None,
             default_timeout,
         },
@@ -836,6 +854,32 @@ fn dial_parallel(
     sent
 }
 
+/// A sequential `dial` as a failover queue.
+///
+/// Its targets are phones being hunted, and a phone that rings sends a 180, so
+/// each target moves on when `timeout_secs` passes whether it rang or not:
+/// every route sets `reroute_after_progress`, where an LCR carrier that has
+/// shown progress would keep the call.
+fn sequential_dial_routes(
+    targets: Vec<DialTarget>,
+    timeout_secs: u32,
+    extra_headers: &[(String, String)],
+) -> Vec<crate::lcr::Route> {
+    targets
+        .into_iter()
+        .map(|target| crate::lcr::Route {
+            ruri: Some(target.uri),
+            next_hop: target.next_hop,
+            timeout_secs: Some(timeout_secs),
+            headers: merged_headers(extra_headers, &target.headers)
+                .into_iter()
+                .collect(),
+            reroute_after_progress: true,
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Try the targets in order, advancing on failure, via the same failover engine
 /// the LCR path uses — but with the call still owned by its controller, so the
 /// exhausted sequence reports `DialFailed` rather than failing the caller.
@@ -847,18 +891,7 @@ fn dial_sequential(
     template: &SipMessage,
     state: &DispatcherState,
 ) -> usize {
-    let routes: Vec<crate::lcr::Route> = targets
-        .into_iter()
-        .map(|target| crate::lcr::Route {
-            ruri: Some(target.uri),
-            next_hop: target.next_hop,
-            timeout_secs: Some(timeout_secs),
-            headers: merged_headers(extra_headers, &target.headers)
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        })
-        .collect();
+    let routes = sequential_dial_routes(targets, timeout_secs, extra_headers);
     state.call_actors.start_route_sequence(
         call_id,
         crate::b2bua::actor::RouteSequenceState {
@@ -866,6 +899,8 @@ fn dial_sequential(
             active: None,
             attempts: Vec::new(),
             active_since: None,
+            active_progressed: false,
+            active_legs_start: 0,
             send_socket: None,
             default_timeout: timeout_secs,
         },
@@ -940,4 +975,64 @@ pub fn report_control_dial_failure(
         }),
     );
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route_target(
+        uri: &str,
+        timeout_secs: Option<u32>,
+        reroute_after_progress: bool,
+    ) -> RouteTarget {
+        RouteTarget {
+            uri: uri.to_string(),
+            next_hop: None,
+            headers: Vec::new(),
+            timeout_secs,
+            reroute_after_progress,
+        }
+    }
+
+    /// A `route` verb hands siphon carriers from an out-of-process routing
+    /// decision, so each is on the LCR progress rule unless its target opts out.
+    #[test]
+    fn route_verb_targets_carry_their_reroute_after_progress() {
+        let routes = route_verb_routes(
+            vec![
+                route_target("sip:+15550100042@carrier-a.example.com", Some(6), false),
+                route_target("sip:+15550100042@carrier-b.example.com", None, true),
+            ],
+            &[],
+            30,
+        );
+        assert_eq!(routes.len(), 2);
+        assert!(!routes[0].reroute_after_progress);
+        assert_eq!(routes[0].timeout_secs, Some(6));
+        assert!(routes[1].reroute_after_progress);
+        assert_eq!(routes[1].timeout_secs, Some(30));
+    }
+
+    /// A sequential `dial` hunts through phones, each of which sends a 180 when
+    /// it rings, so every target moves on at the dial's timeout.
+    #[test]
+    fn a_sequential_dial_hunts_whether_a_target_rang_or_not() {
+        let targets = ["sip:1001@pbx.example.com", "sip:1002@pbx.example.com"]
+            .into_iter()
+            .map(|uri| DialTarget {
+                uri: uri.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let routes =
+            sequential_dial_routes(targets, 20, &[("X-Hunt".to_string(), "desk".to_string())]);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.reroute_after_progress));
+        assert!(routes.iter().all(|route| route.timeout_secs == Some(20)));
+        assert_eq!(
+            routes[0].headers.get("X-Hunt").map(String::as_str),
+            Some("desk")
+        );
+    }
 }

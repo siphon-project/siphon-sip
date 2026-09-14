@@ -1998,6 +1998,7 @@ fn parse_route_target_string_and_object() {
     assert!(string_target.next_hop.is_none());
     assert!(string_target.headers.is_empty());
     assert!(string_target.timeout_secs.is_none());
+    assert!(!string_target.reroute_after_progress);
 
     // Full object form.
     let object_target = parse_route_target(&serde_json::json!({
@@ -2005,8 +2006,23 @@ fn parse_route_target_string_and_object() {
         "next_hop": "sip:gw@203.0.113.7:5060",
         "headers": { "X-Carrier-Token": "abc" },
         "timeout": 12,
+        "reroute_after_progress": true,
     }))
     .unwrap();
+    assert!(object_target.reroute_after_progress);
+    // Absent from an object, it is off.
+    assert!(
+        !parse_route_target(&serde_json::json!({ "uri": "sip:3@carrier.example" }))
+            .unwrap()
+            .reroute_after_progress
+    );
+    // A policy flag that is not a boolean is refused, not read as false.
+    let error = parse_route_target(&serde_json::json!({
+        "uri": "sip:3@carrier.example",
+        "reroute_after_progress": "yes",
+    }))
+    .expect_err("a string is not a boolean");
+    assert!(error.contains("reroute_after_progress"), "{error}");
     assert_eq!(object_target.uri, "sip:2@carrier.example");
     assert_eq!(
         object_target.next_hop.as_deref(),

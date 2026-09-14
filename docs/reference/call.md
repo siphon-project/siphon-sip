@@ -174,6 +174,12 @@ failed with something that outranks a timeout (a `486`, say), the caller gets
 that failure instead (RFC 3261 §16.7, §16.8). It stops mattering the moment a
 `2xx` lands.
 
+On `call.route()` each carrier has its own timer, and it bounds the wait for
+that carrier to show progress (a 101-199) rather than for its answer. A carrier
+that has rung keeps the call up to `timeout=`, then the call fails with `408`
+instead of going to the next carrier. See
+[ring timeout and progress](../cookbook/least-cost-routing.md#ring-timeout-and-progress).
+
 `max_duration=` bounds the **talk**. The clock starts at the answer, so a call
 that rang for 25 seconds still gets its full talk time. When it expires siphon
 BYEs both legs.

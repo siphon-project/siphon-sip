@@ -368,6 +368,7 @@ pub fn handle_b2bua_response(
         ),
         ResponseClass::Provisional => b_leg_provisional(
             call_id,
+            branch,
             message,
             status_code,
             response_source,

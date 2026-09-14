@@ -2074,6 +2074,10 @@
         "doc": "Per-minute rate (for CDR / charging).",
         "kind": "getset_descriptor"
       },
+      "reroute_after_progress": {
+        "doc": "Whether this carrier fails over at `timeout_secs` even after it has shown progress.",
+        "kind": "getset_descriptor"
+      },
       "reroute_causes": {
         "doc": "Per-carrier reroute causes (SIP codes that fail over to the next carrier).",
         "kind": "getset_descriptor"

@@ -226,6 +226,21 @@ class Route:
     """SIP codes from this carrier that fail over to the next (overrides the
     per-gateway and global sets). For a carrier that sends non-standard codes."""
 
+    reroute_after_progress: bool = False
+    """Fail this carrier over when :attr:`timeout_secs` passes, even after it
+    has shown progress.
+
+    A route's ``timeout_secs`` bounds the wait for the carrier to show
+    progress: any provisional from 101 to 199, the line RFC 3261 §16.7 step 2
+    draws for a proxy's Timer C.  Once a carrier has, it keeps the call until
+    the later of its own timeout and the sequence's ring bound
+    (``call.route(timeout=…)``), both counted from its dial, and the call then
+    fails with 408 instead of going to the next carrier.
+
+    A carrier that answers 183 with ringback of its own before it has reached
+    anyone shows progress it does not have; ``True`` puts that one carrier back
+    on failing over at ``timeout_secs``.  Omitted from the JSON when ``False``."""
+
     def is_routable(self) -> bool:
         """A route is routable if it names a gateway group, next-hop, or R-URI."""
         return bool(self.gateway_group or self.next_hop or self.ruri)
@@ -256,6 +271,8 @@ class Route:
             out["cdr_fields"] = dict(self.cdr_fields)
         if self.reroute_causes:
             out["reroute_causes"] = list(self.reroute_causes)
+        if self.reroute_after_progress:
+            out["reroute_after_progress"] = True
         return out
 
     @classmethod
@@ -278,6 +295,7 @@ class Route:
             headers=dict(data.get("headers", {})),
             cdr_fields=dict(data.get("cdr_fields", {})),
             reroute_causes=list(data.get("reroute_causes", [])),
+            reroute_after_progress=bool(data.get("reroute_after_progress", False)),
         )
 
 

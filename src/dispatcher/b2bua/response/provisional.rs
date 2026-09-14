@@ -4,9 +4,12 @@
 use crate::dispatcher::*;
 
 /// A 1xx on the B-leg: mark the call ringing and relay the provisional to
-/// the A-leg, anchoring early media when the response carries SDP.
+/// the A-leg, anchoring early media when the response carries SDP. On an LCR
+/// attempt it is also the carrier's progress, which keeps the carrier past its
+/// ring timeout.
 pub fn b_leg_provisional(
     call_id: &str,
+    branch: &str,
     message: &mut SipMessage,
     status_code: u16,
     response_source: SocketAddr,
@@ -30,6 +33,18 @@ pub fn b_leg_provisional(
             debug!(call_id = %call_id, status = status_code,
         "B2BUA: dropping provisional received after answer");
             return;
+        }
+
+        // An LCR carrier that sends a 101-199 is working on the call, so its
+        // route's timer stops bounding the ring (RFC 3261 §16.7 step 2, Timer C)
+        // and the attempt's deadline moves to the sequence's ring bound.
+        // Recorded before any handler runs, so the sweep sees it at once.
+        if state
+            .call_actors
+            .record_route_progress(call_id, branch, status_code)
+        {
+            debug!(call_id = %call_id, status = status_code,
+                "LCR: carrier in flight showed progress");
         }
 
         // Invoke @b2bua.on_early_media handlers when provisional has SDP body.

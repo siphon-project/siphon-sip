@@ -110,7 +110,7 @@ fn route(number_policy: Option<&str>) -> crate::lcr::Route {
     }
 }
 
-fn a_leg_invite(callee: &str, caller: &str) -> SipMessage {
+pub(super) fn a_leg_invite(callee: &str, caller: &str) -> SipMessage {
     let raw = format!(
         concat!(
             "INVITE sip:{callee}@siphon.example.com SIP/2.0\r\n",
