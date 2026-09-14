@@ -686,22 +686,27 @@ jobs:
       - name: Register bob
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua run --rm sipp-b2bua-register
 
+      # Every case runs through sipp/run_call.sh, which waits for the callee to
+      # finish rather than stopping it when the caller exits, and grades both.
+      # Stopped early, a callee never answers the BYE siphon forwards after
+      # answering the caller's, and that BYE's retransmissions then reach the next
+      # case's callee on bob's same registered address and abort it.
       - name: B2BUA basic call (INVITE → 200 → BYE)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua up --abort-on-container-exit sipp-b2bua-uac sipp-b2bua-uas
+        run: COMPOSE_PROFILES=b2bua bash sipp/run_call.sh sipp-b2bua-uac sipp-b2bua-uas
 
       - name: Cleanup basic call containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua down sipp-b2bua-uac sipp-b2bua-uas 2>/dev/null || true
 
       - name: B2BUA session timer (Session-Expires negotiation)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit sipp-b2bua-st-uac sipp-b2bua-st-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-session-timer bash sipp/run_call.sh sipp-b2bua-st-uac sipp-b2bua-st-uas
 
       - name: Cleanup session timer containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-session-timer down sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true
 
       - name: B2BUA CANCEL (INVITE → CANCEL → 487)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-cancel up --abort-on-container-exit sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-cancel bash sipp/run_call.sh sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
 
       - name: Cleanup cancel containers
         if: always()
@@ -709,10 +714,10 @@ jobs:
 
       # RFC 3261 §14 re-INVITE variants. All four scenarios existed but were
       # wired to nothing — neither CI nor scripts/run-tests.sh named their
-      # profiles, so the behaviour they describe was asserted by nobody.
-      # `--exit-code-from` names the side that carries the assertion in each.
+      # profiles, so the behaviour they describe was asserted by nobody. Caller
+      # and callee are both graded, so the side carrying the assertion counts.
       - name: B2BUA re-INVITE from the A-leg (hold/resume, §8.2.6.2 dialog echo)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-reinvite bash sipp/run_call.sh sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
 
       - name: Cleanup reinvite containers
         if: always()
@@ -730,14 +735,14 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-info rm -sf sipp-b2bua-info-uac sipp-b2bua-info-uas 2>/dev/null || true
 
       - name: B2BUA re-INVITE from the B-leg (Via branch correctness)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-bleg up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-reinvite-bleg bash sipp/run_call.sh sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
 
       - name: Cleanup reinvite-bleg containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite-bleg rm -sf sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas 2>/dev/null || true
 
       - name: B2BUA re-INVITE rejected by the A-leg (dialog survives, §14.1)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-reinvite-reject bash sipp/run_call.sh sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas
 
       - name: Cleanup reinvite-reject containers
         if: always()
@@ -745,9 +750,9 @@ jobs:
 
       # The UAS carries the assertion here: it is the side that must still see a
       # BYE after its own re-INVITE was rejected, so reading the UAC's exit code
-      # would pass vacuously.
+      # alone would pass vacuously.
       - name: B2BUA re-INVITE rejected by the B-leg (dialog survives, §14.1)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-breject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-breject-uas sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-reinvite-breject bash sipp/run_call.sh sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas
 
       - name: Cleanup reinvite-breject containers
         if: always()
@@ -755,12 +760,11 @@ jobs:
 
       # RFC 3261 §17.1.1.3 — the CANCELled B-leg's 487 MUST be ACKed, or the
       # callee retransmits it on Timer G to Timer H (64*T1 = 32 s, §17.2.1) on
-      # every abandoned outbound attempt.  --exit-code-from names the UAS: the
+      # every abandoned outbound attempt.  The UAS carries the assertion: the
       # A-leg gets a correct 487 either way, so reading the UAC's exit code
-      # would pass vacuously — which is exactly why the step above, which does
-      # not name a container at all, never caught this.
+      # alone would pass vacuously.
       - name: B2BUA CANCEL 487 is ACKed (RFC 3261 §17.1.1.3)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-cancel-ack up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-ack-uas sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-cancel-ack bash sipp/run_call.sh sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas
 
       - name: Cleanup cancel-ack containers
         if: always()
@@ -773,7 +777,7 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-register-failure
 
       - name: B2BUA failure (INVITE → 486 Busy)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure up --abort-on-container-exit sipp-b2bua-failure-uac sipp-b2bua-failure-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-failure bash sipp/run_call.sh sipp-b2bua-failure-uac sipp-b2bua-failure-uas
 
       - name: Collect siphon-b2bua logs
         if: always()
@@ -857,7 +861,7 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua up -d --wait siphon-b2bua
 
       - name: B2BUA REFER transparent (RFC 3515 blind transfer, forwarded on the far leg's dialog)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-uac sipp-b2bua-refer-uac sipp-b2bua-refer-uas
+        run: COMPOSE_PROFILES=b2bua,b2bua-refer bash sipp/run_call.sh sipp-b2bua-refer-uac sipp-b2bua-refer-uas
 
       - name: Cleanup transparent containers
         if: always()
@@ -867,7 +871,7 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject up -d --wait siphon-b2bua-refer-modes
 
       - name: B2BUA REFER reject (loop-safe 603 default, zero egress)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas
+        run: COMPOSE_PROFILES=b2bua-refer-reject bash sipp/run_call.sh sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas
 
       - name: Cleanup reject containers
         if: always()
@@ -879,14 +883,14 @@ jobs:
       # before the A-leg 2xx is forwarded, so the caller received an in-dialog
       # REFER for a dialog it had not yet confirmed (RFC 3261 §13.2.2.4).
       - name: B2BUA REFER siphon-originated (REFER follows the 2xx, not before it)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-outbound up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas
+        run: COMPOSE_PROFILES=b2bua-refer-outbound bash sipp/run_call.sh sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas
 
       - name: Cleanup refer-outbound containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-outbound rm -sf sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas 2>/dev/null || true
 
       - name: B2BUA REFER siphon-terminated (dial target + promote + BYE)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
+        run: COMPOSE_PROFILES=b2bua-refer-terminate bash sipp/run_call.sh sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
 
       - name: Cleanup terminate containers
         if: always()
@@ -970,7 +974,7 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-referrer-bye rm -sf sipp-b2bua-refer-referrer-bye-uac sipp-b2bua-refer-referrer-bye-bob-uas sipp-b2bua-refer-referrer-bye-carol-uas 2>/dev/null || true
 
       - name: B2BUA REFER terminate attended (RFC 3891 §3 — Replaces reaches the target's INVITE)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-attended up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-attended-carol-uas sipp-b2bua-refer-attended-uac sipp-b2bua-refer-attended-bob-uas sipp-b2bua-refer-attended-carol-uas
+        run: COMPOSE_PROFILES=b2bua-refer-attended bash sipp/run_call.sh sipp-b2bua-refer-attended-uac sipp-b2bua-refer-attended-bob-uas sipp-b2bua-refer-attended-carol-uas
 
       - name: Cleanup attended containers
         if: always()
@@ -1010,7 +1014,7 @@ jobs:
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces rm -sf replaces-takeover-peer siphon-b2bua-replaces 2>/dev/null || true
 
       - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
+        run: COMPOSE_PROFILES=b2bua-rtpengine-refer bash sipp/run_call.sh sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
 
       - name: Collect logs
         if: always()

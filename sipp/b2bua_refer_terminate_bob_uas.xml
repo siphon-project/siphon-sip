@@ -88,11 +88,21 @@ a=sendrecv
 ]]>
   </send>
 
-  <recv request="ACK" optional="true" timeout="5000" />
+  <!-- Carol can hang up while this re-INVITE is still waiting for its ACK, so
+       the ACK and the forwarded BYE arrive in either order. siphon still ACKs a
+       2xx it receives after sending the BYE (RFC 5407 §3.1.3). Remember whether
+       the ACK came first, and wait for it after the BYE only if it did not: a
+       timed-out wait counts as a failed call, and an ACK landing after the
+       scenario ends aborts on a dead call. -->
+  <recv request="ACK" optional="true" timeout="5000">
+    <action>
+      <ereg regexp="ACK" search_in="msg" check_it="false" assign_to="reinvite_acked" />
+    </action>
+  </recv>
 
   <recv request="BYE" />
 
-  <send>
+  <send next="call_done" test="reinvite_acked">
     <![CDATA[
 SIP/2.0 200 OK
 [last_Via:]
@@ -104,5 +114,15 @@ Content-Length: 0
 
 ]]>
   </send>
+
+  <recv request="ACK" />
+
+  <label id="call_done" />
+
+  <nop>
+    <action>
+      <log message="bob: call complete" />
+    </action>
+  </nop>
 
 </scenario>
