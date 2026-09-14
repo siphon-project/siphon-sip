@@ -18,6 +18,10 @@ mod cache_tests;
 #[path = "integration/proxy_tests.rs"]
 mod proxy_tests;
 
+// registrar.save() answering refused REGISTERs, and the counters a refusal moves.
+#[path = "integration/registrar_tests.rs"]
+mod registrar_tests;
+
 #[path = "integration/rtpengine_tests.rs"]
 mod rtpengine_tests;
 

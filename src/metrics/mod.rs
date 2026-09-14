@@ -275,8 +275,9 @@ pub struct SiphonMetrics {
     /// leaking — the sweep reaps them on their own hard-lifetime + grace.
     pub ipsec_sa_pairs: IntGauge,
 
-    // --- Registration gauges ---
+    // --- Registrar ---
     pub registrations_active: IntGauge,
+    pub registrar_refusals_total: IntCounterVec,
 
     // --- Dialog gauges ---
     /// Active SIP dialogs, defined as `proxy_dialog_sessions + b2bua_calls_active`.
@@ -700,6 +701,10 @@ impl SiphonMetrics {
             "siphon_registrations_active",
             "Number of active registrations (AoR bindings)",
         )?;
+        let registrar_refusals_total = IntCounterVec::new(
+            Opts::new("siphon_registrar_refusals_total", "REGISTER refusals"),
+            &["reason"],
+        )?;
 
         let dialogs_active = IntGauge::new(
             "siphon_dialogs_active",
@@ -1114,6 +1119,7 @@ impl SiphonMetrics {
         registry.register(Box::new(subscribe_dialogs.clone()))?;
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
+        registry.register(Box::new(registrar_refusals_total.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
         registry.register(Box::new(b2bua_calls_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
@@ -1187,6 +1193,7 @@ impl SiphonMetrics {
             subscribe_dialogs,
             ipsec_sa_pairs,
             registrations_active,
+            registrar_refusals_total,
             dialogs_active,
             b2bua_calls_active,
             connections_active,

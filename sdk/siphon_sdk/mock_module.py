@@ -1284,6 +1284,88 @@ def _received_of(request: Any) -> str:
     return f"sip:{request.source_ip}:{port};transport={transport}"
 
 
+# The engine's ``registrar:`` limits when siphon.yaml leaves them out.
+_REGISTRAR_DEFAULTS = {
+    "default_expires": 3600,
+    "max_expires": 7200,
+    "min_expires": 60,
+    "max_contacts": 10,
+}
+
+
+def _header_values(request: Any, name: str) -> list[str]:
+    """Every value of a request header, tolerating duck-typed stand-ins."""
+    get_headers = getattr(request, "get_headers", None)
+    if callable(get_headers):
+        return [str(value) for value in get_headers(name)]
+    get_header = getattr(request, "get_header", None)
+    if callable(get_header):
+        value = get_header(name)
+        return [str(value)] if value is not None else []
+    return []
+
+
+def _split_outside_quotes(value: str, separator: str) -> list[str]:
+    """Split on ``separator`` wherever it is not inside ``"..."`` or ``<...>``."""
+    parts: list[str] = []
+    current: list[str] = []
+    quoted = False
+    depth = 0
+    for char in value:
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char == "<":
+            depth += 1
+        elif not quoted and char == ">" and depth:
+            depth -= 1
+        if char == separator and not quoted and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _parse_contact(entry: str) -> Optional[tuple[str, list[tuple[str, Optional[str]]]]]:
+    """Split one Contact value into its URI and its header parameters.
+
+    Both ``<uri>;params`` and a bare ``uri;params`` parse.  Parameter names are
+    lowercased (RFC 3261 §7.3.1); values are kept verbatim, quotes included.
+    """
+    entry = entry.strip()
+    if "<" in entry:
+        start = entry.index("<")
+        end = entry.find(">", start)
+        if end < 0:
+            return None
+        uri, rest = entry[start + 1:end].strip(), entry[end + 1:]
+    else:
+        uri, _, rest = entry.partition(";")
+        uri = uri.strip()
+    if not uri:
+        return None
+    params = []
+    for raw in _split_outside_quotes(rest, ";"):
+        name, has_value, value = raw.partition("=")
+        params.append((name.strip().lower(), value.strip() if has_value else None))
+    return uri, params
+
+
+def _as_number(value: Any, kind: Callable, default: Any) -> Any:
+    try:
+        return kind(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_storage_key_safe(aor: str) -> bool:
+    """Mirror of ``crate::registrar::is_aor_key_safe``."""
+    return not aor.startswith("state:") and not any(
+        ord(char) < 0x20 or ord(char) == 0x7F for char in aor
+    )
+
+
 class MockRegistrar:
     """Mock registrar with an in-memory contact store.
 
@@ -1309,6 +1391,11 @@ class MockRegistrar:
         # (RFC 3327 §5 / TS 24.229 §5.2.7.2).
         self._tokens: dict[str, str] = {}
         self._on_change_callbacks: list[Callable] = []
+        # The ``registrar:`` limits save() enforces; see configure().
+        self._default_expires: int = _REGISTRAR_DEFAULTS["default_expires"]
+        self._max_expires: int = _REGISTRAR_DEFAULTS["max_expires"]
+        self._min_expires: int = _REGISTRAR_DEFAULTS["min_expires"]
+        self._max_contacts: int = _REGISTRAR_DEFAULTS["max_contacts"]
 
     @staticmethod
     def _normalize_aor(uri: str) -> str:
@@ -1330,6 +1417,48 @@ class MockRegistrar:
     def _resolve_alias(self, aor: str) -> str:
         return self._aliases.get(aor, aor)
 
+    def configure(
+        self,
+        *,
+        default_expires: Optional[int] = None,
+        max_expires: Optional[int] = None,
+        min_expires: Optional[int] = None,
+        max_contacts: Optional[int] = None,
+    ) -> None:
+        """Set the registrar limits :meth:`save` enforces (test helper).
+
+        Mirrors the ``registrar:`` block of ``siphon.yaml``.  A limit not
+        passed keeps its current value.  :func:`reset` (and :meth:`clear`)
+        restore the engine's defaults for a YAML that leaves them out:
+        ``default_expires=3600``, ``max_expires=7200``, ``min_expires=60``,
+        ``max_contacts=10``.
+
+        Args:
+            default_expires: Lifetime granted when the REGISTER asks for none.
+            max_expires: Longest lifetime granted; a longer ask is capped.
+            min_expires: Shortest lifetime accepted; a shorter ask is answered
+                ``423 Interval Too Brief``.
+            max_contacts: Bindings one AoR may hold; a new binding past it is
+                answered ``503 Service Unavailable``.
+
+        Example::
+
+            harness.registrar.configure(max_contacts=1)
+            result = harness.send_request(
+                "REGISTER", "sip:example.com", from_uri="sip:alice@example.com",
+                headers={"Contact": "<sip:alice@192.0.2.11:5060>"},
+            )
+            assert result.status_code == 503
+        """
+        if default_expires is not None:
+            self._default_expires = default_expires
+        if max_expires is not None:
+            self._max_expires = max_expires
+        if min_expires is not None:
+            self._min_expires = min_expires
+        if max_contacts is not None:
+            self._max_contacts = max_contacts
+
     def save(
         self,
         request: Any,
@@ -1337,22 +1466,45 @@ class MockRegistrar:
         aliases: Optional[list[str]] = None,
         flow_token: Optional[str] = None,
     ) -> bool:
-        """Save contact bindings from a REGISTER request and send the 200 OK reply.
+        """Save contact bindings from a REGISTER request and answer it.
 
-        Stores the contact bindings and automatically sends a ``200 OK`` reply
-        to the REGISTER request with the granted ``Expires`` header — the script
-        must **not** call ``request.reply(200, "OK")`` afterwards.
+        Stores the REGISTER's Contacts under the AoR from its ``To`` header
+        and sends the ``200 OK``.  The script must **not** call
+        ``request.reply(200, "OK")`` afterwards.  Each Contact replaces the
+        binding with the same ``+sip.instance`` (RFC 5627), else the one with
+        the same URI, and ``expires=0`` removes it.  Its lifetime is the
+        Contact's ``expires`` parameter, else the ``Expires`` header, else
+        ``default_expires``, capped at ``max_expires``.  ``Contact: *``
+        removes every binding.  Bindings are stamped with
+        :attr:`~siphon_sdk.types.Contact.received` from the request's source
+        address, as the engine does, so ``contact.received or contact.uri``
+        resolves the same way it will there.
 
-        In the mock, extracts the To URI as AoR and stores a default
-        contact binding.  The binding is stamped with
-        :attr:`~siphon_sdk.types.Contact.received` from the request's
-        source address, as the production registrar does — so
-        ``contact.received or contact.uri`` resolves the same way it
-        will on the engine.
+        When the registrar refuses the binding, ``save()`` answers the
+        REGISTER itself and returns ``False``, so the script just returns:
+
+        - ``Expires`` below ``min_expires``: ``423 Interval Too Brief`` with a
+          ``Min-Expires`` header (RFC 3261 §10.3 step 7).
+        - A new binding past ``max_contacts``: ``503 Service Unavailable`` with
+          ``Retry-After`` set to the seconds until the soonest held binding
+          expires (at least 1, at most ``max_expires``, and ``max_expires``
+          when none is held).  503 rather than 403: a UA takes a 403 to its
+          REGISTER as a bad credential and would only re-authenticate.
+        - An AoR that is not a safe storage key: ``404 Not Found``.
+
+        A refused REGISTER stores nothing: none of its Contacts, and with
+        ``force=True`` the existing bindings stay.  No ``@registrar.on_change``
+        handler fires for it.  Set the limits with :meth:`configure`.
+
+        Mock only: a REGISTER with no ``Contact`` header at all binds a
+        synthetic ``sip:<ruri user>@<source ip>:5060`` contact, so fixtures
+        that never modelled a Contact keep registering something.  On the
+        engine such a REGISTER is a query and stores nothing.
 
         Args:
             request: The REGISTER request object.
-            force: If ``True``, evict all existing contacts first.
+            force: If ``True``, replace all existing contacts, once the
+                REGISTER has been accepted.
             aliases: IMS implicit registration set (3GPP TS 23.228) —
                 every URI in the list becomes an alias of this AoR, so
                 subsequent ``registrar.lookup(alias)`` calls resolve to
@@ -1367,7 +1519,9 @@ class MockRegistrar:
                 routing (RFC 3327 §5 / TS 24.229 §5.2.7.2).
 
         Returns:
-            ``True`` on success.
+            ``True`` when the REGISTER was accepted and ``200 OK`` sent;
+            ``False`` when the registrar refused it and the refusal above was
+            sent instead.
 
         Example::
 
@@ -1378,43 +1532,48 @@ class MockRegistrar:
                 # requests come back with it on the topmost Route.
                 token = secrets.token_urlsafe(16)
                 request.add_pcscf_path(token)
-                registrar.save(request, flow_token=token)
+                if not registrar.save(request, flow_token=token):
+                    return          # the refusal is already answered
                 return
         """
         raw_aor = str(request.to_uri) if request.to_uri else str(request.ruri)
         aor = self._resolve_alias(self._normalize_aor(raw_aor))
+        contact_values = _header_values(request, "Contact")
+
+        if contact_values and contact_values[0].strip() == "*":
+            self._drop_bindings(aor)
+            self._fire_on_change(aor, "deregistered")
+            if hasattr(request, "reply"):
+                request.reply(200, "OK")
+            return True
+
+        updates = self._contact_updates(request, contact_values)
+        staged: list[Contact] = []
+        events: list[str] = []
+        refusal: Optional[str] = None
+        if updates:
+            if not _is_storage_key_safe(aor):
+                refusal = "invalid_aor"
+            else:
+                staged = [] if force else list(self._store.get(aor, []))
+                refusal = self._stage(staged, updates, events, request, flow_token)
+        if refusal is not None:
+            self._answer_refusal(request, aor, refusal)
+            return False
+
+        # Accepted: only now does force clear, and the staged list replace the
+        # stored one.
         if force:
-            self._store.pop(aor, None)
-        contacts = self._store.setdefault(aor, [])
-        # Add a default contact from source IP if not already present
-        default_uri = f"sip:{request.ruri.user or 'user'}@{request.source_ip}:5060"
-        already_exists = any(c.uri == default_uri for c in contacts)
-        if not already_exists:
-            contact = Contact(uri=default_uri, received=_received_of(request))
-            if flow_token is not None:
-                contact.flow_token = flow_token
-                # Reconstitute the Flow view from request context.
-                from siphon_sdk.types import Flow as _Flow
-                # Carry the connection id through as well: it is what makes
-                # `contact.flow == call.flow` an RFC 5626 connection-reuse test
-                # rather than an address comparison. A request that already
-                # carries a flow contributes its id, so a test can register and
-                # then call on the same (or a different) connection.
-                inbound = getattr(request, "_flow", None)
-                contact.flow = _Flow(
-                    transport=request.transport,
-                    remote_addr=f"{request.source_ip}:{request.source_port}",
-                    local_addr=getattr(request, "_local_addr", "0.0.0.0:0"),
-                    connection_id=getattr(inbound, "connection_id", 0),
-                )
-            contacts.append(contact)
-            # Index for lookup_by_token.
-            if flow_token is not None:
-                self._tokens[flow_token] = aor
-        # Fire on_change callbacks
-        event_type = "refreshed" if already_exists else "registered"
-        self._fire_on_change(aor, event_type)
-        # Declare the implicit registration set.
+            self._drop_bindings(aor)
+        if updates:
+            if staged:
+                self._store[aor] = staged
+            else:
+                self._store.pop(aor, None)
+        if flow_token is not None and any(c.flow_token == flow_token for c in staged):
+            self._tokens[flow_token] = aor
+        for event in events:
+            self._fire_on_change(aor, event)
         if aliases:
             self.set_associated_uris(aor, list(aliases))
         # Automatically reply 200 OK on behalf of the script — matches the
@@ -1423,6 +1582,142 @@ class MockRegistrar:
         if hasattr(request, "reply"):
             request.reply(200, "OK")
         return True
+
+    def _contact_updates(
+        self, request: Any, contact_values: list[str]
+    ) -> list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]]]]:
+        """``(uri, asked expires, q, +sip.instance, other params)`` per Contact."""
+        expires_header = _header_values(request, "Expires")
+        default_expires = (
+            _as_number(expires_header[0], int, None) if expires_header else None
+        )
+        if default_expires is None:
+            default_expires = self._default_expires
+        if not contact_values:
+            asked = getattr(request, "contact_expires", None)
+            user = getattr(getattr(request, "ruri", None), "user", None) or "user"
+            uri = f"sip:{user}@{request.source_ip}:5060"
+            return [(uri, default_expires if asked is None else asked, 1.0, None, [])]
+        updates = []
+        for value in contact_values:
+            for entry in _split_outside_quotes(value, ","):
+                parsed = _parse_contact(entry)
+                if parsed is None:
+                    continue
+                uri, params = parsed
+                named = dict(params)
+                expires = _as_number(named.get("expires"), int, None)
+                updates.append((
+                    uri,
+                    default_expires if expires is None else expires,
+                    _as_number(named.get("q"), float, 1.0),
+                    named.get("+sip.instance"),
+                    [
+                        (name, param)
+                        for name, param in params
+                        if name not in ("expires", "q", "tag", "+sip.instance", "reg-id")
+                    ],
+                ))
+        return updates
+
+    def _stage(
+        self,
+        staged: list[Contact],
+        updates: list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]]]],
+        events: list[str],
+        request: Any,
+        flow_token: Optional[str],
+    ) -> Optional[str]:
+        """Apply Contacts to ``staged`` in order, as the engine does.
+
+        Returns the refusal reason, or ``None`` when every Contact was
+        accepted.  ``staged`` is a copy; on a refusal the caller drops it.
+        """
+        for uri, asked, q, instance, params in updates:
+            expires = min(asked, self._max_expires)
+            if 0 < expires < self._min_expires:
+                return "interval_too_brief"
+            staged[:] = [held for held in staged if held.expires > 0]
+            if expires == 0:
+                staged[:] = [
+                    held for held in staged
+                    if not (getattr(held, "kind", "ue") == "ue" and held.uri == uri)
+                ]
+                if not any(getattr(held, "kind", "ue") == "ue" for held in staged):
+                    staged.clear()
+                events.append("deregistered")
+                continue
+            binding = Contact(
+                uri=uri,
+                q=q,
+                expires=expires,
+                received=_received_of(request),
+                params=params,
+                _sip_instance=instance,
+            )
+            if flow_token is not None:
+                binding.flow_token = flow_token
+                # Reconstitute the Flow view from request context.
+                from siphon_sdk.types import Flow as _Flow
+                # Carry the connection id through as well: it is what makes
+                # `contact.flow == call.flow` an RFC 5626 connection-reuse test
+                # rather than an address comparison. A request that already
+                # carries a flow contributes its id, so a test can register and
+                # then call on the same (or a different) connection.
+                inbound = getattr(request, "_flow", None)
+                binding.flow = _Flow(
+                    transport=request.transport,
+                    remote_addr=f"{request.source_ip}:{request.source_port}",
+                    local_addr=getattr(request, "_local_addr", "0.0.0.0:0"),
+                    connection_id=getattr(inbound, "connection_id", 0),
+                )
+            index = None
+            if instance is not None:
+                index = next(
+                    (i for i, held in enumerate(staged)
+                     if getattr(held, "_sip_instance", None) == instance),
+                    None,
+                )
+            if index is None:
+                index = next(
+                    (i for i, held in enumerate(staged) if held.uri == uri), None
+                )
+            if index is not None:
+                staged[index] = binding
+                events.append("refreshed")
+            elif len(staged) >= self._max_contacts:
+                return "too_many_contacts"
+            else:
+                staged.append(binding)
+                events.append("registered")
+            staged.sort(key=lambda held: held.q, reverse=True)
+        return None
+
+    def _answer_refusal(self, request: Any, aor: str, reason: str) -> None:
+        """Send the response the engine sends for a refused REGISTER."""
+        header = None
+        if reason == "interval_too_brief":
+            code, phrase = 423, "Interval Too Brief"
+            header = ("Min-Expires", str(self._min_expires))
+        elif reason == "too_many_contacts":
+            code, phrase = 503, "Service Unavailable"
+            ceiling = max(self._max_expires, 1)
+            live = [held.expires for held in self._store.get(aor, []) if held.expires > 0]
+            retry_after = min(max(min(live), 1), ceiling) if live else ceiling
+            header = ("Retry-After", str(retry_after))
+        else:
+            code, phrase = 404, "Not Found"
+        if header is not None and hasattr(request, "set_reply_header"):
+            request.set_reply_header(*header)
+        if hasattr(request, "reply"):
+            request.reply(code, phrase)
+
+    def _drop_bindings(self, aor: str) -> None:
+        """Remove an AoR's bindings and the flow tokens pointing at it."""
+        self._store.pop(aor, None)
+        self._tokens = {
+            token: owner for token, owner in self._tokens.items() if owner != aor
+        }
 
     def save_proxy(
         self,
@@ -2021,12 +2316,15 @@ class MockRegistrar:
         self._store.setdefault(aor, []).append(contact)
 
     def clear(self) -> None:
-        """Remove all registrations (test helper)."""
+        """Remove all registrations and restore the default limits (test helper)."""
         aors = list(self._store.keys())
         self._store.clear()
         self._asserted_identities.clear()
         self._service_routes.clear()
         self._associated_uris.clear()
+        self._aliases.clear()
+        self._tokens.clear()
+        self.configure(**_REGISTRAR_DEFAULTS)
         for aor in aors:
             self._fire_on_change(aor, "deregistered")
 

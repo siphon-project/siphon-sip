@@ -451,6 +451,13 @@ impl PyRequest {
             .push((ReplyHeaderOp::Add, name.to_string(), value));
     }
 
+    /// Queue a single-value reply header (replace semantics) from Rust-side
+    /// callers, e.g. the registrar's `Min-Expires` / `Retry-After` on a refusal.
+    pub fn push_reply_header_replace(&mut self, name: &str, value: String) {
+        self.reply_headers
+            .push((ReplyHeaderOp::Replace, name.to_string(), value));
+    }
+
     /// Take the response body set by `set_reply_body()` (consumed by the dispatcher).
     pub fn take_reply_body(&mut self) -> Option<(Vec<u8>, String)> {
         self.reply_body.take()

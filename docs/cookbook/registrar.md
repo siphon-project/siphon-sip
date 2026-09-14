@@ -73,7 +73,12 @@ def route(request):
 A few things worth knowing:
 
 - **`registrar.save(request)` sends the 200 OK for you** (with the granted Expires,
-  clamped by `max_expires`). You don't reply yourself.
+  clamped by `max_expires`). You don't reply yourself. When the registrar refuses
+  the binding it sends that answer instead and returns `False`: `423` with
+  `Min-Expires` for an `Expires` below `min_expires`, `503` with `Retry-After`
+  for a new binding past `max_contacts`, `404` for an AoR it cannot store.
+  Nothing is stored then, not even with `force=True`, so
+  `if not registrar.save(request): return` is all a script needs.
 - **`request.fork(contacts)`** passes the `Contact` objects (not just `.uri`). That
   matters for two reasons. A binding this node accepted routes over the captured
   inbound flow — the only way to reach a WebSocket UE (RFC 5626 §5.3 connection
