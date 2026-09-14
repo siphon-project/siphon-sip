@@ -303,6 +303,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the carrier is CANCELled and before `@b2bua.on_failure` runs. That is the
   order a carrier failing with a final response already had.
 
+- **A provisional response from a B-leg that already ended no longer reaches the
+  caller.** A 101-199 that arrived on a leg after its INVITE transaction was over
+  was relayed to the caller like any other: from an LCR carrier that had
+  answered `503` while the next carrier was being dialled, from a fork branch
+  that had failed while another still rang, or from a leg siphon had CANCELled
+  once it was no longer kept answerable. Such a response is a straggler,
+  reordered on the way or sent after the leg's own final response (RFC 3261
+  §17.1.1.2), and the caller was shown an early dialog nothing would ever
+  confirm. It also moved an unanswered call to Ringing. It is now dropped before
+  anything reads it: not relayed, no LCR progress recorded, no early media
+  anchored and no `@b2bua.on_early_media`. A provisional on a leg still waiting
+  for its final response is handled as before.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

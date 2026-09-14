@@ -43,8 +43,8 @@ pub(super) fn carrier(carrier_id: &str, address: &str, timeout_secs: u32) -> cra
 
 /// One message siphon put on the wire.
 pub(super) struct Sent {
-    destination: SocketAddr,
-    message: SipMessage,
+    pub(super) destination: SocketAddr,
+    pub(super) message: SipMessage,
 }
 
 impl Sent {
@@ -80,7 +80,7 @@ pub(super) fn invite_to(sent: Vec<Sent>, address: &str) -> SipMessage {
         .unwrap_or_else(|| panic!("no INVITE to {address}, sent: {listed:?}"))
 }
 
-fn top_via_branch(message: &SipMessage) -> String {
+pub(super) fn top_via_branch(message: &SipMessage) -> String {
     let via = message
         .headers
         .get("Via")
@@ -144,6 +144,60 @@ impl Sequence {
         ring_bound_secs: u32,
         script: &str,
     ) -> Sequence {
+        let mut sequence = Sequence::new_call(script);
+        let state = &sequence.dispatcher.state;
+        state.call_actors.start_route_sequence(
+            &sequence.call_id,
+            crate::b2bua::actor::RouteSequenceState {
+                pending: routes.into(),
+                default_timeout: ring_bound_secs,
+                ..Default::default()
+            },
+        );
+        let advance = {
+            let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
+            b2bua_advance_route(&sequence.call_id, &guard, state)
+        };
+        assert!(advance.dialed, "the first carrier was not dialled");
+        sequence.redialled();
+        sequence
+    }
+
+    /// The caller's call forked in parallel to `addresses`, one branch each,
+    /// with no script.
+    pub(super) fn start_fork(addresses: &[&str]) -> Sequence {
+        let mut sequence = Sequence::new_call("");
+        {
+            let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
+            for address in addresses {
+                let target = format!("sip:15550100042@{address}");
+                let next_hop = format!("sip:{address}");
+                let dialled = b2bua_send_b_leg_invite(
+                    &sequence.call_id,
+                    &target,
+                    Some(next_hop.as_str()),
+                    None,
+                    &[],
+                    None,
+                    None,
+                    &guard,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &sequence.dispatcher.state,
+                );
+                assert!(dialled, "the branch to {address} was not dialled");
+            }
+        }
+        sequence.redialled();
+        sequence
+    }
+
+    /// A caller's call through a dispatcher running `script`, with nothing
+    /// dialled yet.
+    fn new_call(script: &str) -> Sequence {
         let dispatcher = test_dispatcher_with_script(script);
         let call_id = dispatcher.state.call_actors.create_call(Leg::new_a_leg(
             "lcr-policy@192.0.2.10".to_string(),
@@ -161,19 +215,6 @@ impl Sequence {
             .state
             .call_actors
             .set_a_leg_invite(&call_id, Arc::clone(&invite));
-        dispatcher.state.call_actors.start_route_sequence(
-            &call_id,
-            crate::b2bua::actor::RouteSequenceState {
-                pending: routes.into(),
-                default_timeout: ring_bound_secs,
-                ..Default::default()
-            },
-        );
-        let advance = {
-            let guard = invite.lock().expect("the A-leg INVITE lock");
-            b2bua_advance_route(&call_id, &guard, &dispatcher.state)
-        };
-        assert!(advance.dialed, "the first carrier was not dialled");
         Sequence {
             dispatcher,
             call_id,
