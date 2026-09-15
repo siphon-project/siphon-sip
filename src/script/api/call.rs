@@ -11,15 +11,7 @@ use pyo3::types::PyDict;
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
 
-/// Per-call session timer override set by Python scripts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionTimerOverride {
-    pub session_expires: u32,
-    pub min_se: u32,
-    /// Who siphon would have refresh each dialog, where the negotiation leaves
-    /// it the choice.
-    pub refresher: crate::config::SessionRefresher,
-}
+pub use super::session_timer::SessionTimerOverride;
 
 /// The action the script chose for this call.
 ///
@@ -1969,16 +1961,9 @@ impl PyCall {
     ///   call.session_timer(expires=1800, min_se=90, refresher="b2bua")
     #[pyo3(signature = (expires=1800, min_se=90, refresher="b2bua"))]
     pub fn session_timer(&mut self, expires: u32, min_se: u32, refresher: &str) -> PyResult<()> {
-        let refresher = crate::config::SessionRefresher::from_name(refresher).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "refresher must be \"uac\", \"uas\" or \"b2bua\", not {refresher:?}"
-            ))
-        })?;
-        self.session_timer_override = Some(SessionTimerOverride {
-            session_expires: expires,
-            min_se,
-            refresher,
-        });
+        self.session_timer_override = Some(SessionTimerOverride::from_script(
+            expires, min_se, refresher,
+        )?);
         Ok(())
     }
 

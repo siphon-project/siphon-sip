@@ -425,38 +425,26 @@ impl PyB2buaControl {
 fn session_timer_from_dict(
     dict: &Bound<'_, pyo3::types::PyDict>,
 ) -> PyResult<crate::script::api::call::SessionTimerOverride> {
-    use pyo3::exceptions::PyValueError;
+    use crate::script::api::call::SessionTimerOverride;
 
-    let mut timer = crate::script::api::call::SessionTimerOverride {
-        session_expires: 1800,
-        min_se: 90,
-        refresher: crate::config::SessionRefresher::B2bua,
-    };
+    let mut expires = SessionTimerOverride::DEFAULT_EXPIRES;
+    let mut min_se = SessionTimerOverride::DEFAULT_MIN_SE;
+    let mut refresher = SessionTimerOverride::DEFAULT_REFRESHER.to_string();
     for (key, value) in dict.iter() {
         let key: String = key.extract()?;
         match key.as_str() {
-            "expires" => timer.session_expires = value.extract()?,
-            "min_se" => timer.min_se = value.extract()?,
-            "refresher" => {
-                let name: String = value.extract()?;
-                timer.refresher =
-                    crate::config::SessionRefresher::from_name(&name.to_ascii_lowercase())
-                        .ok_or_else(|| {
-                            PyValueError::new_err(format!(
-                                "refresher must be \"uac\", \"uas\" or \"b2bua\", not {name:?}"
-                            ))
-                        })?;
-            }
+            "expires" => expires = value.extract()?,
+            "min_se" => min_se = value.extract()?,
+            "refresher" => refresher = value.extract()?,
             other => {
-                let message = format!(
-                    "b2bua.originate session_timer= takes expires, min_se and \
-                     refresher, not {other:?}"
-                );
-                return Err(PyValueError::new_err(message));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "b2bua.originate session_timer= takes expires, min_se and refresher, \
+                     not {other:?}"
+                )));
             }
         }
     }
-    Ok(timer)
+    SessionTimerOverride::from_script(expires, min_se, &refresher)
 }
 
 #[cfg(test)]
