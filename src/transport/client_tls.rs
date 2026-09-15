@@ -112,39 +112,33 @@ pub async fn connect(
 mod tests {
     use super::*;
 
-    /// A self-signed certificate, generated into a temp dir, so the CA-bundle
-    /// paths are exercised against a real PEM rather than a hand-built vector.
+    /// A self-signed CA certificate, generated in process into `directory`, so
+    /// the CA-bundle paths are exercised against a real PEM rather than a
+    /// hand-built vector.
+    ///
+    /// In process rather than through an `openssl` binary: a subprocess per
+    /// test failed to generate under a loaded parallel run, and the test then
+    /// failed for a reason that has nothing to do with root stores.
     fn write_test_ca(directory: &std::path::Path) -> std::path::PathBuf {
+        let key_pair = rcgen::KeyPair::generate().expect("generate the test CA key");
+        let mut params = rcgen::CertificateParams::new(vec!["siphon-client-tls-test".to_string()])
+            .expect("test CA parameters");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let certificate = params
+            .self_signed(&key_pair)
+            .expect("self-sign the test CA");
         let path = directory.join("ca.pem");
-        let status = std::process::Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=siphon-client-tls-test",
-                "-keyout",
-            ])
-            .arg(directory.join("ca.key"))
-            .arg("-out")
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("openssl must be available to generate a test certificate");
-        assert!(status.success(), "openssl failed to generate a certificate");
+        std::fs::write(&path, certificate.pem()).expect("write the test CA");
         path
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!("siphon-client-tls-{name}"));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("temp dir");
-        directory
+    /// A directory of this test's own, removed when it drops.
+    ///
+    /// A fixed name under the system temp dir is shared by every process running
+    /// the test at once, the lib binaries of two checkouts say, and each one's
+    /// cleanup deleted the bundle another was about to read.
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
     }
 
     #[test]
@@ -158,8 +152,8 @@ mod tests {
 
     #[test]
     fn a_ca_path_replaces_the_public_roots_rather_than_extending_them() {
-        let directory = temp_dir("replaces");
-        let ca = write_test_ca(&directory);
+        let directory = temp_dir();
+        let ca = write_test_ca(directory.path());
         let roots = root_store(Some(&ca.to_string_lossy())).expect("custom CA must build");
         assert_eq!(
             roots.len(),
@@ -167,7 +161,6 @@ mod tests {
             "naming a CA must not leave the public roots acceptable too"
         );
         assert!(client_config(Some(&ca.to_string_lossy())).is_ok());
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -182,24 +175,22 @@ mod tests {
 
     #[test]
     fn an_empty_ca_file_is_rejected_rather_than_trusting_nothing() {
-        let directory = temp_dir("empty");
-        let path = directory.join("empty.pem");
+        let directory = temp_dir();
+        let path = directory.path().join("empty.pem");
         std::fs::write(&path, b"").expect("write");
         let error =
             client_config(Some(&path.to_string_lossy())).expect_err("an empty CA bundle must fail");
         assert!(error.to_string().contains("no certificates"), "{error}");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
     fn a_ca_file_that_is_not_pem_is_rejected() {
-        let directory = temp_dir("garbage");
-        let path = directory.join("garbage.pem");
+        let directory = temp_dir();
+        let path = directory.path().join("garbage.pem");
         std::fs::write(&path, b"this is not a certificate").expect("write");
         let error = client_config(Some(&path.to_string_lossy()))
             .expect_err("a non-PEM CA bundle must fail");
         assert!(error.to_string().contains("no certificates"), "{error}");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test]
