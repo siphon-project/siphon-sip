@@ -6,18 +6,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-### Fixed
-
-- **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
-  profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
-  the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own
-  transport (`RTP/SAVPF` with ICE, and DTLS for `wss_to_rtp`) and answered the UE with plain RTP and
-  no ICE, so a plain core refused the offer and a browser could not accept the answer. The offer
-  half now presents plain `RTP/AVP` with ICE removed and RTCP demultiplexed to the core (`dtls: off`
-  for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
-  `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
-  shape matches the DTLS profiles in the WhatsApp calling example.
-
 ## [1.9.0] — 2026-09-15
 
 ### Added
@@ -395,6 +383,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `req.command_name`. Not present in the SDK or the docs.
 
 ### Fixed
+
+- **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
+  profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
+  the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own
+  transport (`RTP/SAVPF` with ICE, and DTLS for `wss_to_rtp`) and answered the UE with plain RTP and
+  no ICE, so a plain core refused the offer and a browser could not accept the answer. The offer
+  half now presents plain `RTP/AVP` with ICE removed and RTCP demultiplexed to the core (`dtls: off`
+  for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
+  `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
+  shape matches the DTLS profiles in the WhatsApp calling example.
 
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
   `auth.require_aka_digest()` can set up IPsec.** Only the HSS path
