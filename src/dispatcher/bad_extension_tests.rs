@@ -132,8 +132,8 @@ async fn unsupported_lists_every_tag_the_call_cannot_honour() {
 }
 
 /// Extensions siphon implements itself never draw a 420, under any preset:
-/// `100rel` (it PRACKs the callee and answers the caller's PRACK), `timer`,
-/// `replaces`, and `sec-agree` on the hop it terminates.
+/// `100rel` (it PRACKs the callee and answers the caller's PRACK), `timer` and
+/// `replaces`. `sec-agree` counts only once verified (`sec_agree_tests`).
 #[tokio::test(flavor = "multi_thread")]
 async fn extensions_siphon_implements_never_draw_420() {
     for policy in [
@@ -144,7 +144,7 @@ async fn extensions_siphon_implements_never_draw_420() {
     ] {
         let sent = place_call(
             &routing_script(&dial_under(policy)),
-            "100rel, Timer, replaces, sec-agree",
+            "100rel, Timer, replaces",
         );
         assert_eq!(
             summaries(&sent),

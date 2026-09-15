@@ -69,18 +69,24 @@ const OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
 /// Option tags for extensions siphon implements on the hop it terminates and
 /// never advertises across a B2BUA: `sec-agree`, the RFC 3329 security agreement
 /// behind 3GPP TS 33.203 IPsec, which a UE requires on every request it sends
-/// over its security association.
+/// over its security association. Honoured only on a call whose agreement siphon
+/// verified when its INVITE arrived
+/// ([`verify_sec_agree`](crate::ipsec::sec_agree::verify_sec_agree)): an
+/// agreement nobody checked is not one siphon keeps.
 const HOP_OPTION_TAGS: &[&str] = &["sec-agree"];
 
 /// Whether siphon implements the extension `tag` names itself, so a caller may
 /// `Require` it of a B2BUA call whatever the header policy: the tags it claims
-/// unconditionally, on the other party's offer, or on its own hop.
-fn implements_option_tag(tag: &str) -> bool {
-    UNCONDITIONAL_OPTION_TAGS
-        .iter()
-        .chain(OFFERED_OPTION_TAGS)
-        .chain(HOP_OPTION_TAGS)
-        .any(|implemented| implemented.eq_ignore_ascii_case(tag))
+/// unconditionally or on the other party's offer, and, on a call whose security
+/// agreement was verified (`sec_agree_verified`), the ones of its own hop.
+fn implements_option_tag(tag: &str, sec_agree_verified: bool) -> bool {
+    let named = |tags: &[&str]| {
+        tags.iter()
+            .any(|implemented| implemented.eq_ignore_ascii_case(tag))
+    };
+    named(UNCONDITIONAL_OPTION_TAGS)
+        || named(OFFERED_OPTION_TAGS)
+        || (sec_agree_verified && named(HOP_OPTION_TAGS))
 }
 
 /// The option tags in `invite`'s `Require` that a B2BUA call routed under
@@ -97,16 +103,21 @@ fn implements_option_tag(tag: &str) -> bool {
 /// rewrites or removes `Require` decides what the caller is held to, and a
 /// `Require` among `script_shaped_headers` reaches the callee whatever the
 /// policy, since script headers are precedence 1.
+///
+/// `sec_agree_verified` is whether the call's security agreement was verified
+/// when its INVITE arrived; `sec-agree` counts as honoured only then.
 pub(super) fn unhonourable_required_tags(
     invite: &SipHeaders,
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
+    sec_agree_verified: bool,
 ) -> Vec<String> {
     let require_crosses =
         crate::b2bua::header_policy::is_script_shaped(script_shaped_headers, "Require")
             || policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
     required_tags_not_honoured(invite, |tag| {
-        implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag))
+        implements_option_tag(tag, sec_agree_verified)
+            || (require_crosses && policy.passes_end_to_end(tag))
     })
 }
 
@@ -115,9 +126,30 @@ pub(super) fn unhonourable_required_tags(
 ///
 /// What a call cannot honour when siphon answers it itself: siphon is then the
 /// only UAS the caller has, so no header policy can hand the extension to a
-/// callee (RFC 3261 §8.2.2.3).
-pub(super) fn unimplemented_required_tags(invite: &SipHeaders) -> Vec<String> {
-    required_tags_not_honoured(invite, implements_option_tag)
+/// callee (RFC 3261 §8.2.2.3). `sec_agree_verified` as for
+/// [`unhonourable_required_tags`].
+pub(super) fn unimplemented_required_tags(
+    invite: &SipHeaders,
+    sec_agree_verified: bool,
+) -> Vec<String> {
+    required_tags_not_honoured(invite, |tag| implements_option_tag(tag, sec_agree_verified))
+}
+
+/// The status and reason phrase that refuse a caller for `unhonoured` required
+/// tags: `494 Security Agreement Required` when `sec-agree` is among them, the
+/// response RFC 3329 §2.3.1 names for an agreement siphon did not verify, and
+/// `420 Bad Extension` otherwise (RFC 3261 §8.2.2.3), which alone carries the
+/// `Unsupported` list.
+pub(super) fn unhonoured_tags_response(unhonoured: &[String]) -> (u16, &'static str) {
+    if unhonoured.iter().any(|tag| {
+        HOP_OPTION_TAGS
+            .iter()
+            .any(|hop| hop.eq_ignore_ascii_case(tag))
+    }) {
+        (494, "Security Agreement Required")
+    } else {
+        (420, "Bad Extension")
+    }
 }
 
 /// The tags in every `Require` line of `invite` for which `honoured` is false,

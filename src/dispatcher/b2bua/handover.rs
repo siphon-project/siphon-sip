@@ -207,12 +207,16 @@ pub fn answer_first_anchor(
     // Checked before anything is anchored: siphon answers this call itself, so
     // a required extension it does not implement is refused `420` (RFC 3261
     // §8.2.2.3) instead of opening media for a call that will not connect.
-    let unsupported = unimplemented_required_tags(&invite.headers);
+    let sec_agree_verified = state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| call.sec_agree_verified);
+    let unsupported = unimplemented_required_tags(&invite.headers, sec_agree_verified);
     if !unsupported.is_empty() {
         let refused = unsupported.join(", ");
         refuse_bad_extension(call_id, invite, unsupported, state);
         return Err(format!(
-            "refused 420 Bad Extension: the caller requires {refused}, which siphon does not implement"
+            "refused: the caller requires {refused}, which siphon does not honour on this call"
         ));
     }
     // Anchored early media already put this leg on the engine and sent its SDP

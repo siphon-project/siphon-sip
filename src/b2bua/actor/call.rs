@@ -353,6 +353,11 @@ pub struct CallActor {
     /// reading it back would falsely conclude the A-leg trunk supports `100rel`,
     /// leaking the reliable provisional to a peer that CANCELs it.
     pub a_leg_supports_100rel: bool,
+    /// Whether the A-leg INVITE required `sec-agree` and siphon verified it
+    /// against the security association it arrived over (RFC 3329 §2.3.1),
+    /// decided at INVITE receipt before the script runs. Only then does a
+    /// required `sec-agree` count as honoured.
+    pub sec_agree_verified: bool,
     /// Number of credentialed outbound INVITEs already sent on the 401/407
     /// auto-retry path for this call. Capped (see `MAX_B2BUA_AUTH_RETRIES` in
     /// the dispatcher): once the cap is hit, a further challenge is treated as a
@@ -525,6 +530,7 @@ impl CallActor {
             teardown_claimed: false,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
+            sec_agree_verified: false,
             auth_retry_count: 0,
             answer_deadline: None,
             answered_at: None,

@@ -9,6 +9,8 @@ pub mod milenage;
 pub mod netlink;
 /// Process-wide access to the running manager/config, used by the datapath.
 pub mod runtime;
+/// RFC 3329 verification of a request received over a security association.
+pub mod sec_agree;
 
 pub mod ue;
 

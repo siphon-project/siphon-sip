@@ -308,6 +308,16 @@ stops it de-registering someone else's IMPU. The S-CSCF takes the header on the
 P-CSCF's word, so only use `verify_integrity_protected` behind a P-CSCF that
 stamps every REGISTER.
 
+When SIPhon terminates the Gm hop as a B2BUA, an INVITE that requires `sec-agree`
+(in `Require` or `Proxy-Require`) is checked before your script runs, per RFC 3329
+§2.3.1. It is answered `494 Security Agreement Required` unless it arrived on a
+protected port over an active SA and its `Security-Verify` names that SA: the
+`ipsec-3gpp` algorithms, SPIs and protected ports your `Security-Server` was built
+from. The 494 carries that SA's `Security-Server`. The agreement ends at SIPhon: the
+B-leg INVITE carries no `sec-agree` in `Require` or `Proxy-Require` and no
+`Security-Verify` or `Security-Client`, unless your script sets them for an agreement
+of the B-leg's own.
+
 ## Checklist
 
 - [ ] `security.failed_auth_ban` + `scanner_block` on, infra in `trusted_cidrs`

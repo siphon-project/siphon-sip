@@ -113,6 +113,8 @@ mod script_header_precedence_tests;
 #[cfg(test)]
 mod sdp_strip_tests;
 #[cfg(test)]
+mod sec_agree_tests;
+#[cfg(test)]
 mod session_refresh_tests;
 #[cfg(test)]
 mod session_timer_legs_tests;

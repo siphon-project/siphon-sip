@@ -437,6 +437,14 @@ pub fn b2bua_send_b_leg_invite(
         // for a leg where nothing implements them. Settled right after the
         // policy, so the per-carrier headers below still land last.
         advertise_b_leg_capabilities(&mut b_leg_invite.headers, &script_shaped_headers, &policy);
+
+        // The caller's security agreement belongs to its hop with siphon (RFC
+        // 3329 §2.3.1): `sec-agree` leaves Require and Proxy-Require, and the
+        // caller's Security-Verify and Security-Client stay behind. What a script
+        // set for an agreement of the B-leg's own goes out as written.
+        crate::ipsec::sec_agree::strip_sec_agree(&mut b_leg_invite.headers, |name| {
+            crate::b2bua::header_policy::is_script_shaped(&script_shaped_headers, name)
+        });
     }
 
     // Per-carrier (LCR) presented CLI: substitute the calling number before the
