@@ -144,7 +144,6 @@ pub fn forward_transfer_response(
             } else {
                 None
             },
-            snapshot.a_leg_supports_100rel,
             call_id,
         );
 

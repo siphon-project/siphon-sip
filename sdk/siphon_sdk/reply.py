@@ -219,8 +219,10 @@ class Reply:
         header policy neither strips nor rewrites it, and siphon's own
         ``Supported`` / ``Allow`` do not replace it (``replaces`` is still
         merged into ``Supported``). siphon keeps its own ``Contact``, drops the
-        callee's ``Record-Route``, and removes ``Require: 100rel`` / ``RSeq``
-        toward a caller that never advertised ``100rel``.
+        callee's ``Record-Route``, and decides a provisional's reliability
+        itself: ``RSeq`` and the ``100rel`` tag in ``Require`` are siphon's own
+        toward the caller (RFC 3262), so a value set for either here does not
+        reach it.
         """
         self._headers[name] = value
 

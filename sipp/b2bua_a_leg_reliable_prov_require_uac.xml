@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA reliable provisionals toward the caller: an A-leg that REQUIRES 100rel.
+
+  INVITE (Require: 100rel) -> 100 -> reliable 180 -> PRACK -> 200 PRACK ->
+  reliable 183 -> PRACK -> 200 PRACK -> 200 INVITE -> ACK -> BYE -> 200
+
+  The callee (b2bua_a_leg_reliable_prov_uas.xml) sends an unreliable 180 and
+  then a reliable 183 with SDP and RSeq 42, and answers as soon as siphon has
+  PRACKed that 183 on the B-leg. siphon is this caller's UAS, so RFC 3262 §3
+  decides what arrives here:
+
+  - the 180 is reliable although the callee sent it unreliably, because the
+    caller required 100rel;
+  - the 183 does not arrive before the 180 is PRACKed (no second reliable
+    provisional until the first is acknowledged), and its RSeq is siphon's,
+    not the callee's 42;
+  - the 200 for the INVITE does not arrive before the 183 is PRACKed, because
+    that 183 carried SDP. The pause before the second PRACK gives an early 2xx
+    time to arrive, where it would fail the call as an unexpected message.
+
+  The PRACK responses are told apart from the INVITE's by CSeq.
+-->
+<scenario name="B2BUA reliable provisionals toward a caller that requires 100rel">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Supported: timer
+Require: 100rel
+User-Agent: SIPp/b2bua-100rel-required
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The callee's unreliable 180 arrives reliably. -->
+  <recv response="180" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
+            check_it="true" assign_to="junk,rseq_ringing" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+PRACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 PRACK
+RAck: [$rseq_ringing] 1 INVITE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="PRACK" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- Only now the 183: reliable, and numbered by siphon rather than the
+       callee (check_it_inverse fails the call on RSeq 42). -->
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
+            check_it="true" assign_to="junk,rseq_progress" />
+      <ereg regexp="^[[:space:]]*42[[:space:]]*$" search_in="hdr" header="RSeq:"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- The callee has already answered. A 2xx that did not wait for this PRACK
+       arrives during the pause and fails the call. -->
+  <pause milliseconds="300" />
+
+  <send retrans="500">
+    <![CDATA[
+PRACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 PRACK
+RAck: [$rseq_progress] 1 INVITE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="PRACK" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="INVITE" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 4 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

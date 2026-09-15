@@ -570,6 +570,11 @@ class Call:
         ``420 Bad Extension`` with ``Unsupported`` instead, whatever the
         header policy, and the call ends (RFC 3261 §8.2.2.3).
 
+        When a reliable provisional that carried SDP (a ``progress()`` 183 to a
+        caller that requires ``100rel``) has not been PRACKed yet, the 2xx waits
+        for the caller's PRACK and goes out right after siphon's 200 for it
+        (RFC 3262 §3).
+
         Args:
             code: Final 2xx status code (200, 202, etc.).
             reason: Reason phrase.
@@ -607,6 +612,11 @@ class Call:
         **immediately** (e.g. ``183 Session Progress`` with early-media SDP, or
         ``180 Ringing``). Does not answer the call: the handler must still
         ``answer()`` / ``dial()`` / ``reject()`` for a final response.
+
+        To a caller that sent ``Require: 100rel`` a 101-199 goes out reliably
+        (RFC 3262 §3): siphon adds ``Require: 100rel`` and its own ``RSeq``,
+        retransmits it until the caller's PRACK, answers that PRACK itself, and
+        sends a later provisional only after it.
 
         Args:
             code: Provisional status code (must be 1xx; 100 carries no To-tag).
@@ -767,7 +777,7 @@ class Call:
                 ``"transparent-b2bua@2026"``).  Built-in presets:
                 ``"transparent-b2bua@2026"`` (today's behaviour),
                 ``"ims-intra-trust-domain@2026"`` (intra-trust IMS,
-                passes P-* and end-to-end PRACK / preconditions),
+                passes P-* and end-to-end preconditions),
                 ``"ims-trust-domain-boundary@2026"`` (BGCF/IBCF/P-CSCF
                 edge, strict trust-boundary hygiene),
                 ``"sip-trunk-edge@2026"`` (plain SIP trunk).  An

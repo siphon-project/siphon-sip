@@ -66,11 +66,12 @@ pub fn b_leg_answered(
         }
         cdr_stamp_route_attempts(state, call_id);
 
-        // Charging is NOT reported here. Both emissions below moved to after
-        // @b2bua.on_answer, because the handler is where the media backend is
-        // driven and so where a call that can never carry audio is found out:
-        // reporting the answer first billed a call siphon was about to fail.
-        // See the failure gate under the handler block.
+        // Charging is NOT reported here, but once the caller's 2xx is on the
+        // wire (`answer_a_leg`). @b2bua.on_answer is where the media backend is
+        // driven and so where a call that can never carry audio is found out
+        // (see the failure gate under the handler block), and the caller's 2xx
+        // can still wait for a PRACK that never comes (RFC 3262 §3): reporting
+        // the answer first billed a call siphon was about to fail.
 
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
         let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
@@ -210,32 +211,6 @@ pub fn b_leg_answered(
             return;
         }
 
-        // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
-        // Fire-and-forget per TS 32.299 §6.5.
-        //
-        // Reported here, after the gate above, rather than on arrival of the
-        // 2xx: an answer siphon is about to turn into a failure is not an
-        // answer, and a CDF/OCS that was told otherwise had no later record
-        // correcting it.
-        if let Some(invite_arc) = &snapshot.a_leg_invite {
-            spawn_rf_b2bua_start(state, call_id, invite_arc);
-        }
-        // Ro is not *started* here — prepaid reserve-before-connect means the
-        // CCR-INITIAL already fired in `@b2bua.on_invite` via
-        // `call.ro_authorize()`, before the B-leg was dialed, and the re-auth
-        // loop it armed keeps running. But the answer is what starts the
-        // chargeable clock (TS 32.260 §5), so report it: a CCR-UPDATE carrying
-        // Time-Stamps tells the OCS when charging actually began, and under
-        // `ro.charge_from: answer` it is also what stops ring time being billed.
-        spawn_ro_b2bua_answer(state, call_id);
-
-        // Resolve SRS URI from config when li.record() was called
-        let li_srs_uri = if snapshot.li_record {
-            state.li_siprec_srs_uri.as_deref()
-        } else {
-            None
-        };
-
         // Extract the (possibly SDP-modified) response and forward to A-leg
         let mut response = match Arc::try_unwrap(response_arc) {
             Ok(mutex) => mutex
@@ -265,52 +240,20 @@ pub fn b_leg_answered(
         // dialog, and that does not wait on the caller's ACK for the A-leg's.
         ack_b_leg_2xx(call_id, message, state, snapshot);
 
-        // Extract SDP body before forwarding (needed for SIPREC)
-        let sdp_body = response.body.clone();
-
-        // Clone the sanitized 2xx before it is moved into send_message so the
-        // A-leg retransmit is byte-identical (RFC 3261 §13.3.1.4).
-        let retransmit_2xx = response.clone();
-
-        // Pin the reply egress socket to the listener the A-leg INVITE arrived on
-        // (`snapshot.a_leg_local_addr`) so a multi-homed UDP host answers on the same port
-        // it received on — a peer doing symmetric signalling drops a 2xx sourced
-        // from a different local port. No-op for TCP/TLS/WS/WSS (routed by the
-        // accepted connection) and for a single-listener host (`udp_by_local` empty).
-        send_message_from(
-            response,
-            snapshot.a_leg.transport.transport,
-            snapshot.a_leg.transport.remote_addr,
-            snapshot.a_leg.transport.connection_id,
-            snapshot.a_leg_local_addr,
-            state,
-        );
-
-        // Arm A-leg 2xx retransmission — the B2BUA has no IST for the A-leg, so
-        // nothing else recovers a lost 200. Cancelled by the caller's ACK in the
-        // A-leg ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
-        // block below so its early returns can't skip it.
-        arm_b2bua_2xx_retransmit(
+        // The caller's 2xx, and what follows it (retransmissions, charging, a
+        // deferred `call.refer()`, SIPREC). It waits for the PRACK of a reliable
+        // provisional with SDP still unacknowledged (RFC 3262 §3) and then
+        // follows that PRACK's 200; its retransmission, and with it the 64*T1
+        // unACKed sweep and the §15 BYE hold, starts only when it is sent.
+        answer_a_leg(
             call_id,
-            retransmit_2xx,
-            snapshot.a_leg.transport.transport,
-            snapshot.a_leg.transport.remote_addr,
-            snapshot.a_leg.transport.connection_id,
-            snapshot.a_leg_local_addr,
+            crate::b2bua::actor::HeldAnswer {
+                response,
+                relayed: true,
+                deferred_refer: deferred_outbound_refer.take(),
+            },
             state,
         );
-
-        // A `call.refer()` deferred from @b2bua.on_answer, now that the answer
-        // it depends on is on the wire. Emitting it up where the handler ran
-        // sent it ahead of the 2xx, so the caller saw an in-dialog REFER for a
-        // dialog it had not yet confirmed. Still before the SIPREC block, whose
-        // early returns would otherwise skip it.
-        if let Some(refer_to) = deferred_outbound_refer.take() {
-            b2bua_send_outbound_refer(state, call_id, /*on_a_leg=*/ true, &refer_to);
-        }
-
-        // SIPREC: start recording if configured for this call
-        start_li_recording(call_id, state, snapshot, li_srs_uri, &sdp_body);
     } // end 2xx guard
 }
 
@@ -713,7 +656,6 @@ pub fn prepare_a_leg_answer(
         state,
         snapshot.a_leg.transport.transport,
         snapshot.a_leg_local_addr,
-        snapshot.a_leg_supports_100rel,
         call_id,
         script_shaped_headers,
     );

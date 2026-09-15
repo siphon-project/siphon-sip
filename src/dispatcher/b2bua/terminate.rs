@@ -343,6 +343,9 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
         &reply_headers,
     );
     drop(invite);
+    // The caller's final response: siphon's reliable provisionals to it stop
+    // (RFC 3262 §3).
+    end_a_leg_reliability(internal_call_id, state);
     send_message_from(
         response,
         transport,

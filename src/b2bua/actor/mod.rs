@@ -31,6 +31,7 @@ mod call;
 mod helpers;
 mod leg;
 mod leg_actor;
+mod reliable;
 mod store;
 
 #[cfg(test)]
@@ -43,6 +44,7 @@ pub use call::*;
 pub use helpers::*;
 pub use leg::*;
 pub use leg_actor::*;
+pub use reliable::*;
 pub use store::*;
 
 // ---------------------------------------------------------------------------

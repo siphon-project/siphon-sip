@@ -115,6 +115,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // not poison the gate that decides whether to strip `Require:100rel`/`RSeq`
     // from provisionals relayed back to this A-leg.  See CallActor.a_leg_supports_100rel.
     let a_leg_supports_100rel = crate::sip::headers::rseq::supports_100rel(&message.headers);
+    let a_leg_requires_100rel = crate::sip::headers::rseq::requires_100rel(&message.headers);
 
     // Guard against INVITE retransmissions: if we already have a call for this
     // SIP Call-ID, this is a retransmission — absorb it silently.
@@ -471,6 +472,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         // call's life) so the reliable-1xx strip gate can't be defeated by the
         // script mutating the shared INVITE for B-leg header shaping.
         call.a_leg_supports_100rel = a_leg_supports_100rel;
+        call.a_leg_requires_100rel = a_leg_requires_100rel;
         // Decided before the script ran, by the RFC 3329 check above.
         call.sec_agree_verified = sec_agree_verified;
         // Listener the INVITE arrived on, so an imperative call.answer() /

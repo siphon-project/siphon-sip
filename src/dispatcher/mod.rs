@@ -77,6 +77,8 @@ mod tasks;
 mod timers;
 
 #[cfg(test)]
+mod a_leg_reliable_provisional_tests;
+#[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;

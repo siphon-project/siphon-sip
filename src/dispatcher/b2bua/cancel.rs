@@ -49,7 +49,12 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
 
     // Only cancel if call is still in Calling or Ringing state
     if call.state != CallState::Calling && call.state != CallState::Ringing {
-        debug!(call_id = %call_id, state = ?call.state, "B2BUA CANCEL: call already answered/terminated");
+        // Unless the callee answered and the caller's 2xx is still held for a
+        // PRACK (RFC 3262 §3): the caller has had no final response, so its
+        // CANCEL still ends the call (RFC 3261 §9.2). The teardown sends the
+        // caller its 487 and the callee, which answered, a BYE.
+        let answer_held = call.a_leg_reliability.holds_answer();
+        drop(call);
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
         send_message_from(
             response,
@@ -59,7 +64,19 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
             Some(inbound.local_addr),
             state,
         );
-        drop(call);
+        if answer_held {
+            info!(call_id = %call_id, "B2BUA CANCEL: the caller's 2xx was still held for its PRACK — ending the call");
+            // The answer never reached the caller, so it does not stand.
+            cdr_clear_b2bua_answer(state, &call_id);
+            b2bua_terminate_call_inner(
+                &call_id,
+                Some("SIP;cause=487;text=\"Request Terminated\""),
+                "caller",
+                state,
+            );
+        } else {
+            debug!(call_id = %call_id, "B2BUA CANCEL: call already answered/terminated");
+        }
         return;
     }
 
@@ -136,6 +153,11 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     for handle in call.b_leg_handles.iter().flatten() {
         let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
+
+    // RFC 3262 §3: the 487 below is the caller's final response, so siphon's
+    // reliable provisionals to it stop being retransmitted. No 2xx is held for a
+    // PRACK here: holding one leaves the call answered, which returned above.
+    let _ = call.a_leg_reliability.finish();
 
     // Send 487 Request Terminated to A-leg for the original INVITE.
     // Capture the stored A-leg INVITE + source before dropping the call ref so

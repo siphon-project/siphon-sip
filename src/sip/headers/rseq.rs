@@ -193,6 +193,33 @@ pub fn strip_100rel_for_unsupported_peer(
     changed
 }
 
+/// Make a provisional reliable with `rseq`, or not reliable at all with `None`.
+///
+/// Whatever reliability the response carried is removed first: its `RSeq` and
+/// the `100rel` tag in `Require`, the header dropped when no tag is left. With
+/// `Some(rseq)`, `100rel` is then added to `Require` (after the tags already
+/// there) and `RSeq` set, the pair RFC 3262 §3 puts on a reliable provisional.
+/// A B2BUA calls this with its own numbering on the leg it sends on: the
+/// reliability a response arrived with belongs to the other leg.
+pub fn set_reliability(headers: &mut super::SipHeaders, rseq: Option<u32>) {
+    strip_100rel_for_unsupported_peer(headers, false);
+    let Some(rseq) = rseq else {
+        return;
+    };
+    let require = match headers.get_all("Require").cloned() {
+        Some(values) if !values.is_empty() => format!("{}, 100rel", values.join(", ")),
+        _ => "100rel".to_string(),
+    };
+    headers.set("Require", require);
+    headers.set(
+        "RSeq",
+        RSeq {
+            response_number: rseq,
+        }
+        .to_header_value(),
+    );
+}
+
 /// Extract `RSeq` from SIP headers.
 pub fn parse_rseq(headers: &super::SipHeaders) -> Option<RSeq> {
     headers.get("RSeq").and_then(|v| RSeq::parse(v))

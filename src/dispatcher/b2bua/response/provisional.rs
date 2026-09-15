@@ -67,6 +67,11 @@ pub fn b_leg_provisional(
                 "LCR: carrier in flight showed progress");
         }
 
+        // Whether the callee sent this provisional reliably (RFC 3262 §3), read
+        // off the wire before a script or the sanitizing below touches it.
+        let callee_sent_reliably = crate::sip::headers::rseq::requires_100rel(&message.headers)
+            && crate::sip::headers::rseq::parse_rseq(&message.headers).is_some();
+
         // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
         // This lets scripts process early media through RTPEngine before forwarding.
         let has_sdp_body = !message.body.is_empty();
@@ -175,7 +180,6 @@ pub fn b_leg_provisional(
             state,
             snapshot.a_leg.transport.transport,
             snapshot.a_leg_local_addr,
-            snapshot.a_leg_supports_100rel,
             call_id,
             &reply_shaped_headers,
         );
@@ -193,16 +197,8 @@ pub fn b_leg_provisional(
                 .call_actors
                 .set_b_leg_early_answer(call_id, index, sdp);
         }
-        // Pin the reply egress socket to the A-leg INVITE's arrival listener
-        // (`snapshot.a_leg_local_addr`) so a multi-homed UDP host answers on the port it
-        // received on. No-op for stream transports and single-listener hosts.
-        send_message_from(
-            message.clone(),
-            snapshot.a_leg.transport.transport,
-            snapshot.a_leg.transport.remote_addr,
-            snapshot.a_leg.transport.connection_id,
-            snapshot.a_leg_local_addr,
-            state,
-        );
+        // To the caller: reliably on siphon's own numbering when it asked for
+        // that (RFC 3262 §3), after the PRACK of a reliable one before it.
+        send_a_leg_provisional(call_id, message.clone(), callee_sent_reliably, state);
     }
 }

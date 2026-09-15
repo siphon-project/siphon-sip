@@ -185,7 +185,6 @@ pub fn forward_reinvite_response(
                 } else {
                     None
                 },
-                snapshot.a_leg_supports_100rel,
                 call_id,
             );
         }

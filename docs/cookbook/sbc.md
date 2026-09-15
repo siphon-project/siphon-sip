@@ -89,7 +89,7 @@ cross the boundary.
 | Preset | Use at | Behaviour |
 |---|---|---|
 | `transparent-b2bua@2026` | general SBC (default) | today's strip set; behaviour-equivalent to pre-policy SIPhon |
-| `ims-intra-trust-domain@2026` | S-CSCF ↔ AS | passes `P-*` headers + end-to-end PRACK / preconditions |
+| `ims-intra-trust-domain@2026` | S-CSCF ↔ AS | passes `P-*` headers + end-to-end preconditions |
 | `ims-trust-domain-boundary@2026` | P-CSCF / IBCF / BGCF edge | strict trust-boundary hygiene |
 | `sip-trunk-edge@2026` | plain SIP trunk | strips `P-*` / `X-*` |
 
@@ -190,16 +190,46 @@ Responses work the same way. What a script does to a B-leg response in
 `@b2bua.on_answer` or `@b2bua.on_early_media` with `reply.set_header()` /
 `reply.remove_header()` / `reply.remove_headers_matching()` reaches the caller as the
 script left it, over the response policy and SIPhon's own `Supported` / `Allow`.
-SIPhon still sets the caller's `Contact`, drops the callee's `Record-Route`, removes
-`Require: 100rel` and `RSeq` toward a caller that never advertised `100rel`, adds its
-`Supported: timer` / `Session-Expires` when absent while it runs the session timer,
-merges `replaces` into `Supported`, and rewrites the SDP origin.
+SIPhon still sets the caller's `Contact`, drops the callee's `Record-Route`, decides a
+provisional's reliability itself (`RSeq` and the `100rel` tag in `Require`, see
+below), adds its `Supported: timer` / `Session-Expires` when absent while it runs the
+session timer, merges `replaces` into `Supported`, and rewrites the SDP origin.
 
 !!! note "One intentional change from pre-policy SIPhon"
     Every preset strips `Proxy-Authenticate` on B→A responses. RFC 3261 §22.3 makes
     it hop-by-hop, so passing it through would point the A-leg's
     `Proxy-Authorization` at the wrong realm. Opt back in with
     `copy=["Proxy-Authenticate"]` if you really want the old transparent behaviour.
+
+### Reliable provisionals toward the caller
+
+SIPhon PRACKs the callee's reliable provisionals itself on the B-leg, and it is the
+caller's UAS on the A-leg, so RFC 3262 on each leg is SIPhon's, under every preset:
+
+- A provisional reaches the caller reliably when the caller sent `Require: 100rel`,
+  or sent `Supported: 100rel` and the callee sent that provisional reliably. It
+  carries `Require: 100rel` and SIPhon's own `RSeq`, one more per provisional on the
+  caller's dialog. The callee's `RSeq` never reaches the caller.
+- It is retransmitted (T1 doubling) until the caller's PRACK, and the next reliable
+  provisional waits for that PRACK.
+- SIPhon answers the PRACK: `200` when its `RAck` names a provisional SIPhon sent on
+  that dialog (again for a retransmission, and after the final response), `481`
+  otherwise. A PRACK is never relayed and its body is not bridged; an early offer
+  goes in an `UPDATE`, which is.
+- A 2xx waits for the PRACK of a reliable provisional that carried SDP, and follows
+  that PRACK's `200`. Only then is it retransmitted until the caller's ACK, with the
+  64×T1 no-ACK teardown and the BYE held for the ACK that every 2xx gets. A call
+  that ends while the 2xx waits (a BYE from the callee, a CANCEL from the caller, a
+  timer) gives the caller `487 Request Terminated`, never a BYE, and the callee a
+  BYE. A final response stops the retransmissions.
+- A caller that leaves a reliable provisional unacknowledged for 32 s (64×T1) is
+  refused `500`. The callee is CANCELled, or BYEd if its 2xx was the one waiting.
+  `@b2bua.on_failure` does not run: routing elsewhere cannot make the caller PRACK.
+  A call already being torn down some other way is left to that teardown.
+
+`call.progress()` and `call.answer()` follow the same rules. `RSeq` and the `100rel`
+tag are SIPhon's alone: a `reply.set_header()` of either in `@b2bua.on_early_media`
+does not reach the caller.
 
 ### `Supported` and `Allow` on both legs
 

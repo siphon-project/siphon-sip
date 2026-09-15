@@ -154,18 +154,19 @@ pub fn build_owned_leg_ack(
         .ok()
 }
 
-/// Arm the RFC 3262 §3 retransmit task for a reliable provisional response.
-///
-/// Stores a [`ReliableProvisional`] entry in the dispatcher state under
-/// `(Call-ID, RSeq)` and spawns a background task that resends `response`
-/// every interval (T1 = 500 ms doubling up to T2 = 4 s, max 64×T1 = 32 s).
-/// The task watches the entry's [`tokio::sync::Notify`] and exits as soon
-/// as the inbound-PRACK handler signals a match — see the proxy PRACK
-/// short-circuit in [`run`].
-///
-/// The transport-layer write goes through `state.outbound`, the same channel
-/// the dispatcher uses, so retransmits look identical to the original send, and
-/// each copy is captured to HEP as the original was ([`TaskCapture`]).
+/// Where a reliable provisional's retransmissions go: the same transport, peer,
+/// connection and local socket as the first send, so they look identical to it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReliableProvisionalRoute {
+    pub transport: Transport,
+    pub destination: SocketAddr,
+    pub connection_id: ConnectionId,
+    pub source_local_addr: Option<SocketAddr>,
+}
+
+/// Arm the RFC 3262 §3 retransmit task for a reliable provisional a script sent
+/// with `reply(reliable=True)`, back to where `request` came from. See
+/// [`arm_reliable_provisional_retransmit_on`].
 pub fn arm_reliable_provisional_retransmit(
     rseq: u32,
     request: &SipMessage,
@@ -180,24 +181,62 @@ pub fn arm_reliable_provisional_retransmit(
         .and_then(|c| c.split_whitespace().next())
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(1);
+    let route = ReliableProvisionalRoute {
+        transport: inbound.transport,
+        destination: inbound.remote_addr,
+        connection_id: inbound.connection_id,
+        // Retransmit the reliable 1xx on the same listener the request arrived on
+        // so a multi-homed UDP host keeps a consistent source port (matches the
+        // initial send).
+        source_local_addr: Some(inbound.local_addr),
+    };
+    arm_reliable_provisional_retransmit_on(
+        call_id,
+        rseq,
+        cseq_num,
+        response,
+        route,
+        Arc::new(tokio::sync::Notify::new()),
+        state,
+    );
+}
+
+/// Arm the RFC 3262 §3 retransmit task for a reliable provisional response.
+///
+/// Stores a [`ReliableProvisional`] entry in the dispatcher state under
+/// `(call_id, rseq)` and spawns a background task that resends `response` along
+/// `route` (T1 = 500 ms doubling up to T2 = 4 s) until a matching PRACK notifies
+/// the entry's `cancel`, giving up after 64×T1 = 32 s. `stop` ends the
+/// retransmissions early, once a final response has gone to the peer (RFC 3262
+/// §3: the UAS "SHOULD NOT continue to retransmit"); the entry then stays until
+/// 64×T1 has passed, because the UAS "MUST be prepared to process PRACK requests
+/// for those outstanding responses".
+///
+/// The transport-layer write goes through `state.outbound`, the same channel
+/// the dispatcher uses, so retransmits look identical to the original send, and
+/// each copy is captured to HEP as the original was ([`TaskCapture`]).
+pub fn arm_reliable_provisional_retransmit_on(
+    call_id: String,
+    rseq: u32,
+    cseq_num: u32,
+    response: SipMessage,
+    route: ReliableProvisionalRoute,
+    stop: Arc<tokio::sync::Notify>,
+    state: &DispatcherState,
+) {
     let entry = Arc::new(ReliableProvisional {
         cancel: tokio::sync::Notify::new(),
+        stop,
         cseq_num,
     });
+    let key = (call_id, rseq);
     state
         .reliable_provisionals
-        .insert((call_id.clone(), rseq), Arc::clone(&entry));
+        .insert(key.clone(), Arc::clone(&entry));
 
     let store = Arc::clone(&state.reliable_provisionals);
     let outbound = Arc::clone(&state.outbound);
-    let destination = inbound.remote_addr;
-    let transport = inbound.transport;
-    let connection_id = inbound.connection_id;
-    // Retransmit the reliable 1xx on the same listener the request arrived on so a
-    // multi-homed UDP host keeps a consistent source port (matches the initial send).
-    let source_local_addr = Some(inbound.local_addr);
-    let capture = TaskCapture::for_task(state, transport, source_local_addr);
-    let key = (call_id.clone(), rseq);
+    let capture = TaskCapture::for_task(state, route.transport, route.source_local_addr);
 
     tokio::spawn(async move {
         // RFC 3262 §3 timing: start at T1 = 500 ms, double on each retransmit
@@ -212,34 +251,44 @@ pub fn arm_reliable_provisional_retransmit(
             let sleep = tokio::time::sleep(interval);
             tokio::pin!(sleep);
             tokio::select! {
-                _ = entry.cancel.notified() => break,
+                _ = entry.cancel.notified() => return,
+                _ = entry.stop.notified() => break,
                 _ = &mut sleep => {
                     if tokio::time::Instant::now() >= deadline {
                         warn!(
                             call_id = %key.0, rseq = key.1,
                             "RFC 3262: no PRACK after 32s — giving up reliable 1xx retransmits"
                         );
-                        store.remove(&key);
-                        break;
+                        store.remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
+                        return;
                     }
                     debug!(
                         call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
                         "retransmitting reliable 1xx (RFC 3262)"
                     );
                     if let Some(capture) = &capture {
-                        capture.capture(destination, transport, &bytes);
+                        capture.capture(route.destination, route.transport, &bytes);
                     }
                     let _ = outbound.send(OutboundMessage {
                         followups: None,
-                        connection_id,
-                        transport,
-                        destination,
+                        connection_id: route.connection_id,
+                        transport: route.transport,
+                        destination: route.destination,
                         data: bytes.clone(),
-                        source_local_addr,
+                        source_local_addr: route.source_local_addr,
                         server_name: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
+            }
+        }
+
+        // A final response went to the peer: no more retransmissions, but a
+        // PRACK for this provisional is still matched until 64×T1 has passed.
+        tokio::select! {
+            _ = entry.cancel.notified() => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                store.remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
             }
         }
     });
@@ -413,33 +462,6 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
         );
         b2bua_unacked_answer_terminate(&unacked.internal_call_id, state);
     }
-}
-
-/// Handle an A-leg PRACK in a B2BUA call (RFC 3262).
-///
-/// The B2BUA strips Require/RSeq from forwarded reliable provisionals (see
-/// sanitize_b2bua_response) so a well-behaved A-leg never sends PRACK in
-/// the first place. This handler exists for A-legs that PRACK anyway —
-/// either because the original INVITE carried Require: 100rel, or because
-/// the UAC is configured to PRACK whenever it sent Supported: 100rel. The
-/// B-leg side is already PRACKed locally by the auto-PRACK path in the
-/// response handler, so all that's left is to terminate the A-leg PRACK
-/// transaction with 200 OK.
-pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
-    let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-    debug!(
-        call_id = %message.headers.get("Call-ID").map(|s| s.as_str()).unwrap_or(""),
-        "B2BUA: auto-200 OK for A-leg PRACK",
-    );
-    // Answer the PRACK on its arrival socket (multi-homed UDP source-port parity).
-    send_message_from(
-        response,
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
 }
 
 /// Handle a mid-dialog re-INVITE for a B2BUA call.

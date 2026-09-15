@@ -846,9 +846,11 @@ fn transparent_b2bua_2026() -> Preset {
 }
 
 /// S-CSCF ↔ AS, intra-trust IMS hop.  P-* flows through (RFC 3325 trust
-/// domain).  Capability headers (`Allow`/`Supported`/`Require`/`RSeq`) flow
-/// end-to-end so PRACK (RFC 3262 §6) and IMS preconditions (RFC 3312 / 4032)
-/// negotiate correctly across the hop.  `X-*` stripped defensively.
+/// domain).  `Supported` and `Require` flow end-to-end so IMS preconditions
+/// (RFC 3312 / 4032) negotiate across the hop.  The reliability of a
+/// provisional (`RSeq`, `100rel`) is per leg whatever this copies: siphon PRACKs
+/// the callee itself and numbers its own reliable provisionals toward the
+/// caller (RFC 3262 §3).  `X-*` stripped defensively.
 fn ims_intra_trust_domain_2026() -> Preset {
     Preset {
         name: "ims-intra-trust-domain".to_string(),
