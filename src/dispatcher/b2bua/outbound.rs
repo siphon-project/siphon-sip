@@ -29,6 +29,20 @@ pub fn send_b2bua_to_bleg(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
+    send_b2bua_to_bleg_checked(message, transport, destination, source_local_addr, state);
+}
+
+/// [`send_b2bua_to_bleg`], returning whether the transport took the message. One it
+/// refused (the outbound channel is gone, a pool connection failed) is not on its
+/// way, so the retransmit schedule armed for it is disarmed again, and a caller
+/// that registered something for its response takes that back.
+pub fn send_b2bua_to_bleg_checked(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) -> bool {
     let data = Bytes::from(message.to_bytes());
     let target = RelayTarget {
         address: destination,
@@ -50,7 +64,7 @@ pub fn send_b2bua_to_bleg(
         udp_egress_source(transport, destination, send_source),
         state,
     );
-    send_to_target(
+    let outcome = send_to_target(
         data,
         &target,
         transport,
@@ -58,6 +72,13 @@ pub fn send_b2bua_to_bleg(
         send_source,
         state,
     );
+    if outcome.delivery_failed {
+        if let Some(key) = retransmit_key(&message) {
+            state.b2bua_retransmits.disarm(&key);
+        }
+        return false;
+    }
+    true
 }
 
 /// Send siphon-originated messages to a B-leg in the given order, with nothing
@@ -132,37 +153,25 @@ pub fn arm_b2bua_retransmit(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
-    let method = match message.method() {
-        Some(method) if *method != crate::sip::message::Method::Ack => method.clone(),
-        // A response, or an ACK — see the doc comment.
-        _ => return,
-    };
-
-    let branch = match message
-        .headers
-        .get("Via")
-        .and_then(|raw| Via::parse_multi(raw).ok())
-        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))
-    {
-        Some(branch) => branch,
-        None => return,
+    let Some(key) = retransmit_key(message) else {
+        return;
     };
 
     // RFC 3261 §9.1: a CANCEL abandons the INVITE it shares a branch with, so
     // stop retransmitting that INVITE the moment we cancel it. Doing this here
     // covers every site that emits a CANCEL (answer timeout, LCR ring timeout,
     // upstream CANCEL relay, deferred CANCEL drain) from one place.
-    if method == crate::sip::message::Method::Cancel {
+    if key.method == crate::sip::message::Method::Cancel {
         state
             .b2bua_retransmits
             .disarm(&crate::b2bua::retransmit::RetransmitKey::new(
-                branch.clone(),
+                key.branch.clone(),
                 crate::sip::message::Method::Invite,
             ));
     }
 
     state.b2bua_retransmits.arm(
-        crate::b2bua::retransmit::RetransmitKey::new(branch, method),
+        key,
         data.clone(),
         crate::b2bua::retransmit::RetransmitTarget {
             destination,
@@ -175,6 +184,23 @@ pub fn arm_b2bua_retransmit(
         },
         std::time::Instant::now(),
     );
+}
+
+/// The key a retransmit schedule for `message` is armed under: its method and its
+/// topmost Via branch. `None` for a response, an ACK, and a request without a
+/// parseable branch, none of which [`arm_b2bua_retransmit`] arms.
+fn retransmit_key(message: &SipMessage) -> Option<crate::b2bua::retransmit::RetransmitKey> {
+    let method = match message.method() {
+        Some(method) if *method != crate::sip::message::Method::Ack => method.clone(),
+        // A response, or an ACK: see `arm_b2bua_retransmit`.
+        _ => return None,
+    };
+    let branch = message
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))?;
+    Some(crate::b2bua::retransmit::RetransmitKey::new(branch, method))
 }
 
 /// Cancel the retransmit schedule of the request this response answers.

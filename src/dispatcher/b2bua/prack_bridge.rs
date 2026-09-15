@@ -103,17 +103,72 @@ pub struct SentPrack {
     pub offer: Option<Vec<u8>>,
 }
 
-/// Send siphon's PRACK for `held` to the callee, carrying `body` when there is one,
-/// with siphon's own identity and the configured attributes stripped. An answer is
-/// recorded as the session description in force on the callee's dialog as it goes;
-/// an offer comes back in the [`SentPrack`] for the callee's answer to put in force.
-/// `None` when it could not be sent.
+/// siphon's PRACK for a callee's reliable provisional, built and not yet handed to
+/// the transport.
+pub struct BuiltPrack {
+    prack: SipMessage,
+    rseq: u32,
+    destination: SocketAddr,
+    transport: Transport,
+    local_addr: Option<SocketAddr>,
+    /// What the callee's response to it will echo, and the offer it carries.
+    pub sent: SentPrack,
+}
+
+/// Send siphon's PRACK for `held` to the callee, carrying `body` when there is one
+/// ([`build_callee_prack`]). `None` when it could not be built or the transport
+/// refused it.
 pub fn send_callee_prack(
     call_id: &str,
     held: &HeldCalleePrack,
     body: Option<PrackBody>,
     state: &DispatcherState,
 ) -> Option<SentPrack> {
+    let built = build_callee_prack(call_id, held, body, state)?;
+    send_built_callee_prack(call_id, built, state)
+}
+
+/// Hand `built` to the transport, returning what the callee's response will echo.
+/// `None` when the transport refused it.
+pub fn send_built_callee_prack(
+    call_id: &str,
+    built: BuiltPrack,
+    state: &DispatcherState,
+) -> Option<SentPrack> {
+    let BuiltPrack {
+        prack,
+        rseq,
+        destination,
+        transport,
+        local_addr,
+        sent,
+    } = built;
+    debug!(
+        call_id = %call_id,
+        rseq,
+        %destination,
+        with_body = !prack.body.is_empty(),
+        "B2BUA: sending the callee's PRACK"
+    );
+    if send_b2bua_to_bleg_checked(prack, transport, destination, local_addr, state) {
+        Some(sent)
+    } else {
+        warn!(call_id = %call_id, rseq, %destination, "B2BUA: the transport refused the callee's PRACK");
+        None
+    }
+}
+
+/// Build siphon's PRACK for `held`, carrying `body` when there is one, with
+/// siphon's own identity and the configured attributes stripped. An answer is
+/// recorded as the session description in force on the callee's dialog here; an
+/// offer comes back in [`BuiltPrack::sent`] for the callee's answer to put in force.
+/// `None` when the call or the leg is gone.
+pub fn build_callee_prack(
+    call_id: &str,
+    held: &HeldCalleePrack,
+    body: Option<PrackBody>,
+    state: &DispatcherState,
+) -> Option<BuiltPrack> {
     let cseq = state
         .call_actors
         .next_b_leg_local_cseq(call_id, held.b_leg_index)?;
@@ -160,24 +215,17 @@ pub fn send_callee_prack(
         leg.transport.remote_addr,
         leg.transport.transport,
     );
-    debug!(
-        call_id = %call_id,
-        rseq = held.rseq,
-        %destination,
-        with_body = !prack.body.is_empty(),
-        "B2BUA: sending the callee's PRACK"
-    );
-    send_b2bua_to_bleg(
+    Some(BuiltPrack {
         prack,
-        transport,
+        rseq: held.rseq,
         destination,
-        leg.transport.local_addr,
-        state,
-    );
-    Some(SentPrack {
-        b_leg_call_id: leg.dialog.call_id,
-        cseq,
-        offer,
+        transport,
+        local_addr: leg.transport.local_addr,
+        sent: SentPrack {
+            b_leg_call_id: leg.dialog.call_id,
+            cseq,
+            offer,
+        },
     })
 }
 
@@ -362,7 +410,11 @@ pub fn bridge_caller_prack(
                     };
                 }
             };
-            let Some(sent) = send_callee_prack(
+            let failed = || CallerPrackBridged::Fail {
+                answer: Some(rejecting_answer(&caller_prack.body)),
+                status: PRACK_OFFER_FAILED_STATUS,
+            };
+            let Some(built) = build_callee_prack(
                 call_id,
                 &held,
                 Some(PrackBody::Offer {
@@ -371,32 +423,54 @@ pub fn bridge_caller_prack(
                 }),
                 state,
             ) else {
-                return CallerPrackBridged::Fail {
-                    answer: Some(rejecting_answer(&caller_prack.body)),
-                    status: PRACK_OFFER_FAILED_STATUS,
-                };
+                return failed();
             };
+            // Registered before the PRACK is handed to the transport: the callee can
+            // answer it on another worker before this one is back from the send, and
+            // that answer has to find the offer it answers.
+            let (b_leg_call_id, b_leg_cseq) = (built.sent.b_leg_call_id.clone(), built.sent.cseq);
+            let registered = state
+                .call_actors
+                .get_call_mut(call_id)
+                .map(|mut call| {
+                    call.prack_bridge.begin_offer(PendingPrackOffer {
+                        caller_prack: caller_prack.clone(),
+                        source: RequestSource {
+                            transport: inbound.transport,
+                            remote_addr: inbound.remote_addr,
+                            connection_id: inbound.connection_id,
+                            local_addr: inbound.local_addr,
+                        },
+                        a_leg_rseq,
+                        b_leg_call_id: b_leg_call_id.clone(),
+                        b_leg_cseq,
+                        b_leg_index: held.b_leg_index,
+                        sent_offer: built.sent.offer.clone(),
+                        offer: caller_prack.body.clone(),
+                        sent_at: Instant::now(),
+                    });
+                })
+                .is_some();
+            if !registered {
+                return failed();
+            }
+            if send_built_callee_prack(call_id, built, state).is_none() {
+                // Nothing reached the callee, so nothing will answer the offer. A
+                // registration something else already took is that one's to finish.
+                let withdrawn = state
+                    .call_actors
+                    .get_call_mut(call_id)
+                    .and_then(|mut call| {
+                        call.prack_bridge.withdraw_offer(&b_leg_call_id, b_leg_cseq)
+                    });
+                if withdrawn.is_some() {
+                    return failed();
+                }
+                return CallerPrackBridged::WaitForCallee;
+            }
             state
                 .call_actors
                 .set_leg_last_sdp(call_id, true, &caller_prack.body);
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.prack_bridge.begin_offer(PendingPrackOffer {
-                    caller_prack: caller_prack.clone(),
-                    source: RequestSource {
-                        transport: inbound.transport,
-                        remote_addr: inbound.remote_addr,
-                        connection_id: inbound.connection_id,
-                        local_addr: inbound.local_addr,
-                    },
-                    a_leg_rseq,
-                    b_leg_call_id: sent.b_leg_call_id,
-                    b_leg_cseq: sent.cseq,
-                    b_leg_index: held.b_leg_index,
-                    sent_offer: sent.offer,
-                    offer: caller_prack.body.clone(),
-                    sent_at: Instant::now(),
-                });
-            }
             CallerPrackBridged::WaitForCallee
         }
     }

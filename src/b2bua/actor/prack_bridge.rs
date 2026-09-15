@@ -150,6 +150,14 @@ impl PrackBridge {
             .is_some_and(|pending| pending.a_leg_rseq == a_leg_rseq)
     }
 
+    /// Whether the pending offer went to the callee in siphon's PRACK `b_leg_cseq`
+    /// on the callee's dialog `b_leg_call_id`.
+    fn offer_went_in(&self, b_leg_call_id: &str, b_leg_cseq: u32) -> bool {
+        self.pending_offer.as_ref().is_some_and(|pending| {
+            pending.b_leg_call_id == b_leg_call_id && pending.b_leg_cseq == b_leg_cseq
+        })
+    }
+
     /// Take the offer siphon's PRACK `b_leg_cseq` on the callee's dialog
     /// `b_leg_call_id` carried, for the callee's response to that PRACK.
     pub fn take_offer(
@@ -157,11 +165,23 @@ impl PrackBridge {
         b_leg_call_id: &str,
         b_leg_cseq: u32,
     ) -> Option<PendingPrackOffer> {
-        let matches = self.pending_offer.as_ref().is_some_and(|pending| {
-            pending.b_leg_call_id == b_leg_call_id && pending.b_leg_cseq == b_leg_cseq
-        });
-        if matches {
+        if self.offer_went_in(b_leg_call_id, b_leg_cseq) {
             self.answering = true;
+            self.pending_offer.take()
+        } else {
+            None
+        }
+    }
+
+    /// Withdraw the offer registered for siphon's PRACK `b_leg_cseq` on the callee's
+    /// dialog `b_leg_call_id` when the transport refused that PRACK: nothing will
+    /// answer the offer, and no answer to it is on its way to the caller.
+    pub fn withdraw_offer(
+        &mut self,
+        b_leg_call_id: &str,
+        b_leg_cseq: u32,
+    ) -> Option<PendingPrackOffer> {
+        if self.offer_went_in(b_leg_call_id, b_leg_cseq) {
             self.pending_offer.take()
         } else {
             None
@@ -333,6 +353,21 @@ mod tests {
         bridge.begin_offer(pending(now));
         assert!(bridge.take_overdue_offer(now + PRACK_OFFER_WAIT).is_some());
         assert!(!bridge.offer_overdue(now + PRACK_OFFER_WAIT));
+    }
+
+    #[test]
+    fn an_offer_whose_prack_the_transport_refused_is_withdrawn_with_nothing_being_answered() {
+        let mut bridge = PrackBridge::default();
+        bridge.begin_offer(pending(Instant::now()));
+        assert!(bridge.withdraw_offer("b-leg@198.51.100.70", 4).is_none());
+        assert!(bridge.withdraw_offer("another@198.51.100.70", 3).is_none());
+        assert!(bridge.offer_pending());
+        assert!(bridge.withdraw_offer("b-leg@198.51.100.70", 3).is_some());
+        assert!(
+            !bridge.offer_pending(),
+            "no 200 is on its way to the caller for a 2xx to wait behind"
+        );
+        assert!(bridge.take_offer("b-leg@198.51.100.70", 3).is_none());
     }
 
     #[test]

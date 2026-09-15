@@ -967,3 +967,184 @@ async fn an_offer_in_the_callers_prack_is_in_force_on_both_dialogs_once_the_call
         Some(CALLEE_NEW_ANSWER.as_bytes().to_vec())
     );
 }
+
+/// A call placed with `offer` on a dispatcher whose UDP egress is split by
+/// direction. What siphon sends the caller leaves from the listener the caller's
+/// INVITE arrived on and stays on [`PrackCall::udp`]. What it sends the callee
+/// names no listener and goes to the returned channel, which has no room: a send
+/// to the callee does not return until the test takes it, so the test decides
+/// what happens while siphon is still handing a request to the callee.
+fn place_with_callee_rendezvous(
+    offer: Option<&str>,
+) -> (PrackCall, flume::Receiver<OutboundMessage>) {
+    let TestDispatcher { mut state, udp } = test_dispatcher_with_script(DIAL);
+    drop(udp);
+    let (to_callee, callee) = flume::bounded(0);
+    let (to_caller, caller) = flume::unbounded();
+    let (to_stream, _) = flume::unbounded();
+    state.outbound = Arc::new(OutboundRouter {
+        udp: to_callee.into(),
+        udp_by_local: std::collections::HashMap::from([(state.local_addr, to_caller.into())]),
+        tcp: to_stream.clone(),
+        tls: to_stream.clone(),
+        ws: to_stream.clone(),
+        wss: to_stream.clone(),
+        sctp: to_stream,
+    });
+    let state = Arc::new(state);
+    let raw = caller_invite(offer);
+    let inbound = InboundMessage {
+        connection_id: ConnectionId::default(),
+        transport: Transport::Udp,
+        local_addr: state.local_addr,
+        remote_addr: address(CALLER),
+        data: Bytes::from(raw.clone().into_bytes()),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let callee_invite = std::thread::scope(|scope| {
+        let dialling = scope.spawn(|| {
+            let _runtime = runtime.enter();
+            handle_b2bua_invite(inbound, parse(&raw), &state);
+        });
+        let invite = receive_from(&callee);
+        dialling.join().expect("the INVITE handler");
+        invite
+    });
+    assert_eq!(callee_invite.method(), Some(&Method::Invite));
+    let call_id = state
+        .call_actors
+        .find_by_sip_call_id(SIP_CALL_ID)
+        .expect("the call was placed");
+    let call = PrackCall {
+        state,
+        udp: caller,
+        call_id,
+        callee_invite,
+    };
+    (call, callee)
+}
+
+/// The next message siphon hands the transport on `channel`, waiting for it.
+fn receive_from(channel: &flume::Receiver<OutboundMessage>) -> SipMessage {
+    let outbound = channel
+        .recv_timeout(Duration::from_secs(5))
+        .expect("siphon sent a message");
+    let frame = outbound.frames().next().expect("a frame");
+    parse_sip_message_bytes(frame).expect("siphon sent a message that parses")
+}
+
+/// siphon's PRACK to the callee as its retransmission schedule holds it, once armed:
+/// armed right before the PRACK is handed to the transport, so from then on the
+/// PRACK is on its way and nothing before the send is still to run.
+fn armed_prack(call: &PrackCall, armed_before: usize) -> SipMessage {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while call.state.b2bua_retransmits.len() <= armed_before {
+        assert!(Instant::now() < deadline, "siphon never armed its PRACK");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    call.state
+        .b2bua_retransmits
+        .due(Instant::now() + Duration::from_secs(1))
+        .into_iter()
+        .find_map(|due| match due {
+            crate::b2bua::retransmit::Due::Send { key, data, .. }
+                if key.method == Method::Prack =>
+            {
+                Some(parse_sip_message_bytes(&data).expect("the armed PRACK parses"))
+            }
+            _ => None,
+        })
+        .expect("the armed PRACK")
+}
+
+/// The callee answers the offer siphon's PRACK carries the moment the PRACK
+/// reaches it, before siphon's thread has returned from handing the PRACK over.
+/// The offer is registered before the PRACK goes out, so that answer finds it,
+/// and the caller's PRACK gets its 200 with the answer (RFC 3262 §5). Registered
+/// after the send, the answer found nothing, was absorbed, and the caller's PRACK
+/// was never answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callee_answer_to_the_prack_offer_that_arrives_during_the_send_reaches_the_caller() {
+    let (call, callee) = place_with_callee_rendezvous(Some(CALLER_OFFER));
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    let armed_before = call.state.b2bua_retransmits.len();
+
+    let runtime = &tokio::runtime::Handle::current();
+    let call = &call;
+    std::thread::scope(|scope| {
+        let pracking = scope.spawn(|| {
+            let _runtime = runtime.enter();
+            call.caller_pracks(&progress, 2, CALLER_NEW_OFFER);
+        });
+        // siphon's thread is now handing its PRACK to the callee, and cannot get
+        // past that until the test takes it.
+        let prack = armed_prack(call, armed_before);
+        assert!(
+            body_text(&prack).contains("m=audio 40002"),
+            "{}",
+            body_text(&prack)
+        );
+        scope
+            .spawn(move || {
+                let _runtime = runtime.enter();
+                call.callee_answers_prack(&prack, 200, CALLEE_NEW_ANSWER);
+            })
+            .join()
+            .expect("the callee's answer");
+        assert_eq!(receive_from(&callee).method(), Some(&Method::Prack));
+        pracking.join().expect("the caller's PRACK");
+    });
+
+    let to_caller = to(&call.wire(), CALLER);
+    let answer = to_caller
+        .iter()
+        .find(|message| message.status_code() == Some(200) && cseq_method(message) == "PRACK")
+        .unwrap_or_else(|| panic!("the caller's PRACK was never answered: {to_caller:?}"));
+    assert!(
+        body_text(answer).contains("m=audio 30002"),
+        "{}",
+        body_text(answer)
+    );
+    assert!(call.call_is_up());
+}
+
+/// siphon's PRACK carrying the caller's offer cannot be handed to the transport.
+/// Nothing reaches the callee, so nothing will answer the offer: it is not left
+/// registered, and the caller's PRACK is answered at once with every stream
+/// rejected, the call refused as when the callee refuses the offer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prack_offer_that_cannot_be_sent_is_not_left_waiting_for_an_answer() {
+    let (call, callee) = place_with_callee_rendezvous(Some(CALLER_OFFER));
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    drop(callee);
+
+    call.caller_pracks(&progress, 2, CALLER_NEW_OFFER);
+
+    let pending = call
+        .state
+        .call_actors
+        .get_call(&call.call_id)
+        .is_some_and(|actor| actor.prack_bridge.offer_pending());
+    assert!(
+        !pending,
+        "an offer nobody was sent is still waiting for its answer"
+    );
+    let to_caller = to(&call.wire(), CALLER);
+    let answer = to_caller
+        .iter()
+        .find(|message| message.status_code() == Some(200) && cseq_method(message) == "PRACK")
+        .unwrap_or_else(|| panic!("the caller's PRACK was never answered: {to_caller:?}"));
+    assert!(
+        body_text(answer).contains("m=audio 0 "),
+        "{}",
+        body_text(answer)
+    );
+    assert!(
+        to_caller
+            .iter()
+            .any(|message| message.status_code() == Some(500) && cseq_method(message) == "INVITE"),
+        "{to_caller:?}"
+    );
+}
