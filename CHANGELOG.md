@@ -272,6 +272,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   is not an RFC 8866 §9 token (`a=msid`, `msid:1`, an empty entry) is refused at
   config load. Empty by default, and then the relayed SDP is not inspected.
 
+- **`rtpengine.answer(target, sdp=..., to_tag=...)` anchors a far side that is
+  not a SIP agent.** A B2BUA leg whose other end hands over its answer SDP
+  through its own transport (a media server behind its own API) could not reach
+  the answer step at all: `answer()` read the SDP and To-tag off a SIP reply, and
+  there was none. So the engine never learned the far side's address or codec,
+  and could not transcode for it. With `sdp=` the SDP goes to the engine directly
+  and the coroutine resolves to the rewritten SDP as `str`, for the script to
+  send in `call.answer(200, "OK", body=...)`. No message body is read or written.
+  The target names the offer being answered: a `Call`, `Request` or `Reply`, or a
+  `(call_id, from_tag)` tuple. A bare `call_id` is refused, it names no from-tag.
+  `to_tag=` names the answering party. Left out, siphon reuses the tag an earlier
+  answer on the call recorded, so a re-answer reaches the same party, and makes
+  one up otherwise. The reply mode is unchanged and still resolves to `True`.
+  Works on the rtpengine, siphon-rtp and rtpproxy backends, and the SDK mock
+  carries both modes.
+
 ### Changed
 
 - **A B2BUA call advertises siphon's own `Supported` and `Allow` on both legs,
@@ -477,6 +493,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   which by then was the new one. That connection stayed open but was never reused, so the next send
   to the peer opened yet another. A reader's cleanup, and a sender that finds a closed channel, now
   only remove the pool entry while it is still their own connection.
+
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own
@@ -1142,6 +1159,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   one that follows a refused offer takes the next version (RFC 3264 §8). The
   refresh is still a re-INVITE, and siphon still refreshes only toward the
   callee.
+
+- **`rtpengine.answer()` addresses the engine by the call-id its `offer` used.**
+  It sent the SIP Call-ID, while `offer` and the dispatcher's re-INVITE answer
+  use the media session's engine call-id. The two differ once a
+  siphon-terminated transfer re-anchors a call on a fresh engine call-id, and a
+  script `answer()` on such a call went to the old one. Calls that were never
+  re-anchored send exactly what they sent before.
 
 ### Security
 

@@ -688,7 +688,7 @@ class _RtpEngineNamespace:
 
     async def answer(self, reply, profile=None, call=None, ws_uri=None, beep_detection=None,
                      beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None,
-                     ws_vad_engine=None, ws_vad_min_speech_ms=None):
+                     ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None):
         raise NotImplementedError("rtpengine.answer() not available — no media.rtpengine in config")
 
     async def delete(self, request):

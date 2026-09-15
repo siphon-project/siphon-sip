@@ -140,6 +140,31 @@ On a **B2BUA** it's the same three calls in `@b2bua.on_invite` / `on_answer` /
 `on_bye` (+ `on_failure` / `on_cancel`); pass `call=` to `answer()` so it reuses the
 A-leg Call-ID that matched the offer (see [the SBC recipe](sbc.md)).
 
+### When the far side is not SIP
+
+Sometimes the other side of a call is not a SIP agent: a media server your script
+reaches over its own API, which terminates RTP itself and hands back an answer SDP.
+There is no reply to pass to `answer()`, so pass the SDP. The coroutine resolves to
+the rewritten SDP, which you send in your own 2xx:
+
+```python
+@b2bua.on_invite
+async def on_invite(call):
+    await rtpengine.offer(call, profile="rtp_passthrough")   # rewrites call.body
+    far_sdp = await my_media_server.connect(call.body)       # your transport, not SIP
+    sdp = await rtpengine.answer(call, sdp=far_sdp)
+    call.answer(200, "OK", body=sdp, content_type="application/sdp")
+```
+
+`call` names the offer being answered. From a handler that only has the
+identifiers, pass `(call_id, from_tag)` instead; a bare `call_id` is refused because
+it names no from-tag. `to_tag=` names the answering party to the engine. Leave it
+out and siphon reuses the tag an earlier answer on the call recorded, so a later
+re-offer and re-answer reach the same party. The offer's profile still decides the
+media work, transcoding included when the two sides share no codec. No source
+address is carried for the far side (siphon never heard from it), so a profile's
+`received_from` does not gate its media.
+
 !!! warning "Always release"
     `offer` without a matching `delete` leaks an RTPEngine session until its
     inactivity timeout. Handle every teardown path — `on_bye`, `on_failure`,

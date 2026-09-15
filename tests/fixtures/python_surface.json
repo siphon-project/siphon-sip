@@ -2103,7 +2103,7 @@
       "answer": {
         "doc": "Send an RTPEngine `answer` command.",
         "kind": "method_descriptor",
-        "sig": "($self, reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+        "sig": "($self, reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None)"
       },
       "answer_local": {
         "doc": "Single-leg UAS answer \u2014 synthesise an RFC 3264 answer for the caller's",

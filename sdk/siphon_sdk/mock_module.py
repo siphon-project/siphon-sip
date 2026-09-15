@@ -3351,8 +3351,20 @@ class MockRtpEngine:
                      ws_sample_rate: Optional[int] = None,
                      ws_tee_sample_rate: Optional[int] = None,
                      ws_vad_engine: Optional[str] = None,
-                     ws_vad_min_speech_ms: Optional[int] = None) -> bool:
+                     ws_vad_min_speech_ms: Optional[int] = None,
+                     sdp: Union[str, bytes, None] = None,
+                     to_tag: Optional[str] = None) -> Union[bool, str]:
         """Send ``answer`` command to RTPEngine.
+
+        Two ways to hand it the answer:
+
+        * **A SIP reply** (the usual proxy / B2BUA case): the SDP and To-tag
+          come off ``reply``, its body is replaced with the rewritten SDP, and
+          the call resolves to ``True``.
+        * **Raw SDP** with ``sdp=``: for a far side that is not a SIP agent and
+          hands over its answer some other way (a media server behind its own
+          API). No message body is read or written; the call resolves to the
+          rewritten SDP as ``str`` for the script to send itself.
 
         Profile precedence (matches the real implementation):
 
@@ -3367,10 +3379,18 @@ class MockRtpEngine:
         reply's SDP is the offer, not an answer. It goes to the engine as an
         ``offer`` from the replying party's side, and siphon completes it with
         the caller's answer from the ACK itself, so a script calls ``answer``
-        the same way for both.
+        the same way for both. A raw ``sdp=`` is always an answer.
+
+        Either command is addressed by the call-id the engine knows the call
+        by, which differs from the SIP Call-ID after a siphon-terminated
+        transfer re-anchored the call.
 
         Args:
-            reply: Reply or Call object with SDP body.
+            reply: Reply or Call object with SDP body. With ``sdp=`` it only
+                   names the offer being answered: a ``Call``, ``Request`` or
+                   ``Reply``, or a ``(call_id, from_tag)`` tuple. A bare
+                   ``call_id`` string names no from-tag and raises
+                   ``TypeError``.
             profile: Optional explicit RTP profile name. When omitted, the
                      profile recorded by the matching offer is used.
             call: Optional Call object — when provided, Call-ID and
@@ -3381,10 +3401,57 @@ class MockRtpEngine:
                     backend only). When omitted, the URI recorded by the
                     matching ``offer`` is reused — the same precedence as
                     ``profile``.
+            sdp: The far side's answer SDP (``str`` or ``bytes``). Switches to
+                 raw mode. Blank raises ``ValueError``. No source address is
+                 carried for the far side: siphon never heard from it, so a
+                 profile's ``received_from`` does not gate its media.
+            to_tag: Tag naming the answering party to the engine. Raw mode only
+                    (``ValueError`` without ``sdp=``). When omitted: the To-tag
+                    on ``reply`` if it carries one, else the tag an earlier
+                    answer on this call recorded (so a re-answer reaches the
+                    same party), else a new one. The mock records what was
+                    passed, ``None`` when omitted.
 
         Returns:
-            ``True`` on success.
+            ``True``, or the rewritten SDP as ``str`` when ``sdp=`` was passed.
+            The mock rewrites nothing and returns ``sdp`` as given.
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                await rtpengine.offer(call, profile="rtp_passthrough")
+                far_sdp = await my_media_server.connect(call.body)  # not SIP
+                sdp = await rtpengine.answer(call, sdp=far_sdp)
+                call.answer(200, "OK", body=sdp, content_type="application/sdp")
         """
+        # Validate before recording anything: the runtime refuses these before
+        # a command reaches the engine.
+        sdp_text: Optional[str] = None
+        if sdp is None:
+            if to_tag is not None:
+                raise ValueError(
+                    "rtpengine.answer(to_tag=...) needs sdp=: a reply's own "
+                    "To-tag names its answerer"
+                )
+        else:
+            if isinstance(sdp, bytes):
+                sdp_text = sdp.decode("utf-8", errors="replace")
+            elif isinstance(sdp, str):
+                sdp_text = sdp
+            else:
+                raise TypeError("rtpengine.answer(sdp=...) must be str or bytes")
+            if not sdp_text.strip():
+                raise ValueError("rtpengine.answer(sdp=...) is empty")
+            if to_tag == "":
+                raise ValueError("rtpengine.answer(to_tag=...) is empty")
+            if isinstance(reply, str):
+                raise TypeError(
+                    "rtpengine.answer(sdp=...) needs the offer's from-tag: pass "
+                    "the Call, Request or Reply, or a (call_id, from_tag) tuple, "
+                    "not a bare call_id"
+                )
+
         if profile is None:
             # Mirror real behavior: recover from last recorded offer.
             for op, recorded in reversed(self.operations):
@@ -3399,7 +3466,18 @@ class MockRtpEngine:
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
             ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
         )))
-        return True
+        if sdp_text is None:
+            return True
+        call_id, from_tag = _resolve_media_target(call if call is not None else reply)
+        self.media_calls.append({
+            "op": "answer",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "to_tag": to_tag,
+            "sdp": sdp_text,
+            "profile": profile,
+        })
+        return sdp_text
 
     async def answer_local(
         self,
