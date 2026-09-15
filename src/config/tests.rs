@@ -1586,7 +1586,7 @@ media:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let media = config.media.unwrap();
-    assert_eq!(media.backend, MediaBackendKind::Rtpengine);
+    assert_eq!(media.backend(), MediaBackendKind::Rtpengine);
     assert!(media.rtpengine.is_some());
     assert!(media.siphon_rtp.is_none());
 }
@@ -1610,7 +1610,7 @@ media:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let media = config.media.unwrap();
-    assert_eq!(media.backend, MediaBackendKind::SiphonRtp);
+    assert_eq!(media.backend(), MediaBackendKind::SiphonRtp);
     assert!(media.rtpengine.is_none());
     let siphon_rtp = media.siphon_rtp.expect("siphon_rtp block configured");
     assert_eq!(siphon_rtp.address.as_deref(), Some("127.0.0.1:8080"));
@@ -1647,7 +1647,7 @@ media:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let media = config.media.unwrap();
-    assert_eq!(media.backend, MediaBackendKind::SiphonRtp);
+    assert_eq!(media.backend(), MediaBackendKind::SiphonRtp);
     let siphon_rtp = media.siphon_rtp.expect("siphon_rtp block configured");
     assert_eq!(siphon_rtp.control_secret.as_deref(), Some("shared"));
     let instances = siphon_rtp.instances();
@@ -1675,7 +1675,7 @@ media:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let media = config.media.unwrap();
-    assert_eq!(media.backend, MediaBackendKind::Rtpproxy);
+    assert_eq!(media.backend(), MediaBackendKind::Rtpproxy);
     assert!(media.rtpengine.is_none());
     assert!(media.siphon_rtp.is_none());
     let rtpproxy = media.rtpproxy.expect("rtpproxy block configured");
@@ -1712,7 +1712,7 @@ media:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let media = config.media.unwrap();
-    assert_eq!(media.backend, MediaBackendKind::Rtpproxy);
+    assert_eq!(media.backend(), MediaBackendKind::Rtpproxy);
     let rtpproxy = media.rtpproxy.expect("rtpproxy block configured");
     assert_eq!(rtpproxy.retries, 3);
     let instances = rtpproxy.instances();
@@ -1720,6 +1720,49 @@ media:
     // First inherits the parent timeout; second overrides it.
     assert_eq!(instances[0], ("10.0.0.1:22222".to_string(), 1500, 2));
     assert_eq!(instances[1], ("10.0.0.2:22222".to_string(), 3000, 1));
+}
+
+/// A `media:` block carrying only SDP handling asks for no media engine: the
+/// `o=`/`s=` topology hiding and the attribute strip run on a B2BUA that anchors
+/// no media at all.
+#[test]
+fn a_media_block_with_only_sdp_settings_expects_no_engine() {
+    for media in [
+        "  sdp_name: \"SIPhon\"\n",
+        "  sdp_strip_attributes: [\"msid\"]\n",
+        "  sdp_name: \"SIPhon\"\n  sdp_strip_attributes: [\"msid\"]\n",
+    ] {
+        let config = config_with(&format!("media:\n{media}")).unwrap();
+        assert!(!config.media.unwrap().expects_engine(), "{media:?}");
+    }
+}
+
+/// Naming a backend, giving an engine's connection block, or setting something
+/// only an engine uses (media profiles, the rtpengine event listener) asks for an
+/// engine, so a missing one is still worth an error at boot.
+#[test]
+fn a_media_block_that_names_or_configures_an_engine_expects_one() {
+    for media in [
+        "  backend: rtpengine\n",
+        "  backend: siphon-rtp\n",
+        "  backend: rtpproxy\n",
+        "  rtpengine:\n    address: \"127.0.0.1:22222\"\n",
+        "  siphon_rtp:\n    address: \"127.0.0.1:8080\"\n",
+        "  rtpproxy:\n    address: \"127.0.0.1:22222\"\n",
+        "  events:\n    listen_addr: \"127.0.0.1:22226\"\n",
+        "  profiles:\n    custom:\n      offer: {}\n      answer: {}\n",
+    ] {
+        let config = config_with(&format!("media:\n  sdp_name: \"SIPhon\"\n{media}")).unwrap();
+        assert!(config.media.unwrap().expects_engine(), "{media:?}");
+    }
+}
+
+/// Telling an unset `backend` from a written one changes nothing about what it
+/// resolves to.
+#[test]
+fn an_unset_media_backend_still_resolves_to_rtpengine() {
+    let config = config_with("media:\n  sdp_name: \"SIPhon\"\n").unwrap();
+    assert_eq!(config.media.unwrap().backend(), MediaBackendKind::Rtpengine);
 }
 
 /// Minimum config the loader accepts, plus whatever the test is about.

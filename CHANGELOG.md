@@ -929,6 +929,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   Cx MAR/MAA, keep `auth.backend` as `static` or `http` and call
   `auth.require_ims_digest()` from the REGISTER handler.
 
+- **A `media:` block that only shapes SDP no longer reports a missing media
+  engine at boot.** One with just `sdp_name` and/or `sdp_strip_attributes`
+  anchors nothing, but `backend` defaulted to `rtpengine`, so boot logged
+  `media.backend is 'rtpengine' but no media.rtpengine block is configured` as
+  an error for a configuration that never asked for an engine. siphon now reads
+  such a block as signalling-only and logs that calls are not media-anchored.
+  The error stays where an engine is expected and missing: a block that names a
+  `backend`, gives an `rtpengine`, `siphon_rtp` or `rtpproxy` block, or sets
+  `profiles` or `events`.
+
 - **Pending auth vectors now expire.** An entry is consumed on use, times out
   after 120 s, and is pruned as new challenges are issued, so an unanswered
   challenge no longer retains it for the life of the process. Affects both AKA

@@ -306,6 +306,11 @@ media:
   script with `sdp.parse()`, `remove_attr()` and `apply()`.
 - Removing an attribute the far side relies on breaks whatever it was for, so
   list only what the other leg has no use for.
+- A `media:` block with nothing but `sdp_name` and `sdp_strip_attributes` asks
+  for no media engine. siphon boots without one, logs that calls are not
+  media-anchored, and applies both settings. Name a `backend`, give an engine's
+  connection block, or set `profiles` or `events`, and a missing engine is
+  reported at boot as before.
 
 ---
 
