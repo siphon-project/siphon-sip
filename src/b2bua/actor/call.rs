@@ -321,13 +321,6 @@ pub struct CallActor {
     /// in-dialog anchor off siphon, so the deployment must route it back or the
     /// dialog breaks. Takes precedence over `contact_user_override`.
     pub contact_override: Option<String>,
-    /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
-    /// Contains (ACK message, transport, destination address).
-    pub pending_b_leg_ack: Option<(
-        SipMessage,
-        crate::transport::Transport,
-        std::net::SocketAddr,
-    )>,
     /// Resolved header policy for this call (preset + per-call deltas) — set
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
@@ -497,7 +490,6 @@ impl CallActor {
             to_host_override: None,
             contact_user_override: None,
             contact_override: None,
-            pending_b_leg_ack: None,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
@@ -1315,9 +1307,8 @@ pub enum WinOutcome {
     /// was cancelled under it too. `cancelled` holds those branches, for the
     /// caller to CANCEL (RFC 3261 §9.1).
     FirstWin { cancelled: Vec<Leg> },
-    /// The call was already answered — this 2xx is a retransmit of the winning
-    /// B-leg's answer (or a losing fork branch). `b_leg_acked` reports whether
-    /// the winning B-leg's ACK has already gone out, so the caller can re-ACK
-    /// to stop the retransmit vs. absorb silently while awaiting the A-leg ACK.
-    AlreadyAnswered { b_leg_acked: bool },
+    /// The call was already answered: this 2xx is a retransmission of the
+    /// winning B-leg's answer (or a losing fork branch's). It is not relayed to
+    /// the caller again, and it is ACKed like every 2xx (RFC 3261 §13.2.2.4).
+    AlreadyAnswered,
 }

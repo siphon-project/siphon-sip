@@ -249,7 +249,7 @@ pub fn arm_reliable_provisional_retransmit(
 /// caller ringing until it CANCELs. Stores a `Notify` under the internal call
 /// ID and spawns a task that resends `response` on the RFC 3261 §17.2.1 UAS
 /// schedule (T1 = 500 ms doubling to T2 = 4 s, give up after 64×T1 = 32 s).
-/// The late-ACK handler fires the `Notify` when the caller's ACK arrives.
+/// The A-leg ACK handler fires the `Notify` when the caller's ACK arrives.
 ///
 /// Mirrors [`arm_reliable_provisional_retransmit`]. On give-up it removes its
 /// own entry and warns (a genuinely abandoned answered call is reclaimed by the

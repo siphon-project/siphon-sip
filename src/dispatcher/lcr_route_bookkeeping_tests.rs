@@ -210,7 +210,15 @@ async fn a_carrier_that_failed_is_not_cancelled_when_the_next_one_answers() {
     );
 
     sequence.carrier_answers(SECOND_CARRIER, &second, 200, "OK");
-    assert_eq!(summaries(&sequence.wire()), [format!("200 to {CALLER}")]);
+    // The answering carrier is ACKed as its 2xx arrives (RFC 3261 §13.2.2.4)
+    // and the answer relayed; nothing goes to the carrier that failed.
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("ACK to {SECOND_CARRIER}"),
+            format!("200 to {CALLER}")
+        ]
+    );
 }
 
 /// `@b2bua.on_failure` routes the call again after the sequence ran out, and

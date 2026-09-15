@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Acceptance test: the callee is ACKed on every answered B2BUA call.
 
-siphon uses the late-ACK pattern (RFC 3261 §14.1) — it does not ACK the callee's
-200 immediately, it holds the ACK until the caller ACKs and then sends it. If
-that deferred ACK is never armed, the callee's INVITE transaction never
-completes: it retransmits its 200 to Timer B and tears the call down, seconds
-after everyone thinks the call is up. Nothing on the caller's side looks wrong,
-which is exactly why this needs its own gate.
+siphon ACKs the callee's 200 as soon as it has handled it (RFC 3261 §13.2.2.4).
+If that ACK is ever skipped, the callee's INVITE transaction never completes: it
+retransmits its 200 for 64*T1 and tears the call down, seconds after everyone
+thinks the call is up. Nothing on the caller's side looks wrong, which is
+exactly why this needs its own gate.
 
 The existing SIPp suites did not catch it. It only appears when a call's 18x and
 its 200 are processed concurrently, which needs back-to-back calls with no pause

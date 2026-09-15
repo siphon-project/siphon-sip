@@ -428,6 +428,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
   `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
   shape matches the DTLS profiles in the WhatsApp calling example.
+- **A B2BUA ACKs the callee's 2xx as soon as it arrives, and ACKs every
+  retransmission of it, instead of holding the ACK until the caller ACKs.**
+  siphon is the UAC of the B-leg, and RFC 3261 §13.2.2.4 has it ACK each 2xx
+  its INVITE draws. It kept that ACK back until the caller's ACK for the A-leg
+  arrived, and dropped every retransmission of the 2xx in the meantime. So when
+  the caller's ACK was late or never came, the callee was never ACKed at all:
+  it retransmitted its 200 for the full 64*T1, and a callee that only starts
+  media once the ACK arrives never started it. The ACK now goes out once the
+  2xx has been handled, each retransmission draws another, and a re-ACK now
+  carries the dialog's route set too, which it used to leave out. The caller's
+  ACK no longer sends anything to the callee. A re-INVITE from the callee that
+  comes before the caller has ACKed is still answered 491.
 
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
   `auth.require_aka_digest()` can set up IPsec.** Only the HSS path

@@ -253,9 +253,8 @@ def establish(alice, bob, label):
     bob.send(bob.respond(b_invite, 180, "Ringing", local_tag=bob_tag))
     bob.send(bob.respond(b_invite, 200, "OK", body=sdp(2000, 40002), local_tag=bob_tag))
 
-    # The caller is answered first and the callee's ACK only follows the
-    # caller's, so both legs complete their INVITE transaction together
-    # (RFC 3261 §14.1). Waiting on the B-leg ACK before ACKing here deadlocks.
+    # siphon ACKs the callee's 200 when it arrives (RFC 3261 §13.2.2.4) and
+    # relays the answer to the caller, who ACKs its own.
     a_200 = alice.recv(
         lambda m: status_of(m) == 200 and (header(m, "CSeq") or "").endswith("INVITE"),
         "the 200 OK for Alice's INVITE",
@@ -264,15 +263,11 @@ def establish(alice, bob, label):
     alice.send(ack_for(alice, a_200, call_id, alice_tag, 1))
 
     # Best-effort, deliberately not an assertion. The callee's ACK is not what
-    # this test measures, and siphon has a separate, pre-existing race that
-    # occasionally drops it on an ordinary call setup (the deferred B-leg ACK is
-    # armed while the A-leg 200 is already on its way out). Failing here would
-    # make this job flap for a reason that has nothing to do with `Replaces`;
-    # the B2BUA suite is what gates ACK behaviour.
+    # this test measures, and the B2BUA suite is what gates ACK behaviour.
     try:
         bob.recv(lambda m: method_of(m) == "ACK", "the B-leg ACK", timeout=3)
     except AssertionError:
-        print(f"note[{label}]: no B-leg ACK observed (unrelated known race)", flush=True)
+        print(f"note[{label}]: no B-leg ACK observed (not asserted here)", flush=True)
 
     assert siphon_a_tag, "siphon must tag the 200 it answers the caller with"
     assert siphon_b_tag, "siphon must tag the INVITE it sends the callee"

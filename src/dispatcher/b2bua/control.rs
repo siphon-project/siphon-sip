@@ -375,7 +375,7 @@ pub fn send_uas_response(
     // A locally-generated 2xx needs the same retransmission cover as a relayed
     // one: the B2BUA intercepts the A-leg INVITE before a server transaction
     // exists, so nothing under this recovers a lost 200 and the caller would
-    // ring on until it gave up. Cancelled by the caller's ACK in the late-ACK
+    // ring on until it gave up. Cancelled by the caller's ACK in the A-leg ACK
     // handler (search `uas_2xx_retransmits`).
     let retransmit = if final_response && (200..300).contains(&code) {
         Some(response.clone())

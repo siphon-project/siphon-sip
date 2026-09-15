@@ -770,6 +770,18 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-cancel-ack down sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas 2>/dev/null || true
 
+      # RFC 3261 §13.2.2.4: the callee's 200 is ACKed when it arrives, not when
+      # the caller ACKs. The caller holds its ACK for 4 s and the callee needs
+      # siphon's within 2 s, with its own Contact (an opaque userpart and
+      # mixed-case parameters) as the Request-URI. The callee carries the
+      # assertion. bob is re-registered at the callee's address first.
+      - name: B2BUA callee 2xx ACKed without waiting for the caller (RFC 3261 §13.2.2.4)
+        run: COMPOSE_PROFILES=b2bua,b2bua-unacked-2xx bash sipp/run_call.sh sipp-b2bua-unacked-uac sipp-b2bua-unacked-uas
+
+      - name: Cleanup unacked-2xx containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-unacked-2xx rm -sf sipp-b2bua-unacked-uac sipp-b2bua-unacked-uas sipp-b2bua-unacked-register sipp-b2bua-unacked-deregister 2>/dev/null || true
+
       - name: Deregister bob (clear previous contacts)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-deregister-bob
 
@@ -785,7 +797,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-failure down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-unacked-2xx --profile b2bua-failure down --remove-orphans
 
       - name: Upload logs
         if: always()
@@ -1264,7 +1276,7 @@ jobs:
       # call's 18x and its 200 are handled concurrently, which the scenario
       # files never produce. Greps the verdict so a peer that dies before
       # asserting cannot read as a pass.
-      - name: B2BUA callee is ACKed on every answered call (RFC 3261 §14.1)
+      - name: B2BUA callee is ACKed on every answered call (RFC 3261 §13.2.2.4)
         run: |
           docker compose -f sipp/docker-compose.yaml --profile b2bua-bleg-ack up -d --wait siphon-b2bua-replaces
           docker compose -f sipp/docker-compose.yaml --profile b2bua-bleg-ack up \

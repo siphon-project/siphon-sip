@@ -751,7 +751,7 @@ impl CallActorStore {
     /// state to `Answered`) and returns [`WinOutcome::FirstWin`]. Otherwise the
     /// call was already answered — this 2xx is a retransmit of the winning
     /// B-leg's answer (or a losing fork branch) — and it returns
-    /// [`WinOutcome::AlreadyAnswered`] with the winning B-leg's `initial_acked`.
+    /// [`WinOutcome::AlreadyAnswered`].
     ///
     /// The check-and-set runs under the DashMap per-key lock, closing the race
     /// where two concurrent B-leg 200s both observe a stale "not answered"
@@ -762,15 +762,10 @@ impl CallActorStore {
     /// lock, and keeps each answerable for the final response its CANCEL draws.
     pub fn try_win(&self, call_id: &str, index: usize) -> WinOutcome {
         let Some(mut call) = self.calls.get_mut(call_id) else {
-            return WinOutcome::AlreadyAnswered { b_leg_acked: false };
+            return WinOutcome::AlreadyAnswered;
         };
         if call.state == CallState::Answered {
-            let b_leg_acked = call
-                .winner
-                .and_then(|w| call.b_legs.get(w))
-                .map(|leg| leg.initial_acked)
-                .unwrap_or(false);
-            WinOutcome::AlreadyAnswered { b_leg_acked }
+            WinOutcome::AlreadyAnswered
         } else {
             call.set_winner(index);
             let cancelled = call.cancel_pending_branches(Some(index));

@@ -322,15 +322,11 @@ pub fn b_leg_answered(
             }
         }
 
-        let b_leg_record_routes = prepare_a_leg_answer(call_id, &mut response, state, snapshot);
+        prepare_a_leg_answer(call_id, &mut response, state, snapshot);
 
-        // Late ACK pattern (RFC 3261 §14.1 compliant): do NOT ACK the B-leg
-        // immediately. Instead, forward the 200 OK to A-leg and wait for A-leg's
-        // ACK before ACKing B-leg. This keeps the B-leg INVITE transaction alive,
-        // preventing the B-leg from sending re-INVITEs before the A-leg has ACKed.
-        // The B-leg will retransmit 200 OK (Timer G) — we absorb those silently
-        // until A-leg ACKs and we send our ACK to B-leg.
-        ack_b_leg_2xx(call_id, message, state, snapshot, &b_leg_record_routes);
+        // ACK the B-leg's 2xx now (RFC 3261 §13.2.2.4). It confirms the B-leg's
+        // dialog, and that does not wait on the caller's ACK for the A-leg's.
+        ack_b_leg_2xx(call_id, message, state, snapshot);
 
         // Extract SDP body before forwarding (needed for SIPREC)
         let sdp_body = response.body.clone();
@@ -355,7 +351,7 @@ pub fn b_leg_answered(
 
         // Arm A-leg 2xx retransmission — the B2BUA has no IST for the A-leg, so
         // nothing else recovers a lost 200. Cancelled by the caller's ACK in the
-        // late-ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
+        // A-leg ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
         // block below so its early returns can't skip it.
         arm_b2bua_2xx_retransmit(
             call_id,
@@ -381,15 +377,18 @@ pub fn b_leg_answered(
     } // end 2xx guard
 }
 
-/// A 2xx that arrives for a call already answered: re-ACK and re-send the
-/// stored A-leg 2xx (RFC 3261 §13.3.1.4) rather than answering twice.
+/// A 2xx that arrives for a call already answered: a retransmission of the
+/// winning B-leg's answer, or a second answer on a branch that lost. It is not
+/// relayed to the caller a second time, and it is ACKed like the first
+/// (RFC 3261 §13.2.2.4). Returns `false` when this 2xx is the one that answers
+/// the call.
 pub fn absorb_answered_retransmit(
     call_id: &str,
-    message: &mut SipMessage,
+    message: &SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) -> bool {
-    let already_answered: Option<bool> = match snapshot
+    let already_answered = match snapshot
         .b_leg_index
         .map(|idx| state.call_actors.try_win(call_id, idx))
     {
@@ -398,182 +397,108 @@ pub fn absorb_answered_retransmit(
             // §16.7). CANCEL them now rather than leave them ringing beside an
             // answered call until each gives up on its own.
             cancel_settled_branches(&cancelled, state);
-            None
+            false
         }
-        Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered { b_leg_acked }) => Some(b_leg_acked),
-        None if snapshot.call_state == CallState::Answered => Some(true),
+        Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered) => true,
+        None if snapshot.call_state == CallState::Answered => true,
         None => {
             state.call_actors.set_state(call_id, CallState::Answered);
-            None
+            false
         }
     };
-    if let Some(b_leg_acked) = already_answered {
-        // Retransmit of the winning B-leg's 200 (it hasn't received our ACK
-        // yet), or a losing fork branch. Re-ACK only once the B-leg ACK has
-        // gone out (late-ACK complete); while still awaiting the A-leg ACK,
-        // absorb silently.
-        if !b_leg_acked {
-            debug!(
-                call_id = %call_id,
-                "B2BUA: absorbing 200 OK retransmission (waiting for A-leg ACK)"
-            );
-            return true;
-        }
-        debug!(
-            call_id = %call_id,
-            "B2BUA: absorbing 200 OK retransmission (already answered)"
-        );
-        // Re-send ACK to B-leg to stop retransmissions
-        if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
-            if let Some((ref b_cid, ref _b_ftag)) = snapshot.b_leg_dialog {
-                // Build a clean ACK from scratch — do NOT clone the 200 OK
-                // (cloning leaks response headers like User-Agent, Contact,
-                // Allow, Supported, etc. from the remote UA).
-                let request_uri = message
-                    .headers
-                    .get("Contact")
-                    .or_else(|| message.headers.get("m"))
-                    .map(|c| crate::b2bua::actor::extract_contact_uri(c))
-                    .and_then(|u| parse_uri_standalone(&u).ok())
-                    .or_else(|| {
-                        snapshot
-                            .b_leg_remote_contact
-                            .as_deref()
-                            .and_then(|u| parse_uri_standalone(u).ok())
-                    })
-                    .or_else(|| {
-                        snapshot
-                            .b_leg_target
-                            .as_deref()
-                            .and_then(|u| parse_uri_standalone(u).ok())
-                    })
-                    .unwrap_or_else(|| SipUri::new("invalid".to_string()));
-                let transport_str = format!("{}", b_transport).to_uppercase();
-                // Sent-by of the leg this ACK goes back on — the flow socket
-                // when the leg was dialled over one.
-                let (outbound_host, outbound_port) =
-                    b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
-                let cseq_num = message
-                    .headers
-                    .cseq()
-                    .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "1".to_string());
-                let from = message.headers.from().cloned().unwrap_or_default();
-                let to = message.headers.to().cloned().unwrap_or_default();
-                let ack = match SipMessageBuilder::new()
-                    .request(Method::Ack, request_uri)
-                    .via(format!(
-                        "SIP/2.0/{} {}:{};branch={}",
-                        transport_str,
-                        outbound_host,
-                        outbound_port,
-                        TransactionKey::generate_branch(),
-                    ))
-                    .from(from.to_string())
-                    .to(to.to_string())
-                    .call_id(b_cid.clone())
-                    .cseq(format!("{} ACK", cseq_num))
-                    .header("Max-Forwards", "70".to_string())
-                    .content_length(0)
-                    .build()
-                {
-                    Ok(ack) => ack,
-                    Err(error) => {
-                        error!("B2BUA ACK for 200 OK retransmission build failed: {error}");
-                        return true;
-                    }
-                };
-                send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
-            }
-        }
-        return true;
+    if !already_answered {
+        return false;
     }
-
-    false
+    // Every copy is ACKed, whether or not the caller has ACKed its own 2xx yet:
+    // the ACK is what stops this leg retransmitting, and nothing else does.
+    debug!(
+        call_id = %call_id,
+        "B2BUA: ACKing a retransmitted B-leg 200 OK (already answered)"
+    );
+    ack_b_leg_2xx(call_id, message, state, snapshot);
+    true
 }
 
-/// RFC 3261 §13.2.2.4: ACK the B-leg's 2xx, or defer it until the A-leg
-/// ACKs when the call is not media-anchored.
+/// ACK a 2xx the B-leg sent for the call's INVITE (RFC 3261 §13.2.2.4): the
+/// first copy once it has been handled, and every retransmission after it.
+///
+/// siphon is the UAC of the B-leg, and this ACK confirms the B-leg's dialog
+/// only. It does not wait for the caller's ACK, which confirms the A-leg's.
+/// Holding it until then left the B-leg unconfirmed for as long as the caller's
+/// ACK was late or lost, with every retransmission of the 2xx absorbed in the
+/// meantime, so the callee retransmitted for all of 64*T1 (§13.3.1.4) and a
+/// callee that starts its media on the ACK never started it. The glare that
+/// holding it was meant to prevent is refused where it arises: a B-leg
+/// re-INVITE that comes before the caller has ACKed is answered 491 (§14.1).
+///
+/// The ACK is built from the 2xx itself by [`build_b2bua_ack_for_2xx`]: its
+/// Contact is the Request-URI, its Record-Route reversed is the route set the
+/// ACK carries and whose first hop it goes to (§12.1.2, §12.2.1.1), and From,
+/// To, Call-ID and the CSeq number are echoed. A retransmission is the same 2xx,
+/// so it draws the same ACK on a fresh branch. It leaves from the socket the
+/// INVITE did and names that socket in its Via.
+///
+/// It carries no body. An answer the caller puts in its own ACK, for a B-leg
+/// INVITE that went out without an offer (RFC 3264 §4), is not relayed here.
 pub fn ack_b_leg_2xx(
     call_id: &str,
-    message: &mut SipMessage,
+    message: &SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
-    b_leg_record_routes: &[String],
 ) {
-    if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
-        if let Some((ref b_cid, ref _b_ftag)) = snapshot.b_leg_dialog {
-            let ack_uri = message
-                .headers
-                .get("Contact")
-                .or_else(|| message.headers.get("m"))
-                .map(|c| crate::b2bua::actor::extract_contact_uri(c))
-                .and_then(|u| parse_uri_standalone(&u).ok())
-                .or_else(|| {
-                    snapshot
-                        .b_leg_remote_contact
-                        .as_deref()
-                        .and_then(|u| parse_uri_standalone(u).ok())
-                })
-                .or_else(|| {
-                    snapshot
-                        .b_leg_target
-                        .as_deref()
-                        .and_then(|u| parse_uri_standalone(u).ok())
-                })
-                .unwrap_or_else(|| SipUri::new("invalid".to_string()));
-            let transport_str = format!("{}", b_transport).to_uppercase();
-            let cseq_num = message
-                .headers
-                .cseq()
-                .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
-                .unwrap_or_else(|| "1".to_string());
-            let from = message.headers.from().cloned().unwrap_or_default();
-            let to = message.headers.to().cloned().unwrap_or_default();
-
-            // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
-            // Flatten BEFORE reversing — see flatten_record_route_headers comment.
-            let b_leg_routes = uac_route_set_from_record_routes(b_leg_record_routes);
-
-            // Sent-by of the leg this ACK goes back on — the flow socket when
-            // the leg was dialled over one, so the ACK is consistent with the
-            // INVITE that drew this 2xx and leaves the same way (below).
-            let (ack_via_host, ack_via_port) =
-                b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
-            let mut ack_builder = SipMessageBuilder::new()
-                .request(Method::Ack, ack_uri)
-                .via(format!(
-                    "SIP/2.0/{} {}:{};branch={}",
-                    transport_str,
-                    ack_via_host,
-                    ack_via_port,
-                    TransactionKey::generate_branch(),
-                ))
-                .from(from.to_string())
-                .to(to.to_string())
-                .call_id(b_cid.clone())
-                .cseq(format!("{} ACK", cseq_num))
-                .header("Max-Forwards", "70".to_string());
-
-            // Add Route headers from reversed B-leg Record-Route
-            for route in &b_leg_routes {
-                ack_builder = ack_builder.header("Route", route.clone());
-            }
-
-            if let Ok(ack) = ack_builder.content_length(0).build() {
-                // ACK to 2xx is end-to-end and follows the dialog route set
-                // (RFC 3261 §13.2.2.4). Use the first Route URI as next hop
-                // rather than the cached B-leg destination, which may be an
-                // upstream that doesn't Record-Route (e.g. IMS I-CSCF).
-                let (ack_dest, ack_transport) =
-                    resolve_in_dialog_destination(&b_leg_routes, state, b_dest, b_transport);
-                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                    call.pending_b_leg_ack = Some((ack, ack_transport, ack_dest));
-                }
-                debug!(call_id = %call_id, destination = %ack_dest, "B2BUA: deferred B-leg ACK until A-leg ACKs");
+    let Some((leg_destination, leg_transport)) = snapshot.b_leg_dest else {
+        warn!(
+            call_id = %call_id,
+            "B2BUA: a B-leg 2xx on a leg with no recorded destination cannot be ACKed; \
+             the callee will retransmit it (RFC 3261 §13.3.1.4)"
+        );
+        return;
+    };
+    let route_set = uac_route_set_from_record_routes(
+        &message
+            .headers
+            .get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let (destination, transport) =
+        resolve_in_dialog_destination(&route_set, state, leg_destination, leg_transport);
+    // Sent-by of the leg this ACK goes back on: the flow socket when the leg was
+    // dialled over one, so the ACK leaves the way its INVITE did.
+    let (via_host, via_port) = b_leg_sent_by(snapshot.b_leg_local_addr, state, &leg_transport);
+    let Some(mut ack) = build_b2bua_ack_for_2xx(message, transport, &via_host, via_port) else {
+        return;
+    };
+    // A 2xx to an INVITE must carry a Contact (§12.1.1). For one that names it
+    // in compact form, or not at all, address the ACK to the remote target the
+    // leg already holds rather than to a placeholder no element can route.
+    if message.headers.get("Contact").is_none() {
+        let fallback = message
+            .headers
+            .get("m")
+            .map(|contact| crate::b2bua::actor::extract_contact_uri(contact))
+            .or_else(|| snapshot.b_leg_remote_contact.clone())
+            .or_else(|| snapshot.b_leg_target.clone())
+            .and_then(|uri| parse_uri_standalone(&uri).ok());
+        if let (Some(uri), StartLine::Request(request_line)) = (fallback, &mut ack.start_line) {
+            request_line.request_uri = uri;
+        }
+    }
+    send_b2bua_to_bleg(
+        ack,
+        transport,
+        destination,
+        snapshot.b_leg_local_addr,
+        state,
+    );
+    if let Some(index) = snapshot.b_leg_index {
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            if let Some(leg) = call.b_legs.get_mut(index) {
+                leg.initial_acked = true;
             }
         }
     }
+    debug!(call_id = %call_id, %destination, "B2BUA: ACKed B-leg 2xx");
 }
 
 /// Start the SIPREC recording session for a call `li.record()` marked,
@@ -739,14 +664,13 @@ pub fn start_li_recording(
 
 /// Turn the B-leg 2xx into the A-leg's answer: rewrite the dialog headers
 /// back to the A-leg's identifiers, restore its Via and CSeq (RFC 3261
-/// §8.2.6.2), sanitize, and persist both dialog route sets. Returns the
-/// B-leg Record-Route set, which the B-leg ACK needs (§12.1.1).
+/// §8.2.6.2), sanitize, and persist both dialog route sets.
 pub fn prepare_a_leg_answer(
     call_id: &str,
     response: &mut SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
-) -> Vec<String> {
+) {
     // Rewrite B-leg dialog headers back to A-leg identifiers.
     // The To-tag MUST be rewritten to A-leg's local_tag (RFC 3261 §12.2.1.1):
     // B-leg 2xx carries the B-leg far end's tag in To, but the A-leg far
@@ -784,8 +708,8 @@ pub fn prepare_a_leg_answer(
         }
     }
 
-    // Extract B-leg Record-Route BEFORE sanitization — needed for B-leg ACK Route set.
-    // Per RFC 3261 §12.1.1, the ACK route set is the Record-Route from the 200 OK reversed.
+    // Extract B-leg Record-Route BEFORE sanitization strips it: the B-leg
+    // dialog's route set is the 2xx's Record-Route reversed (RFC 3261 §12.1.2).
     let b_leg_record_routes = response
         .headers
         .get_all("Record-Route")
@@ -832,7 +756,6 @@ pub fn prepare_a_leg_answer(
     }
 
     // Persist dialog route sets for in-dialog requests (BYE, re-INVITE).
-    // Must happen before we consume the Record-Routes for ACK building.
     {
         // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
         // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
@@ -866,6 +789,4 @@ pub fn prepare_a_leg_answer(
             call.a_leg.dialog.route_set = a_routes;
         }
     }
-
-    b_leg_record_routes
 }
