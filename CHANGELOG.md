@@ -515,6 +515,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   their BYEs. The first teardown now claims the call and the others back off;
   a BYE that arrives while another teardown has the call is answered 200.
 
+- **HEP capture sees the messages siphon sends from background tasks, the
+  retransmissions above all.** The 2xx siphon retransmits to a caller until
+  the ACK (RFC 3261 §13.3.1.4) and a reliable provisional it retransmits until
+  the PRACK (RFC 3262 §3) are resent by a task that wrote straight to the
+  transport, past the capture every other send goes through. Homer showed each
+  of them once however many times it went out, so a caller that never ACKed
+  looked like a caller siphon never retransmitted to. Two more sends skipped
+  capture the same way: a request relayed over a captured flow
+  (`request.relay(flow=…)`), and the protected REGISTER an IMS UE registration
+  sends once its IPsec SAs are installed. All of them are captured now. A
+  deployment without `tracing.hep` does no extra work per message.
+
 - **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
   the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the
   profile offered the plain RTP core `RTP/SAVP` and answered the SRTP UE with `RTP/AVP`, so neither

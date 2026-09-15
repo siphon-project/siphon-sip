@@ -225,7 +225,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| HEP v3 over UDP | **Production** | `tracing.hep` | Homer integration |
+| HEP v3 over UDP | **Production** | `tracing.hep` | Homer integration. Every send is captured, the ones a background task makes included: the A-leg 2xx retransmitted until the ACK, the reliable 1xx retransmitted until the PRACK, and an IMS UE's protected REGISTER, as well as a `request.relay(flow=…)`. Those used to bypass capture. A task resolves its capture once when it is armed (`TaskCapture`), and gets none without HEP, so a deployment without capture does no extra work per message. Dispatcher tests in `dispatcher::retransmit_capture_tests`; the IPsec UE REGISTER task needs installed SAs and is not unit-tested. |
 | HEP over TCP | Implemented | `tracing.hep.transport: tcp` | |
 | HEP over TLS | Implemented | `tracing.hep.transport: tls` | With CA cert + SNI |
 | Custom agent ID | **Production** | `tracing.hep.agent_id` | |

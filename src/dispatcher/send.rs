@@ -33,11 +33,8 @@ pub(super) fn send_outbound_from(
 ) {
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
-        let local = source_local_addr
-            .or_else(|| state.listen_addrs.get(&transport).copied())
-            .unwrap_or(state.local_addr);
         hep.capture_outbound(
-            state.hep_local_addr(local, transport),
+            hep_capture_local(state, transport, source_local_addr),
             destination,
             transport,
             &data,
@@ -56,6 +53,57 @@ pub(super) fn send_outbound_from(
 
     if let Err(error) = state.outbound.send(outbound_message) {
         error!("failed to enqueue outbound message: {error}");
+    }
+}
+
+/// siphon's own endpoint on the HEP capture of a send leaving from
+/// `source_local_addr`: that socket, else the transport's listener, else the
+/// default local address, with a wildcard bind replaced by the advertised address
+/// ([`DispatcherState::hep_local_addr`]).
+fn hep_capture_local(
+    state: &DispatcherState,
+    transport: Transport,
+    source_local_addr: Option<SocketAddr>,
+) -> SocketAddr {
+    let local = source_local_addr
+        .or_else(|| state.listen_addrs.get(&transport).copied())
+        .unwrap_or(state.local_addr);
+    state.hep_local_addr(local, transport)
+}
+
+/// The HEP capture for the messages a spawned task puts on the wire.
+///
+/// A task that resends a message on a timer (the A-leg 2xx until its ACK, a
+/// reliable provisional until its PRACK) holds the outbound channel but no
+/// `DispatcherState`, so it cannot capture the way [`send_outbound_from`] does,
+/// and those sends used to reach the transport uncaptured. Everything the capture
+/// needs is resolved here, once, when the task is armed. Without HEP this is
+/// `None`: nothing is cloned or resolved, and the task pays one branch per send.
+#[derive(Clone)]
+pub(super) struct TaskCapture {
+    sender: Arc<HepSender>,
+    local: SocketAddr,
+}
+
+impl TaskCapture {
+    /// The capture for sends on `transport` leaving from `source_local_addr`, or
+    /// `None` when HEP capture is off.
+    pub(super) fn for_task(
+        state: &DispatcherState,
+        transport: Transport,
+        source_local_addr: Option<SocketAddr>,
+    ) -> Option<TaskCapture> {
+        let sender = state.hep_sender.as_ref()?;
+        Some(TaskCapture {
+            sender: Arc::clone(sender),
+            local: hep_capture_local(state, transport, source_local_addr),
+        })
+    }
+
+    /// Capture `data` as sent to `destination`.
+    pub(super) fn capture(&self, destination: SocketAddr, transport: Transport, data: &[u8]) {
+        self.sender
+            .capture_outbound(self.local, destination, transport, data);
     }
 }
 
@@ -106,10 +154,7 @@ pub(super) fn send_frames_in_order_from(
     // HEP sees each frame individually — they are distinct SIP messages on the
     // wire, and a capture that merged them would not decode.
     if let Some(ref hep) = state.hep_sender {
-        let local = source_local_addr
-            .or_else(|| state.listen_addrs.get(&transport).copied())
-            .unwrap_or(state.local_addr);
-        let local = state.hep_local_addr(local, transport);
+        let local = hep_capture_local(state, transport, source_local_addr);
         hep.capture_outbound(local, destination, transport, &first);
         for frame in &followups {
             hep.capture_outbound(local, destination, transport, frame);
