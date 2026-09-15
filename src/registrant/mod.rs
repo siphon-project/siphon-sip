@@ -301,6 +301,7 @@ impl UeIpsec {
             created_at: Instant::now(),
             role: SaRole::Ue,
             impi: None,
+            security_server: None,
         })
     }
 }

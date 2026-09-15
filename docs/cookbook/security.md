@@ -311,9 +311,36 @@ stamps every REGISTER.
 When SIPhon terminates the Gm hop as a B2BUA, an INVITE that requires `sec-agree`
 (in `Require` or `Proxy-Require`) is checked before your script runs, per RFC 3329
 §2.3.1. It is answered `494 Security Agreement Required` unless it arrived on a
-protected port over an active SA and its `Security-Verify` names that SA: the
-`ipsec-3gpp` algorithms, SPIs and protected ports your `Security-Server` was built
-from. The 494 carries that SA's `Security-Server`. The agreement ends at SIPhon: the
+protected port over an active SA and its `Security-Verify` mirrors the
+`Security-Server` your script put on the 401 for the REGISTER that set that SA up.
+SIPhon records that value on the SA when it relays the 401, and compares the two
+parameter for parameter, `q`, `prot` and `mod` included: names and values ignore
+case (a quoted string must match exactly), whitespace is ignored, and parameters
+and entries can come in any order. `PendingSA.refresh()` carries the value over to
+the re-keyed SA, and the 401 for the re-key records it again. An SA with nothing
+recorded (installed before an upgrade, or set up from a 401 SIPhon generated itself
+rather than relayed) is checked on what the SA holds instead: the `ipsec-3gpp`
+algorithms, SPIs and protected ports. A 494 over an SA carries its recorded
+`Security-Server`, or one built from the SA.
+
+A 494 to an unprotected request has no SA to name. Its `Security-Server` lists what
+SIPhon supports, one `ipsec-3gpp` line per transform with `alg` and `ealg` only:
+
+```
+Security-Server: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null
+Security-Server: ipsec-3gpp; alg=hmac-md5-96; ealg=null
+Security-Server: ipsec-3gpp; alg=hmac-sha-256-128; ealg=null
+Security-Server: ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc
+Security-Server: ipsec-3gpp; alg=hmac-md5-96; ealg=aes-cbc
+Security-Server: ipsec-3gpp; alg=hmac-sha-256-128; ealg=aes-cbc
+```
+
+TS 33.203 Annex H makes `spi-c`, `spi-s`, `port-c` and `port-s` mandatory for
+`ipsec-3gpp`. Leaving them out is deliberate: RFC 3329 §2.3.1 asks the 494 for the
+server's list of supported mechanisms, and before an SA exists there are no SPIs or
+ports to put in it. A UE gets the full syntax on the 401 to its REGISTER. The same
+list goes on the 494 to a call your script made require `sec-agree` without a
+verified agreement. The agreement ends at SIPhon: the
 B-leg INVITE carries no `sec-agree` in `Require` or `Proxy-Require` and no
 `Security-Verify` or `Security-Client`, unless your script sets them for an agreement
 of the B-leg's own.

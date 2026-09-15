@@ -512,6 +512,10 @@ pub struct SecurityAssociationPair {
     /// `Authorization` username of the REGISTER whose challenge keyed it.
     /// `None` when unknown, which never counts as a match.
     pub impi: Option<String>,
+    /// The `Security-Server` value on the 401 siphon relayed for the REGISTER
+    /// that set this pair up, which a later `Security-Verify` must mirror.
+    /// `None` until that 401 is relayed, and for a pair installed without one.
+    pub security_server: Option<String>,
 }
 
 /// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
@@ -2451,6 +2455,7 @@ mod tests {
             created_at: Instant::now(),
             role: SaRole::PCscf,
             impi: None,
+            security_server: None,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -2647,6 +2652,7 @@ mod tests {
             created_at: Instant::now(),
             role: SaRole::PCscf,
             impi: None,
+            security_server: None,
         }
     }
 

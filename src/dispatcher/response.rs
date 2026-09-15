@@ -1083,6 +1083,16 @@ pub(super) fn handle_response(
             // P-CSCF media-authorization 503 is unaffected.
             let status_code = downgrade_503_for_upstream(&mut message, status_code, &server_key);
 
+            // RFC 3329 §2.3.1: a later Security-Verify must mirror the
+            // Security-Server on this 401, so it is recorded on the SA pair it
+            // was built from before it goes to the UE.
+            if status_code == 401
+                && server_key.method == crate::sip::message::Method::Register
+                && message.headers.has("Security-Server")
+            {
+                crate::ipsec::runtime::record_security_server(&source_addr.ip(), &message);
+            }
+
             // Feed the response into the server transaction for caching
             let server_event = if status_code < 200 {
                 if server_key.method == crate::sip::message::Method::Invite {

@@ -437,9 +437,17 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
                 state,
             ) {
                 // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
-                // A 494 for an unverified `sec-agree` lists nothing.
+                // A 494 for an unverified `sec-agree` lists the server's
+                // mechanisms instead (RFC 3329 §2.3.1).
                 if status_code == 420 {
                     response.headers.set("Unsupported", unsupported.join(", "));
+                } else if status_code == 494 {
+                    for line in crate::ipsec::runtime::refusal_security_server_for(
+                        a_leg_local_addr.map(|address| address.port()),
+                        a_leg.transport.remote_addr,
+                    ) {
+                        response.headers.add("Security-Server", line);
+                    }
                 }
                 send_message_from(
                     response,

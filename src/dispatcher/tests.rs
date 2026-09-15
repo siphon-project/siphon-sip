@@ -2148,6 +2148,7 @@ fn agreement_sa(protocol: crate::ipsec::SaProtocol) -> crate::ipsec::SecurityAss
         created_at: std::time::Instant::now(),
         role: crate::ipsec::SaRole::PCscf,
         impi: None,
+        security_server: None,
     }
 }
 
