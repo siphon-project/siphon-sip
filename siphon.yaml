@@ -683,6 +683,13 @@ auth:
 #     timeout_ms: 1000              # NG protocol response timeout
 #   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
 #                                   # (masks remote endpoint identity, default: "SIPhon")
+#   sdp_strip_attributes: ["msid"] # SDP a= attributes removed from the SDP relayed
+#                                   # between B2BUA legs: session and media level, both
+#                                   # directions, with or without a value, names matched
+#                                   # case-insensitively. Runs after the media engine
+#                                   # rewrite. Bare names only (not "a=msid"); an invalid
+#                                   # name fails the config load. Default: none, and then
+#                                   # relayed SDP is not inspected.
 #   health_check_interval_secs: 5  # NG `ping` probe interval per instance (default 5).
 #                                   # Set 0 to disable.  Results are exported as
 #                                   # siphon_rtpengine_instances_up (count) and

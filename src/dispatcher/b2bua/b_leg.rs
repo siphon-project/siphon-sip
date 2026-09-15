@@ -566,6 +566,11 @@ pub fn b2bua_send_b_leg_invite(
             .headers
             .set("Content-Length", b_leg_invite.body.len().to_string());
     }
+    // `media.sdp_strip_attributes`, last: after the script's media engine offer
+    // and the o=/s= rewrite above. The copy stashed on the leg below is this
+    // message, and the 401/407 retry is rebuilt from that stash, so the retry
+    // carries the stripped SDP too.
+    strip_relayed_sdp_attributes(&mut b_leg_invite, state);
     // A call that ended while this INVITE was being built — a CANCEL or the ring
     // timeout landing during destination resolution — has nothing left to dial
     // for. Sending anyway rang the callee for a call nobody was on, with no

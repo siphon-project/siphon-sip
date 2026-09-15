@@ -353,6 +353,39 @@ pub(super) fn stamp_sdp_origin(
     }
 }
 
+/// Remove the `media.sdp_strip_attributes` names from the SDP a message carries
+/// from one leg of a B2BUA call to the other, correcting `Content-Length` when
+/// anything went.
+///
+/// The last SDP mutation on every relay path: after the media engine rewrote the
+/// SDP, so an attribute the engine carried through or added is removed as well,
+/// and after siphon's `o=`/`s=` rewrite. The engine itself is handed the SDP as
+/// the peer sent it. With nothing configured it returns before looking at the
+/// body, so the relay is byte-identical to one without the setting.
+pub(super) fn strip_relayed_sdp_attributes(message: &mut SipMessage, state: &DispatcherState) {
+    if state.sdp_strip_attributes.is_empty() || message.body.is_empty() {
+        return;
+    }
+    let content_type = message_content_type(message).to_string();
+    if crate::media::body::strip_sdp_attributes(
+        &content_type,
+        &mut message.body,
+        &state.sdp_strip_attributes,
+    ) {
+        message
+            .headers
+            .set("Content-Length", message.body.len().to_string());
+    }
+}
+
+/// [`strip_relayed_sdp_attributes`] for an SDP body siphon is about to send under
+/// its own `Content-Type: application/sdp`, before the message exists.
+pub(super) fn strip_relayed_sdp_body(body: &mut Vec<u8>, state: &DispatcherState) {
+    if !state.sdp_strip_attributes.is_empty() {
+        crate::media::sdp::strip_attributes(body, &state.sdp_strip_attributes);
+    }
+}
+
 /// Flip SDP direction attributes for an SRS answer.
 ///
 /// The SRC offers `a=sendonly` (it sends forked media to the SRS).  The SRS

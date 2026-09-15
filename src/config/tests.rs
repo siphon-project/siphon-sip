@@ -1982,6 +1982,58 @@ media:
 }
 
 // -----------------------------------------------------------------------
+// media.sdp_strip_attributes
+// -----------------------------------------------------------------------
+
+fn sdp_strip_yaml(media_lines: &str) -> String {
+    format!(
+        "listen:\n  udp:\n    - \"0.0.0.0:5060\"\ndomain:\n  local:\n    - \"example.com\"\n\
+         media:\n  rtpengine:\n    address: \"127.0.0.1:22222\"\n{media_lines}"
+    )
+}
+
+/// Unset or empty, nothing is stripped and the relay stays byte-identical.
+#[test]
+fn sdp_strip_attributes_defaults_to_empty() {
+    for media_lines in ["", "  sdp_strip_attributes: []\n"] {
+        let config = Config::from_str(&sdp_strip_yaml(media_lines)).unwrap();
+        assert!(
+            config.media.unwrap().sdp_strip_attributes.is_empty(),
+            "{media_lines:?}"
+        );
+    }
+}
+
+#[test]
+fn parses_sdp_strip_attributes() {
+    let config = Config::from_str(&sdp_strip_yaml(
+        "  sdp_strip_attributes: [\"msid\", \"X-Vendor-Tag\"]\n",
+    ))
+    .unwrap();
+    // Kept as written: matching is case-insensitive, so there is nothing to
+    // normalise, and an operator reading the config back sees their own spelling.
+    assert_eq!(
+        config.media.unwrap().sdp_strip_attributes,
+        vec!["msid".to_string(), "X-Vendor-Tag".to_string()]
+    );
+}
+
+/// A name that is not an RFC 8866 §9 token can never equal the name on an `a=`
+/// line, so the relay would read as scrubbed and strip nothing. Refused at load,
+/// with the offending entry named.
+#[test]
+fn rejects_an_sdp_strip_attribute_that_is_not_an_attribute_name() {
+    for bad in ["", "a=msid", "msid:1", "ms id"] {
+        let yaml = sdp_strip_yaml(&format!("  sdp_strip_attributes: [\"{bad}\"]\n"));
+        let message = Config::from_str(&yaml)
+            .expect_err("a non-token attribute name must be refused")
+            .to_string();
+        assert!(message.contains("sdp_strip_attributes"), "{message}");
+        assert!(message.contains(&format!("{bad:?}")), "{message}");
+    }
+}
+
+// -----------------------------------------------------------------------
 // Media profiles: WebSocket bridge / DSP / received_from / rtcp_mux
 // -----------------------------------------------------------------------
 

@@ -815,6 +815,11 @@ pub fn prepare_a_leg_answer(
         }
     }
 
+    // `media.sdp_strip_attributes`, last: after `@b2bua.on_answer` had the media
+    // engine answer and after the o= stamp. The A-leg 2xx retransmit is cloned
+    // from this message.
+    strip_relayed_sdp_attributes(response, state);
+
     // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
     // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg
     // 200 OK must contain the A-leg Record-Route so the UAC can build its route set.

@@ -11,7 +11,8 @@
 //! question of a body, and the answer has to be the same everywhere — which is
 //! what this module is for.
 
-use crate::siprec::multipart::parse_multipart;
+use crate::media::sdp::{is_attribute_line_named, retain_lines, strip_attributes};
+use crate::siprec::multipart::{extract_boundary, parse_multipart};
 
 /// The media type an SDP body is carried under.
 const SDP_MEDIA_TYPE: &str = "application/sdp";
@@ -68,6 +69,79 @@ pub fn sdp_from_body(content_type: &str, body: &[u8]) -> Result<Vec<u8>, String>
         .find(|part| is_sdp(&part.content_type))
         .map(|part| part.body.clone())
         .ok_or_else(|| format!("multipart body has no {SDP_MEDIA_TYPE} part"))
+}
+
+/// Remove the `a=` attributes named in `names` from the SDP a body carries,
+/// returning whether anything was removed.
+///
+/// Scoped the way [`sdp_from_body`] finds the SDP: the whole body under
+/// `application/sdp`, only the `application/sdp` parts of a `multipart/*` body,
+/// and nothing under any other type. The other parts of a multipart body and its
+/// MIME framing cross byte for byte: an ISUP part is binary, and a line in it
+/// that happens to read like an attribute is not one.
+pub fn strip_sdp_attributes(content_type: &str, body: &mut Vec<u8>, names: &[String]) -> bool {
+    if names.is_empty() || body.is_empty() {
+        return false;
+    }
+    if is_sdp(content_type) {
+        return strip_attributes(body, names);
+    }
+    if !is_multipart(content_type) {
+        return false;
+    }
+    let Ok(boundary) = extract_boundary(content_type) else {
+        // No boundary, no parts: there is no SDP part to strip.
+        return false;
+    };
+    let delimiter = format!("--{boundary}");
+    let mut section = MultipartSection::Outside;
+    retain_lines(body, |line| {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if let Some(after_delimiter) = content.strip_prefix(delimiter.as_bytes()) {
+            // `--boundary` opens a part, `--boundary--` closes the body.
+            section = if after_delimiter.starts_with(b"--") {
+                MultipartSection::Outside
+            } else {
+                MultipartSection::PartHeaders { sdp: false }
+            };
+            return true;
+        }
+        match section {
+            MultipartSection::PartHeaders { sdp } if content.is_empty() => {
+                section = MultipartSection::PartBody { sdp };
+                true
+            }
+            MultipartSection::PartHeaders { .. } => {
+                if let Some(value) = part_content_type(content) {
+                    section = MultipartSection::PartHeaders { sdp: is_sdp(value) };
+                }
+                true
+            }
+            MultipartSection::PartBody { sdp: true } => !is_attribute_line_named(line, names),
+            MultipartSection::PartBody { sdp: false } | MultipartSection::Outside => true,
+        }
+    })
+}
+
+/// Where a line of a multipart body sits, for [`strip_sdp_attributes`].
+#[derive(Clone, Copy)]
+enum MultipartSection {
+    /// The preamble before the first delimiter, or the epilogue after the last.
+    Outside,
+    /// A part's header block; `sdp` once its `Content-Type` has named SDP.
+    PartHeaders { sdp: bool },
+    /// A part's content, after the blank line that ends its headers.
+    PartBody { sdp: bool },
+}
+
+/// The value of a part header line, when that header is `Content-Type`.
+fn part_content_type(line: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(line).ok()?;
+    let (name, value) = text.split_once(':')?;
+    name.trim()
+        .eq_ignore_ascii_case("content-type")
+        .then_some(value.trim())
 }
 
 #[cfg(test)]
@@ -200,5 +274,117 @@ mod tests {
         // No boundary parameter at all: the body cannot even be split.
         let error = sdp_from_body("multipart/mixed", no_sdp.as_bytes()).expect_err("unparseable");
         assert!(error.contains("does not parse"), "was: {error}");
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_plain_sdp_body_loses_the_named_attributes() {
+        let mut body = concat!(
+            "v=0\r\n",
+            "a=x-hidden\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+            "a=x-hidden:detail\r\n",
+            "a=sendrecv\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert!(strip_sdp_attributes(
+            "Application/SDP; charset=utf-8",
+            &mut body,
+            &names(&["x-hidden"])
+        ));
+        assert_eq!(
+            String::from_utf8(body).expect("utf-8"),
+            "v=0\r\nm=audio 40000 RTP/AVP 0\r\na=sendrecv\r\n"
+        );
+    }
+
+    #[test]
+    fn only_the_sdp_part_of_a_multipart_body_is_stripped() {
+        // The other part carries a line spelled like the attribute. It is not
+        // SDP, so it has to cross byte for byte, and so do the preamble and the
+        // MIME framing.
+        let mut body = concat!(
+            "a=x-hidden:preamble\r\n",
+            "--siphon-1\r\n",
+            "content-type: application/sdp\r\n",
+            "\r\n",
+            "v=0\r\n",
+            "a=x-hidden\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+            "a=X-Hidden:detail\r\n",
+            "a=sendrecv\r\n",
+            "\r\n--siphon-1\r\n",
+            "Content-Type: application/vnd.example+xml\r\n",
+            "\r\n",
+            "a=x-hidden:not-sdp\r\n",
+            "--siphon-1--\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert!(strip_sdp_attributes(
+            "multipart/mixed;boundary=siphon-1",
+            &mut body,
+            &names(&["x-hidden"])
+        ));
+        assert_eq!(
+            String::from_utf8(body).expect("utf-8"),
+            concat!(
+                "a=x-hidden:preamble\r\n",
+                "--siphon-1\r\n",
+                "content-type: application/sdp\r\n",
+                "\r\n",
+                "v=0\r\n",
+                "m=audio 40000 RTP/AVP 0\r\n",
+                "a=sendrecv\r\n",
+                "\r\n--siphon-1\r\n",
+                "Content-Type: application/vnd.example+xml\r\n",
+                "\r\n",
+                "a=x-hidden:not-sdp\r\n",
+                "--siphon-1--\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_sdp_is_left_alone() {
+        let original = b"a=x-hidden:detail\r\n".to_vec();
+        for content_type in ["text/plain", "", "multipart/mixed"] {
+            // A multipart type with no boundary cannot be split into parts, so
+            // there is no SDP part to strip.
+            let mut body = original.clone();
+            assert!(
+                !strip_sdp_attributes(content_type, &mut body, &names(&["x-hidden"])),
+                "{content_type:?} was stripped"
+            );
+            assert_eq!(body, original, "{content_type:?} changed");
+        }
+    }
+
+    #[test]
+    fn a_multipart_body_whose_sdp_part_has_nothing_to_strip_is_untouched() {
+        let original = concat!(
+            "--b\r\n",
+            "Content-Type: application/sdp\r\n",
+            "\r\n",
+            "v=0\r\n",
+            "a=sendrecv\r\n",
+            "--b--\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut body = original.clone();
+
+        assert!(!strip_sdp_attributes(
+            "multipart/mixed;boundary=b",
+            &mut body,
+            &names(&["x-hidden"])
+        ));
+        assert_eq!(body, original);
     }
 }

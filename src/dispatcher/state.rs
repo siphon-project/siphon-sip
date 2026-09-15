@@ -184,6 +184,9 @@ pub struct DispatcherState {
     pub nat_fix_contact: bool,
     /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
     pub sdp_name: String,
+    /// SDP attribute names removed from the SDP relayed across a B2BUA call
+    /// (from media.sdp_strip_attributes config). Empty when not configured.
+    pub sdp_strip_attributes: Vec<String>,
     /// Per-call event receivers from B-leg actors.
     /// Keyed by internal call ID; the receiver gets [`CallEvent`]s from all
     /// B-leg actors belonging to that call.

@@ -423,6 +423,9 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             {
                 stamp_sdp_origin(&mut forwarded.body, &state.sdp_name, sess_id, version, None);
             }
+            // `media.sdp_strip_attributes`, last: after the media engine re-offer
+            // and the o= stamp.
+            strip_relayed_sdp_attributes(&mut forwarded, state);
             forwarded
                 .headers
                 .set("Content-Length", forwarded.body.len().to_string());

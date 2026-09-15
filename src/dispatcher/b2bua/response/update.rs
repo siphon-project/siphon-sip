@@ -172,6 +172,10 @@ pub fn forward_update_response(
             }
         }
 
+        // `media.sdp_strip_attributes`, last: after the media engine answer and
+        // the o= stamp.
+        strip_relayed_sdp_attributes(message, state);
+
         if (200..300).contains(&status_code) {
             // Session timer refresh on successful UPDATE (RFC 4028 §10).
             state.call_actors.reset_session_timer(call_id);

@@ -178,6 +178,10 @@ pub fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         }
     }
 
+    // The refresh is a clone of the caller's stored INVITE, body included, so the
+    // caller's SDP crosses to the callee again and gets `media.sdp_strip_attributes`.
+    strip_relayed_sdp_attributes(&mut reinvite, state);
+
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
     send_b2bua_to_bleg(
         reinvite,
@@ -261,6 +265,10 @@ pub fn b2bua_send_reinvite_on_leg(
     {
         stamp_sdp_origin(&mut sdp_body, &state.sdp_name, sess_id, version, None);
     }
+    // SDP another party described (a transfer target, a `Replaces` newcomer, a
+    // bridge peer), after any media engine rewrite the caller made:
+    // `media.sdp_strip_attributes`, last.
+    strip_relayed_sdp_body(&mut sdp_body, state);
     let Some(reinvite) = build_b2bua_in_dialog_request(
         &surviving,
         state,

@@ -165,6 +165,18 @@ pub struct MediaConfig {
     /// Hides the remote endpoint's identity (e.g. "FreeSWITCH") from the other leg.
     /// Defaults to "SIPhon" if not set.
     pub sdp_name: Option<String>,
+    /// SDP attribute names siphon removes from the SDP it relays between the two
+    /// legs of a B2BUA call, at session and media level, in both directions
+    /// (e.g. `["msid"]`).
+    ///
+    /// The other half of what `sdp_name` does: `o=` and `s=` are rewritten, but
+    /// every attribute otherwise crosses as the far side wrote it, including ones
+    /// that carry its internal identifiers.  Matched case-insensitively and
+    /// applied last on each relay path, after the media engine's rewrite, so an
+    /// attribute the engine carries through is removed from what goes on the
+    /// wire.  Empty by default, and then the relayed SDP is not looked at.
+    #[serde(default, deserialize_with = "deserialize_sdp_strip_attributes")]
+    pub sdp_strip_attributes: Vec<String>,
     /// Optional inbound event listener for rtpengine async notifications
     /// (DTMF, etc.).  Configure rtpengine with `dtmf-log-ng-tcp-uri=tcp://<this>`
     /// to make it deliver bencode-framed events here.
@@ -406,6 +418,33 @@ where
             }
         })
         .collect()
+}
+
+/// Serde deserializer for `media.sdp_strip_attributes`.
+///
+/// Each entry has to be an SDP attribute name, an RFC 8866 §9 `token`.  One that
+/// is not (an empty entry, `a=msid`, `msid:1`) can never match the name of an
+/// `a=` line, so the relay would read as scrubbed while stripping nothing.
+fn deserialize_sdp_strip_attributes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    let names: Vec<String> = Vec::deserialize(deserializer)?;
+    if let Some(invalid) = names
+        .iter()
+        .find(|name| !crate::media::sdp::is_attribute_name(name))
+    {
+        return Err(de::Error::custom(format!(
+            "media.sdp_strip_attributes entry {invalid:?} is not an SDP attribute name: give \
+             the bare name (\"msid\", not \"a=msid\" or \"msid:1\"), one or more letters, \
+             digits or !#$%&'*+-.^_`{{|}}~ (RFC 8866 §9 token)"
+        )));
+    }
+    Ok(names)
 }
 
 /// Validate a WebSocket URI field, naming `field` in the error.
