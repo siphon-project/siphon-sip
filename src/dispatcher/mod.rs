@@ -109,6 +109,8 @@ mod session_refresh_tests;
 #[cfg(test)]
 mod session_timer_legs_tests;
 #[cfg(test)]
+mod session_timer_min_se_tests;
+#[cfg(test)]
 mod session_timer_tests;
 #[cfg(test)]
 mod teardown_race_tests;

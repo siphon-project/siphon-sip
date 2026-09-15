@@ -1612,7 +1612,7 @@ impl PyCall {
             content_type,
         );
         if !sent {
-            tracing::error!(call_id = %self.id, "call.answer(): no live B2BUA call to answer");
+            tracing::error!(call_id = %self.id, "call.answer(): no 2xx sent: the call is gone, or its session interval was refused 422");
         }
         // Keeps the actor alive after the handler returns: the 2xx is already sent.
         self.action = CallAction::Answered;

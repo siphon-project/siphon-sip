@@ -6,13 +6,15 @@
 //! [`negotiate_relayed_session_timer`]), and driven by the sweep
 //! ([`session_timer_sweep`]): siphon refreshes the dialogs it is the refresher of
 //! ([`b2bua_send_session_refresh`]) and ends a call whose session ran out on
-//! either dialog.
+//! either dialog. A request for a session interval below siphon's minimum is
+//! refused with 422 ([`session_interval_refusal`], [`refuse_too_brief_refresh`]).
 
 use std::time::Instant;
 
 use crate::b2bua::session_timer::{
-    allows_update, answer_as_uas, min_se_of, requested_interval_of, uac_session_timer,
-    withdraw_from_answer, SessionTimerDue, SessionTimerPolicy, MIN_SESSION_INTERVAL,
+    allows_update, answer_as_uas, min_se_of, requested_interval_of, too_brief_session_interval,
+    uac_session_timer, withdraw_from_answer, SessionTimerDue, SessionTimerPolicy,
+    MIN_SESSION_INTERVAL,
 };
 use crate::dispatcher::*;
 use crate::sip::headers::SipHeaders;
@@ -555,6 +557,115 @@ pub fn note_session_refresh_request(
             .call_actors
             .update_leg_session_timer(call_id, from_a_leg, |timer| timer.raise_min_se(min_se));
     }
+}
+
+/// The 422 (Session Interval Too Small) that refuses `invite`, the INVITE of a
+/// call nobody has answered yet, when it asks for less than the minimum of the
+/// session timer siphon runs on the call (RFC 4028 §9,
+/// [`too_brief_session_interval`]). Built like every other final response siphon
+/// gives the caller ([`build_a_leg_final_response`]), with that minimum in
+/// `Min-SE`.
+///
+/// `None` takes the INVITE: an answered call, a call that runs no session timer,
+/// or an interval siphon accepts.
+pub fn session_interval_refusal(
+    state: &DispatcherState,
+    call_id: &str,
+    invite: &SipMessage,
+) -> Option<SipMessage> {
+    let a_leg = state.call_actors.get_call(call_id).and_then(|call| {
+        (!matches!(call.state, CallState::Answered | CallState::Terminated))
+            .then(|| call.a_leg.clone())
+    })?;
+    let policy = session_timer_policy(state, call_id)?;
+    let minimum = too_brief_session_interval(&invite.headers, &policy)?;
+    let mut response = build_a_leg_final_response(
+        invite,
+        &a_leg.dialog.local_tag,
+        a_leg.stored_from.as_ref(),
+        a_leg.stored_to.as_ref(),
+        422,
+        "Session Interval Too Small",
+        state.server_header.as_deref(),
+    );
+    response.headers.set("Min-SE", minimum.to_string());
+    info!(
+        call_id = %call_id,
+        requested = ?requested_interval_of(&invite.headers),
+        minimum,
+        "B2BUA: refusing the caller's session interval with 422, below siphon's minimum (RFC 4028 §9)"
+    );
+    Some(response)
+}
+
+/// Refuse the INVITE of a call nobody has answered yet with 422 when it asks for
+/// too brief a session interval ([`session_interval_refusal`]), and end the call
+/// the way every call that never connected ends: CDR, media, Ro reservation,
+/// control channel.
+///
+/// `@b2bua.on_failure` does not run. Nothing failed to connect: the caller's own
+/// request was refused, and the caller retries it at siphon's minimum (§7.3).
+/// Takes the INVITE's lock only to build the 422, so it is called with none held.
+/// Returns whether the INVITE was refused.
+pub fn refuse_too_brief_invite(
+    call_id: &str,
+    invite: &Arc<std::sync::Mutex<SipMessage>>,
+    state: &DispatcherState,
+) -> bool {
+    let refusal = match invite.lock() {
+        Ok(invite) => session_interval_refusal(state, call_id, &invite),
+        Err(_) => return false,
+    };
+    match refusal {
+        Some(response) => {
+            end_failed_call(call_id, FailedCallEnd::Refusal { response }, state);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Refuse a session refresh request, a re-INVITE or UPDATE from either party of a
+/// call, with 422 and siphon's minimum in `Min-SE` when it asks for too brief a
+/// session interval (RFC 4028 §9, [`too_brief_session_interval`]).
+///
+/// siphon is the UAS of the request on the dialog it arrived on, so it is
+/// answered there and never relayed, and the call carries on with the session it
+/// had. Returns whether the request was refused.
+pub fn refuse_too_brief_refresh(
+    call_id: &str,
+    inbound: &InboundMessage,
+    request: &SipMessage,
+    state: &DispatcherState,
+) -> bool {
+    let Some(minimum) = session_timer_policy(state, call_id)
+        .and_then(|policy| too_brief_session_interval(&request.headers, &policy))
+    else {
+        return false;
+    };
+    let mut response = build_response(
+        request,
+        422,
+        "Session Interval Too Small",
+        state.server_header.as_deref(),
+        &[],
+    );
+    response.headers.set("Min-SE", minimum.to_string());
+    info!(
+        call_id = %call_id,
+        requested = ?requested_interval_of(&request.headers),
+        minimum,
+        "B2BUA: refusing a session refresh with 422, below siphon's minimum (RFC 4028 §9)"
+    );
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    true
 }
 
 /// Settle what a final response to a re-INVITE decides beyond the ACK.

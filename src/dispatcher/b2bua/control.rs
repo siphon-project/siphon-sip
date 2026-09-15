@@ -299,6 +299,14 @@ pub fn send_uas_response(
     content_type: Option<&str>,
     final_response: bool,
 ) -> bool {
+    // RFC 4028 §9: an INVITE asking for too brief a session interval is answered
+    // 422, never 2xx, and the call ends.
+    if final_response && (200..300).contains(&code) {
+        if let Some(response) = session_interval_refusal(state, internal_call_id, invite) {
+            end_failed_call(internal_call_id, FailedCallEnd::Refusal { response }, state);
+            return false;
+        }
+    }
     let (transport, remote_addr, connection_id, local_addr, local_tag) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (

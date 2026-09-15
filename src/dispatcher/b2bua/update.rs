@@ -81,6 +81,12 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         }
     };
 
+    // RFC 4028 §9: a refresh asking for too brief a session interval is refused
+    // here, on the dialog it arrived on, and goes nowhere.
+    if refuse_too_brief_refresh(&call_id, &inbound, &message, state) {
+        return;
+    }
+
     // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
     // later siphon-terminated transfer offers this leg's current media if it is
     // the survivor.

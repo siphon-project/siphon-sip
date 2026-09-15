@@ -580,6 +580,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   API's call `session_timer` changes shape: `{caller, callee}`, one object per dialog or `null`,
   with `refresher` now `siphon` or `peer`.
 
+- **A B2BUA refuses a session interval below its minimum with 422 Session Interval Too Small (RFC
+  4028 §9).** A party that supports session timers and asked for a `Session-Expires` below siphon's
+  `min_se` (the `session_timer:` block's, or `call.session_timer(min_se=...)`) was taken at that
+  interval, and siphon's own refreshes then raised it. siphon now answers 422 with its minimum in
+  `Min-SE`, so the party can retry at that interval (§7.3). An initial INVITE is refused once the
+  script has decided, before the call is dialled, handed over or answered (`call.answer()`
+  included), and the call ends like any call that never connected (CDR, media, Ro reservation)
+  without running `@b2bua.on_failure`. A re-INVITE or UPDATE refresh from either party is refused
+  on its own dialog and not relayed, and the call carries on. A party without timer support cannot
+  act on a 422, so its request is taken as before.
+
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own

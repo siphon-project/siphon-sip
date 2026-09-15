@@ -92,7 +92,8 @@ pub fn classify_failure_action(
     }
 }
 
-/// The failure a call ends on when `@b2bua.on_failure` leaves it be.
+/// The failure a call ends on: one `@b2bua.on_failure` left be, or a refusal of
+/// the caller's request, which runs no handler.
 pub enum FailedCallEnd<'a> {
     /// A B-leg's own final response, relayed to the caller as the leg that
     /// sent it.
@@ -102,22 +103,28 @@ pub enum FailedCallEnd<'a> {
     },
     /// A final response siphon builds for the caller from its own INVITE.
     Local { status_code: u16, reason: String },
+    /// A refusal of the caller's own request that siphon has already built, with
+    /// the headers only that refusal carries: a 422 (Session Interval Too Small)
+    /// and its `Min-SE` (RFC 4028 §9). Sent as it is.
+    Refusal { response: SipMessage },
 }
 
 impl FailedCallEnd<'_> {
     /// The status and reason phrase the caller would be sent.
     fn status_and_reason(&self) -> (u16, String) {
-        match self {
-            FailedCallEnd::Relayed { message, .. } => match &message.start_line {
-                StartLine::Response(status_line) => {
-                    (status_line.status_code, status_line.reason_phrase.clone())
-                }
-                StartLine::Request(_) => (500, best_error_reason(500).to_string()),
-            },
+        let response = match self {
+            FailedCallEnd::Relayed { message, .. } => &**message,
+            FailedCallEnd::Refusal { response } => response,
             FailedCallEnd::Local {
                 status_code,
                 reason,
-            } => (*status_code, reason.clone()),
+            } => return (*status_code, reason.clone()),
+        };
+        match &response.start_line {
+            StartLine::Response(status_line) => {
+                (status_line.status_code, status_line.reason_phrase.clone())
+            }
+            StartLine::Request(_) => (500, best_error_reason(500).to_string()),
         }
     }
 }
@@ -349,7 +356,7 @@ fn reroute_failed_call(
 /// End a failed call with `end`: close the CDR on the status the caller is
 /// sent, send it, tell a control app why, release the media and the Ro
 /// reservation, and remove the call.
-fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &DispatcherState) {
+pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &DispatcherState) {
     let (status_code, reason) = end.status_and_reason();
     let Some((a_leg, a_leg_invite, a_leg_local_addr)) =
         state.call_actors.get_call(call_id).map(|call| {
@@ -395,6 +402,16 @@ fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &DispatcherStat
                     state,
                 );
             }
+        }
+        FailedCallEnd::Refusal { response } => {
+            send_message_from(
+                response,
+                a_leg.transport.transport,
+                a_leg.transport.remote_addr,
+                a_leg.transport.connection_id,
+                a_leg_local_addr,
+                state,
+            );
         }
     }
 

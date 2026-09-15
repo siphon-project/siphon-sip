@@ -521,6 +521,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // new one to route, and the dial plan has no say in where it goes.
     if !matches!(action, CallAction::Reject { .. } | CallAction::None) {
         if let Some(pending) = state.call_actors.take_pending_replaces(&call_id) {
+            if refuse_too_brief_invite(&call_id, &message_arc, state) {
+                return;
+            }
             let Ok(message_guard) = message_arc.lock() else {
                 error!("message_arc lock poisoned in B2BUA invite handler");
                 return;
@@ -548,6 +551,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 answer = policy.answer_first(),
                 "B2BUA: handing over to the control plane (control.inbound, no script)"
             );
+            if refuse_too_brief_invite(&call_id, &message_arc, state) {
+                return;
+            }
             let Ok(message_guard) = message_arc.lock() else {
                 error!("message_arc lock poisoned in B2BUA invite handler");
                 return;
@@ -667,6 +673,12 @@ pub fn apply_routing_action(
     reply_to: &InboundMessage,
     state: &DispatcherState,
 ) {
+    // RFC 4028 §9: a caller asking for less than the minimum session interval of
+    // the timer siphon runs on the call is refused before the call goes anywhere.
+    // Checked after the handler, which may have set that timer.
+    if refuse_too_brief_invite(call_id, invite_arc, state) {
+        return;
+    }
     let Ok(message_guard) = invite_arc.lock() else {
         error!(call_id = %call_id, "B2BUA: A-leg INVITE lock poisoned — the call cannot be routed");
         return;

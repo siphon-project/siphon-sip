@@ -139,6 +139,26 @@ pub fn answer_as_uas(
     })
 }
 
+/// The `Min-SE` of the 422 (Session Interval Too Small) siphon refuses `request`
+/// with, a session refresh request siphon is the UAS of, or `None` to take it
+/// (RFC 4028 §9).
+///
+/// siphon refuses a request whose `Session-Expires` asks for less than its own
+/// minimum, the policy's `min_se` and never under 90 seconds, and names that
+/// minimum. It refuses only a UAC that supports the extension, which is the one
+/// §9 lets a UAS send the 422 to and the one that can retry at the larger
+/// interval. A request that asks for no interval, or at least the minimum, is
+/// taken.
+pub fn too_brief_session_interval(
+    request: &SipHeaders,
+    policy: &SessionTimerPolicy,
+) -> Option<u32> {
+    let requested = parse_session_expires(request)?.delta_seconds;
+    let minimum = policy.min_se.max(MIN_SESSION_INTERVAL);
+    let supports_timer = lists_timer(request, "Supported") || lists_timer(request, "Require");
+    (supports_timer && requested < minimum).then_some(minimum)
+}
+
 /// The session timer headers of a session refresh request, everything
 /// [`answer_as_uas`] reads: its `Session-Expires`, `Min-SE`, `Supported` and
 /// `Require`.
@@ -541,6 +561,61 @@ mod tests {
         assert_eq!(
             interval(&[("Supported", "timer"), ("Min-SE", "1200")], 900),
             Some(1200)
+        );
+    }
+
+    /// RFC 4028 §9: a UAC that supports the extension and asks for less than
+    /// siphon's minimum is refused with that minimum, never under 90 seconds. One
+    /// that does not support it, one asking for the minimum, and one asking for no
+    /// interval are taken.
+    #[test]
+    fn only_a_supporting_uac_asking_below_the_minimum_is_too_brief() {
+        let minimum_300 = SessionTimerPolicy {
+            session_expires: 1800,
+            min_se: 300,
+            preference: SessionRefresher::Uac,
+        };
+        let refused = |request: &[(&str, &str)], policy: &SessionTimerPolicy| {
+            too_brief_session_interval(&headers(request), policy)
+        };
+        assert_eq!(
+            refused(
+                &[("Supported", "timer"), ("Session-Expires", "120")],
+                &minimum_300
+            ),
+            Some(300)
+        );
+        assert_eq!(
+            refused(
+                &[
+                    ("Require", "timer"),
+                    ("Session-Expires", "299;refresher=uac")
+                ],
+                &minimum_300
+            ),
+            Some(300)
+        );
+        assert_eq!(
+            refused(
+                &[("Supported", "timer"), ("Session-Expires", "300")],
+                &minimum_300
+            ),
+            None
+        );
+        assert_eq!(refused(&[("Session-Expires", "120")], &minimum_300), None);
+        assert_eq!(refused(&[("Supported", "timer")], &minimum_300), None);
+
+        let below_the_floor = SessionTimerPolicy {
+            session_expires: 1800,
+            min_se: 30,
+            preference: SessionRefresher::Uac,
+        };
+        assert_eq!(
+            refused(
+                &[("Supported", "timer"), ("Session-Expires", "60")],
+                &below_the_floor
+            ),
+            Some(MIN_SESSION_INTERVAL)
         );
     }
 
