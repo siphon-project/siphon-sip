@@ -113,6 +113,8 @@ export type {
   OriginateMedia,
   OriginateOptions,
   Originated,
+  SessionRefresher,
+  SessionTimer,
   ResponseOptions,
   AnchoredAnswerOptions,
   ReferReplaces,

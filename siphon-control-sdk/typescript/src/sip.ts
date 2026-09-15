@@ -228,6 +228,27 @@ export type OriginateMedia =
   /** Your own body with its own content type. */
   | { body: string; contentType: string };
 
+/**
+ * Who refreshes each dialog of an originated call where the RFC 4028 negotiation
+ * leaves siphon the choice (§7.1): the UAC of each dialog, the UAS of each, or
+ * siphon on both.
+ */
+export type SessionRefresher = "uac" | "uas" | "b2bua";
+
+/**
+ * The RFC 4028 session timer siphon runs on an originated call, over its
+ * `session_timer:` block. A field left out takes the server's default, as in the
+ * script API's `call.session_timer()`: 1800 s, a `Min-SE` of 90 s, and `b2bua`.
+ */
+export interface SessionTimer {
+  /** The session interval, in seconds. */
+  expires?: number;
+  /** The smallest session interval siphon accepts, in seconds. */
+  minSe?: number;
+  /** Who refreshes where the negotiation leaves siphon the choice. */
+  refresher?: SessionRefresher;
+}
+
 /** Optional shaping for {@link SipClient.originate}. */
 export interface OriginateOptions {
   /** From-URI to place the call as. */
@@ -250,6 +271,11 @@ export interface OriginateOptions {
   onLost?: string;
   /** Per-call variables carried on the channel. */
   vars?: Record<string, string>;
+  /**
+   * The RFC 4028 session timer to run on the call; left out, the one the server
+   * has configured runs, if any.
+   */
+  sessionTimer?: SessionTimer;
 }
 
 /**
@@ -298,6 +324,14 @@ export function originateArgs(
   if (options.timeout !== undefined) args.timeout = options.timeout;
   if (options.onLost !== undefined) args.on_lost = options.onLost;
   if (options.vars !== undefined) args.vars = options.vars;
+  if (options.sessionTimer !== undefined) {
+    const timer: Record<string, unknown> = {};
+    const { expires, minSe, refresher } = options.sessionTimer;
+    if (expires !== undefined) timer.expires = expires;
+    if (minSe !== undefined) timer.min_se = minSe;
+    if (refresher !== undefined) timer.refresher = refresher;
+    args.session_timer = timer;
+  }
   return args;
 }
 

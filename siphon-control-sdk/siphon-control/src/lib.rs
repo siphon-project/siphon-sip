@@ -72,17 +72,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
-use siphon_control_client::proto::sip::PeerHangupPolicy;
 use siphon_control_client::proto::ControlErrorCode;
 use siphon_control_client::sip::{
-    Call as RustCall, DtmfOptions, PlayOptions, PlaySource, RouteTarget, SipClient, SipServer,
+    Call as RustCall, DtmfOptions, OriginateOptions, OriginatePrivacy, PlayOptions, SipClient,
+    SipServer,
 };
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
+
+mod args;
+
+use args::{
+    build_play_source, extract_headers, extract_route_target, extract_session_timer,
+    extract_string_pairs, originate_media, parse_peer_hangup,
+};
 
 // ---------------------------------------------------------------------------
 // Interpreter lifecycle
@@ -207,96 +214,6 @@ fn to_pyerr(error: ClientError) -> PyErr {
         let _ = err.value(py).setattr("code", code);
     });
     err
-}
-
-/// Extract one `route` target: a bare URI `str`, or a dict
-/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`.
-fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
-    if let Ok(uri) = item.extract::<String>() {
-        return Ok(RouteTarget::uri(uri));
-    }
-    let dict = item.cast::<pyo3::types::PyDict>().map_err(|_| {
-        PyValueError::new_err(
-            "each route target must be a URI str or a dict {uri, next_hop, headers, timeout}",
-        )
-    })?;
-    let uri: String = match dict.get_item("uri")? {
-        Some(value) => value.extract()?,
-        None => {
-            return Err(PyValueError::new_err(
-                "route target dict requires a string 'uri'",
-            ))
-        }
-    };
-    let next_hop = match dict.get_item("next_hop")? {
-        Some(value) if !value.is_none() => Some(value.extract::<String>()?),
-        _ => None,
-    };
-    let headers = match dict.get_item("headers")? {
-        Some(value) if !value.is_none() => extract_headers(&value)?,
-        _ => Vec::new(),
-    };
-    let timeout_secs = match dict.get_item("timeout")? {
-        Some(value) if !value.is_none() => Some(value.extract::<u32>()?),
-        _ => None,
-    };
-    // A policy flag: anything but a real bool is refused, as the server refuses
-    // it, rather than read as false and quietly left on the default rule.
-    let reroute_after_progress = match dict.get_item("reroute_after_progress")? {
-        Some(value) if !value.is_none() => value.extract::<bool>().map_err(|_| {
-            PyTypeError::new_err("route target 'reroute_after_progress' must be a bool")
-        })?,
-        _ => false,
-    };
-    Ok(RouteTarget {
-        uri,
-        next_hop,
-        headers,
-        timeout_secs,
-        reroute_after_progress,
-    })
-}
-
-/// Build a [`PlaySource`] from the mutually-exclusive `file` / `db_id` / `blob`
-/// kwargs (exactly one must be set — mirrors the in-process `play_media`).
-fn build_play_source(
-    file: Option<String>,
-    db_id: Option<u64>,
-    blob: Option<Vec<u8>>,
-) -> PyResult<PlaySource> {
-    match (file, db_id, blob) {
-        (Some(file), None, None) => Ok(PlaySource::file(file)),
-        (None, Some(db_id), None) => Ok(PlaySource::db_id(db_id)),
-        (None, None, Some(blob)) => Ok(PlaySource::blob(blob)),
-        _ => Err(PyValueError::new_err(
-            "play requires exactly one of file (str), db_id (int), or blob (bytes)",
-        )),
-    }
-}
-
-/// Parse the `on_peer_hangup` argument of `bridge`. Refused here rather than at
-/// the server, so a typo raises before anything touches the two live calls.
-fn parse_peer_hangup(policy: Option<String>) -> PyResult<Option<PeerHangupPolicy>> {
-    match policy {
-        None => Ok(None),
-        Some(token) => PeerHangupPolicy::parse(&token).map(Some).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "on_peer_hangup must be \"hangup\" or \"hold\", got {token:?}"
-            ))
-        }),
-    }
-}
-
-/// Extract a `{name: value}` header dict into ordered string pairs.
-fn extract_headers(object: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
-    let dict = object
-        .cast::<pyo3::types::PyDict>()
-        .map_err(|_| PyValueError::new_err("headers must be a dict of str -> str"))?;
-    let mut pairs = Vec::with_capacity(dict.len());
-    for (key, value) in dict.iter() {
-        pairs.push((key.extract::<String>()?, value.extract::<String>()?));
-    }
-    Ok(pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +912,121 @@ impl ControlClient {
                 .command(module.as_deref(), &verb, target, args)
                 .await
                 .map_err(to_pyerr)?;
+            attach_if_running(|py| json_to_py(py, &value))
+                .unwrap_or_else(|| Err(interpreter_gone()))
+        })
+    }
+
+    /// Place an outbound call under a caller-supplied channel id.
+    ///
+    /// The one verb that creates a channel rather than addressing one. It
+    /// resolves as soon as the INVITE is on the wire, to `{"channel", "call_id",
+    /// "sip_call_id"}`: the call is `calling`, and the answer, a failure or the
+    /// ring timeout arrive later as events on the channel.
+    ///
+    /// Exactly one media plan: `media=True` (siphon anchors the leg, shaped by
+    /// `profile` / `ws_uri`), `sdp=` (your own offer) or `body=` with its
+    /// `content_type`. `from_uri`, `from_display`, `to_display`, `next_hop`,
+    /// `p_asserted_identity`, `privacy` (`"allowed"` / `"restricted"`), `headers`,
+    /// `timeout`, `on_lost` and `vars` shape the call as on the server.
+    /// `session_timer={"expires": 1800, "min_se": 90, "refresher": "b2bua"}` runs an
+    /// RFC 4028 session timer on it, each key left out taking the server's
+    /// default; left out entirely, the configured timer runs.
+    ///
+    /// Raises `ValueError` before anything is sent for what the server would
+    /// refuse (no media plan or two, an unknown privacy, a session timer siphon
+    /// cannot run), and `ControlError` for the server's own refusals (`conflict`
+    /// for a channel id in use, `not_found` for no route, ...).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        channel,
+        to,
+        *,
+        media=false,
+        profile=None,
+        ws_uri=None,
+        sdp=None,
+        body=None,
+        content_type=None,
+        from_uri=None,
+        from_display=None,
+        to_display=None,
+        next_hop=None,
+        p_asserted_identity=None,
+        privacy=None,
+        headers=None,
+        timeout=None,
+        on_lost=None,
+        vars=None,
+        session_timer=None,
+    ))]
+    fn originate<'py>(
+        &self,
+        py: Python<'py>,
+        channel: String,
+        to: String,
+        media: bool,
+        profile: Option<String>,
+        ws_uri: Option<String>,
+        sdp: Option<String>,
+        body: Option<String>,
+        content_type: Option<String>,
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        to_display: Option<String>,
+        next_hop: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
+        headers: Option<Bound<'py, PyAny>>,
+        timeout: Option<u64>,
+        on_lost: Option<String>,
+        vars: Option<Bound<'py, PyAny>>,
+        session_timer: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let plan = originate_media(media, profile, ws_uri, sdp, body, content_type)?;
+        let privacy = match privacy.as_deref() {
+            None => None,
+            Some("allowed") => Some(OriginatePrivacy::Allowed),
+            Some("restricted") => Some(OriginatePrivacy::Restricted),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "originate privacy must be \"allowed\" or \"restricted\", not {other:?}"
+                )))
+            }
+        };
+        let options = OriginateOptions {
+            from: from_uri,
+            from_display,
+            to_display,
+            next_hop,
+            p_asserted_identity,
+            privacy,
+            headers: headers
+                .map(|headers| extract_headers(&headers))
+                .transpose()?
+                .unwrap_or_default(),
+            timeout,
+            on_lost,
+            vars: vars
+                .map(|vars| extract_string_pairs(&vars, "vars"))
+                .transpose()?
+                .unwrap_or_default(),
+            session_timer: session_timer
+                .map(|timer| extract_session_timer(&timer))
+                .transpose()?,
+        };
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            let placed = client
+                .originate(&channel, &to, plan, options)
+                .await
+                .map_err(to_pyerr)?;
+            let value = serde_json::json!({
+                "channel": placed.channel,
+                "call_id": placed.call_id,
+                "sip_call_id": placed.sip_call_id,
+            });
             attach_if_running(|py| json_to_py(py, &value))
                 .unwrap_or_else(|| Err(interpreter_gone()))
         })

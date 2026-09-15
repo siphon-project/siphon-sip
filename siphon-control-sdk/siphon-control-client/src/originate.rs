@@ -108,6 +108,93 @@ impl OriginatePrivacy {
     }
 }
 
+/// Who refreshes each dialog of an originated call where the RFC 4028 negotiation
+/// leaves siphon the choice (§7.1): the UAC of each dialog, the UAS of each, or
+/// siphon on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefresher {
+    /// The UAC of each dialog.
+    Uac,
+    /// The UAS of each dialog.
+    Uas,
+    /// siphon, on both dialogs.
+    B2bua,
+}
+
+impl SessionRefresher {
+    /// The wire token the server parses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionRefresher::Uac => "uac",
+            SessionRefresher::Uas => "uas",
+            SessionRefresher::B2bua => "b2bua",
+        }
+    }
+
+    /// The refresher called `name`, in any case: `uac`, `uas` or `b2bua`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "uac" => Some(SessionRefresher::Uac),
+            "uas" => Some(SessionRefresher::Uas),
+            "b2bua" => Some(SessionRefresher::B2bua),
+            _ => None,
+        }
+    }
+}
+
+/// The RFC 4028 session timer siphon runs on an originated call, over its
+/// `session_timer:` block.
+///
+/// A field left `None` takes the server's default, as in the script API's
+/// `call.session_timer()`: an interval of 1800 s, a `Min-SE` of 90 s, and
+/// [`SessionRefresher::B2bua`]. The INVITE asks for the timer, the callee's 2xx
+/// says who refreshes, and siphon refreshes the dialog or releases the call before
+/// a session the callee let run out expires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTimer {
+    /// The session interval, in seconds.
+    pub expires: Option<u32>,
+    /// The smallest session interval siphon accepts, in seconds.
+    pub min_se: Option<u32>,
+    /// Who refreshes where the negotiation leaves siphon the choice.
+    pub refresher: Option<SessionRefresher>,
+}
+
+impl SessionTimer {
+    /// Ask for this session interval, in seconds.
+    pub fn expires(mut self, seconds: u32) -> Self {
+        self.expires = Some(seconds);
+        self
+    }
+
+    /// Accept no session interval shorter than this, in seconds.
+    pub fn min_se(mut self, seconds: u32) -> Self {
+        self.min_se = Some(seconds);
+        self
+    }
+
+    /// Prefer this refresher.
+    pub fn refresher(mut self, refresher: SessionRefresher) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// The `session_timer` object the server parses, with only the fields set.
+    pub(crate) fn to_json(self) -> serde_json::Value {
+        let mut timer = serde_json::Map::new();
+        if let Some(expires) = self.expires {
+            timer.insert("expires".to_string(), json!(expires));
+        }
+        if let Some(min_se) = self.min_se {
+            timer.insert("min_se".to_string(), json!(min_se));
+        }
+        if let Some(refresher) = self.refresher {
+            timer.insert("refresher".to_string(), json!(refresher.as_str()));
+        }
+        serde_json::Value::Object(timer)
+    }
+}
+
 /// Optional shaping for [`SipClient::originate`]; every field defaults to the
 /// server's behaviour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +220,9 @@ pub struct OriginateOptions {
     pub on_lost: Option<String>,
     /// Per-call variables carried on the channel.
     pub vars: Vec<(String, String)>,
+    /// The RFC 4028 session timer to run on the call; `None` runs the one the
+    /// server has configured, if any.
+    pub session_timer: Option<SessionTimer>,
 }
 
 impl OriginateOptions {
@@ -178,6 +268,12 @@ impl OriginateOptions {
         self
     }
 
+    /// Run this RFC 4028 session timer on the call.
+    pub fn session_timer(mut self, timer: SessionTimer) -> Self {
+        self.session_timer = Some(timer);
+        self
+    }
+
     pub(crate) fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         let mut put = |name: &str, value: &Option<String>| {
             if let Some(value) = value {
@@ -201,6 +297,9 @@ impl OriginateOptions {
         }
         if !self.vars.is_empty() {
             args.insert("vars".to_string(), headers_to_json(&self.vars));
+        }
+        if let Some(timer) = self.session_timer {
+            args.insert("session_timer".to_string(), timer.to_json());
         }
     }
 }

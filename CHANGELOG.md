@@ -127,7 +127,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   places, where before a controller only ever got the configured timer. It is validated by the
   same rules as the script API, and a timer siphon cannot run (a key no timer has, a `refresher`
   other than `uac`, `uas` or `b2bua`, an interval that is not a whole number of seconds) is
-  `bad_request`. Left out, the configured timer runs, as before.
+  `bad_request`. Left out, the configured timer runs, as before. The control SDKs carry it,
+  omitted by default so existing callers are unchanged: Rust `OriginateOptions::session_timer(
+  SessionTimer)`, TypeScript `sessionTimer`, and Python `session_timer={...}` on a new typed
+  `ControlClient.originate()`, which the Python SDK lacked (placing a call meant the raw
+  `command`). Each refuses a timer the server would refuse before a frame goes out.
 
 - **`auth.backend: database` is implemented.** A SQL credential source under
   `auth.database`: a libpq `url`, a `query` that binds the digest username to

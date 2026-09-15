@@ -553,6 +553,30 @@ describe("originate args map to the names the server parses", () => {
     });
   });
 
+  it("sends a session timer as the object the server parses, with only the keys given", () => {
+    expect(
+      originateArgs(
+        "out-1",
+        "sip:1001@pbx.example",
+        { anchor: true },
+        { sessionTimer: { expires: 90, refresher: "uac" } },
+      ),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      media: true,
+      session_timer: { expires: 90, refresher: "uac" },
+    });
+    expect(
+      originateArgs(
+        "out-1",
+        "sip:1001@pbx.example",
+        { anchor: true },
+        { sessionTimer: { expires: 1800, minSe: 120, refresher: "b2bua" } },
+      ).session_timer,
+    ).toEqual({ expires: 1800, min_se: 120, refresher: "b2bua" });
+  });
+
   it("omits untouched options rather than sending undefined", () => {
     const args = originateArgs("out-1", "sip:1001@pbx.example", { anchor: true }, {});
     expect(Object.keys(args).sort()).toEqual(["channel", "media", "to"]);
