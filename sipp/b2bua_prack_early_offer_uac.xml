@@ -40,7 +40,9 @@ Content-Length: 0
             check_it="true" assign_to="junk" />
       <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
             check_it="true" assign_to="junk,rseq_progress" />
-      <ereg regexp="^[[:space:]]*7[[:space:]]*$" search_in="hdr" header="RSeq:"
+      <!-- Not anchored: SIPp matches against " 7", which an anchored
+           bracket-class pattern never matched. -->
+      <ereg regexp="(^|[^0-9])7([^0-9]|$)" search_in="hdr" header="RSeq:"
             check_it_inverse="true" assign_to="junk" />
       <ereg regexp="m=audio" search_in="body"
             check_it="true" assign_to="junk" />
