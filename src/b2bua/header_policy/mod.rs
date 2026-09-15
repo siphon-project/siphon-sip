@@ -31,6 +31,24 @@ use crate::sip::message::SipMessage;
 /// unset `b2bua.default_header_policy`, or a name that could not be found.
 pub const DEFAULT_PRESET_NAME: &str = "transparent-b2bua@2026";
 
+/// Option tags for extensions the two endpoints of a B2BUA call negotiate with
+/// each other *through* siphon, rather than with siphon.
+///
+/// Preconditions (RFC 3312, RFC 4032) are the one the preset library is built
+/// around: the `precondition` tag travels in `Supported`/`Require` in both
+/// directions (RFC 3312 §11) and the preconditions themselves ride the SDP, all
+/// of which a B2BUA relays. So the tag can cross only under a policy that
+/// [relays capability negotiation](ResolvedPolicy::relays_capability_negotiation).
+///
+/// Deliberately short, because a tag that is not listed is not claimed. An
+/// extension tied to state siphon regenerates per leg — dialog identifiers
+/// (`join`, `tdialog`), the Contact (`gruu`), the route or flow (`path`,
+/// `outbound`, `sec-agree`), or another method's semantics (`eventlist`) — can
+/// never be negotiated across a B2BUA. `100rel`, `timer` and `replaces`, which
+/// siphon implements on the B-leg itself, follow their own rules in the
+/// dispatcher.
+pub const END_TO_END_OPTION_TAGS: &[&str] = &["precondition"];
+
 // ---------------------------------------------------------------------------
 // Verbs
 // ---------------------------------------------------------------------------
@@ -285,6 +303,36 @@ impl ResolvedPolicy {
             return v;
         }
         self.preset.response.verb_for(header_name).clone()
+    }
+
+    /// Whether this policy carries capability negotiation across the B2BUA in
+    /// both directions: `Supported` and `Require` copied on the A→B request and
+    /// on the B→A response alike.
+    ///
+    /// That is what an extension the two endpoints negotiate with each other
+    /// needs from the hop in the middle. The caller's `Supported`/`Require` has
+    /// to reach the callee, and the callee's `Require` on its answer has to come
+    /// back, or the caller never learns the extension is in use. A policy that
+    /// strips either on responses (`transparent-b2bua@2026` strips both) would
+    /// leave such an extension half-negotiated. Per-call deltas count:
+    /// `copy=["Supported", "Require"]` opens it, `strip=["Require"]` closes it.
+    pub fn relays_capability_negotiation(&self) -> bool {
+        ["Supported", "Require"].iter().all(|header| {
+            self.verb_for_request(header) == Verb::Copy
+                && self.verb_for_response(header) == Verb::Copy
+        })
+    }
+
+    /// The option tags this policy passes end to end, which the B-leg INVITE
+    /// carries when the caller offered them: [`END_TO_END_OPTION_TAGS`] when the
+    /// policy [relays capability negotiation](Self::relays_capability_negotiation),
+    /// none otherwise.
+    pub fn end_to_end_option_tags(&self) -> &'static [&'static str] {
+        if self.relays_capability_negotiation() {
+            END_TO_END_OPTION_TAGS
+        } else {
+            &[]
+        }
     }
 }
 
@@ -1821,6 +1869,50 @@ mod tests {
         policy.deltas_strip.push("Subject".to_string());
         apply_to_request(&mut msg, &policy, &ctx());
         assert!(!msg.headers.has("Subject"), "strip wins on conflict");
+    }
+
+    // ----- Capability negotiation / end-to-end option tags -----
+
+    #[test]
+    fn capability_negotiation_relays_where_supported_and_require_cross_both_ways() {
+        // transparent strips Supported and Require on responses; the other three
+        // copy both in both directions (boundary by explicit override, the rest
+        // by their Copy default).
+        assert!(!ResolvedPolicy::from_preset(transparent()).relays_capability_negotiation());
+        assert!(ResolvedPolicy::from_preset(intra_trust()).relays_capability_negotiation());
+        assert!(ResolvedPolicy::from_preset(trust_boundary()).relays_capability_negotiation());
+        assert!(ResolvedPolicy::from_preset(trunk_edge()).relays_capability_negotiation());
+    }
+
+    #[test]
+    fn precondition_is_end_to_end_only_under_a_relaying_policy() {
+        assert!(ResolvedPolicy::from_preset(transparent())
+            .end_to_end_option_tags()
+            .is_empty());
+        for preset in [intra_trust(), trust_boundary(), trunk_edge()] {
+            assert_eq!(
+                ResolvedPolicy::from_preset(preset).end_to_end_option_tags(),
+                &["precondition"]
+            );
+        }
+    }
+
+    #[test]
+    fn deltas_open_and_close_capability_negotiation() {
+        let mut opened = ResolvedPolicy::from_preset(transparent());
+        opened.deltas_copy = vec!["Supported".to_string(), "Require".to_string()];
+        assert!(opened.relays_capability_negotiation());
+
+        // Supported alone is not enough: the callee's Require still cannot
+        // reach the caller.
+        let mut half_open = ResolvedPolicy::from_preset(transparent());
+        half_open.deltas_copy = vec!["Supported".to_string()];
+        assert!(!half_open.relays_capability_negotiation());
+
+        let mut closed = ResolvedPolicy::from_preset(intra_trust());
+        closed.deltas_strip = vec!["Require".to_string()];
+        assert!(!closed.relays_capability_negotiation());
+        assert!(closed.end_to_end_option_tags().is_empty());
     }
 
     // ----- Preset validation -----

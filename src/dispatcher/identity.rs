@@ -47,6 +47,96 @@ pub(super) fn advertise_supported_options(headers: &mut SipHeaders) {
     advertise_option_tag(headers, "replaces");
 }
 
+/// Option tags siphon implements on a B-leg but claims there only when the
+/// caller offered them — the rule both have always followed.
+///
+/// `100rel`: siphon PRACKs a callee's reliable provisional itself (RFC 3262), so
+/// the claim is true, and tying it to the caller's offer keeps a callee from
+/// switching to reliable provisionals on calls whose caller never asked for
+/// them. `timer`: siphon relays session refreshes and can run the timer itself
+/// (RFC 4028), and every built-in preset still copies the caller's
+/// `Session-Expires`; without the tag the callee has to take the refresh on
+/// itself (§9). When siphon runs the session timer, the B-leg builder adds
+/// `timer` whatever the caller offered.
+const CALLER_OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
+
+/// Settle the B-leg INVITE's `Supported` and `Allow` once the header policy has
+/// run.
+///
+/// siphon is the UAC of the B-leg, so both are siphon's own claims (RFC 3261
+/// §20.37, §20.5), not the caller's to relay. `outbound` is the B-leg INVITE
+/// after the policy, `script` the A-leg INVITE the script shaped, and
+/// `script_shaped_headers` the headers the script set or removed.
+///
+/// - `Supported`: of the caller's tags the policy left on the request, the ones
+///   siphon claims on the caller's offer ([`CALLER_OFFERED_OPTION_TAGS`]) and
+///   the ones the policy passes end to end
+///   ([`ResolvedPolicy::end_to_end_option_tags`](crate::b2bua::header_policy::ResolvedPolicy::end_to_end_option_tags)).
+///   The tags siphon claims unconditionally — `replaces`, and `timer` when it
+///   runs the session timer — are merged at the end of the build, after the
+///   per-carrier headers, as they always were.
+/// - `Allow`: siphon's method set, the one its responses advertise.
+///
+/// A header the script set or removed is the script's value as written: script
+/// headers are policy precedence 1, above the per-call deltas and the preset.
+/// It is read back from `script` because the policy may have stripped it from
+/// `outbound` already.
+pub(super) fn advertise_b_leg_capabilities(
+    outbound: &mut SipHeaders,
+    script: &SipHeaders,
+    script_shaped_headers: &[String],
+    policy: &crate::b2bua::header_policy::ResolvedPolicy,
+) {
+    let shaped_by_script = |name: &str| {
+        script_shaped_headers
+            .iter()
+            .any(|shaped| crate::sip::headers::same_header_name(shaped, name))
+    };
+
+    if shaped_by_script("Supported") {
+        restore_script_header(outbound, script, "Supported");
+    } else {
+        let end_to_end = policy.end_to_end_option_tags();
+        let offered: Vec<String> = outbound
+            .get_all("Supported")
+            .map(|values| {
+                values
+                    .iter()
+                    .flat_map(|value| value.split(','))
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        outbound.remove("Supported");
+        for tag in offered {
+            if CALLER_OFFERED_OPTION_TAGS
+                .iter()
+                .chain(end_to_end)
+                .any(|claimed| claimed.eq_ignore_ascii_case(&tag))
+            {
+                advertise_option_tag(outbound, &tag);
+            }
+        }
+    }
+
+    if shaped_by_script("Allow") {
+        restore_script_header(outbound, script, "Allow");
+    } else {
+        outbound.remove("Allow");
+        advertise_supported_methods(outbound);
+    }
+}
+
+/// Put `name` on `outbound` exactly as the script left it on `script`: every
+/// line it has, or none at all.
+fn restore_script_header(outbound: &mut SipHeaders, script: &SipHeaders, name: &str) {
+    match script.get_all(name) {
+        Some(values) => outbound.set_all(name, values.clone()),
+        None => outbound.remove(name),
+    }
+}
+
 /// Turn a 2xx OPTIONS into a proper capability response (RFC 3261 §11.2): add a
 /// `Contact` at the advertised sent-by and advertise the supported methods via
 /// `Allow`. Both are added only when absent, so a script-set `Contact`/`Allow`

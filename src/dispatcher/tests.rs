@@ -2621,6 +2621,124 @@ fn advertise_supported_options_respects_a_tag_the_peer_already_named() {
     assert_eq!(headers.get("Supported").unwrap(), "timer, REPLACES");
 }
 
+fn builtin_policy(name: &str) -> crate::b2bua::header_policy::ResolvedPolicy {
+    let preset = crate::b2bua::header_policy::builtin_presets()
+        .get(name)
+        .cloned()
+        .expect("a built-in preset");
+    crate::b2bua::header_policy::ResolvedPolicy::from_preset(preset)
+}
+
+/// The B-leg `Supported` settled under `policy_name` from a caller that listed
+/// `offered`, with no script involved.
+fn b_leg_supported(offered: &str, policy_name: &str) -> Option<String> {
+    let mut outbound = SipHeaders::new();
+    outbound.set("Supported", offered.to_string());
+    let script = outbound.clone();
+    advertise_b_leg_capabilities(&mut outbound, &script, &[], &builtin_policy(policy_name));
+    outbound.get("Supported").cloned()
+}
+
+#[test]
+fn b_leg_capabilities_keep_only_the_caller_tags_siphon_claims() {
+    // RFC 3261 §20.37: the B-leg INVITE's Supported is siphon's claim. The
+    // caller's `100rel`/`timer` stay, in the caller's spelling; `precondition`
+    // only where the policy relays capability negotiation both ways.
+    let offered = "100rel, Timer, outbound, precondition, path";
+    assert_eq!(
+        b_leg_supported(offered, "transparent-b2bua@2026").as_deref(),
+        Some("100rel,Timer")
+    );
+    assert_eq!(
+        b_leg_supported(offered, "ims-intra-trust-domain@2026").as_deref(),
+        Some("100rel,Timer,precondition")
+    );
+}
+
+#[test]
+fn b_leg_capabilities_drop_supported_when_no_caller_tag_is_siphons() {
+    assert_eq!(
+        b_leg_supported("outbound, path, eventlist", "ims-intra-trust-domain@2026"),
+        None
+    );
+}
+
+#[test]
+fn b_leg_capabilities_read_every_supported_line_and_the_compact_form() {
+    let mut outbound = SipHeaders::new();
+    outbound.add("Supported", "outbound".to_string());
+    outbound.add("k", "precondition, 100rel".to_string());
+    let script = outbound.clone();
+    advertise_b_leg_capabilities(
+        &mut outbound,
+        &script,
+        &[],
+        &builtin_policy("ims-intra-trust-domain@2026"),
+    );
+    assert_eq!(
+        outbound.get_all("Supported"),
+        Some(&vec!["precondition,100rel".to_string()])
+    );
+}
+
+#[test]
+fn b_leg_capabilities_replace_the_callers_allow_with_siphons_methods() {
+    // RFC 3261 §20.5: Allow lists the methods the sender supports.
+    let mut outbound = SipHeaders::new();
+    outbound.set("Allow", "INVITE, ACK, BYE".to_string());
+    let script = outbound.clone();
+    advertise_b_leg_capabilities(
+        &mut outbound,
+        &script,
+        &[],
+        &builtin_policy("ims-trust-domain-boundary@2026"),
+    );
+    assert_eq!(
+        outbound.get_all("Allow"),
+        Some(&vec![crate::sip::SUPPORTED_METHODS.to_string()])
+    );
+}
+
+#[test]
+fn b_leg_capabilities_keep_the_scripts_value_even_where_the_policy_stripped_it() {
+    let mut script = SipHeaders::new();
+    script.set("Supported", "x-lab-tag, outbound".to_string());
+    script.set("Allow", "INVITE, ACK, BYE".to_string());
+    // The policy already removed both from the B-leg.
+    let mut outbound = SipHeaders::new();
+    advertise_b_leg_capabilities(
+        &mut outbound,
+        &script,
+        // Recorded as the script spelled them; `k` is `Supported`.
+        &["k".to_string(), "ALLOW".to_string()],
+        &builtin_policy("transparent-b2bua@2026"),
+    );
+    assert_eq!(
+        outbound.get("Supported").map(String::as_str),
+        Some("x-lab-tag, outbound")
+    );
+    assert_eq!(
+        outbound.get("Allow").map(String::as_str),
+        Some("INVITE, ACK, BYE")
+    );
+}
+
+#[test]
+fn b_leg_capabilities_honour_a_script_removal() {
+    let mut outbound = SipHeaders::new();
+    outbound.set("Supported", "100rel".to_string());
+    outbound.set("Allow", "INVITE".to_string());
+    let script = SipHeaders::new();
+    advertise_b_leg_capabilities(
+        &mut outbound,
+        &script,
+        &["Supported".to_string(), "Allow".to_string()],
+        &builtin_policy("transparent-b2bua@2026"),
+    );
+    assert!(!outbound.has("Supported"));
+    assert!(!outbound.has("Allow"));
+}
+
 #[test]
 fn augment_options_response_adds_contact_and_allow() {
     let mut response = SipMessageBuilder::new()

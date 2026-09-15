@@ -281,6 +281,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **The B-leg INVITE advertises siphon's own `Supported` and `Allow`, not the
+  caller's.** siphon is the UAC of the B-leg, so both headers are its claims
+  (RFC 3261 §20.37 and §20.5). It copied the caller's lists almost verbatim and
+  added `timer` and `replaces`, so a callee was told siphon supports whatever
+  the caller happened to name: `outbound`, `path`, `gruu`, `eventlist`, a vendor
+  tag. Nothing on the B-leg implements those.
+
+  `Allow` is now siphon's method set, the one its responses already advertise.
+  `Supported` is `replaces`, plus `timer` when siphon runs the session timer,
+  plus three of the caller's tags if the caller offered them. `100rel` and
+  `timer` pass as before. `precondition` passes only when the call's header
+  policy copies both `Supported` and `Require` in both directions, because
+  preconditions are negotiated between the endpoints through siphon and do not
+  work if the callee's `Require` cannot reach the caller.
+  `ims-intra-trust-domain@2026`, `ims-trust-domain-boundary@2026` and
+  `sip-trunk-edge@2026` do that; `transparent-b2bua@2026`, the default, strips
+  both on responses. Every other caller tag is dropped. On the wire, a caller
+  offering `Supported: 100rel, timer, precondition, outbound, path` now reaches
+  the callee as `Supported: 100rel,timer,replaces` under the default preset, and
+  with `precondition` under the other three.
+
+  A script that needs the caller's list sets it:
+  `call.set_header("Supported", call.get_header("Supported"))`. A `Supported` or
+  `Allow` the script set or removed goes out as the script left it, now even
+  where a `strip=` delta or the policy would have dropped it; `replaces` is
+  still merged into a `Supported` set that way. `copy=["Supported"]` does not
+  bring the caller's list back. Every built-in preset already copies `Supported`
+  on requests, so the delta only matters for whether capability negotiation
+  crosses, together with `Require`.
+
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.0.** The wire stays compatible in both directions:
   0.7.0 only adds optional keys (the call summary's wall-clock start and end,

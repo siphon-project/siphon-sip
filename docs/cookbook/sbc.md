@@ -182,6 +182,43 @@ only; prefix patterns are a config-side feature.
     `Proxy-Authorization` at the wrong realm. Opt back in with
     `copy=["Proxy-Authenticate"]` if you really want the old transparent behaviour.
 
+### `Supported` and `Allow` on the B-leg
+
+SIPhon is the UAC of the B-leg, so the B-leg INVITE's `Supported` and `Allow` say
+what SIPhon supports (RFC 3261 §20.37, §20.5). They are not a copy of the caller's
+lists, whatever the preset does with the rest of the headers:
+
+- `Allow` is SIPhon's method set, the same one its responses advertise.
+- `Supported` is `replaces`, plus `timer` when SIPhon runs the session timer, plus
+  these tags if the caller offered them: `100rel`, `timer`, and `precondition` when
+  the policy relays capability negotiation. Relaying means copying both `Supported`
+  and `Require` on requests and on responses. Preconditions are negotiated between
+  the two endpoints through SIPhon, so they only work where the callee's `Require`
+  can reach the caller.
+
+A caller offering `Supported: 100rel, timer, precondition, outbound, path`:
+
+| Preset | B-leg INVITE carries |
+|---|---|
+| `transparent-b2bua@2026` | `Supported: 100rel,timer,replaces` |
+| `ims-intra-trust-domain@2026` | `Supported: 100rel,timer,precondition,replaces` |
+| `ims-trust-domain-boundary@2026` | `Supported: 100rel,timer,precondition,replaces` |
+| `sip-trunk-edge@2026` | `Supported: 100rel,timer,precondition,replaces` |
+
+Any other tag the caller lists is dropped. Per-call deltas feed the same test:
+`copy=["Supported", "Require"]` lets `precondition` cross under the default preset,
+and `strip=["Require"]` stops it under the other three. `copy=["Supported"]` on its
+own does not relay the caller's list, since every preset already copies `Supported`
+on requests. When a far end really needs the caller's list, set it from the script,
+which is precedence 1 and goes out as written even past a `strip=`:
+
+```python
+call.set_header("Supported", call.get_header("Supported"))
+```
+
+`replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
+`Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
+
 ## Add media anchoring
 
 `call.media.anchor(engine="rtpengine")` hides the media path too. For SRTP↔RTP
