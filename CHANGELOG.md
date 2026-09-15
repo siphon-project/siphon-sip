@@ -6,6 +6,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
+  the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the
+  profile offered the plain RTP core `RTP/SAVP` and answered the SRTP UE with `RTP/AVP`, so neither
+  side got the transport it speaks. The offer half now presents `RTP/AVP` and the answer half
+  `RTP/SAVP`, mirroring `rtp_to_srtp`. ICE removal, origin replacement and `direction` are unchanged.
+
 ## [1.9.0] — 2026-09-15
 
 ### Added

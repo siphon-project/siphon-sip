@@ -7,8 +7,8 @@
 # Unlike the rtpengine pair, this one needs no substitute script: the stock
 # examples/proxy_rtpproxy.py already uses `rtp_passthrough`, which is what a
 # plain RTP relay actually is (rtpproxy does no SRTP/DTLS). It is the rtpengine
-# example, asking for srtp_to_rtp against a UAS that answers plain RTP, that was
-# the odd one out.
+# example, asking for srtp_to_rtp between a UAC and a UAS that both speak plain
+# RTP, that was the odd one out.
 #
 # Used with: sipp/docker-compose.yaml (rtpproxy-real profile)
 # Script:    examples/proxy_rtpproxy.py (unmodified)
