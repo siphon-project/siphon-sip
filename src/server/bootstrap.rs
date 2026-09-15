@@ -421,7 +421,7 @@ pub(super) fn init_li(config: &Config) -> Option<LiState> {
         config
             .media
             .as_ref()
-            .map(|media| media.backend)
+            .map(crate::config::MediaConfig::backend)
             .unwrap_or_default(),
     );
     let (li_manager, iri_rx, audit_rx) =

@@ -19,7 +19,8 @@ use super::*;
 /// the dispatcher's consumer loop; the native backend forwards events from its
 /// control connection over it (the rtpengine backend uses the separate TCP
 /// event listener instead). Returns `(None, None, None)` when `media` is not
-/// configured or the selected backend cannot be built.
+/// configured, when it asks for no engine, or when the selected backend cannot
+/// be built.
 pub fn init_rtpengine(
     config: &Config,
     event_sender: tokio::sync::mpsc::Sender<crate::rtpengine::events::RtpEngineEvent>,
@@ -29,7 +30,21 @@ pub fn init_rtpengine(
         None => return (None, None, None),
     };
 
-    let backend = match media_config.backend {
+    // A block with only `sdp_name` / `sdp_strip_attributes` shapes the SDP siphon
+    // relays and anchors nothing. Reading `backend` for it resolved to the
+    // rtpengine default and reported a missing `media.rtpengine` block as an
+    // error, on a configuration that never asked for an engine. What counts as
+    // asking is `MediaConfig::expects_engine`; where it does, the builders below
+    // still report a missing engine.
+    if !media_config.expects_engine() {
+        info!(
+            "media: sets no media engine, so calls are not media-anchored \
+             (sdp_name and sdp_strip_attributes still apply)"
+        );
+        return (None, None, None);
+    }
+
+    let backend = match media_config.backend() {
         crate::config::MediaBackendKind::Rtpengine => build_rtpengine_backend(media_config),
         crate::config::MediaBackendKind::SiphonRtp => {
             build_siphon_rtp_backend(media_config, event_sender)
@@ -53,7 +68,7 @@ pub fn init_rtpengine(
     // carries (derived from the offered c= line), it does not select a family for
     // the relay.  Say so at boot rather than let the knob look wired.
     if matches!(
-        media_config.backend,
+        media_config.backend(),
         crate::config::MediaBackendKind::Rtpproxy
     ) {
         let mut with_family: Vec<&str> = media_config
@@ -324,4 +339,82 @@ pub(super) fn is_coroutine(python: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> 
     let asyncio = python.import("asyncio")?;
     let result = asyncio.call_method1("iscoroutine", (obj,))?;
     result.is_truthy()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::lcr_number_policy_tests::LogBuffer;
+    use super::*;
+
+    /// Build the media backend for a config whose `media:` block is `media`, and
+    /// return whether a backend came out and what the build logged.
+    fn boot(media: &str) -> (bool, String) {
+        let config = Config::from_str(&format!(
+            "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\nmedia:\n{media}"
+        ))
+        .expect("the config loads");
+        let (events, _events_receiver) = tokio::sync::mpsc::channel(1);
+        let log = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(log.clone())
+            .finish();
+        let (backend, _sessions, _profiles) =
+            tracing::subscriber::with_default(subscriber, || init_rtpengine(&config, events));
+        (backend.is_some(), log.rendered())
+    }
+
+    /// A `media:` block that only shapes SDP asks for no engine, so none is built
+    /// and boot does not report one missing. It says media is not anchored instead.
+    #[test]
+    fn a_media_block_asking_for_no_engine_boots_without_a_missing_engine_error() {
+        for media in [
+            "  sdp_name: \"SIPhon\"\n",
+            "  sdp_strip_attributes: [\"msid\"]\n",
+        ] {
+            let (built, logged) = boot(media);
+            assert!(!built, "{media:?}");
+            assert!(
+                !logged.contains("ERROR"),
+                "{media:?} logged an error:\n{logged}"
+            );
+            assert!(
+                logged.contains("no media engine"),
+                "{media:?} did not say media is unanchored:\n{logged}"
+            );
+        }
+    }
+
+    /// A block that asks for an engine and gives none is still reported: a backend
+    /// named without its connection block, or media profiles with no engine to
+    /// apply them.
+    #[test]
+    fn a_media_block_expecting_a_missing_engine_still_reports_it() {
+        for (media, expected) in [
+            (
+                "  backend: rtpengine\n",
+                "no media.rtpengine block is configured",
+            ),
+            (
+                "  sdp_name: \"SIPhon\"\n  profiles:\n    custom:\n      offer: {}\n      answer: {}\n",
+                "no media.rtpengine block is configured",
+            ),
+            (
+                "  backend: siphon-rtp\n",
+                "no media.siphon_rtp block is configured",
+            ),
+            (
+                "  backend: rtpproxy\n",
+                "no media.rtpproxy block is configured",
+            ),
+        ] {
+            let (built, logged) = boot(media);
+            assert!(!built, "{media:?}");
+            assert!(
+                logged.contains(expected),
+                "{media:?} did not report the missing engine:\n{logged}"
+            );
+        }
+    }
 }

@@ -552,7 +552,7 @@ impl Config {
         let backend = self
             .media
             .as_ref()
-            .map(|media| media.backend)
+            .map(MediaConfig::backend)
             .unwrap_or_default();
         if backend == MediaBackendKind::SiphonRtp {
             return Ok(());
@@ -786,14 +786,14 @@ impl Config {
                 continue;
             };
             for (direction, flags) in [("offer", &profile.offer), ("answer", &profile.answer)] {
-                let unsupported = media.backend.unsupported_profile_fields(flags);
+                let unsupported = media.backend().unsupported_profile_fields(flags);
                 if !unsupported.is_empty() {
                     return Err(SiphonError::Config(format!(
                         "media profile {name:?} sets {} on its {direction} flags, which the \
                          {} backend cannot honour — remove {} or set media.backend to a \
                          backend that supports {}",
                         unsupported.join(", "),
-                        media.backend.as_str(),
+                        media.backend().as_str(),
                         if unsupported.len() == 1 {
                             "the field"
                         } else {

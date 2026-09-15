@@ -144,8 +144,11 @@ pub struct MediaConfig {
     /// Which media engine to drive. Defaults to `rtpengine` for backward
     /// compatibility; set to `siphon-rtp` to use the native JSON-over-TCP
     /// engine via the `siphon_rtp:` block below.
+    ///
+    /// Read it through [`MediaConfig::backend`]. `None` records that the key was
+    /// left out, which [`MediaConfig::expects_engine`] needs to know.
     #[serde(default)]
-    pub backend: MediaBackendKind,
+    pub backend: Option<MediaBackendKind>,
     /// RTPEngine instance(s). A single instance or a list for load-balancing / HA.
     /// Required when `backend: rtpengine` (the default); ignored for `siphon-rtp`.
     #[serde(default)]
@@ -188,6 +191,31 @@ pub struct MediaConfig {
     /// Default: 5.
     #[serde(default = "default_rtpengine_health_check_interval_secs")]
     pub health_check_interval_secs: u64,
+}
+
+impl MediaConfig {
+    /// The media engine this block selects: `backend` as written, or rtpengine
+    /// when the key is left out.
+    pub fn backend(&self) -> MediaBackendKind {
+        self.backend.unwrap_or_default()
+    }
+
+    /// Whether this block asks for a media engine at all.
+    ///
+    /// It does when it names a `backend`, gives an engine's connection block, or
+    /// sets something only an engine uses: media `profiles` (engine flags) or the
+    /// rtpengine `events` listener. A block with only `sdp_name` and
+    /// `sdp_strip_attributes` shapes the SDP siphon relays and anchors nothing, so
+    /// it has no engine to be missing. `health_check_interval_secs` has a default
+    /// and cannot say either way, so on its own it does not count.
+    pub fn expects_engine(&self) -> bool {
+        self.backend.is_some()
+            || self.rtpengine.is_some()
+            || self.siphon_rtp.is_some()
+            || self.rtpproxy.is_some()
+            || !self.profiles.is_empty()
+            || self.events.is_some()
+    }
 }
 
 fn default_rtpengine_health_check_interval_secs() -> u64 {
