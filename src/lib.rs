@@ -110,3 +110,51 @@ macro_rules! install_allocator {
         pub static __SIPHON_MALLOC_CONF: &[u8] = concat!($conf, "\0").as_bytes();
     };
 }
+
+/// Test-only: run a test alone, in a child process of this test binary.
+///
+/// Some tests look at state that belongs to the whole process: resident memory,
+/// a process-wide metrics gauge, or the one `siphon` Python module every
+/// install in the process re-executes into. Whatever the other tests in the
+/// binary are doing moves that state, so such a test re-runs itself in a child
+/// that runs nothing else, and the parent only judges the child's result.
+#[cfg(test)]
+pub(crate) mod own_process {
+    /// Carries the name of the test a child process was started for.
+    const CHILD: &str = "SIPHON_TEST_OWN_PROCESS";
+
+    /// Run `test` in a child process that runs only the test named `full_name`,
+    /// which is `concat!(module_path!(), "::<test fn>")` at the call site.
+    ///
+    /// Inside that child this just calls `test`. In the parent it waits for the
+    /// child and panics with its output unless exactly that one test passed.
+    pub(crate) fn run(full_name: &str, test: impl FnOnce()) {
+        // The harness names a test by its module path without the crate.
+        let test_name = full_name
+            .split_once("::")
+            .map_or(full_name, |(_, rest)| rest);
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            test();
+            return;
+        }
+
+        let binary = std::env::current_exe().expect("path of the running test binary");
+        let output = std::process::Command::new(binary)
+            .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, test_name)
+            .output()
+            .expect("start the test in its own process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "1 passed" as well as success: a name that matches no test also exits
+        // 0, and must not count as the test having run.
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test_name} did not pass in its own process ({}).\n--- stdout ---\n{stdout}\n\
+             --- stderr ---\n{stderr}",
+            output.status
+        );
+        eprint!("{stderr}");
+    }
+}

@@ -419,6 +419,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A pooled outbound TCP/TLS connection could be dropped from the pool by the connection it
+  replaced.** A connection's reader outlives its writer. After the writer gave up on a peer that
+  stopped draining, or a TLS client-certificate reload retired the entry, the next send pooled a new
+  connection while the old reader was still waiting on its socket. When that reader ended, at the
+  peer's close or the 30 s idle timeout, it removed whatever connection held the destination's slot,
+  which by then was the new one. That connection stayed open but was never reused, so the next send
+  to the peer opened yet another. A reader's cleanup, and a sender that finds a closed channel, now
+  only remove the pool entry while it is still their own connection.
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own

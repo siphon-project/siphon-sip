@@ -59,87 +59,61 @@ async fn bind_failure_reaches_the_caller() {
     );
 }
 
-/// Reserve `port` for this process across every test binary on the machine.
+/// Hold the port number `port` for this process, against every other test
+/// binary on the machine, until the process exits.
 ///
-/// The counter below only stops two callers *in one process* being handed
-/// the same port, and that is not the situation that bites: the lib and
-/// integration binaries run separately, a second worktree runs its own, and
-/// each starts its counter from the same base. The file is created
-/// exclusively, so exactly one process wins a given port; a reservation
-/// older than an hour belonged to a run that is long gone and is taken over.
+/// The hold is a TCP socket bound to the port without `SO_REUSEADDR`. The
+/// kernel refuses a second bind like it, so exactly one process holds a given
+/// number, and the hold ends with the process.
+///
+/// It replaces claim files in the temp directory, which two binaries starting
+/// together could both take over: each read the pid an earlier run had left in
+/// the same claim, found that process gone, and wrote its own. Both then bound
+/// the port with `SO_REUSEPORT`, the kernel split connections between the two
+/// listeners, and a client reached the other process instead. A TLS handshake
+/// met the other test's certificate, an inbound message never arrived, and a
+/// bind that overlapped the other process's probe failed with `AddrInUse`.
+///
+/// The hold is on the TCP number, so a TCP listener cannot bind a port taken
+/// here. TCP listeners take theirs from [`free_tcp_port`].
 fn claim_port(port: u16) -> bool {
-    let directory = std::env::temp_dir().join("siphon-test-ports");
-    if std::fs::create_dir_all(&directory).is_err() {
-        // No shared directory to coordinate through — fall back to the
-        // probe alone rather than failing every test.
-        return true;
-    }
-    let path = directory.join(port.to_string());
-    let pid = std::process::id();
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    static HOLDS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+
+    let Ok(hold) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    if hold
+        .bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_err()
     {
-        Ok(_) => std::fs::write(&path, pid.to_string()).is_ok(),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A reservation whose process has exited is free again. On Linux
-            // that is knowable immediately, which matters because a run that
-            // could not reuse its own ports would walk up the range on every
-            // invocation; elsewhere, fall back to the file's age.
-            let owner = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok());
-            let gone = owner.is_some_and(|owner| {
-                !std::path::Path::new("/proc")
-                    .join(owner.to_string())
-                    .exists()
-            });
-            let old = std::fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .map(|modified| {
-                    modified.elapsed().unwrap_or_default() > std::time::Duration::from_secs(3600)
-                })
-                .unwrap_or(false);
-            (gone || old) && std::fs::write(&path, pid.to_string()).is_ok()
-        }
-        Err(_) => true,
+        return false;
     }
+    HOLDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(hold);
+    true
 }
 
-/// A loopback address reserved for this test, on a port nothing else on this
-/// machine will bind.
+/// A loopback address for a UDP listener, on a port no other test binary on
+/// this machine is handed.
 ///
-/// The obvious version — bind port 0, read the address, drop the socket —
-/// looks fine and is the reason these tests flapped. Three things go wrong:
+/// Port 0 does not fit: `listen` takes the address and binds it itself, and a
+/// probe socket closed in between leaves the port to any socket that
+/// auto-binds, which the kernel assigns from the same ephemeral range
+/// (32768-60999 here). So ports come from a counter below that range, where
+/// nothing is auto-assigned, and [`claim_port`] makes each one this process's
+/// alone. The probe then checks no UDP socket already sits on the number.
 ///
-/// * the kernel auto-assigns from the ephemeral range (32768-60999 here),
-///   so between the probe closing and the real bind, any outbound socket in
-///   this process can take that exact port,
-/// * `listen()` used to bind on a **spawned task**, so the caller returned
-///   before the socket existed and a connect could be refused for no reason
-///   but scheduling. The listeners now bind before spawning, so awaiting
-///   `listen` means the socket is accepting; this helper still matters for
-///   the collision above, and
-/// * a counter is per process, and several test binaries run at once on one
-///   machine. Two of them hand out the same port, and the probe below is the
-///   thing that then fails the *other* process: the probe socket carries no
-///   `SO_REUSEPORT` and `bind_tcp_listener` sets it, and Linux refuses a
-///   `SO_REUSEPORT` bind when an existing socket on the port lacks it — so
-///   one process's probe turns the other's listener into `AddrInUse`. That
-///   is the `AddrInUse` these tests saw, and why it never reproduced when
-///   the binary ran on its own.
-///
-/// Handing out ports from a counter *below* the ephemeral range removes the
-/// first collision at its source: nothing is auto-assigned there, so only an
-/// explicit bind can take one. [`claim_port`] removes the third by making
-/// the reservation machine-wide. The probe then confirms the port is
-/// actually free before it is used.
+/// TCP listeners use [`free_tcp_port`].
 fn free_port() -> SocketAddr {
     use std::sync::atomic::{AtomicU16, Ordering};
     // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
     // privileged range and clear of the SIP defaults these tests also use.
-    static NEXT: AtomicU16 = AtomicU16::new(21000);
+    // Starts above 21000, where builds still on claim files count from: those
+    // cannot see a hold, and a UDP probe of theirs open at the moment this
+    // process's listener binds the same number fails that bind.
+    static NEXT: AtomicU16 = AtomicU16::new(26000);
 
     for _ in 0..2048 {
         let port = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -147,17 +121,54 @@ fn free_port() -> SocketAddr {
         if !claim_port(port) {
             continue;
         }
-        // TCP and UDP are separate namespaces and these tests bind either,
-        // so a port is only free when it is free on both.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-            continue;
-        }
+        // The claim holds the TCP number; the UDP one has to be free as well.
         if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
             continue;
         }
         return SocketAddr::from(([127, 0, 0, 1], port));
     }
     panic!("no free loopback port in the reserved test range");
+}
+
+/// A loopback TCP port the kernel picked, kept bound by this process for the
+/// rest of its life so nothing else can take it.
+///
+/// The reservation is a socket bound to port 0 with `SO_REUSEADDR` and
+/// `SO_REUSEPORT`, and never listened on. The kernel does not auto-assign a
+/// port that is already bound, to a port-0 `bind` or to a `connect`, so no
+/// other socket lands on it by chance. The listener under test binds the same
+/// address with the same options, which Linux allows for the same user, and
+/// only listening sockets are handed connections, so the anchor never takes
+/// one.
+///
+/// TCP only: a UDP socket with `SO_REUSEPORT` held on the port would share the
+/// listener's datagrams, so UDP listeners use [`free_port`].
+fn free_tcp_port() -> SocketAddr {
+    static ANCHORS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+
+    let anchor = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        .expect("create the port anchor");
+    anchor
+        .set_reuse_address(true)
+        .expect("SO_REUSEADDR on the port anchor");
+    #[cfg(unix)]
+    anchor
+        .set_reuse_port(true)
+        .expect("SO_REUSEPORT on the port anchor");
+    anchor
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .expect("bind the port anchor");
+    let address = anchor
+        .local_addr()
+        .expect("port anchor address")
+        .as_socket()
+        .expect("port anchor is an IP socket");
+
+    ANCHORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(anchor);
+    address
 }
 
 /// Standard SIP OPTIONS request used across tests.
@@ -286,7 +297,7 @@ async fn udp_roundtrip() {
 
 #[tokio::test]
 async fn tcp_roundtrip() {
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -362,7 +373,7 @@ async fn tcp_roundtrip() {
 /// removal is unit-tested in `registrar::tests::unregister_flow_*`).
 #[tokio::test]
 async fn tcp_close_notifies_flow_failure() {
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -446,7 +457,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
 
     // 2) Build a real ConnectionPool sharing the listener's connection_map
     //    and inbound_tx — same wiring server.rs does in production.
-    let listen_addr = free_port();
+    let listen_addr = free_tcp_port();
     let (inbound_tx, _inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -546,7 +557,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     // a single `\r\n`.  Verify the bytes leave the wire and that a SIP
     // message sent after the ping still frames correctly.
     use siphon::transport::crlf_keepalive::CrlfPongTracker;
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -620,7 +631,7 @@ async fn tls_roundtrip() {
     let directory = tempfile::tempdir().unwrap();
     let tls_config = generate_test_tls_config(&directory);
 
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -707,7 +718,7 @@ async fn ws_roundtrip() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -795,7 +806,7 @@ async fn wss_roundtrip() {
     let directory = tempfile::tempdir().unwrap();
     let tls_config = generate_test_tls_config(&directory);
 
-    let addr = free_port();
+    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -890,8 +901,8 @@ async fn multi_transport_shared_inbound_channel() {
     use tokio_tungstenite::tungstenite::Message;
 
     let udp_addr = free_port();
-    let tcp_addr = free_port();
-    let ws_addr = free_port();
+    let tcp_addr = free_tcp_port();
+    let ws_addr = free_tcp_port();
 
     // All transports share the same inbound channel (like main.rs)
     let (inbound_tx, inbound_rx) = flume::unbounded();

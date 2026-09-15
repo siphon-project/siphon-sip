@@ -423,11 +423,11 @@ mod tests {
         Arc::new(TransportAcl::new(vec![], vec![]))
     }
 
-    use crate::transport::testutil::free_port;
+    use crate::transport::testutil::free_tcp_port;
 
     #[tokio::test]
     async fn ws_connection_lifecycle() {
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
@@ -492,7 +492,7 @@ mod tests {
         // unified stream registry (keyed by UE source address, tagged WS) so
         // the relay path can reach the UE — the only way back over WebSocket —
         // and must clear on close so a stale flow reports dead.
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
@@ -558,7 +558,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
@@ -599,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_connection_cleanup() {
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
@@ -651,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_binary_frame_accepted() {
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
@@ -700,7 +700,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tls_config = write_test_cert(&directory);
 
-        let addr = free_port();
+        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =

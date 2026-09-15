@@ -496,9 +496,14 @@ impl PyExecutor {
                 // so `restart: always` / systemd restart the process.
                 std::process::abort();
             });
+            let check_interval = params.check_interval;
             std::thread::Builder::new()
                 .name("siphon-pyexec-watchdog".to_string())
-                .spawn(move || run_watchdog(metrics, receiver, params, shutdown, on_stall))
+                .spawn(move || {
+                    run_watchdog(metrics, receiver, params, shutdown, on_stall, || {
+                        std::thread::sleep(check_interval)
+                    })
+                })
                 .expect("failed to spawn Python executor watchdog thread")
         };
 
@@ -686,19 +691,26 @@ struct WatchdogParams {
 /// Runs on a dedicated OS thread that never takes a lock or touches Python, so
 /// a handler that wedges every worker (or holds a lock forever) cannot stall
 /// the watchdog itself.
+///
+/// `pace` runs before every sample and is what spaces them: in production it
+/// sleeps `check_interval`. The stall arithmetic counts samples, one
+/// `check_interval` each, so the decision depends only on what the counters
+/// read at each sample. That lets a test step the samples itself instead of
+/// racing a wall clock against other threads' scheduling.
 fn run_watchdog(
     metrics: Arc<PoolMetrics>,
     receiver: flume::Receiver<Job>,
     params: WatchdogParams,
     shutdown: Arc<AtomicBool>,
     on_stall: Arc<dyn Fn() + Send + Sync>,
+    mut pace: impl FnMut(),
 ) {
     let mut stalled_for = Duration::ZERO;
     let mut last_completed = metrics.completed.load(Ordering::Relaxed);
     let mut last_published = last_completed;
 
     loop {
-        std::thread::sleep(params.check_interval);
+        pace();
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
@@ -1089,8 +1101,21 @@ mod tests {
     ///
     /// Each job allocates a small Python dict so any per-handler retention
     /// shows up.  Skipped on non-Linux (no `/proc/self/status`).
+    ///
+    /// RSS is a whole-process number and this test binary runs many tests at
+    /// once, so anything another test allocates between the two samples reads
+    /// as growth here: it failed at 5160 KB against its 5000 KB budget with no
+    /// leak in the pool. The measurement therefore runs in a child process
+    /// that runs nothing but this test, and the parent only judges its result.
     #[test]
     fn pool_steady_state_rss_does_not_grow() {
+        crate::own_process::run(
+            concat!(module_path!(), "::pool_steady_state_rss_does_not_grow"),
+            measure_pool_steady_state_rss,
+        );
+    }
+
+    fn measure_pool_steady_state_rss() {
         test_runtime().block_on(async {
             ensure_pool();
             let Some(_) = read_rss_kb() else {
@@ -1388,6 +1413,66 @@ mod tests {
         drop(pool);
     }
 
+    /// Samples in the watchdog tests' stall window.
+    const STALL_SAMPLES: usize = 3;
+    /// The watchdog tests' sample spacing. Only its arithmetic matters: the
+    /// samples are stepped, never slept.
+    const CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// Drive [`run_watchdog`] for exactly `samples` samples and return the
+    /// sample it first fired on, if any.
+    ///
+    /// The samples are stepped by the test instead of paced by a clock, so what
+    /// the watchdog reads at each one is fixed. With a sleeping watchdog thread
+    /// the result depended on how the scheduler happened to interleave it with
+    /// the other threads under test. `before_sample(n)` runs ahead of sample
+    /// `n`, counted from 1.
+    fn watchdog_first_fired_at(
+        metrics: Arc<PoolMetrics>,
+        receiver: flume::Receiver<Job>,
+        max_threads: usize,
+        samples: usize,
+        mut before_sample: impl FnMut(usize),
+    ) -> Option<usize> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let samples_taken = Arc::new(AtomicUsize::new(0));
+        let fired_at = Arc::new(AtomicUsize::new(0));
+
+        let on_stall: Arc<dyn Fn() + Send + Sync> = {
+            let samples_taken = Arc::clone(&samples_taken);
+            let fired_at = Arc::clone(&fired_at);
+            Arc::new(move || {
+                let _ = fired_at.compare_exchange(
+                    0,
+                    samples_taken.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            })
+        };
+        let params = WatchdogParams {
+            max_threads,
+            stall_abort: Some(CHECK_INTERVAL * STALL_SAMPLES as u32),
+            check_interval: CHECK_INTERVAL,
+        };
+
+        let shutdown_for_pace = Arc::clone(&shutdown);
+        let samples_for_pace = Arc::clone(&samples_taken);
+        run_watchdog(metrics, receiver, params, shutdown, on_stall, move || {
+            let sample = samples_for_pace.fetch_add(1, Ordering::SeqCst) + 1;
+            if sample > samples {
+                shutdown_for_pace.store(true, Ordering::SeqCst);
+            } else {
+                before_sample(sample);
+            }
+        });
+
+        match fired_at.load(Ordering::SeqCst) {
+            0 => None,
+            sample => Some(sample),
+        }
+    }
+
     /// Watchdog positive: a pool with an in-flight handler and zero completions
     /// for the stall window fires the abort action.
     #[test]
@@ -1396,98 +1481,65 @@ mod tests {
         // One worker, busy, never completes.
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
-
         let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_action = Arc::clone(&fired);
-        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            fired_for_action.store(true, Ordering::Relaxed);
-        });
 
-        let params = WatchdogParams {
-            max_threads: 1,
-            stall_abort: Some(Duration::from_millis(150)),
-            check_interval: Duration::from_millis(50),
-        };
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 1, 4 * STALL_SAMPLES, |_| {});
 
-        let metrics_for_thread = Arc::clone(&metrics);
-        let shutdown_for_thread = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_watchdog(
-                metrics_for_thread,
-                receiver,
-                params,
-                shutdown_for_thread,
-                on_stall,
-            )
-        });
-
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(
-            fired.load(Ordering::Relaxed),
-            "watchdog must fire when every worker is busy with zero completions"
+        assert_eq!(
+            fired_at,
+            Some(STALL_SAMPLES),
+            "watchdog must fire when every worker is busy with zero completions, \
+             on the sample that completes the stall window"
         );
-
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = handle.join();
     }
 
     /// Watchdog negative: a pool that keeps completing jobs (even while fully
     /// busy) never trips, so transient backend slowness can't abort the process.
+    ///
+    /// Samples are stepped by the test rather than paced by a clock. With a
+    /// progress thread sleeping against a sampling thread, "progress between
+    /// every two samples" was a claim about the scheduler, and it stopped
+    /// holding whenever the progress thread was descheduled across three
+    /// samples. Here exactly one job completes between consecutive samples,
+    /// which is the slowest progress that still has to count as healthy, held
+    /// for four stall windows. Then progress stops and the same watchdog must
+    /// fire on the stall-window sample, so the quiet phase is not a watchdog
+    /// that never looks.
     #[test]
     fn watchdog_does_not_fire_while_progressing() {
+        const PROGRESSING_SAMPLES: usize = 4 * STALL_SAMPLES;
+
         let metrics = Arc::new(PoolMetrics::default());
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
-
         let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_action = Arc::clone(&fired);
-        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            fired_for_action.store(true, Ordering::Relaxed);
-        });
 
-        // Bump `completed` faster than the watchdog samples, so no tick ever
-        // sees zero forward progress.
         let metrics_for_progress = Arc::clone(&metrics);
-        let shutdown_for_progress = Arc::clone(&shutdown);
-        let progress = std::thread::spawn(move || {
-            while !shutdown_for_progress.load(Ordering::Relaxed) {
-                metrics_for_progress
-                    .completed
-                    .fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-
-        let params = WatchdogParams {
-            max_threads: 1,
-            stall_abort: Some(Duration::from_millis(150)),
-            check_interval: Duration::from_millis(50),
-        };
-        let metrics_for_thread = Arc::clone(&metrics);
-        let shutdown_for_thread = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_watchdog(
-                metrics_for_thread,
-                receiver,
-                params,
-                shutdown_for_thread,
-                on_stall,
-            )
-        });
-
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(
-            !fired.load(Ordering::Relaxed),
-            "watchdog must not fire while the pool keeps completing jobs"
+        let fired_at = watchdog_first_fired_at(
+            metrics,
+            receiver,
+            1,
+            PROGRESSING_SAMPLES + STALL_SAMPLES,
+            |sample| {
+                if sample <= PROGRESSING_SAMPLES {
+                    metrics_for_progress
+                        .completed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            },
         );
 
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = handle.join();
-        let _ = progress.join();
+        assert!(
+            !matches!(fired_at, Some(sample) if sample <= PROGRESSING_SAMPLES),
+            "watchdog must not fire while the pool keeps completing jobs, but fired \
+             at sample {fired_at:?} of {PROGRESSING_SAMPLES} progressing samples"
+        );
+        assert_eq!(
+            fired_at,
+            Some(PROGRESSING_SAMPLES + STALL_SAMPLES),
+            "once completions stop, the watchdog must fire after exactly the stall \
+             window"
+        );
     }
 
     /// **Regression guard for the low-concurrency deadlock** — the watchdog must
@@ -1502,41 +1554,16 @@ mod tests {
         // One of a possible 8 workers is wedged; the pool is nowhere near cap.
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
-
         let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_action = Arc::clone(&fired);
-        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            fired_for_action.store(true, Ordering::Relaxed);
-        });
 
-        let params = WatchdogParams {
-            max_threads: 8,
-            stall_abort: Some(Duration::from_millis(150)),
-            check_interval: Duration::from_millis(50),
-        };
-        let metrics_for_thread = Arc::clone(&metrics);
-        let shutdown_for_thread = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_watchdog(
-                metrics_for_thread,
-                receiver,
-                params,
-                shutdown_for_thread,
-                on_stall,
-            )
-        });
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 8, 4 * STALL_SAMPLES, |_| {});
 
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(
-            fired.load(Ordering::Relaxed),
+        assert_eq!(
+            fired_at,
+            Some(STALL_SAMPLES),
             "watchdog must fire on an in-flight handler that never completes, \
              even far below the thread cap (low-concurrency deadlock)"
         );
-
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = handle.join();
     }
 
     /// Watchdog must fire on a stranded *queued* job too (work pending with zero
@@ -1553,38 +1580,13 @@ mod tests {
             .try_send(Box::new(|| {}) as Job)
             .expect("queue a job that is never consumed");
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_action = Arc::clone(&fired);
-        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            fired_for_action.store(true, Ordering::Relaxed);
-        });
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 4, 4 * STALL_SAMPLES, |_| {});
 
-        let params = WatchdogParams {
-            max_threads: 4,
-            stall_abort: Some(Duration::from_millis(150)),
-            check_interval: Duration::from_millis(50),
-        };
-        let metrics_for_thread = Arc::clone(&metrics);
-        let shutdown_for_thread = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_watchdog(
-                metrics_for_thread,
-                receiver,
-                params,
-                shutdown_for_thread,
-                on_stall,
-            )
-        });
-
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(
-            fired.load(Ordering::Relaxed),
+        assert_eq!(
+            fired_at,
+            Some(STALL_SAMPLES),
             "watchdog must fire on a queued job that is never picked up"
         );
-
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = handle.join();
         drop(keep_alive_sender);
     }
 
@@ -1595,40 +1597,14 @@ mod tests {
         let metrics = Arc::new(PoolMetrics::default());
         metrics.total.store(8, Ordering::Relaxed); // workers exist...
         metrics.inflight.store(0, Ordering::Relaxed); // ...but none are busy
-
         let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8); // empty queue
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_action = Arc::clone(&fired);
-        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            fired_for_action.store(true, Ordering::Relaxed);
-        });
 
-        let params = WatchdogParams {
-            max_threads: 8,
-            stall_abort: Some(Duration::from_millis(150)),
-            check_interval: Duration::from_millis(50),
-        };
-        let metrics_for_thread = Arc::clone(&metrics);
-        let shutdown_for_thread = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_watchdog(
-                metrics_for_thread,
-                receiver,
-                params,
-                shutdown_for_thread,
-                on_stall,
-            )
-        });
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 8, 4 * STALL_SAMPLES, |_| {});
 
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(
-            !fired.load(Ordering::Relaxed),
+        assert_eq!(
+            fired_at, None,
             "watchdog must not fire on an idle pool (no in-flight or queued work)"
         );
-
-        shutdown.store(true, Ordering::Relaxed);
-        let _ = handle.join();
     }
 
     /// **Regression guard for the free-threaded GC stop-the-world deadlock.**
