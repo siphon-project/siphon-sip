@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA offer/answer in PRACK: a caller without SDP answers the callee's
+  early offer in its PRACK.
+
+  INVITE (no SDP, Supported: 100rel) -> 100 -> reliable 183 with the offer ->
+  PRACK with the answer -> 200 PRACK -> 200 INVITE -> ACK -> BYE -> 200
+
+  The callee (b2bua_prack_early_offer_uas.xml) offers in a reliable 183 with
+  RSeq 7. It reaches this caller reliably on siphon's own RSeq, carrying the
+  offer, and the answer in this PRACK is what siphon's PRACK to the callee
+  carries (RFC 3262 §5); the callee checks that.
+-->
+<scenario name="B2BUA offer/answer in PRACK: caller answers the early offer">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:carol@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:carol@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Supported: 100rel, timer
+User-Agent: SIPp/b2bua-prack-early-offer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
+            check_it="true" assign_to="junk,rseq_progress" />
+      <ereg regexp="^[[:space:]]*7[[:space:]]*$" search_in="hdr" header="RSeq:"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="m=audio" search_in="body"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+PRACK sip:carol@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:carol@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 PRACK
+RAck: [$rseq_progress] 1 INVITE
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio 49170 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="PRACK" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="INVITE" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:carol@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:carol@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:carol@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:carol@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

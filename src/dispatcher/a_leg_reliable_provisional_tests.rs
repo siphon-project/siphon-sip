@@ -496,10 +496,34 @@ async fn the_callers_prack_is_answered_by_siphon_on_its_rack() {
     call.caller_pracks(&progress, 5);
     call.caller_pracks(&progress, 5);
     let sent = call.wire();
+    let caller_address = caller();
+    let to_caller: Vec<String> = sent
+        .iter()
+        .filter(|sent| sent.destination == caller_address)
+        .map(|sent| {
+            format!(
+                "{} to {}",
+                sent.message.status_code().unwrap_or_default(),
+                sent.destination
+            )
+        })
+        .collect();
     assert_eq!(
-        summaries(&sent),
+        to_caller,
         [format!("200 to {CALLER}"), format!("200 to {CALLER}")],
-        "the PRACK and its retransmission, neither relayed"
+        "the PRACK and its retransmission"
+    );
+    // The callee gets siphon's own PRACK for its 183, which the caller's PRACK
+    // released, once, and never the caller's PRACK itself (RFC 3262 §5).
+    let callee_address: SocketAddr = CALLEE.parse().expect("a literal address");
+    let to_callee: Vec<&Sent> = sent
+        .iter()
+        .filter(|sent| sent.destination == callee_address)
+        .collect();
+    assert_eq!(to_callee.len(), 1, "{:?}", summaries(&sent));
+    assert_eq!(
+        to_callee[0].message.headers.get("RAck").map(String::as_str),
+        Some("42 1 INVITE")
     );
     assert!(
         call.state.reliable_provisionals.is_empty(),

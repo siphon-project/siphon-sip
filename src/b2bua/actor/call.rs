@@ -360,6 +360,9 @@ pub struct CallActor {
     /// siphon's reliable provisionals toward the caller (RFC 3262 §3): its own
     /// `RSeq` numbering, what awaits a PRACK, and what waits behind it.
     pub a_leg_reliability: super::ALegReliableProvisionals,
+    /// siphon's PRACKs to the callee held for the caller's, and an offer a
+    /// caller's PRACK sent the callee (RFC 3262 §5).
+    pub prack_bridge: super::PrackBridge,
     /// Whether the A-leg INVITE required `sec-agree` and siphon verified it
     /// against the security association it arrived over (RFC 3329 §2.3.1),
     /// decided at INVITE receipt before the script runs. Only then does a
@@ -539,6 +542,7 @@ impl CallActor {
             a_leg_supports_100rel: false,
             a_leg_requires_100rel: false,
             a_leg_reliability: super::ALegReliableProvisionals::default(),
+            prack_bridge: super::PrackBridge::default(),
             sec_agree_verified: false,
             auth_retry_count: 0,
             answer_deadline: None,

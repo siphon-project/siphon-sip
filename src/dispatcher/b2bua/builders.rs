@@ -237,6 +237,17 @@ pub fn early_dialog_target_from_response(response: &SipMessage) -> EarlyDialogTa
 ///
 /// `local_cseq` MUST already have been incremented for the dialog before
 /// calling this — the value passed in is used as-is.
+/// The branch prefix of every PRACK siphon sends a callee. siphon registers no
+/// branch for those, and the response to one is told by it
+/// ([`handle_callee_prack_response`]), since the 2xx answering an offer a PRACK
+/// carried has to go back to the caller (RFC 3262 §5).
+pub const PRACK_BRANCH_PREFIX: &str = "z9hG4bK-prack-";
+
+/// A fresh branch for a PRACK siphon sends a callee.
+pub fn prack_branch() -> String {
+    format!("{PRACK_BRANCH_PREFIX}{}", uuid::Uuid::new_v4().as_simple())
+}
+
 pub fn build_b2bua_prack(
     leg: &crate::b2bua::actor::Leg,
     state: &DispatcherState,
@@ -301,7 +312,7 @@ pub fn build_b2bua_prack_message(
         });
 
     let transport_str = format!("{}", transport).to_uppercase();
-    let branch = TransactionKey::generate_branch();
+    let branch = prack_branch();
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str, via_host, via_port, branch,

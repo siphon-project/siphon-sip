@@ -8,7 +8,10 @@
 # Tests:     siphon owns RFC 3262 on the A-leg — its own RSeq per caller
 #            dialog, one reliable provisional at a time, the caller's PRACK
 #            answered locally, and the 2xx held until the PRACK of a reliable
-#            provisional with SDP.
+#            provisional with SDP. Also offer/answer in PRACK (RFC 3262 §5):
+#            the callee's early offer answered in the caller's PRACK (carol),
+#            and a new offer in the caller's PRACK answered by the callee
+#            (dave), each crossing on siphon's own PRACK.
 #
 # Pins `ims-intra-trust-domain@2026`, whose response policy copies `Require`
 # and `RSeq`: the callee's RSeq 42 would pass straight through if the caller's
@@ -41,6 +44,8 @@ auth:
   users:
     alice: "secret"
     bob: "secret"
+    carol: "secret"
+    dave: "secret"
 
 b2bua:
   default_header_policy: "ims-intra-trust-domain@2026"

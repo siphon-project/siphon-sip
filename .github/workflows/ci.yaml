@@ -959,6 +959,17 @@ jobs:
       - name: A caller that supports 100rel gets the callee's reliable 183 on siphon's RSeq
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-a-leg-reliable-supported-uac sipp-b2bua-a-leg-reliable-supported-uac sipp-b2bua-a-leg-reliable-uas
 
+      - name: Register carol and dave against the instance
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov run --rm sipp-b2bua-prack-early-offer-register
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov run --rm sipp-b2bua-prack-offer-register
+
+      - name: The caller's PRACK answers the callee's early offer on siphon's PRACK
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-prack-early-offer-uac sipp-b2bua-prack-early-offer-uac sipp-b2bua-prack-early-offer-uas
+
+      - name: An offer in the caller's PRACK is answered in the 200 to it
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-prack-offer-uac sipp-b2bua-prack-offer-uac sipp-b2bua-prack-offer-uas
+
       - name: Collect siphon logs
         if: always()
         run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-a-leg-reliable > siphon-a-leg-reliable-prov.log 2>&1 || true

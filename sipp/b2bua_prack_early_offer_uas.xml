@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA offer/answer in PRACK: the callee offers in a reliable 183.
+
+  recv INVITE (no SDP) -> 100 -> reliable 183 (Require: 100rel, RSeq: 7, SDP
+  offer) -> recv PRACK carrying the caller's answer -> 200 PRACK -> 200 INVITE
+  (no SDP, the exchange is done) -> recv ACK -> recv BYE -> 200 BYE.
+
+  siphon's PRACK waits for the caller's PRACK of siphon's copy of the 183, so
+  this side retransmits the 183 until then; siphon discards those copies (RFC
+  3262 §4). The PRACK must carry the answer (RFC 3262 §5) with siphon's origin,
+  never the caller's. A PRACK without the answer leaves the offer unanswered,
+  so this callee refuses the INVITE 488 and the caller's scenario fails on it:
+  the caller never sees the PRACK, and CI gates on the caller.
+
+  Registered as carol (172.20.0.126) by sipp-b2bua-prack-early-offer-register.
+  Pair with b2bua_prack_early_offer_uac.xml on the A-leg side of siphon.
+-->
+<scenario name="B2BUA offer/answer in PRACK: callee offers in a reliable 183">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <!-- The caller's INVITE had no SDP, so neither does siphon's. -->
+      <ereg regexp="m=audio" search_in="body" check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="(.*)" search_in="hdr" header="Via:" assign_to="junk,invite_via" />
+      <ereg regexp="(.*)" search_in="hdr" header="From:" assign_to="junk,invite_from" />
+      <ereg regexp="(.*)" search_in="hdr" header="To:" assign_to="junk,invite_to" />
+      <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="junk,invite_callid" />
+      <ereg regexp="(.*)" search_in="hdr" header="CSeq:" assign_to="junk,invite_cseq" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Require: 100rel
+RSeq: 7
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=carol 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+]]>
+  </send>
+
+  <recv request="PRACK" crlf="true" next="1" test="prack_answer">
+    <action>
+      <ereg regexp="7 [0-9]+ INVITE" search_in="hdr" header="RAck:"
+            check_it="true" assign_to="prack_rack" />
+      <ereg regexp="m=audio 49170 RTP/AVP" search_in="body"
+            assign_to="prack_answer" />
+      <ereg regexp="o=alice" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+      <log message="siphon's PRACK with RAck [$prack_rack] carried the answer: [$prack_answer]" />
+    </action>
+  </recv>
+
+  <!-- No answer in siphon's PRACK: the offer stands unanswered, so refuse the
+       INVITE and let the caller's scenario fail on the 488. -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send>
+    <![CDATA[
+SIP/2.0 488 Not Acceptable Here
+Via:[$invite_via]
+From:[$invite_from]
+To:[$invite_to];tag=[pid]SIPpTag01[call_number]
+Call-ID:[$invite_callid]
+CSeq:[$invite_cseq]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" next="2" />
+
+  <label id="1" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+Via:[$invite_via]
+From:[$invite_from]
+To:[$invite_to];tag=[pid]SIPpTag01[call_number]
+Call-ID:[$invite_callid]
+CSeq:[$invite_cseq]
+Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" optional="true" timeout="10000" />
+
+  <recv request="BYE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <label id="2" />
+
+</scenario>
