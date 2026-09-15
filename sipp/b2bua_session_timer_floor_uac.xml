@@ -16,6 +16,12 @@
 
   The callee (b2bua_session_timer_floor_uas.xml) checks that siphon refreshes
   the callee's dialog in the meantime, and gets the same BYE.
+
+  The CI image's SIPp (3.5.1) never matches a ^ anchor against a header value,
+  so a header that has to be exactly one value is read twice: whole, and as the
+  tail the anchored-at-the-end regexp matches. The two differ when anything
+  comes before the expected value (190;refresher=uac), and no match at all
+  fails check_it.
 -->
 <scenario name="B2BUA caller that never refreshes its session">
 
@@ -59,9 +65,15 @@ a=fmtp:101 0-15
   <recv response="200" rtd="true" crlf="true">
     <action>
       <gettimeofday assign_to="answered_seconds,answered_microseconds" />
-      <ereg regexp="^[[:space:]]*90;refresher=uac[[:space:]]*$"
-            search_in="hdr" header="Session-Expires:" check_it="true"
+      <ereg regexp=".*" search_in="hdr" header="Session-Expires:"
             assign_to="granted_session_expires" />
+      <ereg regexp="[[:space:]]*90;refresher=uac[[:space:]]*$"
+            search_in="hdr" header="Session-Expires:" check_it="true"
+            assign_to="granted_session_expires_own" />
+      <strcmp assign_to="granted_session_expires_compared"
+              variable="granted_session_expires" variable2="granted_session_expires_own" />
+      <test assign_to="granted_session_expires_differs"
+            variable="granted_session_expires_compared" compare="not_equal" value="0" />
       <ereg regexp="timer"
             search_in="hdr" header="Require:" check_it="true"
             assign_to="required_extension" />
@@ -82,6 +94,8 @@ Content-Length: 0
 
 ]]>
   </send>
+
+  <nop next="wrong_grant" test="granted_session_expires_differs" />
 
   <!-- No refresh from this caller. No ontimeout, so a BYE that never comes
        fails the call, and so does anything else that arrives first. -->
@@ -119,6 +133,15 @@ Content-Length: 0
   <nop next="wrong_time" test="too_early" />
   <nop next="wrong_time" test="too_late" />
   <nop next="done" />
+
+  <label id="wrong_grant" />
+  <nop>
+    <action>
+      <log message="WRONG GRANT: siphon's 200 carried Session-Expires [$granted_session_expires], expected 90;refresher=uac" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_GRANT" timeout="100" />
 
   <label id="wrong_time" />
   <nop>

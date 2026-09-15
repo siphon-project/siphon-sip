@@ -18,21 +18,42 @@
   dialog and never refreshes it, so siphon then ends the call: this leg gets a
   BYE with the timer-expiry Reason, 55 to 72 s after the answer. A BYE before
   the refresh is unexpected and fails the call.
+
+  The CI image's SIPp (3.5.1) never matches a ^ anchor against a header value,
+  so a header that has to be exactly one value is read twice: whole, and as the
+  tail the anchored-at-the-end regexp matches. The two differ when anything
+  comes before the expected value (190;refresher=uac), and no match at all
+  fails check_it.
 -->
 <scenario name="B2BUA callee on a call siphon refreshes and then ends">
 
   <!-- RFC 4028 §7.1: siphon, the UAC here, asks to refresh a 90 s session. -->
   <recv request="INVITE" crlf="true">
     <action>
-      <ereg regexp="^[[:space:]]*90;refresher=uac[[:space:]]*$"
-            search_in="hdr" header="Session-Expires:" check_it="true"
+      <ereg regexp=".*" search_in="hdr" header="Session-Expires:"
             assign_to="requested_session_expires" />
-      <ereg regexp="^[[:space:]]*90[[:space:]]*$"
-            search_in="hdr" header="Min-SE:" check_it="true"
+      <ereg regexp="[[:space:]]*90;refresher=uac[[:space:]]*$"
+            search_in="hdr" header="Session-Expires:" check_it="true"
+            assign_to="requested_session_expires_own" />
+      <strcmp assign_to="requested_session_expires_compared"
+              variable="requested_session_expires" variable2="requested_session_expires_own" />
+      <test assign_to="requested_session_expires_differs"
+            variable="requested_session_expires_compared" compare="not_equal" value="0" />
+      <ereg regexp=".*" search_in="hdr" header="Min-SE:"
             assign_to="requested_min_se" />
+      <ereg regexp="[[:space:]]*90[[:space:]]*$"
+            search_in="hdr" header="Min-SE:" check_it="true"
+            assign_to="requested_min_se_own" />
+      <strcmp assign_to="requested_min_se_compared"
+              variable="requested_min_se" variable2="requested_min_se_own" />
+      <test assign_to="requested_min_se_differs"
+            variable="requested_min_se_compared" compare="not_equal" value="0" />
       <log message="INVITE asks for Session-Expires [$requested_session_expires], Min-SE [$requested_min_se]" />
     </action>
   </recv>
+
+  <nop next="wrong_request" test="requested_session_expires_differs" />
+  <nop next="wrong_request" test="requested_min_se_differs" />
 
   <send>
     <![CDATA[
@@ -99,12 +120,24 @@ a=fmtp:101 0-15
       <add assign_to="refreshed_after" variable="refreshed_fraction" />
       <test assign_to="refreshed_early" variable="refreshed_after" compare="less_than" value="40" />
       <test assign_to="refreshed_late" variable="refreshed_after" compare="greater_than" value="55" />
-      <ereg regexp="^[[:space:]]*90;refresher=uac[[:space:]]*$"
-            search_in="hdr" header="Session-Expires:" check_it="true"
+      <ereg regexp=".*" search_in="hdr" header="Session-Expires:"
             assign_to="refresh_session_expires" />
-      <ereg regexp="^[[:space:]]*90[[:space:]]*$"
-            search_in="hdr" header="Min-SE:" check_it="true"
+      <ereg regexp="[[:space:]]*90;refresher=uac[[:space:]]*$"
+            search_in="hdr" header="Session-Expires:" check_it="true"
+            assign_to="refresh_session_expires_own" />
+      <strcmp assign_to="refresh_session_expires_compared"
+              variable="refresh_session_expires" variable2="refresh_session_expires_own" />
+      <test assign_to="refresh_session_expires_differs"
+            variable="refresh_session_expires_compared" compare="not_equal" value="0" />
+      <ereg regexp=".*" search_in="hdr" header="Min-SE:"
             assign_to="refresh_min_se" />
+      <ereg regexp="[[:space:]]*90[[:space:]]*$"
+            search_in="hdr" header="Min-SE:" check_it="true"
+            assign_to="refresh_min_se_own" />
+      <strcmp assign_to="refresh_min_se_compared"
+              variable="refresh_min_se" variable2="refresh_min_se_own" />
+      <test assign_to="refresh_min_se_differs"
+            variable="refresh_min_se_compared" compare="not_equal" value="0" />
       <ereg regexp="application/sdp"
             search_in="hdr" header="Content-Type:" check_it="true"
             assign_to="refresh_offer_type" />
@@ -143,6 +176,8 @@ a=fmtp:101 0-15
 
   <recv request="ACK" timeout="2000" crlf="true" />
 
+  <nop next="wrong_refresh" test="refresh_session_expires_differs" />
+  <nop next="wrong_refresh" test="refresh_min_se_differs" />
   <nop next="refreshed_at_wrong_time" test="refreshed_early" />
   <nop next="refreshed_at_wrong_time" test="refreshed_late" />
 
@@ -182,6 +217,24 @@ Content-Length: 0
   <nop next="ended_at_wrong_time" test="ended_early" />
   <nop next="ended_at_wrong_time" test="ended_late" />
   <nop next="done" />
+
+  <label id="wrong_request" />
+  <nop>
+    <action>
+      <log message="WRONG REQUEST: siphon's INVITE asked for Session-Expires [$requested_session_expires], Min-SE [$requested_min_se], expected 90;refresher=uac and 90" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_REQUEST" timeout="100" />
+
+  <label id="wrong_refresh" />
+  <nop>
+    <action>
+      <log message="WRONG REFRESH: siphon's refresh asked for Session-Expires [$refresh_session_expires], Min-SE [$refresh_min_se], expected 90;refresher=uac and 90" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_REFRESH" timeout="100" />
 
   <label id="refreshed_at_wrong_time" />
   <nop>

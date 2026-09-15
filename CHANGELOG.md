@@ -541,6 +541,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   replaces declared, with their values, when type, labels and buckets are unchanged. Changing those
   still needs a restart, and the reload fails saying so. Declaring one name twice in one load is
   still an error, and a metric keeps the help text it was first registered with.
+
 - **A B2BUA call honours the RFC 4028 session timer refresher negotiated on each of its dialogs.**
   siphon ran one timer per call. It refreshed only the callee, and only when the callee's 2xx
   carried no `refresher`, so a callee answering `refresher=uac`, which names siphon, was never
