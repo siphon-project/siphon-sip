@@ -126,6 +126,13 @@ impl PrackBridge {
         Some(self.held.remove(position).1)
     }
 
+    /// Take every PRACK still held, to send them without the caller's: once the
+    /// caller has its 2xx, siphon no longer retransmits the copies those PRACKs
+    /// wait on, so the caller may never PRACK them.
+    pub fn take_all(&mut self) -> Vec<HeldCalleePrack> {
+        self.held.drain(..).map(|(_, prack)| prack).collect()
+    }
+
     /// The caller's offer is on its way to the callee.
     pub fn begin_offer(&mut self, offer: PendingPrackOffer) {
         self.pending_offer = Some(offer);
@@ -329,5 +336,21 @@ mod tests {
         bridge.record_answered(7, message());
         assert!(bridge.answered_response(7).is_some());
         assert!(bridge.answered_response(8).is_none());
+    }
+
+    #[test]
+    fn take_all_empties_the_held_pracks_and_leaves_their_links_unmatched() {
+        let mut bridge = PrackBridge::default();
+        let first = bridge.hold(held(0, "callee-a", 42), None);
+        bridge.hold(held(1, "callee-b", 7), None);
+        let taken: Vec<(usize, u32)> = bridge
+            .take_all()
+            .into_iter()
+            .map(|prack| (prack.b_leg_index, prack.rseq))
+            .collect();
+        assert_eq!(taken, [(0, 42), (1, 7)]);
+        assert!(bridge.take_all().is_empty());
+        assert!(bridge.take(first).is_none());
+        assert_eq!(bridge.link_for(0, "callee-a", 42), None);
     }
 }

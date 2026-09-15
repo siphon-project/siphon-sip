@@ -187,14 +187,25 @@ impl PrackCall {
     /// `rtpengine.answer` records for an 18x that carries the offer: the callee as
     /// offerer, no answerer yet.
     async fn place_anchored(engine: &TestEngine) -> PrackCall {
+        PrackCall::place_anchored_with(engine, None, "callee-tag", None).await
+    }
+
+    /// A call placed with `offer`, media anchored on `engine`, and an engine
+    /// session whose offerer is `from_tag` and answerer `to_tag`.
+    async fn place_anchored_with(
+        engine: &TestEngine,
+        offer: Option<&str>,
+        from_tag: &str,
+        to_tag: Option<&str>,
+    ) -> PrackCall {
         let TestDispatcher { mut state, udp } = test_dispatcher_with_script(DIAL);
         state.rtpengine_set = Some(engine.backend().await);
         let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
         sessions.insert(crate::rtpengine::MediaSession {
             call_id: SIP_CALL_ID.to_string(),
             rtpengine_call_id: SIP_CALL_ID.to_string(),
-            from_tag: "callee-tag".to_string(),
-            to_tag: None,
+            from_tag: from_tag.to_string(),
+            to_tag: to_tag.map(str::to_string),
             profile: "rtp_passthrough".to_string(),
             ws_uri: None,
             ws_tee: None,
@@ -203,7 +214,7 @@ impl PrackCall {
         });
         state.rtpengine_sessions = Some(sessions);
         state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
-        PrackCall::place_on(TestDispatcher { state, udp }, None)
+        PrackCall::place_on(TestDispatcher { state, udp }, offer)
     }
 
     fn wire(&self) -> Vec<Sent> {
@@ -758,4 +769,107 @@ async fn the_callees_2xx_follows_the_200_that_answers_the_callers_prack_offer() 
         "{:?}",
         summaries(&sent)
     );
+}
+
+/// A callee may send its 2xx before the PRACK of a reliable provisional without
+/// SDP (RFC 3262 §3), and the caller's 2xx then goes out without waiting either.
+/// siphon's copy of that provisional stops being retransmitted, so the caller may
+/// never PRACK it, but siphon still owes the callee its PRACK (§4): the PRACK held
+/// for the caller's goes to the callee with the caller's 2xx, and a late PRACK
+/// from the caller is answered without sending the callee a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prack_still_held_goes_to_the_callee_with_the_callers_2xx() {
+    let call = PrackCall::place(Some(CALLER_OFFER));
+    call.callee_responds(180, "Ringing", Some(42), "");
+    let sent = call.wire();
+    let ringing = to(&sent, CALLER)
+        .into_iter()
+        .find(|message| message.status_code() == Some(180))
+        .expect("a 180 to the caller");
+    assert!(
+        ringing.headers.get("RSeq").is_some(),
+        "the callee's reliable 180 reaches a caller that supports 100rel reliably"
+    );
+    assert!(
+        pracks(&to(&sent, CALLEE)).is_empty(),
+        "{:?}",
+        summaries(&sent)
+    );
+
+    call.callee_responds(200, "OK", None, CALLEE_ANSWER);
+    let sent = call.wire();
+    assert!(
+        to(&sent, CALLER)
+            .iter()
+            .any(|message| message.status_code() == Some(200) && cseq_method(message) == "INVITE"),
+        "the 2xx does not wait for the PRACK of a provisional without SDP: {:?}",
+        summaries(&sent)
+    );
+    let prack = pracks(&to(&sent, CALLEE));
+    assert_eq!(prack.len(), 1, "{:?}", summaries(&sent));
+    assert_eq!(
+        prack[0].headers.get("RAck").map(String::as_str),
+        Some("42 1 INVITE")
+    );
+    assert!(prack[0].body.is_empty());
+
+    call.caller_pracks(&ringing, 2, "");
+    let sent = call.wire();
+    assert!(
+        to(&sent, CALLER)
+            .iter()
+            .any(|message| message.status_code() == Some(200) && cseq_method(message) == "PRACK"),
+        "{:?}",
+        summaries(&sent)
+    );
+    assert!(
+        pracks(&to(&sent, CALLEE)).is_empty(),
+        "{:?}",
+        summaries(&sent)
+    );
+}
+
+/// On an anchored call the caller's offer in its PRACK goes to the media engine as
+/// a re-offer from the caller's side, siphon's PRACK carries the engine's SDP, and
+/// the callee's answer goes to the engine as the `answer` completing it before the
+/// 200 to the caller's PRACK carries the engine's SDP back. Neither party's address
+/// crosses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchored_offer_in_the_callers_prack_crosses_the_media_engine_both_ways() {
+    let engine = TestEngine::start(false).await;
+    let call = PrackCall::place_anchored_with(
+        &engine,
+        Some(CALLER_OFFER),
+        "caller-tag",
+        Some("callee-tag"),
+    )
+    .await;
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+
+    call.caller_pracks(&progress, 2, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    let prack = pracks(&to(&sent, CALLEE));
+    assert_eq!(prack.len(), 1, "{:?}", summaries(&sent));
+    let offer = body_text(&prack[0]);
+    assert!(offer.contains("c=IN IP4 203.0.113.50"), "{offer}");
+    assert!(!offer.contains("192.0.2.30"), "{offer}");
+    let offers = engine.commands("offer");
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].from_tag.as_deref(), Some("caller-tag"));
+    assert_eq!(offers[0].sdp.as_deref(), Some(CALLER_NEW_OFFER));
+
+    call.callee_answers_prack(&prack[0], 200, CALLEE_NEW_ANSWER);
+    let sent = call.wire();
+    let to_caller = to(&sent, CALLER);
+    assert_eq!(to_caller.len(), 1, "{:?}", summaries(&sent));
+    assert_eq!(cseq_method(&to_caller[0]), "PRACK");
+    let answer = body_text(&to_caller[0]);
+    assert!(answer.contains("c=IN IP4 203.0.113.50"), "{answer}");
+    assert!(!answer.contains("198.51.100.71"), "{answer}");
+    let answers = engine.commands("answer");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].from_tag.as_deref(), Some("caller-tag"));
+    assert_eq!(answers[0].to_tag.as_deref(), Some("callee-tag"));
+    assert_eq!(answers[0].sdp.as_deref(), Some(CALLEE_NEW_ANSWER));
 }

@@ -164,12 +164,52 @@ pub fn release_unanswered_callee_prack(call_id: &str, link: u64, state: &Dispatc
         .get_call_mut(call_id)
         .and_then(|mut call| call.prack_bridge.take(link));
     if let Some(held) = held {
-        let body = held
-            .offer
-            .as_deref()
-            .map(|offer| (rejecting_answer(offer), "application/sdp".to_string()));
-        send_callee_prack(call_id, &held, body, state);
+        send_unanswered_callee_prack(call_id, &held, state);
     }
+}
+
+/// Every PRACK still held, once the caller has its 2xx: siphon stops
+/// retransmitting its copies then (RFC 3262 §3), so the caller may never PRACK
+/// them, and the callee is owed its PRACK all the same (§4). A callee may send
+/// its 2xx before the PRACK of a reliable provisional without SDP, and then the
+/// caller's 2xx does not wait for the caller's PRACK either.
+pub fn release_held_callee_pracks(call_id: &str, state: &DispatcherState) {
+    let held = state
+        .call_actors
+        .get_call_mut(call_id)
+        .map(|mut call| call.prack_bridge.take_all())
+        .unwrap_or_default();
+    for held in held {
+        send_unanswered_callee_prack(call_id, &held, state);
+    }
+}
+
+/// Send `held` without anything from the caller: with every stream rejected when
+/// the callee offered (RFC 3264 §6).
+///
+/// Not to a branch that has ended other than the one that answered, which siphon
+/// never PRACKs ([`auto_prack_b_leg`]): a failed or CANCELled branch has no
+/// unacknowledged provisional left to match. The winner is different. Its 2xx
+/// ends the INVITE transaction, but a reliable provisional it sent before that 2xx
+/// stays unacknowledged at its UAS core until a PRACK names it (RFC 3262 §3), and
+/// siphon received that provisional while the branch was still pending.
+fn send_unanswered_callee_prack(call_id: &str, held: &HeldCalleePrack, state: &DispatcherState) {
+    let ended = state.call_actors.get_call(call_id).map_or(true, |call| {
+        call.winner != Some(held.b_leg_index) && call.is_ended_branch(held.b_leg_index)
+    });
+    if ended {
+        debug!(
+            call_id = %call_id,
+            rseq = held.rseq,
+            "B2BUA: no PRACK for a reliable provisional from a leg that already ended"
+        );
+        return;
+    }
+    let body = held
+        .offer
+        .as_deref()
+        .map(|offer| (rejecting_answer(offer), "application/sdp".to_string()));
+    send_callee_prack(call_id, held, body, state);
 }
 
 /// Carry the caller's PRACK `caller_prack`, which acknowledged siphon's copy of

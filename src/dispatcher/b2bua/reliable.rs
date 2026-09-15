@@ -271,6 +271,9 @@ fn deliver_a_leg_answer(
     // signalling drops a 2xx sourced from a different local port.
     leading.push(response);
     send_to_caller(leading, route, state);
+    // The caller has its final response, so the PRACKs siphon still holds for the
+    // caller's go to their callees now (RFC 3262 §4).
+    release_held_callee_pracks(call_id, state);
 
     // The B2BUA has no INVITE server transaction for the caller, so nothing else
     // recovers a lost 2xx. Cancelled by the caller's ACK in the late-ACK handler
@@ -446,8 +449,9 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                         warn!(
                             call_id = %call_id,
                             rseq,
-                            "B2BUA: the caller's PRACK carries a body, but the provisional it acknowledges \
-                             is not the copy of a reliable one from the callee; answered without crossing"
+                            "B2BUA: the caller's PRACK carries a body, but no PRACK to the callee waits for it \
+                             (the provisional was siphon's own, or its PRACK went with the caller's 2xx); \
+                             answered without crossing"
                         );
                     }
                     CallerPrackBridged::Answer

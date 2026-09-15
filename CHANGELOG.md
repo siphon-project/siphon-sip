@@ -783,7 +783,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   leaves it unanswered for 64*T1, fails the call 500 through the teardown claim:
   the caller's PRACK gets a 200 rejecting every stream, and the callee is
   CANCELled, or BYEd if it already answered. Toward a caller without `100rel`
-  siphon still PRACKs at once, rejecting an early offer it cannot pass on.
+  siphon still PRACKs at once, rejecting an early offer it cannot pass on. A
+  callee may answer before the PRACK of a reliable provisional without SDP, and
+  siphon's copy then stops being retransmitted, so a PRACK still waiting for the
+  caller's goes to the callee with the caller's 2xx.
 
 - **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
   security association it arrived over, and the agreement stops at siphon.**
