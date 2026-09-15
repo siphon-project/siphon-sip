@@ -135,6 +135,38 @@ pub struct ALegReliableProvisionals {
     held_answer: Option<Box<HeldAnswer>>,
     /// A final response has gone to the caller.
     finished: bool,
+    /// siphon's offer to a caller whose INVITE carried none, by the `RSeq` of the
+    /// reliable provisional that carried it, until that provisional's PRACK.
+    offer_to_caller: Option<(u32, Vec<u8>)>,
+    /// siphon has sent that caller its offer.
+    offered_to_caller: bool,
+}
+
+impl ALegReliableProvisionals {
+    /// The session description in siphon's reliable provisional `rseq` is siphon's
+    /// offer to a caller whose INVITE carried none (RFC 3262 §5), in force on the
+    /// caller's dialog only once the PRACK of `rseq` answers it. Only the first
+    /// counts: SDP in a later provisional offers nothing new.
+    pub fn note_offer_to_caller(&mut self, rseq: u32, sdp: Vec<u8>) {
+        if !self.offered_to_caller {
+            self.offered_to_caller = true;
+            self.offer_to_caller = Some((rseq, sdp));
+        }
+    }
+
+    /// The offer the caller's PRACK of `rseq` answered, when that provisional
+    /// carried siphon's offer.
+    pub fn take_answered_offer(&mut self, rseq: u32) -> Option<Vec<u8>> {
+        if self
+            .offer_to_caller
+            .as_ref()
+            .is_some_and(|(noted, _)| *noted == rseq)
+        {
+            self.offer_to_caller.take().map(|(_, sdp)| sdp)
+        } else {
+            None
+        }
+    }
 }
 
 impl ALegReliableProvisionals {
@@ -588,6 +620,18 @@ mod tests {
             PrackOutcome::Acknowledged { link, .. } => assert_eq!(link, Some(2)),
             other => panic!("expected an acknowledgement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_offer_to_an_offerless_caller_comes_back_only_for_the_prack_of_its_provisional() {
+        let mut state = ALegReliableProvisionals::default();
+        state.note_offer_to_caller(7, b"offer".to_vec());
+        state.note_offer_to_caller(8, b"later sdp".to_vec());
+        assert_eq!(state.take_answered_offer(8), None, "only the first counts");
+        assert_eq!(state.take_answered_offer(7), Some(b"offer".to_vec()));
+        assert_eq!(state.take_answered_offer(7), None, "taken once");
+        state.note_offer_to_caller(9, b"again".to_vec());
+        assert_eq!(state.take_answered_offer(9), None, "one offer per call");
     }
 
     #[tokio::test]

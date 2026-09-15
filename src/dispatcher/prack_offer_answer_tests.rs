@@ -1148,3 +1148,97 @@ async fn a_prack_offer_that_cannot_be_sent_is_not_left_waiting_for_an_answer() {
         "{to_caller:?}"
     );
 }
+
+/// The answer siphon sends the caller in a reliable 18x is the session
+/// description in force on the caller's dialog as it goes, as an answer in a 2xx
+/// is (RFC 3262 §5).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_in_a_reliable_18x_is_in_force_on_the_callers_dialog() {
+    let call = PrackCall::place(Some(CALLER_OFFER));
+    assert_eq!(sessions_in_force(&call).caller_session, None);
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    assert!(progress.headers.get("RSeq").is_some(), "sent reliably");
+    assert_eq!(
+        sessions_in_force(&call).caller_session,
+        Some(progress.body.clone())
+    );
+}
+
+/// An offer siphon sends the caller in a reliable 18x, to an INVITE without SDP,
+/// is in force on the caller's dialog once the caller's PRACK answers it, and not
+/// before.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_early_offer_in_a_reliable_18x_is_in_force_on_the_callers_dialog_once_answered() {
+    let call = PrackCall::place(None);
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_OFFER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    assert_eq!(sessions_in_force(&call).caller_session, None);
+
+    call.caller_pracks(&progress, 2, CALLER_ANSWER);
+    call.wire();
+    assert_eq!(
+        sessions_in_force(&call).caller_session,
+        Some(progress.body.clone())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A session refresh toward the caller
+// ---------------------------------------------------------------------------
+
+/// The re-INVITE siphon sends the caller when it refreshes the session on the
+/// caller's dialog as its refresher.
+fn refresh_toward_the_caller(call: &PrackCall) -> SipMessage {
+    call.wire();
+    call.state.call_actors.set_leg_session_timer(
+        &call.call_id,
+        true,
+        Some(crate::b2bua::actor::SessionTimerState::new(
+            1800,
+            true,
+            90,
+            Instant::now(),
+        )),
+    );
+    b2bua_send_session_refresh(&call.call_id, true, &call.state);
+    let sent = call.wire();
+    let refresh: Vec<SipMessage> = to(&sent, CALLER)
+        .into_iter()
+        .filter(|message| message.method() == Some(&Method::Invite))
+        .collect();
+    assert_eq!(refresh.len(), 1, "{:?}", summaries(&sent));
+    refresh[0].clone()
+}
+
+/// The callee answered the caller's offer in a reliable 183 and its 2xx carried no
+/// SDP. A refresh of the caller's dialog offers that answer again as it went, `o=`
+/// line and all, so the caller sees the session unchanged (RFC 4028 §7.4, RFC 3264
+/// §8), not a new session id at a version it never saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_toward_the_caller_offers_the_answer_its_reliable_183_carried() {
+    let call = PrackCall::place(Some(CALLER_OFFER));
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    call.caller_pracks(&progress, 2, "");
+    call.wire();
+    call.callee_responds(200, "OK", None, "");
+
+    let refresh = refresh_toward_the_caller(&call);
+    assert_eq!(body_text(&refresh), body_text(&progress));
+}
+
+/// The same for siphon's offer in a reliable 183 to an INVITE without SDP, once the
+/// caller's PRACK answered it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_toward_the_caller_offers_the_early_offer_its_prack_answered() {
+    let call = PrackCall::place(None);
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_OFFER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    call.caller_pracks(&progress, 2, CALLER_ANSWER);
+    call.wire();
+    call.callee_responds(200, "OK", None, "");
+
+    let refresh = refresh_toward_the_caller(&call);
+    assert_eq!(body_text(&refresh), body_text(&progress));
+}

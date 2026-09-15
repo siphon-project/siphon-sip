@@ -111,7 +111,7 @@ pub fn send_a_leg_provisional(
             let unanswered =
                 link.filter(|_| !reliable || matches!(offered, Offered::AfterFinal));
             let messages = match offered {
-                Offered::Send(send) => prepare_provisionals(vec![send], &route, state),
+                Offered::Send(send) => prepare_provisionals(vec![send], &route, state, &mut call),
                 Offered::Queued => {
                     debug!(
                         call_id = %call_id,
@@ -141,11 +141,14 @@ pub fn send_a_leg_provisional(
 
 /// Stamp each provisional with its reliability, siphon's `RSeq` or none, and arm
 /// the retransmissions of a reliable one before it is sent, so a PRACK racing
-/// the send finds it armed. Runs under the call's lock, which a PRACK takes too.
+/// the send finds it armed. The SDP a reliable one carries is recorded on the
+/// caller's dialog ([`record_caller_session`]). Runs under the call's lock, which
+/// a PRACK takes too.
 fn prepare_provisionals(
     sends: Vec<ProvisionalSend>,
     route: &CallerRoute,
     state: &DispatcherState,
+    call: &mut crate::b2bua::actor::CallActor,
 ) -> Vec<SipMessage> {
     sends
         .into_iter()
@@ -157,6 +160,7 @@ fn prepare_provisionals(
              }| {
                 crate::sip::headers::rseq::set_reliability(&mut response.headers, rseq);
                 if let (Some(rseq), Some(stop)) = (rseq, stop) {
+                    record_caller_session(call, rseq, &response);
                     // A reliable provisional opens an early dialog, which the
                     // caller's PRACK names by siphon's tag (RFC 3262 §4).
                     if let Some(to) = response.headers.to().cloned() {
@@ -187,6 +191,37 @@ fn prepare_provisionals(
             },
         )
         .collect()
+}
+
+/// Record the session description a reliable provisional `rseq` carries to the
+/// caller (RFC 3262 §5). To a caller whose INVITE offered it is the answer, in
+/// force on the caller's dialog as it goes. To an INVITE without SDP the first one
+/// is siphon's offer, in force once the caller's PRACK of it answers
+/// ([`handle_b2bua_prack`]). Once a session is in force, SDP in a later
+/// provisional changes nothing.
+///
+/// A provisional goes to the caller with the `o=` session id and version the
+/// callee gave its SDP, so the dialog adopts them
+/// ([`Dialog::adopt_sent_sdp`](crate::b2bua::actor::Dialog::adopt_sent_sdp)): a
+/// session refresh toward the caller offers the session it has, not a new one.
+fn record_caller_session(
+    call: &mut crate::b2bua::actor::CallActor,
+    rseq: u32,
+    response: &SipMessage,
+) {
+    if call.a_leg.dialog.last_sent_sdp.is_some() {
+        return;
+    }
+    let Some(session) = sdp_in_body(message_content_type(response), &response.body) else {
+        return;
+    };
+    // The caller's own SDP is on its leg from the INVITE when the INVITE had one.
+    if call.a_leg.last_sdp.is_some() {
+        let origin = sdp_origin_identity(&session);
+        call.a_leg.dialog.adopt_sent_sdp(session, origin);
+    } else {
+        call.a_leg_reliability.note_offer_to_caller(rseq, session);
+    }
 }
 
 /// Put `messages` on the wire to the caller, several as one ordered group: sent
@@ -411,9 +446,19 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                     {
                         entry.cancel.notify_one();
                     }
+                    // RFC 3262 §5: the answer this PRACK carries puts siphon's offer
+                    // in the provisional it acknowledges in force on the caller's
+                    // dialog, with the `o=` it went with.
+                    if !message.body.is_empty() {
+                        if let Some(offer) = call.a_leg_reliability.take_answered_offer(rseq) {
+                            let origin = sdp_origin_identity(&offer);
+                            call.a_leg.dialog.adopt_sent_sdp(offer, origin);
+                        }
+                    }
+                    let released = prepare_provisionals(release, &route, state, &mut call);
                     CallerPrack::Acknowledged {
                         rseq,
-                        released: prepare_provisionals(release, &route, state),
+                        released,
                         answer,
                         held: link.and_then(|link| call.prack_bridge.take(link)),
                     }
