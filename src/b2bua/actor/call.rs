@@ -1001,6 +1001,23 @@ impl CallActor {
             .is_some_and(|leg| !leg.is_tracking_leg())
     }
 
+    /// Whether the B-leg at `index` is a branch that has ended: it has its final
+    /// response (answered, failed, an LCR carrier settled), siphon CANCELled it,
+    /// or it is no longer on the call. A provisional from such a leg is owed
+    /// nothing: no relay, no LCR progress, no PRACK.
+    ///
+    /// Not quite the negation of [`is_pending_branch`](Self::is_pending_branch):
+    /// a re-INVITE / UPDATE / forwarded-request tracking pseudo-leg is neither.
+    /// It is no branch, and the reliable provisional a re-INVITE draws is still
+    /// PRACKed.
+    pub fn is_ended_branch(&self, index: usize) -> bool {
+        !self.is_pending_branch(index)
+            && !self
+                .b_legs
+                .get(index)
+                .is_some_and(|leg| leg.is_tracking_leg())
+    }
+
     /// Mark every pending branch but `keep` cancelled, and return the ones whose
     /// INVITE is on the wire, for the caller to CANCEL (RFC 3261 §9.1).
     ///

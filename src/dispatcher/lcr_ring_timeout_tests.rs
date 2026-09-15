@@ -244,7 +244,23 @@ impl Sequence {
         status_code: u16,
         reason: &str,
     ) {
+        self.carrier_answers_with(address, invite, status_code, reason, &[]);
+    }
+
+    /// [`Sequence::carrier_answers`] with `headers` set on the response, such as
+    /// the `Require: 100rel` and `RSeq` of a reliable provisional.
+    pub(super) fn carrier_answers_with(
+        &self,
+        address: &str,
+        invite: &SipMessage,
+        status_code: u16,
+        reason: &str,
+        headers: &[(&str, &str)],
+    ) {
         let mut response = carrier_response(invite, status_code, reason);
+        for (name, value) in headers {
+            response.headers.set(name, value.to_string());
+        }
         let handled = handle_b2bua_response(
             &self.call_id,
             &top_via_branch(invite),
