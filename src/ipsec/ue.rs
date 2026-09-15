@@ -126,7 +126,7 @@ mod tests {
             6101,
         );
         // prot=esp;mod=trans, handset parameter order, no spaces within a
-        // mechanism (matches Samsung IMS 6.0 / TS 33.203 §7.2).
+        // mechanism (the shape handsets send; grammar per TS 33.203 Annex H).
         assert_eq!(
             build_security_client(&offer),
             "ipsec-3gpp;prot=esp;mod=trans;spi-c=4369;spi-s=8738;port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=null"
@@ -203,8 +203,9 @@ mod tests {
 
     #[test]
     fn parse_security_server_reads_pcscf_params() {
-        // What a P-CSCF answers with — its own SPIs/ports, plus a protocol= it
-        // is allowed to add (TS 33.203). The shared parser ignores protocol=.
+        // What a P-CSCF answers with: its own SPIs/ports, plus a protocol= that
+        // no sec-agree spec defines (RFC 3329, TS 33.203 Annex H) but a peer
+        // may still send. The shared parser ignores protocol=.
         let header =
             "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=55555; spi-s=66666; port-c=5064; port-s=5066; protocol=udp";
         let server = parse_security_server(header).unwrap();

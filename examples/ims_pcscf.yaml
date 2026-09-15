@@ -24,12 +24,12 @@ listen:
   # advertised_address.
   udp:
     - "0.0.0.0:5060"        # Unprotected SIP (initial REGISTER)
-    - "10.0.0.10:5064"      # IPsec protected client port
-    - "10.0.0.10:5066"      # IPsec protected server port
+    - "192.0.2.10:5064"     # IPsec protected client port
+    - "192.0.2.10:5066"     # IPsec protected server port
   tcp:
     - "0.0.0.0:5060"
-    - "10.0.0.10:5064"      # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
-    - "10.0.0.10:5066"      # IPsec protected server port (ESP-over-TCP)
+    - "192.0.2.10:5064"     # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.1)
+    - "192.0.2.10:5066"     # IPsec protected server port (ESP-over-TCP)
 
   # --- Dual-stack Gm (IPv4 + IPv6) ---------------------------------------
   # A P-CSCF serving VoLTE UEs on both IPv4 and IPv6 bearers binds an
@@ -49,19 +49,19 @@ listen:
   #   - { address: "[2001:db8:ac10::10]:5060", advertise: "pcscf.ims.example" }
   #   - { address: "[2001:db8:ac10::10]:5064", advertise: "pcscf.ims.example" }
   #   - { address: "[2001:db8:ac10::10]:5066", advertise: "pcscf.ims.example" }
-  # tcp:  # ESP-over-TCP mirror (TS 33.203 §7.2), same six entries
+  # tcp:  # ESP-over-TCP mirror (TS 33.203 §7.1), same six entries
   #   - { address: "192.0.2.10:5060" }
   #   - { address: "[2001:db8:ac10::10]:5060" }
   #   # ...
 
 # Public IP — set to the P-CSCF's routable address (per-listener `advertise`
 # above overrides this for dual-stack, so each family gets its own identity)
-advertised_address: "10.0.0.10"
+advertised_address: "192.0.2.10"
 
 domain:
   local:
     - "ims.example.com"
-    - "10.0.0.10"
+    - "192.0.2.10"
 
 script:
   path: "examples/ims_pcscf.py"

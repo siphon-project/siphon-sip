@@ -224,12 +224,12 @@ impl SaRole {
 /// Upper-layer protocol pinned into the XFRM selector for an SA pair —
 /// determines which inner-protocol frames the SA applies to.  IMS IPsec
 /// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
-/// (3GPP TS 33.203 §7.2 — used by UEs that prefer TCP-first SIP).
+/// (the TCP case of the protected ports in 3GPP TS 33.203 §7.1, used by
+/// UEs that prefer TCP-first SIP).
 ///
-/// `Any` is the spec-compliant default: 3GPP TS 33.203 §7.2 requires that
-/// "the Security Associations established between the UE and the P-CSCF
-/// shall be used to protect *all* SIP signalling exchanged between the UE
-/// and the P-CSCF, including SIP traffic over UDP and TCP."  iOS handsets
+/// `Any` is the spec-compliant default: 3GPP TS 33.203 has the two SA
+/// pairs "all shared by TCP and UDP" (§6.3) and says "The transport
+/// protocol selector shall allow UDP and TCP." (§7.1).  iOS handsets
 /// rely on this — they REGISTER over TCP but emit MO MESSAGE over UDP,
 /// and a TCP-pinned SA would silently drop the MESSAGE on
 /// `XfrmInStateMismatch`.  When `Any` is selected, the XFRM selector
@@ -262,11 +262,12 @@ impl SaProtocol {
 
     /// Lower-case name as used in the ``ip xfrm`` UPSPEC grammar.
     /// iproute2 accepts the literal string ``any`` and maps it to
-    /// selector proto 0.  Note: this is NOT the right value to put on
-    /// the RFC 3329 ``protocol=`` parameter wire-side for `Any` —
-    /// callers serialising Security-Server headers should treat `Any`
-    /// the same as omitting the ``protocol=`` param (which per
-    /// RFC 3329 §2.2 implies UDP).
+    /// selector proto 0.  Note: this is NOT a value for a
+    /// Security-Server header.  Callers serialising one should leave
+    /// ``protocol=`` off for `Any`: siphon only appends it for a
+    /// TCP-pinned SA, no sec-agree spec defines it (RFC 3329 §2.2 and
+    /// Appendix A, TS 33.203 Annex H), and an SA shared by UDP and TCP
+    /// is the standard case (TS 33.203 §7.1).
     pub fn as_str(self) -> &'static str {
         match self {
             SaProtocol::Udp => "udp",
@@ -473,9 +474,10 @@ pub struct SecurityAssociationPair {
     pub hard_lifetime_secs: Option<u64>,
     /// Upper-layer protocol pinned into the XFRM selector.  `Any`
     /// (selector_proto=0, the default) covers both ESP-over-UDP and
-    /// ESP-over-TCP under the same SPI pair — required for spec
-    /// compliance with 3GPP TS 33.203 §7.2 ("the SAs shall be used to
-    /// protect *all* SIP signalling … including over UDP and TCP") and
+    /// ESP-over-TCP under the same SPI pair, required for spec
+    /// compliance with 3GPP TS 33.203 (§6.3: the SA pairs are "all
+    /// shared by TCP and UDP"; §7.1: "The transport protocol selector
+    /// shall allow UDP and TCP.") and
     /// for iOS UEs that mix transports (REGISTER over TCP, MO MESSAGE
     /// over UDP).  Pin to `Udp` or `Tcp` only for single-transport
     /// deployments or tests; a mismatched pin silently drops every
@@ -2475,7 +2477,7 @@ mod tests {
         // the kernel ABI.  Linux short-circuits the proto check when
         // sel->proto==0 (see __xfrm{4,6}_selector_match), so the SA
         // pair covers both TCP and UDP under one SPI.  This is the
-        // spec-compliant default per 3GPP TS 33.203 §7.2.
+        // spec-compliant default per 3GPP TS 33.203 §6.3 / §7.1.
         assert_eq!(SaProtocol::Any.as_u8(), 0);
     }
 
@@ -2486,9 +2488,10 @@ mod tests {
         assert_eq!(format!("{}", SaProtocol::Tcp), "tcp");
         // `any` is the iproute2 UPSPEC literal for selector_proto=0 —
         // accepted by `ip xfrm policy add ... proto any sport X dport Y`.
-        // Not a valid RFC 3329 `protocol=` value; callers formatting the
-        // Security-Server header must omit the parameter for `Any`
-        // (RFC 3329 §2.2: absent implies UDP, which is wire-compatible).
+        // Not a value for a Security-Server header; callers formatting one
+        // must omit `protocol=` for `Any`. No sec-agree spec defines that
+        // parameter (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H), so
+        // leaving it off is the standard shape.
         assert_eq!(SaProtocol::Any.as_str(), "any");
         assert_eq!(format!("{}", SaProtocol::Any), "any");
     }
@@ -2617,7 +2620,7 @@ mod tests {
 
     #[test]
     fn sa_protocol_default_is_any() {
-        // Spec-driven default change (3GPP TS 33.203 §7.2): an SA pair
+        // Spec-driven default change (3GPP TS 33.203 §6.3 / §7.1): an SA pair
         // must protect SIP signalling on *both* UDP and TCP between the
         // UE and the P-CSCF.  Single-transport pins are opt-in for tests
         // / niche deployments; `Default::default()` returns the

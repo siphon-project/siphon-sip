@@ -16,11 +16,11 @@ from siphon_sdk import mock_module
 from siphon_sdk.testing import SipTestHarness
 
 PCSCF = "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"
-PCSCF_IP = "10.0.0.10"
+PCSCF_IP = "192.0.2.10"
 HOME = "ims.mnc01.mcc001.3gppnetwork.org"
 IMPU = f"sip:001010000000001@{HOME}"
 IMPI = f"001010000000001@{HOME}"
-TESTER = "sip:5555@10.0.0.100:5060"
+TESTER = "sip:5555@192.0.2.100:5060"
 
 
 def _register():
@@ -38,7 +38,7 @@ def _register():
 
 @pytest.fixture
 def harness():
-    h = SipTestHarness(local_domains=["10.0.0.20"])
+    h = SipTestHarness(local_domains=["192.0.2.20"])
     h.load_script("../examples/ims_ue_b2bua.py")
     _register()
     yield h
@@ -62,9 +62,9 @@ def test_mt_call_bridges_to_tester(harness):
 def test_mo_call_dials_ims_over_sa_flow(harness):
     # A-leg from the tester → originating → dial toward the IMS.
     result = harness.send_invite(
-        source_ip="10.0.0.100",
-        ruri="sip:1234@10.0.0.20",
-        from_uri="sip:tester@10.0.0.100",
+        source_ip="192.0.2.100",
+        ruri="sip:1234@192.0.2.20",
+        from_uri="sip:tester@192.0.2.100",
     )
     assert result.action == "dial"
     # R-URI rebuilt as the dialled number @ the IMS home domain.
@@ -83,6 +83,6 @@ def test_mo_call_dials_ims_over_sa_flow(harness):
 def test_mo_call_rejected_when_not_registered(harness):
     # If the registration isn't up (no ipsec flow), MO is rejected 503.
     mock_module.get_registration()._entries[IMPU]["ipsec"] = False
-    result = harness.send_invite(source_ip="10.0.0.100", ruri="sip:1234@10.0.0.20")
+    result = harness.send_invite(source_ip="192.0.2.100", ruri="sip:1234@192.0.2.20")
     assert result.was_rejected
     assert result.status_code == 503

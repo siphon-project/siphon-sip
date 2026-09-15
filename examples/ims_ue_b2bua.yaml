@@ -22,17 +22,17 @@ server:
 # Bind to a SPECIFIC local IP, NOT 0.0.0.0: the UE address used for the IPsec
 # SA selectors and the protected-REGISTER source is taken from the primary
 # listen address. 0.0.0.0 would make the kernel XFRM selectors unusable.
-advertised_address: "${UE_IP:-10.0.0.20}"
+advertised_address: "${UE_IP:-192.0.2.20}"
 
 listen:
   udp:
-    - "${UE_IP:-10.0.0.20}:5060"     # plain SIP toward the tester
-    - "${UE_IP:-10.0.0.20}:6100"     # UE protected client port (ue_port_c)
-    - "${UE_IP:-10.0.0.20}:6101"     # UE protected server port (ue_port_s)
+    - "${UE_IP:-192.0.2.20}:5060"    # plain SIP toward the tester
+    - "${UE_IP:-192.0.2.20}:6100"    # UE protected client port (ue_port_c)
+    - "${UE_IP:-192.0.2.20}:6101"    # UE protected server port (ue_port_s)
 
 domain:
   local:
-    - "${UE_IP:-10.0.0.20}"
+    - "${UE_IP:-192.0.2.20}"
 
 script:
   path: "examples/ims_ue_b2bua.py"

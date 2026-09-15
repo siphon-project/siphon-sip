@@ -8684,9 +8684,11 @@ class MockSecurityServerParams:
         self.spi_s = spi_s
         self.port_c = port_c
         self.port_s = port_s
-        # Lower-case transport carrying ESP — "udp" or "tcp".  When non-default
-        # ("tcp"), append `protocol=tcp` to the Security-Server header per RFC
-        # 3329 §2.2.  Mirrors the value passed to ipsec.allocate(...).
+        # Lower-case transport carrying ESP, "udp" or "tcp".  Only "tcp" gets
+        # `protocol=tcp` appended to the Security-Server header, and that is a
+        # siphon convention: RFC 3329 (§2.2, Appendix A) and TS 33.203 Annex H
+        # define no such parameter.  Mirrors the value passed to
+        # ipsec.allocate(...).
         self.protocol = protocol
 
     def __repr__(self) -> str:
@@ -8808,13 +8810,15 @@ class MockIpsec:
         # in unit tests.
         #
         # ``protocol=None`` (default) installs an XFRM selector covering
-        # both ESP-over-UDP and ESP-over-TCP under one SPI pair —
-        # required by 3GPP TS 33.203 §7.2 ("the SAs shall be used to
-        # protect *all* SIP signalling … including over UDP and TCP").
+        # both ESP-over-UDP and ESP-over-TCP under one SPI pair, as
+        # 3GPP TS 33.203 requires: the SA pairs are "all shared by TCP and
+        # UDP" (§6.3) and "The transport protocol selector shall allow UDP
+        # and TCP." (§7.1).
         # The wire-form ``protocol`` on the resulting
-        # :class:`SecurityServerParams` collapses to ``"udp"`` because
-        # RFC 3329 §2.2 says an absent ``protocol=`` parameter implies
-        # UDP — keeps the wire shape every existing UE expects.
+        # :class:`SecurityServerParams` collapses to ``"udp"`` so a script
+        # leaves ``protocol=`` off, the standard shape: RFC 3329 (§2.2,
+        # Appendix A) and TS 33.203 Annex H define no such parameter, and
+        # TS 33.203 §7.1 has the SAs carry UDP and TCP alike.
         #
         # Explicit ``"udp"``/``"tcp"``/``"any"`` pin the selector to
         # that one inner protocol (single-transport deployments, tests).
@@ -8834,14 +8838,15 @@ class MockIpsec:
         # consumes ``av`` before this check): the SA's P-CSCF side must be the
         # same family as the UE, so a UE whose family has no configured P-CSCF
         # listener raises rather than installing a dead mixed-family selector
-        # (3GPP TS 33.203 §7.2).
+        # (both SA addresses are those of the initial REGISTER's IP header,
+        # 3GPP TS 33.203 §7.1).
         ue_is_v6 = ":" in offer.ue_addr
         if (self.pcscf_addr_v6 if ue_is_v6 else self.pcscf_addr_v4) is None:
             family = "IPv6" if ue_is_v6 else "IPv4"
             raise ValueError(
                 f"no {family} P-CSCF listener configured for {family} UE "
                 f"{offer.ue_addr}; cannot build a same-family IPsec SA selector "
-                f"(3GPP TS 33.203 §7.2)"
+                f"(3GPP TS 33.203 §7.1)"
             )
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)

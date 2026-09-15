@@ -17,12 +17,15 @@
 //!    :class:`AuthVectorHandle`.
 //! 3. ``ipsec.allocate(av, offer, transform, protocol=…)`` — consume the
 //!    AV, allocate SPIs, install the four XFRM SAs and policies, return
-//!    a :class:`PendingSA`.  ``protocol`` selects the inner transport
-//!    pinned into the XFRM selector — ``"udp"`` (default, ESP-over-UDP)
-//!    or ``"tcp"`` (ESP-over-TCP, TS 33.203 §7.2).  Must match the
-//!    transport the UE used for the initial REGISTER, otherwise the
-//!    kernel selectors won't match the UE's protected frames and every
-//!    subsequent REGISTER arrives unprotected.
+//!    a :class:`PendingSA`.  ``protocol`` selects the inner transport(s)
+//!    the XFRM selectors match.  The default (``None``, same as
+//!    ``"any"``) stamps ``proto=0``, so one SA pair covers both
+//!    ESP-over-UDP and ESP-over-TCP, as 3GPP TS 33.203 requires (§6.3:
+//!    the SA pairs are "all shared by TCP and UDP"; §7.1: "The transport
+//!    protocol selector shall allow UDP and TCP.").  ``"udp"`` or
+//!    ``"tcp"`` pins the selectors to that one transport, for tests and
+//!    single-transport deployments; the kernel then drops every
+//!    protected frame the UE sends on the other transport.
 //! 4. ``pending.security_server_params()`` — produce the
 //!    ``Security-Server`` parameters; the script formats and injects the
 //!    header on the relayed 401.
@@ -229,7 +232,8 @@ impl PyTransform {
 #[pymethods]
 impl PyTransform {
     /// Integrity algorithm name as it appears in a ``Security-Client`` /
-    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g.
+    /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``alg``
+    /// parameter, RFC 3329 Appendix A / 3GPP TS 33.203 Annex H), e.g.
     /// ``"hmac-sha-1-96"``.
     ///
     /// Lets a script advertise its transform policy as a capability list
@@ -243,8 +247,9 @@ impl PyTransform {
     }
 
     /// Encryption algorithm name as it appears in a ``Security-Client`` /
-    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g. ``"aes-cbc"``
-    /// or ``"null"``.
+    /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``ealg``
+    /// parameter, RFC 3329 Appendix A; ``"aes-cbc"`` is added by 3GPP
+    /// TS 33.203 Annex H), e.g. ``"aes-cbc"`` or ``"null"``.
     #[getter(ealg)]
     fn py_ealg(&self) -> &'static str {
         self.ealg_str()
@@ -452,15 +457,17 @@ pub struct PySecurityServerParams {
     #[pyo3(get)]
     pub port_s: u16,
     /// Wire-form transport for the RFC 3329 ``Security-Server``
-    /// ``protocol=`` parameter — either ``"udp"`` or ``"tcp"``.  The
-    /// caller appends ``protocol=tcp`` to the header only when this
-    /// field is ``"tcp"``; ``"udp"`` is the RFC 3329 §2.2 default and
-    /// should be omitted from the wire format every existing UE
-    /// expects.
+    /// header, either ``"udp"`` or ``"tcp"``.  The caller appends
+    /// ``protocol=tcp`` to the header only when this field is ``"tcp"``
+    /// and leaves the parameter off for ``"udp"``.  ``protocol=`` is a
+    /// siphon convention: neither RFC 3329 (§2.2, Appendix A) nor 3GPP
+    /// TS 33.203 Annex H defines a transport parameter for
+    /// ``ipsec-3gpp``, and one SA pair carries UDP and TCP alike
+    /// (TS 33.203 §7.1), so the header without it is the standard shape.
     ///
     /// Note: when :func:`siphon.ipsec.allocate` was called with the
     /// multi-protocol default (no ``protocol`` kwarg), this field
-    /// reads ``"udp"`` — wire-compatible with the spec default — even
+    /// reads ``"udp"``, so the parameter stays off, even
     /// though the underlying SA pair covers both UDP and TCP.  For
     /// diagnostics of the actual SA selector mode, inspect
     /// :attr:`SAHandle.protocol`, which surfaces ``"any"`` in that
@@ -800,8 +807,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Parse the ``protocol`` kwarg from :meth:`PyIpsec.allocate`.
 ///
 /// `None` → :data:`SaProtocol::Any`, the spec-compliant default per
-/// 3GPP TS 33.203 §7.2 — same SPI pair covers both UDP and TCP inner
-/// flows.  Explicit ``"udp"`` / ``"tcp"`` / ``"any"`` (case-insensitive)
+/// 3GPP TS 33.203 §6.3 / §7.1: the same SPI pair covers both UDP and TCP
+/// inner flows.  Explicit ``"udp"`` / ``"tcp"`` / ``"any"`` (case-insensitive)
 /// pin the selectors to that one inner protocol.  Anything else is an
 /// error message the caller surfaces as a Python ``ValueError``.
 fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
@@ -819,11 +826,14 @@ fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
 }
 
 /// Map an internal :data:`SaProtocol` to the wire-form value the
-/// script appends to the RFC 3329 ``Security-Server`` ``protocol=``
-/// parameter.  `Any` collapses to ``"udp"`` because RFC 3329 §2.2
-/// declares an absent ``protocol=`` parameter to imply UDP — keeping
-/// the wire output identical to the pre-multi-protocol shape every
-/// existing UE expects, while the underlying SA covers both transports.
+/// script appends to the ``Security-Server`` ``protocol=`` parameter.
+/// `Any` collapses to ``"udp"`` so a script that appends the parameter
+/// only for ``"tcp"`` leaves it off, keeping the wire output identical
+/// to the pre-multi-protocol shape while the underlying SA covers both
+/// transports.  Off is the standard shape: ``protocol=`` is a siphon
+/// convention that RFC 3329 (§2.2, Appendix A) and 3GPP TS 33.203
+/// Annex H do not define, and TS 33.203 §7.1 has one SA carry UDP and
+/// TCP.
 fn format_params_protocol(sa_protocol: SaProtocol) -> String {
     match sa_protocol {
         SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
@@ -847,7 +857,7 @@ pub struct PyIpsec {
     config: Arc<IpsecConfig>,
     /// Local P-CSCF address per family, captured at startup from the listener
     /// configuration.  The SA's P-CSCF side MUST match the UE's address family
-    /// — the kernel rejects a mixed-family XFRM selector (3GPP TS 33.203 §7.2),
+    /// — the kernel rejects a mixed-family XFRM selector (3GPP TS 33.203 §7.1),
     /// so a dual-stack P-CSCF keeps a v4 and a v6 local address and picks the
     /// one matching the UE that is registering.
     pcscf_addr_v4: Option<IpAddr>,
@@ -883,7 +893,7 @@ impl PyIpsec {
     /// The P-CSCF local address matching the UE's address family, or `None`
     /// when no listener of that family is configured.  The SA's P-CSCF side
     /// must be the same family as the UE — a mixed-family selector never
-    /// matches in the kernel (3GPP TS 33.203 §7.2).
+    /// matches in the kernel (3GPP TS 33.203 §7.1).
     fn pcscf_addr_for(&self, ue_ipv6: bool) -> Option<IpAddr> {
         if ue_ipv6 {
             self.pcscf_addr_v6
@@ -935,8 +945,9 @@ impl PyIpsec {
     /// ("any"), so the same SPI pair covers *both* ESP-over-UDP and
     /// ESP-over-TCP under a single :class:`AuthVectorHandle`
     /// consumption.  This is the spec-compliant behaviour required by
-    /// 3GPP TS 33.203 §7.2 ("the SAs shall be used to protect *all*
-    /// SIP signalling … including over UDP and TCP") and the only
+    /// 3GPP TS 33.203 (§6.3: the SA pairs are "all shared by TCP and
+    /// UDP"; §7.1: "The transport protocol selector shall allow UDP and
+    /// TCP.") and the only
     /// shape that works for handsets that mix transports — iOS
     /// REGISTERs over TCP but sends MO MESSAGE over UDP, and a
     /// single-transport pin would silently drop the MESSAGE on
@@ -986,12 +997,12 @@ impl PyIpsec {
         // a v4 P-CSCF address against a v6 UE (or vice-versa) programs a
         // mixed-family selector the kernel silently never matches, and so does
         // a wildcard bind address (see `pcscf_sa_addresses`) — so fail loudly
-        // rather than install a dead SA (3GPP TS 33.203 §7.2).
+        // rather than install a dead SA (3GPP TS 33.203 §7.1).
         let pcscf_addr = self.pcscf_addr_for(ue_addr.is_ipv6()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "no {family} P-CSCF address for {family} UE {ue_addr}: bind a {family} UDP \
                  listener to a concrete address (a wildcard bind cannot be an IPsec SA \
-                 selector, and the selector must match the UE's family, 3GPP TS 33.203 §7.2)",
+                 selector, and the selector must match the UE's family, 3GPP TS 33.203 §7.1)",
                 family = if ue_addr.is_ipv6() { "IPv6" } else { "IPv4" },
             ))
         })?;
@@ -1482,7 +1493,9 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    /// Every transform variant with its RFC 3329 §2.2 wire spelling.  One
+    /// Every transform variant with its ``alg`` / ``ealg`` wire spelling
+    /// (the ``ipsec-3gpp`` parameters of RFC 3329 Appendix A and 3GPP
+    /// TS 33.203 Annex H).  One
     /// table shared by the three tests below, so a newly added variant
     /// cannot be pinned in one of them and forgotten in the others.
     const RFC3329_NAMES: [(PyTransform, &str, &str); 6] = [
@@ -1502,7 +1515,7 @@ mod tests {
         ),
     ];
 
-    /// The `alg` / `ealg` getters carry the RFC 3329 §2.2 wire spelling for
+    /// The `alg` / `ealg` getters carry the `ipsec-3gpp` wire spelling for
     /// every variant, so a script can build a `Security-Server` capability
     /// list without an allocated SA.  Pinned as literals rather than against
     /// `alg_str()` / `ealg_str()` — comparing a getter to the function it
@@ -1822,7 +1835,7 @@ mod tests {
 
     /// SAHandle surfaces the *internal* SA selector mode for
     /// diagnostics — UDP/TCP for single-transport pins, `any` for the
-    /// multi-protocol default (TS 33.203 §7.2).  The Security-Server
+    /// multi-protocol default (TS 33.203 §6.3 / §7.1).  The Security-Server
     /// wire format (set via PendingSA) is a separate concern; this
     /// test pins the diagnostic surface so logs and metrics stay
     /// useful when chasing iOS-style mixed-transport bugs.
@@ -1837,7 +1850,7 @@ mod tests {
     /// `protocol=None` (the new default) MUST map to SaProtocol::Any
     /// so :meth:`PyIpsec.allocate` installs an XFRM selector covering
     /// both ESP-over-UDP and ESP-over-TCP under one SPI pair
-    /// (3GPP TS 33.203 §7.2).  Without this, iOS handsets that
+    /// (3GPP TS 33.203 §6.3 / §7.1).  Without this, iOS handsets that
     /// REGISTER over TCP and dispatch MO MESSAGE over UDP would have
     /// their MESSAGEs silently dropped by the kernel selector.
     #[test]
@@ -1884,9 +1897,9 @@ mod tests {
     /// `Any` MUST collapse to wire-form ``"udp"`` so the existing
     /// ``protocol=`` formatting in scripts
     /// (``f"; protocol={params.protocol}" if params.protocol != "udp" else ""``)
-    /// keeps emitting parameter-less Security-Server headers — RFC 3329
-    /// §2.2 says an absent ``protocol=`` parameter implies UDP, and
-    /// every existing UE handles that wire shape.
+    /// keeps emitting parameter-less Security-Server headers, the
+    /// standard shape: no sec-agree spec defines ``protocol=`` (RFC 3329
+    /// §2.2 and Appendix A, 3GPP TS 33.203 Annex H).
     #[test]
     fn format_params_protocol_collapses_any_to_udp_for_wire() {
         assert_eq!(format_params_protocol(SaProtocol::Any), "udp");
