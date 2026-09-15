@@ -62,6 +62,16 @@ pub struct AdminState {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct AdminFeatures {
     pub diameter: bool,
+    /// A media engine is configured: the `media:` block names a backend or
+    /// configures one ([`MediaConfig::expects_engine`]), which is what the
+    /// `rtpengine` snapshot reports on. Not just the presence of a `media:` block:
+    /// one with only `sdp_name` / `sdp_strip_attributes` anchors no media, and
+    /// reporting it here showed an engine set with nothing in it.
+    ///
+    /// An engine configured but unreachable still counts, so it shows as
+    /// instances down rather than as not configured.
+    ///
+    /// [`MediaConfig::expects_engine`]: crate::config::MediaConfig::expects_engine
     pub media: bool,
     pub control: bool,
     pub sbi: bool,
@@ -81,7 +91,10 @@ impl AdminFeatures {
     pub fn from_config(config: &crate::config::Config) -> Self {
         Self {
             diameter: config.diameter.is_some(),
-            media: config.media.is_some(),
+            media: config
+                .media
+                .as_ref()
+                .is_some_and(crate::config::MediaConfig::expects_engine),
             control: config.control.is_some(),
             sbi: config.sbi.is_some(),
             ipsec: config.ipsec.is_some(),
@@ -2184,6 +2197,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `media` says whether this node drives a media engine, not whether its
+    /// config has a `media:` block. A block with only `sdp_name` or
+    /// `sdp_strip_attributes` anchors nothing, so `rtpengine` is null for it,
+    /// exactly as for a node with no block at all, and the dashboard shows media
+    /// anchoring as not configured rather than an engine set with nothing in it.
+    #[tokio::test]
+    async fn media_is_reported_only_where_a_media_engine_is_configured() {
+        crate::metrics::init().unwrap();
+        let config = |media: &str| {
+            crate::config::Config::from_str(&format!(
+                "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n{media}"
+            ))
+            .expect("the config loads")
+        };
+
+        for (media, engine) in [
+            ("", false),
+            ("media:\n  sdp_name: \"SIPhon\"\n", false),
+            ("media:\n  sdp_strip_attributes: [\"msid\"]\n", false),
+            (
+                "media:\n  rtpengine:\n    address: \"127.0.0.1:22222\"\n",
+                true,
+            ),
+            (
+                "media:\n  backend: siphon-rtp\n  siphon_rtp:\n    address: \"127.0.0.1:8080\"\n",
+                true,
+            ),
+        ] {
+            let features = AdminFeatures::from_config(&config(media));
+            assert_eq!(features.media, engine, "{media:?}");
+            let json = snapshot_with(features).await;
+            assert_eq!(
+                json["rtpengine"].is_null(),
+                !engine,
+                "{media:?} reported rtpengine as {:?}",
+                json["rtpengine"]
+            );
         }
     }
 
