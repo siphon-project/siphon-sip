@@ -262,11 +262,12 @@ impl SaProtocol {
 
     /// Lower-case name as used in the ``ip xfrm`` UPSPEC grammar.
     /// iproute2 accepts the literal string ``any`` and maps it to
-    /// selector proto 0.  Note: this is NOT the right value to put on
-    /// the RFC 3329 ``protocol=`` parameter wire-side for `Any` —
-    /// callers serialising Security-Server headers should treat `Any`
-    /// the same as omitting the ``protocol=`` param (which per
-    /// RFC 3329 §2.2 implies UDP).
+    /// selector proto 0.  Note: this is NOT a value for a
+    /// Security-Server header.  Callers serialising one should leave
+    /// ``protocol=`` off for `Any`: siphon only appends it for a
+    /// TCP-pinned SA, no sec-agree spec defines it (RFC 3329 §2.2 and
+    /// Appendix A, TS 33.203 Annex H), and an SA shared by UDP and TCP
+    /// is the standard case (TS 33.203 §7.1).
     pub fn as_str(self) -> &'static str {
         match self {
             SaProtocol::Udp => "udp",
@@ -2486,9 +2487,10 @@ mod tests {
         assert_eq!(format!("{}", SaProtocol::Tcp), "tcp");
         // `any` is the iproute2 UPSPEC literal for selector_proto=0 —
         // accepted by `ip xfrm policy add ... proto any sport X dport Y`.
-        // Not a valid RFC 3329 `protocol=` value; callers formatting the
-        // Security-Server header must omit the parameter for `Any`
-        // (RFC 3329 §2.2: absent implies UDP, which is wire-compatible).
+        // Not a value for a Security-Server header; callers formatting one
+        // must omit `protocol=` for `Any`. No sec-agree spec defines that
+        // parameter (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H), so
+        // leaving it off is the standard shape.
         assert_eq!(SaProtocol::Any.as_str(), "any");
         assert_eq!(format!("{}", SaProtocol::Any), "any");
     }

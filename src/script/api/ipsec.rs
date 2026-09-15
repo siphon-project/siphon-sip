@@ -229,7 +229,8 @@ impl PyTransform {
 #[pymethods]
 impl PyTransform {
     /// Integrity algorithm name as it appears in a ``Security-Client`` /
-    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g.
+    /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``alg``
+    /// parameter, RFC 3329 Appendix A / 3GPP TS 33.203 Annex H), e.g.
     /// ``"hmac-sha-1-96"``.
     ///
     /// Lets a script advertise its transform policy as a capability list
@@ -243,8 +244,9 @@ impl PyTransform {
     }
 
     /// Encryption algorithm name as it appears in a ``Security-Client`` /
-    /// ``Security-Server`` header field (RFC 3329 §2.2), e.g. ``"aes-cbc"``
-    /// or ``"null"``.
+    /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``ealg``
+    /// parameter, RFC 3329 Appendix A; ``"aes-cbc"`` is added by 3GPP
+    /// TS 33.203 Annex H), e.g. ``"aes-cbc"`` or ``"null"``.
     #[getter(ealg)]
     fn py_ealg(&self) -> &'static str {
         self.ealg_str()
@@ -452,15 +454,17 @@ pub struct PySecurityServerParams {
     #[pyo3(get)]
     pub port_s: u16,
     /// Wire-form transport for the RFC 3329 ``Security-Server``
-    /// ``protocol=`` parameter — either ``"udp"`` or ``"tcp"``.  The
-    /// caller appends ``protocol=tcp`` to the header only when this
-    /// field is ``"tcp"``; ``"udp"`` is the RFC 3329 §2.2 default and
-    /// should be omitted from the wire format every existing UE
-    /// expects.
+    /// header, either ``"udp"`` or ``"tcp"``.  The caller appends
+    /// ``protocol=tcp`` to the header only when this field is ``"tcp"``
+    /// and leaves the parameter off for ``"udp"``.  ``protocol=`` is a
+    /// siphon convention: neither RFC 3329 (§2.2, Appendix A) nor 3GPP
+    /// TS 33.203 Annex H defines a transport parameter for
+    /// ``ipsec-3gpp``, and one SA pair carries UDP and TCP alike
+    /// (TS 33.203 §7.1), so the header without it is the standard shape.
     ///
     /// Note: when :func:`siphon.ipsec.allocate` was called with the
     /// multi-protocol default (no ``protocol`` kwarg), this field
-    /// reads ``"udp"`` — wire-compatible with the spec default — even
+    /// reads ``"udp"``, so the parameter stays off, even
     /// though the underlying SA pair covers both UDP and TCP.  For
     /// diagnostics of the actual SA selector mode, inspect
     /// :attr:`SAHandle.protocol`, which surfaces ``"any"`` in that
@@ -819,11 +823,14 @@ fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
 }
 
 /// Map an internal :data:`SaProtocol` to the wire-form value the
-/// script appends to the RFC 3329 ``Security-Server`` ``protocol=``
-/// parameter.  `Any` collapses to ``"udp"`` because RFC 3329 §2.2
-/// declares an absent ``protocol=`` parameter to imply UDP — keeping
-/// the wire output identical to the pre-multi-protocol shape every
-/// existing UE expects, while the underlying SA covers both transports.
+/// script appends to the ``Security-Server`` ``protocol=`` parameter.
+/// `Any` collapses to ``"udp"`` so a script that appends the parameter
+/// only for ``"tcp"`` leaves it off, keeping the wire output identical
+/// to the pre-multi-protocol shape while the underlying SA covers both
+/// transports.  Off is the standard shape: ``protocol=`` is a siphon
+/// convention that RFC 3329 (§2.2, Appendix A) and 3GPP TS 33.203
+/// Annex H do not define, and TS 33.203 §7.1 has one SA carry UDP and
+/// TCP.
 fn format_params_protocol(sa_protocol: SaProtocol) -> String {
     match sa_protocol {
         SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
@@ -1482,7 +1489,9 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    /// Every transform variant with its RFC 3329 §2.2 wire spelling.  One
+    /// Every transform variant with its ``alg`` / ``ealg`` wire spelling
+    /// (the ``ipsec-3gpp`` parameters of RFC 3329 Appendix A and 3GPP
+    /// TS 33.203 Annex H).  One
     /// table shared by the three tests below, so a newly added variant
     /// cannot be pinned in one of them and forgotten in the others.
     const RFC3329_NAMES: [(PyTransform, &str, &str); 6] = [
@@ -1502,7 +1511,7 @@ mod tests {
         ),
     ];
 
-    /// The `alg` / `ealg` getters carry the RFC 3329 §2.2 wire spelling for
+    /// The `alg` / `ealg` getters carry the `ipsec-3gpp` wire spelling for
     /// every variant, so a script can build a `Security-Server` capability
     /// list without an allocated SA.  Pinned as literals rather than against
     /// `alg_str()` / `ealg_str()` — comparing a getter to the function it
@@ -1884,9 +1893,9 @@ mod tests {
     /// `Any` MUST collapse to wire-form ``"udp"`` so the existing
     /// ``protocol=`` formatting in scripts
     /// (``f"; protocol={params.protocol}" if params.protocol != "udp" else ""``)
-    /// keeps emitting parameter-less Security-Server headers — RFC 3329
-    /// §2.2 says an absent ``protocol=`` parameter implies UDP, and
-    /// every existing UE handles that wire shape.
+    /// keeps emitting parameter-less Security-Server headers, the
+    /// standard shape: no sec-agree spec defines ``protocol=`` (RFC 3329
+    /// §2.2 and Appendix A, 3GPP TS 33.203 Annex H).
     #[test]
     fn format_params_protocol_collapses_any_to_udp_for_wire() {
         assert_eq!(format_params_protocol(SaProtocol::Any), "udp");
