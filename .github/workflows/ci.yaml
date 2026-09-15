@@ -927,6 +927,54 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-session-timer-floor down --remove-orphans 2>/dev/null || true
 
+  # ── B2BUA reliable provisionals toward the caller (RFC 3262 §3) ─────────
+  # siphon is the caller's UAS, so reliability toward the caller is its own: a
+  # provisional goes out reliably on siphon's RSeq when the caller requires
+  # 100rel, or supports it and the callee sent that provisional reliably; one
+  # reliable provisional at a time; the caller's PRACK answered by siphon; the
+  # 2xx held until the PRACK of a reliable provisional that carried SDP.
+  #
+  # Runs against a dedicated instance pinned to `ims-intra-trust-domain@2026`,
+  # whose response policy copies Require and RSeq, so a callee RSeq that leaked
+  # through would reach the caller. Two callers, one per rule, each against a
+  # fresh callee.
+  sipp-b2bua-a-leg-reliable-prov:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-a-leg-reliable
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up -d --wait siphon-b2bua-a-leg-reliable
+
+      - name: Register bob against the instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov run --rm sipp-b2bua-a-leg-reliable-register
+
+      - name: A caller that requires 100rel gets every provisional reliably, one PRACK at a time
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-a-leg-reliable-require-uac sipp-b2bua-a-leg-reliable-require-uac sipp-b2bua-a-leg-reliable-uas
+
+      - name: A caller that supports 100rel gets the callee's reliable 183 on siphon's RSeq
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-a-leg-reliable-supported-uac sipp-b2bua-a-leg-reliable-supported-uac sipp-b2bua-a-leg-reliable-uas
+
+      - name: Collect siphon logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-a-leg-reliable > siphon-a-leg-reliable-prov.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-a-leg-reliable-prov-logs
+          path: siphon-a-leg-reliable-prov.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov down --remove-orphans 2>/dev/null || true
+
   # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ───────────────
   # call.fork() rings every target and the first answer wins, which puts the
   # hard parts on the branches that do not win. One failing early must not fail

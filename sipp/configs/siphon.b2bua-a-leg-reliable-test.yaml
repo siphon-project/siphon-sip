@@ -1,0 +1,50 @@
+# siphon.b2bua-a-leg-reliable-test.yaml — B2BUA functional test configuration
+# for reliable provisionals toward the caller (RFC 3262 §3).
+#
+# Used with: sipp/docker-compose.yaml (b2bua-a-leg-reliable-prov profile)
+# Script:    scripts/b2bua_100rel_advertise.py  (forks to bob's registered
+#            contact with `Supported: 100rel` on the B-leg, so the callee may
+#            send reliable provisionals)
+# Tests:     siphon owns RFC 3262 on the A-leg — its own RSeq per caller
+#            dialog, one reliable provisional at a time, the caller's PRACK
+#            answered locally, and the 2xx held until the PRACK of a reliable
+#            provisional with SDP.
+#
+# Pins `ims-intra-trust-domain@2026`, whose response policy copies `Require`
+# and `RSeq`: the callee's RSeq 42 would pass straight through if the caller's
+# reliability were not siphon's own, which is what the UAC scenarios check.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.120"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_100rel_advertise.py"
+  reload: auto
+
+advertised_address: "172.20.0.120"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+b2bua:
+  default_header_policy: "ims-intra-trust-domain@2026"
+
+log:
+  level: debug
+  format: pretty

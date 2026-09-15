@@ -402,6 +402,10 @@ pub struct ReliableProvisional {
     /// retransmit task itself decides to give up. The retransmit loop selects
     /// on this; once notified it stops sending and exits.
     pub cancel: tokio::sync::Notify,
+    /// Notified when a final response has gone to the request's sender: the
+    /// retransmissions stop, but the entry stays until 64×T1 so a PRACK for the
+    /// provisional is still answered (RFC 3262 §3).
+    pub stop: Arc<tokio::sync::Notify>,
     /// CSeq number of the INVITE the response belongs to. Used to validate
     /// the RAck — a PRACK whose RAck cseq doesn't match this is not for us.
     pub cseq_num: u32,

@@ -311,7 +311,6 @@ pub fn relay_failure_to_a_leg(
         state,
         snapshot.a_leg.transport.transport,
         snapshot.a_leg_local_addr,
-        snapshot.a_leg_supports_100rel,
         call_id,
     );
     // A failure can carry SDP too: a 488 may describe the media the callee does

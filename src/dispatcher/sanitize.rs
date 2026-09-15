@@ -21,7 +21,6 @@ pub(super) fn sanitize_b2bua_response(
     state: &DispatcherState,
     a_leg_transport: Transport,
     a_leg_local_addr: Option<SocketAddr>,
-    a_leg_supports_100rel: bool,
     call_id: &str,
 ) {
     sanitize_b2bua_response_keeping(
@@ -29,7 +28,6 @@ pub(super) fn sanitize_b2bua_response(
         state,
         a_leg_transport,
         a_leg_local_addr,
-        a_leg_supports_100rel,
         call_id,
         &[],
     );
@@ -42,15 +40,14 @@ pub(super) fn sanitize_b2bua_response(
 /// They go to the caller as the script left them, precedence 1 as on the B-leg
 /// INVITE: the response policy neither strips nor rewrites them, and siphon's
 /// own `Supported` / `Allow` do not replace them. What stays the framework's is
-/// done regardless: siphon's `Contact`, no B-leg `Record-Route`, the `100rel`
-/// strip toward a caller without it, `replaces` merged into `Supported`, and the
-/// SDP origin.
+/// done regardless: siphon's `Contact`, no B-leg `Record-Route`, the reliability
+/// of a provisional (`RSeq` and `100rel` in `Require`, which are siphon's own
+/// toward the caller), `replaces` merged into `Supported`, and the SDP origin.
 pub(super) fn sanitize_b2bua_response_keeping(
     response: &mut SipMessage,
     state: &DispatcherState,
     a_leg_transport: Transport,
     a_leg_local_addr: Option<SocketAddr>,
-    a_leg_supports_100rel: bool,
     call_id: &str,
     script_shaped_headers: &[String],
 ) {
@@ -88,21 +85,18 @@ pub(super) fn sanitize_b2bua_response_keeping(
     // `call.dial(copy=["Proxy-Authenticate"])` for the rare case.
     response.headers.remove("Record-Route");
 
-    // Framework-auto strip — never present a `100rel` reliability contract to
-    // an A-leg that didn't advertise it.  The B-leg's reliable provisional is
-    // PRACKed locally (RFC 3262 auto-PRACK, handle_b2bua_response); leaking
-    // `Require: 100rel` / `RSeq` to a non-100rel A-leg (e.g. a plain PSTN
-    // trunk) makes it CANCEL the call rather than PRACK.  This is a
-    // correctness invariant, not topology hygiene, so it runs preset-independent
-    // here rather than as a preset override.  Done before `apply_to_response`:
-    // a `Copy`/`Rewrite` preset can't resurrect the removed `RSeq`, and the
-    // `Require` edit leaves any surviving option-tags for `Copy` to preserve.
-    // A 100rel-capable A-leg (gate true) still gets the reliable provisional
-    // end-to-end (RFC 3262 §3).
-    crate::sip::headers::rseq::strip_100rel_for_unsupported_peer(
-        &mut response.headers,
-        a_leg_supports_100rel,
-    );
+    // Framework-owned — the callee's reliability never crosses.  siphon PRACKs
+    // the callee's reliable provisional on the B-leg itself (`auto_prack_b_leg`),
+    // so its `RSeq` and `Require: 100rel` describe that leg's numbering, not
+    // anything the caller could PRACK; toward the caller siphon is the UAS and a
+    // provisional is reliable on siphon's own numbering when the caller asked for
+    // that (RFC 3262 §3, `send_a_leg_provisional`).  A plain trunk handed the
+    // callee's contract CANCELs rather than PRACKs, and a 100rel caller handed it
+    // PRACKs an `RSeq` nobody retransmits.  A correctness invariant, not topology
+    // hygiene, so it runs whatever the preset or a script left.  Done before
+    // `apply_to_response`, so a `Copy` preset cannot resurrect the removed `RSeq`
+    // and the `Require` edit leaves the other option-tags for `Copy` to keep.
+    crate::sip::headers::rseq::set_reliability(&mut response.headers, None);
 
     // Apply per-call header policy.  Resolves to the per-call preset (when
     // the script attached one via `call.dial(header_policy=…)`), otherwise

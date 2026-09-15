@@ -408,16 +408,16 @@ pub fn send_uas_response(
             .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
-    // A locally-generated 2xx needs the same retransmission cover as a relayed
-    // one: the B2BUA intercepts the A-leg INVITE before a server transaction
-    // exists, so nothing under this recovers a lost 200 and the caller would
-    // ring on until it gave up. Cancelled by the caller's ACK in the A-leg ACK
-    // handler (search `uas_2xx_retransmits`).
-    // An answer siphon gives the caller itself is the session description in
-    // force on the caller's dialog, under the `o=` it went out with. A
-    // provisional's early media is not, until a 2xx confirms it. The 2xx answers
-    // the caller's request for a session timer as well (RFC 4028 §9).
+    if !final_response && (101..200).contains(&code) {
+        // siphon's own provisional is reliable toward a caller that required
+        // `100rel` (RFC 3262 §3), and waits behind an unacknowledged one.
+        return send_a_leg_provisional(internal_call_id, response, false, state);
+    }
     if final_response && (200..300).contains(&code) {
+        // An answer siphon gives the caller itself is the session description in
+        // force on the caller's dialog, under the `o=` it went out with. A
+        // provisional's early media is not, until a 2xx confirms it. The 2xx answers
+        // the caller's request for a session timer as well (RFC 4028 §9).
         negotiate_uas_answer_session_timer(
             internal_call_id,
             Some(&invite.headers),
@@ -431,24 +431,30 @@ pub fn send_uas_response(
             message_content_type(&response),
             &response.body,
         );
-    }
-    let retransmit = if final_response && (200..300).contains(&code) {
-        Some(response.clone())
-    } else {
-        None
-    };
-    send_message_from(
-        response,
-        transport,
-        remote_addr,
-        connection_id,
-        local_addr,
-        state,
-    );
-    if let Some(retransmit) = retransmit {
-        arm_b2bua_2xx_retransmit(
+        // A locally-generated 2xx needs the same retransmission cover as a
+        // relayed one: the B2BUA intercepts the A-leg INVITE before a server
+        // transaction exists, so nothing under this recovers a lost 200 and the
+        // caller would ring on until it gave up. Armed where the 2xx is actually
+        // sent, which waits for the PRACK of a reliable provisional with SDP (RFC
+        // 3262 §3), and cancelled by the caller's ACK in the A-leg ACK handler
+        // (search `uas_2xx_retransmits`).
+        answer_a_leg(
             internal_call_id,
-            retransmit,
+            crate::b2bua::actor::HeldAnswer {
+                response,
+                relayed: false,
+                deferred_refer: None,
+            },
+            state,
+        );
+    } else {
+        if final_response {
+            // A final failure: siphon's reliable provisionals to the caller stop
+            // (RFC 3262 §3).
+            end_a_leg_reliability(internal_call_id, state);
+        }
+        send_message_from(
+            response,
             transport,
             remote_addr,
             connection_id,

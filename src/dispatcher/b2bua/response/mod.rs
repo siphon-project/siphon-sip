@@ -42,7 +42,6 @@ pub struct BLegResponseSnapshot {
     pub b_leg_stored_to: Option<String>,
     pub call_state: CallState,
     pub outbound_credentials: Option<(String, String)>,
-    pub li_record: bool,
     pub b_leg_handle_tx: Option<tokio::sync::mpsc::Sender<crate::b2bua::actor::LegMessage>>,
     pub b_leg_stored_invite: Option<Arc<Mutex<SipMessage>>>,
     pub b_leg_local_cseq: u32,
@@ -57,7 +56,6 @@ pub struct BLegResponseSnapshot {
     pub b_leg_session_refresh_request: Option<crate::sip::headers::SipHeaders>,
     /// The Via branch the response carries.
     pub branch: String,
-    a_leg_supports_100rel: bool,
     pub a_leg_local_addr: Option<SocketAddr>,
 }
 
@@ -115,7 +113,6 @@ pub fn b_leg_response_snapshot(
         b_leg_stored_to: stored_to,
         call_state: call.state.clone(),
         outbound_credentials: call.outbound_credentials.clone(),
-        li_record: call.li_record,
         b_leg_handle_tx: handle_tx,
         b_leg_stored_invite: stored_invite,
         b_leg_local_cseq: local_cseq,
@@ -123,7 +120,6 @@ pub fn b_leg_response_snapshot(
         b_leg_request_session_expires: matching_b.and_then(|b| b.request_session_expires),
         b_leg_session_refresh_request: matching_b.and_then(|b| b.session_refresh_request.clone()),
         branch: branch.to_string(),
-        a_leg_supports_100rel: call.a_leg_supports_100rel,
         a_leg_local_addr: call.a_leg_local_addr,
     })
 }

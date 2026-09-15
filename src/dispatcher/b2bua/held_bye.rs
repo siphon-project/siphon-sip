@@ -51,6 +51,12 @@ pub fn send_or_hold_bye(
     sender: ByeSender,
     state: &DispatcherState,
 ) {
+    // siphon's 2xx on the caller's dialog is still held for a PRACK (RFC 3262
+    // §3): the caller has no final response yet, so it gets one instead of this
+    // BYE.
+    if end_held_answer_for_caller(internal_call_id, leg, state) {
+        return;
+    }
     // RFC 3261 §12.2.1.1: the next hop is the first Route URI, not the cached
     // source of the INVITE. The socket is the leg's anchored one, so the Via
     // matches (see `build_b2bua_bye`).

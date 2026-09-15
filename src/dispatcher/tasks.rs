@@ -123,6 +123,7 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);
+                        check_b2bua_prack_timeouts(&state);
                         check_b2bua_max_call_durations(&state);
                         check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);

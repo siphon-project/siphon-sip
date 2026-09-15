@@ -39,8 +39,9 @@ pub fn absorb_cancelled_branch_response(
 }
 
 /// RFC 3262 §3: answer a reliable provisional from the B-leg with a PRACK of
-/// our own, built from the B-leg dialog state. The A-leg never sees the
-/// `Require: 100rel` / `RSeq` markers unless it advertised 100rel itself.
+/// our own, built from the B-leg dialog state. The caller never sees the
+/// callee's `Require: 100rel` / `RSeq`: reliability toward the caller is
+/// siphon's own ([`send_a_leg_provisional`]).
 pub fn auto_prack_b_leg(
     call_id: &str,
     message: &mut SipMessage,
@@ -48,23 +49,12 @@ pub fn auto_prack_b_leg(
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) {
-    // The A-leg peer's advertised reliable-provisional capability (RFC 3262 §3),
-    // snapshotted from the on-wire INVITE at receipt (CallActor.a_leg_supports_100rel)
-    // — NOT re-derived from `snapshot.a_leg_invite`, which the `@b2bua.on_invite` script
-    // can mutate via `call.set_header` to advertise 100rel toward the B-leg.
-    // Drives the framework-auto `100rel` strip in `sanitize_b2bua_response` so we
-    // never forward a reliable provisional to an A-leg (e.g. a PSTN trunk) that
-    // can't PRACK it.  Passed to every sanitize call: the responses sanitized
-    // below all flow to the A-leg (or, for the B→A re-INVITE/UPDATE direction,
-    // are produced by the A-leg — so a non-100rel A-leg never emits the markers
-    // and the strip is a no-op there anyway).
-
     // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
     // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),
     // the B2BUA must answer with a PRACK. We do that locally here using
-    // the B-leg dialog state so a non-100rel A-leg sees an ordinary 1xx (the
-    // `Require`/`RSeq` headers are stripped in `sanitize_b2bua_response` when
-    // the A-leg didn't advertise 100rel — preset-independent).
+    // the B-leg dialog state. Reliability is per leg: the callee's markers are
+    // removed in `sanitize_b2bua_response`, and a provisional reaches the caller
+    // reliably on siphon's own numbering when the caller asked for that.
     // We don't track a client transaction for the PRACK — the B-leg's
     // 200 OK PRACK that comes back will hit the response handler with no
     // matching session and be dropped, which is the correct behavior here.
@@ -130,7 +120,7 @@ pub fn auto_prack_b_leg(
             // the B-leg is just retransmitting the reliable 1xx because our
             // PRACK is in flight or got delayed; one PRACK per (dialog, RSeq)
             // is correct. Fall through either way so the 1xx still reaches the
-            // A-leg (Require/RSeq stripped in sanitize_b2bua_response below).
+            // A-leg, where its reliability is siphon's own.
             if state
                 .call_actors
                 .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)

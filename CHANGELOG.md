@@ -731,6 +731,38 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   their BYEs. The first teardown now claims the call and the others back off;
   a BYE that arrives while another teardown has the call is answered 200.
 
+- **A B2BUA call is the caller's UAS for RFC 3262 too: reliable provisionals
+  toward the caller are siphon's own.** siphon PRACKed a callee's reliable
+  provisional itself, then relayed it to a caller that supports `100rel` with the
+  callee's `Require: 100rel` and `RSeq`, or without them where the header policy
+  stripped them. The caller PRACKed an `RSeq` nobody retransmitted, siphon
+  answered every PRACK 200 whatever it named, and a 2xx could overtake the 183
+  whose SDP it relied on. A caller that required `100rel` got unreliable
+  provisionals, which RFC 3262 §3 forbids.
+
+  Now, under every preset, a provisional reaches the caller reliably when the
+  caller requires `100rel`, or supports it and either the callee sent that
+  provisional reliably or it carries SDP, which RFC 3262 §3 allows for any
+  provisional to such a caller. It carries `Require: 100rel` and siphon's own `RSeq`, one more per
+  provisional on the caller's dialog, and is retransmitted on T1 doubling until
+  the caller's PRACK; a second reliable provisional waits for that PRACK. siphon
+  answers the PRACK, matched on `RAck` and the caller's dialog: 200 for the
+  provisional it acknowledges, a retransmission of that PRACK, or one after the
+  final response, 481 for one that matches nothing, 400 without `RAck`. A 2xx
+  waits for the PRACK of a reliable provisional that carried SDP and follows its
+  200; its retransmission, and with it the 64*T1 unACKed sweep and the §15 BYE
+  hold, starts only when it is sent. A teardown or a CANCEL while it waits gives
+  the caller `487 Request Terminated` instead of a BYE, and the callee a BYE. A
+  final response stops the retransmits. A caller that leaves a reliable
+  provisional unacknowledged for 64*T1 is refused 500 without
+  `@b2bua.on_failure`, through the call's teardown claim, and the callee is
+  CANCELled, or BYEd if its 2xx was the one held. `call.progress()` and
+  `call.answer()` follow the same rules.
+  The callee's `RSeq` and `100rel` never reach the caller, and neither do a
+  script's from `@b2bua.on_early_media`. Rf ACR-START and the Ro answer report
+  go out with the caller's 2xx rather than on the callee's. A PRACK body is
+  still not bridged; an early `UPDATE` is.
+
 - **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
   security association it arrived over, and the agreement stops at siphon.**
   RFC 3329 §2.3.1 has every request after the agreement carry a

@@ -380,6 +380,10 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
         return;
     };
 
+    // The caller's final response is on its way: siphon's reliable provisionals
+    // to it stop being retransmitted (RFC 3262 §3).
+    end_a_leg_reliability(call_id, state);
+
     // Every carrier tried, before the record is closed: an exhausted sequence is
     // exactly where the attempt list matters most.
     cdr_stamp_route_attempts(state, call_id);
@@ -452,6 +456,21 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
     finish_failed_call(call_id, &a_leg, status_code, &reason, state);
 }
 
+/// End a call with `status_code` to the caller on a path no `@b2bua.on_failure`
+/// decision applies to: the caller itself let the call fail, so routing it
+/// somewhere else cannot help. Everything else is [`end_failed_call`]'s: the
+/// CDR, the response, the control app, media, Ro, and the call's removal.
+pub fn end_call_without_rerouting(call_id: &str, status_code: u16, state: &DispatcherState) {
+    end_failed_call(
+        call_id,
+        FailedCallEnd::Local {
+            status_code,
+            reason: best_error_reason(status_code).to_string(),
+        },
+        state,
+    );
+}
+
 /// What ends every failed call once the caller has its final response: tell a
 /// control app why, release the media and the Ro reservation, remove the call.
 fn finish_failed_call(
@@ -517,6 +536,7 @@ pub fn refuse_bad_extension(
         status = status_code,
         "B2BUA: the caller requires extensions this call cannot honour — refusing it"
     );
+    end_a_leg_reliability(call_id, state);
     cdr_finalize_b2bua_fail(state, call_id, status_code);
     let mut response = build_a_leg_final_response(
         invite,

@@ -353,6 +353,13 @@ pub struct CallActor {
     /// reading it back would falsely conclude the A-leg trunk supports `100rel`,
     /// leaking the reliable provisional to a peer that CANCELs it.
     pub a_leg_supports_100rel: bool,
+    /// Whether the A-leg peer *required* `100rel` on the wire, snapshotted with
+    /// [`CallActor::a_leg_supports_100rel`] and for the same reason. Every
+    /// provisional to such a caller goes out reliably (RFC 3262 §3).
+    pub a_leg_requires_100rel: bool,
+    /// siphon's reliable provisionals toward the caller (RFC 3262 §3): its own
+    /// `RSeq` numbering, what awaits a PRACK, and what waits behind it.
+    pub a_leg_reliability: super::ALegReliableProvisionals,
     /// Whether the A-leg INVITE required `sec-agree` and siphon verified it
     /// against the security association it arrived over (RFC 3329 §2.3.1),
     /// decided at INVITE receipt before the script runs. Only then does a
@@ -530,6 +537,8 @@ impl CallActor {
             teardown_claimed: false,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
+            a_leg_requires_100rel: false,
+            a_leg_reliability: super::ALegReliableProvisionals::default(),
             sec_agree_verified: false,
             auth_retry_count: 0,
             answer_deadline: None,

@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA reliable provisionals toward the caller: B-leg UAS (the callee).
+
+  recv INVITE -> 100 -> 180 (unreliable, no SDP) -> reliable 183
+  (Require: 100rel, RSeq: 42, SDP) -> recv PRACK (siphon PRACKs the B-leg
+  itself) -> 200 PRACK -> 200 INVITE -> recv ACK -> recv BYE -> 200 BYE.
+
+  The callee answers at once. What the caller sees is siphon's: an RSeq of its
+  own on the caller's dialog, one reliable provisional at a time, and the 2xx
+  held until the caller has PRACKed the 183 that carried SDP (RFC 3262 §3).
+  The caller-side scenarios assert that.
+
+  Registered as bob (172.20.0.122) by sipp-b2bua-a-leg-reliable-register.
+  Pair with b2bua_a_leg_reliable_prov_require_uac.xml or
+  b2bua_a_leg_reliable_prov_supported_uac.xml on the A-leg side of siphon.
+-->
+<scenario name="B2BUA reliable provisionals toward the caller: UAS">
+
+  <recv request="INVITE" crlf="true">
+    <!-- Snapshot the INVITE so the final 200 OK can be rebuilt AFTER the PRACK
+         round-trip (where [last_*] would otherwise refer to the PRACK). -->
+    <action>
+      <ereg regexp="(.*)" search_in="hdr" header="Via:" assign_to="junk,invite_via" />
+      <ereg regexp="(.*)" search_in="hdr" header="From:" assign_to="junk,invite_from" />
+      <ereg regexp="(.*)" search_in="hdr" header="To:" assign_to="junk,invite_to" />
+      <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="junk,invite_callid" />
+      <ereg regexp="(.*)" search_in="hdr" header="CSeq:" assign_to="junk,invite_cseq" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- An unreliable 180: no Require, no RSeq, no SDP. -->
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- A reliable 183 with SDP, numbered in the callee's own RSeq space. -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Require: 100rel
+RSeq: 42
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <!-- siphon PRACKs the B-leg itself, on the callee's RSeq. -->
+  <recv request="PRACK" crlf="true">
+    <action>
+      <ereg regexp="42 [0-9]+ INVITE" search_in="hdr" header="RAck:"
+            check_it="true" assign_to="prack_rack" />
+      <log message="siphon PRACKed the callee's 183 with RAck [$prack_rack]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+Via:[$invite_via]
+From:[$invite_from]
+To:[$invite_to];tag=[pid]SIPpTag01[call_number]
+Call-ID:[$invite_callid]
+CSeq:[$invite_cseq]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv request="ACK" optional="true" timeout="10000" />
+
+  <recv request="BYE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

@@ -347,6 +347,12 @@ pub(super) fn handle_request(
             .call_id()
             .is_some_and(|call_id| state.held_byes.contains_key(call_id.as_str()));
     if !bye_for_held_dialog && terminated_dialog_needs_481(&method, &message, &state.call_actors) {
+        // Except a PRACK for a reliable provisional the call sent its caller
+        // before it ended: RFC 3262 §3 has the UAS "prepared to process PRACK
+        // requests for those outstanding responses" after the final response.
+        if method == "PRACK" && answer_prack_of_tracked_provisional(&inbound, &message, state) {
+            return;
+        }
         debug!(
             method = %method,
             call_id = %message.headers.call_id().map(|s| s.as_str()).unwrap_or(""),
@@ -497,50 +503,12 @@ pub(super) fn handle_request(
         }
     }
     if method == "PRACK" {
-        // RFC 3262 §3 — does this PRACK acknowledge a reliable provisional we
-        // sent ourselves (script called reply(reliable=True))? If so: cancel
-        // retransmits, send 200 OK PRACK, done. Runs in both proxy and B2BUA
-        // modes; the B2BUA-specific auto-200 path below only fires when no
-        // tracked entry matches (e.g. A-leg PRACKs that originated from the
-        // UAC's own 100rel handling, not from us).
-        if let Some(rack) = crate::sip::headers::rseq::parse_rack(&message.headers) {
-            let sip_call_id = message
-                .headers
-                .get("Call-ID")
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let key = (sip_call_id.clone(), rack.response_number);
-            let matched = state
-                .reliable_provisionals
-                .get(&key)
-                .map(|r| Arc::clone(r.value()))
-                .filter(|entry| entry.cseq_num == rack.cseq_number);
-            if let Some(entry) = matched {
-                state.reliable_provisionals.remove(&key);
-                entry.cancel.notify_one();
-                debug!(
-                    call_id = %sip_call_id, rseq = rack.response_number,
-                    "PRACK matches our reliable 1xx — cancelling retransmits and sending 200 OK"
-                );
-                let response =
-                    build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-                send_message_from(
-                    response,
-                    inbound.transport,
-                    inbound.remote_addr,
-                    inbound.connection_id,
-                    Some(inbound.local_addr),
-                    state,
-                );
-                return;
-            }
-        }
-
+        // RFC 3262 §3 — a PRACK on a B2BUA call acknowledges a provisional siphon
+        // sent the caller reliably, as the caller's UAS and on its own numbering.
+        // siphon answers it and releases what waited for it. The callee's
+        // provisionals are PRACKed on the B-leg by siphon itself, so a caller's
+        // PRACK is never relayed.
         if b2bua_mode_active(&engine_state, state) {
-            // RFC 3262: the A-leg PRACK acknowledges our reliable provisional.
-            // In B2BUA mode siphon already PRACKed the B-leg locally (see the
-            // auto-PRACK path in the response handler), so the A-leg PRACK has
-            // no upstream peer to relay to — terminate it here with 200 OK.
             let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
             if let Some(ref sip_call_id) = sip_call_id {
                 if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
@@ -549,6 +517,13 @@ pub(super) fn handle_request(
                     return;
                 }
             }
+        }
+
+        // A PRACK for a reliable provisional still tracked for retransmission: a
+        // script's reply(reliable=True), or one to a B2BUA caller whose call has
+        // ended since. Cancel the retransmits, send 200 OK PRACK, done.
+        if answer_prack_of_tracked_provisional(&inbound, &message, state) {
+            return;
         }
     }
 
