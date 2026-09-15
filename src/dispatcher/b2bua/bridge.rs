@@ -717,7 +717,18 @@ pub fn handle_bridge_reinvite_response(
         }
     }
     state.call_actors.set_pending_reinvite(call_id, true, false);
-    state.call_actors.reset_session_timer(call_id);
+    // A final response to a re-INVITE on the leg's dialog, which siphon sent: a
+    // 2xx refreshes the session there when the dialog runs a session timer
+    // (RFC 4028 §7.2).
+    session_timer_on_response(
+        call_id,
+        true,
+        branch,
+        status_code,
+        &message.headers,
+        None,
+        state,
+    );
 
     match stage {
         // The hold offer an `unbridge` sent. The leg is only *parted* now that

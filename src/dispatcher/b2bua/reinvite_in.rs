@@ -615,7 +615,16 @@ pub fn handle_b2bua_reinvite(
         // The offer as the target leg is sent it. It is committed to that leg's
         // dialog only when the leg answers 2xx (`forward_reinvite_response`).
         reinvite_leg.offered_sdp = sdp_in_body(message_content_type(&forwarded), &forwarded.body);
+        // The interval the relayed request asks for, which a 2xx without a
+        // Session-Expires leaves siphon refreshing at (RFC 4028 §7.2).
+        reinvite_leg.request_session_expires =
+            crate::b2bua::session_timer::requested_interval_of(&forwarded.headers);
+        // And what the originator asked of its own dialog, which siphon answers.
+        reinvite_leg.session_refresh_request = Some(
+            crate::b2bua::session_timer::session_refresh_request(&message.headers),
+        );
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
+        note_session_refresh_request(&call_id, from_a_leg, &message.headers, state);
 
         // Forward to the target leg. A→B: destination-keyed reuse via
         // stream_connections + pool/SNI. B→A: reuse the target leg's live

@@ -1287,25 +1287,45 @@ class Call:
             extras={"replaces": replaces},
         ))
 
-    def session_timer(self, expires: int, min_se: int = 90,
-                      refresher: str = "uac") -> None:
-        """Configure session timer (RFC 4028) for this call.
+    def session_timer(self, expires: int = 1800, min_se: int = 90,
+                      refresher: str = "b2bua") -> None:
+        """Run an RFC 4028 session timer on this call, overriding ``session_timer:``.
+
+        siphon negotiates a session timer on each dialog of the call: the
+        callee's, where siphon sends the INVITE, and the caller's, where siphon
+        answers it. It refreshes the dialogs it ends up the refresher of and
+        ends the call when a session runs out on either.
 
         Args:
-            expires: Session-Expires value in seconds.
-            min_se: Min-SE value in seconds (default 90).
-            refresher: Who refreshes: ``"uac"`` or ``"uas"`` (default ``"uac"``).
+            expires: Session interval in seconds (default 1800).
+            min_se: Smallest session interval accepted, in seconds (default 90).
+            refresher: Who siphon would have refresh each dialog, where the
+                negotiation leaves it the choice: ``"uac"`` (the UAC of each
+                dialog: siphon refreshes the callee, the caller refreshes
+                itself), ``"uas"`` (the UAS of each: the callee refreshes
+                itself, siphon refreshes the caller) or ``"b2bua"`` (siphon
+                refreshes both). Default ``"b2bua"``. A caller that chose its own
+                refresher, or cannot refresh, keeps what RFC 4028 gives it.
+
+        Raises:
+            ValueError: ``refresher`` is not one of ``"uac"``, ``"uas"`` or
+                ``"b2bua"``.
 
         Example::
 
             @b2bua.on_invite
             def new_call(call):
-                call.session_timer(1800, min_se=90, refresher="uac")
+                call.session_timer(1800, min_se=90, refresher="b2bua")
                 call.dial("sip:bob@example.com")
         """
+        if refresher.lower() not in ("uac", "uas", "b2bua"):
+            raise ValueError(
+                f'refresher must be "uac", "uas" or "b2bua", not {refresher!r}'
+            )
         self._actions.append(Action(
             kind="session_timer",
-            extras={"expires": expires, "min_se": min_se, "refresher": refresher},
+            extras={"expires": expires, "min_se": min_se,
+                    "refresher": refresher.lower()},
         ))
 
     def keep_call_id(self) -> None:

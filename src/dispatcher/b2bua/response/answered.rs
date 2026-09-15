@@ -227,49 +227,6 @@ pub fn b_leg_answered(
             None
         };
 
-        // RFC 4028: Activate session timer from negotiated 200 OK headers
-        if let Some(ref timer_config) = state.session_timer_config {
-            if timer_config.enabled {
-                // Parse Session-Expires from 200 OK (e.g. "1800;refresher=uas")
-                let Ok(response_lock) = response_arc.lock() else {
-                    error!("response_arc lock poisoned during session timer parsing");
-                    return;
-                };
-                let (negotiated_expires, negotiated_refresher) =
-                    if let Some(se_header) = response_lock.headers.get("Session-Expires") {
-                        let parts: Vec<&str> = se_header.split(';').collect();
-                        let expires = parts[0]
-                            .trim()
-                            .parse::<u32>()
-                            .unwrap_or(timer_config.session_expires);
-                        let refresher = parts
-                            .iter()
-                            .find(|p| p.trim().starts_with("refresher="))
-                            .map(|p| p.trim().trim_start_matches("refresher=").to_string())
-                            .unwrap_or_else(|| "b2bua".to_string());
-                        (expires, refresher)
-                    } else {
-                        // Remote didn't include Session-Expires — use our config defaults
-                        (timer_config.session_expires, "b2bua".to_string())
-                    };
-                drop(response_lock);
-
-                let timer_state = crate::b2bua::actor::SessionTimerState {
-                    session_expires: negotiated_expires,
-                    refresher: negotiated_refresher.clone(),
-                    last_refresh: std::time::Instant::now(),
-                };
-                state.call_actors.set_session_timer(call_id, timer_state);
-
-                debug!(
-                    call_id = %call_id,
-                    session_expires = negotiated_expires,
-                    refresher = %negotiated_refresher,
-                    "B2BUA: session timer activated"
-                );
-            }
-        }
-
         // Extract the (possibly SDP-modified) response and forward to A-leg
         let mut response = match Arc::try_unwrap(response_arc) {
             Ok(mutex) => mutex
@@ -281,48 +238,13 @@ pub fn b_leg_answered(
                 .clone(),
         };
 
-        // Inject session timer headers into the response forwarded to the A-leg.
-        // RFC 4028 §7.4/§9: a UAS MUST NOT drive a session timer (least of all
-        // `refresher=uac`) toward a UAC that did not advertise `Supported: timer`
-        // (or `Require: timer`) — the refresh it would expect never comes and the
-        // call is torn down at expiry. So only inject when the A-leg INVITE
-        // advertised timer support; otherwise leave the response untouched.
-        if let Some(ref timer_config) = state.session_timer_config {
-            if timer_config.enabled {
-                let a_leg_supports_timer = snapshot
-                    .a_leg_invite
-                    .as_ref()
-                    .and_then(|arc| arc.lock().ok())
-                    .map(|invite| {
-                        let has = |name: &str| {
-                            invite
-                                .headers
-                                .get_all(name)
-                                .map(|values| {
-                                    values
-                                        .iter()
-                                        .any(|v| v.to_ascii_lowercase().contains("timer"))
-                                })
-                                .unwrap_or(false)
-                        };
-                        has("Supported") || has("Require")
-                    })
-                    .unwrap_or(false);
-                if a_leg_supports_timer {
-                    if response.headers.get("Supported").is_none() {
-                        response.headers.add("Supported", "timer".to_string());
-                    }
-                    if response.headers.get("Session-Expires").is_none() {
-                        response.headers.add(
-                            "Session-Expires",
-                            format!("{};refresher=uac", timer_config.session_expires),
-                        );
-                    }
-                }
-            }
-        }
-
         prepare_a_leg_answer(call_id, &mut response, state, snapshot);
+
+        // RFC 4028: negotiate the session timer of each dialog, and put the
+        // caller's on this 2xx. After the sanitize above, so the Session-Expires
+        // the caller gets is the one siphon decided for the caller's dialog; read
+        // off the callee's 2xx as it arrived for the callee's.
+        negotiate_answered_session_timers(call_id, message, &mut response, snapshot, state);
 
         // ACK the B-leg's 2xx now (RFC 3261 §13.2.2.4). It confirms the B-leg's
         // dialog, and that does not wait on the caller's ACK for the A-leg's.
@@ -796,14 +718,19 @@ pub fn prepare_a_leg_answer(
     // from this message.
     strip_relayed_sdp_attributes(response, state);
     // The answer as the caller receives it is the session description in force on
-    // the caller's dialog.
-    record_sdp_sent_to_leg(
-        state,
-        call_id,
-        true,
-        message_content_type(response),
-        &response.body,
-    );
+    // the caller's dialog. A 2xx with no SDP leaves in force the answer the caller
+    // had in this leg's early media.
+    match sdp_in_body(message_content_type(response), &response.body) {
+        Some(answer) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
+        None => {
+            if let Some(early) = snapshot
+                .b_leg_index
+                .and_then(|index| state.call_actors.b_leg_early_answer(call_id, index))
+            {
+                state.call_actors.set_leg_sent_sdp(call_id, true, early);
+            }
+        }
+    }
 
     // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
     // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg

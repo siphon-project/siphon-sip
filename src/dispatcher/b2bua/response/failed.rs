@@ -340,96 +340,98 @@ pub fn retry_after_422(
     snapshot: &BLegResponseSnapshot,
 ) -> bool {
     if status_code == 422 {
-        if let Some(ref timer_config) = state.session_timer_config {
-            if timer_config.enabled {
-                let remote_min_se = message
-                    .headers
-                    .get("Min-SE")
-                    .and_then(|v| v.split(';').next())
-                    .and_then(|v| v.trim().parse::<u32>().ok());
+        if let Some(policy) = session_timer_policy(state, call_id) {
+            let remote_min_se = message
+                .headers
+                .get("Min-SE")
+                .and_then(|v| v.split(';').next())
+                .and_then(|v| v.trim().parse::<u32>().ok());
 
-                if let (Some(min_se), Some(target_uri), Some(stored_invite_arc)) = (
-                    remote_min_se,
-                    &snapshot.b_leg_target,
-                    &snapshot.b_leg_stored_invite,
-                ) {
-                    if min_se > timer_config.session_expires {
-                        info!(
-                            call_id = %call_id,
-                            min_se = min_se,
-                            "B2BUA: 422 received, retrying with Session-Expires={min_se}"
-                        );
+            if let (Some(min_se), Some(target_uri), Some(stored_invite_arc)) = (
+                remote_min_se,
+                &snapshot.b_leg_target,
+                &snapshot.b_leg_stored_invite,
+            ) {
+                if min_se > policy.session_expires {
+                    info!(
+                        call_id = %call_id,
+                        min_se = min_se,
+                        "B2BUA: 422 received, retrying with Session-Expires={min_se}"
+                    );
 
-                        // RFC 5923 connection reuse: keep the higher-
-                        // Session-Expires retry on the SAME trunk member the
-                        // 422'd INVITE traversed, instead of re-resolving the
-                        // trunk hostname and round-robining onto a sibling
-                        // member (see select_b2bua_retry_destination).
-                        {
-                            let (destination, transport, reuse_connection_id, relay_target) =
-                                match select_b2bua_retry_destination(
-                                    snapshot.b_leg_dest,
-                                    snapshot.b_leg_connection_id,
-                                    target_uri,
-                                    &state.dns_resolver,
-                                ) {
-                                    Some(resolved) => resolved,
-                                    None => return true,
-                                };
-
-                            // Rebuilt from the INVITE siphon sent the callee, as the
-                            // 401/407 retry is. The offer the callee refused is
-                            // re-sent as it went out, so the SDP keeps its `o=`/`s=`
-                            // hiding, its attribute strip and its `o=` version (an
-                            // identical offer keeps it, RFC 3264 §8), and the
-                            // headers keep the header policy, siphon's Contact and
-                            // the From topology hiding. The caller's INVITE, which
-                            // this was rebuilt from before, carried none of that.
-                            // Only the transaction (a new Via branch, the next CSeq)
-                            // and the session interval the callee asked for change.
-                            let new_branch = TransactionKey::generate_branch();
-                            // The retry continues the same B-leg, so it keeps the
-                            // leg's sent-by: the flow socket when it was dialled
-                            // over one.
-                            let (retry_via_host, retry_via_port) =
-                                b_leg_sent_by(snapshot.b_leg_local_addr, state, &transport);
-                            let via_value = format!(
-                                "SIP/2.0/{} {}:{};branch={}",
-                                transport, retry_via_host, retry_via_port, new_branch,
-                            );
-                            let retry = {
-                                let Ok(original) = stored_invite_arc.lock() else {
-                                    error!(call_id = %call_id, "b_leg_invite lock poisoned during 422 retry");
-                                    return true;
-                                };
-                                let mut retry = build_retry_invite(
-                                    &original,
-                                    via_value,
-                                    snapshot.b_leg_local_cseq,
-                                );
-                                retry
-                                    .headers
-                                    .set("Session-Expires", format!("{min_se};refresher=uac"));
-                                retry.headers.set("Min-SE", min_se.to_string());
-                                retry
+                    // RFC 5923 connection reuse: keep the higher-
+                    // Session-Expires retry on the SAME trunk member the
+                    // 422'd INVITE traversed, instead of re-resolving the
+                    // trunk hostname and round-robining onto a sibling
+                    // member (see select_b2bua_retry_destination).
+                    {
+                        let (destination, transport, reuse_connection_id, relay_target) =
+                            match select_b2bua_retry_destination(
+                                snapshot.b_leg_dest,
+                                snapshot.b_leg_connection_id,
+                                target_uri,
+                                &state.dns_resolver,
+                            ) {
+                                Some(resolved) => resolved,
+                                None => return true,
                             };
 
-                            // RFC 4028: the 422'd INVITE transaction is complete,
-                            // so the higher-Session-Expires retry continues the
-                            // same logical B-leg.
-                            supersede_b_leg_with_retry(
-                                call_id,
-                                target_uri,
-                                retry,
-                                new_branch,
-                                (destination, transport, reuse_connection_id),
-                                &relay_target,
-                                snapshot,
-                                state,
-                            );
-                        }
-                        return true; // don't forward 422 to A-leg or fire on_failure
+                        // Rebuilt from the INVITE siphon sent the callee, as the
+                        // 401/407 retry is. The offer the callee refused is
+                        // re-sent as it went out, so the SDP keeps its `o=`/`s=`
+                        // hiding, its attribute strip and its `o=` version (an
+                        // identical offer keeps it, RFC 3264 §8), and the
+                        // headers keep the header policy, siphon's Contact and
+                        // the From topology hiding. The caller's INVITE, which
+                        // this was rebuilt from before, carried none of that.
+                        // Only the transaction (a new Via branch, the next CSeq)
+                        // and the session interval the callee asked for change.
+                        let new_branch = TransactionKey::generate_branch();
+                        // The retry continues the same B-leg, so it keeps the
+                        // leg's sent-by: the flow socket when it was dialled
+                        // over one.
+                        let (retry_via_host, retry_via_port) =
+                            b_leg_sent_by(snapshot.b_leg_local_addr, state, &transport);
+                        let via_value = format!(
+                            "SIP/2.0/{} {}:{};branch={}",
+                            transport, retry_via_host, retry_via_port, new_branch,
+                        );
+                        let retry = {
+                            let Ok(original) = stored_invite_arc.lock() else {
+                                error!(call_id = %call_id, "b_leg_invite lock poisoned during 422 retry");
+                                return true;
+                            };
+                            let mut retry =
+                                build_retry_invite(&original, via_value, snapshot.b_leg_local_cseq);
+                            // The interval the callee asked for, with the
+                            // refresher siphon asked for the first time.
+                            let retried = crate::b2bua::session_timer::SessionTimerPolicy {
+                                session_expires: min_se,
+                                min_se,
+                                ..policy
+                            };
+                            retry
+                                .headers
+                                .set("Session-Expires", retried.uac_request_value());
+                            retry.headers.set("Min-SE", min_se.to_string());
+                            retry
+                        };
+
+                        // RFC 4028: the 422'd INVITE transaction is complete,
+                        // so the higher-Session-Expires retry continues the
+                        // same logical B-leg.
+                        supersede_b_leg_with_retry(
+                            call_id,
+                            target_uri,
+                            retry,
+                            new_branch,
+                            (destination, transport, reuse_connection_id),
+                            &relay_target,
+                            snapshot,
+                            state,
+                        );
                     }
+                    return true; // don't forward 422 to A-leg or fire on_failure
                 }
             }
         }

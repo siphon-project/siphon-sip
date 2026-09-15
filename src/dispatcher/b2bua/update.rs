@@ -496,7 +496,14 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         // The offer as the target leg is sent it, committed to that leg's dialog
         // only when the leg answers 2xx (`forward_update_response`).
         update_leg.offered_sdp = sdp_in_body(message_content_type(&forwarded), &forwarded.body);
+        // See the re-INVITE tracking leg: the interval the relayed request asks for.
+        update_leg.request_session_expires =
+            crate::b2bua::session_timer::requested_interval_of(&forwarded.headers);
+        update_leg.session_refresh_request = Some(
+            crate::b2bua::session_timer::session_refresh_request(&message.headers),
+        );
         state.call_actors.add_b_leg(&call_id, update_leg);
+        note_session_refresh_request(&call_id, from_a_leg, &message.headers, state);
 
         // Forward to the target leg. A→B: destination-keyed reuse via
         // stream_connections + pool/SNI. B→A: reuse the target leg's live

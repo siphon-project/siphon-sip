@@ -274,9 +274,8 @@ pub struct CallActor {
     /// response back out the same listener (source-socket parity with the
     /// inbound-driven send path on a multi-homed host).
     pub a_leg_local_addr: Option<std::net::SocketAddr>,
-    /// RFC 4028 session timer state (set after 200 OK negotiation).
-    pub session_timer: Option<SessionTimerState>,
-    /// Per-call session timer override from Python script.
+    /// Per-call session timer override from Python script. The session timers
+    /// themselves are per dialog, on each leg ([`Dialog::session_timer`]).
     pub session_timer_override: Option<crate::script::api::call::SessionTimerOverride>,
     /// Active transfer context (REFER handling).
     pub transfer: Option<crate::b2bua::transfer::TransferContext>,
@@ -503,7 +502,6 @@ impl CallActor {
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
             a_leg_local_addr: None,
-            session_timer: None,
             session_timer_override: None,
             transfer: None,
             pending_replaces: None,
@@ -1236,18 +1234,6 @@ impl CallActor {
     /// Store the original A-leg INVITE message.
     pub fn set_a_leg_invite(&mut self, message: Arc<Mutex<SipMessage>>) {
         self.a_leg_invite = Some(message);
-    }
-
-    /// Set session timer state.
-    pub fn set_session_timer(&mut self, timer: SessionTimerState) {
-        self.session_timer = Some(timer);
-    }
-
-    /// Reset session timer's last_refresh.
-    pub fn reset_session_timer(&mut self) {
-        if let Some(ref mut timer) = self.session_timer {
-            timer.last_refresh = std::time::Instant::now();
-        }
     }
 
     /// Set the actor handle for a B-leg.

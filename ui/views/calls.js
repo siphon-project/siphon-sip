@@ -120,11 +120,18 @@ function detail(call) {
   let body = '<div class="facts">' + rows.join("") + "</div>";
 
   if (call.session_timer) {
+    // One session timer per dialog: the caller's and the callee's are negotiated
+    // separately, and either may have none.
+    const dialogTimer = (party, timer) =>
+      timer
+        ? fact(party + " session-expires", timer.expires + "s") +
+          fact(party + " refresher", timer.refresher) +
+          fact(party + " last refresh", elapsed(timer.last_refresh_secs) + " ago")
+        : fact(party, "no session timer");
     body +=
       '<div class="subhead" style="margin-top:14px">Session timer (RFC 4028)</div><div class="facts">' +
-      fact("session-expires", call.session_timer.expires + "s") +
-      fact("refresher", call.session_timer.refresher) +
-      fact("last refresh", elapsed(call.session_timer.last_refresh_secs) + " ago") +
+      dialogTimer("caller", call.session_timer.caller) +
+      dialogTimer("callee", call.session_timer.callee) +
       "</div>";
   }
 

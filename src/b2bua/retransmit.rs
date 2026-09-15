@@ -136,6 +136,13 @@ impl B2buaRetransmits {
         self.armed.load(std::sync::atomic::Ordering::Relaxed) != 0
     }
 
+    /// How long a request waits for a final response before its transaction has
+    /// timed out: Timer B (INVITE) and Timer F (non-INVITE), both 64·T1 (RFC 3261
+    /// §17.1.1.2, §17.1.2.2).
+    pub fn transaction_timeout(&self) -> Duration {
+        self.timers.timer_b()
+    }
+
     /// Arm a schedule for a request just handed to the transport.
     ///
     /// Returns `false` without storing anything when the transport is reliable

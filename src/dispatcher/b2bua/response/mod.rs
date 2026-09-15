@@ -49,6 +49,14 @@ pub struct BLegResponseSnapshot {
     /// On a re-INVITE / UPDATE tracking leg, the SDP offer siphon sent the
     /// responder (`Leg::offered_sdp`), committed to its dialog on a 2xx.
     pub b_leg_offered_sdp: Option<Vec<u8>>,
+    /// On a re-INVITE / UPDATE tracking leg, the session interval the request's
+    /// `Session-Expires` asked for (`Leg::request_session_expires`).
+    pub b_leg_request_session_expires: Option<u32>,
+    /// On a tracking leg for a relayed re-INVITE or UPDATE, the originator's
+    /// session timer headers (`Leg::session_refresh_request`).
+    pub b_leg_session_refresh_request: Option<crate::sip::headers::SipHeaders>,
+    /// The Via branch the response carries.
+    pub branch: String,
     a_leg_supports_100rel: bool,
     pub a_leg_local_addr: Option<SocketAddr>,
 }
@@ -112,6 +120,9 @@ pub fn b_leg_response_snapshot(
         b_leg_stored_invite: stored_invite,
         b_leg_local_cseq: local_cseq,
         b_leg_offered_sdp: matching_b.and_then(|b| b.offered_sdp.clone()),
+        b_leg_request_session_expires: matching_b.and_then(|b| b.request_session_expires),
+        b_leg_session_refresh_request: matching_b.and_then(|b| b.session_refresh_request.clone()),
+        branch: branch.to_string(),
         a_leg_supports_100rel: call.a_leg_supports_100rel,
         a_leg_local_addr: call.a_leg_local_addr,
     })

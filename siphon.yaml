@@ -634,7 +634,10 @@ auth:
 # session_timer:
 #   session_expires: 1800   # default Session-Expires value in seconds
 #   min_se: 90              # minimum acceptable Session-Expires (Min-SE header)
-#   refresher: uac          # who refreshes: uac (default) or uas
+#   refresher: uac          # who siphon would have refresh each dialog, where the
+#                           # negotiation leaves it the choice: uac (default: siphon
+#                           # refreshes the callee, the caller itself), uas (the
+#                           # callee itself, siphon the caller) or b2bua (siphon both)
 #   enabled: true           # set to false to disable session timers
 
 # ---------------------------------------------------------------------------

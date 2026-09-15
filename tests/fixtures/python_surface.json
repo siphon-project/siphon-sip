@@ -333,7 +333,7 @@
         "kind": "getset_descriptor"
       },
       "session_timer": {
-        "doc": "Set per-call session timer parameters (overrides global config).",
+        "doc": "Run an RFC 4028 session timer on this call, over the `session_timer:` block.",
         "kind": "method_descriptor",
         "sig": "($self, expires=1800, min_se=90, refresher=\"b2bua\")"
       },
