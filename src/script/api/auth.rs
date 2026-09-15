@@ -6,8 +6,10 @@
 //! Credentials come from `auth.users` (static), an HTTP lookup, or SQL —
 //! see [`crate::auth::server`] for the SQL source.
 
+mod vectors;
+
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
@@ -18,28 +20,7 @@ use super::request::PyRequest;
 use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials};
 use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
-
-/// Expected response, cached between the 401 challenge and the verification
-/// REGISTER so the second REGISTER can be checked without deriving a fresh
-/// vector (which would carry a different RAND, hence a different XRES, and so
-/// could never match).
-///
-/// Serves both AKA paths: HSS-backed (XRES from the MAA) and local Milenage
-/// (XRES from `generate_vector`).
-#[derive(Debug, Clone)]
-struct ImsAuthVector {
-    /// Expected response (SIP-Authorization / XRES).
-    ///
-    /// CK/IK (AVP 625/626) are not cached here — they are consumed at
-    /// challenge time via the `hss_ck`/`hss_ik` locals when building the
-    /// WWW-Authenticate, and the P-CSCF IPsec path re-extracts them from the
-    /// relayed 401 header via `reply.take_av()`. The verification REGISTER
-    /// only needs the expected response.
-    expected_response: Vec<u8>,
-    /// When the challenge was issued, so one that is never answered expires
-    /// instead of sitting in the store for the life of the process.
-    stored_at: std::time::Instant,
-}
+use vectors::{auth_vectors, ims_auth_store, store_auth_vector, take_auth_vector};
 
 /// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
 /// plaintext password), with the wall-clock instant it was fetched so the TTL
@@ -56,59 +37,6 @@ struct CachedHa1 {
 /// Pure so the boundary is unit-testable without touching the clock.
 fn is_cache_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
     age < ttl
-}
-
-/// Global store for pending IMS auth vectors — keyed by nonce string.
-/// Populated on the first REGISTER (401 challenge), consumed on the second
-/// REGISTER (credential verification).
-static IMS_AUTH_STORE: OnceLock<Arc<DashMap<String, ImsAuthVector>>> = OnceLock::new();
-
-fn ims_auth_store() -> &'static Arc<DashMap<String, ImsAuthVector>> {
-    IMS_AUTH_STORE.get_or_init(|| Arc::new(DashMap::new()))
-}
-
-/// How long a pending auth vector stays usable after its 401 went out.
-///
-/// A UE answers a challenge inside one SIP transaction, so RFC 3261 Timer F
-/// (64*T1 = 32 s) is the natural ceiling; 120 s leaves room for a slow radio
-/// link and a retransmitted REGISTER. The bound matters because the store only
-/// ever shrank on a *successful* verification, so a peer that collects 401s and
-/// never answers grew it for the life of the process.
-const AUTH_VECTOR_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Prune every Nth insert rather than on each one, so a burst of challenges
-/// does not turn every insert into a full scan of the store. A trickle keeps
-/// the store small on its own, and a burst reaches the threshold quickly.
-const AUTH_VECTOR_PRUNE_EVERY: u64 = 64;
-
-static AUTH_VECTOR_INSERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Cache the expected response for `nonce`, dropping any vector whose
-/// challenge has since expired.
-fn store_auth_vector(nonce: String, expected_response: Vec<u8>) {
-    let store = ims_auth_store();
-    let count = AUTH_VECTOR_INSERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count % AUTH_VECTOR_PRUNE_EVERY == 0 {
-        store.retain(|_, vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL);
-    }
-    store.insert(
-        nonce,
-        ImsAuthVector {
-            expected_response,
-            stored_at: std::time::Instant::now(),
-        },
-    );
-}
-
-/// Consume the vector for `nonce`, if one is cached and still within its TTL.
-///
-/// Removal is unconditional, so a nonce is single-use whether or not the
-/// response verifies: replaying a captured `Authorization` finds nothing.
-fn take_auth_vector(nonce: &str) -> Option<ImsAuthVector> {
-    ims_auth_store()
-        .remove(nonce)
-        .map(|(_, vector)| vector)
-        .filter(|vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL)
 }
 
 /// A credential the script handed to a digest helper, in place of the
@@ -674,11 +602,11 @@ impl PyAuth {
             let nonce_str = extract_nonce_field(auth_value);
             let found = nonce_str
                 .as_ref()
-                .is_some_and(|n| ims_auth_store().contains_key(n));
+                .is_some_and(|n| auth_vectors().contains(n));
             tracing::debug!(
                 nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
                 found,
-                store_size = ims_auth_store().len(),
+                store_size = auth_vectors().len(),
                 "IMS auth: cache lookup",
             );
             let stored = nonce_str.as_ref().and_then(|n| take_auth_vector(n));
@@ -2140,6 +2068,7 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::vectors::{ImsAuthVector, AUTH_VECTOR_TTL};
     use super::*;
     use crate::script::api::request::RequestAction;
     use crate::sip::builder::SipMessageBuilder;
@@ -3514,30 +3443,6 @@ mod tests {
             !ims_auth_store().contains_key(nonce),
             "and is dropped rather than left behind"
         );
-    }
-
-    #[test]
-    fn auth_vector_store_prunes_expired_entries_on_insert() {
-        let store = ims_auth_store();
-        let stale = "aka-nonce-stale-prune";
-        store.insert(
-            stale.to_string(),
-            ImsAuthVector {
-                expected_response: vec![0xBB; 8],
-                stored_at: std::time::Instant::now()
-                    - (AUTH_VECTOR_TTL + std::time::Duration::from_secs(1)),
-            },
-        );
-
-        // Reach the prune threshold; the stale entry must not survive it.
-        for index in 0..=AUTH_VECTOR_PRUNE_EVERY {
-            store_auth_vector(format!("aka-nonce-prune-{index}"), vec![0xCC; 8]);
-        }
-
-        assert!(!store.contains_key(stale), "prune drops expired vectors");
-        for index in 0..=AUTH_VECTOR_PRUNE_EVERY {
-            store.remove(&format!("aka-nonce-prune-{index}"));
-        }
     }
 
     /// The local Milenage 401 has to hand CK/IK to the P-CSCF the way the HSS
