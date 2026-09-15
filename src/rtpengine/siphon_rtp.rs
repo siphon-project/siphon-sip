@@ -1680,6 +1680,10 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id,
             reason,
             duration_ms,
+            // The wall-clock bounds feed an RFC 6035 report, which siphon does
+            // not send; named rather than `..` so the next field is a decision.
+            started_at_unix_ms: _,
+            ended_at_unix_ms: _,
             legs,
         } => RtpEngineEvent::CallSummary(CallSummary {
             call_id,
@@ -2787,6 +2791,10 @@ mod tests {
                 missing_markers: 2,
                 recovered_from_redundancy: 3,
             }),
+            local_address: None,
+            remote_address: None,
+            egress_ssrc: None,
+            payload_type: None,
         };
         let converted = convert_leg_summary(with_text.clone());
         let stats = converted.text.expect("text stats carried");
@@ -3542,6 +3550,10 @@ mod tests {
             mos_max: Some(4.3),
             mos_basis: Some("full".into()),
             text: None,
+            local_address: None,
+            remote_address: None,
+            egress_ssrc: None,
+            payload_type: None,
         };
         let far = ProtoLegSummary {
             tag: "far-tag".into(),
@@ -3561,11 +3573,17 @@ mod tests {
             mos_max: None,
             mos_basis: None,
             text: None,
+            local_address: None,
+            remote_address: None,
+            egress_ssrc: None,
+            payload_type: None,
         };
         match convert_event(Event::CallSummary {
             call_id: "call-9".into(),
             reason: "delete".into(),
             duration_ms: 42_000,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
             legs: vec![near, far],
         }) {
             RtpEngineEvent::CallSummary(summary) => {

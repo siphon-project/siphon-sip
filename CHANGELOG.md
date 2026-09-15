@@ -239,6 +239,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **The `media.backend: siphon-rtp` control contract moves to
+  `siphon-rtp-proto` 0.7.0.** The wire stays compatible in both directions:
+  0.7.0 only adds optional keys (the call summary's wall-clock start and end,
+  and each leg's media addresses, egress SSRC and payload type), which siphon
+  decodes but does not use yet, and which an older engine simply does not send.
+  The engine image the SIPp media jobs run moves from 0.2.0 to 0.7.0 with it, so
+  CI exercises the pairing that ships.
+
 - **An LCR sequence that runs out on a ring timeout, with no carrier showing
   progress, fails the call with `503 Service Unavailable` instead of `408`.**
   When the carrier in flight rang out without ever sending a 101-199 and the
