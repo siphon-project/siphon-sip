@@ -694,6 +694,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   their BYEs. The first teardown now claims the call and the others back off;
   a BYE that arrives while another teardown has the call is answered 200.
 
+- **A B2BUA call answers `420 Bad Extension` when the caller `Require`s an
+  extension the call cannot honour.** siphon is the caller's UAS, and RFC 3261
+  §8.2.2.3 has a UAS refuse a request whose `Require` names an extension it
+  does not support, listing it in `Unsupported`. siphon instead dialled the
+  callee with the requirement copied or stripped by the header policy, so a
+  caller that sent `Require: precondition` could be connected by a
+  `transparent-b2bua@2026` call that strips the callee's `Require` on the way
+  back and never lets preconditions complete.
+
+  A tag is honoured when siphon implements it (`100rel`, `timer`, `replaces`,
+  and `sec-agree` on the hop it terminates), or when the call's policy passes it
+  end to end and copies `Require` to the callee, who is then the one to honour
+  or refuse it: `precondition`, `histinfo` and `resource-priority`, under the
+  same header rules as `Supported`. Anything else, vendor tags included, draws
+  the 420, with every unhonoured tag in `Unsupported` in the caller's order.
+
+  The check runs when the script's `call.dial()`, `call.fork()` or `call.route()`
+  is carried out, because only then is the policy known, and before any B-leg
+  INVITE is sent. The 420 then concludes like any call that could not be
+  connected: `@b2bua.on_failure` runs with `420` / `"Bad Extension"` and what it
+  decides is carried out, so it can release per-call state, reject with its own
+  response, or route again under a policy that relays the extension, which is
+  checked the same way. A script that rewrites or removes `Require` with
+  `call.set_header()` decides what the caller is held to. A
+  `call.handover()` is not checked.
+
 - **HEP capture sees the messages siphon sends from background tasks, the
   retransmissions above all.** The 2xx siphon retransmits to a caller until
   the ACK (RFC 3261 §13.3.1.4) and a reliable provisional it retransmits until

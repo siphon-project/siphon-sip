@@ -107,6 +107,10 @@ pub enum FailedCallEnd<'a> {
     /// the headers only that refusal carries: a 422 (Session Interval Too Small)
     /// and its `Min-SE` (RFC 4028 §9). Sent as it is.
     Refusal { response: SipMessage },
+    /// `420 Bad Extension` for a caller that `Require`s extensions the call
+    /// cannot honour, listed in `Unsupported` (RFC 3261 §8.2.2.3). Built from the
+    /// caller's INVITE like [`FailedCallEnd::Local`].
+    BadExtension { unsupported: Vec<String> },
 }
 
 impl FailedCallEnd<'_> {
@@ -119,6 +123,9 @@ impl FailedCallEnd<'_> {
                 status_code,
                 reason,
             } => return (*status_code, reason.clone()),
+            FailedCallEnd::BadExtension { .. } => {
+                return (420, "Bad Extension".to_string());
+            }
         };
         match &response.start_line {
             StartLine::Response(status_line) => {
@@ -412,6 +419,27 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
                 a_leg_local_addr,
                 state,
             );
+        }
+        FailedCallEnd::BadExtension { unsupported } => {
+            if let Some(mut response) = a_leg_final_response(
+                call_id,
+                &a_leg,
+                a_leg_invite.as_ref(),
+                status_code,
+                &reason,
+                state,
+            ) {
+                // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
+                response.headers.set("Unsupported", unsupported.join(", "));
+                send_message_from(
+                    response,
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
+            }
         }
     }
 

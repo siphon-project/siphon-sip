@@ -694,6 +694,37 @@ pub fn apply_routing_action(
     // What a parallel fork's branches settled while they were still being sent.
     let mut fork_settlement: Option<crate::b2bua::actor::BranchSettlement> = None;
 
+    // RFC 3261 §8.2.2.3: siphon is the caller's UAS, so a `Require` the call
+    // cannot honour is refused `420 Bad Extension` before any B-leg goes out. It
+    // runs here, not at INVITE receipt, because honouring depends on the header
+    // policy and the script only picks that with `call.dial(header_policy=…)`;
+    // this is the one place both `@b2bua.on_invite` and a re-route from
+    // `@b2bua.on_failure` pass through with the policy settled. A handover is not
+    // checked: the control app has not routed anything yet.
+    if matches!(
+        action,
+        CallAction::Dial { .. } | CallAction::Fork { .. } | CallAction::RouteSequence { .. }
+    ) {
+        let unsupported = unhonourable_required_tags(
+            &message_guard.headers,
+            &state.resolve_header_policy(call_id),
+        );
+        if !unsupported.is_empty() {
+            info!(
+                call_id = %call_id,
+                unsupported = %unsupported.join(", "),
+                "B2BUA: the caller requires extensions this call cannot honour — refusing with 420"
+            );
+            // Concluded like any call that could not be connected, with no lock
+            // held on the A-leg INVITE: `@b2bua.on_failure` may hold per-call
+            // state only a failure releases, and may route again under a policy
+            // that does relay the extension.
+            drop(message_guard);
+            conclude_failed_call(call_id, FailedCallEnd::BadExtension { unsupported }, state);
+            return;
+        }
+    }
+
     match action {
         CallAction::Dial {
             target,

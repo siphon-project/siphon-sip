@@ -1178,8 +1178,11 @@ class MockB2bua:
         carrier was routable, an LCR sequence ended on the ring timeout of a
         carrier that never sent a 101-199, or it moved on and none of the
         carriers left could be dialled, ``500`` when ``@b2bua.on_answer``
-        raised or ended an answered call. What the handler leaves on ``call`` is
-        carried out:
+        raised or ended an answered call, ``420`` (``"Bad Extension"``) when the
+        caller ``Require``-s an extension the call cannot honour under its
+        header policy (the default response lists them in ``Unsupported``; a
+        re-route under a policy that relays the extension goes through). What
+        the handler leaves on ``call`` is carried out:
 
         - nothing, or ``call.terminate()``: the caller gets ``code``
         - ``call.reject(code, reason)``: the caller gets that response instead
