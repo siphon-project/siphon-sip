@@ -229,13 +229,12 @@ fn cdr_config_defaults() {
 
 #[tokio::test]
 async fn file_backend_write_and_read_back() {
-    let temp_dir = std::env::temp_dir().join("siphon-cdr-test");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let temp_file = temp_dir.join("test-cdr.jsonl");
+    // A directory of this test's own. A fixed name under the system temp dir is
+    // shared with every other process running this test at once, and the
+    // cleanup of one removed the file another was about to open.
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let temp_file = temp_dir.path().join("test-cdr.jsonl");
     let temp_path = temp_file.to_str().unwrap().to_string();
-
-    // Clean up from previous runs.
-    let _ = std::fs::remove_file(&temp_file);
 
     let config = CdrConfig {
         enabled: true,
@@ -288,8 +287,4 @@ async fn file_backend_write_and_read_back() {
 
     // Verify config was built correctly (not used in write, but validates struct).
     assert!(config.enabled);
-
-    // Clean up.
-    let _ = std::fs::remove_file(&temp_file);
-    let _ = std::fs::remove_dir(&temp_dir);
 }

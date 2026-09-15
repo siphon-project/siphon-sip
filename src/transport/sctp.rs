@@ -22,6 +22,10 @@ use crate::transport::{
 };
 
 /// Spawn an SCTP listener.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0. A bind failure is returned to the
+/// caller rather than logged, as it is for the stream listeners.
 pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
@@ -29,7 +33,13 @@ pub async fn listen(
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
     _tos: Option<u32>,
-) {
+) -> std::io::Result<SocketAddr> {
+    // Bind before spawning anything, so a listener that cannot bind leaves no
+    // task behind. `SctpListener::bind` is synchronous.
+    let listener = SctpListener::bind(local_addr)?;
+    let bound = listener.local_addr()?;
+    info!("SCTP listener on {}", bound);
+
     // Spawn outbound dispatcher
     let connection_map_clone = connection_map.clone();
     tokio::spawn(async move {
@@ -69,16 +79,6 @@ pub async fn listen(
         }
     });
 
-    // SctpListener::bind is synchronous
-    let listener = match SctpListener::bind(local_addr) {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind SCTP listener on {local_addr}: {error}");
-            return;
-        }
-    };
-    info!("SCTP listener on {}", local_addr);
-
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -93,7 +93,7 @@ pub async fn listen(
                     info!("SCTP accepted {} as {:?}", remote_addr, connection_id);
 
                     tokio::spawn(async move {
-                        let local = sctp_stream.local_addr().unwrap_or(local_addr);
+                        let local = sctp_stream.local_addr().unwrap_or(bound);
                         let (mut reader, mut writer) = sctp_stream.into_split();
 
                         // Counts this connection in
@@ -207,6 +207,8 @@ pub async fn listen(
             }
         }
     });
+
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -219,26 +221,53 @@ mod tests {
         Arc::new(TransportAcl::new(vec![], vec![]))
     }
 
-    use crate::transport::testutil::free_port;
+    /// Loopback, port 0: the kernel picks the port and `listen` returns it.
+    fn any_loopback_port() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A bind that cannot succeed reaches the caller, as it does for the stream
+    /// listeners, instead of being logged while `listen` returns as if serving.
+    #[tokio::test]
+    async fn an_sctp_listener_that_cannot_bind_returns_the_error() {
+        // A listening SCTP socket holds the port against any other bind to it,
+        // `SO_REUSEADDR` or not.
+        let occupant = SctpListener::bind(any_loopback_port()).expect("occupant binds");
+        let taken = occupant.local_addr().expect("occupant address");
+
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let error = listen(
+            taken,
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            test_acl(),
+            None,
+        )
+        .await
+        .expect_err("a listener that cannot bind must say so");
+        assert!(error.to_string().contains("bind"), "{error}");
+    }
 
     #[tokio::test]
     async fn sctp_connection_lifecycle() {
-        let addr = free_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
             None,
         )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        .await
+        .expect("sctp listener must bind");
+        assert_ne!(addr.port(), 0, "listen must return the port it bound");
 
         // Connect as an SCTP client
         let client = SctpStream::connect(addr)
@@ -281,22 +310,21 @@ mod tests {
 
     #[tokio::test]
     async fn sctp_connection_cleanup() {
-        let addr = free_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
             None,
         )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        .await
+        .expect("sctp listener must bind");
 
         let client = SctpStream::connect(addr)
             .await
@@ -330,22 +358,21 @@ mod tests {
 
     #[tokio::test]
     async fn sctp_message_boundaries() {
-        let addr = free_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
             None,
         )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        .await
+        .expect("sctp listener must bind");
 
         let client = SctpStream::connect(addr)
             .await

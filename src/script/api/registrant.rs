@@ -576,18 +576,28 @@ mod tests {
     fn rust_namespace_has_on_change_when_singleton_set_first() {
         use pyo3::Python;
 
-        Python::initialize();
-        Python::attach(|python| {
-            // Idempotent: another test may have populated the OnceLock already;
-            // we only need the real namespace bound when install runs.
-            let manager = make_manager();
-            let namespace = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
-            let _ = crate::script::api::set_registration_singleton(python, namespace);
+        // Runs in a process of its own. Applying the decorator appends to the
+        // process-wide handler registry outside any script load, and a script
+        // another test is loading at that moment picked the entry up as one of
+        // its own handlers. Setting the registration singleton also changes
+        // the `siphon` module every later load in the process installs.
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::rust_namespace_has_on_change_when_singleton_set_first"
+            ),
+            || {
+                Python::initialize();
+                Python::attach(|python| {
+                    let manager = make_manager();
+                    let namespace = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+                    let _ = crate::script::api::set_registration_singleton(python, namespace);
 
-            crate::script::api::ensure_registry(python).expect("ensure registry");
-            crate::script::api::install_siphon_module(python).expect("install siphon module");
+                    crate::script::api::ensure_registry(python).expect("ensure registry");
+                    crate::script::api::install_siphon_module(python)
+                        .expect("install siphon module");
 
-            let script = r#"
+                    let script = r#"
 import siphon
 import _siphon_registry
 
@@ -604,16 +614,17 @@ def on_trunk_change(aor, event_type, state):
 
 # Decorator returns the function unchanged...
 assert on_trunk_change.__name__ == 'on_trunk_change'
-# ...and registers under the registrant kind. Membership check only —
-# the registry is process-global and shared with parallel tests.
+# ...and registers under the registrant kind.
 kinds = [entry[0] for entry in _siphon_registry.entries()]
 assert 'registration.on_change' in kinds, kinds
 "#;
-            let assertions = std::ffi::CString::new(script).expect("CString");
-            python
-                .run(assertions.as_c_str(), None, None)
-                .expect("Rust registration namespace must expose on_change");
-        });
+                    let assertions = std::ffi::CString::new(script).expect("CString");
+                    python
+                        .run(assertions.as_c_str(), None, None)
+                        .expect("Rust registration namespace must expose on_change");
+                });
+            },
+        );
     }
 
     #[test]

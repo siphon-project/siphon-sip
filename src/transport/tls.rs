@@ -747,6 +747,9 @@ pub fn build_hot_reload_acceptor(tls_config: &TlsServerConfig) -> io::Result<Sha
 
 /// Spawn a TLS listener. Mirrors the TCP listener but wraps each accepted
 /// connection in a TLS handshake before spawning read/write tasks.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0.
 pub async fn listen(
     local_addr: SocketAddr,
     tls_config: &TlsServerConfig,
@@ -759,25 +762,27 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SocketAddr> {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
         std::process::exit(1);
     });
-
-    // Distribute outbound messages to per-connection senders. When no existing
-    // connection matches, the distributor falls back to the connection pool to
-    // create a new outbound TLS connection (registrant, probes, etc.).
-    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tls, pool);
 
     // Bind before spawning, so that awaiting `listen` means the socket is
     // already accepting. With the bind inside the task, the caller returned
     // first and the listener appeared whenever the runtime got round to it —
     // a peer (or a test) could connect in between and be refused. It also
     // means a bind failure is ordered before the caller continues instead of
-    // surfacing as a listener that silently never exists.
+    // surfacing as a listener that silently never exists, and before any task
+    // is spawned that a failed listener would leave behind.
     let listener = bind_tcp_listener(local_addr, tos)?;
-    info!("TLS listener on {}", local_addr);
+    let bound = listener.local_addr()?;
+    info!("TLS listener on {}", bound);
+
+    // Distribute outbound messages to per-connection senders. When no existing
+    // connection matches, the distributor falls back to the connection pool to
+    // create a new outbound TLS connection (registrant, probes, etc.).
+    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tls, pool);
 
     tokio::spawn(async move {
         loop {
@@ -847,7 +852,7 @@ pub async fn listen(
                             return;
                         }
 
-                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
+                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
                         // frames as a complete "message" and would otherwise
@@ -895,7 +900,7 @@ pub async fn listen(
         }
     });
 
-    Ok(())
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -1181,8 +1186,8 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        // Start TLS listener on a random port
-        listen(
+        // Start the TLS listener on a port the kernel picks.
+        let bound_addr = listen(
             "127.0.0.1:0".parse().unwrap(),
             &tls_config,
             inbound_tx,
@@ -1197,10 +1202,7 @@ mod tests {
         )
         .await
         .expect("tls listener must bind");
-
-        // We need the actual bound port. Since listen() binds inside a spawned task,
-        // give it a moment to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(bound_addr.port(), 0, "listen must return the port it bound");
 
         // Read the cert back to build a client config that trusts it
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();
@@ -1219,40 +1221,6 @@ mod tests {
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_config));
-
-        // Unfortunately we can't easily get the bound port from inside the spawned task.
-        // We'll use a different approach: bind to a known port.
-        // Let's redo with a specific approach — start a raw TcpListener to find a free port first.
-        drop(inbound_rx); // clean up the first attempt
-
-        // --- Retry with a port we control ---
-        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let bound_addr = tcp_listener.local_addr().unwrap();
-        drop(tcp_listener); // release so TLS listener can bind
-
-        let (inbound_tx, inbound_rx) = flume::unbounded();
-        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
-
-        listen(
-            bound_addr,
-            &tls_config,
-            inbound_tx,
-            outbound_rx,
-            Arc::clone(&connection_map),
-            test_acl(),
-            StreamConnections::new(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("tls listener must bind");
-
-        // Give the listener time to bind
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a TLS client
         let tcp_stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
@@ -1302,19 +1270,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tls_config = write_test_cert(&directory);
 
-        // Find a free port
-        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let bound_addr = tcp_listener.local_addr().unwrap();
-        drop(tcp_listener);
-
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
         let stream_connections = StreamConnections::new();
 
-        listen(
-            bound_addr,
+        let bound_addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
             &tls_config,
             inbound_tx,
             outbound_rx,
@@ -1328,8 +1291,7 @@ mod tests {
         )
         .await
         .expect("tls listener must bind");
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(bound_addr.port(), 0, "listen must return the port it bound");
 
         // Build TLS client
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();

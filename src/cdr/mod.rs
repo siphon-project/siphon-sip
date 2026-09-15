@@ -1668,10 +1668,10 @@ mod tests {
         let path = directory.join("cdr.jsonl");
         let _ = std::fs::remove_file(&path);
 
-        let address = crate::transport::testutil::free_tcp_port();
-        let listener = tokio::net::TcpListener::bind(address)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind collector");
+        let address = listener.local_addr().expect("collector address");
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(collector(listener, seen_tx));
 

@@ -67,6 +67,9 @@ pub struct MuxChannels {
 ///
 /// `tls_config` selects the pairing: `Some` gives `tls` + `wss` (TLS handshake
 /// first, sniff the plaintext), `None` gives `tcp` + `ws`.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0.
 pub async fn listen(
     local_addr: SocketAddr,
     tls_config: Option<&TlsServerConfig>,
@@ -78,13 +81,31 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SocketAddr> {
     let secure = tls_config.is_some();
     let (sip_transport, websocket_transport) = if secure {
         (Transport::Tls, Transport::WebSocketSecure)
     } else {
         (Transport::Tcp, Transport::WebSocket)
     };
+
+    let acceptor = tls_config.map(|tls_config| {
+        crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
+            eprintln!("Failed to build TLS acceptor for {local_addr} ({sip_transport}+{websocket_transport} mux): {error}");
+            std::process::exit(1);
+        })
+    });
+
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists, and before any task
+    // is spawned that a failed listener would leave behind.
+    let listener = bind_tcp_listener(local_addr, tos)?;
+    let bound = listener.local_addr()?;
+    info!("{sip_transport}+{websocket_transport} mux listener on {bound}");
 
     // Each half keeps its own distributor, so outbound routing is identical to
     // the dedicated listeners'. Only the raw-SIP half gets the pool: WS/WSS are
@@ -102,24 +123,8 @@ pub async fn listen(
         None,
     );
 
-    let acceptor = tls_config.map(|tls_config| {
-        crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
-            eprintln!("Failed to build TLS acceptor for {local_addr} ({sip_transport}+{websocket_transport} mux): {error}");
-            std::process::exit(1);
-        })
-    });
-
     let sip_connection_map = channels.sip_connection_map;
     let websocket_connection_map = channels.websocket_connection_map;
-
-    // Bind before spawning, so that awaiting `listen` means the socket is
-    // already accepting. With the bind inside the task, the caller returned
-    // first and the listener appeared whenever the runtime got round to it —
-    // a peer (or a test) could connect in between and be refused. It also
-    // means a bind failure is ordered before the caller continues instead of
-    // surfacing as a listener that silently never exists.
-    let listener = bind_tcp_listener(local_addr, tos)?;
-    info!("{sip_transport}+{websocket_transport} mux listener on {local_addr}");
 
     tokio::spawn(async move {
         loop {
@@ -184,7 +189,7 @@ pub async fn listen(
                                 return;
                             }
                         };
-                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
+                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         dispatch(
                             tls_stream,
                             (Transport::Tls, Transport::WebSocketSecure),
@@ -201,7 +206,7 @@ pub async fn listen(
                         .await;
                     }
                     None => {
-                        let local_addr = tcp_stream.local_addr().unwrap_or(local_addr);
+                        let local_addr = tcp_stream.local_addr().unwrap_or(bound);
                         dispatch(
                             tcp_stream,
                             (Transport::Tcp, Transport::WebSocket),
@@ -222,7 +227,7 @@ pub async fn listen(
         }
     });
 
-    Ok(())
+    Ok(bound)
 }
 
 /// Sniff one accepted (and, for `tls`/`wss`, already-decrypted) stream and run
@@ -348,12 +353,8 @@ mod tests {
         websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     }
 
-    /// Bind a port, release it, and start a mux listener on it.
+    /// Start a mux listener on a port the kernel picks.
     async fn spawn_mux(tls_config: Option<&TlsServerConfig>) -> Harness {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_sip_outbound_tx, sip_outbound_rx) = flume::unbounded::<OutboundMessage>();
         let (_ws_outbound_tx, websocket_outbound_rx) = flume::unbounded::<OutboundMessage>();
@@ -362,8 +363,8 @@ mod tests {
         let websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
             tls_config,
             MuxChannels {
                 sip_outbound_rx,
@@ -381,8 +382,7 @@ mod tests {
         )
         .await
         .expect("mux listener must bind");
-        // listen() binds inside a spawned task.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(addr.port(), 0, "listen must return the port it bound");
 
         Harness {
             addr,
