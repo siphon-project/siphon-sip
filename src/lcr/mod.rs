@@ -797,11 +797,14 @@ mod tests {
         format!("http://{addr}/route")
     }
 
-    /// A URL to a guaranteed-closed port (bind then drop) → connection refused.
+    /// A URL whose port refuses connections.
+    ///
+    /// The port stays bound, never listened on, for the life of the test
+    /// process. A port bound and then released is free again at once, and a
+    /// listener another test binds to port 0 can be handed it, so the connect
+    /// the test expects refused could reach that listener instead.
     async fn closed_port_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let addr = crate::transport::testutil::free_tcp_port();
         format!("http://{addr}/route")
     }
 
