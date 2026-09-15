@@ -236,16 +236,19 @@ pub fn b_leg_answered(
         // off the callee's 2xx as it arrived for the callee's.
         negotiate_answered_session_timers(call_id, message, &mut response, snapshot, state);
 
-        // ACK the B-leg's 2xx now (RFC 3261 §13.2.2.4). It confirms the B-leg's
-        // dialog, and that does not wait on the caller's ACK for the A-leg's.
-        ack_b_leg_2xx(call_id, message, state, snapshot);
-
         // The caller's 2xx, and what follows it (retransmissions, charging, a
         // deferred `call.refer()`, SIPREC). It waits for the PRACK of a reliable
         // provisional with SDP still unacknowledged (RFC 3262 §3) and then
-        // follows that PRACK's 200; its retransmission, and with it the 64*T1
-        // unACKed sweep and the §15 BYE hold, starts only when it is sent.
-        answer_a_leg(
+        // follows that PRACK's 200; the 64*T1 unACKed sweep and the §15 BYE hold
+        // cover it only once it goes out.
+        //
+        // The B-leg's 2xx is ACKed in between (RFC 3261 §13.2.2.4): it confirms
+        // the B-leg's dialog and does not wait on the caller's ACK for the A-leg's.
+        // When the caller's 2xx goes out now, the ACK leaves after that 2xx is
+        // registered as waiting for the caller's ACK. A callee may BYE the moment
+        // it is ACKed, and its BYE, handled on another worker, has to find the
+        // caller's 2xx waiting to be held behind that ACK (§15).
+        answer_a_leg_after(
             call_id,
             crate::b2bua::actor::HeldAnswer {
                 response,
@@ -253,6 +256,7 @@ pub fn b_leg_answered(
                 deferred_refer: deferred_outbound_refer.take(),
             },
             state,
+            || ack_b_leg_2xx(call_id, message, state, snapshot),
         );
     } // end 2xx guard
 }
