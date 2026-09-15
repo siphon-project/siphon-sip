@@ -34,6 +34,16 @@ impl CallActorStore {
             .is_some_and(|call| call.is_pending_branch(index))
     }
 
+    /// Whether the B-leg at `index` is a branch that has ended. See
+    /// [`CallActor::is_ended_branch`]. `true` when the call is gone, which ended
+    /// every branch it had.
+    pub fn is_ended_branch(&self, call_id: &str, index: usize) -> bool {
+        // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
+        self.calls
+            .get(call_id)
+            .map_or(true, |call| call.is_ended_branch(index))
+    }
+
     /// Open a fork's dispatch window. See [`CallActor::fork_dispatching`].
     pub fn start_fork_dispatch(&self, call_id: &str) {
         if let Some(mut call) = self.calls.get_mut(call_id) {

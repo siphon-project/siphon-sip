@@ -453,6 +453,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   anchored and no `@b2bua.on_early_media`. A provisional on a leg still waiting
   for its final response is handled as before.
 
+- **A reliable provisional from a B-leg that already ended no longer draws a
+  PRACK.** siphon PRACKs a B-leg's `Require: 100rel` 18x itself (RFC 3262 §4),
+  and it did so before checking whether the leg was still waiting for its final
+  response. So a reliable 183 from an LCR carrier that had answered `503`, or
+  from a fork branch that had failed, was dropped but still PRACKed. That leg's
+  INVITE transaction was over, the PRACK named an early dialog that no longer
+  existed, and a compliant carrier answered `481`. It gets no PRACK now. Neither
+  does a leg siphon CANCELled, even before its `487` is back: the `487` is what
+  stops the carrier retransmitting, and a PRACK sent behind the CANCEL would only
+  meet a `481`. A reliable provisional on a leg still waiting for its final
+  response is PRACKed as before.
+
 - **A 2xx to an INVITE or re-INVITE siphon sent is ACKed when it arrives after
   the call ended.** RFC 3261 §13.2.2.4 has the UAC ACK every 2xx, and RFC 5407
   §3.1.3 keeps that true for a 2xx that crosses the UAC's own BYE. siphon

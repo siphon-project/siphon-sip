@@ -27,10 +27,11 @@ pub fn b_leg_provisional(
         // will confirm, recording it could read as progress, and anchoring its
         // SDP would open media that goes nowhere. A response takes no ACK, so it
         // is only dropped. Checked before the call is marked ringing, so a
-        // straggler cannot move it to Ringing either.
+        // straggler cannot move it to Ringing either. The same check already
+        // kept a reliable one from being PRACKed (`auto_prack_b_leg`).
         if snapshot
             .b_leg_index
-            .is_some_and(|index| !state.call_actors.is_pending_branch(call_id, index))
+            .is_some_and(|index| state.call_actors.is_ended_branch(call_id, index))
         {
             debug!(call_id = %call_id, branch = %branch, status = status_code,
                 "B2BUA: dropping a provisional from a leg that already ended");

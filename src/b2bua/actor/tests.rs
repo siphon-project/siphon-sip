@@ -1248,6 +1248,50 @@ fn tracking_legs_are_not_fork_branches() {
         .is_some());
 }
 
+/// A branch has ended once it has its final response or siphon CANCELled it. One
+/// still waiting has not, and neither has a tracking pseudo-leg, which is no
+/// branch at all.
+#[test]
+fn a_branch_has_ended_once_it_is_final_or_cancelled() {
+    let mut call = CallActor::new(make_a_leg());
+    for index in 0..4 {
+        call.add_b_leg(make_sent_b_leg(index));
+    }
+    let mut tracking = make_b_leg(4);
+    tracking.dialog.target_uri = Some("reinvite:a2b".to_string());
+    call.add_b_leg(tracking);
+
+    call.mark_b_leg_ringing(1);
+    assert!(call.settle_route_branch(2, 503));
+    call.mark_b_leg_cancelled(3);
+
+    assert!(!call.is_ended_branch(0), "trying");
+    assert!(!call.is_ended_branch(1), "ringing");
+    assert!(call.is_ended_branch(2), "failed");
+    assert!(call.is_ended_branch(3), "cancelled");
+    assert!(!call.is_ended_branch(4), "a tracking leg is no branch");
+    assert!(call.is_ended_branch(5), "no leg at that index");
+
+    call.set_winner(1);
+    assert!(call.is_ended_branch(1), "answered");
+}
+
+/// A call that is gone ended every branch it had, so a provisional still in
+/// flight for one of them reads as from a leg that ended.
+#[test]
+fn every_branch_of_a_call_that_is_gone_has_ended() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    store
+        .get_call_mut(&call_id)
+        .expect("the call just created")
+        .add_b_leg(make_sent_b_leg(0));
+    assert!(!store.is_ended_branch(&call_id, 0));
+
+    store.remove_call(&call_id);
+    assert!(store.is_ended_branch(&call_id, 0));
+}
+
 /// A CANCEL is a copy of its INVITE (§9.1), so a branch whose INVITE is not
 /// stashed yet cannot be cancelled now. It is flagged instead, and the send path
 /// CANCELs it the moment the INVITE lands.

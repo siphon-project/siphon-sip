@@ -76,6 +76,39 @@ pub fn auto_prack_b_leg(
             crate::sip::headers::rseq::parse_rseq(&message.headers),
             snapshot.b_leg_index,
         ) {
+            // No PRACK for a leg that has ended. It is the check
+            // `b_leg_provisional` drops the provisional on, so siphon never
+            // PRACKs a provisional it does not relay.
+            //
+            // A final response is already in (a failed fork branch, an LCR
+            // carrier settled by its failure, the winner's 2xx): the INVITE
+            // client transaction is over (RFC 3261 §17.1.1.2), and a non-2xx
+            // final ended every early dialog it opened (§12.3). The far end has
+            // no unacknowledged provisional left for a PRACK to match and answers
+            // it 481 (RFC 3262 §3).
+            //
+            // siphon CANCELled the leg and its 487 is not back yet: the
+            // transaction still lives, so RFC 3262 §4 on its own would PRACK.
+            // siphon does not. The far end answers the CANCEL with a 487 at once
+            // (RFC 3261 §9.2), may do so with a provisional unacknowledged (RFC
+            // 3262 §3), and sends no provisional after a final (RFC 3261
+            // §17.2.1), so that 487 is what stops the retransmissions. A PRACK
+            // can only leave behind the CANCEL, reaches the far end after the 487
+            // in the ordinary case, and meets the same 481. Were the CANCEL lost,
+            // the far end rejects the INVITE after 64*T1 without its PRACK (RFC
+            // 3262 §3), which ends the leg siphon was ending anyway. While the
+            // branch is kept answerable, `absorb_cancelled_branch_response`
+            // already dropped the provisional before this runs; this covers the
+            // leg once it is not.
+            if state.call_actors.is_ended_branch(call_id, idx) {
+                debug!(
+                    call_id = %call_id,
+                    rseq = rseq.response_number,
+                    "B2BUA: no PRACK for a reliable provisional from a leg that already ended"
+                );
+                return;
+            }
+
             // RFC 3262 §4 + RFC 3261 §12.1.2: this reliable provisional
             // establishes (or refreshes) an early dialog. Build the auto-PRACK
             // from THIS response's remote target — Contact (→ Request-URI), To
