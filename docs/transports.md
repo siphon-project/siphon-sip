@@ -409,6 +409,24 @@ listen:
       advertise: "sip-tls.example.com"
 ```
 
+!!! warning "TLS and WSS listeners should advertise a DNS name"
+    A peer that opens a *new* TLS connection to siphon dials the host siphon put
+    in its Contact, Record-Route or Via, and validates the certificate against
+    it. It does this to send the ACK or a later in-dialog request when the
+    original connection is gone or not reused. Certificates name DNS names, so an
+    IP literal there fails validation, and nothing shows on siphon's side: the
+    request just never arrives. Set `advertise:` on each `listen.tls` /
+    `listen.wss` entry (or `advertised_address`) to a DNS name `tls.certificate`
+    carries.
+
+    At startup siphon logs a warning for every TLS and WSS listener whose
+    advertised host comes out as an IP literal, naming the transport, the bind
+    address and the IP. It stays quiet when `tls.certificate` carries that IP as
+    an iPAddress subjectAltName, since that validates. Only `tls.certificate` is
+    checked: a peer dialling an IP sends no SNI (RFC 6066 §3), so it is never
+    served a `tls.certificates` entry. If the certificate can't be read, the
+    warning still fires and says the SAN check was not possible.
+
 !!! danger "Binding `0.0.0.0` / `[::]` requires an advertised address"
     With a wildcard bind and **no** advertised address, siphon can't know which
     local IP to put in Via/Contact, so it falls back to `127.0.0.1` and logs a

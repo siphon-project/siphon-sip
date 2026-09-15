@@ -1435,6 +1435,316 @@ fn resolve_advertised_host_none_is_legacy_behavior() {
 }
 
 // -----------------------------------------------------------------------
+// TLS / WSS listeners that advertise an IP literal (startup warning)
+// -----------------------------------------------------------------------
+
+/// A listener registry from `(transport, bound address, advertise)` rows.
+fn secure_listener_registry(
+    listeners: &[(Transport, &str, Option<&str>)],
+) -> crate::transport::ListenerRegistry {
+    crate::transport::ListenerRegistry::from_entries(listeners.iter().map(
+        |(transport, address, advertise)| {
+            (
+                *transport,
+                address.parse().unwrap(),
+                advertise.map(str::to_string),
+            )
+        },
+    ))
+}
+
+/// `listen_addrs` the way the server fills it: the first listener of each
+/// transport, in config order.
+fn first_listener_per_transport(
+    listeners: &[(Transport, &str, Option<&str>)],
+) -> std::collections::HashMap<Transport, SocketAddr> {
+    let mut listen_addrs = std::collections::HashMap::new();
+    for (transport, address, _) in listeners {
+        listen_addrs
+            .entry(*transport)
+            .or_insert_with(|| address.parse().unwrap());
+    }
+    listen_addrs
+}
+
+fn secure_host(
+    transport: Transport,
+    listener: &str,
+    host: &str,
+) -> (Transport, SocketAddr, String) {
+    (transport, listener.parse().unwrap(), host.to_string())
+}
+
+#[test]
+fn secure_listener_advertised_hosts_covers_only_tls_and_wss() {
+    let listeners = [
+        (Transport::Udp, "192.0.2.10:5060", None),
+        (Transport::Tcp, "192.0.2.10:5060", None),
+        (Transport::WebSocket, "192.0.2.10:80", None),
+        (Transport::Tls, "192.0.2.10:5061", None),
+        (Transport::WebSocketSecure, "192.0.2.10:443", None),
+    ];
+    let hosts = secure_listener_advertised_hosts(
+        &secure_listener_registry(&listeners),
+        &std::collections::HashMap::new(),
+        &first_listener_per_transport(&listeners),
+        "192.0.2.10".parse().unwrap(),
+    );
+    assert_eq!(
+        hosts,
+        vec![
+            secure_host(Transport::Tls, "192.0.2.10:5061", "192.0.2.10"),
+            secure_host(Transport::WebSocketSecure, "192.0.2.10:443", "192.0.2.10"),
+        ]
+    );
+}
+
+#[test]
+fn secure_listener_advertised_hosts_reports_every_listener_sharing_advertised_address() {
+    // The global `advertised_address` folded into every transport, as `run`
+    // does: each listener writes it, so each listener is reported.
+    let listeners = [
+        (Transport::Tls, "192.0.2.10:5061", None),
+        (Transport::Tls, "192.0.2.11:5061", None),
+        (Transport::WebSocketSecure, "192.0.2.10:443", None),
+    ];
+    let mut advertised = std::collections::HashMap::new();
+    advertised.insert(Transport::Tls, "198.51.100.1".to_string());
+    advertised.insert(Transport::WebSocketSecure, "198.51.100.1".to_string());
+    let hosts = secure_listener_advertised_hosts(
+        &secure_listener_registry(&listeners),
+        &advertised,
+        &first_listener_per_transport(&listeners),
+        "192.0.2.10".parse().unwrap(),
+    );
+    assert_eq!(
+        hosts,
+        vec![
+            secure_host(Transport::Tls, "192.0.2.10:5061", "198.51.100.1"),
+            secure_host(Transport::Tls, "192.0.2.11:5061", "198.51.100.1"),
+            secure_host(Transport::WebSocketSecure, "192.0.2.10:443", "198.51.100.1"),
+        ]
+    );
+}
+
+#[test]
+fn secure_listener_advertised_hosts_uses_the_listener_advertise() {
+    let listeners = [(Transport::Tls, "192.0.2.10:5061", Some("sip.example.com"))];
+    let mut advertised = std::collections::HashMap::new();
+    advertised.insert(Transport::Tls, "sip.example.com".to_string());
+    let hosts = secure_listener_advertised_hosts(
+        &secure_listener_registry(&listeners),
+        &advertised,
+        &first_listener_per_transport(&listeners),
+        "192.0.2.10".parse().unwrap(),
+    );
+    assert_eq!(
+        hosts,
+        vec![secure_host(
+            Transport::Tls,
+            "192.0.2.10:5061",
+            "sip.example.com"
+        )]
+    );
+}
+
+#[test]
+fn secure_listener_advertised_hosts_on_a_wildcard_bind_is_the_resolved_ip() {
+    // No advertise anywhere and an unspecified bind: the host is whatever the
+    // resolver falls back to, a routable local IP or else loopback. Which one
+    // depends on the machine, but it is an IP literal either way, and never the
+    // unspecified address itself.
+    let listeners = [
+        (Transport::Tls, "0.0.0.0:5061", None),
+        (Transport::WebSocketSecure, "[::]:443", None),
+    ];
+    let registry = secure_listener_registry(&listeners);
+    let advertised = std::collections::HashMap::new();
+    // `run` resolves the default the same way, from the first listener.
+    let via_addr = crate::uac::resolve_via_addr(
+        "0.0.0.0:5061".parse().unwrap(),
+        &Transport::Udp,
+        &advertised,
+        None,
+    );
+    let hosts = secure_listener_advertised_hosts(
+        &registry,
+        &advertised,
+        &first_listener_per_transport(&listeners),
+        via_addr.ip(),
+    );
+
+    for (transport, address) in [
+        (Transport::Tls, "0.0.0.0:5061"),
+        (Transport::WebSocketSecure, "[::]:443"),
+    ] {
+        let listener: SocketAddr = address.parse().unwrap();
+        let own = resolve_advertised_host(
+            &registry,
+            &advertised,
+            via_addr.ip(),
+            Some(listener),
+            &transport,
+        );
+        assert!(
+            hosts.contains(&(transport, listener, own.clone())),
+            "{transport} {listener} should report {own}: {hosts:?}"
+        );
+    }
+    for (transport, listener, host) in &hosts {
+        let ip = strip_ipv6_brackets(host).parse::<IpAddr>();
+        assert!(
+            ip.as_ref().is_ok_and(|ip| !ip.is_unspecified()),
+            "{transport} {listener} advertises {host}"
+        );
+    }
+}
+
+#[test]
+fn secure_listener_advertised_hosts_reports_a_different_transport_default() {
+    // Multi-homed, nothing advertised: the Via and B-leg Contact on TLS fall
+    // back to the first listener of any transport (UDP here), not the TLS bind
+    // IP the A-leg Contact carries. Both reach a TLS peer, so both are reported.
+    let listeners = [
+        (Transport::Udp, "192.0.2.1:5060", None),
+        (Transport::Tls, "192.0.2.2:5061", None),
+    ];
+    let hosts = secure_listener_advertised_hosts(
+        &secure_listener_registry(&listeners),
+        &std::collections::HashMap::new(),
+        &first_listener_per_transport(&listeners),
+        "192.0.2.1".parse().unwrap(),
+    );
+    assert_eq!(
+        hosts,
+        vec![
+            secure_host(Transport::Tls, "192.0.2.2:5061", "192.0.2.2"),
+            secure_host(Transport::Tls, "192.0.2.2:5061", "192.0.2.1"),
+        ]
+    );
+}
+
+/// A self-signed certificate for `names` in `directory`. rcgen writes an IP
+/// literal as an iPAddress subjectAltName and anything else as a dNSName.
+fn write_certificate_for(directory: &tempfile::TempDir, names: &[&str]) -> String {
+    let key_pair = rcgen::KeyPair::generate().expect("keygen");
+    let certificate = rcgen::CertificateParams::new(
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .expect("certificate params")
+    .self_signed(&key_pair)
+    .expect("self-sign");
+    let path = directory.path().join("certificate.pem");
+    std::fs::write(&path, certificate.pem()).expect("write certificate");
+    path.to_str().expect("utf-8 path").to_string()
+}
+
+/// The WARN lines `emit` logs.
+fn captured_warnings(emit: impl FnOnce()) -> Vec<String> {
+    let log = super::lcr_number_policy_tests::LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(log.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, emit);
+    log.rendered()
+        .lines()
+        .filter(|line| line.contains("WARN"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn startup_warns_for_each_secure_listener_whose_ip_the_certificate_lacks() {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = write_certificate_for(
+        &directory,
+        &["sip.example.com", "192.0.2.10", "2001:db8::10"],
+    );
+    let listeners = [
+        // Carried as an iPAddress SAN, and so is the transport default.
+        (Transport::Tls, "192.0.2.10:5061", None),
+        (Transport::Tls, "198.51.100.1:5061", None),
+        // Covered; its transport default (192.0.2.10) is covered too.
+        (Transport::WebSocketSecure, "[2001:db8::10]:443", None),
+        (Transport::WebSocketSecure, "[2001:db8::20]:443", None),
+    ];
+    let warnings = captured_warnings(|| {
+        warn_secure_listeners_advertising_ip_literals(
+            &certificate,
+            &secure_listener_registry(&listeners),
+            &std::collections::HashMap::new(),
+            &first_listener_per_transport(&listeners),
+            "192.0.2.10".parse().unwrap(),
+        )
+    });
+
+    assert_eq!(warnings.len(), 2, "{warnings:#?}");
+    assert!(
+        warnings[0].contains("listen.tls")
+            && warnings[0].contains("transport=TLS")
+            && warnings[0].contains("listener=198.51.100.1:5061")
+            && warnings[0].contains("advertised=198.51.100.1")
+            && warnings[0].contains("iPAddress subjectAltName")
+            && warnings[0].contains("Set `advertise:`"),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        warnings[1].contains("listen.wss")
+            && warnings[1].contains("transport=WSS")
+            && warnings[1].contains("listener=[2001:db8::20]:443")
+            && warnings[1].contains("advertised=2001:db8::20")
+            && warnings[1].contains("Set `advertise:`"),
+        "{}",
+        warnings[1]
+    );
+}
+
+#[test]
+fn startup_warns_when_the_certificate_cannot_be_read_for_the_san_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.pem");
+    let listeners = [
+        (Transport::Tls, "192.0.2.10:5061", None),
+        // A DNS name is never checked, so an unreadable certificate says nothing
+        // about it.
+        (
+            Transport::WebSocketSecure,
+            "192.0.2.20:443",
+            Some("sip.example.com"),
+        ),
+    ];
+    let mut advertised = std::collections::HashMap::new();
+    advertised.insert(Transport::WebSocketSecure, "sip.example.com".to_string());
+    let warnings = captured_warnings(|| {
+        warn_secure_listeners_advertising_ip_literals(
+            missing.to_str().unwrap(),
+            &secure_listener_registry(&listeners),
+            &advertised,
+            &first_listener_per_transport(&listeners),
+            "192.0.2.10".parse().unwrap(),
+        )
+    });
+
+    assert_eq!(warnings.len(), 1, "{warnings:#?}");
+    assert!(
+        warnings[0].contains("listen.tls")
+            && warnings[0].contains("listener=192.0.2.10:5061")
+            && warnings[0].contains("advertised=192.0.2.10")
+            && warnings[0].contains("not possible")
+            && warnings[0].contains("missing.pem")
+            && warnings[0].contains("Set `advertise:`"),
+        "{}",
+        warnings[0]
+    );
+}
+
+// -----------------------------------------------------------------------
 // Imperative B2BUA terminate helpers (b2bua.terminate / session timer)
 // -----------------------------------------------------------------------
 

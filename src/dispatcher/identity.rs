@@ -499,3 +499,149 @@ pub(super) fn cached_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
     let cache = if ipv6 { &V6 } else { &V4 };
     *cache.get_or_init(|| crate::transport::detect_routable_local_ip(ipv6))
 }
+
+/// Every host siphon writes into its own Via, Contact and Record-Route for a TLS
+/// or WSS listener, as `(transport, listener, host)`, sorted by transport and
+/// then listener.
+///
+/// Two derivations feed those headers, so both are reported, and both go
+/// through [`resolve_advertised_host`] rather than a copy of it:
+///
+/// - **The listener's own host**, resolved with that socket: the Contact on a
+///   B2BUA response to a peer that reached siphon there
+///   ([`sanitize_b2bua_response`]), and the inbound Record-Route of a relay
+///   that bridges two sockets.
+/// - **The transport's default host**, resolved with no socket, which is what
+///   [`DispatcherState::via_host`] returns: the Via sent-by, the outbound
+///   Record-Route and an unpinned B-leg Contact. It is reported against the
+///   transport's first configured listener (`listen_addrs`), whose port those
+///   headers carry, and only when it differs from that listener's own host.
+///
+/// The two part ways on a multi-homed host with nothing advertised, where the
+/// default falls back to the first listener of any transport. On a wildcard
+/// bind with nothing advertised both come out as the auto-detected routable IP,
+/// else loopback. Path never comes from here: `add_path` takes the script's URI
+/// and `add_pcscf_path` stamps `ipsec.path_host`.
+pub(super) fn secure_listener_advertised_hosts(
+    registry: &crate::transport::ListenerRegistry,
+    advertised_addrs: &std::collections::HashMap<Transport, String>,
+    listen_addrs: &std::collections::HashMap<Transport, SocketAddr>,
+    default_local_ip: IpAddr,
+) -> Vec<(Transport, SocketAddr, String)> {
+    let mut listeners: Vec<(Transport, SocketAddr)> = registry
+        .entries()
+        .into_iter()
+        .filter(|(transport, _, _)| {
+            matches!(transport, Transport::Tls | Transport::WebSocketSecure)
+        })
+        .map(|(transport, address, _)| (transport, address))
+        .collect();
+    // The registry is a HashMap; sort so the warnings come out in a stable order.
+    listeners.sort_by_key(|(transport, address)| (transport.label(), *address));
+
+    let mut hosts = Vec::new();
+    for (transport, listener) in listeners {
+        let own = resolve_advertised_host(
+            registry,
+            advertised_addrs,
+            default_local_ip,
+            Some(listener),
+            &transport,
+        );
+        let transport_default = (listen_addrs.get(&transport) == Some(&listener))
+            .then(|| {
+                resolve_advertised_host(
+                    registry,
+                    advertised_addrs,
+                    default_local_ip,
+                    None,
+                    &transport,
+                )
+            })
+            .filter(|host| *host != own);
+        hosts.push((transport, listener, own));
+        if let Some(host) = transport_default {
+            hosts.push((transport, listener, host));
+        }
+    }
+    hosts
+}
+
+/// Warn, once at startup, for every TLS and WSS listener that advertises an IP
+/// literal its certificate cannot be validated against.
+///
+/// A peer that opens a new TLS connection to siphon, to send the ACK or a later
+/// in-dialog request once the original connection is gone or not reused, dials
+/// a host from [`secure_listener_advertised_hosts`] and validates the
+/// certificate against it. Certificates name DNS names, so an IP there fails
+/// the handshake, and nothing shows on siphon's side: the request never
+/// arrives. That silence is why this is a warning and not only a line in the
+/// docs.
+///
+/// Checked against `tls.certificate` alone, read once; see
+/// [`crate::transport::tls::certificate_ip_addresses`] for why the SNI pairs do
+/// not count. A certificate that cannot be read still warns, and says the check
+/// was not possible.
+pub(super) fn warn_secure_listeners_advertising_ip_literals(
+    certificate_path: &str,
+    registry: &crate::transport::ListenerRegistry,
+    advertised_addrs: &std::collections::HashMap<Transport, String>,
+    listen_addrs: &std::collections::HashMap<Transport, SocketAddr>,
+    default_local_ip: IpAddr,
+) {
+    let hosts = secure_listener_advertised_hosts(
+        registry,
+        advertised_addrs,
+        listen_addrs,
+        default_local_ip,
+    );
+    if hosts.is_empty() {
+        return;
+    }
+    let certificate_ip_addresses =
+        crate::transport::tls::certificate_ip_addresses(certificate_path)
+            .map_err(|error| error.to_string());
+
+    for (transport, listener, host) in hosts {
+        let Some((ip, problem)) = crate::transport::tls::advertised_ip_problem(
+            transport,
+            &host,
+            certificate_ip_addresses.as_deref().map_err(String::as_str),
+        ) else {
+            continue;
+        };
+        let listen_key = if transport == Transport::WebSocketSecure {
+            "listen.wss"
+        } else {
+            "listen.tls"
+        };
+        match problem {
+            crate::transport::tls::AdvertisedIpProblem::NotInCertificate => warn!(
+                transport = %transport,
+                listener = %listener,
+                advertised = %ip,
+                certificate = %certificate_path,
+                "{listen_key} listener advertises an IP literal in its Contact/Record-Route/Via \
+                 and tls.certificate has no iPAddress subjectAltName for it. A peer that opens a \
+                 new TLS connection to that address (to send the ACK or a later in-dialog \
+                 request when the original connection is gone or not reused) fails certificate \
+                 validation and never sends the request. Set `advertise:` on this listener to a \
+                 DNS name the certificate carries."
+            ),
+            crate::transport::tls::AdvertisedIpProblem::CertificateUnreadable(error) => warn!(
+                transport = %transport,
+                listener = %listener,
+                advertised = %ip,
+                certificate = %certificate_path,
+                error = %error,
+                "{listen_key} listener advertises an IP literal in its Contact/Record-Route/Via \
+                 and tls.certificate could not be read, so the SAN check for a matching \
+                 iPAddress subjectAltName was not possible. Unless the certificate carries that \
+                 IP, a peer that opens a new TLS connection to that address (to send the ACK or \
+                 a later in-dialog request when the original connection is gone or not reused) \
+                 fails certificate validation and never sends the request. Set `advertise:` on \
+                 this listener to a DNS name the certificate carries."
+            ),
+        }
+    }
+}

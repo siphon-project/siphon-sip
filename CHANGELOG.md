@@ -249,6 +249,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   response relay, the tracking-leg check and a new retransmit guard, so a type
   cannot be forwarded without being recognised on the way back.
 
+- **siphon warns at startup when a TLS or WSS listener advertises an IP
+  literal.** On a secure transport the host siphon writes into its own Contact,
+  Record-Route and Via comes from the listener's `advertise:`, then
+  `advertised_address`, then the bound IP. With no DNS name configured that host
+  is an IP. A peer that opens a new TLS connection to it, to send the ACK or a
+  later in-dialog request once the original connection is gone or not reused,
+  validates siphon's certificate against that IP. Certificates name DNS names, so
+  the handshake fails, and nothing shows on siphon's side: the request just never
+  arrives.
+
+  Each such listener now logs a WARN naming its transport, bind address and the
+  IP, and telling you to set `advertise:` to a DNS name the certificate carries.
+  It stays quiet when `tls.certificate` carries that IP as an iPAddress
+  subjectAltName, which validates. A certificate siphon cannot read still
+  warns, and says the SAN check was not possible. Only `tls.certificate` is
+  checked: a peer that dials an IP sends no SNI, so it never gets a
+  `tls.certificates` entry. Nothing else changes and there is no new setting.
+
 ### Changed
 
 - **The `media.backend: siphon-rtp` control contract moves to

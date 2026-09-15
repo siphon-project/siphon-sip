@@ -94,6 +94,16 @@ listen:
   #
   # The global `advertised_address` (below) serves as fallback for transports
   # that don't have a per-socket advertise.
+  #
+  # TLS and WSS: advertise a DNS name the certificate carries.  A peer that
+  # opens a new TLS connection to siphon's Contact or Record-Route (the ACK, or
+  # a later in-dialog request once the first connection is gone or not reused)
+  # validates the certificate against that host.  Certificates name DNS names,
+  # so an IP there fails the handshake and the request never arrives.  With no
+  # advertise the host is `advertised_address`, else the bound IP.  siphon
+  # logs a warning at startup for each TLS/WSS listener whose host is an IP
+  # literal, unless tls.certificate carries that IP as an iPAddress
+  # subjectAltName.
 
 # ---------------------------------------------------------------------------
 # Network identity
