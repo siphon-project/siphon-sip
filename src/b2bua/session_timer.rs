@@ -71,6 +71,89 @@ impl SessionTimerPolicy {
     }
 }
 
+/// The RFC 4028 session timer a script or a controller runs on one call, over the
+/// `session_timer:` block: `call.session_timer()`,
+/// `b2bua.originate(session_timer={...})` and the control plane's `originate`
+/// `args.session_timer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTimerOverride {
+    pub session_expires: u32,
+    pub min_se: u32,
+    /// Who siphon would have refresh each dialog, where the negotiation leaves
+    /// it the choice.
+    pub refresher: SessionRefresher,
+}
+
+impl SessionTimerOverride {
+    /// A session timer with `refresher` by name: `uac`, `uas` or `b2bua`, in any
+    /// case. The error says what was given.
+    pub fn named(session_expires: u32, min_se: u32, refresher: &str) -> Result<Self, String> {
+        let Some(preference) = SessionRefresher::from_name(refresher) else {
+            return Err(format!(
+                "refresher must be \"uac\", \"uas\" or \"b2bua\", not {refresher:?}"
+            ));
+        };
+        Ok(Self {
+            session_expires,
+            min_se,
+            refresher: preference,
+        })
+    }
+}
+
+/// One field of a session timer given as a map, `{expires, min_se, refresher}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTimerField {
+    /// `expires`: the session interval, in seconds.
+    Expires,
+    /// `min_se`: the smallest session interval siphon accepts, in seconds.
+    MinSe,
+    /// `refresher`: `uac`, `uas` or `b2bua`.
+    Refresher,
+}
+
+impl SessionTimerField {
+    /// The field called `key`. The error names the fields there are and the key
+    /// that was given.
+    pub fn named(key: &str) -> Result<Self, String> {
+        match key {
+            "expires" => Ok(Self::Expires),
+            "min_se" => Ok(Self::MinSe),
+            "refresher" => Ok(Self::Refresher),
+            other => Err(format!(
+                "session_timer takes expires, min_se and refresher, not {other:?}"
+            )),
+        }
+    }
+}
+
+/// A session timer given field by field, each one left out defaulting as in
+/// `call.session_timer()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionTimerFields {
+    pub expires: Option<u32>,
+    pub min_se: Option<u32>,
+    pub refresher: Option<String>,
+}
+
+impl SessionTimerFields {
+    /// The session interval of a timer that names none, in seconds.
+    pub const DEFAULT_EXPIRES: u32 = 1800;
+    /// The `Min-SE` of a timer that names none, in seconds.
+    pub const DEFAULT_MIN_SE: u32 = MIN_SESSION_INTERVAL;
+    /// The refresher of a timer that names none.
+    pub const DEFAULT_REFRESHER: &'static str = "b2bua";
+
+    /// The session timer these fields give, or why they give none.
+    pub fn build(self) -> Result<SessionTimerOverride, String> {
+        SessionTimerOverride::named(
+            self.expires.unwrap_or(Self::DEFAULT_EXPIRES),
+            self.min_se.unwrap_or(Self::DEFAULT_MIN_SE),
+            self.refresher.as_deref().unwrap_or(Self::DEFAULT_REFRESHER),
+        )
+    }
+}
+
 /// How siphon, the UAS of a session refresh request, answers its request for a
 /// session timer (RFC 4028 §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,6 +644,58 @@ mod tests {
         assert_eq!(
             interval(&[("Supported", "timer"), ("Min-SE", "1200")], 900),
             Some(1200)
+        );
+    }
+
+    #[test]
+    fn a_session_timer_takes_a_refresher_by_name_in_any_case_and_refuses_others() {
+        assert_eq!(
+            SessionTimerOverride::named(900, 120, "UAC"),
+            Ok(SessionTimerOverride {
+                session_expires: 900,
+                min_se: 120,
+                refresher: SessionRefresher::Uac,
+            })
+        );
+        let error = SessionTimerOverride::named(1800, 90, "sometimes")
+            .expect_err("a refresher siphon cannot negotiate");
+        assert!(
+            error.contains("refresher") && error.contains("sometimes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_session_timer_given_field_by_field_defaults_what_it_leaves_out() {
+        assert_eq!(
+            SessionTimerFields::default().build(),
+            Ok(SessionTimerOverride {
+                session_expires: 1800,
+                min_se: 90,
+                refresher: SessionRefresher::B2bua,
+            })
+        );
+        let fields = SessionTimerFields {
+            expires: Some(90),
+            min_se: None,
+            refresher: Some("uas".to_string()),
+        };
+        assert_eq!(
+            fields.build(),
+            Ok(SessionTimerOverride {
+                session_expires: 90,
+                min_se: 90,
+                refresher: SessionRefresher::Uas,
+            })
+        );
+        assert_eq!(
+            SessionTimerField::named("min_se"),
+            Ok(SessionTimerField::MinSe)
+        );
+        let error = SessionTimerField::named("interval").expect_err("a field no timer has");
+        assert!(
+            error.contains("session_timer") && error.contains("interval"),
+            "{error}"
         );
     }
 

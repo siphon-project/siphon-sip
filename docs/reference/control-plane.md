@@ -251,7 +251,7 @@ chunk, so logs join Homer and billing with no mapping table.
 
 | verb | module | args | notes |
 |---|---|---|---|
-| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
+| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
 | `answer` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
 | `ring` | sip | `{reason?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
 | `progress` | sip | `{code, reason?, body?, content_type?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress` |
@@ -472,7 +472,8 @@ notification and the dial half of a transfer:
             "privacy": "allowed",
             "headers": { "X-Campaign": "reminder" },
             "media": true,
-            "timeout": 30 } }
+            "timeout": 30,
+            "session_timer": { "expires": 1800, "refresher": "uac" } } }
 ```
 
 ```json
@@ -550,8 +551,18 @@ answered, and a CANCEL (RFC 3261 §9.1) while it is still ringing — never a SI
 response, which a UAC has no business sending to the party it is calling. The
 same CANCEL fires when `timeout` (default 30 s, `0` to disable) elapses unanswered.
 
+**Session timer.** `session_timer: {expires, min_se, refresher}` runs an RFC 4028
+session timer on the call over the `session_timer:` block, each key left out
+defaulting as in `call.session_timer()` (1800, 90, `b2bua`). The INVITE asks for
+it, the callee's 2xx says who refreshes, and siphon refreshes the dialog or
+releases the call just before a session the callee let run out expires, exactly
+as for [`b2bua.originate(session_timer=...)`](call.md#placing-a-call-b2buaoriginate).
+Left out, the configured timer runs, if there is one. A key no timer has, a
+`refresher` other than `uac`, `uas` or `b2bua`, or an `expires` / `min_se` that is
+not a whole number of seconds is `bad_request`, and nothing is placed.
+
 Refusals are typed and separately actionable: `bad_request` (missing/contradictory
-args, unparseable URI, bad `privacy`), `conflict` (the id is in use), `not_found`
+args, unparseable URI, bad `privacy` or `session_timer`), `conflict` (the id is in use), `not_found`
 (no route to the target), `unsupported_verb` (the backend cannot serve the media
 plan), `unavailable` (the B2BUA is not running, or the commanding connection has
 gone — nothing would own the call).

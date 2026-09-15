@@ -523,7 +523,16 @@ pub fn b2bua_originate_dial(prepared: &PreparedOriginate) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread (the control command consumer, an async-pool loop).
+    let _enter = control.runtime.enter();
+    dial_originate(&control.state, prepared)
+}
+
+/// [`b2bua_originate_dial`] on the dispatcher the caller already holds, inside a
+/// tokio runtime: the dial half of [`prepare_originate`], and what lets a test
+/// place a staged originate the way the control plane does.
+pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> bool {
     if state
         .call_actors
         .get_call(&prepared.internal_call_id)
@@ -531,9 +540,6 @@ pub fn b2bua_originate_dial(prepared: &PreparedOriginate) -> bool {
     {
         return false;
     }
-    // The send path may spawn (TCP/TLS connect) and the caller may be on a
-    // non-tokio thread (the control command consumer, an async-pool loop).
-    let _enter = control.runtime.enter();
 
     let data = Bytes::from(prepared.invite.to_bytes());
     arm_b2bua_retransmit(

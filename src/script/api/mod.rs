@@ -31,7 +31,6 @@ pub mod request;
 pub mod rtpengine;
 pub mod sbi;
 pub mod sdp;
-pub mod session_timer;
 pub mod sip_uri;
 pub mod srs;
 pub mod stir;

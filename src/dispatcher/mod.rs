@@ -81,6 +81,8 @@ mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod control_originate_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
 mod held_bye_tests;

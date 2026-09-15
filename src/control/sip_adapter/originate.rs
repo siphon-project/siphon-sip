@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 
+use crate::b2bua::session_timer::{SessionTimerField, SessionTimerFields, SessionTimerOverride};
 use crate::control::protocol::{ControlErrorCode, ControlResult};
 use crate::control::registry::ControlBus;
 use crate::control::AdapterCommand;
+use crate::dispatcher::{OriginateError, OriginateParams, PreparedOriginate};
 
 use super::routing::parse_extra_headers;
 use super::string_arg;
@@ -32,6 +34,17 @@ use super::string_arg;
 /// [`crate::dispatcher::b2bua_originate_prepare`] / `..._dial` split), so a
 /// callee that answers instantly cannot beat its own `StasisStart`.
 pub(super) fn originate(command: AdapterCommand) -> ControlResult {
+    #[cfg(test)]
+    {
+        if let Some(rail) = staged::rail_for(&command.origin.app) {
+            return originate_on(
+                &rail.bus,
+                command,
+                |params| (rail.prepare)(params),
+                |prepared| (rail.dial)(prepared),
+            );
+        }
+    }
     let Some(bus) = ControlBus::global() else {
         return ControlResult::error(
             ControlErrorCode::Unavailable,
@@ -46,6 +59,23 @@ pub(super) fn originate(command: AdapterCommand) -> ControlResult {
 pub(super) fn originate_with_bus(
     bus: &std::sync::Arc<ControlBus>,
     command: AdapterCommand,
+) -> ControlResult {
+    originate_on(
+        bus,
+        command,
+        crate::dispatcher::b2bua_originate_prepare,
+        crate::dispatcher::b2bua_originate_dial,
+    )
+}
+
+/// [`originate_with_bus`] with the B2BUA rail injected as well: `prepare` stages
+/// the call and `dial` sends its INVITE. The running B2BUA's in production, a
+/// test's own dispatcher when it drives the verb end to end.
+pub(super) fn originate_on(
+    bus: &std::sync::Arc<ControlBus>,
+    command: AdapterCommand,
+    prepare: impl FnOnce(OriginateParams) -> Result<PreparedOriginate, OriginateError>,
+    dial: impl FnOnce(&PreparedOriginate) -> bool,
 ) -> ControlResult {
     let args = &command.args;
     let Some(channel_id) = args.get("channel").and_then(|value| value.as_str()) else {
@@ -70,6 +100,10 @@ pub(super) fn originate_with_bus(
     };
     let privacy = match parse_privacy(args.get("privacy")) {
         Ok(privacy) => privacy,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let session_timer = match parse_session_timer(args.get("session_timer")) {
+        Ok(session_timer) => session_timer,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
     let headers = parse_extra_headers(args.get("headers"));
@@ -120,10 +154,10 @@ pub(super) fn originate_with_bus(
         headers,
         timeout_secs,
         media,
-        session_timer: None,
+        session_timer,
     };
 
-    let prepared = match crate::dispatcher::b2bua_originate_prepare(params) {
+    let prepared = match prepare(params) {
         Ok(prepared) => prepared,
         Err(error) => return originate_error(error),
     };
@@ -137,7 +171,7 @@ pub(super) fn originate_with_bus(
         &on_lost,
         vars,
     );
-    if !crate::dispatcher::b2bua_originate_dial(&prepared) {
+    if !dial(&prepared) {
         bus.remove_channel(channel_id);
         return ControlResult::error(
             ControlErrorCode::Unavailable,
@@ -243,6 +277,59 @@ pub(super) fn parse_privacy(
     }
 }
 
+/// Parse the optional `session_timer` argument: the RFC 4028 session timer to run
+/// on the call over the `session_timer:` block, `{expires, min_se, refresher}`,
+/// each key left out defaulting as in `call.session_timer()`.
+///
+/// Validated by the rules `call.session_timer()` and
+/// `b2bua.originate(session_timer=...)` use ([`SessionTimerFields`]): a key no
+/// timer has, a refresher that is not `uac`, `uas` or `b2bua`, or an interval
+/// that is not a whole number of seconds is refused. Absent or `null` runs the
+/// configured timer, if any.
+pub(super) fn parse_session_timer(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<SessionTimerOverride>, String> {
+    let object = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(object)) => object,
+        Some(_) => {
+            return Err(
+                "originate args.session_timer must be an object: {expires, min_se, refresher}"
+                    .to_string(),
+            )
+        }
+    };
+    let seconds = |key: &str, value: &serde_json::Value| {
+        value
+            .as_u64()
+            .and_then(|seconds| u32::try_from(seconds).ok())
+            .ok_or_else(|| {
+                format!("originate args.session_timer.{key} must be a whole number of seconds")
+            })
+    };
+    let mut fields = SessionTimerFields::default();
+    for (key, value) in object {
+        match SessionTimerField::named(key)
+            .map_err(|message| format!("originate args.{message}"))?
+        {
+            SessionTimerField::Expires => fields.expires = Some(seconds(key, value)?),
+            SessionTimerField::MinSe => fields.min_se = Some(seconds(key, value)?),
+            SessionTimerField::Refresher => {
+                let Some(refresher) = value.as_str() else {
+                    return Err(
+                        "originate args.session_timer.refresher must be a string".to_string()
+                    );
+                };
+                fields.refresher = Some(refresher.to_string());
+            }
+        }
+    }
+    fields
+        .build()
+        .map(Some)
+        .map_err(|message| format!("originate args.session_timer.{message}"))
+}
+
 /// Map an [`crate::dispatcher::OriginateError`] onto its own wire code, so a
 /// caller can tell a bad URI from no route from a backend that cannot do it.
 pub(super) fn originate_error(error: crate::dispatcher::OriginateError) -> ControlResult {
@@ -263,5 +350,58 @@ pub(super) fn originate_error(error: crate::dispatcher::OriginateError) -> Contr
         OriginateError::Unavailable(_) | OriginateError::BuildFailed(_) => {
             ControlResult::error(ControlErrorCode::Unavailable, message)
         }
+    }
+}
+
+/// The B2BUA rail a test hands `originate`, keyed by the app a command comes
+/// from.
+///
+/// `originate` reaches the running B2BUA through its process-wide handle, which is
+/// set once per process, and tests elsewhere rely on it being absent. A test that
+/// drives the verb end to end, from the controller's frame through the command
+/// consumer and the adapter's dispatch table, stages a dispatcher of its own here
+/// under an app name of its own, and every other command takes the production
+/// path.
+#[cfg(test)]
+pub(crate) mod staged {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use crate::control::registry::ControlBus;
+    use crate::dispatcher::{OriginateError, OriginateParams, PreparedOriginate};
+
+    /// Stages an originate on the test's dispatcher.
+    pub(crate) type Prepare =
+        Box<dyn Fn(OriginateParams) -> Result<PreparedOriginate, OriginateError> + Send + Sync>;
+    /// Sends a staged originate's INVITE.
+    pub(crate) type Dial = Box<dyn Fn(&PreparedOriginate) -> bool + Send + Sync>;
+
+    /// Where an app's originates are placed, and the bus that owns their channels.
+    pub(crate) struct OriginateRail {
+        pub(crate) bus: Arc<ControlBus>,
+        pub(crate) prepare: Prepare,
+        pub(crate) dial: Dial,
+    }
+
+    type Rails = Mutex<HashMap<String, Arc<OriginateRail>>>;
+
+    fn rails() -> &'static Rails {
+        static RAILS: OnceLock<Rails> = OnceLock::new();
+        RAILS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Place every originate `app` sends on `rail`.
+    pub(crate) fn stage(app: &str, rail: OriginateRail) {
+        if let Ok(mut rails) = rails().lock() {
+            rails.insert(app.to_string(), Arc::new(rail));
+        }
+    }
+
+    /// The rail `app` was staged on, if any.
+    pub(crate) fn rail_for(app: &str) -> Option<Arc<OriginateRail>> {
+        rails()
+            .lock()
+            .ok()
+            .and_then(|rails| rails.get(app).cloned())
     }
 }
