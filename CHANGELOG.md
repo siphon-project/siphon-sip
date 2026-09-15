@@ -6,6 +6,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+
+- **`siphon-rtp-proto` 0.7.1.** The control contract is unchanged (only a doc comment moved), so
+  nothing in siphon's use of it changes. The bump tracks siphon-rtp 0.7.1, whose engine now
+  terminates a DTLS-SRTP (WebRTC) caller toward a plain RTP callee on `offer`/`answer`, which is
+  what the built-in `wss_to_rtp` profile asks for.
+
 ## [1.9.0] — 2026-09-15
 
 ### Added
