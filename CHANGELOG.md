@@ -366,6 +366,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   starting without it. A UDP listener still comes up as long as one of its
   workers binds.
 
+- **A header a B2BUA script sets or removes goes out on the B-leg INVITE as the
+  script left it, whatever the header policy.** The docs put script
+  `call.set_header()` / `call.remove_header()` first in the policy precedence,
+  and it was not: the policy ran over the A-leg INVITE the script had shaped. A
+  preset or a `strip=` delta that strips a header dropped the script's value
+  with it, a preset rewrite replaced it (`User-Agent`, the
+  `P-Asserted-Identity` host), and `ims-trust-domain-boundary@2026` turned a
+  `Diversion` the script wrote into `History-Info`. Only removals, and headers
+  the policy happened to copy, came out as the script meant.
+
+  A header set or removed with `call.set_header()`, `call.remove_header()` or
+  `call.remove_headers_matching()`, in `@b2bua.on_invite` or in an
+  `@b2bua.on_failure` that routes again, is now left alone by the preset and by
+  the per-call `copy=` / `strip=` / `translate=` deltas. The framework-managed
+  headers stay siphon's: `Via`, `Call-ID`, `CSeq`, `Max-Forwards`,
+  `Content-Length`, `From`, `To`, `Contact`, `Record-Route` and `Route`.
+  `Proxy-Authorization`, which every preset strips but `copy=` could always
+  carry, is a script's to set as well; the docs had listed it as
+  framework-managed. What runs after the policy still applies on top of a
+  script's value: the number policy and a carrier's caller ID and CLIR on the
+  identity headers, LCR route headers, siphon's `Session-Expires`/`Min-SE` when
+  it runs the session timer, and `replaces` merged into `Supported`. A
+  `Require` the script set counts as reaching the callee when siphon decides
+  whether to answer `420 Bad Extension`.
+
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.1.** The wire stays compatible in both directions:
   0.7.0 only adds optional keys (the call summary's wall-clock start and end,

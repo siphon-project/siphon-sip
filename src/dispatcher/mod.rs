@@ -107,6 +107,8 @@ mod retransmit_capture_tests;
 #[cfg(test)]
 mod ro_orphan_backstop_tests;
 #[cfg(test)]
+mod script_header_precedence_tests;
+#[cfg(test)]
 mod sdp_strip_tests;
 #[cfg(test)]
 mod session_refresh_tests;

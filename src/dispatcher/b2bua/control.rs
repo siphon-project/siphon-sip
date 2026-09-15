@@ -159,6 +159,11 @@ pub(crate) fn b2bua_route_call_with_state(
     // carrier ends the call.
     let unsupported = unhonourable_required_tags(
         &template.headers,
+        &state
+            .call_actors
+            .get_call(&internal_call_id)
+            .map(|call| call.script_shaped_headers.clone())
+            .unwrap_or_default(),
         &state.resolve_header_policy(&internal_call_id),
     );
     if !unsupported.is_empty() {
@@ -902,6 +907,11 @@ pub(crate) fn b2bua_dial_call_with_state(
     // caller either: it is refused now, not reported as a dial to retry.
     let unsupported = unhonourable_required_tags(
         &template.headers,
+        &state
+            .call_actors
+            .get_call(&internal_call_id)
+            .map(|call| call.script_shaped_headers.clone())
+            .unwrap_or_default(),
         &state.resolve_header_policy(&internal_call_id),
     );
     if !unsupported.is_empty() {

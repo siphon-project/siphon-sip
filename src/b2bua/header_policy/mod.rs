@@ -290,6 +290,9 @@ impl Preset {
 /// 3. delta translate
 /// 4. preset override
 /// 5. preset default
+///
+/// Above all five on the B-leg INVITE sits a header the script set or removed:
+/// [`apply_to_request_keeping`] never asks for its verb.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicy {
     pub preset: Arc<Preset>,
@@ -431,7 +434,25 @@ pub(crate) fn is_framework_auto(name: &str) -> bool {
 /// Called from `b2bua_send_b_leg_invite` after Record-Route/Route/etc. have
 /// been stripped, and before Via/Call-ID/From/To/Contact framework rewrites.
 pub fn apply_to_request(outbound: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext) {
-    apply(outbound, policy, ctx, /*is_request=*/ true);
+    apply(outbound, policy, ctx, /*is_request=*/ true, &[]);
+}
+
+/// [`apply_to_request`], leaving every header named in `kept` exactly as it is.
+///
+/// `kept` is the headers a script set or removed on the A-leg INVITE the B-leg
+/// INVITE is cloned from. Script headers are precedence 1, above the per-call
+/// deltas and the preset, so the policy neither strips, rewrites nor translates
+/// them: one the script set goes out as written, one it removed stays absent.
+/// Names compare case-insensitively with compact forms folded. The
+/// [framework-managed headers](FRAMEWORK_AUTO_HEADERS) are not the policy's to
+/// touch in the first place, and `kept` does not hand them to the script.
+pub fn apply_to_request_keeping(
+    outbound: &mut SipMessage,
+    policy: &ResolvedPolicy,
+    ctx: &PolicyContext,
+    kept: &[String],
+) {
+    apply(outbound, policy, ctx, /*is_request=*/ true, kept);
 }
 
 /// Apply the policy to a B-leg → A-leg response that is being forwarded back
@@ -440,10 +461,16 @@ pub fn apply_to_request(outbound: &mut SipMessage, policy: &ResolvedPolicy, ctx:
 /// Called from `sanitize_b2bua_response` in place of the previous hardcoded
 /// `Allow` / `Supported` / `Require` / etc. strips.
 pub fn apply_to_response(response: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext) {
-    apply(response, policy, ctx, /*is_request=*/ false);
+    apply(response, policy, ctx, /*is_request=*/ false, &[]);
 }
 
-fn apply(message: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext, is_request: bool) {
+fn apply(
+    message: &mut SipMessage,
+    policy: &ResolvedPolicy,
+    ctx: &PolicyContext,
+    is_request: bool,
+    kept: &[String],
+) {
     let header_names: Vec<String> = message
         .headers
         .names()
@@ -452,7 +479,11 @@ fn apply(message: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext,
         .collect();
 
     for name in header_names {
-        if is_framework_auto(&name) {
+        if is_framework_auto(&name)
+            || kept
+                .iter()
+                .any(|kept_name| crate::sip::headers::same_header_name(kept_name, &name))
+        {
             continue;
         }
         let verb = if is_request {
@@ -1905,6 +1936,60 @@ mod tests {
         policy.deltas_strip.push("Subject".to_string());
         apply_to_request(&mut msg, &policy, &ctx());
         assert!(!msg.headers.has("Subject"), "strip wins on conflict");
+    }
+
+    // ----- Script-kept headers -----
+
+    #[test]
+    fn kept_headers_are_neither_stripped_rewritten_nor_translated() {
+        let mut msg = invite_with(&[
+            ("Subject", "set by the script"),
+            ("User-Agent", "lab-agent/1.0"),
+            ("X-Lab-Tag", "set by the script"),
+            ("X-Other", "not kept"),
+            ("Diversion", "<sip:carol@atlanta.com>;reason=unconditional"),
+        ]);
+        // Default strip, a User-Agent rewrite and a Diversion translate, plus a
+        // per-call strip on top.
+        let mut policy = ResolvedPolicy::from_preset(trust_boundary());
+        policy.deltas_strip.push("Subject".to_string());
+        apply_to_request_keeping(
+            &mut msg,
+            &policy,
+            &ctx(),
+            // As a script spells them: case does not matter.
+            &[
+                "subject".to_string(),
+                "User-Agent".to_string(),
+                "X-LAB-TAG".to_string(),
+                "Diversion".to_string(),
+            ],
+        );
+        assert_eq!(
+            msg.headers.get("Subject").map(String::as_str),
+            Some("set by the script")
+        );
+        assert_eq!(
+            msg.headers.get("User-Agent").map(String::as_str),
+            Some("lab-agent/1.0")
+        );
+        assert!(msg.headers.has("X-Lab-Tag"));
+        assert!(
+            msg.headers.has("Diversion") && !msg.headers.has("History-Info"),
+            "a kept Diversion is not translated"
+        );
+        // Everything not kept still gets the policy.
+        assert!(!msg.headers.has("X-Other"));
+    }
+
+    #[test]
+    fn nothing_kept_applies_the_policy_as_before() {
+        let mut kept_nothing = invite_with(&[("User-Agent", "lab-agent/1.0"), ("X-Other", "x")]);
+        let mut plain = kept_nothing.clone();
+        let policy = ResolvedPolicy::from_preset(trust_boundary());
+        apply_to_request_keeping(&mut kept_nothing, &policy, &ctx(), &[]);
+        apply_to_request(&mut plain, &policy, &ctx());
+        assert_eq!(kept_nothing.to_bytes(), plain.to_bytes());
     }
 
     // ----- End-to-end option tags -----
