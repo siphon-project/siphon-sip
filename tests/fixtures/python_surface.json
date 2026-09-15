@@ -95,7 +95,7 @@
       "originate": {
         "doc": "Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.",
         "kind": "method_descriptor",
-        "sig": "($self, to, from_uri=None, from_display=None, to_display=None, next_hop=None, p_asserted_identity=None, privacy=None, headers=None, sdp=None, media=False, profile=None, ws_uri=None, timeout=30, body=None, content_type=None)"
+        "sig": "($self, to, from_uri=None, from_display=None, to_display=None, next_hop=None, p_asserted_identity=None, privacy=None, headers=None, sdp=None, media=False, profile=None, ws_uri=None, timeout=30, body=None, content_type=None, session_timer=None)"
       },
       "refer": {
         "kind": "method_descriptor",

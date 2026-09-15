@@ -700,7 +700,7 @@ pub fn answer_one_legged_reoffer(
         // siphon agreed at answer, and there is nothing to re-negotiate. A
         // refresh is still a refresh, so accept it without a body.
         debug!(call_id = %call_id, what, "B2BUA: one-legged re-offer with no media backend — 200 without a body");
-        send_one_legged_ok(inbound, message, Vec::new(), state);
+        send_one_legged_ok(inbound, message, call_id, Vec::new(), state);
         return;
     };
 
@@ -767,7 +767,7 @@ pub fn answer_one_legged_reoffer(
             // The answer is the session description now in force on the leg.
             record_sdp_sent_to_leg(state, call_id, true, "application/sdp", sdp.as_bytes());
             debug!(call_id = %call_id, what, "B2BUA: answered a one-legged re-offer from the media engine");
-            send_one_legged_ok(inbound, message, sdp.into_bytes(), state);
+            send_one_legged_ok(inbound, message, call_id, sdp.into_bytes(), state);
         }
         Err(error) => {
             error!(
@@ -782,13 +782,26 @@ pub fn answer_one_legged_reoffer(
 }
 
 /// Send the `200 OK` for a one-legged re-offer, with `body` as its SDP.
+///
+/// The re-offer is a session refresh request too (RFC 4028 §7.4). With no other
+/// party to relay it to, siphon answers it itself (§9): the 2xx answers the
+/// request's session timer and restarts the session on the dialog.
 fn send_one_legged_ok(
     inbound: &InboundMessage,
     message: &SipMessage,
+    call_id: &str,
     body: Vec<u8>,
     state: &DispatcherState,
 ) {
     let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    note_session_refresh_request(call_id, true, &message.headers, state);
+    negotiate_relayed_session_timer(
+        call_id,
+        true,
+        Some(&message.headers),
+        &mut response.headers,
+        state,
+    );
     if !body.is_empty() {
         response
             .headers

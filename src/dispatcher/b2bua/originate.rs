@@ -74,6 +74,9 @@ pub struct OriginateParams {
     pub timeout_secs: u32,
     /// The media plan.
     pub media: OriginateMedia,
+    /// The RFC 4028 session timer the script set on the originate, over the
+    /// `session_timer:` block. `None` runs the configured one, if any.
+    pub session_timer: Option<crate::script::api::call::SessionTimerOverride>,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -152,8 +155,16 @@ pub fn b2bua_originate_prepare(
             "b2bua is not running — nothing to originate from".to_string(),
         ));
     };
-    let state = &control.state;
+    prepare_originate(&control.state, params)
+}
 
+/// [`b2bua_originate_prepare`] on the dispatcher the caller already holds, which
+/// is what lets a test stage an originate: the control handle is set once per
+/// process, and tests elsewhere rely on it being absent.
+pub fn prepare_originate(
+    state: &DispatcherState,
+    params: OriginateParams,
+) -> Result<PreparedOriginate, OriginateError> {
     let target_uri =
         parse_uri_standalone(&params.to).map_err(|error| OriginateError::InvalidUri {
             field: "to",
@@ -211,6 +222,7 @@ pub fn b2bua_originate_prepare(
                 .as_deref()
                 .or(state.server_header.as_deref()),
         },
+        session_timer_policy_for(state, params.session_timer.as_ref()),
     )?;
 
     let mut leg = crate::b2bua::actor::Leg::new_originating_leg(
@@ -261,6 +273,9 @@ pub fn b2bua_originate_prepare(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
     if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
         call.event_tx = Some(event_tx);
+        // What a refresh, a bridge re-INVITE and the 2xx read the call's session
+        // timer policy from.
+        call.session_timer_override = params.session_timer.clone();
     }
     state
         .call_event_receivers
@@ -302,10 +317,16 @@ pub struct OriginateIdentity<'a> {
 /// Build the INVITE an originate puts on the wire. Pure — no state, no I/O — so
 /// the identity rules that matter (From/To shape, PAI, CLIR ordering, the
 /// reserved-header guard, offer vs offerless body) are unit-testable.
+///
+/// `session_timer` is the RFC 4028 session timer siphon runs on the call, the
+/// script's or the configured one. The INVITE asks for it the way every INVITE
+/// siphon sends does (§7.1): `Session-Expires` with the refresher siphon prefers,
+/// `Min-SE`, and `timer` in `Supported`.
 pub fn build_originate_invite(
     params: &OriginateParams,
     target_uri: SipUri,
     identity: OriginateIdentity<'_>,
+    session_timer: Option<crate::b2bua::session_timer::SessionTimerPolicy>,
 ) -> Result<SipMessage, OriginateError> {
     let from_uri = params
         .from
@@ -352,6 +373,14 @@ pub fn build_originate_invite(
     let mut invite = builder
         .build()
         .map_err(|error| OriginateError::BuildFailed(format!("cannot build INVITE: {error}")))?;
+    if let Some(policy) = session_timer {
+        invite
+            .headers
+            .set("Session-Expires", policy.uac_request_value());
+        invite.headers.set("Min-SE", policy.min_se.to_string());
+        advertise_supported_options(&mut invite.headers);
+        advertise_option_tag(&mut invite.headers, "timer");
+    }
 
     // Custom headers last, so a caller can shape anything the framework set
     // above short of the dialog-defining ones it must not touch.
@@ -742,6 +771,7 @@ pub fn handle_originated_call_response(
             call.a_leg.dialog.local_cseq = 2;
             leg = call.a_leg.clone();
         }
+        originate_answered_session(internal_call_id, message, anchor_answer.as_deref(), state);
         state
             .call_actors
             .set_state(internal_call_id, CallState::Answered);
@@ -807,6 +837,49 @@ pub fn handle_originated_call_response(
     originate_delete_media(&sip_call_id, state);
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
+}
+
+/// What the callee's 2xx settles on the dialog of a call siphon placed besides
+/// the dialog itself: its RFC 4028 session timer (§7.2), and the session in force
+/// on it. That is the SDP siphon sent the callee, under the `o=` it went out
+/// with: the answer the ACK carries (`anchor_answer`), or else the INVITE's offer.
+fn originate_answered_session(
+    internal_call_id: &str,
+    answer: &SipMessage,
+    anchor_answer: Option<&str>,
+    state: &DispatcherState,
+) {
+    let stored = state
+        .call_actors
+        .get_call(internal_call_id)
+        .and_then(|call| call.a_leg_invite.clone());
+    let invite = stored
+        .as_ref()
+        .and_then(|invite| invite.lock().ok().map(|invite| invite.clone()));
+    negotiate_uac_answer_session_timer(
+        internal_call_id,
+        true,
+        invite.as_ref().map(|invite| &invite.headers),
+        &answer.headers,
+        state,
+    );
+    match (anchor_answer, &invite) {
+        (Some(sdp), _) => adopt_sdp_sent_to_leg(
+            state,
+            internal_call_id,
+            true,
+            "application/sdp",
+            sdp.as_bytes(),
+        ),
+        (None, Some(invite)) => adopt_sdp_sent_to_leg(
+            state,
+            internal_call_id,
+            true,
+            message_content_type(invite),
+            &invite.body,
+        ),
+        (None, None) => {}
+    }
 }
 
 /// The response body as text, for a control event payload. `None` for an empty

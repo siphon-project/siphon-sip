@@ -50,6 +50,12 @@ placing a call the callee can only answer by offering into silence. The full
 argument set and its failure modes are below; the out-of-process twin is the
 control plane's [`originate` verb](control-plane.md#placing-a-call-originate).
 
+A placed call runs the RFC 4028 session timer of the `session_timer:` block, or
+the one `session_timer={"expires": 1800, "min_se": 90, "refresher": "b2bua"}`
+sets on it (keys left out default as in `call.session_timer()`). The INVITE asks
+for it, the callee's 2xx says who refreshes, and siphon refreshes the dialog or
+releases the call just before a session the callee let run out expires.
+
 ::: siphon_sdk.mock_module.MockB2bua.originate
 
 ## Joining two calls: `b2bua.bridge`

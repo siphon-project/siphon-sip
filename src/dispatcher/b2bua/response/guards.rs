@@ -446,8 +446,7 @@ pub fn dispatch_bridge_reinvite_response(
             branch,
             message,
             status_code,
-            &snapshot.a_leg,
-            snapshot.b_leg_index,
+            snapshot,
             state,
         );
         return true;

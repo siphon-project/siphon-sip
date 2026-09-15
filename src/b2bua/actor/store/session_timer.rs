@@ -75,6 +75,28 @@ impl CallActorStore {
         }
     }
 
+    /// Record `sdp` as the session description siphon has in force on one leg's
+    /// dialog, the A-leg or the winning B-leg, with `origin`, its `o=` session id
+    /// and version, as the dialog's own (RFC 3264 §8): the next SDP siphon sends
+    /// there takes the version after it. A no-op if the call or leg is absent.
+    pub fn adopt_leg_sent_sdp(
+        &self,
+        call_id: &str,
+        on_a_leg: bool,
+        sdp: Vec<u8>,
+        origin: Option<(u64, u64)>,
+    ) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            if let Some(leg) = dialog_leg(&mut call, on_a_leg) {
+                if let Some((session_id, version)) = origin {
+                    leg.dialog.sdp_session_id = session_id;
+                    leg.dialog.sdp_version = version.saturating_add(1);
+                }
+                leg.dialog.last_sent_sdp = Some(sdp);
+            }
+        }
+    }
+
     /// Record the SDP siphon relayed to the caller in the early media of the
     /// B-leg at `index`, as it went on the wire.
     pub fn set_b_leg_early_answer(&self, call_id: &str, index: usize, sdp: Vec<u8>) {

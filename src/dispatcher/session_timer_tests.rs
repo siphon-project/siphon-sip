@@ -20,7 +20,7 @@ use super::test_dispatcher::TestDispatcher;
 use super::*;
 
 /// A dispatcher with `config` as its `session_timer:` block, or none.
-fn timer_dispatcher(config: Option<&str>) -> TestDispatcher {
+pub(super) fn timer_dispatcher(config: Option<&str>) -> TestDispatcher {
     let mut dispatcher = strip_dispatcher(&[]);
     dispatcher.state.session_timer_config =
         config.map(|yaml| serde_yaml_ng::from_str(yaml).expect("a session timer config"));
@@ -29,7 +29,7 @@ fn timer_dispatcher(config: Option<&str>) -> TestDispatcher {
 
 /// Everything siphon has put on the wire since the last look, in order, the
 /// followers of an ordered group (an ACK and the BYE after it) included.
-fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
+pub(super) fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
     dispatcher
         .udp
         .try_iter()
@@ -112,7 +112,7 @@ fn callee_answers_unacked(
 
 /// The caller ACKs `relayed_200`, the 2xx siphon sent it, through the ACK path
 /// the request dispatcher takes for it.
-fn caller_acks(dispatcher: &TestDispatcher, relayed_200: &SipMessage) {
+pub(super) fn caller_acks(dispatcher: &TestDispatcher, relayed_200: &SipMessage) {
     let raw = format!(
         concat!(
             "ACK sip:192.0.2.1:5060 SIP/2.0\r\n",
@@ -141,7 +141,7 @@ fn caller_acks(dispatcher: &TestDispatcher, relayed_200: &SipMessage) {
 }
 
 /// Move the session on one leg's dialog `seconds` past its last refresh.
-fn age(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool, seconds: u64) {
+pub(super) fn age(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool, seconds: u64) {
     let then = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(seconds))
         .expect("the clock reaches back that far");
@@ -156,14 +156,14 @@ fn age(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool, seconds: u64)
 }
 
 /// Run the session timer sweep once, and return what it put on the wire.
-fn sweep(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
+pub(super) fn sweep(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
     let _ = wire(dispatcher);
     session_timer_sweep(&dispatcher.state);
     wire(dispatcher)
 }
 
 /// The requests of `method` sent to `destination`.
-fn requests(
+pub(super) fn requests(
     sent: &[(SocketAddr, SipMessage)],
     destination: &str,
     method: Method,
@@ -175,7 +175,7 @@ fn requests(
 }
 
 /// The topmost Via branch of a request.
-fn branch_of(request: &SipMessage) -> String {
+pub(super) fn branch_of(request: &SipMessage) -> String {
     request
         .headers
         .get("Via")
@@ -185,7 +185,7 @@ fn branch_of(request: &SipMessage) -> String {
 }
 
 /// Whether a `Require` or `Supported` header lists `tag` as a token.
-fn lists_option_tag(message: &SipMessage, header: &str, tag: &str) -> bool {
+pub(super) fn lists_option_tag(message: &SipMessage, header: &str, tag: &str) -> bool {
     message.headers.get_all(header).is_some_and(|values| {
         values
             .iter()

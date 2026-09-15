@@ -107,6 +107,8 @@ mod sdp_strip_tests;
 #[cfg(test)]
 mod session_refresh_tests;
 #[cfg(test)]
+mod session_timer_legs_tests;
+#[cfg(test)]
 mod session_timer_tests;
 #[cfg(test)]
 mod teardown_race_tests;
@@ -137,7 +139,9 @@ pub use b2bua::{
 // they are deliberately not part of `siphon::dispatcher`'s API. Counted by
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
-pub(crate) use b2bua::{b2bua_dial_call, dial_targets_for_aor, DialError, DialTarget};
+pub(crate) use b2bua::{
+    b2bua_dial_call, b2bua_set_session_timer, dial_targets_for_aor, DialError, DialTarget,
+};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};

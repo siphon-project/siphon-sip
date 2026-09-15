@@ -23,41 +23,6 @@ pub fn forward_reinvite_response(
     if let Some(direction) = reinvite_direction {
         let is_a2b = direction == "a2b";
 
-        // Determine where to route the response: back to the leg that sent the re-INVITE.
-        // A→B re-INVITE: response goes to A-leg, rewrite B-leg→A-leg headers
-        // B→A re-INVITE: response goes to B-leg, rewrite A-leg→B-leg headers
-        // The 4th element is the responder leg's anchored egress socket, so the
-        // forwarded response leaves from the same socket that leg is bridged on
-        // (A-leg: its arrival listener; B-leg: its flow socket, when dialled
-        // with `call.dial(flow=…)`).
-        let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
-            (
-                snapshot.a_leg.transport.remote_addr,
-                snapshot.a_leg.transport.transport,
-                snapshot.a_leg.transport.connection_id,
-                snapshot.a_leg_local_addr,
-            )
-        } else {
-            // B→A: send response to winning B-leg
-            match state.call_actors.get_call(call_id) {
-                Some(call) => {
-                    let winner = call.winner.and_then(|i| call.b_legs.get(i));
-                    if let Some(b) = winner {
-                        (
-                            b.transport.remote_addr,
-                            b.transport.transport,
-                            ConnectionId::default(),
-                            b.transport.local_addr,
-                        )
-                    } else {
-                        warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
-                        return true;
-                    }
-                }
-                None => return true,
-            }
-        };
-
         // A siphon-originated re-INVITE (session-timer refresh / transfer media
         // re-anchor) has no originator leg — its tracking entry carries empty
         // stored Vias. Its response is absorbed (only used to ACK the responder),
@@ -65,6 +30,44 @@ pub fn forward_reinvite_response(
         // the ACK is built from the responder's own 200. Only a bridged re-INVITE
         // (a real originator leg) rewrites the response identity.
         let is_bridged_reinvite = !snapshot.b_leg_stored_vias.is_empty();
+
+        // Determine where to route the response: back to the leg that sent the re-INVITE.
+        // A→B re-INVITE: response goes to A-leg, rewrite B-leg→A-leg headers
+        // B→A re-INVITE: response goes to B-leg, rewrite A-leg→B-leg headers
+        // The 4th element is the responder leg's anchored egress socket, so the
+        // forwarded response leaves from the same socket that leg is bridged on
+        // (A-leg: its arrival listener; B-leg: its flow socket, when dialled
+        // with `call.dial(flow=…)`). A siphon-originated re-INVITE is forwarded
+        // nowhere, and may be on a call with no B-leg at all (one siphon answered
+        // or placed itself), so it never looks for a winning B-leg.
+        let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) =
+            if is_a2b || !is_bridged_reinvite {
+                (
+                    snapshot.a_leg.transport.remote_addr,
+                    snapshot.a_leg.transport.transport,
+                    snapshot.a_leg.transport.connection_id,
+                    snapshot.a_leg_local_addr,
+                )
+            } else {
+                // B→A: send response to winning B-leg
+                match state.call_actors.get_call(call_id) {
+                    Some(call) => {
+                        let winner = call.winner.and_then(|i| call.b_legs.get(i));
+                        if let Some(b) = winner {
+                            (
+                                b.transport.remote_addr,
+                                b.transport.transport,
+                                ConnectionId::default(),
+                                b.transport.local_addr,
+                            )
+                        } else {
+                            warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
+                            return true;
+                        }
+                    }
+                    None => return true,
+                }
+            };
 
         // The response's headers as they arrived, before the rewrites below: they
         // decide the responder dialog's session timer.

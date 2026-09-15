@@ -28,6 +28,11 @@ pub fn b2bua_send_media_reinvite(
 /// Send a siphon-originated re-INVITE on one leg of a call carrying SDP someone
 /// else described, tracked under `tracking_target` so the response arm knows
 /// what it was for. Returns whether the re-INVITE reached the transport.
+///
+/// The re-INVITE is a session refresh of that dialog too (RFC 4028 §7.4): it
+/// carries the dialog's session timer, or asks for the one siphon runs on the
+/// call where the dialog runs none ([`session_timer_headers_for_leg`]), so its 2xx
+/// sets the dialog's timer, refresher included.
 pub fn b2bua_send_reinvite_on_leg(
     call_id: &str,
     surviving_on_a_leg: bool,
@@ -90,15 +95,22 @@ pub fn send_in_dialog_reinvite(
     tracking_target: &str,
     state: &DispatcherState,
 ) -> bool {
+    // A re-INVITE is a session refresh of its dialog (RFC 4028 §7.4).
+    let (timer_headers, requested_session_expires) =
+        session_timer_headers_for_leg(call_id, on_a_leg, state);
+    let mut headers = extra_headers.to_vec();
+    for (name, value) in timer_headers {
+        headers.push((name, value));
+    }
     send_in_dialog_request(
         call_id,
         on_a_leg,
         InDialogRequest {
             method: Method::Invite,
             body: offer,
-            extra_headers,
+            extra_headers: &headers,
             tracking_target,
-            requested_session_expires: None,
+            requested_session_expires,
         },
         |_| {},
         state,

@@ -1573,8 +1573,7 @@ impl PyCall {
     ///     await rtpengine.echo(call)
     /// ```
     ///
-    /// Synchronous — no `await` needed (the send is a queue push). The A-leg
-    /// dialog is confirmed and `@b2bua.on_bye` takes over when the UAC BYEs.
+    /// Synchronous (a queue push); `@b2bua.on_bye` takes over when the UAC BYEs.
     ///
     /// Args:
     ///     code: Final response status (must be 2xx).
@@ -1601,6 +1600,9 @@ impl PyCall {
         };
 
         let invite = self.locked_invite()?;
+        if let Some(timer) = &self.session_timer_override {
+            crate::dispatcher::b2bua_set_session_timer(&self.id, timer.clone());
+        }
         let sent = crate::dispatcher::b2bua_answer_call(
             &self.id,
             &invite,
@@ -1612,8 +1614,7 @@ impl PyCall {
         if !sent {
             tracing::error!(call_id = %self.id, "call.answer(): no live B2BUA call to answer");
         }
-        // Marker so the dispatcher keeps the actor alive after the handler
-        // returns (the 2xx has already been sent by b2bua_answer_call).
+        // Keeps the actor alive after the handler returns: the 2xx is already sent.
         self.action = CallAction::Answered;
         Ok(())
     }

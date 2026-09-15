@@ -567,8 +567,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   in a re-INVITE on that party's dialog, through the media engine where the call is anchored, and
   puts that party's answer in the ACK, so media continues as the two agree. A party that refuses the
   relayed offer or never answers it ends the call through its teardown, the held ACK going out with
-  every stream rejected ahead of the BYE. In-dialog re-INVITEs and UPDATEs siphon originates are now retransmitted over UDP, each
-  copy captured to HEP like the first. The admin
+  every stream rejected ahead of the BYE. A call siphon answers itself (`call.answer()`, a
+  handover's answer, the control plane's) negotiates the caller's timer from its INVITE the same
+  way, a `call.session_timer()` set before `call.answer()` included. A call siphon places asks for
+  the configured timer, or the one `b2bua.originate(session_timer={...})` sets, and takes the
+  refresher from the callee's 2xx. Every re-INVITE siphon sends on a dialog of its own accord (a
+  bridge step, a transfer's media re-INVITE) carries that dialog's timer or asks for siphon's, and
+  its 2xx sets the timer, so bridged legs are refreshed and released like any other. An SDP siphon
+  sent as it was given (a script's or media engine's answer, an originate's offer) keeps its own
+  `o=` session id, so a refresh offers it unchanged. In-dialog re-INVITEs and UPDATEs siphon
+  originates are now retransmitted over UDP, each copy captured to HEP like the first. The admin
   API's call `session_timer` changes shape: `{caller, callee}`, one object per dialog or `null`,
   with `refresher` now `siphon` or `peer`.
 

@@ -120,6 +120,7 @@ pub(super) fn originate_with_bus(
         headers,
         timeout_secs,
         media,
+        session_timer: None,
     };
 
     let prepared = match crate::dispatcher::b2bua_originate_prepare(params) {

@@ -378,10 +378,17 @@ pub fn send_uas_response(
     // ring on until it gave up. Cancelled by the caller's ACK in the A-leg ACK
     // handler (search `uas_2xx_retransmits`).
     // An answer siphon gives the caller itself is the session description in
-    // force on the caller's dialog. A provisional's early media is not, until a
-    // 2xx confirms it.
+    // force on the caller's dialog, under the `o=` it went out with. A
+    // provisional's early media is not, until a 2xx confirms it. The 2xx answers
+    // the caller's request for a session timer as well (RFC 4028 §9).
     if final_response && (200..300).contains(&code) {
-        record_sdp_sent_to_leg(
+        negotiate_uas_answer_session_timer(
+            internal_call_id,
+            Some(&invite.headers),
+            &mut response.headers,
+            state,
+        );
+        adopt_sdp_sent_to_leg(
             state,
             internal_call_id,
             true,

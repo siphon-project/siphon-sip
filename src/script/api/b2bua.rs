@@ -98,10 +98,16 @@ impl PyB2buaControl {
     /// )
     /// ```
     ///
+    /// `session_timer={"expires": 1800, "min_se": 90, "refresher": "b2bua"}` runs
+    /// an RFC 4028 session timer on the call over the `session_timer:` block,
+    /// each key left out defaulting as in `call.session_timer()`. The INVITE asks
+    /// for it and the callee's 2xx says who refreshes.
+    ///
     /// Raises `ValueError` when the target/identity URIs do not parse, no route
     /// exists, the media plan is not one the configured backend can serve, the
-    /// body carries no offer, or the B2BUA is not running — never a silent
-    /// `None` for a call that was never placed.
+    /// body carries no offer, `session_timer` names an unknown key or refresher,
+    /// or the B2BUA is not running — never a silent `None` for a call that was
+    /// never placed.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         to,
@@ -119,6 +125,7 @@ impl PyB2buaControl {
         timeout=30,
         body=None,
         content_type=None,
+        session_timer=None,
     ))]
     fn originate(
         &self,
@@ -137,8 +144,11 @@ impl PyB2buaControl {
         timeout: u32,
         body: Option<&Bound<'_, pyo3::types::PyAny>>,
         content_type: Option<&str>,
+        session_timer: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<String> {
         use pyo3::exceptions::PyValueError;
+
+        let session_timer = session_timer.map(session_timer_from_dict).transpose()?;
 
         // `sdp=` and `body=` are one slot with two spellings — `sdp=` is the
         // body carried as application/sdp, `body=` is the body with its type
@@ -221,6 +231,7 @@ impl PyB2buaControl {
             headers: extra_headers,
             timeout_secs: timeout,
             media: media_plan,
+            session_timer,
         };
         crate::dispatcher::b2bua_originate(params)
             .map(|placed| placed.sip_call_id)
@@ -404,5 +415,100 @@ impl PyB2buaControl {
         )
         .map(|()| true)
         .map_err(|error| PyValueError::new_err(format!("{}: {error}", error.code())))
+    }
+}
+
+/// The session timer `b2bua.originate(session_timer=...)` sets on the call: a dict
+/// with `expires`, `min_se` and `refresher`, each key left out defaulting as in
+/// `call.session_timer()`. `ValueError` for any other key, or a refresher that is
+/// not `uac`, `uas` or `b2bua`.
+fn session_timer_from_dict(
+    dict: &Bound<'_, pyo3::types::PyDict>,
+) -> PyResult<crate::script::api::call::SessionTimerOverride> {
+    use pyo3::exceptions::PyValueError;
+
+    let mut timer = crate::script::api::call::SessionTimerOverride {
+        session_expires: 1800,
+        min_se: 90,
+        refresher: crate::config::SessionRefresher::B2bua,
+    };
+    for (key, value) in dict.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "expires" => timer.session_expires = value.extract()?,
+            "min_se" => timer.min_se = value.extract()?,
+            "refresher" => {
+                let name: String = value.extract()?;
+                timer.refresher =
+                    crate::config::SessionRefresher::from_name(&name.to_ascii_lowercase())
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!(
+                                "refresher must be \"uac\", \"uas\" or \"b2bua\", not {name:?}"
+                            ))
+                        })?;
+            }
+            other => {
+                let message = format!(
+                    "b2bua.originate session_timer= takes expires, min_se and \
+                     refresher, not {other:?}"
+                );
+                return Err(PyValueError::new_err(message));
+            }
+        }
+    }
+    Ok(timer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SessionRefresher;
+    use crate::script::api::call::SessionTimerOverride;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn a_session_timer_dict_defaults_each_key_it_leaves_out() {
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            let dict = PyDict::new(python);
+            dict.set_item("expires", 90).expect("a dict item");
+            assert_eq!(
+                session_timer_from_dict(&dict).expect("a session timer"),
+                SessionTimerOverride {
+                    session_expires: 90,
+                    min_se: 90,
+                    refresher: SessionRefresher::B2bua,
+                }
+            );
+
+            let dict = PyDict::new(python);
+            dict.set_item("min_se", 120).expect("a dict item");
+            dict.set_item("refresher", "UAS").expect("a dict item");
+            assert_eq!(
+                session_timer_from_dict(&dict).expect("a session timer"),
+                SessionTimerOverride {
+                    session_expires: 1800,
+                    min_se: 120,
+                    refresher: SessionRefresher::Uas,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn a_session_timer_dict_refuses_a_key_or_refresher_it_does_not_know() {
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            let dict = PyDict::new(python);
+            dict.set_item("interval", 90).expect("a dict item");
+            let error = session_timer_from_dict(&dict).expect_err("an unknown key");
+            assert!(error.to_string().contains("session_timer"), "{error}");
+
+            let dict = PyDict::new(python);
+            dict.set_item("refresher", "sometimes")
+                .expect("a dict item");
+            let error = session_timer_from_dict(&dict).expect_err("an unknown refresher");
+            assert!(error.to_string().contains("refresher"), "{error}");
+        });
     }
 }

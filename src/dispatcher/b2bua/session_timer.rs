@@ -51,6 +51,22 @@ pub fn session_timer_policy_for(
     }
 }
 
+/// Set `call.session_timer()` on a live call while its handler still runs, for an
+/// answer the handler sends itself (`call.answer()`), which negotiates the
+/// caller's session timer as it goes out. A no-op when the dispatcher is not
+/// running or the call is gone.
+pub(crate) fn b2bua_set_session_timer(
+    internal_call_id: &str,
+    timer: crate::script::api::call::SessionTimerOverride,
+) {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return;
+    };
+    if let Some(mut call) = control.state.call_actors.get_call_mut(internal_call_id) {
+        call.session_timer_override = Some(timer);
+    }
+}
+
 /// Negotiate the session timers of both dialogs of a call the callee just
 /// answered, and put the caller's on the 2xx siphon sends the caller.
 ///
@@ -72,64 +88,136 @@ pub fn negotiate_answered_session_timers(
         .a_leg_invite
         .as_ref()
         .and_then(|invite| invite.lock().ok().map(|invite| invite.headers.clone()));
-    state.call_actors.set_leg_peer_allows_update(
+    negotiate_uas_answer_session_timer(
         call_id,
-        false,
-        allows_update(&callee_answer.headers),
+        caller_request.as_ref(),
+        &mut caller_answer.headers,
+        state,
     );
-    if let Some(request) = &caller_request {
-        state
-            .call_actors
-            .set_leg_peer_allows_update(call_id, true, allows_update(request));
-    }
 
-    let Some(policy) = session_timer_policy(state, call_id) else {
-        return;
-    };
-    let now = Instant::now();
-
-    // The INVITE siphon sent the callee asked for the policy's interval; with no
-    // Session-Expires in the 2xx siphon still refreshes at that interval (§7.2).
     let callee_request = snapshot
         .b_leg_stored_invite
         .as_ref()
         .and_then(|invite| invite.lock().ok().map(|invite| invite.headers.clone()));
-    let requested = callee_request
-        .as_ref()
-        .and_then(requested_interval_of)
-        .unwrap_or_else(|| policy.requested_interval());
-    let callee_min_se = policy
-        .min_se
-        .max(callee_request.as_ref().and_then(min_se_of).unwrap_or(0));
-    let callee_timer =
-        uac_session_timer(&callee_answer.headers, Some(requested), callee_min_se, now);
+    negotiate_uac_answer_session_timer(
+        call_id,
+        false,
+        callee_request.as_ref(),
+        &callee_answer.headers,
+        state,
+    );
+}
 
-    let caller_timer = match caller_request
-        .as_ref()
-        .and_then(|request| answer_as_uas(request, &policy, None))
-    {
-        Some(answer) => {
-            answer.apply(&mut caller_answer.headers);
-            Some(answer.timer(policy.min_se.max(answer.request_min_se), now))
+/// Negotiate the session timer of a dialog siphon is the UAS of, from `request`,
+/// the headers of the INVITE siphon answers, and put it on `answer`, the 2xx
+/// siphon sends there (RFC 4028 §9 Table 2): the caller of a relayed call, and of
+/// a call siphon answers itself (`call.answer()`, a handover's answer, the
+/// control plane's). Whether the caller allows UPDATE is kept either way; nothing
+/// else changes on a call that runs no session timer.
+pub fn negotiate_uas_answer_session_timer(
+    call_id: &str,
+    request: Option<&SipHeaders>,
+    answer: &mut SipHeaders,
+    state: &DispatcherState,
+) {
+    if let Some(request) = request {
+        state
+            .call_actors
+            .set_leg_peer_allows_update(call_id, true, allows_update(request));
+    }
+    let Some(policy) = session_timer_policy(state, call_id) else {
+        return;
+    };
+    let timer = match request.and_then(|request| answer_as_uas(request, &policy, None)) {
+        Some(negotiated) => {
+            negotiated.apply(answer);
+            Some(negotiated.timer(policy.min_se.max(negotiated.request_min_se), Instant::now()))
         }
         None => {
-            withdraw_from_answer(&mut caller_answer.headers);
+            withdraw_from_answer(answer);
             None
         }
     };
-
     debug!(
         call_id = %call_id,
-        caller = ?caller_timer.as_ref().map(|timer| (timer.session_expires, timer.siphon_refreshes)),
-        callee = ?callee_timer.as_ref().map(|timer| (timer.session_expires, timer.siphon_refreshes)),
-        "B2BUA: session timers negotiated (interval, siphon refreshes)"
+        caller = ?timer.as_ref().map(|timer| (timer.session_expires, timer.siphon_refreshes)),
+        "B2BUA: the caller's session timer negotiated (interval, siphon refreshes)"
     );
     state
         .call_actors
-        .set_leg_session_timer(call_id, false, callee_timer);
+        .set_leg_session_timer(call_id, true, timer);
+}
+
+/// Negotiate the session timer of a dialog siphon is the UAC of, from `answer`,
+/// the 2xx to the INVITE siphon sent there (RFC 4028 §7.2): the callee of a
+/// relayed call (`on_a_leg` false), and the callee of a call siphon placed, whose
+/// dialog is the A-leg. `request` is that INVITE's headers. Whether the callee
+/// allows UPDATE is kept either way; nothing else changes on a call that runs no
+/// session timer.
+///
+/// The INVITE asked for the policy's interval, so with no `Session-Expires` in the
+/// 2xx siphon still refreshes at that interval (§7.2).
+pub fn negotiate_uac_answer_session_timer(
+    call_id: &str,
+    on_a_leg: bool,
+    request: Option<&SipHeaders>,
+    answer: &SipHeaders,
+    state: &DispatcherState,
+) {
     state
         .call_actors
-        .set_leg_session_timer(call_id, true, caller_timer);
+        .set_leg_peer_allows_update(call_id, on_a_leg, allows_update(answer));
+    let Some(policy) = session_timer_policy(state, call_id) else {
+        return;
+    };
+    let requested = request
+        .and_then(requested_interval_of)
+        .unwrap_or_else(|| policy.requested_interval());
+    let min_se = policy.min_se.max(request.and_then(min_se_of).unwrap_or(0));
+    let timer = uac_session_timer(answer, Some(requested), min_se, Instant::now());
+    debug!(
+        call_id = %call_id,
+        on_a_leg,
+        callee = ?timer.as_ref().map(|timer| (timer.session_expires, timer.siphon_refreshes)),
+        "B2BUA: the callee's session timer negotiated (interval, siphon refreshes)"
+    );
+    state
+        .call_actors
+        .set_leg_session_timer(call_id, on_a_leg, timer);
+}
+
+/// The session timer headers of a re-INVITE siphon sends on one leg's dialog of
+/// its own accord (a bridge step, a transfer's media re-INVITE), and the interval
+/// they ask for.
+///
+/// Such a re-INVITE is a session refresh (RFC 4028 §7.4). On a dialog that runs a
+/// timer it keeps the interval and the refresher; on one that runs none it asks
+/// for the timer siphon runs on the call, the script's or the configured one
+/// (§7.1). The option tags are the ones a refresh on that dialog carries. Nothing
+/// on a call that runs no session timer.
+pub fn session_timer_headers_for_leg(
+    call_id: &str,
+    on_a_leg: bool,
+    state: &DispatcherState,
+) -> (Vec<(&'static str, String)>, Option<u32>) {
+    let Some(leg) = state.call_actors.clone_leg(call_id, on_a_leg) else {
+        return (Vec::new(), None);
+    };
+    if let Some(timer) = &leg.dialog.session_timer {
+        return (
+            refresh_request_headers(&leg, on_a_leg, timer),
+            Some(timer.refresh_interval()),
+        );
+    }
+    match session_timer_policy(state, call_id) {
+        Some(policy) => {
+            let mut headers = dialog_option_tags(&leg, on_a_leg);
+            headers.push(("Session-Expires", policy.uac_request_value()));
+            headers.push(("Min-SE", policy.min_se.to_string()));
+            (headers, Some(policy.requested_interval()))
+        }
+        None => (Vec::new(), None),
+    }
 }
 
 /// Refresh the session on one leg's dialog (RFC 4028 §7.4, §10): the A-leg, or
@@ -143,10 +231,10 @@ pub fn negotiate_answered_session_timers(
 /// A re-INVITE offers the session description in force on the dialog
 /// ([`session_refresh_offer`]). With none, the refresh is an UPDATE without a
 /// body where the peer allows UPDATE, which §7.4 recommends and which needs no
-/// offer, and otherwise a re-INVITE without one, whose 2xx brings an offer siphon
-/// answers in the ACK ([`answer_offer_in_ack`]). The refresh is recorded as in
-/// flight before it goes out, so its response is always recognised; only a 2xx to
-/// it restarts the session.
+/// offer, and otherwise a re-INVITE without one, whose 2xx brings an offer the
+/// other party answers in the ACK ([`intercept_refresh_offer`]). The refresh is
+/// recorded as in flight before it goes out, so its response is always
+/// recognised; only a 2xx to it restarts the session.
 pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &DispatcherState) {
     let Some(leg) = state.call_actors.clone_leg(call_id, on_a_leg) else {
         debug!(call_id = %call_id, on_a_leg, "B2BUA refresh: the leg is gone");
@@ -157,12 +245,7 @@ pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &Dispatc
         return;
     };
     let session_expires = timer.refresh_interval();
-    let mut headers = if on_a_leg {
-        own_option_tags()
-    } else {
-        initial_option_tags(&leg)
-    };
-    headers.extend(session_timer_request_headers(&timer));
+    let headers = refresh_request_headers(&leg, on_a_leg, &timer);
 
     let offer = session_refresh_offer(&leg, call_id, on_a_leg, state);
     let (method, tracking_target) = match (&offer, leg.dialog.peer_allows_update) {
@@ -240,6 +323,29 @@ fn own_option_tags() -> Vec<(&'static str, String)> {
     own.get("Supported")
         .map(|value| vec![("Supported", value.clone())])
         .unwrap_or_default()
+}
+
+/// The option tags of a session refresh on `leg`'s dialog: siphon's own on the
+/// A-leg, and on a B-leg those of the INVITE siphon sent it (RFC 4028 §7.4).
+fn dialog_option_tags(leg: &Leg, on_a_leg: bool) -> Vec<(&'static str, String)> {
+    if on_a_leg {
+        own_option_tags()
+    } else {
+        initial_option_tags(leg)
+    }
+}
+
+/// The headers of a session refresh request on `leg`'s dialog, which runs
+/// `timer`: the dialog's option tags ([`dialog_option_tags`]) and its
+/// `Session-Expires` and `Min-SE` ([`session_timer_request_headers`]).
+fn refresh_request_headers(
+    leg: &Leg,
+    on_a_leg: bool,
+    timer: &crate::b2bua::actor::SessionTimerState,
+) -> Vec<(&'static str, String)> {
+    let mut headers = dialog_option_tags(leg, on_a_leg);
+    headers.extend(session_timer_request_headers(timer));
+    headers
 }
 
 /// The offer a session refresh carries: the session description siphon has in
