@@ -106,12 +106,14 @@ impl TestEngine {
 
     /// Every command of kind `name` the engine has been sent so far, in order.
     pub(crate) fn commands(&self, name: &str) -> Vec<EngineCommand> {
-        self.commands
-            .lock()
-            .expect("the command log")
-            .iter()
+        self.all_commands()
+            .into_iter()
             .filter(|command| command.name == name)
-            .cloned()
             .collect()
+    }
+
+    /// Every command the engine has been sent so far, of any kind, in order.
+    pub(crate) fn all_commands(&self) -> Vec<EngineCommand> {
+        self.commands.lock().expect("the command log").clone()
     }
 }

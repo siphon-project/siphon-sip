@@ -15,7 +15,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
-use crate::rtpengine::answer::{exchange_answer, AnswerExchange};
 use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::{
     validate_ws_sample_rate, NgFlags, ProfileRegistry, WsTeeDirection, WsVadEngine,
@@ -28,6 +27,10 @@ use crate::sip::message::SipMessage;
 use super::call::PyCall;
 use super::reply::PyReply;
 use super::request::PyRequest;
+
+mod answer;
+
+use answer::AnswerExchange;
 
 /// Python-visible RTPEngine namespace.
 ///
@@ -753,13 +756,24 @@ impl PyRtpEngine {
 
     /// Send an RTPEngine `answer` command.
     ///
-    /// Extracts SDP from the object body, sends it to RTPEngine, and replaces
-    /// the body with the rewritten SDP.
+    /// Two ways to hand it the answer:
+    ///
+    /// * **A SIP reply** (the usual proxy / B2BUA case): the SDP and To-tag come
+    ///   off `reply`, its body is replaced with the rewritten SDP, and the
+    ///   coroutine resolves to ``True``.
+    /// * **Raw SDP** with ``sdp=``: for a far side that is not a SIP agent and
+    ///   hands over its answer some other way. No message body is read or
+    ///   written; the coroutine resolves to the rewritten SDP as ``str`` for the
+    ///   script to send itself, typically in ``call.answer(200, "OK", body=...)``.
     ///
     /// In B2BUA mode the offer was keyed by the A-leg Call-ID/From-tag, but the
     /// reply carries B-leg identifiers. The A-leg identifiers are resolved
     /// automatically when the reply carries an A-leg reference (set by the
     /// dispatcher), or via an explicit `call` parameter.
+    ///
+    /// The engine is addressed by the call-id the matching ``offer`` used, which
+    /// differs from the SIP Call-ID after a siphon-terminated transfer re-anchored
+    /// the call.
     ///
     /// Profile precedence:
     ///   1. Explicit ``profile=`` argument (script override).
@@ -801,7 +815,23 @@ impl PyRtpEngine {
     ///     ws_vad_engine: ``"energy"`` or ``"neural"`` uplink VAD.
     ///     ws_vad_min_speech_ms: Leading minimum continuous-speech run before the
     ///             speech-start edge fires (60-120 ms is the useful range).
-    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    ///     sdp: The far side's answer SDP (``str`` or ``bytes``), for a far side
+    ///          that is not a SIP agent. Switches to raw mode: ``reply`` then only
+    ///          names the offer being answered — a Call, Request or Reply, or a
+    ///          ``(call_id, from_tag)`` tuple; a bare ``call_id`` string names no
+    ///          from-tag and raises ``TypeError`` — and the rewritten SDP is
+    ///          returned rather than written into a body. No source address is
+    ///          carried: siphon never heard from that far side, so a profile's
+    ///          ``received_from`` does not gate its media.
+    ///     to_tag: Tag naming the answering party to the engine. Raw mode only
+    ///             (``ValueError`` without ``sdp``). When omitted: the To-tag on
+    ///             ``reply`` if it carries one, else the tag an earlier answer on
+    ///             this call recorded, so a re-answer reaches the same party, else
+    ///             a new one.
+    ///
+    /// Returns:
+    ///     ``True``, or the rewritten SDP as ``str`` when ``sdp`` was passed.
+    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None))]
     #[allow(clippy::too_many_arguments)]
     fn answer<'py>(
         &self,
@@ -816,51 +846,21 @@ impl PyRtpEngine {
         ws_tee_sample_rate: Option<u32>,
         ws_vad_engine: Option<&str>,
         ws_vad_min_speech_ms: Option<u32>,
+        sdp: Option<&Bound<'py, PyAny>>,
+        to_tag: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let message = extract_message(reply)?;
+        let mut exchange = AnswerExchange::resolve(reply, call, sdp, to_tag, &self.sessions)?;
 
-        // Resolve A-leg identifiers for RTPEngine correlation:
-        // 1. Explicit `call` parameter (backward compat / proxy-with-call)
-        // 2. Automatic: PyReply carries A-leg INVITE ref set by B2BUA dispatcher
-        // 3. Fallback: extract from the reply itself (proxy mode, same Call-ID)
-        let a_leg_msg: Option<Arc<Mutex<SipMessage>>> = if let Some(call_obj) = call {
-            Some(extract_message(call_obj)?)
-        } else if let Ok(py_reply) = reply.cast::<PyReply>() {
-            py_reply.borrow().a_leg_message()
-        } else {
-            None
-        };
-
-        // A delayed offer (RFC 3264 §4): the A-leg INVITE carried no SDP, so the
-        // reply's SDP is not an answer but the offer, and the caller answers it in
-        // its ACK. The engine is sent it as an `offer` from the replying party's
-        // side, and siphon completes it with the caller's answer when that ACK
-        // arrives (`send_delayed_offer_ack`).
-        let delayed_offer = match &a_leg_msg {
-            Some(a_msg) => lock_message(a_msg)?.body.is_empty(),
-            None => false,
-        };
-
-        let (call_id, from_tag, to_tag, sdp) = if let Some(ref a_msg) = a_leg_msg {
-            let (cid, ftag) = {
-                let a_leg_invite = lock_message(a_msg)?;
-                dialog_ids(&a_leg_invite)?
-            };
-            let (_reply_cid, _reply_ftag, ttag, reply_sdp) = extract_answer_params(&message)?;
-            (cid, ftag, ttag, reply_sdp)
-        } else {
-            extract_answer_params(&message)?
-        };
-
-        let profile_name = resolve_answer_profile(profile, &self.sessions, &call_id);
+        let profile_name = resolve_answer_profile(profile, &self.sessions, &exchange.call_id);
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        // The flags of the command the engine is actually sent.
-        let side = if delayed_offer {
+        // The flags of the command the engine is actually sent: a delayed offer
+        // goes to it as an `offer`.
+        let side = if exchange.delayed_offer {
             &entry.offer
         } else {
             &entry.answer
@@ -869,17 +869,24 @@ impl PyRtpEngine {
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
-        let resolved_ws_uri =
-            resolve_ws_uri(ws_uri, &self.sessions, &call_id, side.ws_uri.as_deref());
+        let resolved_ws_uri = resolve_ws_uri(
+            ws_uri,
+            &self.sessions,
+            &exchange.call_id,
+            side.ws_uri.as_deref(),
+        );
         let resolved_ws_uri = match resolved_ws_uri {
             Some(template) => {
-                let (from_user, to_user) =
-                    ws_uri_user_parts(a_leg_msg.as_ref().unwrap_or(&message));
+                let (from_user, to_user) = exchange
+                    .identity
+                    .as_ref()
+                    .map(ws_uri_user_parts)
+                    .unwrap_or((None, None));
                 Some(expand_ws_uri(
                     &template,
                     &WsUriContext {
-                        call_id: &call_id,
-                        from_tag: &from_tag,
+                        call_id: &exchange.call_id,
+                        from_tag: &exchange.from_tag,
                         from_user: from_user.as_deref(),
                         to_user: to_user.as_deref(),
                     },
@@ -887,9 +894,6 @@ impl PyRtpEngine {
             }
             None => None,
         };
-        // A reply carries no source address of its own; when the script passed
-        // `call=`, that object does.
-        let source_ip = call.and_then(|object| extract_source_ip(object));
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -903,34 +907,30 @@ impl PyRtpEngine {
             &self.client,
             resolved_ws_uri.clone(),
             overrides,
-            source_ip.as_deref(),
+            exchange.source_ip.as_deref(),
             &profile_name,
         )?;
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
-        let exchange = AnswerExchange {
-            call_id,
-            from_tag,
-            to_tag,
-            sdp,
-            flags,
-            delayed_offer,
-            profile: profile_name,
-            ws_uri: resolved_ws_uri,
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = exchange_answer(&client, &sessions, exchange)
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.answer failed: {error}"
-                    ))
-                })?;
-            replace_body(&message, &rewritten_sdp)?;
-            Ok(true)
-        })
+        let body = exchange.body.take();
+        match body {
+            // Reply mode: the rewritten SDP replaces the reply's body.
+            Some(message) => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+                let rewritten_sdp = exchange
+                    .send(&client, &sessions, &flags, &profile_name, resolved_ws_uri)
+                    .await?;
+                replace_body(&message, &rewritten_sdp)?;
+                Ok(true)
+            }),
+            // Raw mode: the script sends the rewritten SDP itself.
+            None => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+                let rewritten_sdp = exchange
+                    .send(&client, &sessions, &flags, &profile_name, resolved_ws_uri)
+                    .await?;
+                Ok(String::from_utf8_lossy(&rewritten_sdp).into_owned())
+            }),
+        }
     }
 
     /// Single-leg UAS answer — synthesise an RFC 3264 answer for the caller's
@@ -3430,5 +3430,444 @@ mod tests {
             let error = resolve_call_from_tag(number.as_any()).unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
         });
+    }
+
+    // -- answer(sdp=...): driven through the Python method against a recording engine
+
+    mod answer_with_sdp {
+        //! `rtpengine.answer(target, sdp=...)` for a far side that is not a SIP
+        //! agent, driven through the real Python method against the in-process
+        //! NG engine: what reaches the engine, and what the coroutine resolves to.
+
+        use super::*;
+        use std::ffi::CString;
+        use std::net::SocketAddr;
+
+        use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
+        use tokio::sync::mpsc;
+
+        use crate::rtpengine::test_engine::{EngineCommand, TestEngine, ENGINE_SDP};
+
+        const OFFER_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\n\
+            c=IN IP4 192.0.2.10\r\nt=0 0\r\nm=audio 20000 RTP/AVP 96\r\n";
+        const FAR_SDP: &str = "v=0\r\no=- 1 1 IN IP4 198.51.100.7\r\ns=-\r\n\
+            c=IN IP4 198.51.100.7\r\nt=0 0\r\nm=audio 30000 RTP/AVP 8\r\n";
+
+        /// The `rtpengine` namespace, with its commands going to `engine`.
+        async fn namespace_on(
+            engine: &TestEngine,
+            sessions: &Arc<MediaSessionStore>,
+        ) -> PyRtpEngine {
+            PyRtpEngine::new(
+                engine.backend().await,
+                Arc::clone(sessions),
+                Arc::new(ProfileRegistry::new()),
+            )
+        }
+
+        /// The one `answer` the engine was sent.
+        fn the_answer(engine: &TestEngine) -> EngineCommand {
+            let answers = engine.commands("answer");
+            assert_eq!(answers.len(), 1, "one answer reaches the engine");
+            answers[0].clone()
+        }
+
+        /// A session as `offer` leaves it, optionally re-anchored on another
+        /// engine call-id and optionally already answered.
+        fn offered(call_id: &str, engine_call_id: &str, to_tag: Option<&str>) -> MediaSession {
+            MediaSession {
+                rtpengine_call_id: engine_call_id.to_string(),
+                to_tag: to_tag.map(str::to_string),
+                ..make_session(call_id, DEFAULT_PROFILE)
+            }
+        }
+
+        /// An INVITE carrying `body`, or with `to_tag` the 200 OK answering with it.
+        fn dialog_message(
+            call_id: &str,
+            to_tag: Option<&str>,
+            body: &str,
+        ) -> Arc<Mutex<SipMessage>> {
+            use crate::sip::message::{StartLine, StatusLine, Version};
+
+            let mut message = test_message(Some("application/sdp"), body.as_bytes());
+            message.headers.set("Call-ID", call_id.to_string());
+            message
+                .headers
+                .set("From", "<sip:alice@example.com>;tag=tag-a".to_string());
+            let to = match to_tag {
+                Some(tag) => {
+                    // A tagged To is the far end answering: a response, which is
+                    // what `PyReply` wraps.
+                    message.start_line = StartLine::Response(StatusLine {
+                        version: Version::sip_2_0(),
+                        status_code: 200,
+                        reason_phrase: "OK".to_string(),
+                    });
+                    format!("<sip:bob@example.com>;tag={tag}")
+                }
+                None => "<sip:bob@example.com>".to_string(),
+            };
+            message.headers.set("To", to);
+            Arc::new(Mutex::new(message))
+        }
+
+        /// A stand-in siphon-rtp control server: every request's JSON body goes out
+        /// on the channel, offer and answer come back with `ENGINE_SDP`, ping
+        /// with a pong and anything else `Ok`.
+        async fn spawn_siphon_rtp_engine(
+        ) -> (SocketAddr, mpsc::UnboundedReceiver<serde_json::Value>) {
+            use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sender, receiver) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            while let Ok(Some((request, consumed))) =
+                                frame::decode::<Request>(&buffer)
+                            {
+                                let body =
+                                    serde_json::from_slice(&buffer[frame::HEADER_LEN..consumed])
+                                        .unwrap_or(serde_json::Value::Null);
+                                buffer.drain(..consumed);
+                                let _ = sender.send(body);
+                                let result = match request.command {
+                                    Command::Ping => CmdResult::Pong,
+                                    Command::Offer { .. } | Command::Answer { .. } => {
+                                        CmdResult::Ok {
+                                            sdp: Some(ENGINE_SDP.to_string()),
+                                            duration_ms: None,
+                                            to_tag: None,
+                                            stats: None,
+                                            play_id: None,
+                                            recording_id: None,
+                                        }
+                                    }
+                                    _ => CmdResult::Ok {
+                                        sdp: None,
+                                        duration_ms: None,
+                                        to_tag: None,
+                                        stats: None,
+                                        play_id: None,
+                                        recording_id: None,
+                                    },
+                                };
+                                let Ok(bytes) = frame::encode(&Response {
+                                    id: request.id,
+                                    result,
+                                }) else {
+                                    return;
+                                };
+                                if stream.write_all(&bytes).await.is_err() {
+                                    return;
+                                }
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                    });
+                }
+            });
+            (address, receiver)
+        }
+
+        /// Run `body` attached to Python on a blocking thread — where a script
+        /// handler runs — with the namespace object bound for it.
+        async fn with_engine<T: Send + 'static>(
+            engine: PyRtpEngine,
+            body: impl FnOnce(Python<'_>, &Bound<'_, PyRtpEngine>) -> T + Send + 'static,
+        ) -> T {
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|python| {
+                    let engine = Bound::new(python, engine).unwrap();
+                    body(python, &engine)
+                })
+            })
+            .await
+            .unwrap()
+        }
+
+        /// `await engine.answer(target, **kwargs)` from inside a coroutine, the
+        /// way a script does, so `future_into_py` finds a running loop.
+        fn await_answer(
+            python: Python<'_>,
+            engine: &Bound<'_, PyRtpEngine>,
+            target: &Bound<'_, PyAny>,
+            kwargs: &Bound<'_, PyDict>,
+        ) -> PyResult<Py<PyAny>> {
+            let code = CString::new(
+                "async def run(engine, target, kwargs):\n\
+                 \x20\x20\x20\x20return await engine.answer(target, **kwargs)\n",
+            )
+            .unwrap();
+            let globals = PyDict::new(python);
+            python.run(code.as_c_str(), Some(&globals), None)?;
+            let run = globals.get_item("run")?.unwrap();
+            let coroutine = run.call1((engine, target, kwargs))?;
+            crate::script::engine::run_coroutine_value(python, &coroutine)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_tuple_target_sends_the_far_sdp_and_resolves_to_the_rewritten_sdp() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-1", "call-1", None));
+            let namespace = namespace_on(&engine, &sessions).await;
+
+            let answered = with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-1", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", FAR_SDP).unwrap();
+                kwargs.set_item("to_tag", "tag-b").unwrap();
+                let value = await_answer(python, engine, target.as_any(), &kwargs).unwrap();
+                value.bind(python).extract::<String>().unwrap()
+            })
+            .await;
+
+            assert_eq!(answered, ENGINE_SDP);
+            let command = the_answer(&engine);
+            assert_eq!(command.call_id.as_deref(), Some("call-1"));
+            assert_eq!(command.from_tag.as_deref(), Some("tag-a"));
+            assert_eq!(command.to_tag.as_deref(), Some("tag-b"));
+            assert_eq!(command.sdp.as_deref(), Some(FAR_SDP));
+            assert_eq!(
+                sessions.get("call-1").unwrap().to_tag.as_deref(),
+                Some("tag-b")
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_call_target_reuses_the_stored_to_tag_and_leaves_the_invite_body_alone() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            // Already answered once: a re-answer must address the same monologue.
+            sessions.insert(offered("call-2", "call-2", Some("tag-stored")));
+            let namespace = namespace_on(&engine, &sessions).await;
+            let invite = dialog_message("call-2", None, OFFER_SDP);
+            let call_invite = Arc::clone(&invite);
+
+            let answered = with_engine(namespace, move |python, engine| {
+                let call = PyCall::new(
+                    "id-2".to_string(),
+                    call_invite,
+                    "192.0.2.10".to_string(),
+                    "udp".to_string(),
+                );
+                let target = Bound::new(python, call).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs
+                    .set_item("sdp", PyBytes::new(python, FAR_SDP.as_bytes()))
+                    .unwrap();
+                let value = await_answer(python, engine, target.as_any(), &kwargs).unwrap();
+                value.bind(python).extract::<String>().unwrap()
+            })
+            .await;
+
+            assert_eq!(answered, ENGINE_SDP);
+            let command = the_answer(&engine);
+            assert_eq!(command.call_id.as_deref(), Some("call-2"));
+            assert_eq!(command.from_tag.as_deref(), Some("tag-a"));
+            assert_eq!(command.to_tag.as_deref(), Some("tag-stored"));
+            assert_eq!(command.sdp.as_deref(), Some(FAR_SDP));
+            assert_eq!(invite.lock().unwrap().body, OFFER_SDP.as_bytes());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn with_no_to_tag_anywhere_one_is_generated_and_recorded() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-4", "call-4", None));
+            let namespace = namespace_on(&engine, &sessions).await;
+
+            with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-4", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", FAR_SDP).unwrap();
+                await_answer(python, engine, target.as_any(), &kwargs).unwrap();
+            })
+            .await;
+
+            let sent = the_answer(&engine)
+                .to_tag
+                .expect("the answer names its answerer");
+            assert!(sent.starts_with("siphon-"), "generated tag, got {sent:?}");
+            assert_eq!(sessions.get("call-4").unwrap().to_tag, Some(sent));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn both_modes_address_the_engine_by_the_session_engine_call_id() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            // A siphon-terminated transfer re-anchors the pair on a fresh engine
+            // call-id while the store key stays the SIP Call-ID.
+            sessions.insert(offered("call-3", "engine-3", Some("tag-b")));
+            let namespace = namespace_on(&engine, &sessions).await;
+            let reply_message = dialog_message("call-3", Some("tag-b"), FAR_SDP);
+            let script_reply = Arc::clone(&reply_message);
+
+            let (replaced, raw) = with_engine(namespace, move |python, engine| {
+                // Reply mode: SDP and To-tag off the reply, body rewritten in place.
+                let reply = Bound::new(python, PyReply::new(script_reply)).unwrap();
+                let replaced = await_answer(python, engine, reply.as_any(), &PyDict::new(python))
+                    .unwrap()
+                    .bind(python)
+                    .extract::<bool>()
+                    .unwrap();
+                // Raw mode on the same call.
+                let target = PyTuple::new(python, ["call-3", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", FAR_SDP).unwrap();
+                let raw = await_answer(python, engine, target.as_any(), &kwargs)
+                    .unwrap()
+                    .bind(python)
+                    .extract::<String>()
+                    .unwrap();
+                (replaced, raw)
+            })
+            .await;
+
+            assert!(replaced);
+            assert_eq!(raw, ENGINE_SDP);
+            assert_eq!(reply_message.lock().unwrap().body, ENGINE_SDP.as_bytes());
+            let answers = engine.commands("answer");
+            assert_eq!(answers.len(), 2, "one answer from each mode");
+            for answer in answers {
+                assert_eq!(answer.call_id.as_deref(), Some("engine-3"));
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_engine_error_raises_runtime_error() {
+            Python::initialize();
+            let engine = TestEngine::start(true).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-5", "call-5", None));
+            let namespace = namespace_on(&engine, &sessions).await;
+
+            let is_runtime_error = with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-5", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", FAR_SDP).unwrap();
+                let error = await_answer(python, engine, target.as_any(), &kwargs).unwrap_err();
+                error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python)
+            })
+            .await;
+
+            assert!(is_runtime_error);
+            assert_eq!(sessions.get("call-5").unwrap().to_tag, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn bad_arguments_are_refused_before_anything_reaches_the_engine() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-6", "call-6", None));
+            let namespace = namespace_on(&engine, &sessions).await;
+            let reply_message = dialog_message("call-6", Some("tag-b"), FAR_SDP);
+
+            let refusals = with_engine(namespace, move |python, engine| {
+                let tuple = PyTuple::new(python, ["call-6", "tag-a"]).unwrap();
+                let reply = Bound::new(python, PyReply::new(reply_message)).unwrap();
+                let bare_call_id = PyString::new(python, "call-6");
+
+                let refuse = |target: &Bound<'_, PyAny>, pairs: &[(&str, Bound<'_, PyAny>)]| {
+                    let kwargs = PyDict::new(python);
+                    for (key, value) in pairs {
+                        kwargs.set_item(*key, value).unwrap();
+                    }
+                    await_answer(python, engine, target, &kwargs).unwrap_err()
+                };
+                let text = |value: &str| PyString::new(python, value).into_any();
+
+                vec![
+                    // A bare call_id names no from-tag, and the answer needs one.
+                    refuse(bare_call_id.as_any(), &[("sdp", text(FAR_SDP))])
+                        .is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                    // to_tag only means something next to sdp=.
+                    refuse(reply.as_any(), &[("to_tag", text("tag-x"))])
+                        .is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    refuse(tuple.as_any(), &[("sdp", text(""))])
+                        .is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    refuse(
+                        tuple.as_any(),
+                        &[("sdp", text(FAR_SDP)), ("to_tag", text(""))],
+                    )
+                    .is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    refuse(
+                        tuple.as_any(),
+                        &[("sdp", 42i64.into_pyobject(python).unwrap().into_any())],
+                    )
+                    .is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                ]
+            })
+            .await;
+
+            assert_eq!(refusals, vec![true; 5]);
+            assert!(
+                engine.all_commands().is_empty(),
+                "nothing may reach the engine"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_siphon_rtp_backend_gets_the_same_answer() {
+            Python::initialize();
+            let (address, mut requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-7", "call-7", None));
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                Arc::clone(&sessions),
+                Arc::new(ProfileRegistry::new()),
+            );
+
+            let answered = with_engine(engine, |python, engine| {
+                let target = PyTuple::new(python, ["call-7", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", FAR_SDP).unwrap();
+                kwargs.set_item("to_tag", "tag-b").unwrap();
+                let value = await_answer(python, engine, target.as_any(), &kwargs).unwrap();
+                value.bind(python).extract::<String>().unwrap()
+            })
+            .await;
+
+            assert_eq!(answered, ENGINE_SDP);
+            let answer = loop {
+                let body = requests.recv().await.unwrap();
+                if body["command"] == "answer" {
+                    break body;
+                }
+            };
+            assert_eq!(answer["call_id"], "call-7");
+            assert_eq!(answer["from_tag"], "tag-a");
+            assert_eq!(answer["to_tag"], "tag-b");
+            assert_eq!(answer["sdp"], FAR_SDP);
+            assert_eq!(
+                sessions.get("call-7").unwrap().to_tag.as_deref(),
+                Some("tag-b")
+            );
+        }
     }
 }

@@ -9,7 +9,6 @@
 //! Python scripts interact via `from siphon import rtpengine` or
 //! `call.media.anchor()`.
 
-pub(crate) mod answer;
 pub mod backend;
 pub mod bencode;
 pub mod client;
