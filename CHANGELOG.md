@@ -701,6 +701,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   still waiting for the caller's answer, is sent that ACK first, with every
   stream rejected, right before its BYE.
 
+- **A callee that BYEs the moment its 2xx is ACKed no longer gets the caller a
+  BYE before the caller's ACK.** siphon ACKed the callee's 2xx, and only then
+  sent the caller its own 2xx and recorded it as waiting for the caller's ACK. A
+  callee that hangs up as soon as it is ACKed could have its BYE handled on
+  another worker in that gap, find no 2xx to hold the caller's BYE behind, and
+  the caller got that BYE before it had ACKed, which RFC 3261 §15 rules out. The
+  caller's 2xx is now registered as waiting for its ACK before the callee's ACK
+  or the 2xx itself goes out, on every path that answers the caller: a relayed
+  answer, siphon's own through `call.answer()` or the control plane, and a 2xx
+  that waited for a PRACK. Nothing changes on the wire.
+
 - **A B2BUA call that ends before the caller has ACKed the 2xx sends the caller
   its BYE after the ACK, not before it.** RFC 3261 §15 has a UAS send no BYE on
   a confirmed dialog until the ACK for its 2xx arrives or the transaction times

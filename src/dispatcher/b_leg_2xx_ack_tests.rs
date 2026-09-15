@@ -641,3 +641,143 @@ async fn every_ack_for_a_record_routed_2xx_follows_the_route_set() {
         );
     }
 }
+
+/// The listener the caller's INVITE arrived on in
+/// [`Call::bridged_with_caller_rendezvous`]: not the one the callee's requests
+/// arrive on, so what siphon sends the two parties leaves on different channels.
+const CALLER_LISTENER: &str = "192.0.2.1:5070";
+
+impl Call {
+    /// [`Call::bridged`] on a dispatcher whose UDP egress is split by direction.
+    /// What siphon sends the caller leaves from the caller's listener and goes to
+    /// the returned channel, which has no room: a send to the caller does not
+    /// return until the test takes it. Everything else stays on [`Call::wire`].
+    fn bridged_with_caller_rendezvous() -> (Call, flume::Receiver<OutboundMessage>) {
+        let TestDispatcher { mut state, udp } = test_dispatcher();
+        drop(udp);
+        let caller_listener: SocketAddr = CALLER_LISTENER.parse().expect("a literal address");
+        let (to_caller, caller_channel) = flume::bounded(0);
+        let (to_others, others) = flume::unbounded();
+        let (to_stream, _) = flume::unbounded();
+        state.outbound = Arc::new(OutboundRouter {
+            udp: to_others.into(),
+            udp_by_local: std::collections::HashMap::from([(caller_listener, to_caller.into())]),
+            tcp: to_stream.clone(),
+            tls: to_stream.clone(),
+            ws: to_stream.clone(),
+            wss: to_stream.clone(),
+            sctp: to_stream,
+        });
+        let call = Call::bridged_on(TestDispatcher { state, udp: others }, false);
+        if let Some(mut actor) = call.state.call_actors.get_call_mut(&call.call_id) {
+            actor.a_leg_local_addr = Some(caller_listener);
+        }
+        (call, caller_channel)
+    }
+}
+
+/// The next message siphon hands the transport on `channel`, waiting for it.
+fn receive_from(channel: &flume::Receiver<OutboundMessage>) -> SipMessage {
+    let outbound = channel
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("siphon sent a message");
+    let frame = outbound.frames().next().expect("a frame");
+    parse_sip_message_bytes(frame).expect("siphon sent a message that parses")
+}
+
+/// The callee BYEs the moment its 2xx is ACKed, as a UAS may, and that BYE is
+/// handled on another worker while siphon is still handing the caller its 2xx.
+/// The caller's answer is registered as waiting for the caller's ACK before the
+/// callee's ACK leaves, so the callee's BYE finds it and the caller's BYE is held
+/// until the caller has ACKed (RFC 3261 §15). Registered only after the 2xx went
+/// out, the BYE found nothing to wait behind and reached the caller before its ACK.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callee_bye_between_its_ack_and_the_callers_2xx_is_held_for_the_callers_ack() {
+    let (call, to_caller) = Call::bridged_with_caller_rendezvous();
+    let runtime = &tokio::runtime::Handle::current();
+    let call = &call;
+    std::thread::scope(|scope| {
+        let ringing = scope.spawn(move || {
+            let _runtime = runtime.enter();
+            call.callee_sends(&call.callee_response("180 Ringing", "", ""));
+        });
+        assert_eq!(receive_from(&to_caller).status_code(), Some(180));
+        ringing.join().expect("the callee's 180");
+    });
+
+    let answer = call.callee_response(
+        "200 OK",
+        "",
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.78\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.78\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+        ),
+    );
+    let mut sent = Vec::new();
+    let mut registered_when_the_callee_was_acked = false;
+    let relayed = std::thread::scope(|scope| {
+        let answering = scope.spawn(move || {
+            let _runtime = runtime.enter();
+            call.callee_sends(&answer);
+        });
+        // The callee's ACK is out. siphon's thread gets no further than handing
+        // the caller its 2xx, which it cannot finish until the test takes it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sent.iter().any(Sent::is_ack) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the callee's 2xx was never ACKed"
+            );
+            sent.extend(call.wire());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        registered_when_the_callee_was_acked =
+            call.state.uas_2xx_retransmits.contains_key(CALLER_CALL_ID);
+        scope
+            .spawn(move || {
+                let _runtime = runtime.enter();
+                call.callee_hangs_up();
+            })
+            .join()
+            .expect("the callee's BYE");
+        let relayed = receive_from(&to_caller);
+        answering.join().expect("the callee's 2xx");
+        relayed
+    });
+    assert_eq!(relayed.status_code(), Some(200));
+    sent.extend(call.wire());
+
+    let byes_to_caller = |sent: &[Sent]| {
+        sent.iter()
+            .filter(|sent| {
+                sent.destination == caller() && sent.message.method() == Some(&Method::Bye)
+            })
+            .count()
+    };
+    assert_eq!(
+        byes_to_caller(&sent),
+        0,
+        "the caller was sent a BYE before it ACKed its 2xx"
+    );
+    assert!(
+        sent.iter()
+            .any(|sent| sent.destination == callee() && sent.message.status_code() == Some(200)),
+        "the callee's BYE is answered at once"
+    );
+    assert!(
+        registered_when_the_callee_was_acked,
+        "the caller's 2xx was not waiting for its ACK when the callee's ACK left"
+    );
+
+    call.caller_acks(&relayed);
+    assert_eq!(
+        byes_to_caller(&call.wire()),
+        1,
+        "the caller's ACK releases its BYE"
+    );
+}

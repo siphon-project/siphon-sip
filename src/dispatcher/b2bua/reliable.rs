@@ -252,6 +252,21 @@ fn send_to_caller(messages: Vec<SipMessage>, route: &CallerRoute, state: &Dispat
 /// provisional that carried SDP awaits its PRACK (RFC 3262 §3, §5), in which
 /// case it follows that PRACK's 200.
 pub fn answer_a_leg(call_id: &str, answer: HeldAnswer, state: &DispatcherState) {
+    answer_a_leg_after(call_id, answer, state, || {});
+}
+
+/// [`answer_a_leg`], running `before_answer` in between: when the 2xx goes out now,
+/// after it is registered as waiting for the caller's ACK and before it is sent;
+/// when it is held, or the call is gone, at once. `b_leg_answered` ACKs the callee
+/// there, so a callee that BYEs the moment it is ACKed finds the caller's 2xx
+/// waiting for its ACK, and its BYE to the caller is held behind that ACK (RFC
+/// 3261 §15).
+pub fn answer_a_leg_after(
+    call_id: &str,
+    answer: HeldAnswer,
+    state: &DispatcherState,
+    before_answer: impl FnOnce(),
+) {
     let Some((route, step)) = state.call_actors.get_call_mut(call_id).map(|mut call| {
         let step = match call.a_leg_reliability.answer(Box::new(answer)) {
             // An offer the caller's PRACK carried is still with the callee: the
@@ -266,31 +281,48 @@ pub fn answer_a_leg(call_id: &str, answer: HeldAnswer, state: &DispatcherState) 
         (CallerRoute::of(&call), step)
     }) else {
         warn!(call_id = %call_id, "B2BUA: the call was gone before its answer went to the caller");
+        before_answer();
         return;
     };
     match step {
         AnswerStep::Send(answer) => {
-            deliver_a_leg_answer(call_id, answer, Vec::new(), &route, state)
+            deliver_a_leg_answer_after(call_id, answer, Vec::new(), &route, state, before_answer)
         }
-        AnswerStep::Held => debug!(
-            call_id = %call_id,
-            "B2BUA: the caller's 2xx waits for a PRACK of a reliable provisional (RFC 3262 §3), or for the 200 answering an offer in one (§5)"
-        ),
+        AnswerStep::Held => {
+            before_answer();
+            debug!(
+                call_id = %call_id,
+                "B2BUA: the caller's 2xx waits for a PRACK of a reliable provisional (RFC 3262 §3), or for the 200 answering an offer in one (§5)"
+            );
+        }
     }
 }
 
 /// Send the caller's 2xx after `leading`, and what follows an answer.
 ///
 /// An answer relayed from the callee starts the charging and SIPREC, which
-/// siphon's own answer does not. Arming its retransmission here, when it is
-/// actually sent, is what puts it under the 64*T1 unACKed sweep and the RFC 3261
-/// §15 BYE hold; a 2xx still held is under neither.
+/// siphon's own answer does not. Registering it here, when it is about to be sent,
+/// is what puts it under the 64*T1 unACKed sweep and the RFC 3261 §15 BYE hold; a
+/// 2xx still held is under neither.
 fn deliver_a_leg_answer(
+    call_id: &str,
+    answer: Box<HeldAnswer>,
+    leading: Vec<SipMessage>,
+    route: &CallerRoute,
+    state: &DispatcherState,
+) {
+    deliver_a_leg_answer_after(call_id, answer, leading, route, state, || {});
+}
+
+/// [`deliver_a_leg_answer`], running `before_send` once the 2xx is registered as
+/// waiting for the caller's ACK and before anything is sent.
+fn deliver_a_leg_answer_after(
     call_id: &str,
     answer: Box<HeldAnswer>,
     mut leading: Vec<SipMessage>,
     route: &CallerRoute,
     state: &DispatcherState,
+    before_send: impl FnOnce(),
 ) {
     let HeldAnswer {
         response,
@@ -302,6 +334,14 @@ fn deliver_a_leg_answer(
     // Clone the 2xx so the retransmit is byte-identical (RFC 3261 §13.3.1.4).
     let retransmit = response.clone();
 
+    // Waiting for the caller's ACK before it or anything else goes out, so a BYE
+    // for the caller's dialog handled on another worker meanwhile is held behind
+    // that ACK (RFC 3261 §15). The B2BUA has no INVITE server transaction for the
+    // caller, so nothing else recovers a lost 2xx; the caller's ACK cancels it in
+    // the late-ACK handler (search `uas_2xx_retransmits`).
+    let unacked = register_unacked_answer(call_id, &response, state);
+    before_send();
+
     // From the listener the caller's INVITE arrived on: a peer doing symmetric
     // signalling drops a 2xx sourced from a different local port.
     leading.push(response);
@@ -310,11 +350,8 @@ fn deliver_a_leg_answer(
     // caller's go to their callees now (RFC 3262 §4).
     release_held_callee_pracks(call_id, state);
 
-    // The B2BUA has no INVITE server transaction for the caller, so nothing else
-    // recovers a lost 2xx. Cancelled by the caller's ACK in the late-ACK handler
-    // (search `uas_2xx_retransmits`).
-    arm_b2bua_2xx_retransmit(
-        call_id,
+    start_2xx_retransmits(
+        unacked,
         retransmit,
         route.transport,
         route.remote_addr,
