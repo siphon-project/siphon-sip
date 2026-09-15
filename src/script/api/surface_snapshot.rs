@@ -357,6 +357,9 @@ _surface_json = json.dumps(surface, indent=2, sort_keys=True)
         in_source.sort();
         in_source.dedup();
 
+        // Initialised here, not assumed: run alone, or before any test that
+        // initialises it, this test is the first in the process to use Python.
+        Python::initialize();
         let listed = Python::attach(|python| pyclass_types(python).len());
 
         assert_eq!(

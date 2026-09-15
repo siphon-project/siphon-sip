@@ -3603,6 +3603,9 @@ async def new_call(call):
 
     #[test]
     fn bytecode_corrupt_payload_returns_error() {
+        // `load_bytecode` reaches Python past the length check, and nothing on
+        // its path initialises the interpreter.
+        Python::initialize();
         // Valid-length header but garbage payload
         let mut bad_pyc = vec![0u8; 16];
         bad_pyc.extend_from_slice(b"\xff\xff\xff\xff");
