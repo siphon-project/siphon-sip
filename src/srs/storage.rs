@@ -317,8 +317,11 @@ mod tests {
 
     #[tokio::test]
     async fn file_backend_writes_metadata() {
-        let temp_dir = std::env::temp_dir().join("siphon-srs-test");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        // A directory of this test's own: a fixed name under the system temp
+        // dir is shared by every process running the test at once, and each
+        // one's cleanup removed what another had just written.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let temp_dir = directory.path().to_path_buf();
 
         let config = SrsConfig {
             enabled: true,
@@ -345,16 +348,12 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["session_id"], "test-session-001");
         assert_eq!(parsed["duration_secs"], 120);
-
-        // Clean up.
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     async fn collect_audio_files_skips_metadata() {
-        let temp_dir = std::env::temp_dir().join("siphon-srs-audio-test");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let directory = tempfile::tempdir().expect("temp dir");
+        let temp_dir = directory.path().to_path_buf();
 
         // Create fake audio files and a metadata.json.
         tokio::fs::write(temp_dir.join("metadata.json"), b"{}")
@@ -375,20 +374,14 @@ mod tests {
         );
         let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
         assert!(!names.contains(&"metadata.json"));
-
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     async fn collect_audio_files_empty_dir() {
-        let temp_dir = std::env::temp_dir().join("siphon-srs-audio-empty");
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let directory = tempfile::tempdir().expect("temp dir");
 
-        let files = collect_audio_files(&temp_dir.display().to_string()).await;
+        let files = collect_audio_files(&directory.path().display().to_string()).await;
         assert!(files.is_empty());
-
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
