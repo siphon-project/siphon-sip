@@ -93,6 +93,8 @@ mod relayed_identity_tests;
 #[cfg(test)]
 mod ro_orphan_backstop_tests;
 #[cfg(test)]
+mod sdp_strip_tests;
+#[cfg(test)]
 mod test_dispatcher;
 #[cfg(test)]
 mod tests;
@@ -439,6 +441,11 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_strip_attributes: config
+            .media
+            .as_ref()
+            .map(|media| media.sdp_strip_attributes.clone())
+            .unwrap_or_default(),
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),

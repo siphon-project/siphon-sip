@@ -283,6 +283,13 @@ pub fn b2bua_bridge_inbound_replaces(
         call.a_leg_local_addr = stored_local_addr;
     }
 
+    // The survivor's SDP, or the engine's answer built from it, reaches the new
+    // party in this 200, so it gets `media.sdp_strip_attributes` here. The
+    // survivor's re-INVITE below is stripped where every siphon-originated
+    // re-INVITE is.
+    let mut sdp_for_new_party = sdp_for_new_party;
+    strip_relayed_sdp_body(&mut sdp_for_new_party, state);
+
     // Accept the takeover. Sent before the BYE below so the transferee is
     // connected to the surviving party before the replaced one is told to go.
     if !b2bua_answer_call(

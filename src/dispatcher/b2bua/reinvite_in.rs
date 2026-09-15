@@ -528,6 +528,10 @@ pub fn handle_b2bua_reinvite(
             }
         }
 
+        // `media.sdp_strip_attributes`, last: after the media engine re-offer and
+        // the o= stamp. The engine was handed the offer as the peer sent it.
+        strip_relayed_sdp_attributes(&mut forwarded, state);
+
         // Update Content-Length after SDP rewrite (o=/s= and RTPEngine changes may alter body size)
         if !forwarded.body.is_empty() {
             forwarded

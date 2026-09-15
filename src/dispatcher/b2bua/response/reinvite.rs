@@ -530,4 +530,11 @@ pub fn rewrite_reinvite_answer_sdp(
                 .set("Content-Length", message.body.len().to_string());
         }
     }
+
+    // `media.sdp_strip_attributes`, last: after the media engine answer and the
+    // o= stamp. Only a bridged re-INVITE's response is forwarded; the response
+    // to a siphon-originated one is absorbed.
+    if is_bridged_reinvite {
+        strip_relayed_sdp_attributes(message, state);
+    }
 }

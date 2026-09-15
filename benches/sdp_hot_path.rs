@@ -8,7 +8,7 @@
 //! and run once (often twice) per call. Gated by `scripts/bench_regression.sh`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use siphon::media::sdp::SdpBody;
+use siphon::media::sdp::{strip_attributes, SdpBody};
 use std::hint::black_box;
 
 /// A representative offer: G.711 + Opus + telephone-event, the common VoIP shape.
@@ -25,6 +25,27 @@ const SAMPLE_SDP: &str = concat!(
     "a=fmtp:97 minptime=10;useinbandfec=1\r\n",
     "a=rtpmap:101 telephone-event/8000\r\n",
     "a=fmtp:101 0-16\r\n",
+    "a=sendrecv\r\n",
+);
+
+/// The same offer carrying attributes a deployment strips on relay
+/// (`media.sdp_strip_attributes`), at session and media level.
+const STRIPPABLE_SDP: &str = concat!(
+    "v=0\r\n",
+    "o=alice 2890844526 2890844526 IN IP4 192.0.2.1\r\n",
+    "s=-\r\n",
+    "c=IN IP4 192.0.2.1\r\n",
+    "t=0 0\r\n",
+    "a=msid-semantic: WMS stream-a\r\n",
+    "a=x-internal-id:0001\r\n",
+    "m=audio 49170 RTP/AVP 0 8 97 101\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "a=rtpmap:8 PCMA/8000\r\n",
+    "a=rtpmap:97 opus/48000/2\r\n",
+    "a=fmtp:97 minptime=10;useinbandfec=1\r\n",
+    "a=rtpmap:101 telephone-event/8000\r\n",
+    "a=fmtp:101 0-16\r\n",
+    "a=msid:stream-a track-a\r\n",
     "a=sendrecv\r\n",
 );
 
@@ -63,6 +84,30 @@ fn bench_sdp(criterion: &mut Criterion) {
             let mut sdp = SdpBody::parse(black_box(SAMPLE_SDP));
             sdp.filter_codecs(&["PCMU", "PCMA"]);
             black_box(sdp.to_string())
+        });
+    });
+
+    // `media.sdp_strip_attributes` on one relayed SDP, per relay hop that
+    // carries a body: two names configured, two lines to drop. The body copy is
+    // inside the timed region for the same reason `filter_codecs` keeps its
+    // parse there. Unconfigured costs nothing: the relay path returns before
+    // reading the body.
+    let strip_names = vec!["msid".to_string(), "x-internal-id".to_string()];
+    group.bench_function("strip_attributes", |bencher| {
+        bencher.iter(|| {
+            let mut body = black_box(STRIPPABLE_SDP).as_bytes().to_vec();
+            black_box(strip_attributes(&mut body, black_box(&strip_names)));
+            black_box(body)
+        });
+    });
+
+    // Configured, but the SDP carries none of the names: the scan alone, with
+    // the body left in place.
+    group.bench_function("strip_attributes_no_match", |bencher| {
+        bencher.iter(|| {
+            let mut body = black_box(SAMPLE_SDP).as_bytes().to_vec();
+            black_box(strip_attributes(&mut body, black_box(&strip_names)));
+            black_box(body)
         });
     });
 

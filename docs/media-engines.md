@@ -268,6 +268,47 @@ would cut the party's live audio.
 
 ---
 
+## SDP topology hiding
+
+On a B2BUA call siphon rewrites the `o=` and `s=` lines of the SDP it relays
+between the legs, so neither party sees the other's user name, host or session
+name (`media.sdp_name`). Every other line crosses as the far side wrote it. When
+an attribute carries something the other leg should not see, list it in
+`media.sdp_strip_attributes`:
+
+```yaml
+media:
+  sdp_name: "SIPhon"
+  sdp_strip_attributes: ["msid", "x-internal-id"]
+```
+
+- Give the bare attribute name (`msid`, not `a=msid` or `msid:1`), an RFC 8866
+  §9 token. Anything else fails the config load, and the error names the entry.
+- Names match case-insensitively. The attribute goes with or without a value
+  (`a=x-internal-id` and `a=x-internal-id:42`), at session and media level. A
+  different attribute that only shares a prefix (`msid-semantic`) stays.
+- It applies in both directions, on every path an offer or an answer crosses:
+  the INVITE to the callee and its 401/407 and 422 retries, 18x early media, the
+  2xx, a relayed failure that carries SDP, re-INVITE and UPDATE either way and
+  their answers, and the re-INVITEs siphon sends with the other party's SDP
+  (session refresh, transfer re-anchor, `Replaces` takeover, controller bridge).
+- In a `multipart/*` body (SIP-I, PIDF-LO) only the `application/sdp` part is
+  touched; the other parts cross byte for byte.
+- **Order with media anchoring.** The engine is handed the SDP as the peer sent
+  it. The strip runs last, on what the engine returns and after the `o=`/`s=`
+  rewrite, so an attribute the engine carries through does not reach the wire
+  either.
+- Left empty (the default) it strips nothing and the relayed SDP is not
+  inspected, so the relay is byte-identical to one without the setting.
+- It covers relayed SDP only. SDP siphon writes itself (a script's
+  `call.answer(body=...)`, a controller's answer, an engine answer to a
+  one-legged re-offer) goes out as written. For a per-call decision, strip in the
+  script with `sdp.parse()`, `remove_attr()` and `apply()`.
+- Removing an attribute the far side relies on breaks whatever it was for, so
+  list only what the other leg has no use for.
+
+---
+
 ## Managing rtpengine
 
 rtpengine is a separate daemon you install and operate on its own (systemd unit,

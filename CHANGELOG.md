@@ -255,6 +255,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   checked: a peer that dials an IP sends no SNI, so it never gets a
   `tls.certificates` entry. Nothing else changes and there is no new setting.
 
+- **`media.sdp_strip_attributes` removes named attributes from the SDP a B2BUA
+  relays.** Topology hiding rewrote only `o=` and `s=`, so every other attribute
+  crossed as the far side wrote it, including ones that carry its internal
+  identifiers. A script could strip them per call with `sdp.parse()`,
+  `remove_attr()` and `apply()`, but there was no setting. The listed names are
+  removed at session and media level, in both directions, on every path an offer
+  or answer crosses: the INVITE to the callee and its 401/407 and 422 retries,
+  18x, the 2xx, a relayed failure carrying SDP, re-INVITE and UPDATE and their
+  answers, and the re-INVITEs siphon sends with the other party's SDP (session
+  refresh, transfer re-anchor, `Replaces` takeover, controller bridge). Names
+  match case-insensitively, with or without a value, and only the
+  `application/sdp` part of a multipart body is touched. On an anchored call the
+  media engine still gets the SDP as the peer sent it, and the strip runs on what
+  the engine returns, so nothing it carries through reaches the wire. A name that
+  is not an RFC 8866 §9 token (`a=msid`, `msid:1`, an empty entry) is refused at
+  config load. Empty by default, and then the relayed SDP is not inspected.
+
 ### Changed
 
 - **The `media.backend: siphon-rtp` control contract moves to

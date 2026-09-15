@@ -632,6 +632,104 @@ pub fn rewrite_sdp_body(body: &str, keep_codecs: &[&str]) -> (String, usize) {
     (new_body, length)
 }
 
+/// Whether `name` is an SDP attribute name: `attribute-name = token` in the
+/// RFC 8866 §9 grammar, one or more of ALPHA, DIGIT and ``!#$%&'*+-.^_`{|}~``.
+///
+/// A name outside that set can never be the name of an `a=` line, which is why
+/// operator-configured names are held to it at load.
+pub fn is_attribute_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_token_char)
+}
+
+/// RFC 8866 §9 `token-char`.
+fn is_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+        )
+}
+
+/// Remove every `a=` line whose attribute name is one of `names`, at session and
+/// media level alike, comparing names ASCII case-insensitively.
+///
+/// Works on the raw lines rather than a [`SdpBody`] parse and serialize, so every
+/// line it keeps goes out exactly as it came in: its line ending, its position,
+/// and the lines `SdpBody` does not model. Returns whether anything was removed.
+/// A body with no matching line is neither copied nor rewritten.
+pub fn strip_attributes(body: &mut Vec<u8>, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    retain_lines(body, |line| !is_attribute_line_named(line, names))
+}
+
+/// Whether `line` is an `a=` line whose attribute name is one of `names`, ASCII
+/// case-insensitively. The name runs from after `a=` to the first `:` or the end
+/// of the line, so `msid` names `a=msid:…` and not `a=msid-semantic:…`.
+pub(crate) fn is_attribute_line_named(line: &[u8], names: &[String]) -> bool {
+    let Some(attribute) = line.strip_prefix(b"a=") else {
+        return false;
+    };
+    let name_length = attribute
+        .iter()
+        .position(|&byte| matches!(byte, b':' | b'\r' | b'\n'))
+        .unwrap_or(attribute.len());
+    let name = &attribute[..name_length];
+    names
+        .iter()
+        .any(|configured| configured.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// Drop the lines of `body` that `keep` refuses and leave every other line byte
+/// for byte, line ending included. Lines are split after each `\n`, so a last
+/// line with no terminator is a line too. Returns whether any line was dropped;
+/// until the first one is, nothing is copied.
+pub(crate) fn retain_lines(body: &mut Vec<u8>, mut keep: impl FnMut(&[u8]) -> bool) -> bool {
+    let mut kept: Option<Vec<u8>> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive(|&byte| byte == b'\n') {
+        let keep_line = keep(line);
+        match kept.as_mut() {
+            Some(buffer) => {
+                if keep_line {
+                    buffer.extend_from_slice(line);
+                }
+            }
+            None if !keep_line => {
+                // The first line to go: everything before it stays as it was.
+                let mut buffer = Vec::with_capacity(body.len());
+                buffer.extend_from_slice(&body[..offset]);
+                kept = Some(buffer);
+            }
+            None => {}
+        }
+        offset += line.len();
+    }
+    match kept {
+        Some(buffer) => {
+            *body = buffer;
+            true
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1365,5 +1463,147 @@ mod tests {
         assert!(sdp.media_sections[0]
             .get_attrs_by_name("nonexistent")
             .is_empty());
+    }
+
+    fn attribute_names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn strip_attributes_removes_named_attributes_at_session_and_media_level() {
+        let mut body = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.10\r\n",
+            "s=-\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "t=0 0\r\n",
+            "a=x-hidden\r\n",
+            "a=msid-semantic: WMS stream-a\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=msid:stream-a track-a\r\n",
+            "a=x-hidden:detail\r\n",
+            "a=sendrecv\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert!(strip_attributes(
+            &mut body,
+            &attribute_names(&["msid", "x-hidden"])
+        ));
+        // `msid-semantic` shares a prefix with `msid` and is a different
+        // attribute, so it stays.
+        assert_eq!(
+            String::from_utf8(body).expect("utf-8"),
+            concat!(
+                "v=0\r\n",
+                "o=- 1 1 IN IP4 192.0.2.10\r\n",
+                "s=-\r\n",
+                "c=IN IP4 192.0.2.10\r\n",
+                "t=0 0\r\n",
+                "a=msid-semantic: WMS stream-a\r\n",
+                "m=audio 40000 RTP/AVP 0\r\n",
+                "a=rtpmap:0 PCMU/8000\r\n",
+                "a=sendrecv\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn strip_attributes_matches_names_case_insensitively() {
+        for configured in ["msid", "MSID", "MsId"] {
+            let mut body =
+                b"v=0\r\na=msid:stream-a track-a\r\na=MSID:stream-b track-b\r\n".to_vec();
+            assert!(
+                strip_attributes(&mut body, &attribute_names(&[configured])),
+                "{configured}"
+            );
+            assert_eq!(body, b"v=0\r\n".to_vec(), "{configured}");
+        }
+    }
+
+    #[test]
+    fn strip_attributes_removes_an_attribute_with_and_without_a_value() {
+        let mut body = b"a=x-hidden\r\na=x-hidden:detail\r\na=x-hidden:\r\na=sendrecv\r\n".to_vec();
+        assert!(strip_attributes(&mut body, &attribute_names(&["x-hidden"])));
+        assert_eq!(body, b"a=sendrecv\r\n".to_vec());
+    }
+
+    #[test]
+    fn strip_attributes_leaves_a_body_with_nothing_to_strip_byte_identical() {
+        // Mixed line endings, a line `SdpBody` does not model and a last line
+        // with no terminator: a serialize round trip would move some of it.
+        let original =
+            b"v=0\na=sendrecv\r\nx=unmodelled\r\na=msid-semantic: WMS\r\na=rtpmap:0 PCMU/8000"
+                .to_vec();
+        let mut body = original.clone();
+
+        assert!(!strip_attributes(
+            &mut body,
+            &attribute_names(&["msid", "x-hidden"])
+        ));
+        assert_eq!(body, original);
+
+        assert!(!strip_attributes(&mut body, &[]));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn strip_attributes_keeps_the_line_endings_of_the_lines_it_keeps() {
+        let mut body = b"v=0\na=x-hidden\r\na=sendrecv\na=x-hidden".to_vec();
+        assert!(strip_attributes(&mut body, &attribute_names(&["x-hidden"])));
+        assert_eq!(body, b"v=0\na=sendrecv\n".to_vec());
+    }
+
+    #[test]
+    fn strip_attributes_reads_only_the_name_of_an_attribute_line() {
+        // The name appearing in a value, in another line type or after `a=`
+        // somewhere other than the start of a line is not the attribute.
+        let original =
+            b"s=x-hidden\r\ni=a=x-hidden\r\na=label:x-hidden\r\n a=x-hidden\r\n".to_vec();
+        let mut body = original.clone();
+        assert!(!strip_attributes(
+            &mut body,
+            &attribute_names(&["x-hidden"])
+        ));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn is_attribute_name_accepts_every_token_char() {
+        for name in [
+            "msid",
+            "rtcp-fb",
+            "X-Vendor_Tag.1",
+            "AZaz09",
+            "!#$%&'*+-.^_`{|}~",
+        ] {
+            assert!(is_attribute_name(name), "{name:?} was refused");
+        }
+    }
+
+    #[test]
+    fn is_attribute_name_refuses_what_is_not_a_token() {
+        for name in [
+            "",
+            "a=msid",
+            "msid:1",
+            "ms id",
+            "msid\r",
+            "(msid)",
+            "ms\"id",
+            "m\u{e9}sid",
+            "@",
+            "[x]",
+            "a/b",
+            "a?",
+            "<x>",
+            "a,b",
+            "a;b",
+            "a\\b",
+        ] {
+            assert!(!is_attribute_name(name), "{name:?} was accepted");
+        }
     }
 }

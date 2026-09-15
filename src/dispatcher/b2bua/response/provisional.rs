@@ -173,6 +173,9 @@ pub fn b_leg_provisional(
             snapshot.a_leg_supports_100rel,
             call_id,
         );
+        // `media.sdp_strip_attributes`, after `@b2bua.on_early_media` had the
+        // media engine rewrite the early media SDP.
+        strip_relayed_sdp_attributes(message, state);
         // Pin the reply egress socket to the A-leg INVITE's arrival listener
         // (`snapshot.a_leg_local_addr`) so a multi-homed UDP host answers on the port it
         // received on. No-op for stream transports and single-listener hosts.

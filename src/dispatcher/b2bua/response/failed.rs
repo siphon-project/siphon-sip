@@ -314,6 +314,9 @@ pub fn relay_failure_to_a_leg(
         snapshot.a_leg_supports_100rel,
         call_id,
     );
+    // A failure can carry SDP too: a 488 may describe the media the callee does
+    // support (RFC 3261 §21.4.26).
+    strip_relayed_sdp_attributes(message, state);
     // Pin the reply egress socket to the A-leg INVITE's arrival listener so a
     // multi-homed UDP host answers on the port it received on. No-op for stream
     // transports and single-listener hosts.
@@ -434,6 +437,10 @@ pub fn retry_after_422(
                                 &retry_from_tag,
                                 None,
                             );
+                            // Rebuilt from the caller's INVITE rather than from
+                            // the stripped one the callee refused, so it needs its
+                            // own `media.sdp_strip_attributes` pass.
+                            strip_relayed_sdp_attributes(&mut retry, state);
 
                             let mut b_leg = Leg::new_b_leg(
                                 retry_call_id,

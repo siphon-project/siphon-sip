@@ -192,6 +192,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | SDP attribute get/set/remove | Implemented | None | Session and media-level `a=` attributes |
 | SDP codec filtering | Implemented | None | `filter_codecs()` / `remove_codecs()` |
 | SDP media section removal | Implemented | None | `remove_media("video")` |
+| SDP attribute strip on B2BUA relay | Implemented | `media.sdp_strip_attributes` | Removes the named `a=` attributes (session and media level, case-insensitive, with or without a value) from SDP relayed between B2BUA legs in both directions: the B-leg INVITE and its 401/407 and 422 retries, 18x, 2xx, relayed failures, re-INVITE and UPDATE and their answers, and siphon-originated re-INVITEs carrying the other leg's SDP (session refresh, transfer re-anchor, `Replaces`, controller bridge). Runs last, after the media engine rewrite; the engine still sees the peer's SDP. Only the `application/sdp` part of a multipart body. Names validated as RFC 8866 §9 tokens at config load; empty (default) skips the body entirely. Dispatcher-driven tests in `dispatcher::sdp_strip_tests`, including a fake NG engine for the ordering. Not yet SIPp-validated. |
 
 ## Gateway Routing & Load Balancing
 

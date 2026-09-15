@@ -109,6 +109,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         stream_connections: StreamConnections::new(),
         nat_fix_contact: false,
         sdp_name: "siphon".to_string(),
+        sdp_strip_attributes: Vec::new(),
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),
