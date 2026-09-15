@@ -780,7 +780,10 @@ class Call:
                 with in both directions (``Supported`` + ``Require``,
                 ``History-Info``, ``Resource-Priority`` out and
                 ``Accept-Resource-Priority`` back).  A value set with
-                :meth:`set_header` goes out instead.
+                :meth:`set_header` goes out instead.  Responses relayed back
+                to the caller get the same treatment with the callee's tags:
+                siphon's ``Allow``, and ``Supported`` narrowed the same way
+                plus ``replaces``.
             copy: Per-call delta — headers to copy verbatim regardless of
                 the preset's default verb (e.g. ``["X-Operator-Tag"]``).
             strip: Per-call delta — headers to strip regardless of the

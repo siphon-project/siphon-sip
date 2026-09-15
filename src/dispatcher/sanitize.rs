@@ -12,8 +12,9 @@ use super::*;
 /// - Replaces Contact with siphon's own address (critical for dialog routing),
 ///   except on a 3xx, whose Contact is the redirect target
 /// - Strips User-Agent (UAC header — not for responses), sets Server
-/// - Strips the B-leg's Allow-Events/Supported/Require, and replaces Allow with
-///   siphon's own supported methods (a B2BUA is a UA in its own right)
+/// - Replaces the B-leg's `Allow` with siphon's own methods and narrows its
+///   `Supported` to the tags siphon may claim, under every preset (a B2BUA is a
+///   UA in its own right)
 /// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 pub(super) fn sanitize_b2bua_response(
     response: &mut SipMessage,
@@ -88,21 +89,16 @@ pub(super) fn sanitize_b2bua_response(
     };
     crate::b2bua::header_policy::apply_to_response(response, &policy, &ctx);
 
-    // Advertise siphon's own supported methods. The policy above strips the
-    // B-leg's Allow (a B2BUA terminates the dialog, so the B-leg's capabilities
-    // are not siphon's to relay); replace it with what siphon actually implements
-    // as a UA, so a peer that reads transfer capability from the Allow sees
-    // REFER/NOTIFY — Microsoft Teams Direct Routing selects its transfer method
-    // this way, and without it never hands siphon a REFER. Gated on absence so a
-    // script `call.set_header("Allow", …)` (policy precedence 1) still wins.
-    advertise_supported_methods(&mut response.headers);
-
-    // ...and the extensions, for the same reason and by the same route: the
-    // policy stripped the B-leg's `Supported` (not siphon's to relay), so
-    // without this the A-leg sees no option tags at all. RFC 5589 §7.3 has a
-    // transferor read `Supported: replaces` off exactly this response to decide
-    // whether it can offer an attended transfer.
-    advertise_supported_options(&mut response.headers);
+    // Advertise siphon's own capabilities, under every preset. A B2BUA terminates
+    // the dialog, so the far leg's `Allow` and extensions are not siphon's to
+    // claim toward this one (RFC 3261 §20.5, §20.37); only the tags the policy
+    // passes end to end, and `100rel`/`timer`, survive from the far leg.
+    // `Allow` is what siphon implements as a UA, so a peer that reads transfer
+    // capability from it sees REFER/NOTIFY (some trunk peers pick their transfer
+    // method this way and never send a REFER without it), and `Supported`
+    // carries `replaces`, which RFC 5589 §7.3 has a transferor read off exactly
+    // this response to decide whether it can offer an attended transfer.
+    advertise_relayed_response_capabilities(&mut response.headers, &policy);
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.

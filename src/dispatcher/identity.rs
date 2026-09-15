@@ -47,8 +47,8 @@ pub(super) fn advertise_supported_options(headers: &mut SipHeaders) {
     advertise_option_tag(headers, "replaces");
 }
 
-/// Option tags siphon implements on a B-leg but claims there only when the
-/// caller offered them — the rule both have always followed.
+/// Option tags siphon implements itself but claims on one leg only when the
+/// party on the other leg offered them — the rule both have always followed.
 ///
 /// `100rel`: siphon PRACKs a callee's reliable provisional itself (RFC 3262), so
 /// the claim is true, and tying it to the caller's offer keeps a callee from
@@ -58,7 +58,58 @@ pub(super) fn advertise_supported_options(headers: &mut SipHeaders) {
 /// `Session-Expires`; without the tag the callee has to take the refresh on
 /// itself (§9). When siphon runs the session timer, the B-leg builder adds
 /// `timer` whatever the caller offered.
-const CALLER_OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
+const OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
+
+/// Narrow the far party's `Supported`, as the header policy left it, to the tags
+/// siphon may claim on this leg: [`OFFERED_OPTION_TAGS`] and the ones the policy
+/// passes end to end
+/// ([`ResolvedPolicy::passes_end_to_end`](crate::b2bua::header_policy::ResolvedPolicy::passes_end_to_end)).
+/// Every `Supported` line is read; the survivors go out on one, and none at all
+/// removes the header.
+fn keep_claimable_option_tags(
+    headers: &mut SipHeaders,
+    policy: &crate::b2bua::header_policy::ResolvedPolicy,
+) {
+    let offered: Vec<String> = headers
+        .get_all("Supported")
+        .map(|values| {
+            values
+                .iter()
+                .flat_map(|value| value.split(','))
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    headers.remove("Supported");
+    for tag in offered {
+        if OFFERED_OPTION_TAGS
+            .iter()
+            .any(|claimed| claimed.eq_ignore_ascii_case(&tag))
+            || policy.passes_end_to_end(&tag)
+        {
+            advertise_option_tag(headers, &tag);
+        }
+    }
+}
+
+/// Settle `Supported` and `Allow` on a response siphon relays from one leg to
+/// the other, once the header policy has run, under every preset.
+///
+/// A B2BUA terminates the dialog, so the far leg's capabilities are not siphon's
+/// to claim (RFC 3261 §20.37, §20.5). The same rule as the B-leg INVITE,
+/// mirrored: `Supported` keeps the far leg's claimable tags
+/// ([`keep_claimable_option_tags`]) plus `replaces`, and `Allow` is siphon's
+/// method set.
+pub(super) fn advertise_relayed_response_capabilities(
+    headers: &mut SipHeaders,
+    policy: &crate::b2bua::header_policy::ResolvedPolicy,
+) {
+    keep_claimable_option_tags(headers, policy);
+    advertise_supported_options(headers);
+    headers.remove("Allow");
+    advertise_supported_methods(headers);
+}
 
 /// Settle the B-leg INVITE's `Supported` and `Allow` once the header policy has
 /// run.
@@ -68,10 +119,7 @@ const CALLER_OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
 /// after the policy, `script` the A-leg INVITE the script shaped, and
 /// `script_shaped_headers` the headers the script set or removed.
 ///
-/// - `Supported`: of the caller's tags the policy left on the request, the ones
-///   siphon claims on the caller's offer ([`CALLER_OFFERED_OPTION_TAGS`]) and
-///   the ones the policy passes end to end
-///   ([`ResolvedPolicy::passes_end_to_end`](crate::b2bua::header_policy::ResolvedPolicy::passes_end_to_end)).
+/// - `Supported`: the caller's claimable tags ([`keep_claimable_option_tags`]).
 ///   The tags siphon claims unconditionally — `replaces`, and `timer` when it
 ///   runs the session timer — are merged at the end of the build, after the
 ///   per-carrier headers, as they always were.
@@ -96,27 +144,7 @@ pub(super) fn advertise_b_leg_capabilities(
     if shaped_by_script("Supported") {
         restore_script_header(outbound, script, "Supported");
     } else {
-        let offered: Vec<String> = outbound
-            .get_all("Supported")
-            .map(|values| {
-                values
-                    .iter()
-                    .flat_map(|value| value.split(','))
-                    .map(|tag| tag.trim().to_string())
-                    .filter(|tag| !tag.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        outbound.remove("Supported");
-        for tag in offered {
-            if CALLER_OFFERED_OPTION_TAGS
-                .iter()
-                .any(|claimed| claimed.eq_ignore_ascii_case(&tag))
-                || policy.passes_end_to_end(&tag)
-            {
-                advertise_option_tag(outbound, &tag);
-            }
-        }
+        keep_claimable_option_tags(outbound, policy);
     }
 
     if shaped_by_script("Allow") {

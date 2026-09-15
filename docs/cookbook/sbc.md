@@ -182,11 +182,19 @@ only; prefix patterns are a config-side feature.
     `Proxy-Authorization` at the wrong realm. Opt back in with
     `copy=["Proxy-Authenticate"]` if you really want the old transparent behaviour.
 
-### `Supported` and `Allow` on the B-leg
+### `Supported` and `Allow` on both legs
 
-SIPhon is the UAC of the B-leg, so the B-leg INVITE's `Supported` and `Allow` say
-what SIPhon supports (RFC 3261 §20.37, §20.5). They are not a copy of the caller's
-lists, whatever the preset does with the rest of the headers:
+SIPhon is the UAC of the B-leg and the UAS of the A-leg, so the B-leg INVITE's
+`Supported` and `Allow`, and those of every response it relays back to the caller,
+say what SIPhon supports (RFC 3261 §20.37, §20.5). They are not a copy of the other
+party's lists, whatever the preset does with the rest of the headers.
+
+A relayed response follows the same rule as the INVITE, mirrored: the callee's
+`100rel`/`timer` and the end-to-end tags below survive, plus `replaces`, and `Allow`
+is SIPhon's. `transparent-b2bua@2026` strips the callee's `Supported` on responses
+before that, so its responses carry just `Supported: replaces`.
+
+On the B-leg INVITE:
 
 - `Allow` is SIPhon's method set, the same one its responses advertise.
 - `Supported` is `replaces`, plus `timer` when SIPhon runs the session timer, plus

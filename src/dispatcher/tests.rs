@@ -2740,6 +2740,46 @@ fn b_leg_capabilities_honour_a_script_removal() {
 }
 
 #[test]
+fn relayed_response_capabilities_mirror_the_b_leg_rule() {
+    // A relayed response's far leg is the callee: its claimable tags survive in
+    // its own order, `replaces` is merged, and `Allow` is siphon's.
+    let mut headers = SipHeaders::new();
+    headers.add("Supported", "gruu, precondition".to_string());
+    headers.add("k", "timer, outbound".to_string());
+    headers.set("Allow", "INVITE, ACK, BYE".to_string());
+    advertise_relayed_response_capabilities(
+        &mut headers,
+        &builtin_policy("ims-trust-domain-boundary@2026"),
+    );
+    assert_eq!(
+        headers.get_all("Supported"),
+        Some(&vec!["precondition,timer,replaces".to_string()])
+    );
+    assert_eq!(
+        headers.get_all("Allow"),
+        Some(&vec![crate::sip::SUPPORTED_METHODS.to_string()])
+    );
+}
+
+#[test]
+fn relayed_response_capabilities_add_siphons_own_to_an_empty_response() {
+    // The default preset stripped the callee's Supported and Allow already.
+    let mut headers = SipHeaders::new();
+    advertise_relayed_response_capabilities(
+        &mut headers,
+        &builtin_policy("transparent-b2bua@2026"),
+    );
+    assert_eq!(
+        headers.get("Supported").map(String::as_str),
+        Some("replaces")
+    );
+    assert_eq!(
+        headers.get("Allow").map(String::as_str),
+        Some(crate::sip::SUPPORTED_METHODS)
+    );
+}
+
+#[test]
 fn augment_options_response_adds_contact_and_allow() {
     let mut response = SipMessageBuilder::new()
         .response(200, "OK".to_string())

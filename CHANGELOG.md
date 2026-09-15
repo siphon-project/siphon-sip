@@ -281,12 +281,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
-- **The B-leg INVITE advertises siphon's own `Supported` and `Allow`, not the
-  caller's.** siphon is the UAC of the B-leg, so both headers are its claims
-  (RFC 3261 §20.37 and §20.5). It copied the caller's lists almost verbatim and
-  added `timer` and `replaces`, so a callee was told siphon supports whatever
-  the caller happened to name: `outbound`, `path`, `gruu`, `eventlist`, a vendor
-  tag. Nothing on the B-leg implements those.
+- **A B2BUA call advertises siphon's own `Supported` and `Allow` on both legs,
+  not the other party's.** siphon is the UAC of the B-leg and the UAS of the
+  A-leg, so both headers are its claims (RFC 3261 §20.37 and §20.5). The B-leg
+  INVITE copied the caller's lists almost verbatim and added `timer` and
+  `replaces`, so a callee was told siphon supports whatever the caller happened
+  to name: `outbound`, `path`, `gruu`, `eventlist`, a vendor tag. Responses
+  relayed to the caller did the same with the callee's lists under every preset
+  but the default. Nothing on the other leg implements those.
+
+  The same rule now applies in both directions. On a relayed response it reads
+  the callee's tags where it reads the caller's on the INVITE, and
+  `transparent-b2bua@2026` still strips the callee's `Supported` first, so the
+  default preset's responses are unchanged (`Supported: replaces`, siphon's
+  `Allow`). On the B-leg INVITE:
 
   `Allow` is now siphon's method set, the one its responses already advertise.
   `Supported` is `replaces`, plus `timer` when siphon runs the session timer,

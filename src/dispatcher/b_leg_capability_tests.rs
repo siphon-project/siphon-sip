@@ -1,11 +1,12 @@
-//! What the B-leg INVITE says siphon supports.
+//! What siphon says it supports on each leg of a B2BUA call.
 //!
-//! siphon is the UAC of the B-leg, so that INVITE's `Supported` (RFC 3261
-//! §20.37) and `Allow` (§20.5) are siphon's own claims, not a relay of the
-//! caller's. Driven through the dispatcher's own send path, with the B-leg
-//! INVITE read back off the UDP egress.
+//! siphon is the UAC of the B-leg and the UAS of the A-leg, so the B-leg
+//! INVITE's `Supported` (RFC 3261 §20.37) and `Allow` (§20.5), and those of
+//! every response it relays to the caller, are siphon's own claims, not a relay
+//! of the other party's. Driven through the dispatcher's own send and response
+//! paths, with what siphon sent read back off the UDP egress.
 
-use super::lcr_ring_timeout_tests::{invite_to, Sent};
+use super::lcr_ring_timeout_tests::{invite_to, summaries, Sent, Sequence, FIRST_CARRIER};
 use super::test_dispatcher::{test_dispatcher, test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use crate::b2bua::header_policy::ResolvedPolicy;
@@ -463,4 +464,134 @@ async fn a_script_remove_header_wins_over_siphons_allow() {
         "    call.dial(\"sip:15550100042@198.51.100.7:5060\")\n",
     ));
     assert_eq!(allow(&invite), None);
+}
+
+// ----- Responses relayed to the caller -----
+
+/// What the callee answers with: the tags siphon implements, the ones the
+/// endpoints negotiate through siphon, ones nothing on the A-leg implements,
+/// and the callee's own methods.
+const CALLEE_CAPABILITIES: &[(&str, &str)] = &[
+    (
+        "Supported",
+        "100rel, timer, precondition, histinfo, resource-priority, outbound, gruu",
+    ),
+    ("Allow", "INVITE, ACK, BYE"),
+];
+
+/// The callee answers the caller's call with `status_code`, advertising
+/// [`CALLEE_CAPABILITIES`], under `policy`; returns the response siphon relayed
+/// to the caller.
+fn relayed_to_caller(policy: ResolvedPolicy, status_code: u16, reason: &str) -> SipMessage {
+    let sequence = Sequence::start_fork(&[FIRST_CARRIER]);
+    sequence
+        .dispatcher
+        .state
+        .call_actors
+        .get_call_mut(&sequence.call_id)
+        .expect("the call exists")
+        .resolved_header_policy = Some(Arc::new(policy));
+    let invite = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers_with(
+        FIRST_CARRIER,
+        &invite,
+        status_code,
+        reason,
+        CALLEE_CAPABILITIES,
+    );
+    let caller: SocketAddr = CALLER.parse().expect("a literal address");
+    let sent = sequence.wire();
+    let listed = summaries(&sent);
+    sent.into_iter()
+        .find(|sent| sent.destination == caller && sent.message.status_code() == Some(status_code))
+        .map(|sent| sent.message)
+        .unwrap_or_else(|| panic!("no {status_code} to the caller, sent: {listed:?}"))
+}
+
+/// The callee's `Allow` and extensions are no more siphon's to claim toward the
+/// caller than the caller's are toward the callee. Every preset but the default
+/// used to relay both verbatim, `outbound` and `gruu` included.
+#[tokio::test(flavor = "multi_thread")]
+async fn relayed_responses_advertise_siphons_capabilities_under_every_preset() {
+    for (name, expected) in [
+        (
+            // Strips the callee's Supported on responses outright.
+            "transparent-b2bua@2026",
+            tags(&["replaces"]),
+        ),
+        (
+            "ims-intra-trust-domain@2026",
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "histinfo",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+        (
+            "ims-trust-domain-boundary@2026",
+            tags(&["100rel", "timer", "precondition", "replaces"]),
+        ),
+        (
+            "sip-trunk-edge@2026",
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+    ] {
+        for (status_code, reason) in [(183, "Session Progress"), (200, "OK"), (486, "Busy Here")] {
+            let response = relayed_to_caller(preset(name), status_code, reason);
+            assert_eq!(
+                supported_tags(&response),
+                expected,
+                "{status_code} under {name}"
+            );
+            assert_eq!(
+                allow(&response),
+                Some(vec![crate::sip::SUPPORTED_METHODS.to_string()]),
+                "{status_code} under {name}"
+            );
+        }
+    }
+}
+
+/// The response direction reads the same per-call deltas: copying `Supported`
+/// and `Require` onto the default preset relays the callee's `precondition`, and
+/// its end-to-end tags with it, while `outbound` and `gruu` stay behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn relayed_responses_follow_the_per_call_deltas() {
+    let mut copy_both = preset("transparent-b2bua@2026");
+    copy_both.deltas_copy = vec!["Supported".to_string(), "Require".to_string()];
+    let response = relayed_to_caller(copy_both, 183, "Session Progress");
+    assert_eq!(
+        supported_tags(&response),
+        tags(&[
+            "100rel",
+            "timer",
+            "precondition",
+            "histinfo",
+            "resource-priority",
+            "replaces"
+        ])
+    );
+
+    let mut no_history = preset("ims-intra-trust-domain@2026");
+    no_history.deltas_strip = vec!["History-Info".to_string()];
+    let response = relayed_to_caller(no_history, 183, "Session Progress");
+    assert_eq!(
+        supported_tags(&response),
+        tags(&[
+            "100rel",
+            "timer",
+            "precondition",
+            "resource-priority",
+            "replaces"
+        ])
+    );
 }
