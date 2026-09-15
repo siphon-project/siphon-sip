@@ -31,14 +31,34 @@ use crate::sip::message::SipMessage;
 /// unset `b2bua.default_header_policy`, or a name that could not be found.
 pub const DEFAULT_PRESET_NAME: &str = "transparent-b2bua@2026";
 
-/// Option tags for extensions the two endpoints of a B2BUA call negotiate with
-/// each other *through* siphon, rather than with siphon.
+/// An extension the two endpoints of a B2BUA call negotiate with each other
+/// *through* siphon rather than with siphon, and the headers that negotiation
+/// rides on.
 ///
-/// Preconditions (RFC 3312, RFC 4032) are the one the preset library is built
-/// around: the `precondition` tag travels in `Supported`/`Require` in both
-/// directions (RFC 3312 §11) and the preconditions themselves ride the SDP, all
-/// of which a B2BUA relays. So the tag can cross only under a policy that
-/// [relays capability negotiation](ResolvedPolicy::relays_capability_negotiation).
+/// Its option tag can only be claimed across siphon when the call's policy
+/// [relays](ResolvedPolicy::relays) every one of those headers: copied on the
+/// A→B request and on the B→A response alike.
+#[derive(Debug)]
+pub struct EndToEndOptionTag {
+    /// The option tag, as it appears in `Supported` / `Require`.
+    pub tag: &'static str,
+    /// Headers that have to reach the callee on the request.
+    pub request_headers: &'static [&'static str],
+    /// Headers that have to come back to the caller on the response.
+    pub response_headers: &'static [&'static str],
+}
+
+/// The extensions siphon passes end to end, each with what it negotiates with.
+///
+/// - `precondition` (RFC 3312, RFC 4032): the tag travels in `Supported` /
+///   `Require` both ways (RFC 3312 §11) and the preconditions themselves in the
+///   SDP, which a B2BUA relays. A callee's `Require: precondition` that cannot
+///   reach the caller leaves the extension half-negotiated.
+/// - `histinfo` (RFC 7044): the caller's `History-Info` reaches the callee, and
+///   the callee returns the entries it saw in `History-Info` on its responses.
+/// - `resource-priority` (RFC 4412): `Resource-Priority` on the request, and
+///   `Accept-Resource-Priority` on the response that says which namespaces the
+///   callee accepts.
 ///
 /// Deliberately short, because a tag that is not listed is not claimed. An
 /// extension tied to state siphon regenerates per leg — dialog identifiers
@@ -47,7 +67,23 @@ pub const DEFAULT_PRESET_NAME: &str = "transparent-b2bua@2026";
 /// never be negotiated across a B2BUA. `100rel`, `timer` and `replaces`, which
 /// siphon implements on the B-leg itself, follow their own rules in the
 /// dispatcher.
-pub const END_TO_END_OPTION_TAGS: &[&str] = &["precondition"];
+pub const END_TO_END_OPTION_TAGS: &[EndToEndOptionTag] = &[
+    EndToEndOptionTag {
+        tag: "precondition",
+        request_headers: &["Supported", "Require"],
+        response_headers: &["Supported", "Require"],
+    },
+    EndToEndOptionTag {
+        tag: "histinfo",
+        request_headers: &["History-Info"],
+        response_headers: &["History-Info"],
+    },
+    EndToEndOptionTag {
+        tag: "resource-priority",
+        request_headers: &["Resource-Priority"],
+        response_headers: &["Accept-Resource-Priority"],
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Verbs
@@ -305,34 +341,34 @@ impl ResolvedPolicy {
         self.preset.response.verb_for(header_name).clone()
     }
 
-    /// Whether this policy carries capability negotiation across the B2BUA in
-    /// both directions: `Supported` and `Require` copied on the A→B request and
-    /// on the B→A response alike.
+    /// Whether this policy carries `extension`'s negotiation across the B2BUA:
+    /// every header it rides on copied, the request headers A→B and the response
+    /// headers B→A.
     ///
-    /// That is what an extension the two endpoints negotiate with each other
-    /// needs from the hop in the middle. The caller's `Supported`/`Require` has
-    /// to reach the callee, and the callee's `Require` on its answer has to come
-    /// back, or the caller never learns the extension is in use. A policy that
-    /// strips either on responses (`transparent-b2bua@2026` strips both) would
-    /// leave such an extension half-negotiated. Per-call deltas count:
-    /// `copy=["Supported", "Require"]` opens it, `strip=["Require"]` closes it.
-    pub fn relays_capability_negotiation(&self) -> bool {
-        ["Supported", "Require"].iter().all(|header| {
-            self.verb_for_request(header) == Verb::Copy
-                && self.verb_for_response(header) == Verb::Copy
-        })
+    /// Anything short of that leaves the extension half-negotiated — the caller's
+    /// offer never reaches the callee, or the callee's answer never comes back.
+    /// Per-call deltas count: `copy=["Supported", "Require"]` opens
+    /// `precondition` under `transparent-b2bua@2026`, which strips both on
+    /// responses, and `strip=["History-Info"]` closes `histinfo` anywhere.
+    pub fn relays(&self, extension: &EndToEndOptionTag) -> bool {
+        extension
+            .request_headers
+            .iter()
+            .all(|header| self.verb_for_request(header) == Verb::Copy)
+            && extension
+                .response_headers
+                .iter()
+                .all(|header| self.verb_for_response(header) == Verb::Copy)
     }
 
-    /// The option tags this policy passes end to end, which the B-leg INVITE
-    /// carries when the caller offered them: [`END_TO_END_OPTION_TAGS`] when the
-    /// policy [relays capability negotiation](Self::relays_capability_negotiation),
-    /// none otherwise.
-    pub fn end_to_end_option_tags(&self) -> &'static [&'static str] {
-        if self.relays_capability_negotiation() {
-            END_TO_END_OPTION_TAGS
-        } else {
-            &[]
-        }
+    /// Whether `tag` (case-insensitive, RFC 3261 §19.2 option tags compare that
+    /// way in practice) names an [end-to-end extension](END_TO_END_OPTION_TAGS)
+    /// this policy [relays](Self::relays). Only such a tag may be claimed across
+    /// siphon on the other party's behalf.
+    pub fn passes_end_to_end(&self, tag: &str) -> bool {
+        END_TO_END_OPTION_TAGS
+            .iter()
+            .any(|extension| extension.tag.eq_ignore_ascii_case(tag) && self.relays(extension))
     }
 }
 
@@ -1871,48 +1907,70 @@ mod tests {
         assert!(!msg.headers.has("Subject"), "strip wins on conflict");
     }
 
-    // ----- Capability negotiation / end-to-end option tags -----
+    // ----- End-to-end option tags -----
 
-    #[test]
-    fn capability_negotiation_relays_where_supported_and_require_cross_both_ways() {
-        // transparent strips Supported and Require on responses; the other three
-        // copy both in both directions (boundary by explicit override, the rest
-        // by their Copy default).
-        assert!(!ResolvedPolicy::from_preset(transparent()).relays_capability_negotiation());
-        assert!(ResolvedPolicy::from_preset(intra_trust()).relays_capability_negotiation());
-        assert!(ResolvedPolicy::from_preset(trust_boundary()).relays_capability_negotiation());
-        assert!(ResolvedPolicy::from_preset(trunk_edge()).relays_capability_negotiation());
+    /// Which of `precondition` / `histinfo` / `resource-priority` a policy
+    /// passes end to end, in that order.
+    fn passed(policy: &ResolvedPolicy) -> [bool; 3] {
+        ["precondition", "histinfo", "resource-priority"].map(|tag| policy.passes_end_to_end(tag))
     }
 
     #[test]
-    fn precondition_is_end_to_end_only_under_a_relaying_policy() {
-        assert!(ResolvedPolicy::from_preset(transparent())
-            .end_to_end_option_tags()
-            .is_empty());
-        for preset in [intra_trust(), trust_boundary(), trunk_edge()] {
-            assert_eq!(
-                ResolvedPolicy::from_preset(preset).end_to_end_option_tags(),
-                &["precondition"]
-            );
-        }
+    fn each_preset_passes_the_tags_whose_negotiating_headers_it_relays() {
+        // transparent: strips Supported/Require on responses, copies the rest.
+        assert_eq!(
+            passed(&ResolvedPolicy::from_preset(transparent())),
+            [false, true, true]
+        );
+        // intra-trust: default copy both ways, nothing relevant overridden.
+        assert_eq!(
+            passed(&ResolvedPolicy::from_preset(intra_trust())),
+            [true, true, true]
+        );
+        // boundary: default strip; Supported/Require are in its copy sets,
+        // History-Info / Resource-Priority / Accept-Resource-Priority are not.
+        assert_eq!(
+            passed(&ResolvedPolicy::from_preset(trust_boundary())),
+            [true, false, false]
+        );
+        // trunk-edge: strips History-Info on requests only.
+        assert_eq!(
+            passed(&ResolvedPolicy::from_preset(trunk_edge())),
+            [true, false, true]
+        );
     }
 
     #[test]
-    fn deltas_open_and_close_capability_negotiation() {
-        let mut opened = ResolvedPolicy::from_preset(transparent());
-        opened.deltas_copy = vec!["Supported".to_string(), "Require".to_string()];
-        assert!(opened.relays_capability_negotiation());
-
-        // Supported alone is not enough: the callee's Require still cannot
-        // reach the caller.
+    fn a_tag_needs_every_negotiating_header_in_both_directions() {
+        // Supported alone is not enough for precondition: the callee's Require
+        // still cannot reach the caller.
         let mut half_open = ResolvedPolicy::from_preset(transparent());
         half_open.deltas_copy = vec!["Supported".to_string()];
-        assert!(!half_open.relays_capability_negotiation());
+        assert!(!half_open.passes_end_to_end("precondition"));
+
+        let mut opened = ResolvedPolicy::from_preset(transparent());
+        opened.deltas_copy = vec!["Supported".to_string(), "Require".to_string()];
+        assert!(opened.passes_end_to_end("precondition"));
+
+        // Resource-Priority out without Accept-Resource-Priority back.
+        let mut out_only = ResolvedPolicy::from_preset(trust_boundary());
+        out_only.deltas_copy = vec!["Resource-Priority".to_string()];
+        assert!(!out_only.passes_end_to_end("resource-priority"));
 
         let mut closed = ResolvedPolicy::from_preset(intra_trust());
-        closed.deltas_strip = vec!["Require".to_string()];
-        assert!(!closed.relays_capability_negotiation());
-        assert!(closed.end_to_end_option_tags().is_empty());
+        closed.deltas_strip = vec!["Require".to_string(), "History-Info".to_string()];
+        assert_eq!(passed(&closed), [false, false, true]);
+    }
+
+    #[test]
+    fn only_listed_tags_pass_end_to_end_and_case_does_not_matter() {
+        let policy = ResolvedPolicy::from_preset(intra_trust());
+        assert!(policy.passes_end_to_end("HistInfo"));
+        for tag in [
+            "outbound", "path", "gruu", "100rel", "timer", "replaces", "",
+        ] {
+            assert!(!policy.passes_end_to_end(tag), "{tag} is not end to end");
+        }
     }
 
     // ----- Preset validation -----

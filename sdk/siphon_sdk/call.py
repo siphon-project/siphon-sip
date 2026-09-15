@@ -775,9 +775,11 @@ class Call:
                 siphon's own, because siphon is that leg's UAC: ``Allow``
                 is siphon's method set, and ``Supported`` is ``replaces``
                 plus the caller's ``100rel`` / ``timer``, with the caller's
-                ``precondition`` only when the policy copies ``Supported``
-                and ``Require`` in both directions (every built-in preset
-                except ``"transparent-b2bua@2026"``).  A value set with
+                ``precondition`` / ``histinfo`` / ``resource-priority``
+                only when the policy copies what that extension negotiates
+                with in both directions (``Supported`` + ``Require``,
+                ``History-Info``, ``Resource-Priority`` out and
+                ``Accept-Resource-Priority`` back).  A value set with
                 :meth:`set_header` goes out instead.
             copy: Per-call delta — headers to copy verbatim regardless of
                 the preset's default verb (e.g. ``["X-Operator-Tag"]``).

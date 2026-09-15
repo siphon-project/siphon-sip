@@ -15,9 +15,9 @@ const CALLER: &str = "192.0.2.10:5060";
 
 /// A caller listing extensions a B2BUA does not implement on the leg it
 /// originates (`outbound`, `path`, `gruu`, `eventlist`, `answermode`,
-/// `park-info`, `histinfo`) next to ones it does (`100rel`, `timer`) and one
-/// the endpoints negotiate through it (`precondition`), and an `Allow` that is
-/// not siphon's method set.
+/// `park-info`) next to ones it does (`100rel`, `timer`) and the ones the
+/// endpoints negotiate through it (`precondition`, `histinfo`,
+/// `resource-priority`), and an `Allow` that is not siphon's method set.
 const CALLER_INVITE: &str = concat!(
     "INVITE sip:15550100042@siphon.example.com SIP/2.0\r\n",
     "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caps\r\n",
@@ -28,7 +28,7 @@ const CALLER_INVITE: &str = concat!(
     "CSeq: 1 INVITE\r\n",
     "Contact: <sip:caller@192.0.2.10:5060>\r\n",
     "Supported: 100rel, timer, precondition, outbound, path, gruu\r\n",
-    "Supported: eventlist, answermode, park-info, histinfo\r\n",
+    "Supported: eventlist, answermode, park-info, histinfo, resource-priority\r\n",
     "Allow: INVITE, ACK, BYE, CANCEL, PRACK, UPDATE, SUBSCRIBE, NOTIFY, PUBLISH\r\n",
     "Content-Length: 0\r\n",
     "\r\n",
@@ -56,7 +56,6 @@ const NOT_SIPHONS: &[&str] = &[
     "eventlist",
     "answermode",
     "park-info",
-    "histinfo",
 ];
 
 fn parse(raw: &str) -> SipMessage {
@@ -166,25 +165,129 @@ async fn the_b_leg_advertises_siphons_extensions_not_the_callers() {
             "`{tag}` is the caller's extension, not siphon's: {supported:?}"
         );
     }
-    assert_eq!(supported, tags(&["100rel", "timer", "replaces"]));
+    assert_eq!(
+        supported,
+        tags(&[
+            "100rel",
+            "timer",
+            "histinfo",
+            "resource-priority",
+            "replaces"
+        ])
+    );
 }
 
-/// `precondition` is negotiated between the two endpoints, so it belongs on the
-/// B-leg exactly when the call's policy relays `Supported` and `Require` both
-/// ways; a policy that strips the callee's `Require` on the way back would
-/// leave the caller unable to see the answer's preconditions.
+/// An end-to-end tag belongs on the B-leg exactly when the call's policy relays
+/// what that extension negotiates with, both ways: `Supported` and `Require`
+/// for `precondition`, `History-Info` for `histinfo`, `Resource-Priority` out
+/// and `Accept-Resource-Priority` back for `resource-priority`.
 #[tokio::test(flavor = "multi_thread")]
-async fn precondition_crosses_only_under_a_policy_that_relays_capability_negotiation() {
-    let relayed = tags(&["100rel", "timer", "precondition", "replaces"]);
-    let withheld = tags(&["100rel", "timer", "replaces"]);
+async fn end_to_end_tags_cross_only_where_the_policy_relays_their_negotiation() {
     for (name, expected) in [
-        ("transparent-b2bua@2026", &withheld),
-        ("ims-intra-trust-domain@2026", &relayed),
-        ("ims-trust-domain-boundary@2026", &relayed),
-        ("sip-trunk-edge@2026", &relayed),
+        (
+            // Strips Supported/Require on responses; copies the rest.
+            "transparent-b2bua@2026",
+            tags(&[
+                "100rel",
+                "timer",
+                "histinfo",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+        (
+            "ims-intra-trust-domain@2026",
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "histinfo",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+        (
+            // Default-strip: History-Info, Resource-Priority and
+            // Accept-Resource-Priority are not in its copy set.
+            "ims-trust-domain-boundary@2026",
+            tags(&["100rel", "timer", "precondition", "replaces"]),
+        ),
+        (
+            // Strips History-Info on requests.
+            "sip-trunk-edge@2026",
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
     ] {
         let invite = b_leg_invite(CALLER_INVITE, Some(preset(name)));
-        assert_eq!(&supported_tags(&invite), expected, "under {name}");
+        assert_eq!(supported_tags(&invite), expected, "under {name}");
+    }
+}
+
+/// Per-call deltas move the same test: each tag follows the headers its
+/// extension rides on, in both directions, and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn deltas_on_the_negotiating_headers_move_the_end_to_end_tags() {
+    let mut no_history = preset("ims-intra-trust-domain@2026");
+    no_history.deltas_strip = vec!["History-Info".to_string()];
+    let mut no_priority_answer = preset("ims-intra-trust-domain@2026");
+    no_priority_answer.deltas_strip = vec!["Accept-Resource-Priority".to_string()];
+    let mut boundary_history = preset("ims-trust-domain-boundary@2026");
+    boundary_history.deltas_copy = vec!["History-Info".to_string()];
+    let mut boundary_priority_out_only = preset("ims-trust-domain-boundary@2026");
+    boundary_priority_out_only.deltas_copy = vec!["Resource-Priority".to_string()];
+    let mut boundary_priority = preset("ims-trust-domain-boundary@2026");
+    boundary_priority.deltas_copy = vec![
+        "Resource-Priority".to_string(),
+        "Accept-Resource-Priority".to_string(),
+    ];
+
+    for (label, policy, expected) in [
+        (
+            "intra-trust, strip=[History-Info]",
+            no_history,
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+        (
+            "intra-trust, strip=[Accept-Resource-Priority]",
+            no_priority_answer,
+            tags(&["100rel", "timer", "precondition", "histinfo", "replaces"]),
+        ),
+        (
+            "boundary, copy=[History-Info]",
+            boundary_history,
+            tags(&["100rel", "timer", "precondition", "histinfo", "replaces"]),
+        ),
+        (
+            "boundary, copy=[Resource-Priority]",
+            boundary_priority_out_only,
+            tags(&["100rel", "timer", "precondition", "replaces"]),
+        ),
+        (
+            "boundary, copy=[Resource-Priority, Accept-Resource-Priority]",
+            boundary_priority,
+            tags(&[
+                "100rel",
+                "timer",
+                "precondition",
+                "resource-priority",
+                "replaces",
+            ]),
+        ),
+    ] {
+        let invite = b_leg_invite(CALLER_INVITE, Some(policy));
+        assert_eq!(supported_tags(&invite), expected, "{label}");
     }
 }
 
@@ -199,7 +302,13 @@ async fn a_copy_delta_relays_capability_negotiation_not_the_callers_list() {
     let invite = b_leg_invite(CALLER_INVITE, Some(copy_supported));
     assert_eq!(
         supported_tags(&invite),
-        tags(&["100rel", "timer", "replaces"])
+        tags(&[
+            "100rel",
+            "timer",
+            "histinfo",
+            "resource-priority",
+            "replaces"
+        ])
     );
 
     let mut copy_both = preset("transparent-b2bua@2026");
@@ -207,7 +316,14 @@ async fn a_copy_delta_relays_capability_negotiation_not_the_callers_list() {
     let invite = b_leg_invite(CALLER_INVITE, Some(copy_both));
     assert_eq!(
         supported_tags(&invite),
-        tags(&["100rel", "timer", "precondition", "replaces"])
+        tags(&[
+            "100rel",
+            "timer",
+            "precondition",
+            "histinfo",
+            "resource-priority",
+            "replaces"
+        ])
     );
 }
 

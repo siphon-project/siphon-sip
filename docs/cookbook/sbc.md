@@ -190,27 +190,36 @@ lists, whatever the preset does with the rest of the headers:
 
 - `Allow` is SIPhon's method set, the same one its responses advertise.
 - `Supported` is `replaces`, plus `timer` when SIPhon runs the session timer, plus
-  these tags if the caller offered them: `100rel`, `timer`, and `precondition` when
-  the policy relays capability negotiation. Relaying means copying both `Supported`
-  and `Require` on requests and on responses. Preconditions are negotiated between
-  the two endpoints through SIPhon, so they only work where the callee's `Require`
-  can reach the caller.
+  the caller's `100rel` and `timer` if it offered them. On top of that go the tags of
+  extensions the two endpoints negotiate with each other through SIPhon, if the
+  caller offered them and the policy copies what they negotiate with on requests
+  *and* on responses:
 
-A caller offering `Supported: 100rel, timer, precondition, outbound, path`:
+| Tag | Needs the policy to copy |
+|---|---|
+| `precondition` (RFC 3312) | `Supported` and `Require`, both ways |
+| `histinfo` (RFC 7044) | `History-Info`, both ways |
+| `resource-priority` (RFC 4412) | `Resource-Priority` on the request, `Accept-Resource-Priority` on the response |
+
+Half a negotiation is no negotiation: a callee's `Require: precondition` that cannot
+reach the caller leaves preconditions stuck. A caller offering
+`Supported: 100rel, timer, precondition, histinfo, resource-priority, outbound, path`:
 
 | Preset | B-leg INVITE carries |
 |---|---|
-| `transparent-b2bua@2026` | `Supported: 100rel,timer,replaces` |
-| `ims-intra-trust-domain@2026` | `Supported: 100rel,timer,precondition,replaces` |
+| `transparent-b2bua@2026` | `Supported: 100rel,timer,histinfo,resource-priority,replaces` |
+| `ims-intra-trust-domain@2026` | `Supported: 100rel,timer,precondition,histinfo,resource-priority,replaces` |
 | `ims-trust-domain-boundary@2026` | `Supported: 100rel,timer,precondition,replaces` |
-| `sip-trunk-edge@2026` | `Supported: 100rel,timer,precondition,replaces` |
+| `sip-trunk-edge@2026` | `Supported: 100rel,timer,precondition,resource-priority,replaces` |
 
 Any other tag the caller lists is dropped. Per-call deltas feed the same test:
 `copy=["Supported", "Require"]` lets `precondition` cross under the default preset,
-and `strip=["Require"]` stops it under the other three. `copy=["Supported"]` on its
-own does not relay the caller's list, since every preset already copies `Supported`
-on requests. When a far end really needs the caller's list, set it from the script,
-which is precedence 1 and goes out as written even past a `strip=`:
+`strip=["History-Info"]` keeps `histinfo` off anywhere, and
+`copy=["Resource-Priority", "Accept-Resource-Priority"]` opens `resource-priority` at
+the trust boundary. `copy=["Supported"]` on its own does not relay the caller's list,
+since every preset already copies `Supported` on requests. When a far end really needs
+the caller's list, set it from the script, which is precedence 1 and goes out as
+written even past a `strip=`:
 
 ```python
 call.set_header("Supported", call.get_header("Supported"))

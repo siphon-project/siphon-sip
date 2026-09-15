@@ -290,17 +290,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   `Allow` is now siphon's method set, the one its responses already advertise.
   `Supported` is `replaces`, plus `timer` when siphon runs the session timer,
-  plus three of the caller's tags if the caller offered them. `100rel` and
-  `timer` pass as before. `precondition` passes only when the call's header
-  policy copies both `Supported` and `Require` in both directions, because
-  preconditions are negotiated between the endpoints through siphon and do not
-  work if the callee's `Require` cannot reach the caller.
-  `ims-intra-trust-domain@2026`, `ims-trust-domain-boundary@2026` and
-  `sip-trunk-edge@2026` do that; `transparent-b2bua@2026`, the default, strips
-  both on responses. Every other caller tag is dropped. On the wire, a caller
-  offering `Supported: 100rel, timer, precondition, outbound, path` now reaches
-  the callee as `Supported: 100rel,timer,replaces` under the default preset, and
-  with `precondition` under the other three.
+  plus the caller's `100rel` and `timer` as before. On top of that go the tags
+  of extensions the caller and callee negotiate with each other through siphon,
+  if the caller offered them and the call's header policy copies what they
+  negotiate with in both directions. Half a negotiation does not work:
+
+  - `precondition` needs `Supported` and `Require`. `ims-intra-trust-domain@2026`,
+    `ims-trust-domain-boundary@2026` and `sip-trunk-edge@2026` copy both;
+    `transparent-b2bua@2026`, the default, strips both on responses.
+  - `histinfo` (RFC 7044) needs `History-Info`. The default preset and
+    `ims-intra-trust-domain@2026` copy it both ways.
+  - `resource-priority` (RFC 4412) needs `Resource-Priority` on the request and
+    `Accept-Resource-Priority` on the response. Every preset but
+    `ims-trust-domain-boundary@2026` copies them.
+
+  Every other caller tag is dropped. On the wire, a caller offering
+  `Supported: 100rel, timer, precondition, histinfo, outbound, path` now reaches
+  the callee as `Supported: 100rel,timer,histinfo,replaces` under the default
+  preset, and as `Supported: 100rel,timer,precondition,replaces` under
+  `ims-trust-domain-boundary@2026`.
 
   A script that needs the caller's list sets it:
   `call.set_header("Supported", call.get_header("Supported"))`. A `Supported` or
@@ -308,8 +316,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   where a `strip=` delta or the policy would have dropped it; `replaces` is
   still merged into a `Supported` set that way. `copy=["Supported"]` does not
   bring the caller's list back. Every built-in preset already copies `Supported`
-  on requests, so the delta only matters for whether capability negotiation
-  crosses, together with `Require`.
+  on requests, so per-call deltas only move the tags above:
+  `copy=["Supported", "Require"]` lets `precondition` through under the default
+  preset, and `strip=["History-Info"]` keeps `histinfo` off.
 
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.0.** The wire stays compatible in both directions:

@@ -71,7 +71,7 @@ const CALLER_OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
 /// - `Supported`: of the caller's tags the policy left on the request, the ones
 ///   siphon claims on the caller's offer ([`CALLER_OFFERED_OPTION_TAGS`]) and
 ///   the ones the policy passes end to end
-///   ([`ResolvedPolicy::end_to_end_option_tags`](crate::b2bua::header_policy::ResolvedPolicy::end_to_end_option_tags)).
+///   ([`ResolvedPolicy::passes_end_to_end`](crate::b2bua::header_policy::ResolvedPolicy::passes_end_to_end)).
 ///   The tags siphon claims unconditionally — `replaces`, and `timer` when it
 ///   runs the session timer — are merged at the end of the build, after the
 ///   per-carrier headers, as they always were.
@@ -96,7 +96,6 @@ pub(super) fn advertise_b_leg_capabilities(
     if shaped_by_script("Supported") {
         restore_script_header(outbound, script, "Supported");
     } else {
-        let end_to_end = policy.end_to_end_option_tags();
         let offered: Vec<String> = outbound
             .get_all("Supported")
             .map(|values| {
@@ -112,8 +111,8 @@ pub(super) fn advertise_b_leg_capabilities(
         for tag in offered {
             if CALLER_OFFERED_OPTION_TAGS
                 .iter()
-                .chain(end_to_end)
                 .any(|claimed| claimed.eq_ignore_ascii_case(&tag))
+                || policy.passes_end_to_end(&tag)
             {
                 advertise_option_tag(outbound, &tag);
             }
