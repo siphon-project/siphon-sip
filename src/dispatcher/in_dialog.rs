@@ -156,7 +156,7 @@ pub(super) fn ack_forward_hop(
 }
 
 /// Pin the outbound transport to a matching IPsec SA's protocol
-/// (3GPP TS 33.203 §7.2).  When `destination` matches a registered UE binding,
+/// (3GPP TS 33.203 §7.1).  When `destination` matches a registered UE binding,
 /// the SA's pinned protocol (UDP vs TCP) overrides whatever the dialog route
 /// set or cached transport selected.  In-dialog requests (BYE, UPDATE,
 /// in-dialog re-INVITE, end-to-end 2xx ACK) often arrive with a Route URI /

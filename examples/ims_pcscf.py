@@ -243,9 +243,10 @@ async def _handle_401_register(request, reply):
     # up.  +60 s grace allows a re-REGISTER round-trip before expiry.
     expires_secs = (request.contact_expires or 600) + 60
 
-    # No `protocol=` kwarg → multi-protocol XFRM selectors (TS 33.203
-    # §7.2: "the SAs shall be used to protect *all* SIP signalling …
-    # including over UDP and TCP").  One SPI pair covers both transports
+    # No `protocol=` kwarg → multi-protocol XFRM selectors.  TS 33.203
+    # §6.3 has the SA pairs "all shared by TCP and UDP", and §7.1 says
+    # "The transport protocol selector shall allow UDP and TCP."
+    # One SPI pair covers both transports
     # under a single AuthVectorHandle consumption.  Required for iOS
     # handsets that REGISTER over TCP but emit MO MESSAGE over UDP —
     # the old single-transport pin would silently drop the MESSAGE on

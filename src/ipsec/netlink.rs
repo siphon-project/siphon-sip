@@ -460,7 +460,7 @@ fn xfrm_enc_name(ealg: EncryptionAlgorithm) -> &'static str {
 ///
 /// `selector_proto` is the upper-layer protocol number stamped into the
 /// XFRM selector — typically `IPPROTO_UDP` (17) for ESP-over-UDP IMS
-/// IPsec, or `IPPROTO_TCP` (6) for ESP-over-TCP (TS 33.203 §7.2).  The
+/// IPsec, or `IPPROTO_TCP` (6) for ESP-over-TCP (TS 33.203 §7.1).  The
 /// kernel only applies this SA to inner-protocol frames matching the
 /// selector, so a UDP-pinned selector silently drops TCP IPsec frames.
 pub async fn add_sa(
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(out[SELECTOR_PROTO_OFFSET], 6);
     }
 
-    /// `SaProtocol::Any` (the spec-compliant default per TS 33.203 §7.2)
+    /// `SaProtocol::Any` (the spec-compliant default per TS 33.203 §6.3 / §7.1)
     /// must surface as selector_proto=0 in both `xfrm_usersa_info` and
     /// `xfrm_userpolicy_info`.  The Linux kernel short-circuits the
     /// proto check when `sel->proto == 0` (see
@@ -1167,7 +1167,7 @@ mod tests {
         );
         assert_eq!(
             out[SELECTOR_PROTO_OFFSET], 0,
-            "selector_proto must be 0 to match any inner protocol (TS 33.203 §7.2)"
+            "selector_proto must be 0 to match any inner protocol (TS 33.203 §7.1)"
         );
         // Ports remain pinned — the SA still discriminates UE↔P-CSCF
         // flows by (port_uc, port_ps) vs (port_us, port_pc) even with

@@ -126,7 +126,7 @@ mod tests {
             6101,
         );
         // prot=esp;mod=trans, handset parameter order, no spaces within a
-        // mechanism (matches Samsung IMS 6.0 / TS 33.203 §7.2).
+        // mechanism (the shape handsets send; grammar per TS 33.203 Annex H).
         assert_eq!(
             build_security_client(&offer),
             "ipsec-3gpp;prot=esp;mod=trans;spi-c=4369;spi-s=8738;port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=null"

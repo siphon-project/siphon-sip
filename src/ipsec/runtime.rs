@@ -235,8 +235,9 @@ pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std:
 ///
 /// Equivalent cost to [`outbound_local_addr_for`] — one DashMap walk —
 /// but also returns the upper-layer protocol pinned into the SA's XFRM
-/// selector (3GPP TS 33.203 §7.2: UDP for ESP-over-UDP, TCP for
-/// ESP-over-TCP).  Use this on relay paths where the dispatcher would
+/// selector (UDP for ESP-over-UDP, TCP for ESP-over-TCP, or both, the
+/// default 3GPP TS 33.203 §7.1 calls for).  Use this on relay paths
+/// where the dispatcher would
 /// otherwise pick the transport from the URI's ``;transport=`` param or
 /// the inbound transport — in-dialog requests (BYE, UPDATE, in-dialog
 /// re-INVITE) route via the cached Contact captured at REGISTER time,
@@ -250,8 +251,8 @@ pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std:
 ///
 /// `current_transport` is the transport the dispatcher would otherwise
 /// use (URI hint / inbound transport / default).  When the SA covers
-/// both transports (`SaProtocol::Any` — the spec-compliant default per
-/// TS 33.203 §7.2), the caller's choice is preserved verbatim; only
+/// both transports (`SaProtocol::Any`, the spec-compliant default per
+/// TS 33.203 §7.1), the caller's choice is preserved verbatim; only
 /// when the SA is single-transport-pinned does this function override.
 ///
 /// Returns `None` under the same conditions as `outbound_local_addr_for`
@@ -292,7 +293,7 @@ fn outbound_endpoint_for_sa(
 ///
 /// `current_transport` is the transport the dispatcher would otherwise
 /// use; it's returned verbatim when the SA covers both transports
-/// (`SaProtocol::Any` — spec default per TS 33.203 §7.2).  For
+/// (`SaProtocol::Any`, the spec default per TS 33.203 §7.1).  For
 /// single-transport pins the SA's protocol wins, since a UDP-over-TCP
 /// or TCP-over-UDP mismatch silently drops the frame at the kernel
 /// XFRM selector.
@@ -533,7 +534,7 @@ mod tests {
     }
     #[test]
     fn outbound_for_sa_returns_tcp_transport_for_tcp_protocol() {
-        // ESP-over-TCP SA — TS 33.203 §7.2, iOS-style TCP-first UEs.
+        // ESP-over-TCP SA (the TCP case of TS 33.203 §7.1), iOS-style TCP-first UEs.
         // The dispatcher MUST route this destination via the TCP send
         // path even when the URI / inbound suggested UDP; the kernel
         // selector (proto=IPPROTO_TCP) silently drops UDP egress to

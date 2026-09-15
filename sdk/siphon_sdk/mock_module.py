@@ -8810,9 +8810,10 @@ class MockIpsec:
         # in unit tests.
         #
         # ``protocol=None`` (default) installs an XFRM selector covering
-        # both ESP-over-UDP and ESP-over-TCP under one SPI pair —
-        # required by 3GPP TS 33.203 §7.2 ("the SAs shall be used to
-        # protect *all* SIP signalling … including over UDP and TCP").
+        # both ESP-over-UDP and ESP-over-TCP under one SPI pair, as
+        # 3GPP TS 33.203 requires: the SA pairs are "all shared by TCP and
+        # UDP" (§6.3) and "The transport protocol selector shall allow UDP
+        # and TCP." (§7.1).
         # The wire-form ``protocol`` on the resulting
         # :class:`SecurityServerParams` collapses to ``"udp"`` so a script
         # leaves ``protocol=`` off, the standard shape: RFC 3329 (§2.2,
@@ -8837,14 +8838,15 @@ class MockIpsec:
         # consumes ``av`` before this check): the SA's P-CSCF side must be the
         # same family as the UE, so a UE whose family has no configured P-CSCF
         # listener raises rather than installing a dead mixed-family selector
-        # (3GPP TS 33.203 §7.2).
+        # (both SA addresses are those of the initial REGISTER's IP header,
+        # 3GPP TS 33.203 §7.1).
         ue_is_v6 = ":" in offer.ue_addr
         if (self.pcscf_addr_v6 if ue_is_v6 else self.pcscf_addr_v4) is None:
             family = "IPv6" if ue_is_v6 else "IPv4"
             raise ValueError(
                 f"no {family} P-CSCF listener configured for {family} UE "
                 f"{offer.ue_addr}; cannot build a same-family IPsec SA selector "
-                f"(3GPP TS 33.203 §7.2)"
+                f"(3GPP TS 33.203 §7.1)"
             )
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)
