@@ -103,9 +103,13 @@ fn shard_for(destination: SocketAddr, shards: usize) -> usize {
     (folded % shards as u64) as usize
 }
 
-/// Spawn one UDP listener worker per channel in `outbound_rx`, all sharing the
-/// same port via SO_REUSEPORT. Each worker sends inbound messages to
-/// `inbound_tx` and sends what its own channel carries (see [`UdpOutbound`]).
+/// Spawn one UDP listener worker per channel in `outbound_rx`, all serving one
+/// port. Each worker sends inbound messages to `inbound_tx` and sends what its
+/// own channel carries (see [`UdpOutbound`]).
+///
+/// On a configured port every worker binds a socket of its own, and they share
+/// the port via SO_REUSEPORT. On port 0 the workers share one socket, which
+/// holds the port the kernel picked alone (see [`PortSharing::Exclusive`]).
 ///
 /// Returns the address the workers bound, which carries the port the kernel
 /// picked when `local_addr` asks for port 0. A listener is up as long as one
@@ -121,15 +125,38 @@ pub async fn listen(
 ) -> std::io::Result<SocketAddr> {
     let worker_count = outbound_rx.len();
 
-    // The first socket to bind settles the address, and every later worker binds
-    // that concrete address. Were each to bind `local_addr`, a port-0 listener
-    // would get a separate kernel-picked port per worker.
+    if local_addr.port() == 0 && worker_count > 0 {
+        let socket = Arc::new(create_udp_socket(
+            local_addr,
+            tos,
+            recv_buffer_bytes,
+            PortSharing::Exclusive,
+        )?);
+        let bound = socket.local_addr()?;
+        info!(
+            "Started {} UDP workers on {}, sharing one socket",
+            worker_count, bound
+        );
+        for (worker_index, outbound_rx) in outbound_rx.into_iter().enumerate() {
+            tokio::spawn(run_worker(
+                worker_index,
+                bound,
+                Arc::clone(&socket),
+                inbound_tx.clone(),
+                outbound_rx,
+                Arc::clone(&acl),
+            ));
+        }
+        return Ok(bound);
+    }
+
+    // Every worker binds the configured address; the first socket to bind gives
+    // the address the listener returns.
     let mut bound: Option<SocketAddr> = None;
     let mut first_error: Option<std::io::Error> = None;
     let mut sockets: Vec<Option<Arc<UdpSocket>>> = Vec::with_capacity(worker_count);
     for worker_index in 0..worker_count {
-        let address = bound.unwrap_or(local_addr);
-        let opened = create_reusable_udp_socket(address, tos, recv_buffer_bytes)
+        let opened = create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes)
             .and_then(|socket| socket.local_addr().map(|actual| (socket, actual)));
         match opened {
             Ok((socket, actual)) => {
@@ -139,7 +166,7 @@ pub async fn listen(
             Err(error) => {
                 error!(
                     "[udp-worker-{}] failed to create socket on {}: {}",
-                    worker_index, address, error
+                    worker_index, local_addr, error
                 );
                 first_error.get_or_insert(error);
                 sockets.push(None);
@@ -305,10 +332,38 @@ pub(crate) fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> Connec
     ConnectionId(hasher.finish())
 }
 
+/// How a listener socket holds its port.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PortSharing {
+    /// `SO_REUSEADDR` and `SO_REUSEPORT`: every worker of a configured port binds
+    /// a socket of its own to it, and the kernel spreads datagrams over them.
+    Workers,
+    /// Neither option: the port belongs to this one socket.
+    ///
+    /// For a port the kernel picks. Linux lets a socket of the same user that
+    /// sets `SO_REUSEPORT` join a port whose sockets all set it, and a port-0
+    /// bind is handed such a port as readily as a free one. Were a port-0
+    /// listener to set the option, another port-0 bind that sets it too (another
+    /// listener, in this process or not) could land on the listener's port and
+    /// take a share of its datagrams.
+    Exclusive,
+}
+
+/// A worker socket for a configured port; see [`PortSharing::Workers`].
 fn create_reusable_udp_socket(
     local_addr: SocketAddr,
     tos: Option<u32>,
     recv_buffer_bytes: usize,
+) -> std::io::Result<UdpSocket> {
+    create_udp_socket(local_addr, tos, recv_buffer_bytes, PortSharing::Workers)
+}
+
+/// A listener socket bound to `local_addr`, holding its port as `sharing` says.
+fn create_udp_socket(
+    local_addr: SocketAddr,
+    tos: Option<u32>,
+    recv_buffer_bytes: usize,
+    sharing: PortSharing,
 ) -> std::io::Result<UdpSocket> {
     let socket = match local_addr {
         SocketAddr::V4(_) => socket2::Socket::new(
@@ -323,9 +378,11 @@ fn create_reusable_udp_socket(
         ),
     }?;
 
-    socket.set_reuse_address(true)?;
-    #[cfg(not(target_os = "windows"))]
-    socket.set_reuse_port(true)?;
+    if sharing == PortSharing::Workers {
+        socket.set_reuse_address(true)?;
+        #[cfg(not(target_os = "windows"))]
+        socket.set_reuse_port(true)?;
+    }
     socket.set_nonblocking(true)?;
 
     // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort (a marking
@@ -849,10 +906,10 @@ mod tests {
     /// A listener asked for port 0 returns the port the kernel picked, and every
     /// one of its workers serves that port.
     ///
-    /// Each worker binds a socket of its own. Were each to bind the requested
-    /// address, a port-0 listener would get a different port per worker: a peer
-    /// could reach only one of them, and the other workers would send from ports
-    /// that no reply is ever addressed to.
+    /// The workers share the listener's one socket. Were each to bind the
+    /// requested address, a port-0 listener would get a different port per
+    /// worker: a peer could reach only one of them, and the other workers would
+    /// send from ports that no reply is ever addressed to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_port_zero_listener_returns_the_one_port_its_workers_share() {
         const WORKERS: usize = 4;
@@ -920,6 +977,46 @@ mod tests {
                 "worker {shard} sent from {source}, not from the listener's address"
             );
         }
+    }
+
+    /// The port a port-0 listener is given is its own: no other socket can bind
+    /// it and take a share of its datagrams.
+    ///
+    /// Linux lets a socket of the same user that sets `SO_REUSEPORT` join a port
+    /// whose sockets all set it, and splits the port's datagrams between them. A
+    /// configured port is shared that way on purpose, by its workers. A port the
+    /// kernel picks must not be: a port-0 bind elsewhere with `SO_REUSEPORT` can
+    /// be handed a port such a listener holds, since the kernel's search passes
+    /// over only the ports that bind could not share, and a peer's datagrams
+    /// then reach the listener only some of the time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_port_zero_listener_holds_a_port_no_other_socket_can_join() {
+        let (inbound_tx, _inbound_rx) = flume::unbounded::<InboundMessage>();
+        let (_outbound, outbound_rx) = UdpOutbound::channels(4);
+        let bound = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            0,
+        )
+        .await
+        .expect("a port-0 udp listener binds");
+
+        let joiner = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        joiner.set_reuse_address(true).unwrap();
+        joiner.set_reuse_port(true).unwrap();
+        let error = joiner
+            .bind(&SockAddr::from(bound))
+            .expect_err("another socket must not be able to join a port-0 listener's port");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
     }
 
     /// A listener none of whose workers can bind returns the error to its caller,

@@ -344,11 +344,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   SCTP returned `()`. Bind port 0 and use the returned address to get a port the
   kernel picked, rather than choosing a port first and hoping nothing takes it
   before the bind. A UDP listener asked for port 0 now serves one port from all
-  its workers; each worker used to bind a port of its own. UDP and SCTP also
-  return a failed bind to the caller now, as the stream listeners already did,
-  and siphon exits when a configured UDP or SCTP listener cannot bind, naming the
-  transport and address, instead of starting without it. A UDP listener still
-  comes up as long as one of its workers binds.
+  its workers, on one socket that holds the port alone. Each worker used to bind
+  a port of its own with `SO_REUSEPORT` set, and a port-0 bind by another socket
+  of the same user that set it too could be handed one of those ports and take a
+  share of its datagrams. UDP and SCTP also return a failed bind to the caller
+  now, as the stream listeners already did, and siphon exits when a configured
+  UDP or SCTP listener cannot bind, naming the transport and address, instead of
+  starting without it. A UDP listener still comes up as long as one of its
+  workers binds.
 
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.1.** The wire stays compatible in both directions:
