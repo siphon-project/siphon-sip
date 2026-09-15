@@ -107,9 +107,11 @@ pub enum FailedCallEnd<'a> {
     /// the headers only that refusal carries: a 422 (Session Interval Too Small)
     /// and its `Min-SE` (RFC 4028 §9). Sent as it is.
     Refusal { response: SipMessage },
-    /// `420 Bad Extension` for a caller that `Require`s extensions the call
-    /// cannot honour, listed in `Unsupported` (RFC 3261 §8.2.2.3). Built from the
-    /// caller's INVITE like [`FailedCallEnd::Local`].
+    /// A caller that `Require`s extensions the call cannot honour: `420 Bad
+    /// Extension` listing them in `Unsupported` (RFC 3261 §8.2.2.3), or `494
+    /// Security Agreement Required` when an unverified `sec-agree` is among them
+    /// (RFC 3329 §2.3.1). Built from the caller's INVITE like
+    /// [`FailedCallEnd::Local`].
     BadExtension { unsupported: Vec<String> },
 }
 
@@ -123,8 +125,9 @@ impl FailedCallEnd<'_> {
                 status_code,
                 reason,
             } => return (*status_code, reason.clone()),
-            FailedCallEnd::BadExtension { .. } => {
-                return (420, "Bad Extension".to_string());
+            FailedCallEnd::BadExtension { unsupported } => {
+                let (status_code, reason) = unhonoured_tags_response(unsupported);
+                return (status_code, reason.to_string());
             }
         };
         match &response.start_line {
@@ -430,7 +433,10 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
                 state,
             ) {
                 // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
-                response.headers.set("Unsupported", unsupported.join(", "));
+                // A 494 for an unverified `sec-agree` lists nothing.
+                if status_code == 420 {
+                    response.headers.set("Unsupported", unsupported.join(", "));
+                }
                 send_message_from(
                     response,
                     a_leg.transport.transport,
@@ -476,10 +482,13 @@ fn finish_failed_call(
     state.call_event_receivers.remove(call_id);
 }
 
-/// Refuse the caller `420 Bad Extension`, listing `unsupported`, and end the
-/// call, on a path no `@b2bua.on_failure` decision applies to.
+/// Refuse the caller for the `unsupported` required tags and end the call, on a
+/// path no `@b2bua.on_failure` decision applies to.
 ///
-/// RFC 3261 §8.2.2.3. [`FailedCallEnd::BadExtension`] is the same refusal for
+/// The response is [`unhonoured_tags_response`]'s: `420 Bad Extension` listing
+/// them in `Unsupported` (RFC 3261 §8.2.2.3), or `494 Security Agreement
+/// Required` when an unverified `sec-agree` is among them (RFC 3329 §2.3.1).
+/// [`FailedCallEnd::BadExtension`] is the same refusal for
 /// a script's own routing action, where `@b2bua.on_failure` may still route
 /// again under another policy. These paths have no such decision to revisit:
 /// siphon answering the call itself is siphon as the only UAS, so no policy can
@@ -501,22 +510,27 @@ pub fn refuse_bad_extension(
     else {
         return;
     };
+    let (status_code, reason) = unhonoured_tags_response(&unsupported);
     info!(
         call_id = %call_id,
         unsupported = %unsupported.join(", "),
-        "B2BUA: the caller requires extensions this call cannot honour — refusing with 420"
+        status = status_code,
+        "B2BUA: the caller requires extensions this call cannot honour — refusing it"
     );
-    cdr_finalize_b2bua_fail(state, call_id, 420);
+    cdr_finalize_b2bua_fail(state, call_id, status_code);
     let mut response = build_a_leg_final_response(
         invite,
         &a_leg.dialog.local_tag,
         a_leg.stored_from.as_ref(),
         a_leg.stored_to.as_ref(),
-        420,
-        "Bad Extension",
+        status_code,
+        reason,
         state.server_header.as_deref(),
     );
-    response.headers.set("Unsupported", unsupported.join(", "));
+    if status_code == 420 {
+        // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
+        response.headers.set("Unsupported", unsupported.join(", "));
+    }
     send_message_from(
         response,
         a_leg.transport.transport,
@@ -525,7 +539,47 @@ pub fn refuse_bad_extension(
         a_leg_local_addr,
         state,
     );
-    finish_failed_call(call_id, &a_leg, 420, "Bad Extension", state);
+    finish_failed_call(call_id, &a_leg, status_code, reason, state);
+}
+
+/// Refuse `invite` on its own server transaction for the `unsupported` required
+/// tags ([`unhonoured_tags_response`]) and drop the call `call_id` made for it:
+/// for an INVITE siphon answers itself before it is a call of its own, a
+/// `Replaces` takeover, which must not touch the call it names.
+pub fn refuse_unhonoured_on_transaction(
+    inbound: &InboundMessage,
+    invite: &SipMessage,
+    call_id: &str,
+    unsupported: Vec<String>,
+    state: &DispatcherState,
+) {
+    let (status_code, reason) = unhonoured_tags_response(&unsupported);
+    warn!(
+        call_id = %call_id,
+        unsupported = %unsupported.join(", "),
+        status = status_code,
+        "B2BUA Replaces: refusing takeover — the INVITE requires extensions siphon does not honour"
+    );
+    let mut response = build_response(
+        invite,
+        status_code,
+        reason,
+        state.server_header.as_deref(),
+        &[],
+    );
+    if status_code == 420 {
+        response.headers.set("Unsupported", unsupported.join(", "));
+    }
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    state.call_actors.remove_call(call_id);
+    state.call_event_receivers.remove(call_id);
 }
 
 /// Release the media session a call that never connected still holds. No BYE

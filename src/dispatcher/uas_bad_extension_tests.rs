@@ -163,7 +163,7 @@ async fn answering_the_call_itself_goes_ahead_when_siphon_implements_every_requi
     let dispatcher = test_dispatcher();
     let (call_id, invite) = new_call(
         &dispatcher,
-        "100rel, timer, replaces, sec-agree",
+        "100rel, timer, replaces",
         "transparent-b2bua@2026",
     );
     assert!(b2bua_answer_call_with_state(

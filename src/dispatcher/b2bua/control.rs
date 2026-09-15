@@ -157,14 +157,16 @@ pub(crate) fn b2bua_route_call_with_state(
     // RFC 3261 §8.2.2.3, checked as `call.route()` is, under the call's policy,
     // before any carrier is dialled: refused the way a route with no routable
     // carrier ends the call.
+    let (script_shaped_headers, sec_agree_verified) = state
+        .call_actors
+        .get_call(&internal_call_id)
+        .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
+        .unwrap_or_default();
     let unsupported = unhonourable_required_tags(
         &template.headers,
-        &state
-            .call_actors
-            .get_call(&internal_call_id)
-            .map(|call| call.script_shaped_headers.clone())
-            .unwrap_or_default(),
+        &script_shaped_headers,
         &state.resolve_header_policy(&internal_call_id),
+        sec_agree_verified,
     );
     if !unsupported.is_empty() {
         refuse_bad_extension(&internal_call_id, &template, unsupported, state);
@@ -505,9 +507,14 @@ pub(crate) fn b2bua_answer_call_with_state(
     state: &DispatcherState,
 ) -> bool {
     // RFC 3261 §8.2.2.3: answering the call itself makes siphon the only UAS the
-    // caller has, so a required extension siphon does not implement is refused
-    // `420`, whatever the header policy would have relayed to a callee.
-    let unsupported = unimplemented_required_tags(&invite.headers);
+    // caller has, so a required extension siphon does not honour is refused
+    // (`420`, or `494` for an unverified `sec-agree`), whatever the header
+    // policy would have relayed to a callee.
+    let sec_agree_verified = state
+        .call_actors
+        .get_call(internal_call_id)
+        .is_some_and(|call| call.sec_agree_verified);
+    let unsupported = unimplemented_required_tags(&invite.headers, sec_agree_verified);
     if !unsupported.is_empty() {
         refuse_bad_extension(internal_call_id, invite, unsupported, state);
         return false;
@@ -905,22 +912,24 @@ pub(crate) fn b2bua_dial_call_with_state(
     // RFC 3261 §8.2.2.3, checked as `call.dial()` is, under the call's policy.
     // A controller cannot change that policy, so no other dial could connect the
     // caller either: it is refused now, not reported as a dial to retry.
+    let (script_shaped_headers, sec_agree_verified) = state
+        .call_actors
+        .get_call(&internal_call_id)
+        .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
+        .unwrap_or_default();
     let unsupported = unhonourable_required_tags(
         &template.headers,
-        &state
-            .call_actors
-            .get_call(&internal_call_id)
-            .map(|call| call.script_shaped_headers.clone())
-            .unwrap_or_default(),
+        &script_shaped_headers,
         &state.resolve_header_policy(&internal_call_id),
+        sec_agree_verified,
     );
     if !unsupported.is_empty() {
         control_notify_channel_event(
             sip_call_id,
             "DialFailed",
             serde_json::json!({
-                "code": 420,
-                "reason": "Bad Extension",
+                "code": unhonoured_tags_response(&unsupported).0,
+                "reason": unhonoured_tags_response(&unsupported).1,
                 "timed_out": false,
                 "unsupported": unsupported.clone(),
             }),

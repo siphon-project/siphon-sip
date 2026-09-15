@@ -2764,9 +2764,15 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
     );
     // Under the default preset precondition cannot cross (responses strip
     // Supported/Require); histinfo can, and Require reaches the callee. The
-    // duplicate vendor tag is listed once, in the caller's spelling.
+    // duplicate vendor tag is listed once, in the caller's spelling. The call's
+    // sec-agree was verified.
     assert_eq!(
-        unhonourable_required_tags(&invite, &[], &builtin_policy("transparent-b2bua@2026")),
+        unhonourable_required_tags(
+            &invite,
+            &[],
+            &builtin_policy("transparent-b2bua@2026"),
+            true
+        ),
         vec!["precondition".to_string(), "X-Lab-Extension".to_string()]
     );
     // The trust boundary relays precondition but not History-Info.
@@ -2774,7 +2780,8 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
         unhonourable_required_tags(
             &invite,
             &[],
-            &builtin_policy("ims-trust-domain-boundary@2026")
+            &builtin_policy("ims-trust-domain-boundary@2026"),
+            true
         ),
         vec!["X-Lab-Extension".to_string(), "histinfo".to_string()]
     );
@@ -2785,10 +2792,10 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
     let mut invite = SipHeaders::new();
     invite.set("Require", "precondition, replaces".to_string());
     let mut no_require = builtin_policy("ims-intra-trust-domain@2026");
-    assert!(unhonourable_required_tags(&invite, &[], &no_require).is_empty());
+    assert!(unhonourable_required_tags(&invite, &[], &no_require, false).is_empty());
     no_require.deltas_strip = vec!["Require".to_string()];
     assert_eq!(
-        unhonourable_required_tags(&invite, &[], &no_require),
+        unhonourable_required_tags(&invite, &[], &no_require, false),
         vec!["precondition".to_string()]
     );
     // A Require the script set goes out over the strip, so the callee is shown
@@ -2798,11 +2805,11 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
     let mut history = SipHeaders::new();
     history.set("Require", "histinfo, precondition".to_string());
     assert_eq!(
-        unhonourable_required_tags(&history, &[], &no_require),
+        unhonourable_required_tags(&history, &[], &no_require, false),
         vec!["histinfo".to_string(), "precondition".to_string()]
     );
     assert_eq!(
-        unhonourable_required_tags(&history, &["require".to_string()], &no_require),
+        unhonourable_required_tags(&history, &["require".to_string()], &no_require, false),
         vec!["precondition".to_string()]
     );
 }
@@ -2810,9 +2817,39 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
 #[test]
 fn unhonourable_required_tags_is_empty_without_require() {
     let invite = SipHeaders::new();
-    assert!(
-        unhonourable_required_tags(&invite, &[], &builtin_policy("transparent-b2bua@2026"))
-            .is_empty()
+    assert!(unhonourable_required_tags(
+        &invite,
+        &[],
+        &builtin_policy("transparent-b2bua@2026"),
+        false
+    )
+    .is_empty());
+}
+
+#[test]
+fn sec_agree_is_honoured_only_on_a_call_whose_agreement_was_verified() {
+    // RFC 3329 §2.3.1: an agreement siphon did not verify is not one it keeps,
+    // and the refusal for it is 494, not 420.
+    let mut invite = SipHeaders::new();
+    invite.set("Require", "sec-agree, 100rel".to_string());
+    let policy = builtin_policy("ims-intra-trust-domain@2026");
+    assert_eq!(
+        unhonourable_required_tags(&invite, &[], &policy, false),
+        vec!["sec-agree".to_string()]
+    );
+    assert!(unhonourable_required_tags(&invite, &[], &policy, true).is_empty());
+    assert_eq!(
+        unimplemented_required_tags(&invite, false),
+        vec!["sec-agree".to_string()]
+    );
+    assert!(unimplemented_required_tags(&invite, true).is_empty());
+    assert_eq!(
+        unhonoured_tags_response(&["precondition".to_string(), "SEC-AGREE".to_string()]),
+        (494, "Security Agreement Required")
+    );
+    assert_eq!(
+        unhonoured_tags_response(&["precondition".to_string()]),
+        (420, "Bad Extension")
     );
 }
 

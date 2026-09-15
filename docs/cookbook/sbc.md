@@ -261,8 +261,9 @@ The same rule decides whether SIPhon can take a call whose INVITE *requires* an
 extension. SIPhon is the caller's UAS, so a `Require` the call cannot honour is
 refused `420 Bad Extension` with the tags listed in `Unsupported` (RFC 3261 §8.2.2.3),
 before any B-leg goes out. A tag is honoured when SIPhon implements it (`100rel`,
-`timer`, `replaces`, `sec-agree`), or when the policy passes it end to end per the
-table above *and* copies `Require` to the callee. `Require: precondition` under
+`timer`, `replaces`, and `sec-agree` once the caller's IPsec agreement is verified),
+or when the policy passes it end to end per the table above *and* copies `Require`
+to the callee. `Require: precondition` under
 `transparent-b2bua@2026` is refused; under `ims-intra-trust-domain@2026` it is dialled.
 
 The check runs when `call.dial()` / `fork()` / `route()` is carried out, since that

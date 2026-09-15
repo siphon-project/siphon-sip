@@ -132,6 +132,58 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         return;
     }
 
+    // RFC 3329 §2.3.1: a request that requires the security agreement is checked
+    // against the association it arrived over before anything is done with it. An
+    // unprotected one, or one whose Security-Verify does not mirror that
+    // association, is answered 494 here, before any call or script exists; the
+    // 494 carries the association's Security-Server, "the server's unmodified
+    // list", when there is one to name.
+    let protected_sa = crate::ipsec::runtime::is_protected_local_port(inbound.local_addr.port())
+        .then(|| {
+            crate::ipsec::runtime::find_sa_for_ue(
+                &inbound.remote_addr.ip(),
+                inbound.remote_addr.port(),
+            )
+        })
+        .flatten();
+    let sec_agree_verified = match crate::ipsec::sec_agree::verify_sec_agree(
+        &message.headers,
+        protected_sa.as_ref(),
+    ) {
+        crate::ipsec::sec_agree::SecAgreeVerdict::NotRequired => false,
+        crate::ipsec::sec_agree::SecAgreeVerdict::Verified => true,
+        crate::ipsec::sec_agree::SecAgreeVerdict::Refused(refusal) => {
+            info!(
+                call_id = %sip_call_id,
+                source = %inbound.remote_addr,
+                ?refusal,
+                "B2BUA: refusing INVITE with 494 — the security agreement it requires is not verified"
+            );
+            let mut response = build_response(
+                &message,
+                494,
+                "Security Agreement Required",
+                state.server_header.as_deref(),
+                &[],
+            );
+            if let Some(sa) = protected_sa.as_ref() {
+                response.headers.set(
+                    "Security-Server",
+                    crate::ipsec::sec_agree::security_server_value(sa),
+                );
+            }
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+            return;
+        }
+    };
+
     // RFC 3891: if the INVITE carries a `Replaces` header it must match an
     // existing dialog, otherwise we MUST reject with 481 Call/Transaction
     // Does Not Exist. Silently treating it as a fresh INVITE would defeat
@@ -419,6 +471,8 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         // call's life) so the reliable-1xx strip gate can't be defeated by the
         // script mutating the shared INVITE for B-leg header shaping.
         call.a_leg_supports_100rel = a_leg_supports_100rel;
+        // Decided before the script ran, by the RFC 3329 check above.
+        call.sec_agree_verified = sec_agree_verified;
         // Listener the INVITE arrived on, so an imperative call.answer() /
         // call.progress() (which has no `inbound` in scope) sends the UAS
         // response back out the same socket.
@@ -705,21 +759,22 @@ pub fn apply_routing_action(
         action,
         CallAction::Dial { .. } | CallAction::Fork { .. } | CallAction::RouteSequence { .. }
     ) {
-        let script_shaped_headers = state
+        let (script_shaped_headers, sec_agree_verified) = state
             .call_actors
             .get_call(call_id)
-            .map(|call| call.script_shaped_headers.clone())
+            .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
             .unwrap_or_default();
         let unsupported = unhonourable_required_tags(
             &message_guard.headers,
             &script_shaped_headers,
             &state.resolve_header_policy(call_id),
+            sec_agree_verified,
         );
         if !unsupported.is_empty() {
             info!(
                 call_id = %call_id,
                 unsupported = %unsupported.join(", "),
-                "B2BUA: the caller requires extensions this call cannot honour — refusing with 420"
+                "B2BUA: the caller requires extensions this call cannot honour — refusing it"
             );
             // Concluded like any call that could not be connected, with no lock
             // held on the A-leg INVITE: `@b2bua.on_failure` may hold per-call

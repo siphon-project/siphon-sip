@@ -731,6 +731,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   their BYEs. The first teardown now claims the call and the others back off;
   a BYE that arrives while another teardown has the call is answered 200.
 
+- **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
+  security association it arrived over, and the agreement stops at siphon.**
+  RFC 3329 §2.3.1 has every request after the agreement carry a
+  `Security-Verify` that "mirrors the server's list received previously in the
+  Security-Server header field", has the server check it, and answers both a
+  modified list and "an unprotected request that contains a Require or
+  Proxy-Require header field with the value "sec-agree"" with `494 Security
+  Agreement Required`. The B2BUA checked none of this: such an INVITE was
+  routed whatever it carried, and its `sec-agree` went on to the callee.
+
+  Before the script runs, an INVITE whose `Require` or `Proxy-Require` lists
+  `sec-agree` is now answered 494 unless it arrived on a P-CSCF protected port
+  over an active security association and its `Security-Verify` names that
+  association: `ipsec-3gpp` with its algorithms, SPIs and protected ports. The
+  494 carries the association's `Security-Server` when there is one. siphon
+  keeps the association, not the `Security-Server` line a script sent, so
+  parameters the association does not record (`q`, `prot`, `mod`) are not
+  compared. `sec-agree` counts as honoured for the Require check only on a
+  verified call, and a script that makes an unverified call require it gets
+  the call refused 494 rather than 420. On the B-leg INVITE `sec-agree` is
+  removed from `Require` and `Proxy-Require`, each dropped when empty, and the
+  caller's `Security-Verify` and `Security-Client` are dropped, as siphon's
+  in-dialog forwarding already does. A script that sets any of them for an
+  agreement of the B-leg's own keeps what it set.
+
 - **A B2BUA call answers `420 Bad Extension` when the caller `Require`s an
   extension the call cannot honour.** siphon is the caller's UAS, and RFC 3261
   §8.2.2.3 has a UAS refuse a request whose `Require` names an extension it
