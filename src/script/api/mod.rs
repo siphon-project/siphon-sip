@@ -630,20 +630,55 @@ pub fn ensure_registry(python: Python<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Install the `siphon` Python package into `sys.modules`.
-///
-/// Creates (or recreates) the module each time. If Rust singletons have been
-/// registered via `set_rust_singletons()`, they replace the Python stubs
-/// before any user script can import them.
-pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
-    let source = CString::new(include_str!("siphon_package.py"))
-        .map_err(|error| SiphonError::Script(format!("siphon package source CString: {error}")))?;
-    let file_name = CString::new("siphon/__init__.py")
-        .map_err(|error| SiphonError::Script(format!("siphon file name CString: {error}")))?;
-    let module_name = CString::new("siphon")
-        .map_err(|error| SiphonError::Script(format!("siphon module name CString: {error}")))?;
+/// Tell the namespaces that keep state across script loads that a new load
+/// starts. Call once per load, before the script runs.
+pub fn begin_script_load(python: Python<'_>) -> Result<()> {
+    if let Some(metrics_py) = METRICS_SINGLETON.get() {
+        let namespace = metrics_py
+            .bind(python)
+            .cast::<metrics::PyMetricsNamespace>()
+            .map_err(|error| SiphonError::Script(format!("metrics namespace: {error}")))?;
+        namespace
+            .try_borrow()
+            .map_err(|error| SiphonError::Script(format!("metrics namespace: {error}")))?
+            .begin_script_load();
+    }
+    Ok(())
+}
 
-    let module = PyModule::from_code(python, &source, &file_name, &module_name)
+/// Install a new `siphon` Python package into `sys.modules`.
+///
+/// Builds a new module object every time, fills it in completely (the package
+/// source, the pyclasses, the Rust singletons that replace the Python stubs,
+/// user namespaces, module extensions) and only then puts it in `sys.modules`.
+///
+/// It must not reuse the module already there. `PyModule::from_code` does, via
+/// `PyImport_ExecCodeModuleEx`: it re-executes the package into the live
+/// module. On a hot reload that is the module the running script's handlers
+/// hold, and re-executing the package rebinds every namespace on it to a fresh
+/// stub before the singletons are put back, while those handlers keep running.
+pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
+    let module = PyModule::new(python, "siphon")
+        .map_err(|error| SiphonError::Script(format!("failed to create siphon module: {error}")))?;
+    let builtins = python
+        .import("builtins")
+        .map_err(|error| SiphonError::Script(format!("import builtins: {error}")))?;
+    module
+        .setattr("__file__", "siphon/__init__.py")
+        .map_err(|error| SiphonError::Script(format!("siphon __file__: {error}")))?;
+    let code = builtins
+        .getattr("compile")
+        .and_then(|compile| {
+            compile.call1((
+                include_str!("siphon_package.py"),
+                "siphon/__init__.py",
+                "exec",
+            ))
+        })
+        .map_err(|error| SiphonError::Script(format!("compile siphon package: {error}")))?;
+    builtins
+        .getattr("exec")
+        .and_then(|exec| exec.call1((code, module.dict())))
         .map_err(|error| SiphonError::Script(format!("failed to create siphon module: {error}")))?;
 
     // Register pyclasses as top-level attributes on the `siphon` module
@@ -907,9 +942,66 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         .getattr("modules")
         .map_err(|error| SiphonError::Script(format!("sys.modules: {error}")))?;
 
+    // The one step that makes the module visible, and it replaces the previous
+    // module whole: a lookup through `sys.modules` gets either that one or this
+    // one, and a handler holding the previous one keeps it as it was.
     modules
         .set_item("siphon", &module)
         .map_err(|error| SiphonError::Script(format!("sys.modules['siphon'] = ...: {error}")))?;
 
     Ok(())
+}
+
+/// The `siphon` module installed for one script load.
+///
+/// Every load gets a module of its own (see [`install_siphon_module`]): handlers
+/// still running from the script a reload replaces keep the module they were
+/// loaded against, and the reloaded script gets the new one. A load that fails
+/// keeps the old script running, so unless [`Self::keep`] is called once the
+/// load has succeeded, the module is taken back out again and `sys.modules`
+/// goes on holding the module that script runs against.
+pub(crate) struct FreshSiphonModule<'py> {
+    modules: Bound<'py, PyAny>,
+    previous: Option<Bound<'py, PyAny>>,
+    kept: bool,
+}
+
+impl<'py> FreshSiphonModule<'py> {
+    /// Install a new `siphon` module for a script load that is about to run.
+    pub(crate) fn install(python: Python<'py>) -> Result<Self> {
+        let modules = python
+            .import("sys")
+            .and_then(|sys| sys.getattr("modules"))
+            .map_err(|error| SiphonError::Script(format!("sys.modules: {error}")))?;
+        let previous = modules.get_item("siphon").ok();
+        install_siphon_module(python)?;
+        let installed = Self {
+            modules,
+            previous,
+            kept: false,
+        };
+        begin_script_load(python)?;
+        Ok(installed)
+    }
+
+    /// The load succeeded: the new module stays.
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for FreshSiphonModule<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        if let Some(previous) = self.previous.take() {
+            if let Err(error) = self.modules.set_item("siphon", previous) {
+                tracing::error!(
+                    %error,
+                    "a script load failed and the siphon module it replaced could not be put back"
+                );
+            }
+        }
+    }
 }

@@ -746,7 +746,7 @@ impl ScriptEngine {
 
         Python::attach(|python| {
             let registry_module = get_or_create_registry(python)?;
-            super::api::install_siphon_module(python)?;
+            let siphon_module = super::api::FreshSiphonModule::install(python)?;
 
             // Clear the handler registry.
             registry_module
@@ -793,6 +793,7 @@ impl ScriptEngine {
                 "bytecode loaded and handlers extracted"
             );
 
+            siphon_module.keep();
             Ok(ScriptState {
                 source_path: path.to_owned(),
                 handlers,
@@ -818,8 +819,8 @@ impl ScriptEngine {
         // Create (or get) the registry module first — siphon_package.py imports it.
         let registry_module = get_or_create_registry(python)?;
 
-        // Ensure the siphon package is installed in sys.modules.
-        super::api::install_siphon_module(python)?;
+        // A new siphon package for this load, taken back out if the load fails.
+        let siphon_module = super::api::FreshSiphonModule::install(python)?;
 
         // Clear the handler registry before executing the script.
         let clear_fn = registry_module
@@ -898,6 +899,7 @@ impl ScriptEngine {
             "script compiled and handlers extracted"
         );
 
+        siphon_module.keep();
         Ok(ScriptState {
             source_path: path.to_owned(),
             handlers,
@@ -2328,6 +2330,324 @@ def route(request):
         assert!(result.is_err());
         // Old state is preserved
         assert_eq!(engine.state().handlers.len(), 1);
+    }
+
+    fn reload_test_config(path: &Path) -> ScriptConfig {
+        ScriptConfig {
+            path: path.to_str().unwrap().to_owned(),
+            reload: ReloadMode::Auto,
+            async_pool_size: None,
+            sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
+        }
+    }
+
+    /// The `siphon` module a loaded script's globals hold, read off its first
+    /// handler.
+    fn handler_siphon_module(python: Python<'_>, state: &ScriptState) -> Py<PyAny> {
+        state.handlers[0]
+            .callable
+            .bind(python)
+            .getattr("__globals__")
+            .unwrap()
+            .get_item("siphon")
+            .unwrap()
+            .unbind()
+    }
+
+    /// A reload runs while handlers of the script it replaces are still
+    /// executing: requests in flight do not wait for it. Such a handler must
+    /// keep the `siphon` module it started with, whole, until it returns, and a
+    /// script loaded afterwards must get the module the reload installed.
+    ///
+    /// Reinstalling the package into the one live module rebound every
+    /// namespace on it to a fresh stub while the handler held it, and put the
+    /// Rust singletons back only afterwards, so the handler could meet stubs:
+    /// `proxy` utils "not initialized", `auth` and `metrics` raising,
+    /// `b2bua.terminate` quietly returning `False`.
+    ///
+    /// Runs in a process of its own: other tests' script loads install
+    /// `siphon` modules too, and this one reads which module `sys.modules` holds.
+    #[test]
+    fn a_reload_leaves_a_running_handler_the_siphon_module_it_started_with() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::a_reload_leaves_a_running_handler_the_siphon_module_it_started_with"
+            ),
+            || {
+                Python::initialize();
+                let directory = tempfile::TempDir::new().unwrap();
+                let script = directory.path().join("in_flight.py");
+                std::fs::write(
+                    &script,
+                    concat!(
+                        "import threading\n",
+                        "import siphon\n",
+                        "from siphon import proxy\n",
+                        "\n",
+                        "started = threading.Event()\n",
+                        "resume = threading.Event()\n",
+                        "\n",
+                        "@proxy.on_request\n",
+                        "def route(request):\n",
+                        "    module = siphon\n",
+                        "    namespaces = {name: getattr(module, name) for name in ('proxy', 'b2bua', 'auth', 'metrics', 'timer')}\n",
+                        "    started.set()\n",
+                        "    if not resume.wait(30):\n",
+                        "        return 'the test never resumed the handler'\n",
+                        "    for name, namespace in namespaces.items():\n",
+                        "        if getattr(module, name) is not namespace:\n",
+                        "            return 'siphon.' + name + ' was replaced under the running handler'\n",
+                        "    return 'consistent'\n",
+                    ),
+                )
+                .unwrap();
+
+                let engine = ScriptEngine::new(&reload_test_config(&script)).expect("initial load");
+                let (route, started, resume, old_module) = Python::attach(|python| {
+                    let state = engine.state();
+                    let globals = state.handlers[0]
+                        .callable
+                        .bind(python)
+                        .getattr("__globals__")
+                        .unwrap();
+                    (
+                        state.handlers[0].callable.clone_ref(python),
+                        globals.get_item("started").unwrap().unbind(),
+                        globals.get_item("resume").unwrap().unbind(),
+                        handler_siphon_module(python, &state),
+                    )
+                });
+
+                let running = std::thread::spawn(move || {
+                    Python::attach(|python| {
+                        route
+                            .bind(python)
+                            .call1((python.None(),))
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap()
+                    })
+                });
+                let handler_started = Python::attach(|python| {
+                    started
+                        .bind(python)
+                        .call_method1("wait", (30,))
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                });
+                assert!(handler_started, "the handler never started");
+
+                engine.reload().expect("reload while the handler runs");
+
+                Python::attach(|python| {
+                    resume.bind(python).call_method0("set").unwrap();
+                });
+                assert_eq!(running.join().unwrap(), "consistent");
+
+                Python::attach(|python| {
+                    let installed = python
+                        .import("sys")
+                        .unwrap()
+                        .getattr("modules")
+                        .unwrap()
+                        .get_item("siphon")
+                        .unwrap();
+                    let new_module = handler_siphon_module(python, &engine.state());
+                    assert!(
+                        new_module.bind(python).is(&installed),
+                        "the reloaded script must run against the module the reload installed"
+                    );
+                    assert!(
+                        !new_module.bind(python).is(old_module.bind(python)),
+                        "the reloaded script must not share the module the old handler holds"
+                    );
+                });
+            },
+        );
+    }
+
+    /// The value of `name`'s series whose labels are exactly `labels`.
+    fn counter_value(
+        registry: &prometheus::Registry,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        registry
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .find(|metric| {
+                let pairs = metric.get_label();
+                pairs.len() == labels.len()
+                    && labels.iter().all(|(label, value)| {
+                        pairs
+                            .iter()
+                            .any(|pair| pair.name() == *label && pair.value() == *value)
+                    })
+            })
+            .map(|metric| metric.get_counter().value())
+    }
+
+    /// A reload re-runs the script's top level, and that is where a script
+    /// declares its metrics: `calls = metrics.counter(...)` is the documented
+    /// pattern. The declarations of the load a reload replaces are still
+    /// registered, so the reload must take an identical declaration over, with
+    /// the counts it has, rather than refuse it as a duplicate. A reload that
+    /// changes a metric's labels is still refused, with the reason, since a
+    /// registered metric cannot change shape.
+    ///
+    /// Before, every reload of such a script failed with "already registered"
+    /// and kept the old script, so hot reload never worked for it.
+    ///
+    /// Runs in a process of its own: it installs the process-wide `metrics`
+    /// namespace, which every other test's script load would then pick up.
+    #[test]
+    fn a_reload_redeclares_the_metrics_its_script_declares() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::a_reload_redeclares_the_metrics_its_script_declares"
+            ),
+            || {
+                Python::initialize();
+                let registry = prometheus::Registry::new();
+                let custom = Arc::new(crate::metrics::custom::CustomMetrics::new(&registry));
+                Python::attach(|python| {
+                    crate::script::api::set_metrics_singleton(
+                        python,
+                        crate::script::api::metrics::PyMetricsNamespace::new(Arc::clone(&custom)),
+                    )
+                })
+                .expect("install the metrics namespace");
+
+                let directory = tempfile::TempDir::new().unwrap();
+                let script = directory.path().join("metrics_reload.py");
+                let declaring = |labels: &str| {
+                    format!(
+                        concat!(
+                            "from siphon import metrics, proxy\n",
+                            "\n",
+                            "calls = metrics.counter(\"reload_probe_calls_total\", \"Calls\", labels={})\n",
+                            "\n",
+                            "@proxy.on_request\n",
+                            "def route(request):\n",
+                            "    calls.labels(direction=\"inbound\").inc()\n",
+                        ),
+                        labels
+                    )
+                };
+                let count = || {
+                    counter_value(
+                        &registry,
+                        "reload_probe_calls_total",
+                        &[("direction", "inbound")],
+                    )
+                };
+                let handle_one_request = |engine: &ScriptEngine| {
+                    Python::attach(|python| {
+                        engine.state().handlers[0]
+                            .callable
+                            .bind(python)
+                            .call1((python.None(),))
+                            .expect("the handler runs");
+                    });
+                };
+
+                std::fs::write(&script, declaring("[\"direction\"]")).unwrap();
+                let engine = ScriptEngine::new(&reload_test_config(&script)).expect("initial load");
+                handle_one_request(&engine);
+                assert_eq!(count(), Some(1.0));
+
+                engine
+                    .reload()
+                    .expect("a reload must re-declare the metrics its script declares");
+                handle_one_request(&engine);
+                assert_eq!(
+                    count(),
+                    Some(2.0),
+                    "the reloaded script must count on in the metric it took over"
+                );
+
+                std::fs::write(&script, declaring("[\"direction\", \"result\"]")).unwrap();
+                let error = engine
+                    .reload()
+                    .expect_err("a reload must not change a registered metric's labels");
+                assert!(error.to_string().contains("labels"), "{error}");
+                handle_one_request(&engine);
+                assert_eq!(
+                    count(),
+                    Some(3.0),
+                    "the refused reload keeps the old script"
+                );
+            },
+        );
+    }
+
+    /// A reload that fails keeps the old script running, so `sys.modules` must
+    /// keep the `siphon` module that script runs against, not the one installed
+    /// for the load that failed.
+    ///
+    /// Runs in a process of its own, for the reason
+    /// `a_reload_leaves_a_running_handler_the_siphon_module_it_started_with` does.
+    #[test]
+    fn a_failed_reload_keeps_the_siphon_module_of_the_script_it_keeps() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::a_failed_reload_keeps_the_siphon_module_of_the_script_it_keeps"
+            ),
+            || {
+                Python::initialize();
+                let directory = tempfile::TempDir::new().unwrap();
+                let script = directory.path().join("failing_reload.py");
+                std::fs::write(
+                    &script,
+                    concat!(
+                        "import siphon\n",
+                        "from siphon import proxy\n",
+                        "\n",
+                        "@proxy.on_request\n",
+                        "def route(request):\n",
+                        "    pass\n",
+                    ),
+                )
+                .unwrap();
+                let engine = ScriptEngine::new(&reload_test_config(&script)).expect("initial load");
+                let running_module =
+                    Python::attach(|python| handler_siphon_module(python, &engine.state()));
+
+                std::fs::write(
+                    &script,
+                    concat!(
+                        "import siphon\n",
+                        "raise RuntimeError('this load fails on purpose')\n",
+                    ),
+                )
+                .unwrap();
+                assert!(engine.reload().is_err());
+
+                Python::attach(|python| {
+                    let installed = python
+                        .import("sys")
+                        .unwrap()
+                        .getattr("modules")
+                        .unwrap()
+                        .get_item("siphon")
+                        .unwrap();
+                    assert!(
+                        installed.is(running_module.bind(python)),
+                        "sys.modules must go back to the module the kept script runs against"
+                    );
+                });
+            },
+        );
     }
 
     #[test]

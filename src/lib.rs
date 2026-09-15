@@ -114,8 +114,8 @@ macro_rules! install_allocator {
 /// Test-only: run a test alone, in a child process of this test binary.
 ///
 /// Some tests look at state that belongs to the whole process: resident memory,
-/// a process-wide metrics gauge, or the one `siphon` Python module every
-/// install in the process re-executes into. Whatever the other tests in the
+/// a process-wide metrics gauge, or the `siphon` Python module in `sys.modules`
+/// and the registries every install mounts from. Whatever the other tests in the
 /// binary are doing moves that state, so such a test re-runs itself in a child
 /// that runs nothing else, and the parent only judges the child's result.
 #[cfg(test)]

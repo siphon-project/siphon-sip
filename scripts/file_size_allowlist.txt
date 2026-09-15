@@ -36,6 +36,6 @@ src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
 src/rtpengine/siphon_rtp.rs  2350  # one backend; client/set/events/connection split when touched — +116 for the recording commands and their event
 src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched
-src/script/engine.rs         1600  # 74 lines over; ratchet down on next touch
+src/script/engine.rs         1580  # 80 lines over; ratchet down on next touch
 src/admin/mod.rs             1600  # axum handlers; split by handler group when touched
 src/registrant/mod.rs        1550  # 4 lines over; ratchet down on next touch

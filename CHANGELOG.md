@@ -523,6 +523,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   every 5 s liveness tick. Each connection now removes only its own entry. For crate embedders,
   `StreamConnections::unregister` takes the connection id.
 
+- **A script hot reload could swap the `siphon` namespaces out from under handlers that were still
+  running.** A reload ran the package again inside the one live `siphon` module. That rebound every
+  namespace on it to a fresh Python stub, and only then put the Rust-backed namespaces back, while
+  requests kept being handled. A handler that looked a namespace up through the module in that
+  window (`import siphon` then `siphon.proxy...`, an import inside the function, or a helper module
+  imported then) could get a stub: `proxy` utilities "not initialized", `auth` and `metrics`
+  raising, `b2bua.terminate` returning `False`. Every load now gets a module of its own, filled in
+  completely before it goes into `sys.modules`. A running handler keeps the module it started with,
+  the reloaded script gets the new one, and a reload that fails puts the old one back. Names a
+  script imports at load time (`from siphon import proxy`) were never affected.
+
+- **Hot reload never worked for a script that declares custom metrics.** A reload runs the script's
+  top level again, and that is where `metrics.counter()`, `gauge()` and `histogram()` are declared,
+  but each refused a name that was already registered. So every reload of such a script failed with
+  "already registered" and kept the old script. A reload now takes over the metrics the script it
+  replaces declared, with their values, when type, labels and buckets are unchanged. Changing those
+  still needs a restart, and the reload fails saying so. Declaring one name twice in one load is
+  still an error, and a metric keeps the help text it was first registered with.
+
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own
