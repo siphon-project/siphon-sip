@@ -438,11 +438,18 @@ pub fn set_sdp_body(message: &mut SipMessage, body: Vec<u8>, content_type: &str)
         .set("Content-Length", message.body.len().to_string());
 }
 
-/// Give an SDP body siphon sends a B-leg siphon's own identity: the origin and
-/// its address are siphon's (topology hiding), stamped with the leg's session id
-/// and next version (RFC 3264 §8), which this advances.
+/// Give an SDP body siphon sends a B-leg what every SDP relayed toward a leg gets,
+/// in the same order as [`own_sdp_toward_leg`]: siphon's `o=` owner, `s=` and `o=`
+/// address (topology hiding), the leg's session id at its next version (RFC 3264
+/// §8), which this advances, and then the configured `media.sdp_strip_attributes`
+/// removed. `content_type` scopes the strip to the SDP part of a multipart body.
+///
+/// For a caller that already holds the leg, under the call's lock or detached
+/// from the call, where `own_sdp_toward_leg` would reserve the version through
+/// the store again.
 pub fn stamp_b_leg_origin(
     body: &mut Vec<u8>,
+    content_type: &str,
     leg: &mut Leg,
     transport: &Transport,
     state: &DispatcherState,
@@ -457,6 +464,7 @@ pub fn stamp_b_leg_origin(
         Some(&host),
     );
     leg.dialog.sdp_version += 1;
+    crate::media::body::strip_sdp_attributes(content_type, body, &state.sdp_strip_attributes);
 }
 
 /// Send the B-leg ACK held for a delayed offer (see `ack_b_leg_2xx`) with the
@@ -526,7 +534,7 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
         };
         let mut body = answer;
         if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
-            stamp_b_leg_origin(&mut body, leg, &held.transport, state);
+            stamp_b_leg_origin(&mut body, &content_type, leg, &held.transport, state);
             leg.initial_acked = true;
         }
         let mut ack = held.ack.clone();
@@ -629,7 +637,7 @@ pub fn take_held_ack_rejecting_offer(
     let held = call.delayed_offer_ack.clone().filter(|held| !held.sent)?;
     let mut body = rejecting_answer(&held.offer);
     if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
-        stamp_b_leg_origin(&mut body, leg, &held.transport, state);
+        stamp_b_leg_origin(&mut body, "application/sdp", leg, &held.transport, state);
         leg.initial_acked = true;
     }
     let mut ack = held.ack.clone();

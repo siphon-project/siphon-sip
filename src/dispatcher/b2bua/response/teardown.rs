@@ -337,7 +337,7 @@ pub fn b2bua_ack_and_bye_answered_leg(
         .filter(|_| invite_carried_no_offer && !response.body.is_empty())
     {
         let mut body = rejecting_answer(&response.body);
-        stamp_b_leg_origin(&mut body, &mut leg, &transport, state);
+        stamp_b_leg_origin(&mut body, "application/sdp", &mut leg, &transport, state);
         set_sdp_body(ack, body, "application/sdp");
     }
 

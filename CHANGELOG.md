@@ -444,8 +444,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   One call still waits for the caller, on purpose. When the B-leg INVITE went
   out without an offer, the callee's 2xx carries the offer and the ACK has to
   carry the answer (RFC 3264 §4), and only the caller has one, in its own ACK.
-  So that ACK goes out when the caller's arrives, carrying the caller's answer,
-  and every later copy of the 2xx gets the same ACK again, answer included. It
+  So that ACK goes out when the caller's arrives, carrying the caller's answer
+  the way any relayed SDP goes, with siphon's `o=`/`s=` and the configured
+  `media.sdp_strip_attributes` removed, and every later copy of the 2xx gets the
+  same ACK again, answer included. It
   used to go out with no body at all. A call that ends before the caller
   answers (a caller BYE, `b2bua.terminate`, an `@b2bua.on_answer` that raised)
   still ACKs the callee, with every stream rejected, right before the BYE. A

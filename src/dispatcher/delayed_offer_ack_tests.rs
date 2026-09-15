@@ -222,6 +222,13 @@ impl OfferlessCall {
         OfferlessCall::dial_on(TestDispatcher { state, udp })
     }
 
+    /// [`OfferlessCall::dial`] with `media.sdp_strip_attributes` set to `names`.
+    fn dial_stripping(names: &[&str]) -> OfferlessCall {
+        let mut dispatcher = test_dispatcher_with_script("");
+        dispatcher.state.sdp_strip_attributes = names.iter().map(|name| name.to_string()).collect();
+        OfferlessCall::dial_on(dispatcher)
+    }
+
     fn dial_on(TestDispatcher { state, udp }: TestDispatcher) -> OfferlessCall {
         let state = Arc::new(state);
         let call_id = state.call_actors.create_call(caller_leg());
@@ -459,6 +466,67 @@ fn assert_rejecting_ack_then_bye(sent: &[Sent]) -> (SipMessage, SipMessage) {
         Some(ack.body.len().to_string().as_str())
     );
     (ack, callee[bye_at].message.clone())
+}
+
+/// The caller's answer carrying attributes `media.sdp_strip_attributes` names, next
+/// to ones that stay: `msid-semantic` shares a prefix with `msid`.
+const CALLER_ANSWER_WITH_HIDDEN_ATTRIBUTES: &str = concat!(
+    "v=0\r\n",
+    "o=caller 3 3 IN IP4 192.0.2.20\r\n",
+    "s=caller session\r\n",
+    "c=IN IP4 192.0.2.20\r\n",
+    "t=0 0\r\n",
+    "a=x-hidden\r\n",
+    "a=msid-semantic: WMS stream-a\r\n",
+    "m=audio 40000 RTP/AVP 0 101\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "a=MSID:stream-a track-a\r\n",
+    "a=X-Hidden:detail\r\n",
+    "a=rtpmap:101 telephone-event/8000\r\n",
+    "m=video 0 RTP/AVP 96\r\n",
+);
+
+/// The callee's ACK carries SDP the caller wrote, so it gets what every SDP
+/// relayed toward a leg gets: siphon's `o=` and `s=` in place of the caller's,
+/// and the configured attributes stripped, at session and media level.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_in_the_callee_ack_is_hidden_and_stripped_like_any_relayed_sdp() {
+    let call = OfferlessCall::dial_stripping(&["msid", "x-hidden"]);
+    call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER_WITH_HIDDEN_ATTRIBUTES));
+    let sent = call.wire();
+    let acks_sent = acks(&sent);
+    assert_eq!(acks_sent.len(), 1, "one ACK, once the caller has answered");
+    let ack = &acks_sent[0].message;
+    let carried = body_text(ack);
+    assert!(
+        carried.contains("o=siphon ") && carried.contains("s=siphon\r\n"),
+        "siphon's o= and s= toward the callee:\n{carried}"
+    );
+    assert!(
+        !carried.contains("o=caller") && !carried.contains("s=caller"),
+        "{carried}"
+    );
+    assert!(
+        !carried.to_ascii_lowercase().contains("a=msid:")
+            && !carried.to_ascii_lowercase().contains("a=x-hidden"),
+        "the configured attributes are stripped:\n{carried}"
+    );
+    assert!(
+        carried.contains("a=msid-semantic: WMS stream-a"),
+        "{carried}"
+    );
+    assert!(
+        carried.contains("a=rtpmap:101 telephone-event/8000"),
+        "{carried}"
+    );
+    assert!(carried.contains("m=video 0 RTP/AVP 96"), "{carried}");
+    assert_eq!(
+        ack.headers.get("Content-Length").map(String::as_str),
+        Some(ack.body.len().to_string().as_str())
+    );
 }
 
 /// The case this exists for. The callee's ACK waits for the caller's, carries
