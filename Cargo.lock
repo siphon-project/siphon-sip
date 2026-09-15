@@ -3103,9 +3103,9 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "079caeea312b3e9c0cd4633e09a84cfbada1022f01cf5fad7b2a0ae4300529ac"
+checksum = "e86c05d7124484f19d7f4a2e23d37ad279f98805b855b1a52342ac275593637f"
 dependencies = [
  "serde",
  "serde_bytes",
