@@ -694,44 +694,44 @@ scale — and wants its own row.
 |-------|-----------|-----------------------|---------:|----------:|---------:|
 | Proxy | UDP       | `1000 250 1`          |      250 |       20% |    114 MB |
 | Proxy | UDP       | `5000 1000 4`         |    1 004 |       57% |    190 MB |
-| Proxy | UDP       | `20000 5000 4`        |    4 964 |      208% |    465 MB |
-| Proxy | UDP       | `40000 10000 8`       |    9 888 |      370% |    836 MB |
+| Proxy | UDP       | `20000 5000 4`        |    4 992 |      145% |    398 MB |
+| Proxy | UDP       | `40000 10000 8`       |    9 904 |      290% |    691 MB |
 | Proxy | TCP       | `1000 250 1`          |      250 |       19% |     92 MB |
 | Proxy | TCP       | `5000 1000 4`         |    1 004 |       47% |    121 MB |
-| Proxy | TCP       | `20000 5000 4`        |    4 960 |      161% |    220 MB |
-| Proxy | TCP       | `40000 10000 8`       |    9 928 |      323% |    356 MB |
+| Proxy | TCP       | `20000 5000 4`        |    4 964 |      156% |    221 MB |
+| Proxy | TCP       | `40000 10000 8`       |    9 960 |      325% |    343 MB |
 | B2BUA | UDP       | `1000 250 1`          |      250 |       20% |    106 MB |
 | B2BUA | UDP       | `5000 1000 4`         |    1 004 |       53% |    121 MB |
-| B2BUA | UDP       | `20000 5000 4`        |    4 948 |      190% |    140 MB |
-| B2BUA | UDP       | `40000 10000 8`       |    9 912 |      358% |    162 MB |
+| B2BUA | UDP       | `20000 5000 4`        |    4 968 |      165% |    142 MB |
+| B2BUA | UDP       | `40000 10000 8`       |    9 944 |      331% |    163 MB |
 | B2BUA | TCP       | `1000 250 1`          |      250 |       20% |    100 MB |
 | B2BUA | TCP       | `5000 1000 4`         |    1 004 |       50% |    111 MB |
 | B2BUA | TCP       | `20000 5000 4`        |    4 972 |      173% |    130 MB |
-| B2BUA | TCP       | `40000 10000 8`       |    9 912 |      321% |    150 MB |
+| B2BUA | TCP       | `40000 10000 8`       |    9 928 |      339% |    164 MB |
 | Register      | UDP    | `1000 250 1`         |      250 |        8% |   97.7 MB |
 | Register      | UDP    | `5000 1000 4`        |    1 004 |       19% |  137.5 MB |
-| Register      | UDP    | `20000 5000 4`       |    4 984 |       53% |  230.2 MB |
-| Register      | UDP    | `40000 10000 8`      |   10 000 |       94% |  360.9 MB |
+| Register      | UDP    | `20000 5000 4`       |    5 200 |       58% |  219.1 MB |
+| Register      | UDP    | `40000 10000 8`      |   10 248 |       96% |  341.0 MB |
 | Register      | TCP    | `1000 250 1`         |      250 |        6% |   84.2 MB |
 | Register      | TCP    | `5000 1000 4`        |    1 004 |       21% |   85.7 MB |
-| Register      | TCP    | `20000 5000 4`       |    4 984 |       55% |   87.3 MB |
-| Register      | TCP    | `40000 10000 8`      |    9 904 |       80% |   88.7 MB |
+| Register      | TCP    | `20000 5000 4`       |    4 992 |       58% |   90.7 MB |
+| Register      | TCP    | `40000 10000 8`      |    9 984 |       83% |   89.5 MB |
 | Register+auth | UDP    | `1000 250 1`         |      250 |       13% |  109.2 MB |
 | Register+auth | UDP    | `5000 1000 4`        |    1 004 |       31% |  170.4 MB |
-| Register+auth | UDP    | `20000 5000 4`       |    4 968 |       90% |  370.5 MB |
-| Register+auth | UDP    | `40000 10000 8`      |    9 944 |      167% |  646.5 MB |
+| Register+auth | UDP    | `20000 5000 4`       |    5 000 |       92% |  354.4 MB |
+| Register+auth | UDP    | `40000 10000 8`      |    9 984 |      141% |  607.1 MB |
 | Register+auth | TCP    | `1000 250 1`         |      250 |       13% |   84.6 MB |
 | Register+auth | TCP    | `5000 1000 4`        |    1 004 |       30% |   87.8 MB |
-| Register+auth | TCP    | `20000 5000 4`       |    4 984 |       75% |   91.2 MB |
-| Register+auth | TCP    | `40000 10000 8`      |    9 976 |      128% |   92.6 MB |
+| Register+auth | TCP    | `20000 5000 4`       |    5 012 |       82% |   91.1 MB |
+| Register+auth | TCP    | `40000 10000 8`      |    9 992 |      133% |   92.0 MB |
 
 The REGISTER rows are cheaper than the call rows by a wide margin — 10 000
-registrations/sec costs under one core (94 % UDP, 80 % TCP) where 10 000
-calls/sec costs 3.2–3.7 — which is what you would expect from one transaction
+registrations/sec costs under one core (96 % UDP, 83 % TCP) where 10 000
+calls/sec costs 2.9–3.4 — which is what you would expect from one transaction
 against an in-memory store versus a full INVITE→200→ACK→BYE→200 dialog.
 
-Digest authentication then adds 60–80 % on top (94 % → 167 % on UDP, 80 % →
-128 % on TCP at the 10 k rows): a second server transaction plus the hash. That
+Digest authentication then adds 45–60 % on top (96 % → 141 % on UDP, 83 % →
+133 % on TCP at the 10 k rows): a second server transaction plus the hash. That
 is the number that matters for an IMS edge, because a real P-CSCF/S-CSCF
 challenges every registration — the unauthenticated row is the floor, not the
 operating point.
@@ -750,7 +750,7 @@ Two asymmetries in the table are worth knowing about rather than puzzling over:
   The ephemeral-port pressure in the call rows comes from siphon's *outbound*
   connections to the UAS peers. A REGISTER has no callee leg, so siphon opens no
   outbound connections at all and the port table never comes under pressure.
-- **UDP REGISTER holds noticeably more RSS than TCP** (366 MB vs 87 MB at the
+- **UDP REGISTER holds noticeably more RSS than TCP** (341 MB vs 90 MB at the
   10 k row) while using *more* CPU. The UDP listener allocates a fresh receive
   buffer per datagram across every worker, so at 10 k cps that is allocator
   churn the stream transports do not pay; jemalloc holds the freed pages rather
