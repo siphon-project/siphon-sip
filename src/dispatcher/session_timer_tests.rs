@@ -843,72 +843,281 @@ async fn with_no_session_in_force_a_refresh_is_a_bodyless_update_where_allowed()
     );
 }
 
-/// RFC 3261 §14.1 / RFC 3264: a refresh re-INVITE without an offer draws the
-/// offer in the 2xx, and siphon answers it in the ACK. Holding no session
-/// description on the dialog, siphon has agreed to no media there, so its answer
-/// declines each offered stream (RFC 3264 §6) under siphon's own origin.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_offer_a_bodyless_refresh_draws_is_answered_in_the_ack() {
-    let dispatcher = timer_dispatcher(Some("session_expires: 90\n"));
-    let call_id = ringing_call_from(&dispatcher, &[]);
+/// The offer the callee's 2xx brings back to siphon's offerless refresh.
+const CALLEE_REFRESH_OFFER: &str = concat!(
+    "v=0\r\n",
+    "o=callee 7 7 IN IP4 198.51.100.20\r\n",
+    "s=-\r\n",
+    "c=IN IP4 198.51.100.20\r\n",
+    "t=0 0\r\n",
+    "m=audio 40000 RTP/AVP 0 8\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "m=video 40002 RTP/AVP 96\r\n",
+    "a=rtpmap:96 H264/90000\r\n",
+);
+
+/// The caller's answer to that offer, relayed to it.
+const CALLER_REFRESH_ANSWER: &str = concat!(
+    "v=0\r\n",
+    "o=caller 3 3 IN IP4 192.0.2.10\r\n",
+    "s=-\r\n",
+    "c=IN IP4 192.0.2.10\r\n",
+    "t=0 0\r\n",
+    "m=audio 41000 RTP/AVP 0\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "m=video 0 RTP/AVP 96\r\n",
+);
+
+/// A call where siphon refreshes the callee's dialog and holds no session
+/// description on it, toward a callee that allows no UPDATE: the refresh is a
+/// re-INVITE without an offer. Returns the call and that refresh.
+fn call_with_offerless_refresh_out(dispatcher: &TestDispatcher) -> (String, SipMessage) {
+    let call_id = ringing_call_from(dispatcher, &[]);
     callee_answers(
-        &dispatcher,
+        dispatcher,
         &call_id,
         &[("Session-Expires", "90")],
         &endpoint_sdp("198.51.100.20"),
     );
-    age(&dispatcher, &call_id, false, 46);
-    let refresh = requests(&sweep(&dispatcher), CALLEE, Method::Invite);
+    age(dispatcher, &call_id, false, 46);
+    let mut refresh = requests(&sweep(dispatcher), CALLEE, Method::Invite);
     assert_eq!(refresh.len(), 1, "no refresh went out");
     assert!(refresh[0].body.is_empty(), "the refresh carried an offer");
+    (call_id, refresh.remove(0))
+}
 
-    let offer = concat!(
-        "v=0\r\n",
-        "o=callee 7 7 IN IP4 198.51.100.20\r\n",
-        "s=-\r\n",
-        "c=IN IP4 198.51.100.20\r\n",
-        "t=0 0\r\n",
-        "m=audio 40000 RTP/AVP 0 8\r\n",
-        "a=rtpmap:0 PCMU/8000\r\n",
-        "m=video 40002 RTP/AVP 96\r\n",
-        "a=rtpmap:96 H264/90000\r\n",
+/// The callee answers `request`, one siphon sent it, with `status_code`, through
+/// the dispatcher's response entry. Returns what siphon put on the wire.
+fn callee_responds(
+    dispatcher: &TestDispatcher,
+    call_id: &str,
+    request: &SipMessage,
+    status_code: u16,
+    body: &str,
+) -> Vec<(SocketAddr, SipMessage)> {
+    let branch = branch_of(request);
+    let cseq = request
+        .headers
+        .cseq()
+        .cloned()
+        .expect("the request has a CSeq");
+    let mut response = callee_response(status_code, "Answer", &branch, &cseq, body);
+    response
+        .headers
+        .set("Session-Expires", "90;refresher=uac".to_string());
+    let _ = wire(dispatcher);
+    assert!(handle_b2bua_response(
+        call_id,
+        &branch,
+        &mut response,
+        status_code,
+        address(CALLEE),
+        &dispatcher.state,
+    ));
+    wire(dispatcher)
+}
+
+/// The caller answers `request`, one siphon sent it, with `status_code`, through
+/// the dispatcher's response entry. Returns what siphon put on the wire.
+fn caller_responds(
+    dispatcher: &TestDispatcher,
+    call_id: &str,
+    request: &SipMessage,
+    status_code: u16,
+    body: &str,
+) -> Vec<(SocketAddr, SipMessage)> {
+    let branch = branch_of(request);
+    let cseq = request
+        .headers
+        .cseq()
+        .cloned()
+        .expect("the request has a CSeq");
+    let siphon_tag = siphon_a_leg_tag(dispatcher, call_id);
+    let ok = caller_response(&branch, &cseq, &siphon_tag, body);
+    let text = String::from_utf8(ok.to_bytes())
+        .expect("the response is text")
+        .replacen(
+            "SIP/2.0 200 OK",
+            &format!("SIP/2.0 {status_code} Answer"),
+            1,
+        );
+    let mut response = parse_sip_message_bytes(text.as_bytes()).expect("the response parses");
+    let _ = wire(dispatcher);
+    assert!(handle_b2bua_response(
+        call_id,
+        &branch,
+        &mut response,
+        status_code,
+        address(CALLER),
+        &dispatcher.state,
+    ));
+    wire(dispatcher)
+}
+
+/// The session description siphon has in force on one leg's dialog.
+fn in_force(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool) -> Option<Vec<u8>> {
+    dispatcher
+        .state
+        .call_actors
+        .clone_leg(call_id, on_a_leg)
+        .and_then(|leg| leg.dialog.last_sent_sdp)
+}
+
+/// RFC 3261 §14.1, RFC 3264 §4: an offerless refresh draws the callee's offer in
+/// its 2xx, and the ACK has to carry the answer. siphon has none of its own: the
+/// caller has it. So the offer goes to the caller in a re-INVITE on the caller's
+/// dialog, with siphon's identity on it, and the caller's answer goes in the
+/// callee's ACK. Until then copies of the callee's 2xx are absorbed; afterwards
+/// each draws that same ACK. Media continues as the two parties agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_offer_an_offerless_refresh_draws_is_answered_by_the_other_party_in_the_ack() {
+    let dispatcher = timer_dispatcher(Some("session_expires: 90\n"));
+    let (call_id, refresh) = call_with_offerless_refresh_out(&dispatcher);
+
+    let sent = callee_responds(&dispatcher, &call_id, &refresh, 200, CALLEE_REFRESH_OFFER);
+    assert!(
+        requests(&sent, CALLEE, Method::Ack).is_empty(),
+        "the callee's 2xx was ACKed before there was an answer to put in the ACK"
     );
-    let sent = callee_answers_reinvite(
+    let relayed = requests(&sent, CALLER, Method::Invite);
+    assert_eq!(
+        relayed.len(),
+        1,
+        "the callee's offer was not relayed to the caller"
+    );
+    let relayed_offer = body_text(&relayed[0]);
+    assert!(
+        relayed_offer.contains("m=audio 40000 RTP/AVP 0 8\r\n")
+            && relayed_offer.contains("m=video 40002 RTP/AVP 96\r\n"),
+        "{relayed_offer}"
+    );
+    assert!(!relayed_offer.contains("o=callee"), "{relayed_offer}");
+    assert_eq!(
+        relayed[0].headers.call_id().map(String::as_str),
+        Some(A_LEG_CALL_ID)
+    );
+
+    let copy = callee_responds(&dispatcher, &call_id, &refresh, 200, CALLEE_REFRESH_OFFER);
+    assert!(requests(&copy, CALLEE, Method::Ack).is_empty());
+    assert!(
+        requests(&copy, CALLER, Method::Invite).is_empty(),
+        "a copy of the 2xx relayed the offer again"
+    );
+
+    let sent = caller_responds(
         &dispatcher,
         &call_id,
-        &refresh[0],
+        &relayed[0],
         200,
-        &[("Session-Expires", "90;refresher=uac")],
-        offer,
+        CALLER_REFRESH_ANSWER,
     );
-
-    let ack = request_to(&sent, CALLEE, Method::Ack);
-    let answer = body_text(&ack);
-    let media: Vec<&str> = answer
-        .lines()
-        .filter(|line| line.starts_with("m="))
-        .collect();
+    assert_eq!(requests(&sent, CALLER, Method::Ack).len(), 1);
+    let acks = requests(&sent, CALLEE, Method::Ack);
     assert_eq!(
-        media,
-        vec!["m=audio 0 RTP/AVP 0 8", "m=video 0 RTP/AVP 96"],
-        "the ACK does not answer each offered stream: {answer:?}"
+        acks.len(),
+        1,
+        "the callee was not ACKed once the answer was in"
     );
-    let session_id = dispatcher
+    let answer = body_text(&acks[0]);
+    assert!(answer.contains("m=audio 41000 RTP/AVP 0\r\n"), "{answer}");
+    assert!(answer.contains("m=video 0 RTP/AVP 96\r\n"), "{answer}");
+    assert!(!answer.contains("o=caller"), "{answer}");
+    let callee_session_id = dispatcher
         .state
         .call_actors
         .clone_leg(&call_id, false)
         .map(|leg| leg.dialog.sdp_session_id)
         .expect("the callee leg");
     assert!(
-        answer.lines().any(|line| {
-            line.starts_with("o=") && line.split(' ').nth(1) == Some(&session_id.to_string())
-        }),
-        "the answer does not carry siphon's origin toward the callee: {answer:?}"
+        answer.lines().any(|line| line.starts_with("o=")
+            && line.split(' ').nth(1) == Some(callee_session_id.to_string().as_str())),
+        "the answer does not carry siphon's origin toward the callee: {answer}"
     );
     assert_eq!(
-        ack.headers.get("Content-Type").map(String::as_str),
-        Some("application/sdp")
+        in_force(&dispatcher, &call_id, false),
+        Some(acks[0].body.clone())
     );
+    assert_eq!(
+        in_force(&dispatcher, &call_id, true),
+        Some(relayed[0].body.clone())
+    );
+
+    let again = callee_responds(&dispatcher, &call_id, &refresh, 200, CALLEE_REFRESH_OFFER);
+    let again = requests(&again, CALLEE, Method::Ack);
+    assert_eq!(again.len(), 1, "a later copy of the 2xx is ACKed");
+    assert_eq!(again[0].to_bytes(), acks[0].to_bytes());
+    assert!(dispatcher.state.call_actors.get_call(&call_id).is_some());
+}
+
+/// Every frame sent to `destination`, as methods and status codes in order.
+fn sequence_to(sent: &[(SocketAddr, SipMessage)], destination: &str) -> Vec<String> {
+    sent.iter()
+        .filter(|(to, _)| *to == address(destination))
+        .map(|(_, message)| match message.method() {
+            Some(method) => method.as_str().to_string(),
+            None => message
+                .status_code()
+                .map(|code| code.to_string())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// A caller that refuses the relayed offer leaves siphon no answer for the
+/// callee. The callee's 2xx is still owed an ACK with a valid answer, every stream
+/// rejected (RFC 3264 §6), and the call ends through its teardown, that ACK going
+/// out ahead of the callee's BYE (RFC 3261 §13.2.2.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_relay_of_a_refresh_offer_ends_the_call_after_the_ack_the_callee_is_owed() {
+    let dispatcher = timer_dispatcher(Some("session_expires: 90\n"));
+    let (call_id, refresh) = call_with_offerless_refresh_out(&dispatcher);
+    let sent = callee_responds(&dispatcher, &call_id, &refresh, 200, CALLEE_REFRESH_OFFER);
+    let relayed = requests(&sent, CALLER, Method::Invite);
+    assert_eq!(
+        relayed.len(),
+        1,
+        "the callee's offer was not relayed to the caller"
+    );
+
+    let sent = caller_responds(&dispatcher, &call_id, &relayed[0], 488, "");
+
+    assert_eq!(sequence_to(&sent, CALLEE), vec!["ACK", "BYE"]);
+    let ack = request_to(&sent, CALLEE, Method::Ack);
+    let answer = body_text(&ack);
+    assert!(answer.contains("m=audio 0 RTP/AVP 0\r\n"), "{answer}");
+    assert!(answer.contains("m=video 0 RTP/AVP 96\r\n"), "{answer}");
+    assert_eq!(requests(&sent, CALLER, Method::Bye).len(), 1);
+    assert!(dispatcher.state.call_actors.get_call(&call_id).is_none());
+}
+
+/// A caller that never answers the relayed offer ends the call like a refresh
+/// nobody answers (RFC 3261 §17.1.1.2, RFC 4028 §10), again with the callee ACKed
+/// ahead of its BYE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_of_a_refresh_offer_nobody_answers_ends_the_call() {
+    let dispatcher = timer_dispatcher(Some("session_expires: 90\n"));
+    let (call_id, refresh) = call_with_offerless_refresh_out(&dispatcher);
+    let sent = callee_responds(&dispatcher, &call_id, &refresh, 200, CALLEE_REFRESH_OFFER);
+    assert_eq!(requests(&sent, CALLER, Method::Invite).len(), 1);
+
+    let timeout = dispatcher.state.b2bua_retransmits.transaction_timeout();
+    assert!(
+        dispatcher
+            .state
+            .call_actors
+            .update_leg_session_timer(&call_id, false, |timer| {
+                if let Some(in_flight) = timer.refresh_in_flight.as_mut() {
+                    in_flight.sent_at = std::time::Instant::now()
+                        .checked_sub(timeout)
+                        .expect("the clock reaches back that far");
+                }
+            }),
+        "the callee's dialog runs no session timer"
+    );
+    let sent = sweep(&dispatcher);
+
+    assert_eq!(sequence_to(&sent, CALLEE), vec!["ACK", "BYE"]);
+    assert_eq!(requests(&sent, CALLER, Method::Bye).len(), 1);
 }
 
 // ---------------------------------------------------------------------------

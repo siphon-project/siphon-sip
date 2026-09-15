@@ -423,43 +423,6 @@ fn remove_option_tag(headers: &mut SipHeaders, name: &str, tag: &str) {
     }
 }
 
-/// An SDP answer that declines every stream of `offer` (RFC 3264 §6): an `m=` line
-/// for each offered one, in order, with port zero and the offered formats. The
-/// origin and connection address are `address`. `None` when the offer is not text.
-///
-/// The answer siphon gives, in an ACK, to the offer a 2xx brings back to a
-/// refresh re-INVITE siphon sent without one on a dialog it holds no session
-/// description on. siphon has agreed to no media on that dialog, so accepting a
-/// stream would add media nobody set up; declining every stream leaves the dialog
-/// as it was.
-pub fn declining_answer(offer: &[u8], address: &str) -> Option<Vec<u8>> {
-    let offer = std::str::from_utf8(offer).ok()?;
-    let address_type = if address.contains(':') { "IP6" } else { "IP4" };
-    let address = address.trim_start_matches('[').trim_end_matches(']');
-    let mut answer = format!(
-        "v=0\r\no=- 0 0 IN {address_type} {address}\r\ns=-\r\nc=IN {address_type} {address}\r\nt=0 0\r\n"
-    );
-    for line in offer.lines() {
-        let Some(media) = line.trim_end_matches('\r').strip_prefix("m=") else {
-            continue;
-        };
-        let mut fields = media.split_whitespace();
-        let (Some(media_type), Some(_port), Some(protocol)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let formats: Vec<&str> = fields.collect();
-        answer.push_str(&format!("m={media_type} 0 {protocol}"));
-        for format in &formats {
-            answer.push(' ');
-            answer.push_str(format);
-        }
-        answer.push_str("\r\n");
-    }
-    Some(answer.into_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,40 +806,5 @@ mod tests {
         ])));
         assert!(!allows_update(&headers(&[("Allow", "INVITE, ACK, BYE")])));
         assert!(!allows_update(&headers(&[])));
-    }
-
-    #[test]
-    fn the_declining_answer_has_one_rejected_stream_per_offered_one() {
-        let offer = concat!(
-            "v=0\r\n",
-            "o=peer 7 7 IN IP4 198.51.100.20\r\n",
-            "s=-\r\n",
-            "c=IN IP4 198.51.100.20\r\n",
-            "t=0 0\r\n",
-            "m=audio 40000 RTP/AVP 0 8\r\n",
-            "a=rtpmap:0 PCMU/8000\r\n",
-            "m=video 40002/2 RTP/AVP 96\r\n",
-        );
-        let answer = String::from_utf8(
-            declining_answer(offer.as_bytes(), "192.0.2.1").expect("a text offer"),
-        )
-        .expect("the answer is text");
-        assert_eq!(
-            answer,
-            concat!(
-                "v=0\r\n",
-                "o=- 0 0 IN IP4 192.0.2.1\r\n",
-                "s=-\r\n",
-                "c=IN IP4 192.0.2.1\r\n",
-                "t=0 0\r\n",
-                "m=audio 0 RTP/AVP 0 8\r\n",
-                "m=video 0 RTP/AVP 96\r\n",
-            )
-        );
-        let v6 = String::from_utf8(
-            declining_answer(b"v=0\r\nm=audio 1 RTP/AVP 0\r\n", "[2001:db8::1]").expect("text"),
-        )
-        .expect("text");
-        assert!(v6.contains("c=IN IP6 2001:db8::1\r\n"));
     }
 }

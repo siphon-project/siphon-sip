@@ -265,6 +265,17 @@ pub fn handle_b2bua_response(
     if absorb_completed_bridge_retransmit(call_id, message, status_code, state, &snapshot) {
         return true;
     }
+    if intercept_refresh_offer(
+        call_id,
+        branch,
+        message,
+        status_code,
+        response_source,
+        state,
+        &snapshot,
+    ) {
+        return true;
+    }
     if forward_reinvite_response(
         call_id,
         branch,

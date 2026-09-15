@@ -11,9 +11,8 @@
 use std::time::Instant;
 
 use crate::b2bua::session_timer::{
-    allows_update, answer_as_uas, declining_answer, min_se_of, requested_interval_of,
-    uac_session_timer, withdraw_from_answer, SessionTimerDue, SessionTimerPolicy,
-    MIN_SESSION_INTERVAL,
+    allows_update, answer_as_uas, min_se_of, requested_interval_of, uac_session_timer,
+    withdraw_from_answer, SessionTimerDue, SessionTimerPolicy, MIN_SESSION_INTERVAL,
 };
 use crate::dispatcher::*;
 use crate::sip::headers::SipHeaders;
@@ -163,11 +162,7 @@ pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &Dispatc
     } else {
         initial_option_tags(&leg)
     };
-    headers.push((
-        "Session-Expires",
-        format!("{session_expires};refresher=uac"),
-    ));
-    headers.push(("Min-SE", timer.min_se.to_string()));
+    headers.extend(session_timer_request_headers(&timer));
 
     let offer = session_refresh_offer(&leg, call_id, on_a_leg, state);
     let (method, tracking_target) = match (&offer, leg.dialog.peer_allows_update) {
@@ -277,34 +272,21 @@ fn session_refresh_offer(
     Some(sdp)
 }
 
-/// siphon's answer, for the ACK, to the offer a 2xx brought back to a re-INVITE
-/// siphon sent on one leg's dialog without one (RFC 3261 §13.2.1, §14.1): every
-/// offered stream declined ([`declining_answer`]), under siphon's identity toward
-/// the leg. Recorded as the session description in force on the dialog. `None`
-/// without such a 2xx, or when it carries no SDP.
-pub fn answer_offer_in_ack(
-    call_id: &str,
-    on_a_leg: bool,
-    response: Option<&SipMessage>,
-    state: &DispatcherState,
-) -> Option<Vec<u8>> {
-    let response = response?;
-    let offer = sdp_in_body(message_content_type(response), &response.body)?;
-    let leg = state.call_actors.clone_leg(call_id, on_a_leg)?;
-    let host = state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport);
-    let mut answer = declining_answer(&offer, &host)?;
-    own_sdp_toward_leg(
-        &mut answer,
-        "application/sdp",
-        state,
-        call_id,
-        on_a_leg,
-        Some(&host),
-    );
-    state
-        .call_actors
-        .set_leg_sent_sdp(call_id, on_a_leg, answer.clone());
-    Some(answer)
+/// The `Session-Expires` and `Min-SE` of a session refresh request siphon sends
+/// on a dialog that runs `timer` (RFC 4028 §7.4): the current interval, at least
+/// the dialog's `Min-SE`, with the refresher left where it is: `uac` where siphon
+/// refreshes, `uas` where the peer does.
+pub fn session_timer_request_headers(
+    timer: &crate::b2bua::actor::SessionTimerState,
+) -> Vec<(&'static str, String)> {
+    let refresher = if timer.siphon_refreshes { "uac" } else { "uas" };
+    vec![
+        (
+            "Session-Expires",
+            format!("{};refresher={refresher}", timer.refresh_interval()),
+        ),
+        ("Min-SE", timer.min_se.to_string()),
+    ]
 }
 
 /// Keep the session timer of the dialog a re-INVITE or UPDATE went out on, where
@@ -469,18 +451,23 @@ pub fn note_session_refresh_request(
     }
 }
 
-/// Keep the session timers of the dialogs a final response to a re-INVITE
-/// crossed. `is_a2b` says the re-INVITE went toward the B-leg. The responder's
-/// dialog is kept from the response as it arrived there
-/// ([`session_timer_on_response`]); for a bridged re-INVITE's 2xx, `relayed` is
-/// the copy relayed to the originator, which carries siphon's answer on the
-/// originator's dialog ([`negotiate_relayed_session_timer`]).
-pub fn keep_session_timers(
+/// Settle what a final response to a re-INVITE decides beyond the ACK.
+/// `is_a2b` says the re-INVITE went toward the B-leg.
+///
+/// The responder's session timer is kept from the response as it arrived there
+/// ([`session_timer_on_response`]). For a bridged re-INVITE's 2xx, `message` is
+/// the copy relayed to the originator, and it gets siphon's answer on the
+/// originator's dialog ([`negotiate_relayed_session_timer`]). A re-INVITE that
+/// carried the offer a refresh drew completes that refresh
+/// ([`complete_refresh_offer_relay`]).
+#[allow(clippy::too_many_arguments)]
+pub fn settle_reinvite_response(
     call_id: &str,
     is_a2b: bool,
     status_code: u16,
     responder_headers: &SipHeaders,
-    relayed: Option<&mut SipHeaders>,
+    message: &mut SipMessage,
+    is_bridged_reinvite: bool,
     snapshot: &BLegResponseSnapshot,
     state: &DispatcherState,
 ) {
@@ -493,26 +480,16 @@ pub fn keep_session_timers(
         snapshot.b_leg_request_session_expires,
         state,
     );
-    if let (true, Some(relayed)) = ((200..300).contains(&status_code), relayed) {
+    if is_bridged_reinvite && (200..300).contains(&status_code) {
         negotiate_relayed_session_timer(
             call_id,
             is_a2b,
             snapshot.b_leg_session_refresh_request.as_ref(),
-            relayed,
+            &mut message.headers,
             state,
         );
     }
-}
-
-/// Put an SDP `answer` on an ACK, when there is one: the answer to an offer the
-/// 2xx it acknowledges brought (RFC 3261 §13.2.1).
-pub fn attach_ack_answer(ack: &mut SipMessage, answer: Option<Vec<u8>>) {
-    if let Some(answer) = answer {
-        ack.headers
-            .set("Content-Type", "application/sdp".to_string());
-        ack.headers.set("Content-Length", answer.len().to_string());
-        ack.body = answer;
-    }
+    complete_refresh_offer_relay(call_id, &snapshot.branch, status_code, message, state);
 }
 
 /// Act on the session timers of every answered call, run every few seconds

@@ -66,11 +66,9 @@ pub fn forward_reinvite_response(
         // (a real originator leg) rewrites the response identity.
         let is_bridged_reinvite = !snapshot.b_leg_stored_vias.is_empty();
 
-        // The response as it arrived, before the rewrites below: its session timer
-        // headers, and for siphon's offerless re-INVITE the offer the ACK answers.
+        // The response's headers as they arrived, before the rewrites below: they
+        // decide the responder dialog's session timer.
         let responder_headers = message.headers.clone();
-        let responder_offer =
-            (!is_bridged_reinvite && snapshot.b_leg_offered_sdp.is_none()).then(|| message.clone());
 
         // The responder's OWN From/To, captured before the rewrite below edits
         // them in place — the same "capture before we overwrite it" the CSeq and
@@ -225,119 +223,115 @@ pub fn forward_reinvite_response(
         // Helper: build and send ACK to the responder of the re-INVITE.
         // For 2xx: ACK uses a NEW branch (end-to-end, RFC 3261 §13.2.2.4).
         // For non-2xx: ACK uses the SAME branch (hop-by-hop, RFC 3261 §17.1.1.3).
-        // `answer` is the SDP answer the ACK carries, for a 2xx that brought an
-        // offer back to a re-INVITE siphon sent without one.
-        let send_reinvite_ack =
-            |ack_branch: String, answer: Option<Vec<u8>>, state: &DispatcherState| {
-                if let Some((responder_dest, responder_transport)) = snapshot.b_leg_dest {
-                    if let Some((ref responder_cid, ref _responder_ftag)) = snapshot.b_leg_dialog {
-                        let transport_str = format!("{}", responder_transport).to_uppercase();
-                        // ACK Via sent-by: the responder's anchored listener. When the
-                        // responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
-                        // arrival socket on a multi-homed host; when it is the B-leg,
-                        // the flow socket the leg was dialled over (`b_leg_sent_by`).
-                        let (outbound_host, outbound_port) = if is_a2b {
-                            b_leg_sent_by(snapshot.b_leg_local_addr, state, &responder_transport)
-                        } else {
-                            (
-                                state.a_leg_advertised_host(
-                                    snapshot.a_leg.transport.local_addr,
-                                    &responder_transport,
-                                ),
-                                a_leg_advertised_port(
-                                    snapshot.a_leg.transport.local_addr,
-                                    state
-                                        .listen_addrs
-                                        .get(&responder_transport)
-                                        .map(|a| a.port())
-                                        .unwrap_or(state.local_addr.port()),
-                                ),
-                            )
-                        };
-                        // Use the responder's CSeq (captured before originator CSeq restoration).
-                        let cseq_num = responder_cseq_num.clone();
-                        // The responder's own dialog identity, captured before the
-                        // originator rewrite (RFC 3261 §12.2.1.1 — this ACK belongs
-                        // to the responder's dialog, not the originator's). Reading
-                        // `message` here sent it the far leg's tag pair.
-                        let from = responder_from.clone().unwrap_or_default();
-                        let to = responder_to.clone().unwrap_or_default();
-                        // RURI: the responder's own Contact as it arrived (RFC 3261
-                        // §12.2.1.1), captured above before sanitize rewrote it to
-                        // siphon's address — reading `message` here addressed the ACK
-                        // to ourselves. Falls back to the stored remote_contact.
-                        let ack_uri = responder_contact
-                            .as_deref()
-                            .map(crate::b2bua::actor::extract_contact_uri)
-                            .and_then(|u| parse_uri_standalone(&u).ok())
-                            .or_else(|| {
-                                if is_a2b {
-                                    snapshot
-                                        .b_leg_remote_contact
-                                        .as_deref()
-                                        .and_then(|u| parse_uri_standalone(u).ok())
-                                } else {
-                                    snapshot
-                                        .a_leg
-                                        .dialog
-                                        .remote_contact
-                                        .as_deref()
-                                        .and_then(|u| parse_uri_standalone(u).ok())
-                                }
-                            })
-                            .unwrap_or_else(|| {
-                                SipUri::new(responder_dest.ip().to_string())
-                                    .with_port(responder_dest.port())
-                            });
-                        let Some(mut ack) = build_reinvite_ack(ReinviteAck {
-                            request_uri: ack_uri,
-                            via_transport: &transport_str,
-                            via_host: &outbound_host,
-                            via_port: outbound_port,
-                            branch: &ack_branch,
-                            from: from.as_str(),
-                            to: to.as_str(),
-                            call_id: responder_cid,
-                            cseq_number: &cseq_num,
-                            route_set: &responder_route_set,
-                        }) else {
-                            return;
-                        };
-                        attach_ack_answer(&mut ack, answer);
-                        // With a route set the ACK goes to its first hop, not the
-                        // cached leg address (RFC 3261 §12.2.1.1) — the same
-                        // resolution the re-INVITE used. A no-op when the route set
-                        // is empty or still resolves to the established peer.
-                        let (ack_dest, ack_transport) = resolve_in_dialog_destination(
-                            &responder_route_set,
-                            state,
-                            responder_dest,
-                            responder_transport,
-                        );
-                        if is_a2b {
-                            send_b2bua_to_bleg(
-                                ack,
-                                ack_transport,
-                                ack_dest,
-                                snapshot.b_leg_local_addr,
-                                state,
-                            );
-                        } else {
-                            // ACK to the A-leg responder — source it from the A-leg's
-                            // anchored socket (multi-homed source-port parity; Via above
-                            // matches). No-op for single-listener hosts.
-                            send_message_from(
-                                ack,
-                                ack_transport,
-                                ack_dest,
-                                snapshot.a_leg.transport.connection_id,
+        let send_reinvite_ack = |ack_branch: String, state: &DispatcherState| {
+            if let Some((responder_dest, responder_transport)) = snapshot.b_leg_dest {
+                if let Some((ref responder_cid, ref _responder_ftag)) = snapshot.b_leg_dialog {
+                    let transport_str = format!("{}", responder_transport).to_uppercase();
+                    // ACK Via sent-by: the responder's anchored listener. When the
+                    // responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
+                    // arrival socket on a multi-homed host; when it is the B-leg,
+                    // the flow socket the leg was dialled over (`b_leg_sent_by`).
+                    let (outbound_host, outbound_port) = if is_a2b {
+                        b_leg_sent_by(snapshot.b_leg_local_addr, state, &responder_transport)
+                    } else {
+                        (
+                            state.a_leg_advertised_host(
                                 snapshot.a_leg.transport.local_addr,
-                                state,
-                            );
-                        }
+                                &responder_transport,
+                            ),
+                            a_leg_advertised_port(
+                                snapshot.a_leg.transport.local_addr,
+                                state
+                                    .listen_addrs
+                                    .get(&responder_transport)
+                                    .map(|a| a.port())
+                                    .unwrap_or(state.local_addr.port()),
+                            ),
+                        )
+                    };
+                    // Use the responder's CSeq (captured before originator CSeq restoration).
+                    let cseq_num = responder_cseq_num.clone();
+                    // The responder's own dialog identity, captured before the
+                    // originator rewrite (RFC 3261 §12.2.1.1 — this ACK belongs
+                    // to the responder's dialog, not the originator's). Reading
+                    // `message` here sent it the far leg's tag pair.
+                    let from = responder_from.clone().unwrap_or_default();
+                    let to = responder_to.clone().unwrap_or_default();
+                    // RURI: the responder's own Contact as it arrived (RFC 3261
+                    // §12.2.1.1), captured above before sanitize rewrote it to
+                    // siphon's address — reading `message` here addressed the ACK
+                    // to ourselves. Falls back to the stored remote_contact.
+                    let ack_uri = responder_contact
+                        .as_deref()
+                        .map(crate::b2bua::actor::extract_contact_uri)
+                        .and_then(|u| parse_uri_standalone(&u).ok())
+                        .or_else(|| {
+                            if is_a2b {
+                                snapshot
+                                    .b_leg_remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            } else {
+                                snapshot
+                                    .a_leg
+                                    .dialog
+                                    .remote_contact
+                                    .as_deref()
+                                    .and_then(|u| parse_uri_standalone(u).ok())
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            SipUri::new(responder_dest.ip().to_string())
+                                .with_port(responder_dest.port())
+                        });
+                    let Some(ack) = build_reinvite_ack(ReinviteAck {
+                        request_uri: ack_uri,
+                        via_transport: &transport_str,
+                        via_host: &outbound_host,
+                        via_port: outbound_port,
+                        branch: &ack_branch,
+                        from: from.as_str(),
+                        to: to.as_str(),
+                        call_id: responder_cid,
+                        cseq_number: &cseq_num,
+                        route_set: &responder_route_set,
+                    }) else {
+                        return;
+                    };
+                    // With a route set the ACK goes to its first hop, not the
+                    // cached leg address (RFC 3261 §12.2.1.1) — the same
+                    // resolution the re-INVITE used. A no-op when the route set
+                    // is empty or still resolves to the established peer.
+                    let (ack_dest, ack_transport) = resolve_in_dialog_destination(
+                        &responder_route_set,
+                        state,
+                        responder_dest,
+                        responder_transport,
+                    );
+                    if is_a2b {
+                        send_b2bua_to_bleg(
+                            ack,
+                            ack_transport,
+                            ack_dest,
+                            snapshot.b_leg_local_addr,
+                            state,
+                        );
+                    } else {
+                        // ACK to the A-leg responder — source it from the A-leg's
+                        // anchored socket (multi-homed source-port parity; Via above
+                        // matches). No-op for single-listener hosts.
+                        send_message_from(
+                            ack,
+                            ack_transport,
+                            ack_dest,
+                            snapshot.a_leg.transport.connection_id,
+                            snapshot.a_leg.transport.local_addr,
+                            state,
+                        );
                     }
                 }
-            };
+            }
+        };
 
         if (200..300).contains(&status_code) {
             // The responder took the offer, so it is now the session description
@@ -358,10 +352,8 @@ pub fn forward_reinvite_response(
                 );
             }
 
-            // ACK the responder with a new branch (end-to-end ACK for 2xx), answering
-            // an offer the 2xx brought back to siphon's offerless re-INVITE.
-            let answer = answer_offer_in_ack(call_id, !is_a2b, responder_offer.as_ref(), state);
-            send_reinvite_ack(TransactionKey::generate_branch(), answer, state);
+            // ACK the responder with a new branch (end-to-end ACK for 2xx)
+            send_reinvite_ack(TransactionKey::generate_branch(), state);
             debug!(
                 call_id = %call_id,
                 direction = direction,
@@ -389,7 +381,7 @@ pub fn forward_reinvite_response(
         } else if status_code >= 300 {
             // Non-2xx: ACK is hop-by-hop — reuse the SAME branch as the
             // forwarded re-INVITE (RFC 3261 §17.1.1.3).
-            send_reinvite_ack(branch.to_string(), None, state);
+            send_reinvite_ack(branch.to_string(), state);
             debug!(
                 call_id = %call_id,
                 direction = direction,
@@ -408,13 +400,15 @@ pub fn forward_reinvite_response(
                 .set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         }
 
-        // RFC 4028: the session timers of the dialogs this response crossed.
-        keep_session_timers(
+        // RFC 4028: the session timers of the dialogs this response crossed, and
+        // a refresh whose offer this re-INVITE carried to its other party.
+        settle_reinvite_response(
             call_id,
             is_a2b,
             status_code,
             &responder_headers,
-            is_bridged_reinvite.then_some(&mut message.headers),
+            message,
+            is_bridged_reinvite,
             snapshot,
             state,
         );

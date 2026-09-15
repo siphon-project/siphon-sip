@@ -445,72 +445,49 @@ pub fn handle_b2bua_reinvite(
         // Without this, re-INVITE SDP passes through unmodified — if the remote side
         // includes stale or cross-wired RTP ports, media breaks (one-way audio).
         if !forwarded.body.is_empty() {
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
-                &state.rtpengine_set,
-                &state.rtpengine_sessions,
-                &state.rtpengine_profiles,
+            match reoffer_through_media_engine(
+                state,
+                &a_leg.dialog.call_id,
+                from_a_leg,
+                inbound.remote_addr.ip(),
+                &forwarded.body,
             ) {
-                let a_sip_call_id = &a_leg.dialog.call_id;
-                if let Some(session) = media_sessions.get(a_sip_call_id) {
-                    if let Some(profile) = profiles.get(&session.profile) {
-                        // The tag of whichever side is sending the offer. A re-offer from the callee
-                        // must carry the callee's own tag: the engine resolves the re-offering party
-                        // by tag and answers with the leg facing the *other* one, so substituting
-                        // the caller's tag does not identify the callee — it claims to be the caller
-                        // and comes back wired to the wrong leg.
-                        let Some(offer_tag) = session.offer_tag(from_a_leg) else {
-                            warn!(
-                                call_id = %call_id,
-                                "B2BUA re-INVITE from the callee on a media session with no \
-                                 recorded answerer tag — rejecting with 488 rather than naming the \
-                                 caller to the media engine"
-                            );
-                            reject_unanchorable_offer(
-                                &message,
-                                &inbound,
-                                state,
-                                &call_id,
-                                Some(!from_a_leg),
-                            );
-                            return;
-                        };
-                        let mut offer_flags = profile.offer.clone();
-                        // Pin media ingress to where this re-INVITE actually came from, the way the
-                        // initial offer does: a client that changed network re-INVITEs from a new
-                        // public address, and the engine gates the leg on the last hint it was given.
-                        if offer_flags.carry_received_from {
-                            offer_flags.received_from = Some(inbound.remote_addr.ip());
-                        }
-                        match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
-                                session.rtpengine_id(),
-                                offer_tag,
-                                &forwarded.body,
-                                &offer_flags,
-                            ))
-                        }) {
-                            Ok(rewritten_sdp) => {
-                                forwarded.body = rewritten_sdp;
-                                debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE SDP (offer)");
-                            }
-                            Err(error) => {
-                                error!(
-                                    call_id = %call_id,
-                                    "RTPEngine offer for re-INVITE failed: {error} — rejecting the \
-                                     re-INVITE with 488 rather than forwarding SDP that routes both \
-                                     parties around the anchor"
-                                );
-                                reject_unanchorable_offer(
-                                    &message,
-                                    &inbound,
-                                    state,
-                                    &call_id,
-                                    Some(!from_a_leg),
-                                );
-                                return;
-                            }
-                        }
-                    }
+                ReofferOutcome::NotAnchored => {}
+                ReofferOutcome::Rewritten(rewritten_sdp) => {
+                    forwarded.body = rewritten_sdp;
+                    debug!(call_id = %call_id, "RTPEngine: rewrote re-INVITE SDP (offer)");
+                }
+                ReofferOutcome::NoOfferTag => {
+                    warn!(
+                        call_id = %call_id,
+                        "B2BUA re-INVITE from the callee on a media session with no \
+                         recorded answerer tag: rejecting with 488 rather than naming the \
+                         caller to the media engine"
+                    );
+                    reject_unanchorable_offer(
+                        &message,
+                        &inbound,
+                        state,
+                        &call_id,
+                        Some(!from_a_leg),
+                    );
+                    return;
+                }
+                ReofferOutcome::Failed(error) => {
+                    error!(
+                        call_id = %call_id,
+                        "RTPEngine offer for re-INVITE failed: {error}: rejecting the \
+                         re-INVITE with 488 rather than forwarding SDP that routes both \
+                         parties around the anchor"
+                    );
+                    reject_unanchorable_offer(
+                        &message,
+                        &inbound,
+                        state,
+                        &call_id,
+                        Some(!from_a_leg),
+                    );
+                    return;
                 }
             }
         }
@@ -829,4 +806,67 @@ fn send_one_legged_ok(
         Some(inbound.local_addr),
         state,
     );
+}
+
+/// What the media engine made of an offer one party of an anchored call re-offers.
+pub enum ReofferOutcome {
+    /// The call's media is not anchored: the offer goes on as it is.
+    NotAnchored,
+    /// The engine's offer, facing the other party.
+    Rewritten(Vec<u8>),
+    /// The engine session has no tag for the offering party, so it cannot be
+    /// named to the engine without claiming to be the other one.
+    NoOfferTag,
+    /// The engine refused the offer.
+    Failed(String),
+}
+
+/// Re-offer `offer`, from the caller when `from_a_leg` and else from the callee,
+/// through the media engine anchoring the call keyed by `a_leg_call_id`, with
+/// media ingress pinned to `received_from` where the profile asks for it.
+///
+/// The offering party is named by its own tag: the engine resolves the
+/// re-offering party by tag and answers with the leg facing the other one, so the
+/// other party's tag would come back wired to the wrong leg.
+pub fn reoffer_through_media_engine(
+    state: &DispatcherState,
+    a_leg_call_id: &str,
+    from_a_leg: bool,
+    received_from: std::net::IpAddr,
+    offer: &[u8],
+) -> ReofferOutcome {
+    let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
+        &state.rtpengine_set,
+        &state.rtpengine_sessions,
+        &state.rtpengine_profiles,
+    ) else {
+        return ReofferOutcome::NotAnchored;
+    };
+    let Some(session) = media_sessions.get(a_leg_call_id) else {
+        return ReofferOutcome::NotAnchored;
+    };
+    let Some(profile) = profiles.get(&session.profile) else {
+        return ReofferOutcome::NotAnchored;
+    };
+    let Some(offer_tag) = session.offer_tag(from_a_leg) else {
+        return ReofferOutcome::NoOfferTag;
+    };
+    let mut offer_flags = profile.offer.clone();
+    // Pin media ingress to where the offer actually came from, the way the initial
+    // offer does: a client that changed network re-offers from a new public
+    // address, and the engine gates the leg on the last hint it was given.
+    if offer_flags.carry_received_from {
+        offer_flags.received_from = Some(received_from);
+    }
+    match tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
+            session.rtpengine_id(),
+            offer_tag,
+            offer,
+            &offer_flags,
+        ))
+    }) {
+        Ok(rewritten) => ReofferOutcome::Rewritten(rewritten),
+        Err(error) => ReofferOutcome::Failed(error.to_string()),
+    }
 }

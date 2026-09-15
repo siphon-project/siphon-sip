@@ -563,8 +563,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   without a `session_timer:` block, where before it was ignored. Early media SDP relayed to the
   caller is the session in force when the 2xx carries none. On a dialog with no session description
   in force, a refresh is an UPDATE without a body toward a peer that allows UPDATE, otherwise a
-  re-INVITE without an offer, and siphon answers the offer its 2xx brings in the ACK, declining every
-  stream. In-dialog re-INVITEs and UPDATEs siphon originates are now retransmitted over UDP, each
+  re-INVITE without an offer. siphon relays the offer that re-INVITE's 2xx brings to the other party
+  in a re-INVITE on that party's dialog, through the media engine where the call is anchored, and
+  puts that party's answer in the ACK, so media continues as the two agree. A party that refuses the
+  relayed offer or never answers it ends the call through its teardown, the held ACK going out with
+  every stream rejected ahead of the BYE. In-dialog re-INVITEs and UPDATEs siphon originates are now retransmitted over UDP, each
   copy captured to HEP like the first. The admin
   API's call `session_timer` changes shape: `{caller, callee}`, one object per dialog or `null`,
   with `refresher` now `siphon` or `peer`.
