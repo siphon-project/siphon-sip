@@ -337,6 +337,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `copy=["Supported", "Require"]` lets `precondition` through under the default
   preset, and `strip=["History-Info"]` keeps `histinfo` off.
 
+- **Every transport `listen` function returns the address it bound.** For crate
+  embedders: `transport::udp::listen`, `tcp::listen`, `tls::listen`, `ws::listen`,
+  `ws::listen_secure`, `mux::listen` and `sctp::listen` now return
+  `io::Result<SocketAddr>`. The stream listeners returned `io::Result<()>`, UDP and
+  SCTP returned `()`. Bind port 0 and use the returned address to get a port the
+  kernel picked, rather than choosing a port first and hoping nothing takes it
+  before the bind. A UDP listener asked for port 0 now serves one port from all
+  its workers; each worker used to bind a port of its own. UDP and SCTP also
+  return a failed bind to the caller now, as the stream listeners already did,
+  and siphon exits when a configured UDP or SCTP listener cannot bind, naming the
+  transport and address, instead of starting without it. A UDP listener still
+  comes up as long as one of its workers binds.
+
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.1.** The wire stays compatible in both directions:
   0.7.0 only adds optional keys (the call summary's wall-clock start and end,

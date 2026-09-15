@@ -106,6 +106,11 @@ fn shard_for(destination: SocketAddr, shards: usize) -> usize {
 /// Spawn one UDP listener worker per channel in `outbound_rx`, all sharing the
 /// same port via SO_REUSEPORT. Each worker sends inbound messages to
 /// `inbound_tx` and sends what its own channel carries (see [`UdpOutbound`]).
+///
+/// Returns the address the workers bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0. A listener is up as long as one
+/// worker opened its socket, since that worker also sends for the others; only
+/// when none could does this return an error, the first worker's.
 pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
@@ -113,38 +118,50 @@ pub async fn listen(
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
     recv_buffer_bytes: usize,
-) {
+) -> std::io::Result<SocketAddr> {
     let worker_count = outbound_rx.len();
-    info!("Starting {} UDP workers on {}", worker_count, local_addr);
 
-    let sockets: Vec<Option<Arc<UdpSocket>>> = (0..worker_count)
-        .map(
-            |worker_index| match create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes) {
-                Ok(socket) => Some(Arc::new(socket)),
-                Err(error) => {
-                    error!(
-                        "[udp-worker-{}] failed to create socket: {}",
-                        worker_index, error
-                    );
-                    None
-                }
-            },
-        )
-        .collect();
-    let Some(fallback) = sockets.iter().flatten().next().cloned() else {
-        error!(
-            "[udp {}] no worker could open a socket — nothing is sent or received on this listener",
-            local_addr
-        );
-        return;
+    // The first socket to bind settles the address, and every later worker binds
+    // that concrete address. Were each to bind `local_addr`, a port-0 listener
+    // would get a separate kernel-picked port per worker.
+    let mut bound: Option<SocketAddr> = None;
+    let mut first_error: Option<std::io::Error> = None;
+    let mut sockets: Vec<Option<Arc<UdpSocket>>> = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        let address = bound.unwrap_or(local_addr);
+        let opened = create_reusable_udp_socket(address, tos, recv_buffer_bytes)
+            .and_then(|socket| socket.local_addr().map(|actual| (socket, actual)));
+        match opened {
+            Ok((socket, actual)) => {
+                bound.get_or_insert(actual);
+                sockets.push(Some(Arc::new(socket)));
+            }
+            Err(error) => {
+                error!(
+                    "[udp-worker-{}] failed to create socket on {}: {}",
+                    worker_index, address, error
+                );
+                first_error.get_or_insert(error);
+                sockets.push(None);
+            }
+        }
+    }
+    let (Some(bound), Some(fallback)) = (bound, sockets.iter().flatten().next().cloned()) else {
+        return Err(first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the UDP listener on {local_addr} was given no workers"),
+            )
+        }));
     };
+    info!("Started {} UDP workers on {}", worker_count, bound);
 
     for (worker_index, (socket, outbound_rx)) in sockets.into_iter().zip(outbound_rx).enumerate() {
         match socket {
             Some(socket) => {
                 tokio::spawn(run_worker(
                     worker_index,
-                    local_addr,
+                    bound,
                     socket,
                     inbound_tx.clone(),
                     outbound_rx,
@@ -164,6 +181,8 @@ pub async fn listen(
             }
         }
     }
+
+    Ok(bound)
 }
 
 /// One listener worker: receive on `socket`, and send what `outbound_rx` carries.
@@ -604,7 +623,8 @@ mod tests {
             None,
             0,
         )
-        .await;
+        .await
+        .expect("udp listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         for group in 0..GROUPS {
@@ -709,7 +729,8 @@ mod tests {
             None,
             0,
         )
-        .await;
+        .await
+        .expect("udp listener must bind");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         for index in 0..MESSAGES {
@@ -823,5 +844,106 @@ mod tests {
         .expect("the orphaned channel was never drained")
         .unwrap();
         assert_eq!(&buffer[..size], b"OPTIONS");
+    }
+
+    /// A listener asked for port 0 returns the port the kernel picked, and every
+    /// one of its workers serves that port.
+    ///
+    /// Each worker binds a socket of its own. Were each to bind the requested
+    /// address, a port-0 listener would get a different port per worker: a peer
+    /// could reach only one of them, and the other workers would send from ports
+    /// that no reply is ever addressed to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_port_zero_listener_returns_the_one_port_its_workers_share() {
+        const WORKERS: usize = 4;
+
+        let (inbound_tx, inbound_rx) = flume::unbounded::<InboundMessage>();
+        let (outbound, outbound_rx) = UdpOutbound::channels(WORKERS);
+        let bound = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            0,
+        )
+        .await
+        .expect("a port-0 udp listener binds");
+        assert_ne!(bound.port(), 0, "the kernel-picked port must be returned");
+        assert_eq!(bound.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        // Inbound: a datagram to the returned address arrives, stamped with it.
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"OPTIONS sip:bob@example.com SIP/2.0\r\n\r\n", bound)
+            .await
+            .unwrap();
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(5), inbound_rx.recv_async())
+                .await
+                .expect("a datagram to the returned address must arrive")
+                .expect("inbound channel open");
+        assert_eq!(inbound.local_addr, bound);
+
+        // Outbound: one peer per worker, so each worker's socket sends once, and
+        // every one of them must send from the returned address.
+        let mut peers = Vec::new();
+        let mut covered = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            if covered.len() == WORKERS {
+                break;
+            }
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let shard = shard_for(peer.local_addr().unwrap(), WORKERS);
+            if covered.insert(shard) {
+                peers.push((shard, peer));
+            }
+        }
+        assert_eq!(covered.len(), WORKERS, "a peer for every worker");
+
+        for (_, peer) in &peers {
+            outbound
+                .send(message_to(peer.local_addr().unwrap()))
+                .unwrap();
+        }
+        for (shard, peer) in &peers {
+            let mut buffer = [0u8; 64];
+            let (_, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                peer.recv_from(&mut buffer),
+            )
+            .await
+            .expect("every worker must send")
+            .unwrap();
+            assert_eq!(
+                source, bound,
+                "worker {shard} sent from {source}, not from the listener's address"
+            );
+        }
+    }
+
+    /// A listener none of whose workers can bind returns the error to its caller,
+    /// rather than logging it and returning as if it were serving.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_udp_listener_that_cannot_bind_returns_the_error() {
+        // A socket on the port without SO_REUSEPORT: Linux then refuses the
+        // SO_REUSEPORT bind every worker's socket makes.
+        let occupant = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let taken = occupant.local_addr().unwrap();
+
+        let (inbound_tx, _inbound_rx) = flume::unbounded::<InboundMessage>();
+        let (_outbound, outbound_rx) = UdpOutbound::channels(2);
+        let error = listen(
+            taken,
+            inbound_tx,
+            outbound_rx,
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            0,
+        )
+        .await
+        .expect_err("a listener that cannot bind must say so");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
     }
 }

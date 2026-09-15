@@ -221,6 +221,9 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
 }
 
 /// Spawn a plain WebSocket (WS) listener.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0.
 pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
@@ -230,22 +233,24 @@ pub async fn listen(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SocketAddr> {
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists, and before any task
+    // is spawned that a failed listener would leave behind.
+    let listener = bind_tcp_listener(local_addr, tos)?;
+    let bound = listener.local_addr()?;
+    info!("WS listener on {}", bound);
+
     spawn_outbound_distributor(
         outbound_rx,
         connection_map.clone(),
         Transport::WebSocket,
         None,
     );
-
-    // Bind before spawning, so that awaiting `listen` means the socket is
-    // already accepting. With the bind inside the task, the caller returned
-    // first and the listener appeared whenever the runtime got round to it —
-    // a peer (or a test) could connect in between and be refused. It also
-    // means a bind failure is ordered before the caller continues instead of
-    // surfacing as a listener that silently never exists.
-    let listener = bind_tcp_listener(local_addr, tos)?;
-    info!("WS listener on {}", local_addr);
 
     tokio::spawn(async move {
         loop {
@@ -274,7 +279,7 @@ pub async fn listen(
                     info!("WS accepted {} as {:?}", remote_addr, connection_id);
 
                     tokio::spawn(async move {
-                        let local = tcp_stream.local_addr().unwrap_or(local_addr);
+                        let local = tcp_stream.local_addr().unwrap_or(bound);
                         handle_connection(
                             tcp_stream,
                             Transport::WebSocket,
@@ -297,11 +302,14 @@ pub async fn listen(
         }
     });
 
-    Ok(())
+    Ok(bound)
 }
 
 /// Spawn a secure WebSocket (WSS) listener. Reuses the TLS cert from
 /// the top-level `tls:` config block via `transport::tls::build_tls_acceptor`.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0.
 pub async fn listen_secure(
     local_addr: SocketAddr,
     tls_config: &TlsServerConfig,
@@ -312,12 +320,23 @@ pub async fn listen_secure(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SocketAddr> {
     let acceptor =
         crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
             eprintln!("Failed to build TLS acceptor for WSS: {error}");
             std::process::exit(1);
         });
+
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists, and before any task
+    // is spawned that a failed listener would leave behind.
+    let listener = bind_tcp_listener(local_addr, tos)?;
+    let bound = listener.local_addr()?;
+    info!("WSS listener on {}", bound);
 
     spawn_outbound_distributor(
         outbound_rx,
@@ -325,15 +344,6 @@ pub async fn listen_secure(
         Transport::WebSocketSecure,
         None,
     );
-
-    // Bind before spawning, so that awaiting `listen` means the socket is
-    // already accepting. With the bind inside the task, the caller returned
-    // first and the listener appeared whenever the runtime got round to it —
-    // a peer (or a test) could connect in between and be refused. It also
-    // means a bind failure is ordered before the caller continues instead of
-    // surfacing as a listener that silently never exists.
-    let listener = bind_tcp_listener(local_addr, tos)?;
-    info!("WSS listener on {}", local_addr);
 
     tokio::spawn(async move {
         loop {
@@ -388,7 +398,7 @@ pub async fn listen_secure(
                         let connection_id = next_connection_id();
                         info!("WSS accepted {} as {:?}", remote_addr, connection_id);
 
-                        let local = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
+                        let local = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         handle_connection(
                             tls_stream,
                             Transport::WebSocketSecure,
@@ -411,7 +421,7 @@ pub async fn listen_secure(
         }
     });
 
-    Ok(())
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -423,18 +433,20 @@ mod tests {
         Arc::new(TransportAcl::new(vec![], vec![]))
     }
 
-    use crate::transport::testutil::free_tcp_port;
+    /// Loopback, port 0: the kernel picks the port and `listen` returns it.
+    fn any_loopback_port() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
 
     #[tokio::test]
     async fn ws_connection_lifecycle() {
-        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
@@ -445,7 +457,7 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(addr.port(), 0, "listen must return the port it bound");
 
         // Connect as a WebSocket client
         let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -474,6 +486,7 @@ mod tests {
                 .expect("inbound channel closed");
 
         assert_eq!(message.transport, Transport::WebSocket);
+        assert_eq!(message.local_addr, addr);
         assert!(!message.data.is_empty());
         let data_str = String::from_utf8_lossy(&message.data);
         assert!(
@@ -492,15 +505,14 @@ mod tests {
         // unified stream registry (keyed by UE source address, tagged WS) so
         // the relay path can reach the UE — the only way back over WebSocket —
         // and must clear on close so a stale flow reports dead.
-        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
         let registry = StreamConnections::new();
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
@@ -511,7 +523,6 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
         let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -558,14 +569,13 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-        let addr = free_tcp_port();
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
@@ -576,7 +586,6 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut request = format!("ws://127.0.0.1:{}", addr.port())
             .into_client_request()
@@ -599,14 +608,13 @@ mod tests {
 
     #[tokio::test]
     async fn ws_connection_cleanup() {
-        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
@@ -617,7 +625,6 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
         let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -651,14 +658,13 @@ mod tests {
 
     #[tokio::test]
     async fn ws_binary_frame_accepted() {
-        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(
-            addr,
+        let addr = listen(
+            any_loopback_port(),
             inbound_tx,
             outbound_rx,
             Arc::clone(&connection_map),
@@ -669,7 +675,6 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", addr.port());
         let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -700,14 +705,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tls_config = write_test_cert(&directory);
 
-        let addr = free_tcp_port();
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen_secure(
-            addr,
+        let addr = listen_secure(
+            any_loopback_port(),
             &tls_config,
             inbound_tx,
             outbound_rx,
@@ -719,7 +723,7 @@ mod tests {
         )
         .await
         .expect("ws listener must bind");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(addr.port(), 0, "listen must return the port it bound");
 
         // Build a TLS client config that trusts our self-signed cert
         let cert_pem = std::fs::read(&tls_config.certificate).unwrap();

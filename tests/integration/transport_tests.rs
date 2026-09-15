@@ -59,116 +59,21 @@ async fn bind_failure_reaches_the_caller() {
     );
 }
 
-/// Hold the port number `port` for this process, against every other test
-/// binary on the machine, until the process exits.
+/// Where every listener in this file binds: loopback, port 0.
 ///
-/// The hold is a TCP socket bound to the port without `SO_REUSEADDR`. The
-/// kernel refuses a second bind like it, so exactly one process holds a given
-/// number, and the hold ends with the process.
-///
-/// It replaces claim files in the temp directory, which two binaries starting
-/// together could both take over: each read the pid an earlier run had left in
-/// the same claim, found that process gone, and wrote its own. Both then bound
-/// the port with `SO_REUSEPORT`, the kernel split connections between the two
-/// listeners, and a client reached the other process instead. A TLS handshake
-/// met the other test's certificate, an inbound message never arrived, and a
-/// bind that overlapped the other process's probe failed with `AddrInUse`.
-///
-/// The hold is on the TCP number, so a TCP listener cannot bind a port taken
-/// here. TCP listeners take theirs from [`free_tcp_port`].
-fn claim_port(port: u16) -> bool {
-    static HOLDS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+/// The kernel picks a free port inside the bind itself, and `listen` returns the
+/// address it bound, so no port is ever chosen ahead of the bind and left for
+/// another socket or another test binary to take in between.
+const LOOPBACK_ANY_PORT: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    0,
+));
 
-    let Ok(hold) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    if hold
-        .bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_err()
-    {
-        return false;
-    }
-    HOLDS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(hold);
-    true
-}
-
-/// A loopback address for a UDP listener, on a port no other test binary on
-/// this machine is handed.
-///
-/// Port 0 does not fit: `listen` takes the address and binds it itself, and a
-/// probe socket closed in between leaves the port to any socket that
-/// auto-binds, which the kernel assigns from the same ephemeral range
-/// (32768-60999 here). So ports come from a counter below that range, where
-/// nothing is auto-assigned, and [`claim_port`] makes each one this process's
-/// alone. The probe then checks no UDP socket already sits on the number.
-///
-/// TCP listeners use [`free_tcp_port`].
-fn free_port() -> SocketAddr {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
-    // privileged range and clear of the SIP defaults these tests also use.
-    // Starts above 21000, where builds still on claim files count from: those
-    // cannot see a hold, and a UDP probe of theirs open at the moment this
-    // process's listener binds the same number fails that bind.
-    static NEXT: AtomicU16 = AtomicU16::new(26000);
-
-    for _ in 0..2048 {
-        let port = NEXT.fetch_add(1, Ordering::Relaxed);
-        assert!(port < 32000, "exhausted the reserved test port range");
-        if !claim_port(port) {
-            continue;
-        }
-        // The claim holds the TCP number; the UDP one has to be free as well.
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
-            continue;
-        }
-        return SocketAddr::from(([127, 0, 0, 1], port));
-    }
-    panic!("no free loopback port in the reserved test range");
-}
-
-/// A loopback TCP port the kernel picked, kept bound by this process for the
-/// rest of its life so nothing else can take it.
-///
-/// The reservation is a socket bound to port 0 with `SO_REUSEADDR` and
-/// `SO_REUSEPORT`, and never listened on. The kernel does not auto-assign a
-/// port that is already bound, to a port-0 `bind` or to a `connect`, so no
-/// other socket lands on it by chance. The listener under test binds the same
-/// address with the same options, which Linux allows for the same user, and
-/// only listening sockets are handed connections, so the anchor never takes
-/// one.
-///
-/// TCP only: a UDP socket with `SO_REUSEPORT` held on the port would share the
-/// listener's datagrams, so UDP listeners use [`free_port`].
-fn free_tcp_port() -> SocketAddr {
-    static ANCHORS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
-
-    let anchor = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-        .expect("create the port anchor");
-    anchor
-        .set_reuse_address(true)
-        .expect("SO_REUSEADDR on the port anchor");
-    #[cfg(unix)]
-    anchor
-        .set_reuse_port(true)
-        .expect("SO_REUSEPORT on the port anchor");
-    anchor
-        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .expect("bind the port anchor");
-    let address = anchor
-        .local_addr()
-        .expect("port anchor address")
-        .as_socket()
-        .expect("port anchor is an IP socket");
-
-    ANCHORS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(anchor);
-    address
+/// The address a listener returned must be a real one: the loopback it was
+/// asked for, on the port the kernel picked.
+fn assert_bound(addr: SocketAddr) {
+    assert_eq!(addr.ip(), LOOPBACK_ANY_PORT.ip());
+    assert_ne!(addr.port(), 0, "listen must return the port it bound");
 }
 
 /// Standard SIP OPTIONS request used across tests.
@@ -200,7 +105,6 @@ fn sip_200_ok() -> &'static str {
 }
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Retry a connect while the listener is still coming up.
 ///
@@ -238,12 +142,20 @@ where
 
 #[tokio::test]
 async fn udp_roundtrip() {
-    let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
 
-    udp::listen(addr, inbound_tx, vec![outbound_rx], test_acl(), None, 0).await;
-    tokio::time::sleep(SETTLE).await;
+    let addr = udp::listen(
+        LOOPBACK_ANY_PORT,
+        inbound_tx,
+        vec![outbound_rx],
+        test_acl(),
+        None,
+        0,
+    )
+    .await
+    .expect("udp listener must bind");
+    assert_bound(addr);
 
     // Client: send OPTIONS
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -259,6 +171,7 @@ async fn udp_roundtrip() {
         .expect("inbound channel closed");
 
     assert_eq!(inbound.transport, Transport::Udp);
+    assert_eq!(inbound.local_addr, addr);
     let data_str = String::from_utf8_lossy(&inbound.data);
     assert!(
         data_str.contains("OPTIONS"),
@@ -297,13 +210,12 @@ async fn udp_roundtrip() {
 
 #[tokio::test]
 async fn tcp_roundtrip() {
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    tcp::listen(
-        addr,
+    let addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx,
         outbound_rx,
         Arc::clone(&connection_map),
@@ -315,7 +227,7 @@ async fn tcp_roundtrip() {
     )
     .await
     .expect("tcp listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     // Client: connect and send OPTIONS
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
@@ -331,6 +243,7 @@ async fn tcp_roundtrip() {
         .expect("inbound channel closed");
 
     assert_eq!(inbound.transport, Transport::Tcp);
+    assert_eq!(inbound.local_addr, addr);
     let data_str = String::from_utf8_lossy(&inbound.data);
     assert!(
         data_str.contains("OPTIONS"),
@@ -373,14 +286,13 @@ async fn tcp_roundtrip() {
 /// removal is unit-tested in `registrar::tests::unregister_flow_*`).
 #[tokio::test]
 async fn tcp_close_notifies_flow_failure() {
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let (close_tx, close_rx) = flume::unbounded::<u64>();
 
-    tcp::listen(
-        addr,
+    let addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx,
         outbound_rx,
         Arc::clone(&connection_map),
@@ -392,7 +304,7 @@ async fn tcp_close_notifies_flow_failure() {
     )
     .await
     .expect("tcp listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     // Connect and send a request so we learn the assigned ConnectionId.
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
@@ -457,14 +369,15 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
 
     // 2) Build a real ConnectionPool sharing the listener's connection_map
     //    and inbound_tx — same wiring server.rs does in production.
-    let listen_addr = free_tcp_port();
+    //    The pool takes the listener's address before the listener exists; it
+    //    uses only the IP, to bind outbound connections, so port 0 stands in.
     let (inbound_tx, _inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let pool = Arc::new(ConnectionPool::new(
         Arc::clone(&connection_map),
         inbound_tx.clone(),
-        listen_addr,
+        LOOPBACK_ANY_PORT,
         None,
         None,
         None,
@@ -478,8 +391,8 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     // 3) Start the TCP listener with the pool wired in — this is the
     //    distributor task that should fall back to the pool when the
     //    sentinel connection_id misses the map.
-    tcp::listen(
-        listen_addr,
+    let listen_addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx,
         outbound_rx,
         Arc::clone(&connection_map),
@@ -491,7 +404,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     )
     .await
     .expect("tcp listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(listen_addr);
 
     // 4) Fire-and-forget: send the OutboundMessage UacSender::send_request()
     //    builds — sentinel id 0, no source_local_addr.
@@ -557,14 +470,13 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     // a single `\r\n`.  Verify the bytes leave the wire and that a SIP
     // message sent after the ping still frames correctly.
     use siphon::transport::crlf_keepalive::CrlfPongTracker;
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let tracker = Arc::new(CrlfPongTracker::new());
 
-    tcp::listen(
-        addr,
+    let addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx,
         outbound_rx,
         Arc::clone(&connection_map),
@@ -576,7 +488,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     )
     .await
     .expect("tcp listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
 
@@ -631,13 +543,12 @@ async fn tls_roundtrip() {
     let directory = tempfile::tempdir().unwrap();
     let tls_config = generate_test_tls_config(&directory);
 
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    tls::listen(
-        addr,
+    let addr = tls::listen(
+        LOOPBACK_ANY_PORT,
         &tls_config,
         inbound_tx,
         outbound_rx,
@@ -651,7 +562,7 @@ async fn tls_roundtrip() {
     )
     .await
     .expect("tls listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     // Build a TLS client that trusts our self-signed cert
     let tls_connector = build_test_tls_connector(&tls_config);
@@ -676,6 +587,7 @@ async fn tls_roundtrip() {
         .expect("inbound channel closed");
 
     assert_eq!(inbound.transport, Transport::Tls);
+    assert_eq!(inbound.local_addr, addr);
     let data_str = String::from_utf8_lossy(&inbound.data);
     assert!(
         data_str.contains("OPTIONS"),
@@ -718,13 +630,12 @@ async fn ws_roundtrip() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    ws::listen(
-        addr,
+    let addr = ws::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx,
         outbound_rx,
         Arc::clone(&connection_map),
@@ -735,7 +646,7 @@ async fn ws_roundtrip() {
     )
     .await
     .expect("ws listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     // Client: connect via WebSocket
     let url = format!("ws://127.0.0.1:{}", addr.port());
@@ -755,6 +666,7 @@ async fn ws_roundtrip() {
         .expect("inbound channel closed");
 
     assert_eq!(inbound.transport, Transport::WebSocket);
+    assert_eq!(inbound.local_addr, addr);
     let data_str = String::from_utf8_lossy(&inbound.data);
     assert!(
         data_str.contains("OPTIONS"),
@@ -806,13 +718,12 @@ async fn wss_roundtrip() {
     let directory = tempfile::tempdir().unwrap();
     let tls_config = generate_test_tls_config(&directory);
 
-    let addr = free_tcp_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    ws::listen_secure(
-        addr,
+    let addr = ws::listen_secure(
+        LOOPBACK_ANY_PORT,
         &tls_config,
         inbound_tx,
         outbound_rx,
@@ -824,7 +735,7 @@ async fn wss_roundtrip() {
     )
     .await
     .expect("ws listener must bind");
-    tokio::time::sleep(SETTLE).await;
+    assert_bound(addr);
 
     // Manual TLS connect then WebSocket upgrade
     let tls_connector = build_test_tls_connector(&tls_config);
@@ -854,6 +765,7 @@ async fn wss_roundtrip() {
         .expect("inbound channel closed");
 
     assert_eq!(inbound.transport, Transport::WebSocketSecure);
+    assert_eq!(inbound.local_addr, addr);
     let data_str = String::from_utf8_lossy(&inbound.data);
     assert!(
         data_str.contains("OPTIONS"),
@@ -900,10 +812,6 @@ async fn multi_transport_shared_inbound_channel() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    let udp_addr = free_port();
-    let tcp_addr = free_tcp_port();
-    let ws_addr = free_tcp_port();
-
     // All transports share the same inbound channel (like main.rs)
     let (inbound_tx, inbound_rx) = flume::unbounded();
 
@@ -917,17 +825,18 @@ async fn multi_transport_shared_inbound_channel() {
         Arc::new(DashMap::new());
 
     // Start all three transports with the same inbound_tx
-    udp::listen(
-        udp_addr,
+    let udp_addr = udp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx.clone(),
         vec![udp_outbound_rx],
         test_acl(),
         None,
         0,
     )
-    .await;
-    tcp::listen(
-        tcp_addr,
+    .await
+    .expect("udp listener must bind");
+    let tcp_addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx.clone(),
         tcp_outbound_rx,
         Arc::clone(&tcp_connection_map),
@@ -939,8 +848,8 @@ async fn multi_transport_shared_inbound_channel() {
     )
     .await
     .expect("tcp listener must bind");
-    ws::listen(
-        ws_addr,
+    let ws_addr = ws::listen(
+        LOOPBACK_ANY_PORT,
         inbound_tx.clone(),
         ws_outbound_rx,
         Arc::clone(&ws_connection_map),
@@ -952,7 +861,6 @@ async fn multi_transport_shared_inbound_channel() {
     .await
     .expect("ws listener must bind");
     drop(inbound_tx); // Only transport workers hold clones now
-    tokio::time::sleep(SETTLE).await;
 
     // Send via UDP
     let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

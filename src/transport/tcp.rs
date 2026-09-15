@@ -34,6 +34,9 @@ use crate::transport::{
 /// The `connection_map` maps ConnectionId → per-connection outbound sender.
 /// The outbound dispatcher (in the core) looks up the connection ID and routes
 /// responses to the right connection.
+///
+/// Returns the address the listener bound, which carries the port the kernel
+/// picked when `local_addr` asks for port 0.
 pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
@@ -44,7 +47,18 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SocketAddr> {
+    // Bind before spawning, so that awaiting `listen` means the socket is
+    // already accepting. With the bind inside the task, the caller returned
+    // first and the listener appeared whenever the runtime got round to it —
+    // a peer (or a test) could connect in between and be refused. It also
+    // means a bind failure is ordered before the caller continues instead of
+    // surfacing as a listener that silently never exists, and before any task
+    // is spawned that a failed listener would leave behind.
+    let listener = bind_tcp_listener(local_addr, tos)?;
+    let bound = listener.local_addr()?;
+    info!("TCP listener on {}", bound);
+
     // Distribute outbound messages to per-connection senders. When no existing
     // connection matches (`ConnectionId::default()` from fire-and-forget UAC
     // sends, or a connection that has since closed), the distributor falls back
@@ -53,15 +67,6 @@ pub async fn listen(
     // in-dialog NOTIFY frames built but never written to the wire when the
     // Route header pointed at a destination with no live inbound connection.
     spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tcp, pool);
-
-    // Bind before spawning, so that awaiting `listen` means the socket is
-    // already accepting. With the bind inside the task, the caller returned
-    // first and the listener appeared whenever the runtime got round to it —
-    // a peer (or a test) could connect in between and be refused. It also
-    // means a bind failure is ordered before the caller continues instead of
-    // surfacing as a listener that silently never exists.
-    let listener = bind_tcp_listener(local_addr, tos)?;
-    info!("TCP listener on {}", local_addr);
 
     tokio::spawn(async move {
         loop {
@@ -90,7 +95,7 @@ pub async fn listen(
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
                     tokio::spawn(async move {
-                        let local_addr = socket.local_addr().unwrap_or(local_addr);
+                        let local_addr = socket.local_addr().unwrap_or(bound);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
                         // frames as a complete "message" and would otherwise be
@@ -140,7 +145,7 @@ pub async fn listen(
         }
     });
 
-    Ok(())
+    Ok(bound)
 }
 
 /// Determine the total length of a complete SIP message in the buffer.
@@ -790,16 +795,12 @@ mod tests {
 
     // --- end to end: the listener only serves connections that speak SIP ----
 
-    /// Bind a port, release it, and start a TCP SIP listener on it.
+    /// Start a TCP SIP listener on a port the kernel picks.
     async fn spawn_listener() -> (SocketAddr, flume::Receiver<InboundMessage>) {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        listen(
-            addr,
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
             inbound_tx,
             outbound_rx,
             Arc::new(DashMap::new()),
@@ -811,8 +812,7 @@ mod tests {
         )
         .await
         .expect("tcp listener must bind");
-        // listen() binds inside a spawned task.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_ne!(addr.port(), 0, "listen must return the port it bound");
         (addr, inbound_rx)
     }
 

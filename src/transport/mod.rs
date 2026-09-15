@@ -21,75 +21,22 @@ pub mod ws;
 pub(crate) mod testutil {
     use std::net::SocketAddr;
 
-    /// Hold the port number `port` for this process, against every other test
-    /// binary on the machine, until the process exits.
-    ///
-    /// The hold is a TCP socket bound to the port without `SO_REUSEADDR`. The
-    /// kernel refuses a second bind like it, so exactly one process holds a
-    /// given number, and the hold ends with the process. It replaces claim
-    /// files in the temp directory, which two binaries starting together could
-    /// both take over: each found the claim an earlier run had left, saw that
-    /// process gone, and wrote its own pid, and then both bound the port.
-    #[cfg(feature = "sctp")]
-    fn claim_port(port: u16) -> bool {
-        static HOLDS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
-
-        let Ok(hold) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-        else {
-            return false;
-        };
-        if hold
-            .bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())
-            .is_err()
-        {
-            return false;
-        }
-        HOLDS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(hold);
-        true
-    }
-
-    /// A loopback address for an SCTP listener, on a port no other test binary
-    /// on this machine is handed.
-    ///
-    /// Ports come from a counter below the ephemeral range (32768-60999 here),
-    /// where the kernel assigns nothing on its own, and [`claim_port`] makes
-    /// each one this process's alone. TCP listeners use [`free_tcp_port`]: the
-    /// claim holds the TCP number, which they could not then bind.
-    #[cfg(feature = "sctp")]
-    pub(crate) fn free_port() -> SocketAddr {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
-        // privileged range and clear of the SIP defaults these tests also use.
-        // Starts above 21000, where builds still on claim files count from:
-        // those cannot see a hold.
-        static NEXT: AtomicU16 = AtomicU16::new(26000);
-
-        for _ in 0..2048 {
-            let port = NEXT.fetch_add(1, Ordering::Relaxed);
-            assert!(port < 32000, "exhausted the reserved test port range");
-            if claim_port(port) {
-                return SocketAddr::from(([127, 0, 0, 1], port));
-            }
-        }
-        panic!("no free loopback port in the reserved test range");
-    }
-
     /// A loopback TCP port the kernel picked, kept bound by this process for
     /// the rest of its life so nothing else can take it.
+    ///
+    /// For a test that needs an address before anything listens on it: one
+    /// that must refuse connects, or a peer that only starts listening partway
+    /// through. A listener under test does not need this: every transport
+    /// `listen` binds port 0 and returns the address it bound.
     ///
     /// The reservation is a socket bound to port 0 with `SO_REUSEADDR` and
     /// `SO_REUSEPORT`, and never listened on. The kernel does not auto-assign a
     /// port that is already bound, to a port-0 `bind` or to a `connect`, so no
-    /// other socket lands on it by chance. The listener under test binds the
+    /// other socket lands on it by chance. A listener that later binds the
     /// same address with the same options, which Linux allows for the same
-    /// user, and only listening sockets are handed connections, so the anchor
-    /// never takes one. Until something listens, connects are refused.
-    ///
-    /// TCP only: the anchor holds the TCP port, not the SCTP one, so the SCTP
-    /// tests use [`free_port`].
+    /// user, is the one handed connections, since only listening sockets are,
+    /// so the anchor never takes one. Until something listens, connects are
+    /// refused.
     pub(crate) fn free_tcp_port() -> SocketAddr {
         static ANCHORS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
 

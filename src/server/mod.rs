@@ -1394,7 +1394,9 @@ impl SiphonServer {
                 .get(&addr)
                 .map(|(_, rx)| rx.clone())
                 .unwrap_or_else(|| transport::udp::UdpOutbound::channels(udp_workers).1);
-            transport::udp::listen(
+            // A configured listener that cannot bind is fatal, as it is for the
+            // stream transports below.
+            if let Err(error) = transport::udp::listen(
                 addr,
                 inbound_tx.clone(),
                 listener_rx,
@@ -1402,7 +1404,11 @@ impl SiphonServer {
                 tos,
                 udp_recv_buffer_bytes,
             )
-            .await;
+            .await
+            {
+                error!(%addr, "failed to bind UDP listener: {error}");
+                std::process::exit(1);
+            }
         }
 
         // RFC 5626 §4.4.1 pong tracker — created up front so it can be
@@ -1889,7 +1895,9 @@ impl SiphonServer {
                 ));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
-                transport::sctp::listen(
+                // A configured listener that cannot bind is fatal, as it is for
+                // every other transport.
+                if let Err(error) = transport::sctp::listen(
                     addr,
                     inbound_tx.clone(),
                     sctp_outbound_rx.clone(),
@@ -1897,7 +1905,11 @@ impl SiphonServer {
                     Arc::clone(&transport_acl),
                     tos,
                 )
-                .await;
+                .await
+                {
+                    error!(%addr, "failed to bind SCTP listener: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         // Built without the `sctp` feature: any configured SCTP listener cannot
