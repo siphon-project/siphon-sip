@@ -791,6 +791,43 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   on the callee's dialog as it goes, and an offer in it once the callee answers,
   with the answer siphon relays to the caller in force on the caller's.
 
+- **The SDP siphon sends a B2BUA caller in a reliable provisional is the session
+  in force on the caller's dialog (RFC 3262 §5).** siphon recorded neither the
+  answer in a reliable 18x to a caller whose INVITE offered, nor its early offer
+  in one to an INVITE without SDP, so a session refresh toward the caller had
+  nothing, or something stale, to offer. The answer is in force as it goes, and
+  the offer once the caller's PRACK answers it. SDP in a later provisional
+  changes nothing. A provisional goes to the caller with the `o=` session id
+  and version the callee gave its SDP, and the caller's dialog now takes those
+  as its own (RFC 3264 §8), so a refresh offers the caller that SDP unchanged
+  instead of a session id it never saw at version 0, and a later SDP toward the
+  caller keeps the session id.
+
+- **An offer in a B2BUA caller's PRACK that arrives after its 2xx reaches the
+  callee in an UPDATE (RFC 3311).** When the callee answers before the PRACK of
+  a reliable provisional without SDP, the caller's 2xx does not wait and
+  siphon's PRACK goes to the callee with it. A PRACK from the caller that then
+  carries an offer was answered 200 with no answer at all. Now siphon carries
+  the offer to the callee in an UPDATE on its dialog, through the media engine
+  on an anchored call, and returns the callee's answer in the 200 to the
+  caller's PRACK, both in force on their dialogs. An UPDATE rather than a
+  re-INVITE because the PRACK has to be answered at once, which a re-INVITE
+  waiting on the callee's user cannot promise. A refusal leaves the session as it
+  was (RFC 3311 §5.3) and refuses the caller's PRACK the same way, which RFC 6337
+  §2.3 allows, the call carrying on: 488 or 606 from the callee gives the caller
+  488, 491 and 504 pass as they are, 500 passes with its `Retry-After`, and any
+  other failure gives 500. A 481, a 408, or no response in 64*T1 means the
+  callee's dialog is gone, so the caller gets 500 and the call ends. A callee
+  that did not list UPDATE in `Allow` gets none and the caller gets 488; so does
+  a call with no answered callee, or an offer the media engine refuses. An offer
+  that crosses the callee's unanswered offer in the 2xx gets 491. A
+  retransmission of the PRACK gets the same answer or refusal, and a new PRACK
+  without the offer gets 200. A new PRACK with an offer is a new offer, not a
+  retransmission: while the UPDATE for an earlier one is still out it gets 500
+  with a `Retry-After` of up to 10 seconds, and otherwise it goes to the callee
+  in an UPDATE of its own. The caller's offer becomes its own SDP, the one a
+  siphon-terminated transfer offers onward, only once the callee accepts it.
+
 - **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
   security association it arrived over, and the agreement stops at siphon.**
   RFC 3329 §2.3.1 has every request after the agreement carry a

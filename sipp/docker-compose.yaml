@@ -1344,6 +1344,15 @@ services:
   #   172.20.0.128 — B-leg UAS dave (offer in the PRACK)
   #   172.20.0.129 — A-leg UAC answering carol's early offer
   #   172.20.0.148 — A-leg UAC offering in its PRACK to dave
+  #
+  # erin answers at once after a reliable 180 without SDP, so the caller has its
+  # 2xx and siphon's PRACK went to erin with it; the caller then offers in its
+  # PRACK of the 180, which siphon carries to erin in an UPDATE (RFC 3311) and
+  # answers with erin's answer in the 200 to that PRACK.
+  #
+  #   172.20.0.216 — registration helper for erin
+  #   172.20.0.217 — B-leg UAS erin (late offer in an UPDATE)
+  #   172.20.0.218 — A-leg UAC offering in its PRACK after the 2xx
 
   siphon-b2bua-a-leg-reliable:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
@@ -1620,6 +1629,85 @@ services:
       - "172.20.0.120:5060"
       - -sf
       - /sipp/scenarios/b2bua_prack_offer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
+  sipp-b2bua-prack-late-offer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-a-leg-reliable:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.216
+    entrypoint:
+      - sipp
+      - "172.20.0.120:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_prack_late_offer_erin_contact.csv
+      - -s
+      - erin
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
+  sipp-b2bua-prack-late-offer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-prack-late-offer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.217
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_prack_late_offer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
+  sipp-b2bua-prack-late-offer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-a-leg-reliable:
+        condition: service_healthy
+      sipp-b2bua-prack-late-offer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.218
+    entrypoint:
+      - sipp
+      - "172.20.0.120:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_prack_late_offer_uac.xml
       - -m
       - "1"
       - -l
