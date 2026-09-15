@@ -873,3 +873,97 @@ async fn an_anchored_offer_in_the_callers_prack_crosses_the_media_engine_both_wa
     assert_eq!(answers[0].to_tag.as_deref(), Some("callee-tag"));
     assert_eq!(answers[0].sdp.as_deref(), Some(CALLEE_NEW_ANSWER));
 }
+
+/// The session descriptions siphon has in force on each dialog, and the callee's
+/// own last SDP, as a session refresh and a siphon-terminated transfer read them.
+struct SessionsInForce {
+    caller_session: Option<Vec<u8>>,
+    callee_session: Option<Vec<u8>>,
+    callee_sdp: Option<Vec<u8>>,
+}
+
+fn sessions_in_force(call: &PrackCall) -> SessionsInForce {
+    call.state
+        .call_actors
+        .get_call(&call.call_id)
+        .map(|actor| {
+            let callee = actor.b_legs.first();
+            SessionsInForce {
+                caller_session: actor.a_leg.dialog.last_sent_sdp.clone(),
+                callee_session: callee.and_then(|leg| leg.dialog.last_sent_sdp.clone()),
+                callee_sdp: callee.and_then(|leg| leg.last_sdp.clone()),
+            }
+        })
+        .expect("the call")
+}
+
+/// The callee offered in its reliable 183 to an INVITE siphon sent without SDP,
+/// and the caller answered in its PRACK. The answer siphon's PRACK carried is the
+/// session description in force on the callee's dialog, so once the call is up a
+/// session refresh offers it again, unchanged (RFC 4028 §7.4, RFC 3264 §8), and
+/// the callee's offer is its own last SDP.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_refresh_after_an_early_offer_answered_in_prack_offers_that_answer() {
+    let call = PrackCall::place(None);
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_OFFER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    call.caller_pracks(&progress, 2, CALLER_ANSWER);
+    let prack = pracks(&to(&call.wire(), CALLEE));
+    assert_eq!(prack.len(), 1);
+    call.callee_responds(200, "OK", None, "");
+    call.wire();
+
+    let sessions = sessions_in_force(&call);
+    assert_eq!(sessions.callee_session, Some(prack[0].body.clone()));
+    assert_eq!(sessions.callee_sdp, Some(CALLEE_OFFER.as_bytes().to_vec()));
+
+    // The callee's 2xx named siphon the refresher of the callee's dialog.
+    call.state.call_actors.set_leg_session_timer(
+        &call.call_id,
+        false,
+        Some(crate::b2bua::actor::SessionTimerState::new(
+            1800,
+            true,
+            90,
+            Instant::now(),
+        )),
+    );
+    b2bua_send_session_refresh(&call.call_id, false, &call.state);
+    let sent = call.wire();
+    let refresh: Vec<SipMessage> = to(&sent, CALLEE)
+        .into_iter()
+        .filter(|message| message.method() == Some(&Method::Invite))
+        .collect();
+    assert_eq!(refresh.len(), 1, "{:?}", summaries(&sent));
+    assert_eq!(body_text(&refresh[0]), body_text(&prack[0]));
+}
+
+/// An offer in the caller's PRACK is in force on the callee's dialog once the
+/// callee answers it, and the answer siphon returns in the 200 to the caller's
+/// PRACK is in force on the caller's: the rule an UPDATE's offer and answer
+/// follow. Until the callee answers, the INVITE's offer stays in force there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_in_the_callers_prack_is_in_force_on_both_dialogs_once_the_callee_answers() {
+    let call = PrackCall::place(Some(CALLER_OFFER));
+    call.callee_responds(183, "Session Progress", Some(42), CALLEE_ANSWER);
+    let progress = the_183(&to(&call.wire(), CALLER));
+    call.caller_pracks(&progress, 2, CALLER_NEW_OFFER);
+    let prack = pracks(&to(&call.wire(), CALLEE));
+    assert_eq!(prack.len(), 1);
+    assert_eq!(
+        sessions_in_force(&call).callee_session,
+        Some(call.callee_invite.body.clone()),
+        "the INVITE's offer, until the callee answers"
+    );
+
+    call.callee_answers_prack(&prack[0], 200, CALLEE_NEW_ANSWER);
+    let to_caller = to(&call.wire(), CALLER);
+    assert_eq!(to_caller.len(), 1);
+    let sessions = sessions_in_force(&call);
+    assert_eq!(sessions.callee_session, Some(prack[0].body.clone()));
+    assert_eq!(sessions.caller_session, Some(to_caller[0].body.clone()));
+    assert_eq!(
+        sessions.callee_sdp,
+        Some(CALLEE_NEW_ANSWER.as_bytes().to_vec())
+    );
+}

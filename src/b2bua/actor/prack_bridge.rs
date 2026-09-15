@@ -64,6 +64,10 @@ pub struct PendingPrackOffer {
     /// PRACK's CSeq number, which the callee's response echoes.
     pub b_leg_call_id: String,
     pub b_leg_cseq: u32,
+    /// The callee's leg, and the offer as siphon's PRACK carried it there: the
+    /// session description in force on that dialog once the callee answers it.
+    pub b_leg_index: usize,
+    pub sent_offer: Option<Vec<u8>>,
     /// The caller's offer as it wrote it, for an answer rejecting every stream
     /// should the callee not answer.
     pub offer: Vec<u8>,
@@ -269,6 +273,8 @@ mod tests {
             a_leg_rseq: 7,
             b_leg_call_id: "b-leg@198.51.100.70".to_string(),
             b_leg_cseq: 3,
+            b_leg_index: 0,
+            sent_offer: None,
             offer: b"v=0\r\n".to_vec(),
             sent_at,
         }

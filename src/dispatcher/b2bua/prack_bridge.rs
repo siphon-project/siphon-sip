@@ -69,21 +69,51 @@ pub fn hold_or_send_callee_prack(
             "B2BUA: the callee offered in a reliable provisional to a caller that cannot PRACK it; \
              answering the offer with every stream rejected"
         );
-        (rejecting_answer(&offer), "application/sdp".to_string())
+        rejecting_prack_answer(&offer)
     });
     send_callee_prack(call_id, &prack, body, state);
 }
 
-/// Send siphon's PRACK for `held` to the callee, carrying `body` (the SDP and its
-/// Content-Type) when there is one, with siphon's own identity and the configured
-/// attributes stripped. Returns the callee dialog's Call-ID and the PRACK's CSeq
-/// number, which the callee's response echoes; `None` when it could not be sent.
+/// What siphon's PRACK to a callee carries (RFC 3262 §5).
+pub enum PrackBody {
+    /// An answer to the offer the callee made in its provisional. Like the answer
+    /// in an ACK, it is the session description in force on the callee's dialog
+    /// once it is sent.
+    Answer { sdp: Vec<u8>, content_type: String },
+    /// An offer from the caller's PRACK, in force on the callee's dialog only once
+    /// the callee answers it, as an UPDATE's offer is.
+    Offer { sdp: Vec<u8>, content_type: String },
+}
+
+/// An answer rejecting every stream of `offer` (RFC 3264 §6), for a PRACK.
+fn rejecting_prack_answer(offer: &[u8]) -> PrackBody {
+    PrackBody::Answer {
+        sdp: rejecting_answer(offer),
+        content_type: "application/sdp".to_string(),
+    }
+}
+
+/// siphon's PRACK on a callee's dialog, as it went out.
+pub struct SentPrack {
+    /// The dialog's Call-ID and the PRACK's CSeq number, which the callee's
+    /// response echoes.
+    pub b_leg_call_id: String,
+    pub cseq: u32,
+    /// The session description of an offer the PRACK carried, as siphon sent it.
+    pub offer: Option<Vec<u8>>,
+}
+
+/// Send siphon's PRACK for `held` to the callee, carrying `body` when there is one,
+/// with siphon's own identity and the configured attributes stripped. An answer is
+/// recorded as the session description in force on the callee's dialog as it goes;
+/// an offer comes back in the [`SentPrack`] for the callee's answer to put in force.
+/// `None` when it could not be sent.
 pub fn send_callee_prack(
     call_id: &str,
     held: &HeldCalleePrack,
-    body: Option<(Vec<u8>, String)>,
+    body: Option<PrackBody>,
     state: &DispatcherState,
-) -> Option<(String, u32)> {
+) -> Option<SentPrack> {
     let cseq = state
         .call_actors
         .next_b_leg_local_cseq(call_id, held.b_leg_index)?;
@@ -92,7 +122,7 @@ pub fn send_callee_prack(
         to_header: held.to_header.clone(),
         route_set: held.route_set.clone(),
     };
-    let (prack, leg) = {
+    let (prack, leg, offer) = {
         let mut call = state.call_actors.get_call_mut(call_id)?;
         let leg = call.b_legs.get_mut(held.b_leg_index)?;
         let mut prack = build_b2bua_prack(
@@ -104,12 +134,22 @@ pub fn send_callee_prack(
             &held.cseq_method,
             cseq,
         )?;
-        if let Some((mut sdp, content_type)) = body {
+        let mut offer = None;
+        if let Some(body) = body {
+            let (mut sdp, content_type, answers) = match body {
+                PrackBody::Answer { sdp, content_type } => (sdp, content_type, true),
+                PrackBody::Offer { sdp, content_type } => (sdp, content_type, false),
+            };
             let transport = leg.transport.transport;
             stamp_b_leg_origin(&mut sdp, &content_type, leg, &transport, state);
+            match (answers, sdp_in_body(&content_type, &sdp)) {
+                (true, Some(session)) => leg.dialog.last_sent_sdp = Some(session),
+                (true, None) => {}
+                (false, session) => offer = session,
+            }
             set_sdp_body(&mut prack, sdp, &content_type);
         }
-        (prack, leg.clone())
+        (prack, leg.clone(), offer)
     };
     // PRACK follows this early dialog's route set (RFC 3262 §4, RFC 3261
     // §12.2.1.1), from the reliable provisional's Record-Route; without one it goes
@@ -134,7 +174,26 @@ pub fn send_callee_prack(
         leg.transport.local_addr,
         state,
     );
-    Some((leg.dialog.call_id, cseq))
+    Some(SentPrack {
+        b_leg_call_id: leg.dialog.call_id,
+        cseq,
+        offer,
+    })
+}
+
+/// Run `update` on the callee's leg `b_leg_index`. By index, where the store's
+/// per-leg setters reach only the winning leg: in the early dialog none has won.
+fn update_callee_leg(
+    call_id: &str,
+    b_leg_index: usize,
+    state: &DispatcherState,
+    update: impl FnOnce(&mut Leg),
+) {
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(leg) = call.b_legs.get_mut(b_leg_index) {
+            update(leg);
+        }
+    }
 }
 
 /// The link siphon's copy of a callee's reliable provisional carries to the PRACK
@@ -205,10 +264,7 @@ fn send_unanswered_callee_prack(call_id: &str, held: &HeldCalleePrack, state: &D
         );
         return;
     }
-    let body = held
-        .offer
-        .as_deref()
-        .map(|offer| (rejecting_answer(offer), "application/sdp".to_string()));
+    let body = held.offer.as_deref().map(rejecting_prack_answer);
     send_callee_prack(call_id, held, body, state);
 }
 
@@ -225,8 +281,10 @@ fn send_unanswered_callee_prack(call_id: &str, held: &HeldCalleePrack, state: &D
 ///   through the media engine when the call is anchored, and the 200 to the
 ///   caller's PRACK waits for the callee's answer.
 ///
-/// An offer or answer that crosses is recorded as its leg's last SDP, as one in an
-/// UPDATE is, so a later session refresh offers what was agreed.
+/// Each party's SDP that crosses is recorded as that party's own last SDP, which a
+/// siphon-terminated transfer offers. What siphon sends the callee is the session
+/// description in force on the callee's dialog, which a session refresh offers:
+/// an answer as it goes, an offer once the callee answers it, as an UPDATE's are.
 pub fn bridge_caller_prack(
     call_id: &str,
     held: HeldCalleePrack,
@@ -241,7 +299,6 @@ pub fn bridge_caller_prack(
         .or_else(|| caller_prack.headers.get("c"))
         .cloned()
         .unwrap_or_else(|| "application/sdp".to_string());
-    let rejecting = |offer: &[u8]| Some((rejecting_answer(offer), "application/sdp".to_string()));
     match (held.offer.as_deref(), caller_prack.body.is_empty()) {
         (Some(offer), true) => {
             warn!(
@@ -249,7 +306,7 @@ pub fn bridge_caller_prack(
                 "B2BUA: the caller PRACKed the callee's offer without an answer (RFC 3262 §5); \
                  rejecting the offer toward the callee and refusing the call"
             );
-            send_callee_prack(call_id, &held, rejecting(offer), state);
+            send_callee_prack(call_id, &held, Some(rejecting_prack_answer(offer)), state);
             CallerPrackBridged::Fail {
                 answer: None,
                 status: NO_ANSWER_IN_PRACK_STATUS,
@@ -265,18 +322,28 @@ pub fn bridge_caller_prack(
                         "B2BUA: the media engine refused the caller's answer to the callee's early offer; \
                          rejecting the offer toward the callee and refusing the call"
                     );
-                    send_callee_prack(call_id, &held, rejecting(offer), state);
+                    send_callee_prack(call_id, &held, Some(rejecting_prack_answer(offer)), state);
                     return CallerPrackBridged::Fail {
                         answer: None,
                         status: PRACK_OFFER_FAILED_STATUS,
                     };
                 }
             };
-            state.call_actors.set_leg_last_sdp(call_id, false, offer);
+            update_callee_leg(call_id, held.b_leg_index, state, |leg| {
+                leg.last_sdp = Some(offer.to_vec());
+            });
             state
                 .call_actors
                 .set_leg_last_sdp(call_id, true, &caller_prack.body);
-            send_callee_prack(call_id, &held, Some((answer, content_type)), state);
+            send_callee_prack(
+                call_id,
+                &held,
+                Some(PrackBody::Answer {
+                    sdp: answer,
+                    content_type,
+                }),
+                state,
+            );
             CallerPrackBridged::Answer
         }
         (None, true) => {
@@ -295,9 +362,15 @@ pub fn bridge_caller_prack(
                     };
                 }
             };
-            let Some((b_leg_call_id, b_leg_cseq)) =
-                send_callee_prack(call_id, &held, Some((offer, content_type)), state)
-            else {
+            let Some(sent) = send_callee_prack(
+                call_id,
+                &held,
+                Some(PrackBody::Offer {
+                    sdp: offer,
+                    content_type,
+                }),
+                state,
+            ) else {
                 return CallerPrackBridged::Fail {
                     answer: Some(rejecting_answer(&caller_prack.body)),
                     status: PRACK_OFFER_FAILED_STATUS,
@@ -316,8 +389,10 @@ pub fn bridge_caller_prack(
                         local_addr: inbound.local_addr,
                     },
                     a_leg_rseq,
-                    b_leg_call_id,
-                    b_leg_cseq,
+                    b_leg_call_id: sent.b_leg_call_id,
+                    b_leg_cseq: sent.cseq,
+                    b_leg_index: held.b_leg_index,
+                    sent_offer: sent.offer,
                     offer: caller_prack.body.clone(),
                     sent_at: Instant::now(),
                 });
@@ -383,9 +458,16 @@ pub fn handle_callee_prack_response(
             Anchoring::Refused => None,
         };
         if let Some(mut answer) = answer {
-            state
-                .call_actors
-                .set_leg_last_sdp(&call_id, false, &message.body);
+            // The callee took the offer siphon's PRACK carried, so that offer is the
+            // session description in force on the callee's dialog now, and the
+            // callee's answer is its own last SDP.
+            let sent_offer = pending.sent_offer.clone();
+            update_callee_leg(&call_id, pending.b_leg_index, state, |leg| {
+                leg.last_sdp = Some(message.body.clone());
+                if let Some(offer) = sent_offer {
+                    leg.dialog.last_sent_sdp = Some(offer);
+                }
+            });
             let content_type = message
                 .headers
                 .get("Content-Type")
@@ -402,6 +484,8 @@ pub fn handle_callee_prack_response(
                 true,
                 Some(&host),
             );
+            // The answer as the caller receives it is in force on the caller's dialog.
+            record_sdp_sent_to_leg(state, &call_id, true, &content_type, &answer);
             let mut ok = build_response(
                 &pending.caller_prack,
                 200,

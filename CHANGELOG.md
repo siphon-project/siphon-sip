@@ -786,7 +786,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   siphon still PRACKs at once, rejecting an early offer it cannot pass on. A
   callee may answer before the PRACK of a reliable provisional without SDP, and
   siphon's copy then stops being retransmitted, so a PRACK still waiting for the
-  caller's goes to the callee with the caller's 2xx.
+  caller's goes to the callee with the caller's 2xx. What a PRACK exchange agrees
+  is the session a later refresh offers: the answer in siphon's PRACK is in force
+  on the callee's dialog as it goes, and an offer in it once the callee answers,
+  with the answer siphon relays to the caller in force on the caller's.
 
 - **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
   security association it arrived over, and the agreement stops at siphon.**
