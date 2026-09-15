@@ -435,6 +435,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
   `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
   shape matches the DTLS profiles in the WhatsApp calling example.
+
 - **A B2BUA ACKs the callee's 2xx as soon as it arrives, and ACKs every
   retransmission of it, instead of holding the ACK until the caller ACKs.**
   siphon is the UAC of the B-leg, and RFC 3261 §13.2.2.4 has it ACK each 2xx
@@ -483,6 +484,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   retransmitted. A callee whose own 2xx carried the offer, and whose ACK is
   still waiting for the caller's answer, is sent that ACK first, with every
   stream rejected, right before its BYE.
+
 - **A B2BUA call that ends before the caller has ACKed the 2xx sends the caller
   its BYE after the ACK, not before it.** RFC 3261 §15 has a UAS send no BYE on
   a confirmed dialog until the ACK for its 2xx arrives or the transaction times
@@ -498,6 +500,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   credit cut, a bridge peer's hangup, the session timer and the maximum call
   duration. A caller that sends its own BYE in that window is answered 200
   instead of 481, and siphon sends it nothing more.
+
+  Transfers follow the same rule, through the same path. The referrer a REFER
+  releases (at once, or once the terminating NOTIFY is answered), the surviving
+  party of a transfer that failed after the referrer left, and the party an
+  INVITE with `Replaces` takes over each get their BYE after their ACK when
+  they have not ACKed yet. What decides is the dialog, not the leg slot: a
+  takeover of the callee's side moves the caller into the B-leg slot, and a
+  later teardown still holds the caller's BYE.
+
+- **Two teardowns of one B2BUA call that start at the same moment no longer
+  BYE each leg twice.** The 64*T1 no-ACK teardown and a script, a timer or
+  a BYE could each read the call before either removed it, and both sent
+  their BYEs. The first teardown now claims the call and the others back off;
+  a BYE that arrives while another teardown has the call is answered 200.
 
 - **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
   the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the

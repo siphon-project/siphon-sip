@@ -68,7 +68,7 @@ fn call_is_up(call: &Call) -> bool {
 
 /// Both stores drained: no answer waiting for an ACK and no BYE held for one.
 fn nothing_held(call: &Call) -> bool {
-    call.state.held_a_leg_byes.is_empty() && call.state.uas_2xx_retransmits.is_empty()
+    call.state.held_byes.is_empty() && call.state.uas_2xx_retransmits.is_empty()
 }
 
 /// A BYE in the dialog the 2xx created (RFC 3261 §12.2.1.1): the caller's remote

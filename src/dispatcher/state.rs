@@ -205,9 +205,13 @@ pub struct DispatcherState {
     /// CANCELs. The A-leg ACK handler removes the entry and cancels the
     /// retransmit task when the caller's ACK arrives; otherwise the task stops at
     /// 64×T1 and `sweep_unacked_uas_2xx` removes the entry and ends the call.
+    ///
+    /// Keyed by the SIP Call-ID of the dialog the 2xx went out on, which its ACK
+    /// names, not by the internal call id: a takeover can leave one call with two
+    /// unACKed answers, and can move a dialog to another of the call's legs.
     pub uas_2xx_retransmits: Arc<DashMap<String, Arc<UnackedAnswer>>>,
-    /// BYEs to callers whose 2xx is still unACKed, keyed by the A-leg SIP
-    /// Call-ID.
+    /// BYEs to parties whose 2xx from siphon is still unACKed, keyed by that
+    /// dialog's SIP Call-ID. Released through `release_held_bye`.
     ///
     /// RFC 3261 §15: the callee's UA MUST NOT send a BYE on a confirmed dialog
     /// until it has received an ACK for its 2xx or the server transaction has
@@ -216,7 +220,7 @@ pub struct DispatcherState {
     /// The caller's ACK sends it, and so does `sweep_unacked_uas_2xx` at 64×T1.
     /// Keyed by the SIP Call-ID rather than the internal id: the call itself is
     /// gone by the time the ACK arrives.
-    pub held_a_leg_byes: Arc<DashMap<String, HeldBye>>,
+    pub held_byes: Arc<DashMap<String, HeldBye>>,
     /// INVITE server transactions whose CANCEL has already been accepted,
     /// keyed by the INVITE's transaction key.
     ///
@@ -359,24 +363,37 @@ pub struct UnackedAnswer {
     /// store, the sweep ends the call. A tokio instant, so a paused test clock
     /// moves it.
     pub deadline: tokio::time::Instant,
-    /// The caller's Call-ID, taken off the 2xx: the key a BYE held for this ACK
-    /// is stored under in `held_a_leg_byes`.
-    pub a_leg_call_id: String,
+    /// The call the 2xx belongs to. The sweep ends it at 64×T1 while the dialog is
+    /// still one of its legs.
+    pub internal_call_id: String,
 }
 
-/// A BYE to the caller that waits for the ACK of the 2xx siphon sent it
-/// (RFC 3261 §15), with everything needed to send it after the call is gone.
+/// A BYE that waits for the ACK of the 2xx siphon sent on its dialog (RFC 3261
+/// §15), with everything needed to send it after the call is gone.
 pub struct HeldBye {
     pub bye: SipMessage,
     pub transport: Transport,
     pub destination: SocketAddr,
     pub connection_id: ConnectionId,
     pub local_addr: Option<SocketAddr>,
-    /// The call this BYE ends: the key of its answer in `uas_2xx_retransmits`.
+    /// How the BYE goes out once it is released.
+    pub sender: ByeSender,
+    /// The call this BYE ends, for the log line.
     pub internal_call_id: String,
     /// The unACKed 2xx this BYE waits for. Only an entry that is this very `Arc`
     /// is stopped along with it.
     pub answer: Arc<UnackedAnswer>,
+}
+
+/// How a siphon-originated BYE goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByeSender {
+    /// Straight onto the dialog's flow (`send_message_from`), the way every BYE
+    /// to a caller and every BYE a transfer sends has always gone.
+    Dialog,
+    /// To a leg siphon dialled (`send_b2bua_to_bleg`), which also arms the RFC 3261
+    /// §17.1 retransmit schedule every request siphon originates on it gets.
+    BLeg,
 }
 
 /// State for one outstanding reliable provisional response (RFC 3262 §3).

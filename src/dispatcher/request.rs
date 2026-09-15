@@ -226,39 +226,48 @@ pub(super) fn handle_request(
                     // when it arrived (RFC 3261 §13.2.2.4, see `ack_b_leg_2xx`),
                     // except when that 2xx carried the offer: its ACK has waited
                     // for the answer this ACK carries, and goes now.
+                    // The ACK stops the retransmission of the 2xx siphon sent on
+                    // this dialog (RFC 3261 §13.3.1.4); the store is keyed by the
+                    // dialog's Call-ID. Removing the entry is also what keeps the
+                    // 64*T1 sweep from ending the call: the sweep only acts on an
+                    // entry it removes itself, so an ACK processed first always
+                    // wins. No-op if none is armed (the ACK for a non-2xx).
+                    let acked_now = match state.uas_2xx_retransmits.remove(cid) {
+                        Some((_, unacked)) => {
+                            unacked.cancel.notify_one();
+                            true
+                        }
+                        None => false,
+                    };
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
-                        // The caller's ACK stops A-leg 2xx retransmission
-                        // (RFC 3261 §13.3.1.4). Removing the entry is also what
-                        // keeps the 64*T1 sweep from ending the call: the sweep
-                        // only acts on an entry it removes itself, so an ACK
-                        // processed first always wins. No-op if none is armed
-                        // (the ACK for a non-2xx).
-                        let acked_now = match state.uas_2xx_retransmits.remove(&internal_id) {
-                            Some((_, unacked)) => {
-                                unacked.cancel.notify_one();
-                                true
-                            }
-                            None => false,
-                        };
+                        // The leg carrying this dialog is confirmed, whichever
+                        // slot a takeover has moved it to.
                         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
-                            call.a_leg.initial_acked = true;
+                            if call.a_leg.dialog.call_id == *cid {
+                                call.a_leg.initial_acked = true;
+                            } else if let Some(leg) = call
+                                .b_legs
+                                .iter_mut()
+                                .find(|leg| leg.dialog.call_id == *cid)
+                            {
+                                leg.initial_acked = true;
+                            }
                         }
                         send_delayed_offer_ack(&internal_id, &message, state);
                         // A teardown that began while this ACK was on its way
-                        // may have held the caller's BYE for it (RFC 3261 §15):
-                        // it goes out now, right after the ACK. Only the ACK
-                        // that took the answer can find one.
+                        // may have held the BYE for it (RFC 3261 §15): it goes
+                        // out now, right after the ACK. Only the ACK that took the
+                        // answer can find one.
                         if acked_now {
-                            release_held_a_leg_bye(cid, state);
+                            release_held_bye(cid, state);
                         }
                         debug!(call_id = %internal_id, "B2BUA: absorbed A-leg ACK");
                         return;
                     }
-                    // The call has ended while its 2xx waited for this ACK, and
-                    // the caller's BYE was held for it (RFC 3261 §15): the ACK
-                    // sends it, and stops the 2xx retransmission.
-                    if release_held_a_leg_bye(cid, state) {
-                        debug!(sip_call_id = %cid, "B2BUA: ACK for a call that has ended; sent the BYE held for it");
+                    // The dialog has ended while its 2xx waited for this ACK, and
+                    // its BYE was held for it (RFC 3261 §15): the ACK sends it.
+                    if release_held_bye(cid, state) || acked_now {
+                        debug!(sip_call_id = %cid, "B2BUA: ACK for a dialog that has ended");
                         return;
                     }
                 }
@@ -381,7 +390,7 @@ pub(super) fn handle_request(
         && message
             .headers
             .call_id()
-            .is_some_and(|call_id| state.held_a_leg_byes.contains_key(call_id.as_str()));
+            .is_some_and(|call_id| state.held_byes.contains_key(call_id.as_str()));
     if !bye_for_held_dialog && terminated_dialog_needs_481(&method, &message, &state.call_actors) {
         debug!(
             method = %method,
@@ -440,7 +449,7 @@ pub(super) fn handle_request(
             // A call that ended with the caller's BYE held for its ACK is still
             // a dialog to that caller (RFC 3261 §15), so its BYE is the B2BUA's.
             if state.call_actors.find_by_sip_call_id(sip_call_id).is_some()
-                || state.held_a_leg_byes.contains_key(sip_call_id)
+                || state.held_byes.contains_key(sip_call_id)
             {
                 drop(engine_state);
                 handle_b2bua_bye(inbound, message, state);

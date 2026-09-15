@@ -7559,10 +7559,17 @@ fn pending_inbound_refer_store_drains_to_baseline() {
 fn sample_deferred_bye(deadline: std::time::Instant) -> DeferredReferrerBye {
     DeferredReferrerBye {
         message: sample_refer(),
-        transport: Transport::Udp,
-        destination: "192.0.2.1:5060".parse().expect("destination must parse"),
-        connection_id: ConnectionId::default(),
-        local_addr: None,
+        leg: Leg::new_a_leg(
+            "transfer-call@example.com".to_string(),
+            "referrer-tag".to_string(),
+            "z9hG4bK-referrer".to_string(),
+            LegTransport {
+                remote_addr: "192.0.2.1:5060".parse().expect("destination must parse"),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        ),
         deadline,
         call_id: "transfer-call@example.com".to_string(),
     }

@@ -669,7 +669,7 @@ async fn ending_the_call_while_the_ack_is_held_sends_it_rejecting_the_offer_befo
         to_callee(&sent).is_empty(),
         "the callee was ACKed and BYEd already"
     );
-    assert!(call.state.held_a_leg_byes.is_empty());
+    assert!(call.state.held_byes.is_empty());
 }
 
 /// The caller hangs up before it ACKs: the held ACK goes to the callee, offer

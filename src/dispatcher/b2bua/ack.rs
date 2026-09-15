@@ -247,7 +247,7 @@ pub fn arm_reliable_provisional_retransmit(
 /// retransmits the A-leg 2xx — and the IST would step aside on 2xx anyway
 /// ("TU owns retransmissions"). Without this, a single lost 200 leaves the
 /// caller ringing until it CANCELs. Stores an [`UnackedAnswer`] under the
-/// internal call ID and spawns a task that resends `response` on the RFC 3261
+/// dialog's Call-ID and spawns a task that resends `response` on the RFC 3261
 /// §17.2.1 UAS schedule (T1 doubling to T2) until the caller's ACK cancels it
 /// or 64×T1 has passed.
 ///
@@ -272,17 +272,19 @@ pub fn arm_b2bua_2xx_retransmit(
     let unacked = Arc::new(UnackedAnswer {
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() + timers.t1 * 64,
-        a_leg_call_id: response
-            .headers
-            .call_id()
-            .map(|call_id| call_id.to_string())
-            .unwrap_or_default(),
+        internal_call_id: internal_call_id.to_string(),
     });
-    // A second 2xx armed for the same call replaces the first: stop the task
+    // Keyed by the dialog the 2xx went out on, which its ACK names.
+    let dialog_call_id = response
+        .headers
+        .call_id()
+        .map(|call_id| call_id.to_string())
+        .unwrap_or_else(|| internal_call_id.to_string());
+    // A second 2xx armed for the same dialog replaces the first: stop the task
     // still retransmitting the one it replaced.
     if let Some(replaced) = state
         .uas_2xx_retransmits
-        .insert(internal_call_id.to_string(), Arc::clone(&unacked))
+        .insert(dialog_call_id, Arc::clone(&unacked))
     {
         replaced.cancel.notify_one();
     }
@@ -344,7 +346,7 @@ pub fn arm_b2bua_2xx_retransmit(
 /// no BYE follows it. A call already torn down gets no BYE here either; its
 /// entry is just removed, which also stops its 2xx being retransmitted. The
 /// exception is a call that ended with the caller's BYE held for this ACK
-/// (RFC 3261 §15, [`send_or_hold_a_leg_bye`]): its 2xx goes on being
+/// (RFC 3261 §15, [`send_or_hold_bye`]): its 2xx goes on being
 /// retransmitted until the deadline, and that held BYE is then the one sent.
 ///
 /// Runs on the 100 ms timer tick. Entries exist only for answers still waiting
@@ -360,40 +362,46 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
-    for (call_id, unacked) in armed {
-        let call_ended = state.call_actors.get_call(&call_id).is_none();
-        // A call that ended with the caller's BYE held for this ACK still owes
-        // the caller its 2xx, until the ACK or 64×T1 (RFC 3261 §13.3.1.4, §15).
-        let still_owed = !call_ended || state.held_a_leg_byes.contains_key(&unacked.a_leg_call_id);
+    for (dialog_call_id, unacked) in armed {
+        // The dialog is part of its call only while one of the call's legs still
+        // carries it: a transfer or a takeover can release the party the 2xx went
+        // to while the call goes on without it.
+        let dialog_ended = !state
+            .call_actors
+            .get_call(&unacked.internal_call_id)
+            .is_some_and(|call| call.carries_dialog(&dialog_call_id));
+        // A dialog that ended with its BYE held for this ACK is still owed its 2xx,
+        // until the ACK or 64×T1 (RFC 3261 §13.3.1.4, §15).
+        let still_owed = !dialog_ended || state.held_byes.contains_key(&dialog_call_id);
         if still_owed && now < unacked.deadline {
             continue;
         }
         let claimed = state
             .uas_2xx_retransmits
-            .remove_if(&call_id, |_, current| Arc::ptr_eq(current, &unacked))
+            .remove_if(&dialog_call_id, |_, current| Arc::ptr_eq(current, &unacked))
             .is_some();
         if !claimed {
             continue;
         }
         unacked.cancel.notify_one();
-        // The call was already ended some other way, with the caller's BYE held
-        // for the ACK that never came: that BYE is the one the caller gets.
-        if release_held_a_leg_bye(&unacked.a_leg_call_id, state) {
+        // The dialog was already ended some other way, with its BYE held for the
+        // ACK that never came: that BYE is the one the party gets.
+        if release_held_bye(&dialog_call_id, state) {
             warn!(
-                call_id = %call_id,
-                "RFC 3261 §15: the caller never ACKed the 2xx within 64*T1, sent the BYE held for it"
+                call_id = %unacked.internal_call_id,
+                "RFC 3261 §15: the 2xx was never ACKed within 64*T1, sent the BYE held for it"
             );
             continue;
         }
-        if call_ended {
-            debug!(call_id = %call_id, "A-leg 2xx retransmission stopped: the call already ended");
+        if dialog_ended {
+            debug!(call_id = %unacked.internal_call_id, "2xx retransmission stopped: its dialog already ended");
             continue;
         }
         warn!(
-            call_id = %call_id,
+            call_id = %unacked.internal_call_id,
             "RFC 3261 §13.3.1.4: the caller never ACKed the 2xx within 64*T1, ending the call"
         );
-        b2bua_unacked_answer_terminate(&call_id, state);
+        b2bua_unacked_answer_terminate(&unacked.internal_call_id, state);
     }
 }
 
@@ -703,23 +711,49 @@ fn anchored_answer(
     }
 }
 
-/// The B-leg ACK still held for a delayed offer, completed with an answer that
-/// rejects every stream, for a call ending before the caller answered. Marks it
-/// sent. `None` when no ACK is held.
+/// The ACK still held for a delayed offer on `dialog_leg`'s dialog, completed with
+/// an answer that rejects every stream, for a dialog ending before the caller
+/// answered. Marks it sent. `None` when no ACK is held for that dialog.
 ///
 /// RFC 3261 §13.2.2.4 still has the 2xx ACKed with a valid answer, and §15 lets
 /// the dialog be released with a BYE only once it is. The returned ACK goes out
-/// right before that BYE: see [`send_bye_to_b_leg`].
+/// right before that BYE: see [`send_or_hold_bye`]. The leg is found on the call
+/// by its Call-ID, since a transfer can move it or take it off the call; a leg
+/// taken off is stamped from `dialog_leg` itself.
 pub fn take_held_ack_rejecting_offer(
     call_id: &str,
+    dialog_leg: &Leg,
     state: &DispatcherState,
 ) -> Option<crate::b2bua::actor::DelayedOfferAck> {
     let mut call = state.call_actors.get_call_mut(call_id)?;
-    let held = call.delayed_offer_ack.clone().filter(|held| !held.sent)?;
+    let held = call.delayed_offer_ack.clone().filter(|held| {
+        !held.sent
+            && held
+                .ack
+                .headers
+                .call_id()
+                .is_some_and(|ack_call_id| *ack_call_id == dialog_leg.dialog.call_id)
+    })?;
     let mut body = rejecting_answer(&held.offer);
-    if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
-        stamp_b_leg_origin(&mut body, "application/sdp", leg, &held.transport, state);
-        leg.initial_acked = true;
+    match call
+        .b_legs
+        .iter_mut()
+        .find(|leg| leg.dialog.call_id == dialog_leg.dialog.call_id)
+    {
+        Some(leg) => {
+            stamp_b_leg_origin(&mut body, "application/sdp", leg, &held.transport, state);
+            leg.initial_acked = true;
+        }
+        None => {
+            let mut detached = dialog_leg.clone();
+            stamp_b_leg_origin(
+                &mut body,
+                "application/sdp",
+                &mut detached,
+                &held.transport,
+                state,
+            );
+        }
     }
     let mut ack = held.ack.clone();
     set_sdp_body(&mut ack, body, "application/sdp");
@@ -730,65 +764,6 @@ pub fn take_held_ack_rejecting_offer(
     };
     call.delayed_offer_ack = Some(sent.clone());
     Some(sent)
-}
-
-/// Send `bye` to the winning B-leg `b_leg`, preceded by `held_ack`, the ACK its
-/// 2xx was still owed ([`take_held_ack_rejecting_offer`]).
-///
-/// The two go out as one ordered unit when they share a next hop: sent
-/// separately over UDP they can reach the callee BYE first, for a dialog it has
-/// not yet seen confirmed (RFC 3261 §13.2.2.4, §15).
-pub fn send_bye_to_b_leg(
-    b_leg: &Leg,
-    bye: SipMessage,
-    held_ack: Option<crate::b2bua::actor::DelayedOfferAck>,
-    state: &DispatcherState,
-) {
-    // RFC 3261 §12.2.1.1: next hop is the first Route URI, not the cached
-    // destination of the original INVITE (which may have traversed nodes, an
-    // IMS I-CSCF say, that don't Record-Route and so aren't in the route set).
-    let (destination, transport) = resolve_in_dialog_destination(
-        &b_leg.dialog.route_set,
-        state,
-        b_leg.transport.remote_addr,
-        b_leg.transport.transport,
-    );
-    match held_ack {
-        Some(held) if held.destination == destination && held.transport == transport => {
-            send_b2bua_sequence_to_bleg(
-                vec![held.ack, bye],
-                transport,
-                destination,
-                b_leg.transport.local_addr,
-                state,
-            );
-        }
-        Some(held) => {
-            send_b2bua_to_bleg(
-                held.ack,
-                held.transport,
-                held.destination,
-                held.local_addr,
-                state,
-            );
-            send_b2bua_to_bleg(
-                bye,
-                transport,
-                destination,
-                b_leg.transport.local_addr,
-                state,
-            );
-        }
-        None => {
-            send_b2bua_to_bleg(
-                bye,
-                transport,
-                destination,
-                b_leg.transport.local_addr,
-                state,
-            );
-        }
-    }
 }
 
 #[cfg(test)]

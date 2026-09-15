@@ -326,22 +326,10 @@ pub fn b2bua_bridge_inbound_replaces(
 
     // RFC 3891 §3: the replaced dialog is terminated once the new INVITE is
     // accepted. Its leg is already off the call, so this BYE is built from the
-    // snapshot taken during the swap.
+    // snapshot taken during the swap. A replaced party that has not ACKed its 2xx
+    // gets the BYE after the ACK (RFC 3261 §15).
     if let Some(bye) = build_b2bua_bye(&replaced, state) {
-        let (destination, transport) = resolve_in_dialog_destination(
-            &replaced.dialog.route_set,
-            state,
-            replaced.transport.remote_addr,
-            replaced.transport.transport,
-        );
-        send_message_from(
-            bye,
-            transport,
-            destination,
-            replaced.transport.connection_id,
-            replaced.transport.local_addr,
-            state,
-        );
+        send_or_hold_bye(&replaced_call_id, &replaced, bye, ByeSender::Dialog, state);
     }
 
     // Re-point the survivor at the new party (RFC 3261 §14) — it is still
@@ -1134,14 +1122,6 @@ pub fn b2bua_complete_terminated_transfer(
             .promote_transfer_target(call_id, target_idx, referrer_on_a_leg);
     if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
-            let (dest, transport) = resolve_in_dialog_destination(
-                &referrer_leg.dialog.route_set,
-                state,
-                referrer_leg.transport.remote_addr,
-                referrer_leg.transport.transport,
-            );
-            let connection_id = referrer_leg.transport.connection_id;
-            let local_addr = referrer_leg.transport.local_addr;
             match notify_branch.take() {
                 // A NOTIFY is going out on this dialog, so the BYE waits for it
                 // to be answered. Ordering the two sends is NOT enough: the
@@ -1160,19 +1140,17 @@ pub fn b2bua_complete_terminated_transfer(
                         &branch,
                         DeferredReferrerBye {
                             message: bye,
-                            transport,
-                            destination: dest,
-                            connection_id,
-                            local_addr,
+                            leg: referrer_leg,
                             deadline: std::time::Instant::now() + DEFERRED_REFERRER_BYE_TIMEOUT,
                             call_id: call_id.to_string(),
                         },
                     );
                 }
                 // No NOTIFY was built (a `SiphonInitiated` replacement, which
-                // nobody subscribed to): nothing to wait for, send it now.
+                // nobody subscribed to): nothing to wait for. Sent now, or after
+                // the referrer ACKs a 2xx it has not ACKed yet (RFC 3261 §15).
                 None => {
-                    send_message_from(bye, transport, dest, connection_id, local_addr, state);
+                    send_or_hold_bye(call_id, &referrer_leg, bye, ByeSender::Dialog, state);
                 }
             }
         }
@@ -1376,23 +1354,17 @@ pub fn b2bua_fail_terminated_transfer(
     // arrived, so release it and tear the call down. (When the referrer is still
     // there the original call is intact and simply continues — the arm below.)
     if referrer_gone {
+        // This ends the call, and only one teardown may: one already under way
+        // sends what is owed and removes the call itself.
+        if !state.call_actors.claim_teardown(call_id) {
+            return;
+        }
         let survivor_on_a_leg = !referrer_on_a_leg;
         if let Some(survivor_leg) = state.call_actors.clone_leg(call_id, survivor_on_a_leg) {
             if let Some(bye) = build_b2bua_bye(&survivor_leg, state) {
-                let (dest, transport) = resolve_in_dialog_destination(
-                    &survivor_leg.dialog.route_set,
-                    state,
-                    survivor_leg.transport.remote_addr,
-                    survivor_leg.transport.transport,
-                );
-                send_message_from(
-                    bye,
-                    transport,
-                    dest,
-                    survivor_leg.transport.connection_id,
-                    survivor_leg.transport.local_addr,
-                    state,
-                );
+                // Sent now, or after the survivor ACKs a 2xx it has not ACKed yet
+                // (RFC 3261 §15).
+                send_or_hold_bye(call_id, &survivor_leg, bye, ByeSender::Dialog, state);
             }
         }
         warn!(

@@ -211,7 +211,7 @@ async fn a_call_that_already_ended_gets_no_second_bye() {
         "a 2xx for a call that ended is not retransmitted"
     );
     assert!(call.state.uas_2xx_retransmits.is_empty());
-    assert!(call.state.held_a_leg_byes.is_empty());
+    assert!(call.state.held_byes.is_empty());
 }
 
 /// A 2xx siphon answered itself (`call.answer()`, the control plane's answer)
