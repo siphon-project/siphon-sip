@@ -1970,7 +1970,7 @@ jobs:
         # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
         # a known-good pairing rather than whatever shipped most recently.
         run: |
-          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.7.0
+          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.7.1
           docker cp rtp-extract:/usr/local/bin/siphon-rtp ./siphon-rtp
           docker rm rtp-extract
           chmod +x ./siphon-rtp
