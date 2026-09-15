@@ -29,6 +29,11 @@ impl PyMetricsNamespace {
     pub fn new(custom: Arc<CustomMetrics>) -> Self {
         Self { custom }
     }
+
+    /// A new script load starts: see [`CustomMetrics::begin_script_load`].
+    pub(crate) fn begin_script_load(&self) {
+        self.custom.begin_script_load();
+    }
 }
 
 #[pymethods]

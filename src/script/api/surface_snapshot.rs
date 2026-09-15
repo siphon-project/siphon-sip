@@ -215,14 +215,11 @@ _surface_json = json.dumps(surface, indent=2, sort_keys=True)
 
     /// The guard the split runs against.
     ///
-    /// Runs in a process of its own. Every `install_siphon_module` in a process
-    /// re-executes the package into the same `siphon` module object:
-    /// `PyModule::from_code` goes through `PyImport_ExecCodeModuleEx`, which
-    /// reuses a module already in `sys.modules`. Whatever an earlier install
-    /// mounted therefore stays on it after its registry entry is cleared, so the
-    /// probe namespaces and extensions other tests in this binary register
-    /// (`probe_ns`, `ext_alpha`, `ModuleExtensionProbe`) showed up here as ADDED
-    /// whenever one of those tests had run first.
+    /// Runs in a process of its own. Other tests in this binary register probe
+    /// namespaces and extensions (`probe_ns`, `ext_alpha`,
+    /// `ModuleExtensionProbe`) in the process-wide registries every
+    /// `install_siphon_module` mounts, and one still registered while this test
+    /// installs would show up here as ADDED.
     #[test]
     fn python_surface_is_unchanged() {
         crate::own_process::run(
@@ -360,6 +357,9 @@ _surface_json = json.dumps(surface, indent=2, sort_keys=True)
         in_source.sort();
         in_source.dedup();
 
+        // Initialised here, not assumed: run alone, or before any test that
+        // initialises it, this test is the first in the process to use Python.
+        Python::initialize();
         let listed = Python::attach(|python| pyclass_types(python).len());
 
         assert_eq!(

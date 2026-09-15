@@ -5,14 +5,83 @@
 //! appear alongside built-in metrics on the `/metrics` endpoint.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry};
 use regex::Regex;
 
 /// Maximum number of distinct label-value combinations per metric.
 const MAX_CARDINALITY: usize = 128;
+
+/// The three kinds of metric a script can declare.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+impl std::fmt::Display for MetricKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+            MetricKind::Histogram => "histogram",
+        })
+    }
+}
+
+/// What a metric was declared as: everything about it that cannot change while
+/// it stays registered.
+#[derive(Clone, Debug, PartialEq)]
+struct Declaration {
+    kind: MetricKind,
+    labels: Vec<String>,
+    /// As given; empty means the default buckets. Always empty unless a histogram.
+    buckets: Vec<f64>,
+}
+
+impl Declaration {
+    fn new(kind: MetricKind, labels: &[&str], buckets: &[f64]) -> Self {
+        Self {
+            kind,
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            buckets: buckets.to_vec(),
+        }
+    }
+}
+
+impl std::fmt::Display for Declaration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a {} with labels [{}]",
+            self.kind,
+            self.labels.join(", ")
+        )?;
+        if self.kind == MetricKind::Histogram {
+            if self.buckets.is_empty() {
+                formatter.write_str(" and the default buckets")?;
+            } else {
+                write!(formatter, " and buckets {:?}", self.buckets)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How a declaration relates to what is already registered.
+enum Claim {
+    /// The name was free; it is now claimed by this script load, whose number
+    /// this carries, and the caller registers the metric.
+    New(u64),
+    /// An earlier script load registered the same metric, and this load has
+    /// taken it over as it is.
+    TakenOver,
+}
 
 /// Thread-safe store for script-defined Prometheus metrics.
 pub struct CustomMetrics {
@@ -24,6 +93,10 @@ pub struct CustomMetrics {
     label_names: DashMap<String, Vec<String>>,
     /// Cardinality tracking: metric name → set of distinct label combos seen.
     cardinality: DashMap<String, Mutex<HashSet<Vec<String>>>>,
+    /// Every declared metric, with the script load that last declared it.
+    declarations: DashMap<String, (Declaration, u64)>,
+    /// The script load declarations are made by now; see [`Self::begin_script_load`].
+    script_load: AtomicU64,
 }
 
 impl CustomMetrics {
@@ -36,58 +109,113 @@ impl CustomMetrics {
             histograms: DashMap::new(),
             label_names: DashMap::new(),
             cardinality: DashMap::new(),
+            declarations: DashMap::new(),
+            script_load: AtomicU64::new(0),
         }
     }
 
-    /// Register a new counter metric.
+    /// Start a new script load.
+    ///
+    /// A script declares its metrics at its top level, and a reload runs that
+    /// top level again while the metrics the replaced load declared stay
+    /// registered, as do the handles its handlers hold. So a load may declare a
+    /// metric an earlier load declared, and takes it over with the values it
+    /// has, as long as its type, labels and buckets are unchanged; those cannot
+    /// change without a restart. The metric keeps the help text it was first
+    /// registered with. Declaring one name twice within one load is an error.
+    pub fn begin_script_load(&self) {
+        self.script_load.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Claim `name` for `declaration` on behalf of the current script load.
+    fn claim(&self, name: &str, declaration: &Declaration) -> Result<Claim, String> {
+        let script_load = self.script_load.load(Ordering::Relaxed);
+        match self.declarations.entry(name.to_owned()) {
+            Entry::Vacant(vacant) => {
+                vacant.insert((declaration.clone(), script_load));
+                Ok(Claim::New(script_load))
+            }
+            Entry::Occupied(mut occupied) => {
+                let (registered, declared_in) = occupied.get_mut();
+                if *declared_in == script_load {
+                    return Err(format!("metric '{name}' is already registered"));
+                }
+                if registered != declaration {
+                    return Err(format!(
+                        "metric '{name}' is already registered as {registered}; a reload \
+                         cannot change a metric's type, labels or buckets, restart to change them"
+                    ));
+                }
+                *declared_in = script_load;
+                Ok(Claim::TakenOver)
+            }
+        }
+    }
+
+    /// Give back a new claim whose metric could not be registered after all.
+    fn release(&self, name: &str, script_load: u64) {
+        self.declarations
+            .remove_if(name, |_, (_, declared_in)| *declared_in == script_load);
+    }
+
+    /// Record what a newly registered metric needs for later updates.
+    fn track(&self, name: &str, labels: &[&str]) {
+        self.label_names.insert(
+            name.to_owned(),
+            labels.iter().map(|s| (*s).to_owned()).collect(),
+        );
+        self.cardinality
+            .insert(name.to_owned(), Mutex::new(HashSet::new()));
+    }
+
+    /// Register a new counter metric. See [`Self::begin_script_load`] for a
+    /// reload declaring it again.
     pub fn register_counter(&self, name: &str, help: &str, labels: &[&str]) -> Result<(), String> {
         validate_metric_name(name)?;
         validate_labels(labels)?;
-        if self.is_registered(name) {
-            return Err(format!("metric '{name}' is already registered"));
-        }
-
         let counter = CounterVec::new(Opts::new(name, help), labels)
             .map_err(|error| format!("failed to create counter '{name}': {error}"))?;
-        self.registry
-            .register(Box::new(counter.clone()))
-            .map_err(|error| format!("failed to register counter '{name}': {error}"))?;
+
+        let Claim::New(script_load) =
+            self.claim(name, &Declaration::new(MetricKind::Counter, labels, &[]))?
+        else {
+            return Ok(());
+        };
+        if let Err(error) = self.registry.register(Box::new(counter.clone())) {
+            self.release(name, script_load);
+            return Err(format!("failed to register counter '{name}': {error}"));
+        }
 
         self.counters.insert(name.to_owned(), counter);
-        self.label_names.insert(
-            name.to_owned(),
-            labels.iter().map(|s| (*s).to_owned()).collect(),
-        );
-        self.cardinality
-            .insert(name.to_owned(), Mutex::new(HashSet::new()));
+        self.track(name, labels);
         Ok(())
     }
 
-    /// Register a new gauge metric.
+    /// Register a new gauge metric. See [`Self::begin_script_load`] for a
+    /// reload declaring it again.
     pub fn register_gauge(&self, name: &str, help: &str, labels: &[&str]) -> Result<(), String> {
         validate_metric_name(name)?;
         validate_labels(labels)?;
-        if self.is_registered(name) {
-            return Err(format!("metric '{name}' is already registered"));
-        }
-
         let gauge = GaugeVec::new(Opts::new(name, help), labels)
             .map_err(|error| format!("failed to create gauge '{name}': {error}"))?;
-        self.registry
-            .register(Box::new(gauge.clone()))
-            .map_err(|error| format!("failed to register gauge '{name}': {error}"))?;
+
+        let Claim::New(script_load) =
+            self.claim(name, &Declaration::new(MetricKind::Gauge, labels, &[]))?
+        else {
+            return Ok(());
+        };
+        if let Err(error) = self.registry.register(Box::new(gauge.clone())) {
+            self.release(name, script_load);
+            return Err(format!("failed to register gauge '{name}': {error}"));
+        }
 
         self.gauges.insert(name.to_owned(), gauge);
-        self.label_names.insert(
-            name.to_owned(),
-            labels.iter().map(|s| (*s).to_owned()).collect(),
-        );
-        self.cardinality
-            .insert(name.to_owned(), Mutex::new(HashSet::new()));
+        self.track(name, labels);
         Ok(())
     }
 
-    /// Register a new histogram metric.
+    /// Register a new histogram metric. See [`Self::begin_script_load`] for a
+    /// reload declaring it again.
     pub fn register_histogram(
         &self,
         name: &str,
@@ -97,27 +225,24 @@ impl CustomMetrics {
     ) -> Result<(), String> {
         validate_metric_name(name)?;
         validate_labels(labels)?;
-        if self.is_registered(name) {
-            return Err(format!("metric '{name}' is already registered"));
-        }
-
+        let declaration = Declaration::new(MetricKind::Histogram, labels, &buckets);
         let mut opts = HistogramOpts::new(name, help);
         if !buckets.is_empty() {
             opts = opts.buckets(buckets);
         }
         let histogram = HistogramVec::new(opts, labels)
             .map_err(|error| format!("failed to create histogram '{name}': {error}"))?;
-        self.registry
-            .register(Box::new(histogram.clone()))
-            .map_err(|error| format!("failed to register histogram '{name}': {error}"))?;
+
+        let Claim::New(script_load) = self.claim(name, &declaration)? else {
+            return Ok(());
+        };
+        if let Err(error) = self.registry.register(Box::new(histogram.clone())) {
+            self.release(name, script_load);
+            return Err(format!("failed to register histogram '{name}': {error}"));
+        }
 
         self.histograms.insert(name.to_owned(), histogram);
-        self.label_names.insert(
-            name.to_owned(),
-            labels.iter().map(|s| (*s).to_owned()).collect(),
-        );
-        self.cardinality
-            .insert(name.to_owned(), Mutex::new(HashSet::new()));
+        self.track(name, labels);
         Ok(())
     }
 
@@ -194,13 +319,6 @@ impl CustomMetrics {
         self.check_cardinality(name, &label_values)?;
         histogram.with_label_values(&refs).observe(value);
         Ok(())
-    }
-
-    /// Check if a metric name is already registered (any type).
-    fn is_registered(&self, name: &str) -> bool {
-        self.counters.contains_key(name)
-            || self.gauges.contains_key(name)
-            || self.histograms.contains_key(name)
     }
 
     /// Resolve label key-value pairs into ordered values matching the registered label names.
@@ -423,6 +541,99 @@ mod tests {
             .unwrap();
         let result = custom.register_gauge("cross_type", "Gauge", &[]);
         assert!(result.is_err());
+    }
+
+    /// A reload runs the script's declarations again: the load after it takes
+    /// an identical metric over, values and all, and still may not declare one
+    /// name twice itself.
+    #[test]
+    fn a_later_script_load_takes_over_an_identical_declaration() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("reloaded_total", "Calls", &["direction"])
+            .unwrap();
+        custom
+            .counter_inc("reloaded_total", &[("direction", "inbound")], 2.0)
+            .unwrap();
+
+        custom.begin_script_load();
+        custom
+            .register_counter("reloaded_total", "Calls", &["direction"])
+            .expect("a later load takes over an identical declaration");
+        custom
+            .counter_inc("reloaded_total", &[("direction", "inbound")], 1.0)
+            .unwrap();
+
+        let counter = custom.counters.get("reloaded_total").unwrap();
+        assert_eq!(
+            counter.with_label_values(&["inbound"]).get(),
+            3.0,
+            "the metric taken over keeps its value"
+        );
+        assert_eq!(
+            registry
+                .gather()
+                .iter()
+                .filter(|family| family.name() == "reloaded_total")
+                .count(),
+            1,
+            "taking a metric over registers nothing new"
+        );
+        let twice = custom
+            .register_counter("reloaded_total", "Calls", &["direction"])
+            .expect_err("one load still may not declare a name twice");
+        assert!(twice.contains("already registered"), "{twice}");
+    }
+
+    /// What a registered metric is cannot change under it, so a later load
+    /// that declares the name differently is refused, and says why.
+    #[test]
+    fn a_later_script_load_cannot_change_what_a_metric_is() {
+        let (_registry, custom) = test_registry();
+        custom
+            .register_counter("shaped_total", "Calls", &["direction"])
+            .unwrap();
+        custom
+            .register_histogram("shaped_seconds", "Latency", &[], vec![0.1, 1.0])
+            .unwrap();
+
+        custom.begin_script_load();
+        let labels = custom
+            .register_counter("shaped_total", "Calls", &["direction", "result"])
+            .expect_err("different labels");
+        assert!(labels.contains("labels [direction]"), "{labels}");
+        let kind = custom
+            .register_gauge("shaped_total", "Calls", &["direction"])
+            .expect_err("a different type");
+        assert!(kind.contains("a counter"), "{kind}");
+        let buckets = custom
+            .register_histogram("shaped_seconds", "Latency", &[], vec![0.5, 5.0])
+            .expect_err("different buckets");
+        assert!(buckets.contains("buckets [0.1, 1.0]"), "{buckets}");
+
+        // A refused declaration leaves the metric to the load that has it, so a
+        // later load that declares it as it was still takes it over.
+        custom.begin_script_load();
+        custom
+            .register_counter("shaped_total", "Calls", &["direction"])
+            .expect("the unchanged declaration is still taken over");
+    }
+
+    /// A claim whose metric the registry refuses is given back, so the name is
+    /// not left claimed by a metric that does not exist.
+    #[test]
+    fn a_declaration_the_registry_refuses_leaves_the_name_free() {
+        let (registry, custom) = test_registry();
+        let taken = prometheus::IntCounter::new("taken_by_siphon_total", "Built in").unwrap();
+        registry.register(Box::new(taken)).unwrap();
+
+        assert!(custom
+            .register_counter("taken_by_siphon_total", "Script", &[])
+            .is_err());
+        assert!(
+            custom.declarations.get("taken_by_siphon_total").is_none(),
+            "a refused registration must not stay claimed"
+        );
     }
 
     #[test]
