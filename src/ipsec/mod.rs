@@ -224,12 +224,12 @@ impl SaRole {
 /// Upper-layer protocol pinned into the XFRM selector for an SA pair —
 /// determines which inner-protocol frames the SA applies to.  IMS IPsec
 /// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
-/// (3GPP TS 33.203 §7.2 — used by UEs that prefer TCP-first SIP).
+/// (the TCP case of the protected ports in 3GPP TS 33.203 §7.1, used by
+/// UEs that prefer TCP-first SIP).
 ///
-/// `Any` is the spec-compliant default: 3GPP TS 33.203 §7.2 requires that
-/// "the Security Associations established between the UE and the P-CSCF
-/// shall be used to protect *all* SIP signalling exchanged between the UE
-/// and the P-CSCF, including SIP traffic over UDP and TCP."  iOS handsets
+/// `Any` is the spec-compliant default: 3GPP TS 33.203 has the two SA
+/// pairs "all shared by TCP and UDP" (§6.3) and says "The transport
+/// protocol selector shall allow UDP and TCP." (§7.1).  iOS handsets
 /// rely on this — they REGISTER over TCP but emit MO MESSAGE over UDP,
 /// and a TCP-pinned SA would silently drop the MESSAGE on
 /// `XfrmInStateMismatch`.  When `Any` is selected, the XFRM selector
@@ -474,9 +474,10 @@ pub struct SecurityAssociationPair {
     pub hard_lifetime_secs: Option<u64>,
     /// Upper-layer protocol pinned into the XFRM selector.  `Any`
     /// (selector_proto=0, the default) covers both ESP-over-UDP and
-    /// ESP-over-TCP under the same SPI pair — required for spec
-    /// compliance with 3GPP TS 33.203 §7.2 ("the SAs shall be used to
-    /// protect *all* SIP signalling … including over UDP and TCP") and
+    /// ESP-over-TCP under the same SPI pair, required for spec
+    /// compliance with 3GPP TS 33.203 (§6.3: the SA pairs are "all
+    /// shared by TCP and UDP"; §7.1: "The transport protocol selector
+    /// shall allow UDP and TCP.") and
     /// for iOS UEs that mix transports (REGISTER over TCP, MO MESSAGE
     /// over UDP).  Pin to `Udp` or `Tcp` only for single-transport
     /// deployments or tests; a mismatched pin silently drops every
@@ -2476,7 +2477,7 @@ mod tests {
         // the kernel ABI.  Linux short-circuits the proto check when
         // sel->proto==0 (see __xfrm{4,6}_selector_match), so the SA
         // pair covers both TCP and UDP under one SPI.  This is the
-        // spec-compliant default per 3GPP TS 33.203 §7.2.
+        // spec-compliant default per 3GPP TS 33.203 §6.3 / §7.1.
         assert_eq!(SaProtocol::Any.as_u8(), 0);
     }
 
@@ -2619,7 +2620,7 @@ mod tests {
 
     #[test]
     fn sa_protocol_default_is_any() {
-        // Spec-driven default change (3GPP TS 33.203 §7.2): an SA pair
+        // Spec-driven default change (3GPP TS 33.203 §6.3 / §7.1): an SA pair
         // must protect SIP signalling on *both* UDP and TCP between the
         // UE and the P-CSCF.  Single-transport pins are opt-in for tests
         // / niche deployments; `Default::default()` returns the

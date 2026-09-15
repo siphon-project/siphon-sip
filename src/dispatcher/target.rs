@@ -409,7 +409,7 @@ pub(super) fn send_to_target(
     match transport {
         Transport::Tcp => {
             // Use connection pool for outbound TCP.  For ESP-over-TCP
-            // IPsec destinations (TS 33.203 §7.2 — iOS clients),
+            // IPsec destinations (TS 33.203 §7.1, iOS clients),
             // bind the local socket to the SA-pair source endpoint
             // (`pcscf_addr:pcscf_port_c`) so the kernel egress XFRM
             // selector for SA #3 matches.  An ephemerally-bound socket

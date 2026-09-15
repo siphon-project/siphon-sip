@@ -28,7 +28,7 @@ listen:
     - "10.0.0.10:5066"      # IPsec protected server port
   tcp:
     - "0.0.0.0:5060"
-    - "10.0.0.10:5064"      # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
+    - "10.0.0.10:5064"      # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.1)
     - "10.0.0.10:5066"      # IPsec protected server port (ESP-over-TCP)
 
   # --- Dual-stack Gm (IPv4 + IPv6) ---------------------------------------
@@ -49,7 +49,7 @@ listen:
   #   - { address: "[2001:db8:ac10::10]:5060", advertise: "pcscf.ims.example" }
   #   - { address: "[2001:db8:ac10::10]:5064", advertise: "pcscf.ims.example" }
   #   - { address: "[2001:db8:ac10::10]:5066", advertise: "pcscf.ims.example" }
-  # tcp:  # ESP-over-TCP mirror (TS 33.203 §7.2), same six entries
+  # tcp:  # ESP-over-TCP mirror (TS 33.203 §7.1), same six entries
   #   - { address: "192.0.2.10:5060" }
   #   - { address: "[2001:db8:ac10::10]:5060" }
   #   # ...
