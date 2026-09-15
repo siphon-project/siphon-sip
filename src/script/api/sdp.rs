@@ -225,6 +225,10 @@ impl PySdp {
     // -----------------------------------------------------------------
 
     /// Keep only codecs whose names match the given list (case-insensitive).
+    ///
+    /// RTP sections only: a `udptl`, `UDP/DTLS/SCTP` or `TCP/MSRP` section is
+    /// left alone. An RTP section left with none of the codecs is rejected,
+    /// port 0 with its first format kept (RFC 3264 §6).
     fn filter_codecs(&self, keep: Vec<String>) -> PyResult<()> {
         let keep_refs: Vec<&str> = keep.iter().map(|s| s.as_str()).collect();
         self.lock()?.filter_codecs(&keep_refs);
@@ -232,6 +236,9 @@ impl PySdp {
     }
 
     /// Remove codecs by name (case-insensitive).
+    ///
+    /// RTP sections only, and removing every codec of a stream rejects it the
+    /// same way as `filter_codecs`.
     fn remove_codecs(&self, remove: Vec<String>) -> PyResult<()> {
         let remove_refs: Vec<&str> = remove.iter().map(|s| s.as_str()).collect();
         self.lock()?.remove_codecs(&remove_refs);
@@ -348,6 +355,9 @@ impl PyMediaSection {
     }
 
     /// Codec names derived from rtpmap and static payload types.
+    ///
+    /// Empty for a section that is not RTP (T.38, WebRTC data channel, MSRP),
+    /// whose formats are not codecs.
     #[getter]
     fn codecs(&self) -> PyResult<Vec<String>> {
         let sdp = self.lock()?;

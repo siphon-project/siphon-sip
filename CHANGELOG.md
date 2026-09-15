@@ -1167,6 +1167,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   script `answer()` on such a call went to the old one. Calls that were never
   re-anchored send exactly what they sent before.
 
+- **SDP formats that are not RTP payload types survive `sdp.parse()` and
+  every path that re-serializes SDP.** RFC 8866 §5.14 makes each format on an
+  `m=` line a token, but the parser only kept numbers, so `t38`,
+  `webrtc-datachannel`, `*` and the like were dropped along with the `a=fmtp:`
+  line keyed on them. The section then went out as an `m=` line with no format
+  at all, which is not SDP. That hit a script's `parse`/`apply`, the rtpproxy
+  backend and the control-plane re-bridge alike. Every format is now kept as it
+  arrived, `fmtp` is keyed by format, and an `a=rtpmap:` line the parser cannot
+  read and a `port/count` go back out unchanged (`49170/2` used to read as port
+  0, which disables the stream; rtpproxy drops the count when it anchors the
+  stream on its one relay port). An `m=` line with no protocol is no longer
+  given `RTP/AVP`. `filter_codecs()` and `remove_codecs()` only touch RTP
+  sections now, so a T.38 or data channel section next to the audio is left
+  alone, and a stream they leave with no codec is rejected with port 0 and one
+  format kept (RFC 3264 §6) instead of being emptied. For Rust embedders:
+  `MediaLine::formats` is now `Vec<String>`, `MediaLine::fmtp` is keyed by
+  `String`, and `MediaLine` has a new `port_count` field.
+
 ### Security
 
 - **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3

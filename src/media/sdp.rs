@@ -5,9 +5,9 @@
 //! get/set/remove arbitrary `a=` attributes at session and media level.
 //!
 //! This is NOT a full RFC 4566 parser — it handles the common cases needed for
-//! SDP manipulation in a SIP proxy/B2BUA context.
-
-use std::collections::HashSet;
+//! SDP manipulation in a SIP proxy/B2BUA context. What it does not break out it
+//! carries through as it arrived: a proxy or B2BUA has to pass on media it does
+//! not model (T.38, WebRTC data channels, MSRP, floor control) intact.
 
 /// A parsed media line from SDP.
 #[derive(Debug, Clone)]
@@ -16,14 +16,22 @@ pub struct MediaLine {
     pub media_type: String,
     /// Port number.
     pub port: u16,
-    /// Protocol: "RTP/AVP", "RTP/SAVP", "RTP/SAVPF", "UDP/TLS/RTP/SAVPF", etc.
+    /// The number of ports an `m=<media> <port>/<count>` line gives
+    /// (RFC 8866 §5.14), `None` when the line gives only the port.
+    pub port_count: Option<u16>,
+    /// Protocol: "RTP/AVP", "RTP/SAVPF", "UDP/TLS/RTP/SAVPF", "udptl", etc.
+    /// Empty when the `m=` line has none.
     pub protocol: String,
-    /// Payload type numbers.
-    pub formats: Vec<u16>,
-    /// Codec attributes keyed by payload type.
+    /// The media formats, verbatim and in order. RFC 8866 §5.14 makes each one
+    /// a token: an RTP payload type number under an RTP protocol, and whatever
+    /// the protocol defines otherwise (`t38`, `webrtc-datachannel`, `*`).
+    pub formats: Vec<String>,
+    /// Codec attributes keyed by payload type. An `a=rtpmap:` line whose
+    /// payload type is not a number stays in `other_attrs` as it arrived.
     pub rtpmap: Vec<(u16, String)>,
-    /// fmtp attributes keyed by payload type.
-    pub fmtp: Vec<(u16, String)>,
+    /// fmtp attributes keyed by format (RFC 8866 §6.15). An `a=fmtp:` line
+    /// without parameters stays in `other_attrs` as it arrived.
+    pub fmtp: Vec<(String, String)>,
     /// Other lines of this media section (everything but rtpmap/fmtp), kept in
     /// arrival order.  The serializer, not this vector, is what puts them into
     /// RFC 4566 §5 order — see [`PRE_ATTRIBUTE_PREFIXES`].
@@ -162,18 +170,64 @@ impl MediaLine {
 
     /// Return codec names derived from `rtpmap` entries and static payload
     /// type names for formats without an explicit `rtpmap`.
+    ///
+    /// Only an RTP section has codecs: anywhere else a format is not a payload
+    /// type, so the list is empty.
     pub fn codec_names(&self) -> Vec<String> {
+        if !self.is_rtp() {
+            return Vec::new();
+        }
         self.formats
             .iter()
-            .filter_map(|&pt| {
-                // Check rtpmap first.
-                if let Some((_, codec)) = self.rtpmap.iter().find(|(rpt, _)| *rpt == pt) {
-                    return Some(codec.split('/').next().unwrap_or(codec).to_string());
-                }
-                // Fall back to well-known static payload types.
-                static_codec_name(pt).map(|name| name.to_string())
-            })
+            .filter_map(|format| codec_name(&self.rtpmap, format))
+            .map(str::to_string)
             .collect()
+    }
+
+    /// Whether this section carries RTP, which is what makes its formats RTP
+    /// payload type numbers (RFC 8866 §5.14). `RTP/AVP`, `RTP/SAVPF`,
+    /// `UDP/TLS/RTP/SAVPF` and `TCP/RTP/AVP` do; `udptl`, `UDP/DTLS/SCTP`,
+    /// `TCP/MSRP` and a bare `udp` do not.
+    pub fn is_rtp(&self) -> bool {
+        self.protocol
+            .split('/')
+            .any(|part| part.eq_ignore_ascii_case("RTP"))
+    }
+
+    /// Keep the formats whose codec `keep` accepts, with their `rtpmap` and
+    /// `fmtp` lines. `keep` gets the codec name, or `None` for a format that
+    /// names no known codec.
+    ///
+    /// A section that is not RTP is left alone, since its formats are not
+    /// codecs. An RTP section that would be left with no format is rejected
+    /// instead (RFC 3264 §6, §8.2): port 0, and its first format stays because
+    /// an `m=` line needs at least one (RFC 8866 §5.14).
+    fn retain_codecs(&mut self, keep: impl Fn(Option<&str>) -> bool) {
+        if !self.is_rtp() {
+            return;
+        }
+        let rtpmap = &self.rtpmap;
+        if self
+            .formats
+            .iter()
+            .any(|format| keep(codec_name(rtpmap, format)))
+        {
+            self.formats
+                .retain(|format| keep(codec_name(rtpmap, format)));
+        } else if !self.formats.is_empty() {
+            self.formats.truncate(1);
+            self.port = 0;
+            self.port_count = None;
+        }
+        let formats = &self.formats;
+        self.rtpmap.retain(|(payload_type, _)| {
+            formats.iter().any(|format| {
+                format
+                    .parse::<u16>()
+                    .is_ok_and(|parsed| parsed == *payload_type)
+            })
+        });
+        self.fmtp.retain(|(format, _)| formats.contains(format));
     }
 }
 
@@ -205,17 +259,15 @@ impl SdpBody {
                 current_media = Some(parse_media_line(line));
             } else if let Some(ref mut media) = current_media {
                 // We're inside a media section
-                if line.starts_with("a=rtpmap:") {
+                if let Some(rtpmap) = parse_rtpmap(line) {
                     // a=rtpmap:97 opus/48000/2
-                    if let Some((pt, codec)) = parse_rtpmap(line) {
-                        media.rtpmap.push((pt, codec));
-                    }
-                } else if line.starts_with("a=fmtp:") {
+                    media.rtpmap.push(rtpmap);
+                } else if let Some(fmtp) = parse_fmtp(line) {
                     // a=fmtp:97 minptime=10;useinbandfec=1
-                    if let Some((pt, params)) = parse_fmtp(line) {
-                        media.fmtp.push((pt, params));
-                    }
+                    media.fmtp.push(fmtp);
                 } else {
+                    // Everything else, an rtpmap or fmtp line that does not
+                    // read as one included, goes back out as it came in.
                     media.other_attrs.push(line.to_string());
                 }
             } else {
@@ -242,58 +294,27 @@ impl SdpBody {
     ///
     /// Static payload types (0-95) without explicit rtpmap are matched by their
     /// well-known names.
+    ///
+    /// Only RTP sections are filtered, and a stream left with none of the
+    /// codecs is rejected rather than emptied (see `MediaLine::retain_codecs`).
     pub fn filter_codecs(&mut self, keep: &[&str]) {
-        let keep_set: HashSet<String> = keep.iter().map(|s| s.to_lowercase()).collect();
-
         for media in &mut self.media_sections {
-            let kept_pts: HashSet<u16> = media
-                .formats
-                .iter()
-                .filter(|&&pt| {
-                    // Check rtpmap first
-                    if let Some(codec_name) = media.rtpmap.iter().find(|(rpt, _)| *rpt == pt) {
-                        let name = codec_name.1.split('/').next().unwrap_or("");
-                        return keep_set.contains(&name.to_lowercase());
-                    }
-                    // Fall back to well-known static payload types
-                    if let Some(name) = static_codec_name(pt) {
-                        return keep_set.contains(&name.to_lowercase());
-                    }
-                    false
-                })
-                .copied()
-                .collect();
-
-            media.formats.retain(|pt| kept_pts.contains(pt));
-            media.rtpmap.retain(|(pt, _)| kept_pts.contains(pt));
-            media.fmtp.retain(|(pt, _)| kept_pts.contains(pt));
+            media.retain_codecs(|name| {
+                name.is_some_and(|name| keep.iter().any(|wanted| wanted.eq_ignore_ascii_case(name)))
+            });
         }
     }
 
-    /// Remove codecs by name. Opposite of `filter_codecs`.
+    /// Remove codecs by name. Opposite of `filter_codecs`, with the same scope:
+    /// RTP sections only, and a stream left with no codec is rejected.
     pub fn remove_codecs(&mut self, remove: &[&str]) {
-        let remove_set: HashSet<String> = remove.iter().map(|s| s.to_lowercase()).collect();
-
         for media in &mut self.media_sections {
-            let removed_pts: HashSet<u16> = media
-                .formats
-                .iter()
-                .filter(|&&pt| {
-                    if let Some(codec_name) = media.rtpmap.iter().find(|(rpt, _)| *rpt == pt) {
-                        let name = codec_name.1.split('/').next().unwrap_or("");
-                        return remove_set.contains(&name.to_lowercase());
-                    }
-                    if let Some(name) = static_codec_name(pt) {
-                        return remove_set.contains(&name.to_lowercase());
-                    }
-                    false
-                })
-                .copied()
-                .collect();
-
-            media.formats.retain(|pt| !removed_pts.contains(pt));
-            media.rtpmap.retain(|(pt, _)| !removed_pts.contains(pt));
-            media.fmtp.retain(|(pt, _)| !removed_pts.contains(pt));
+            media.retain_codecs(|name| match name {
+                Some(name) => !remove
+                    .iter()
+                    .any(|unwanted| unwanted.eq_ignore_ascii_case(name)),
+                None => true,
+            });
         }
     }
 
@@ -455,24 +476,20 @@ impl std::fmt::Display for SdpBody {
         }
 
         for media in &self.media_sections {
-            // m=audio 49170 RTP/AVP 0 8 97
-            let formats: Vec<String> = media.formats.iter().map(|pt| pt.to_string()).collect();
-            if formats.is_empty() {
-                write!(
-                    f,
-                    "m={} {} {}\r\n",
-                    media.media_type, media.port, media.protocol,
-                )?;
-            } else {
-                write!(
-                    f,
-                    "m={} {} {} {}\r\n",
-                    media.media_type,
-                    media.port,
-                    media.protocol,
-                    formats.join(" ")
-                )?;
+            // m=audio 49170 RTP/AVP 0 8 97, with only the fields the section
+            // has: nothing invented for a line that arrived short, and no
+            // trailing space.
+            write!(f, "m={} {}", media.media_type, media.port)?;
+            if let Some(count) = media.port_count {
+                write!(f, "/{count}")?;
             }
+            if !media.protocol.is_empty() {
+                write!(f, " {}", media.protocol)?;
+            }
+            for format in &media.formats {
+                write!(f, " {format}")?;
+            }
+            write!(f, "\r\n")?;
 
             // RFC 4566 §5 fixes the order inside a media description: m=,
             // i=, c=, b=, k=, then a=.  The parser buckets every line that is
@@ -553,23 +570,29 @@ fn attr_extract_value(attr_value: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Parse an `m=` line into a MediaLine.
+///
+/// `media-field = "m=" media SP port ["/" integer] SP proto 1*(SP fmt)`
+/// (RFC 8866 §9). Every format is kept as the token it is, and a field the
+/// line lacks is left empty rather than filled in.
 fn parse_media_line(line: &str) -> MediaLine {
     let content = line.strip_prefix("m=").unwrap_or(line);
-    let parts: Vec<&str> = content.split_whitespace().collect();
+    let mut fields = content.split_whitespace();
 
-    let media_type = parts.first().unwrap_or(&"audio").to_string();
-    let port = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let protocol = parts.get(2).unwrap_or(&"RTP/AVP").to_string();
-    let formats: Vec<u16> = parts
-        .get(3..)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let media_type = fields.next().unwrap_or_default().to_string();
+    let (port, port_count): (u16, Option<u16>) = match fields.next() {
+        Some(field) => match field.split_once('/') {
+            Some((port, count)) => (port.parse().unwrap_or(0), count.parse().ok()),
+            None => (field.parse().unwrap_or(0), None),
+        },
+        None => (0, None),
+    };
+    let protocol = fields.next().unwrap_or_default().to_string();
+    let formats = fields.map(str::to_string).collect();
 
     MediaLine {
         media_type,
         port,
+        port_count,
         protocol,
         formats,
         rtpmap: Vec::new(),
@@ -586,12 +609,24 @@ fn parse_rtpmap(line: &str) -> Option<(u16, String)> {
     Some((pt, codec.to_string()))
 }
 
-/// Parse `a=fmtp:97 minptime=10` → (97, "minptime=10")
-fn parse_fmtp(line: &str) -> Option<(u16, String)> {
+/// Parse `a=fmtp:97 minptime=10` → ("97", "minptime=10"). The format is a
+/// token like any other (RFC 8866 §6.15), so one that is not a payload type
+/// number reads too.
+fn parse_fmtp(line: &str) -> Option<(String, String)> {
     let content = line.strip_prefix("a=fmtp:")?;
-    let (pt_str, params) = content.split_once(' ')?;
-    let pt = pt_str.parse().ok()?;
-    Some((pt, params.to_string()))
+    let (format, parameters) = content.split_once(' ')?;
+    Some((format.to_string(), parameters.to_string()))
+}
+
+/// The codec an RTP format names: its `a=rtpmap:` encoding name, else the
+/// RFC 3551 static name of its payload type. `None` for a format that is not a
+/// payload type number or that names no known codec.
+fn codec_name<'a>(rtpmap: &'a [(u16, String)], format: &str) -> Option<&'a str> {
+    let payload_type = format.parse::<u16>().ok()?;
+    match rtpmap.iter().find(|(mapped, _)| *mapped == payload_type) {
+        Some((_, encoding)) => encoding.split('/').next(),
+        None => static_codec_name(payload_type),
+    }
 }
 
 /// Well-known static codec names for payload types 0-34.
@@ -769,7 +804,8 @@ mod tests {
         assert_eq!(media.media_type, "audio");
         assert_eq!(media.port, 49170);
         assert_eq!(media.protocol, "RTP/AVP");
-        assert_eq!(media.formats, vec![0, 8, 97, 101]);
+        assert_eq!(media.formats, vec!["0", "8", "97", "101"]);
+        assert_eq!(media.port_count, None);
     }
 
     #[test]
@@ -790,9 +826,9 @@ mod tests {
         let media = &sdp.media_sections[0];
 
         assert_eq!(media.fmtp.len(), 2);
-        assert_eq!(media.fmtp[0].0, 97);
+        assert_eq!(media.fmtp[0].0, "97");
         assert!(media.fmtp[0].1.contains("minptime=10"));
-        assert_eq!(media.fmtp[1].0, 101);
+        assert_eq!(media.fmtp[1].0, "101");
     }
 
     #[test]
@@ -801,7 +837,7 @@ mod tests {
         sdp.filter_codecs(&["PCMU", "PCMA"]);
 
         let media = &sdp.media_sections[0];
-        assert_eq!(media.formats, vec![0, 8]);
+        assert_eq!(media.formats, vec!["0", "8"]);
         assert_eq!(media.rtpmap.len(), 2);
         assert!(media.fmtp.is_empty()); // opus and telephone-event fmtp removed
     }
@@ -812,7 +848,7 @@ mod tests {
         sdp.filter_codecs(&["pcmu", "Opus"]);
 
         let media = &sdp.media_sections[0];
-        assert_eq!(media.formats, vec![0, 97]);
+        assert_eq!(media.formats, vec!["0", "97"]);
     }
 
     #[test]
@@ -821,7 +857,7 @@ mod tests {
         sdp.remove_codecs(&["telephone-event"]);
 
         let media = &sdp.media_sections[0];
-        assert_eq!(media.formats, vec![0, 8, 97]);
+        assert_eq!(media.formats, vec!["0", "8", "97"]);
         assert!(!media
             .rtpmap
             .iter()
@@ -1346,7 +1382,8 @@ mod tests {
 
     #[test]
     fn malformed_m_line_no_panic() {
-        // m= with fewer than 4 tokens should not panic.
+        // m= with fewer than 4 tokens should not panic, and is not given a
+        // protocol it never had: it goes back out as it came in.
         let sdp_str = concat!(
             "v=0\r\n",
             "o=- 0 0 IN IP4 0.0.0.0\r\n",
@@ -1358,12 +1395,17 @@ mod tests {
         assert_eq!(sdp.media_sections.len(), 1);
         assert_eq!(sdp.media_sections[0].media_type, "audio");
         assert_eq!(sdp.media_sections[0].port, 5060);
+        assert_eq!(sdp.media_sections[0].protocol, "");
+        assert!(!sdp.media_sections[0].is_rtp());
         assert!(sdp.media_sections[0].formats.is_empty());
+        assert_eq!(sdp.to_string(), sdp_str);
     }
 
     #[test]
-    fn empty_formats_no_trailing_space() {
-        // When all codecs are filtered out, the m= line should not have a trailing space.
+    fn filter_codecs_rejects_a_stream_left_with_no_codec() {
+        // RFC 8866 §5.14 requires at least one format on an m= line, so a
+        // stream with none of the wanted codecs cannot be emptied. It is
+        // rejected the RFC 3264 §6 way instead: port 0, one format kept.
         let sdp_str = concat!(
             "v=0\r\n",
             "o=- 0 0 IN IP4 0.0.0.0\r\n",
@@ -1374,14 +1416,41 @@ mod tests {
             "a=rtpmap:8 PCMA/8000\r\n",
         );
         let mut sdp = SdpBody::parse(sdp_str);
-        // Filter out everything — no codecs kept.
         sdp.filter_codecs(&["nonexistent"]);
-        let output = sdp.to_string();
-        assert!(
-            output.contains("m=audio 49170 RTP/AVP\r\n"),
-            "m= line should not have trailing space: {:?}",
-            output
+        assert_eq!(
+            sdp.to_string(),
+            concat!(
+                "v=0\r\n",
+                "o=- 0 0 IN IP4 0.0.0.0\r\n",
+                "s=-\r\n",
+                "t=0 0\r\n",
+                "m=audio 0 RTP/AVP 0\r\n",
+                "a=rtpmap:0 PCMU/8000\r\n",
+            )
         );
+    }
+
+    #[test]
+    fn removing_every_codec_rejects_the_stream_and_drops_its_port_count() {
+        let mut sdp =
+            SdpBody::parse("v=0\r\nm=audio 49170/2 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n");
+        sdp.remove_codecs(&["PCMA"]);
+        assert_eq!(sdp.media_sections[0].port_count, None);
+        assert_eq!(
+            sdp.to_string(),
+            "v=0\r\nm=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+        );
+    }
+
+    #[test]
+    fn filter_codecs_leaves_a_section_with_no_formats_as_it_is() {
+        // Only a malformed m= line has no format to begin with. There is no
+        // format to keep, so the port is not touched, and the line still goes
+        // out without a trailing space.
+        let mut sdp = SdpBody::parse("v=0\r\nm=audio 5060 RTP/AVP\r\n");
+        sdp.filter_codecs(&["PCMU"]);
+        assert_eq!(sdp.media_sections[0].port, 5060);
+        assert_eq!(sdp.to_string(), "v=0\r\nm=audio 5060 RTP/AVP\r\n");
     }
 
     #[test]
@@ -1398,7 +1467,141 @@ mod tests {
         let mut sdp = SdpBody::parse(sdp_str);
         sdp.filter_codecs(&["PCMU"]);
 
-        assert_eq!(sdp.media_sections[0].formats, vec![0]);
+        assert_eq!(sdp.media_sections[0].formats, vec!["0"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Formats that are not RTP payload types (RFC 8866 §5.14)
+    // -----------------------------------------------------------------
+
+    /// Every section but the audio one has a format that is a token rather
+    /// than a payload type number: T.38 fax, a WebRTC data channel, MSRP, and a
+    /// floor-control stream whose format also keys an fmtp line.
+    const MIXED_FORMATS_SDP: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 192.0.2.10\r\n",
+        "s=-\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "t=0 0\r\n",
+        "m=audio 49170 RTP/AVP 8 101\r\n",
+        "a=rtpmap:8 PCMA/8000\r\n",
+        "a=rtpmap:101 telephone-event/8000\r\n",
+        "a=fmtp:101 0-15\r\n",
+        "m=image 49172 udptl t38\r\n",
+        "a=T38FaxVersion:0\r\n",
+        "a=T38FaxRateManagement:transferredTCF\r\n",
+        "m=application 49174 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+        "a=sctp-port:5000\r\n",
+        "m=message 49176 TCP/MSRP *\r\n",
+        "a=accept-types:message/cpim text/plain\r\n",
+        "m=application 49178 udp MCPTT\r\n",
+        "a=fmtp:MCPTT mc_queueing;mc_priority=5\r\n",
+    );
+
+    #[test]
+    fn token_formats_and_their_fmtp_survive_a_round_trip() {
+        let sdp = SdpBody::parse(MIXED_FORMATS_SDP);
+        assert_eq!(sdp.media_sections[1].formats, vec!["t38"]);
+        assert_eq!(sdp.media_sections[2].formats, vec!["webrtc-datachannel"]);
+        assert_eq!(sdp.media_sections[3].formats, vec!["*"]);
+        assert_eq!(sdp.media_sections[4].formats, vec!["MCPTT"]);
+        assert_eq!(
+            sdp.media_sections[4].fmtp,
+            vec![("MCPTT".to_string(), "mc_queueing;mc_priority=5".to_string())]
+        );
+        assert_eq!(sdp.to_string(), MIXED_FORMATS_SDP);
+    }
+
+    #[test]
+    fn codec_filtering_leaves_sections_that_are_not_rtp_alone() {
+        let without_telephone_event = |audio_line: &str| {
+            MIXED_FORMATS_SDP
+                .replace("m=audio 49170 RTP/AVP 8 101\r\n", audio_line)
+                .replace("a=rtpmap:101 telephone-event/8000\r\n", "")
+                .replace("a=fmtp:101 0-15\r\n", "")
+        };
+
+        let mut sdp = SdpBody::parse(MIXED_FORMATS_SDP);
+        sdp.filter_codecs(&["PCMA"]);
+        assert_eq!(
+            sdp.to_string(),
+            without_telephone_event("m=audio 49170 RTP/AVP 8\r\n")
+        );
+
+        // Removing both audio codecs rejects the audio stream and still leaves
+        // every other section as it was.
+        let mut sdp = SdpBody::parse(MIXED_FORMATS_SDP);
+        sdp.remove_codecs(&["PCMA", "telephone-event"]);
+        assert_eq!(
+            sdp.to_string(),
+            without_telephone_event("m=audio 0 RTP/AVP 8\r\n")
+        );
+    }
+
+    #[test]
+    fn sections_that_are_not_rtp_have_no_codecs() {
+        let sdp = SdpBody::parse(MIXED_FORMATS_SDP);
+        assert_eq!(
+            sdp.media_sections[0].codec_names(),
+            vec!["PCMA", "telephone-event"]
+        );
+        for media in &sdp.media_sections[1..] {
+            assert!(media.codec_names().is_empty(), "{}", media.protocol);
+        }
+    }
+
+    #[test]
+    fn is_rtp_reads_the_protocol() {
+        for protocol in [
+            "RTP/AVP",
+            "RTP/SAVP",
+            "RTP/AVPF",
+            "RTP/SAVPF",
+            "UDP/TLS/RTP/SAVPF",
+            "TCP/RTP/AVP",
+            "TCP/TLS/RTP/AVP",
+        ] {
+            let sdp = SdpBody::parse(&format!("m=audio 5004 {protocol} 0\r\n"));
+            assert!(sdp.media_sections[0].is_rtp(), "{protocol}");
+        }
+        for protocol in [
+            "udptl",
+            "UDP/DTLS/SCTP",
+            "TCP/MSRP",
+            "TCP/TLS/MSRP",
+            "TCP/BFCP",
+            "udp",
+        ] {
+            let sdp = SdpBody::parse(&format!("m=application 5004 {protocol} x\r\n"));
+            assert!(!sdp.media_sections[0].is_rtp(), "{protocol}");
+        }
+    }
+
+    #[test]
+    fn port_count_survives_a_round_trip() {
+        // `49170/2` used to fail the port parse and read as port 0, which
+        // disables the stream.
+        let raw = "v=0\r\nm=video 49170/2 RTP/AVP 31\r\n";
+        let sdp = SdpBody::parse(raw);
+        assert_eq!(sdp.media_sections[0].port, 49170);
+        assert_eq!(sdp.media_sections[0].port_count, Some(2));
+        assert_eq!(sdp.to_string(), raw);
+    }
+
+    #[test]
+    fn unreadable_rtpmap_and_fmtp_lines_are_kept() {
+        // Neither line breaks out into rtpmap/fmtp, so both stay among the
+        // section's other lines instead of being deleted.
+        let raw = concat!(
+            "v=0\r\n",
+            "m=audio 49170 RTP/AVP 97\r\n",
+            "a=rtpmap:dynamic opus/48000/2\r\n",
+            "a=fmtp:97\r\n",
+        );
+        let sdp = SdpBody::parse(raw);
+        assert!(sdp.media_sections[0].rtpmap.is_empty());
+        assert!(sdp.media_sections[0].fmtp.is_empty());
+        assert_eq!(sdp.to_string(), raw);
     }
 
     #[test]

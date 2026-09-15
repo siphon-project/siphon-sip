@@ -40,6 +40,22 @@ const AUDIO_VIDEO_SDP: &str = concat!(
     "a=rtpmap:97 VP8/90000\r\n",
 );
 
+/// A re-INVITE moving a fax call to T.38: the audio stream is rejected and the
+/// image stream's one format is the token `t38`, not a payload type number.
+const T38_REINVITE_SDP: &str = concat!(
+    "v=0\r\n",
+    "o=alice 2890844526 2890844527 IN IP4 192.0.2.10\r\n",
+    "s=-\r\n",
+    "c=IN IP4 192.0.2.10\r\n",
+    "t=0 0\r\n",
+    "m=audio 0 RTP/AVP 0\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "m=image 49172 udptl t38\r\n",
+    "a=T38FaxVersion:0\r\n",
+    "a=T38MaxBitRate:14400\r\n",
+    "a=T38FaxRateManagement:transferredTCF\r\n",
+);
+
 // ---------------------------------------------------------------------------
 // Parse audio-only SDP
 // ---------------------------------------------------------------------------
@@ -59,7 +75,7 @@ fn parse_audio_only_sdp() {
     assert_eq!(media.media_type, "audio");
     assert_eq!(media.port, 49170);
     assert_eq!(media.protocol, "RTP/AVP");
-    assert_eq!(media.formats, vec![0, 8, 97, 101]);
+    assert_eq!(media.formats, vec!["0", "8", "97", "101"]);
     assert_eq!(media.rtpmap.len(), 4);
     assert_eq!(media.fmtp.len(), 2);
 }
@@ -77,16 +93,16 @@ fn parse_audio_and_video_sdp() {
     let audio = &sdp.media_sections[0];
     assert_eq!(audio.media_type, "audio");
     assert_eq!(audio.port, 5004);
-    assert_eq!(audio.formats, vec![0, 8]);
+    assert_eq!(audio.formats, vec!["0", "8"]);
     assert_eq!(audio.rtpmap.len(), 2);
 
     let video = &sdp.media_sections[1];
     assert_eq!(video.media_type, "video");
     assert_eq!(video.port, 5006);
-    assert_eq!(video.formats, vec![96, 97]);
+    assert_eq!(video.formats, vec!["96", "97"]);
     assert_eq!(video.rtpmap.len(), 2);
     assert_eq!(video.fmtp.len(), 1);
-    assert_eq!(video.fmtp[0].0, 96);
+    assert_eq!(video.fmtp[0].0, "96");
     assert!(video.fmtp[0].1.contains("profile-level-id"));
 }
 
@@ -100,7 +116,7 @@ fn filter_codecs_keep_pcmu_only() {
     sdp.filter_codecs(&["PCMU"]);
 
     let media = &sdp.media_sections[0];
-    assert_eq!(media.formats, vec![0]);
+    assert_eq!(media.formats, vec!["0"]);
     assert_eq!(media.rtpmap.len(), 1);
     assert_eq!(media.rtpmap[0].1, "PCMU/8000");
     assert!(
@@ -115,7 +131,7 @@ fn filter_codecs_is_case_insensitive() {
     sdp.filter_codecs(&["pcmu", "Opus"]);
 
     let media = &sdp.media_sections[0];
-    assert_eq!(media.formats, vec![0, 97]);
+    assert_eq!(media.formats, vec!["0", "97"]);
 }
 
 #[test]
@@ -124,7 +140,7 @@ fn filter_codecs_keep_pcmu_and_pcma() {
     sdp.filter_codecs(&["PCMU", "PCMA"]);
 
     let media = &sdp.media_sections[0];
-    assert_eq!(media.formats, vec![0, 8]);
+    assert_eq!(media.formats, vec!["0", "8"]);
     assert_eq!(media.rtpmap.len(), 2);
     assert!(media.fmtp.is_empty());
 }
@@ -139,12 +155,12 @@ fn remove_codecs_telephone_event() {
     sdp.remove_codecs(&["telephone-event"]);
 
     let media = &sdp.media_sections[0];
-    assert_eq!(media.formats, vec![0, 8, 97]);
+    assert_eq!(media.formats, vec!["0", "8", "97"]);
     assert!(!media
         .rtpmap
         .iter()
         .any(|(_, codec)| codec.contains("telephone-event")));
-    assert!(!media.fmtp.iter().any(|(pt, _)| *pt == 101));
+    assert!(!media.fmtp.iter().any(|(format, _)| format == "101"));
 }
 
 #[test]
@@ -153,9 +169,9 @@ fn remove_codecs_opus_removes_fmtp() {
     sdp.remove_codecs(&["opus"]);
 
     let media = &sdp.media_sections[0];
-    assert_eq!(media.formats, vec![0, 8, 101]);
+    assert_eq!(media.formats, vec!["0", "8", "101"]);
     assert!(!media.rtpmap.iter().any(|(_, codec)| codec.contains("opus")));
-    assert!(!media.fmtp.iter().any(|(pt, _)| *pt == 97));
+    assert!(!media.fmtp.iter().any(|(format, _)| format == "97"));
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +227,7 @@ fn filter_then_roundtrip() {
     let reparsed = SdpBody::parse(&serialized);
 
     let media = &reparsed.media_sections[0];
-    assert_eq!(media.formats, vec![0, 8]);
+    assert_eq!(media.formats, vec!["0", "8"]);
     assert_eq!(media.rtpmap.len(), 2);
     assert!(media.fmtp.is_empty());
 }
@@ -348,7 +364,7 @@ fn filter_static_codecs_without_rtpmap() {
     let mut sdp = SdpBody::parse(sdp_str);
     sdp.filter_codecs(&["PCMU"]);
 
-    assert_eq!(sdp.media_sections[0].formats, vec![0]);
+    assert_eq!(sdp.media_sections[0].formats, vec!["0"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +382,18 @@ fn rewrite_sdp_body_returns_filtered_body_and_length() {
     assert_eq!(length, new_body.len());
 }
 
+#[test]
+fn rewrite_sdp_body_passes_a_t38_stream_through_intact() {
+    // The image stream is not RTP, so a codec filter has nothing to say about
+    // it; the rejected audio stream already carries only PCMU.
+    let sdp = SdpBody::parse(T38_REINVITE_SDP);
+    assert_eq!(sdp.media_sections[1].formats, vec!["t38"]);
+
+    let (new_body, length) = rewrite_sdp_body(T38_REINVITE_SDP, &["PCMU"]);
+    assert_eq!(new_body, T38_REINVITE_SDP);
+    assert_eq!(length, T38_REINVITE_SDP.len());
+}
+
 // ---------------------------------------------------------------------------
 // Multi-media section filtering
 // ---------------------------------------------------------------------------
@@ -378,10 +406,10 @@ fn filter_codecs_applies_to_each_media_section() {
     sdp.filter_codecs(&["PCMU", "H264"]);
 
     let audio = &sdp.media_sections[0];
-    assert_eq!(audio.formats, vec![0]);
+    assert_eq!(audio.formats, vec!["0"]);
 
     let video = &sdp.media_sections[1];
-    assert_eq!(video.formats, vec![96]);
+    assert_eq!(video.formats, vec!["96"]);
     assert_eq!(video.rtpmap.len(), 1);
     assert!(video.rtpmap[0].1.contains("H264"));
 }

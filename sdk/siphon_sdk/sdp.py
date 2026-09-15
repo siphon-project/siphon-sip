@@ -34,7 +34,7 @@ Usage::
         m.remove_attr("des")
         m.has_attr("sendrecv")
 
-    # Codec filtering
+    # Codec filtering (RTP sections only)
     s.filter_codecs(["PCMU", "PCMA"])
     s.remove_codecs(["G729"])
 
@@ -45,11 +45,15 @@ Usage::
     s.apply(request)                  # sets body + content_type
     str(s)                            # serialize
     bytes(s)                          # serialize
+
+Formats that are not RTP payload types (``t38``, ``webrtc-datachannel``,
+``*``), their ``a=fmtp:`` lines and a ``port/count`` survive a parse and
+serialize unchanged (RFC 8866 §5.14).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 # Well-known static payload type names (RFC 3551).
 _STATIC_CODEC_NAMES: dict[int, str] = {
@@ -73,6 +77,30 @@ def _attr_extract_value(attr_value: str) -> str:
     return parts[1] if len(parts) > 1 else ""
 
 
+def _parse_u16(text: str) -> Optional[int]:
+    """The 16-bit unsigned number *text* is, or ``None``."""
+    digits = text[1:] if text.startswith("+") else text
+    if not digits or not digits.isascii() or not digits.isdigit():
+        return None
+    value = int(digits)
+    return value if value <= 0xFFFF else None
+
+
+def _codec_name(rtpmap: list[tuple[int, str]], fmt: str) -> Optional[str]:
+    """The codec an RTP format names: its rtpmap encoding, else its static name.
+
+    ``None`` for a format that is not a payload type number or names nothing
+    known.
+    """
+    payload_type = _parse_u16(fmt)
+    if payload_type is None:
+        return None
+    for mapped, encoding in rtpmap:
+        if mapped == payload_type:
+            return encoding.split("/")[0]
+    return _STATIC_CODEC_NAMES.get(payload_type)
+
+
 class MockMediaSection:
     """A single media section within a parsed SDP body.
 
@@ -93,13 +121,15 @@ class MockMediaSection:
         media_type: str,
         port: int,
         protocol: str,
-        formats: list[int],
+        formats: list[str],
         rtpmap: list[tuple[int, str]],
-        fmtp: list[tuple[int, str]],
+        fmtp: list[tuple[str, str]],
         other_attrs: list[str],
+        port_count: Optional[int] = None,
     ) -> None:
         self._media_type = media_type
         self.port = port
+        self._port_count = port_count
         self._protocol = protocol
         self._formats = formats
         self._rtpmap = rtpmap
@@ -113,28 +143,31 @@ class MockMediaSection:
 
     @property
     def protocol(self) -> str:
-        """Protocol: ``"RTP/AVP"``, ``"RTP/SAVPF"``, etc."""
+        """Protocol: ``"RTP/AVP"``, ``"RTP/SAVPF"``, ``"udptl"``, etc.
+
+        ``""`` when the ``m=`` line has none.
+        """
         return self._protocol
 
     @property
     def codecs(self) -> list[str]:
         """Codec names derived from rtpmap and static payload types.
 
+        Only an RTP section has codecs. In any other section (T.38 ``udptl``,
+        WebRTC ``UDP/DTLS/SCTP``, ``TCP/MSRP``) the formats are not payload
+        types, so this is ``[]``.
+
         Example::
 
             m.codecs  # ["PCMU", "PCMA", "opus"]
         """
+        if not self._is_rtp():
+            return []
         names: list[str] = []
-        for pt in self._formats:
-            # Check rtpmap first.
-            found = False
-            for rpt, codec in self._rtpmap:
-                if rpt == pt:
-                    names.append(codec.split("/")[0])
-                    found = True
-                    break
-            if not found and pt in _STATIC_CODEC_NAMES:
-                names.append(_STATIC_CODEC_NAMES[pt])
+        for fmt in self._formats:
+            name = _codec_name(self._rtpmap, fmt)
+            if name is not None:
+                names.append(name)
         return names
 
     @property
@@ -155,7 +188,9 @@ class MockMediaSection:
         """All ``a=`` attribute values for this media section.
 
         Returns the part after ``a=``. Excludes ``rtpmap`` and ``fmtp``
-        (which are stored separately).
+        (which are stored separately), except an ``rtpmap`` line whose payload
+        type is not a number or an ``fmtp`` line without parameters, which
+        stay here as they arrived.
 
         Example::
 
@@ -253,6 +288,31 @@ class MockMediaSection:
             if line.startswith("a=") and _attr_matches_name(line[2:], name):
                 return True
         return False
+
+    def _is_rtp(self) -> bool:
+        """Whether the section carries RTP, so its formats are payload types."""
+        return any(part.lower() == "rtp" for part in self._protocol.split("/"))
+
+    def _retain_codecs(self, keep: Callable[[Optional[str]], bool]) -> None:
+        """Keep the formats whose codec *keep* accepts, in an RTP section only.
+
+        A section left with no format is rejected instead: port 0 and its
+        first format kept, because an ``m=`` line needs one (RFC 3264 §6).
+        """
+        if not self._is_rtp():
+            return
+        if any(keep(_codec_name(self._rtpmap, fmt)) for fmt in self._formats):
+            self._formats = [
+                fmt for fmt in self._formats
+                if keep(_codec_name(self._rtpmap, fmt))
+            ]
+        elif self._formats:
+            self._formats = self._formats[:1]
+            self.port = 0
+            self._port_count = None
+        payload_types = {_parse_u16(fmt) for fmt in self._formats}
+        self._rtpmap = [(pt, c) for pt, c in self._rtpmap if pt in payload_types]
+        self._fmtp = [(fmt, p) for fmt, p in self._fmtp if fmt in self._formats]
 
     def __repr__(self) -> str:
         return (
@@ -448,6 +508,12 @@ class MockSdp:
     def filter_codecs(self, keep: list[str]) -> None:
         """Keep only codecs whose names match the given list (case-insensitive).
 
+        Applies to RTP sections only. Any other section (T.38 ``udptl``,
+        WebRTC ``UDP/DTLS/SCTP``, ``TCP/MSRP``) is left as it is, because its
+        formats are not codecs. An RTP section left with none of the codecs is
+        rejected rather than emptied: its port becomes 0 and its first format
+        stays, since an ``m=`` line needs at least one (RFC 3264 §6).
+
         Args:
             keep: List of codec names to keep (e.g. ``["PCMU", "PCMA"]``).
 
@@ -457,25 +523,15 @@ class MockSdp:
         """
         keep_lower = {name.lower() for name in keep}
         for media in self._media_sections:
-            kept_pts: set[int] = set()
-            for pt in media._formats:
-                # Check rtpmap first.
-                for rpt, codec in media._rtpmap:
-                    if rpt == pt:
-                        if codec.split("/")[0].lower() in keep_lower:
-                            kept_pts.add(pt)
-                        break
-                else:
-                    # Fall back to static names.
-                    name = _STATIC_CODEC_NAMES.get(pt)
-                    if name and name.lower() in keep_lower:
-                        kept_pts.add(pt)
-            media._formats = [pt for pt in media._formats if pt in kept_pts]
-            media._rtpmap = [(pt, c) for pt, c in media._rtpmap if pt in kept_pts]
-            media._fmtp = [(pt, p) for pt, p in media._fmtp if pt in kept_pts]
+            media._retain_codecs(
+                lambda name: name is not None and name.lower() in keep_lower
+            )
 
     def remove_codecs(self, remove: list[str]) -> None:
         """Remove codecs by name (case-insensitive).
+
+        Applies to RTP sections only, like ``filter_codecs``. Removing every
+        codec of a stream rejects it the same way: port 0, first format kept.
 
         Args:
             remove: List of codec names to remove (e.g. ``["G729"]``).
@@ -486,20 +542,9 @@ class MockSdp:
         """
         remove_lower = {name.lower() for name in remove}
         for media in self._media_sections:
-            removed_pts: set[int] = set()
-            for pt in media._formats:
-                for rpt, codec in media._rtpmap:
-                    if rpt == pt:
-                        if codec.split("/")[0].lower() in remove_lower:
-                            removed_pts.add(pt)
-                        break
-                else:
-                    name = _STATIC_CODEC_NAMES.get(pt)
-                    if name and name.lower() in remove_lower:
-                        removed_pts.add(pt)
-            media._formats = [pt for pt in media._formats if pt not in removed_pts]
-            media._rtpmap = [(pt, c) for pt, c in media._rtpmap if pt not in removed_pts]
-            media._fmtp = [(pt, p) for pt, p in media._fmtp if pt not in removed_pts]
+            media._retain_codecs(
+                lambda name: name is None or name.lower() not in remove_lower
+            )
 
     # -----------------------------------------------------------------
     # Media section removal
@@ -554,23 +599,20 @@ class MockSdp:
         for line in self._session_lines:
             lines.append(f"{line}\r\n")
         for media in self._media_sections:
-            formats = " ".join(str(pt) for pt in media._formats)
-            if formats:
-                lines.append(
-                    f"m={media._media_type} {media.port} "
-                    f"{media._protocol} {formats}\r\n"
-                )
-            else:
-                lines.append(
-                    f"m={media._media_type} {media.port} "
-                    f"{media._protocol}\r\n"
-                )
+            m_line = f"m={media._media_type} {media.port}"
+            if media._port_count is not None:
+                m_line += f"/{media._port_count}"
+            if media._protocol:
+                m_line += f" {media._protocol}"
+            for fmt in media._formats:
+                m_line += f" {fmt}"
+            lines.append(f"{m_line}\r\n")
             for attr in media._other_attrs:
                 lines.append(f"{attr}\r\n")
             for pt, codec in media._rtpmap:
                 lines.append(f"a=rtpmap:{pt} {codec}\r\n")
-            for pt, params in media._fmtp:
-                lines.append(f"a=fmtp:{pt} {params}\r\n")
+            for fmt, params in media._fmtp:
+                lines.append(f"a=fmtp:{fmt} {params}\r\n")
         return "".join(lines)
 
     def __bytes__(self) -> bytes:
@@ -601,6 +643,9 @@ class MockSdpNamespace:
 
     def parse(self, source: Union[str, bytes, object]) -> MockSdp:
         """Parse SDP from a Request/Reply/Call message, a string, or bytes.
+
+        Parsing does not reject SDP it cannot fully read: whatever it does not
+        break out is kept and written back as it arrived.
 
         Args:
             source: A ``Request``, ``Reply``, ``Call``, ``str``, or ``bytes``
@@ -648,6 +693,31 @@ class MockSdpNamespace:
         return "<SdpNamespace>"
 
 
+def _parse_port(field: str) -> tuple[int, Optional[int]]:
+    """Split an ``m=`` port field, ``49170`` or ``49170/2``, into port and count."""
+    port_text, _, count_text = field.partition("/")
+    port = _parse_u16(port_text)
+    count = _parse_u16(count_text) if count_text else None
+    return (port if port is not None else 0), count
+
+
+def _parse_rtpmap(line: str) -> Optional[tuple[int, str]]:
+    """``a=rtpmap:97 opus/48000/2`` → ``(97, "opus/48000/2")``, else ``None``."""
+    payload_type, space, encoding = line[len("a=rtpmap:"):].partition(" ")
+    value = _parse_u16(payload_type)
+    if not space or value is None:
+        return None
+    return value, encoding
+
+
+def _parse_fmtp(line: str) -> Optional[tuple[str, str]]:
+    """``a=fmtp:97 minptime=10`` → ``("97", "minptime=10")``, else ``None``."""
+    fmt, space, parameters = line[len("a=fmtp:"):].partition(" ")
+    if not space:
+        return None
+    return fmt, parameters
+
+
 def _parse_sdp_string(sdp_text: str) -> MockSdp:
     """Parse an SDP string into a ``MockSdp`` object."""
     session_lines: list[str] = []
@@ -661,48 +731,26 @@ def _parse_sdp_string(sdp_text: str) -> MockSdp:
             # Save previous media section.
             if current_media is not None:
                 media_sections.append(_build_media_section(current_media))
-            # Parse new m= line.
-            content = line[2:]
-            parts = content.split()
-            media_type = parts[0] if parts else "audio"
-            port = int(parts[1]) if len(parts) > 1 else 0
-            protocol = parts[2] if len(parts) > 2 else "RTP/AVP"
-            formats: list[int] = []
-            for p in parts[3:]:
-                try:
-                    formats.append(int(p))
-                except ValueError:
-                    pass
+            # Parse new m= line: every format is kept as the token it is.
+            parts = line[2:].split()
+            port, port_count = _parse_port(parts[1]) if len(parts) > 1 else (0, None)
             current_media = {
-                "media_type": media_type,
+                "media_type": parts[0] if parts else "",
                 "port": port,
-                "protocol": protocol,
-                "formats": formats,
+                "port_count": port_count,
+                "protocol": parts[2] if len(parts) > 2 else "",
+                "formats": parts[3:],
                 "rtpmap": [],
                 "fmtp": [],
                 "other_attrs": [],
             }
         elif current_media is not None:
-            if line.startswith("a=rtpmap:"):
-                content = line[len("a=rtpmap:"):]
-                space = content.find(" ")
-                if space > 0:
-                    try:
-                        pt = int(content[:space])
-                        codec = content[space + 1:]
-                        current_media["rtpmap"].append((pt, codec))
-                    except ValueError:
-                        pass
-            elif line.startswith("a=fmtp:"):
-                content = line[len("a=fmtp:"):]
-                space = content.find(" ")
-                if space > 0:
-                    try:
-                        pt = int(content[:space])
-                        params = content[space + 1:]
-                        current_media["fmtp"].append((pt, params))
-                    except ValueError:
-                        pass
+            rtpmap = _parse_rtpmap(line) if line.startswith("a=rtpmap:") else None
+            fmtp = _parse_fmtp(line) if line.startswith("a=fmtp:") else None
+            if rtpmap is not None:
+                current_media["rtpmap"].append(rtpmap)
+            elif fmtp is not None:
+                current_media["fmtp"].append(fmtp)
             elif line:
                 current_media["other_attrs"].append(line)
         elif line:
@@ -725,4 +773,5 @@ def _build_media_section(data: dict) -> MockMediaSection:
         rtpmap=data["rtpmap"],
         fmtp=data["fmtp"],
         other_attrs=data["other_attrs"],
+        port_count=data["port_count"],
     )
