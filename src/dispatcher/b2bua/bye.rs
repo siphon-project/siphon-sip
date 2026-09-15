@@ -13,6 +13,11 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
+            // The call ended while its 2xx waited for this caller's ACK, with the
+            // caller's BYE held for it: the dialog is still the caller's to end.
+            if answer_caller_bye_for_held_dialog(&inbound, &message, &sip_call_id, state) {
+                return;
+            }
             // Lost a race with a concurrent teardown — the dispatch gate saw
             // this call, and it is gone by now. Same answer as the no-dialog-leg
             // arm below: 481, never a silent drop (RFC 3261 §15.1.2).
@@ -251,25 +256,11 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             warn!(call_id = %call_id, "B2BUA: no winner set for BYE");
         }
     } else {
-        // BYE from B → generate new A-leg BYE from stored dialog state.
+        // BYE from B → generate new A-leg BYE from stored dialog state. The
+        // callee's BYE was answered above; the caller's goes now, or right after
+        // the caller ACKs a 2xx it has not ACKed yet (RFC 3261 §15).
         if let Some(bye) = build_b2bua_bye(&call.a_leg, state) {
-            let (destination, transport) = resolve_in_dialog_destination(
-                &call.a_leg.dialog.route_set,
-                state,
-                call.a_leg.transport.remote_addr,
-                call.a_leg.transport.transport,
-            );
-            // Source the siphon-originated BYE from the A-leg's anchored socket so a
-            // strict peer sees it from the port the dialog runs on (Via matches — see
-            // build_b2bua_bye). No-op for single-listener hosts.
-            send_message_from(
-                bye,
-                transport,
-                destination,
-                call.a_leg.transport.connection_id,
-                call.a_leg.transport.local_addr,
-                state,
-            );
+            send_or_hold_a_leg_bye(&call_id, &call.a_leg, bye, state);
         }
     }
 

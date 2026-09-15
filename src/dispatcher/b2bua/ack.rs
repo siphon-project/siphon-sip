@@ -272,6 +272,11 @@ pub fn arm_b2bua_2xx_retransmit(
     let unacked = Arc::new(UnackedAnswer {
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() + timers.t1 * 64,
+        a_leg_call_id: response
+            .headers
+            .call_id()
+            .map(|call_id| call_id.to_string())
+            .unwrap_or_default(),
     });
     // A second 2xx armed for the same call replaces the first: stop the task
     // still retransmitting the one it replaced.
@@ -337,7 +342,10 @@ pub fn arm_b2bua_2xx_retransmit(
 /// the two, whichever gets to it first decides: an ACK processed before the
 /// sweep, even one that lands after the deadline, leaves nothing to claim and
 /// no BYE follows it. A call already torn down gets no BYE here either; its
-/// entry is just removed, which also stops its 2xx being retransmitted.
+/// entry is just removed, which also stops its 2xx being retransmitted. The
+/// exception is a call that ended with the caller's BYE held for this ACK
+/// (RFC 3261 §15, [`send_or_hold_a_leg_bye`]): its 2xx goes on being
+/// retransmitted until the deadline, and that held BYE is then the one sent.
 ///
 /// Runs on the 100 ms timer tick. Entries exist only for answers still waiting
 /// for their ACK, and an empty store returns straight away.
@@ -354,7 +362,10 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
         .collect();
     for (call_id, unacked) in armed {
         let call_ended = state.call_actors.get_call(&call_id).is_none();
-        if !call_ended && now < unacked.deadline {
+        // A call that ended with the caller's BYE held for this ACK still owes
+        // the caller its 2xx, until the ACK or 64×T1 (RFC 3261 §13.3.1.4, §15).
+        let still_owed = !call_ended || state.held_a_leg_byes.contains_key(&unacked.a_leg_call_id);
+        if still_owed && now < unacked.deadline {
             continue;
         }
         let claimed = state
@@ -365,6 +376,15 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
             continue;
         }
         unacked.cancel.notify_one();
+        // The call was already ended some other way, with the caller's BYE held
+        // for the ACK that never came: that BYE is the one the caller gets.
+        if release_held_a_leg_bye(&unacked.a_leg_call_id, state) {
+            warn!(
+                call_id = %call_id,
+                "RFC 3261 §15: the caller never ACKed the 2xx within 64*T1, sent the BYE held for it"
+            );
+            continue;
+        }
         if call_ended {
             debug!(call_id = %call_id, "A-leg 2xx retransmission stopped: the call already ended");
             continue;

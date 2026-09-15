@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA callee that hangs up right after it is ACKed, before the caller ACKs.
+
+  RFC 3261 §15: siphon answers this BYE at once. Only its BYE to the caller
+  waits for the caller's ACK, which b2bua_bye_before_ack_uac.xml holds for 3 s.
+  A 200 that waited for the caller's ACK arrives after 1.5 s and fails the call
+  here.
+-->
+<scenario name="B2BUA callee hanging up before the caller's ACK">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="From:" check_it="true"
+            assign_to="siphon_from" />
+      <ereg regexp="sip:[^>]*" search_in="hdr" header="Contact:" check_it="true"
+            assign_to="siphon_contact" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=udp>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=udp>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=callee 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv request="ACK" timeout="2000" crlf="true" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [$siphon_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:bob@[local_ip]>;tag=[pid]SIPpTag01[call_number]
+To: [$siphon_from]
+Call-ID: [call_id]
+CSeq: 1 BYE
+Contact: <sip:bob@[local_ip]:[local_port];transport=udp>
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- No ontimeout: a 200 that waited for the caller's ACK fails the call. -->
+  <recv response="200" timeout="1500" />
+
+</scenario>

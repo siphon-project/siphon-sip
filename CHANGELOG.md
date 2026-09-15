@@ -483,6 +483,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   retransmitted. A callee whose own 2xx carried the offer, and whose ACK is
   still waiting for the caller's answer, is sent that ACK first, with every
   stream rejected, right before its BYE.
+- **A B2BUA call that ends before the caller has ACKed the 2xx sends the caller
+  its BYE after the ACK, not before it.** RFC 3261 §15 has a UAS send no BYE on
+  a confirmed dialog until the ACK for its 2xx arrives or the transaction times
+  out, and toward the caller siphon is that UAS. A callee that hung up the
+  moment it answered was turned straight into a BYE to a caller that had not
+  ACKed yet, so the caller saw the dialog released before it had confirmed it.
+  The callee's BYE is still answered at once, and the call is still torn down
+  then (media, Rf/Ro `ACR-STOP`, the CDR). Only the caller's BYE waits: siphon
+  keeps retransmitting the 2xx, sends the BYE right after the caller's ACK, or
+  sends it once at 64*T1 if the ACK never comes. Every teardown siphon starts
+  itself does the same: `b2bua.terminate` (and so a script ending a call on
+  `@rtpengine.on_media_timeout`), the control-plane and admin hangups, an Ro
+  credit cut, a bridge peer's hangup, the session timer and the maximum call
+  duration. A caller that sends its own BYE in that window is answered 200
+  instead of 481, and siphon sends it nothing more.
 
 - **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
   the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the

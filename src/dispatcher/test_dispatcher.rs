@@ -113,6 +113,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),
+        held_a_leg_byes: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         is_draining: Arc::new(DrainState::new()),
         rf_charger: None,

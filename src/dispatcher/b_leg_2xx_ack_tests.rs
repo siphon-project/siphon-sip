@@ -14,7 +14,7 @@
 //! `unacked_answer_tests`, which drives the other half of the same exchange.
 
 use super::lcr_ring_timeout_tests::top_via_branch;
-use super::test_dispatcher::{test_dispatcher, TestDispatcher};
+use super::test_dispatcher::{test_dispatcher, test_dispatcher_with_script, TestDispatcher};
 use super::*;
 
 const CALLER: &str = "192.0.2.10:5060";
@@ -176,8 +176,17 @@ impl Call {
         Call::bridged_with(true)
     }
 
+    /// [`Call::bridged`] on a dispatcher running `script`.
+    pub(super) fn bridged_with_script(script: &str) -> Call {
+        Call::bridged_on(test_dispatcher_with_script(script), false)
+    }
+
     fn bridged_with(store_offerless_invite: bool) -> Call {
-        let (state, udp, call_id) = Call::caller_alone();
+        Call::bridged_on(test_dispatcher(), store_offerless_invite)
+    }
+
+    fn bridged_on(dispatcher: TestDispatcher, store_offerless_invite: bool) -> Call {
+        let (state, udp, call_id) = Call::caller_on(dispatcher);
         let invite = Call::callee_invite();
         let mut leg = Leg::new_b_leg(
             "b2b-callee@192.0.2.1".to_string(),
@@ -231,7 +240,16 @@ impl Call {
         flume::Receiver<OutboundMessage>,
         String,
     ) {
-        let TestDispatcher { state, udp } = test_dispatcher();
+        Call::caller_on(test_dispatcher())
+    }
+
+    fn caller_on(
+        TestDispatcher { state, udp }: TestDispatcher,
+    ) -> (
+        Arc<DispatcherState>,
+        flume::Receiver<OutboundMessage>,
+        String,
+    ) {
         let state = Arc::new(state);
         let call_id = state.call_actors.create_call(caller_leg());
         state
@@ -326,6 +344,46 @@ impl Call {
         caller_acks(&self.state, relayed_200);
     }
 
+    /// The callee hangs up: a BYE in the dialog its 2xx created, handed to
+    /// [`handle_b2bua_bye`] the way the dispatcher's B2BUA gate hands it over.
+    pub(super) fn callee_hangs_up(&self) {
+        let header = |name: &str| {
+            self.invite
+                .headers
+                .get(name)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| panic!("siphon's INVITE has no {name}"))
+        };
+        let raw = format!(
+            concat!(
+                "BYE sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
+                "Via: SIP/2.0/UDP 198.51.100.77:5060;branch=z9hG4bK-callee-bye\r\n",
+                "Max-Forwards: 70\r\n",
+                "From: {from};tag=callee-tag\r\n",
+                "To: {to}\r\n",
+                "Call-ID: {call_id}\r\n",
+                "CSeq: 1 BYE\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            ),
+            from = header("To"),
+            to = header("From"),
+            call_id = header("Call-ID"),
+        );
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the callee's BYE parses");
+        handle_b2bua_bye(
+            InboundMessage {
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
+                remote_addr: callee(),
+                data: Bytes::from(raw),
+            },
+            message,
+            &self.state,
+        );
+    }
+
     fn callee_leg_acked(&self) -> bool {
         self.state
             .call_actors
@@ -340,18 +398,33 @@ impl Call {
 
 /// The caller ACKs `relayed_200`, the 2xx siphon sent it (RFC 3261 §13.2.2.4).
 pub(super) fn caller_acks(state: &Arc<DispatcherState>, relayed_200: &SipMessage) {
+    caller_sends(state, "ACK", "1 ACK", relayed_200);
+}
+
+/// The caller hangs up in the dialog `relayed_200` created, through
+/// [`handle_request`].
+pub(super) fn caller_hangs_up(state: &Arc<DispatcherState>, relayed_200: &SipMessage) {
+    caller_sends(state, "BYE", "2 BYE", relayed_200);
+}
+
+/// A request from the caller in the dialog `relayed_200` created, through
+/// [`handle_request`].
+fn caller_sends(state: &Arc<DispatcherState>, method: &str, cseq: &str, relayed_200: &SipMessage) {
     let raw = format!(
         concat!(
-            "ACK sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
-            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-ack\r\n",
+            "{method} sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-{branch}\r\n",
             "Max-Forwards: 70\r\n",
             "From: {from}\r\n",
             "To: {to}\r\n",
             "Call-ID: {call_id}\r\n",
-            "CSeq: 1 ACK\r\n",
+            "CSeq: {cseq}\r\n",
             "Content-Length: 0\r\n",
             "\r\n",
         ),
+        method = method,
+        branch = method.to_ascii_lowercase(),
+        cseq = cseq,
         from = relayed_200
             .headers
             .from()
@@ -359,7 +432,7 @@ pub(super) fn caller_acks(state: &Arc<DispatcherState>, relayed_200: &SipMessage
         to = relayed_200.headers.to().expect("the relayed 200 has a To"),
         call_id = CALLER_CALL_ID,
     );
-    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's ACK parses");
+    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's request parses");
     handle_request(
         InboundMessage {
             connection_id: ConnectionId::default(),
@@ -369,7 +442,7 @@ pub(super) fn caller_acks(state: &Arc<DispatcherState>, relayed_200: &SipMessage
             data: Bytes::from(raw),
         },
         message,
-        "ACK".to_string(),
+        method.to_string(),
         state,
     );
 }

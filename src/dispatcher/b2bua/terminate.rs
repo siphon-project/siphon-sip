@@ -61,7 +61,9 @@ pub fn format_normal_clearing_reason(reason: &str) -> String {
 /// Full B2BUA call teardown initiated by the framework — session-timer expiry or
 /// an imperative `b2bua.terminate` — NOT by an inbound BYE. Sends an in-dialog
 /// BYE to BOTH legs from stored dialog state (a single-leg UAS call degrades to
-/// just the A-leg), emits Rf ACR-STOP + a CDR + stops SIPREC (matching the
+/// just the A-leg); a caller that has not ACKed its 2xx gets its BYE once it
+/// does, or at 64×T1 (RFC 3261 §15, [`send_or_hold_a_leg_bye`]). Emits Rf
+/// ACR-STOP + a CDR + stops SIPREC (matching the
 /// inbound-BYE teardown in [`handle_b2bua_bye`] so those per-call stores drain
 /// here too), tears down media, and removes all dialog/registry state.
 ///
@@ -113,21 +115,9 @@ pub fn b2bua_terminate_call_inner(
         Some(bye)
     };
     if let Some(bye_msg) = build_bye(&a_leg) {
-        let (destination, transport) = resolve_in_dialog_destination(
-            &a_leg.dialog.route_set,
-            state,
-            a_leg.transport.remote_addr,
-            a_leg.transport.transport,
-        );
-        // Source the framework BYE from the A-leg's anchored socket (Via matches).
-        send_message_from(
-            bye_msg,
-            transport,
-            destination,
-            a_leg.transport.connection_id,
-            a_leg.transport.local_addr,
-            state,
-        );
+        // Sent now, or right after the caller ACKs a 2xx it has not ACKed yet
+        // (RFC 3261 §15). Everything else in this teardown runs now either way.
+        send_or_hold_a_leg_bye(internal_call_id, &a_leg, bye_msg, state);
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_bye(b_leg) {

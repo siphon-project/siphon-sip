@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA caller whose callee hangs up before this caller has ACKed the 200.
+
+  RFC 3261 §15: siphon is the UAS of this dialog and must not send a BYE on it
+  until this caller has ACKed the 200. The callee (b2bua_bye_before_ack_uas.xml)
+  hangs up right after siphon ACKs it. This caller holds its ACK for 3 s, and a
+  BYE in that time fails the call; siphon's 200 retransmissions meanwhile are
+  absorbed as retransmissions. Once the ACK is out, the BYE has to follow.
+-->
+<scenario name="B2BUA caller ACKing after its callee hung up">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" />
+
+  <!-- The ACK is held for 3 s. A BYE that arrives in that time is one siphon
+       sent before the ACK: SIPp takes it as an unexpected message, aborts the
+       call and fails it. Copies of the 200 are absorbed as retransmissions. -->
+  <pause milliseconds="3000" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- No ontimeout: a BYE that does not follow the ACK fails the call. -->
+  <recv request="BYE" timeout="5000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

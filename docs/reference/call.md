@@ -233,6 +233,13 @@ session ended, and siphon sends both legs a BYE with
 with the same CDR `disconnect_initiator="timeout"`. An ACK that siphon processes
 before the teardown runs keeps the call up.
 
+A call that ends while its 2xx is still waiting for that ACK (the callee hangs
+up right after answering, or any of the teardowns above) sends the callee its BYE
+at once, but not the caller: RFC 3261 §15 sends no BYE on a dialog before its 2xx
+is ACKed. The caller keeps receiving the 2xx, and its BYE goes out right after
+its ACK, or at 64×T1 if the ACK never comes. The CDR, charging and media are
+closed when the call ends, not when that BYE goes out.
+
 ::: siphon_sdk.call.Call.set_max_duration
 
 ## `MediaHandle`

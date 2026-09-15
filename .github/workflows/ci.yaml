@@ -802,6 +802,17 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-noack-2xx rm -sf sipp-b2bua-noack-uac sipp-b2bua-noack-uas sipp-b2bua-noack-register sipp-b2bua-noack-deregister 2>/dev/null || true
 
+      # RFC 3261 §15: the callee hangs up right after it is ACKed, while the
+      # caller still holds its own ACK for 3 s. The callee's BYE has to be
+      # answered within 1.5 s; the caller must get no BYE before its ACK and one
+      # after it. Both sides carry the assertion.
+      - name: B2BUA caller BYE held until the caller ACKs (RFC 3261 §15)
+        run: COMPOSE_PROFILES=b2bua,b2bua-bye-before-ack bash sipp/run_call.sh sipp-b2bua-bye-before-ack-uac sipp-b2bua-bye-before-ack-uas
+
+      - name: Cleanup bye-before-ack containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-bye-before-ack rm -sf sipp-b2bua-bye-before-ack-uac sipp-b2bua-bye-before-ack-uas sipp-b2bua-bye-before-ack-register sipp-b2bua-bye-before-ack-deregister 2>/dev/null || true
+
       - name: Deregister bob (clear previous contacts)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-deregister-bob
 
@@ -817,7 +828,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-unacked-2xx --profile b2bua-delayed-offer --profile b2bua-noack-2xx --profile b2bua-failure down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-unacked-2xx --profile b2bua-delayed-offer --profile b2bua-noack-2xx --profile b2bua-bye-before-ack --profile b2bua-failure down --remove-orphans
 
       - name: Upload logs
         if: always()

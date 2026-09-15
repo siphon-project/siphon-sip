@@ -165,7 +165,9 @@ async fn an_ack_processed_after_the_deadline_but_before_the_sweep_wins() {
 }
 
 /// A call torn down some other way while its 2xx waits for an ACK is not sent a
-/// second BYE at 64*T1, and its 2xx stops being retransmitted once it is gone.
+/// second BYE at 64*T1. The teardown BYEs the callee and holds the caller's BYE for
+/// the ACK (RFC 3261 §15); at 64*T1 the sweep sends that one BYE, and the 2xx stops
+/// being retransmitted.
 #[tokio::test(start_paused = true)]
 async fn a_call_that_already_ended_gets_no_second_bye() {
     let call = Call::bridged();
@@ -178,10 +180,28 @@ async fn a_call_that_already_ended_gets_no_second_bye() {
         "b2bua",
         &call.state,
     ));
-    assert_eq!(byes(&call.wire()).len(), 2, "the teardown BYEs both legs");
-    sweep_unacked_uas_2xx(&call.state);
+    let ended = call.wire();
+    let destinations: Vec<SocketAddr> = byes(&ended).iter().map(|bye| bye.destination).collect();
+    assert_eq!(
+        destinations,
+        vec![callee()],
+        "the teardown BYEs the callee; the caller's BYE waits for its ACK"
+    );
 
     tokio::time::sleep(Duration::from_secs(33)).await;
+    sweep_unacked_uas_2xx(&call.state);
+    let at_deadline = call.wire();
+    let destinations: Vec<SocketAddr> = byes(&at_deadline)
+        .iter()
+        .map(|bye| bye.destination)
+        .collect();
+    assert_eq!(
+        destinations,
+        vec![caller()],
+        "the held BYE, and no second one to either leg"
+    );
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
     sweep_unacked_uas_2xx(&call.state);
     let after = call.wire();
     assert!(byes(&after).is_empty(), "no second BYE");
@@ -191,6 +211,7 @@ async fn a_call_that_already_ended_gets_no_second_bye() {
         "a 2xx for a call that ended is not retransmitted"
     );
     assert!(call.state.uas_2xx_retransmits.is_empty());
+    assert!(call.state.held_a_leg_byes.is_empty());
 }
 
 /// A 2xx siphon answered itself (`call.answer()`, the control plane's answer)
