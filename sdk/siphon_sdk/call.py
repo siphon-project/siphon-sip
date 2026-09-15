@@ -613,8 +613,9 @@ class Call:
         ``180 Ringing``). Does not answer the call: the handler must still
         ``answer()`` / ``dial()`` / ``reject()`` for a final response.
 
-        To a caller that sent ``Require: 100rel`` a 101-199 goes out reliably
-        (RFC 3262 §3): siphon adds ``Require: 100rel`` and its own ``RSeq``,
+        To a caller that sent ``Require: 100rel`` a 101-199 goes out reliably,
+        and so does one carrying SDP to a caller that only sent
+        ``Supported: 100rel`` (RFC 3262 §3): siphon adds ``Require: 100rel`` and its own ``RSeq``,
         retransmits it until the caller's PRACK, answers that PRACK itself, and
         sends a later provisional only after it.
 

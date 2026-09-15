@@ -78,8 +78,9 @@ impl CallerRoute {
 /// caller's dialog identifiers, to the caller of `call_id`.
 ///
 /// It goes out reliably (RFC 3262 §3) when the caller required `100rel`, or
-/// supports it and the callee sent this provisional reliably
-/// (`callee_sent_reliably`, `false` for siphon's own provisional): with siphon's
+/// supports it and either the callee sent this provisional reliably
+/// (`callee_sent_reliably`, `false` for siphon's own provisional) or it carries
+/// SDP: with siphon's
 /// next `RSeq` on the caller's dialog, retransmitted until the caller's PRACK.
 /// While a reliable provisional before it is unacknowledged it waits, and goes
 /// out when that PRACK arrives. Returns `false` when the call is gone.
@@ -95,6 +96,7 @@ pub fn send_a_leg_provisional(
             call.a_leg_requires_100rel,
             call.a_leg_supports_100rel,
             callee_sent_reliably,
+            crate::b2bua::actor::carries_session_description(&response),
         );
         let route = CallerRoute::of(&call);
         let messages = match call.a_leg_reliability.offer(response, reliable, now) {

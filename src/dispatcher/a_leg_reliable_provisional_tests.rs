@@ -794,3 +794,51 @@ async fn a_released_answer_holds_a_callee_bye_until_the_callers_ack() {
     assert!(!listed.contains(&format!("BYE to {CALLER}")), "{listed:?}");
     assert!(call.state.held_byes.contains_key(SIP_CALL_ID));
 }
+
+/// RFC 3262 §3 lets a UAS send any provisional to an INVITE reliably when the
+/// caller supports `100rel`. siphon does for one that carries SDP, even when the
+/// callee sent it unreliably, so the caller does not lose the early media it is
+/// told about. One without SDP stays as the callee sent it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_18x_with_sdp_reaches_a_caller_that_supports_100rel_reliably_whatever_the_callee_did() {
+    for preset in PRESETS {
+        let call = Call::place(SUPPORTS, &dial_script(preset, ""));
+        call.callee_sends(183, "Session Progress", &[], Some(CALLEE_SDP));
+        let progress = only(call.to_caller(), 183);
+        assert!(is_reliable(&progress), "under {preset}: {progress:?}");
+    }
+
+    let call = Call::place(SUPPORTS, &default_dial());
+    call.callee_sends(180, "Ringing", &[], None);
+    assert!(!is_reliable(&only(call.to_caller(), 180)));
+}
+
+/// The same for siphon's own provisional (`call.progress()`): a 183 with SDP to a
+/// caller that supports `100rel` is reliable, a 180 without SDP is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn siphons_own_18x_with_sdp_is_reliable_toward_a_caller_that_supports_100rel() {
+    let call = Call::place(SUPPORTS, &default_dial());
+    assert!(send_uas_response(
+        &call.state,
+        &call.call_id,
+        &call.invite,
+        180,
+        "Ringing",
+        None,
+        None,
+        false,
+    ));
+    assert!(!is_reliable(&only(call.to_caller(), 180)));
+
+    assert!(send_uas_response(
+        &call.state,
+        &call.call_id,
+        &call.invite,
+        183,
+        "Session Progress",
+        Some(CALLER_SDP.as_bytes().to_vec()),
+        Some("application/sdp"),
+        false,
+    ));
+    assert!(is_reliable(&only(call.to_caller(), 183)));
+}

@@ -207,7 +207,8 @@ SIPhon PRACKs the callee's reliable provisionals itself on the B-leg, and it is 
 caller's UAS on the A-leg, so RFC 3262 on each leg is SIPhon's, under every preset:
 
 - A provisional reaches the caller reliably when the caller sent `Require: 100rel`,
-  or sent `Supported: 100rel` and the callee sent that provisional reliably. It
+  or sent `Supported: 100rel` and either the callee sent that provisional reliably
+  or it carries SDP (an 18x without SDP stays as the callee sent it). It
   carries `Require: 100rel` and SIPhon's own `RSeq`, one more per provisional on the
   caller's dialog. The callee's `RSeq` never reaches the caller.
 - It is retransmitted (T1 doubling) until the caller's PRACK, and the next reliable

@@ -741,8 +741,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   provisionals, which RFC 3262 §3 forbids.
 
   Now, under every preset, a provisional reaches the caller reliably when the
-  caller requires `100rel`, or supports it and the callee sent that provisional
-  reliably. It carries `Require: 100rel` and siphon's own `RSeq`, one more per
+  caller requires `100rel`, or supports it and either the callee sent that
+  provisional reliably or it carries SDP, which RFC 3262 §3 allows for any
+  provisional to such a caller. It carries `Require: 100rel` and siphon's own `RSeq`, one more per
   provisional on the caller's dialog, and is retransmitted on T1 doubling until
   the caller's PRACK; a second reliable provisional waits for that PRACK. siphon
   answers the PRACK, matched on `RAck` and the caller's dialog: 200 for the

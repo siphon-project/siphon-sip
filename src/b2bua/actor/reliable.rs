@@ -26,13 +26,16 @@ const RSEQ_CEILING: u32 = 0x7FFF_FFFF;
 /// Always when the caller required `100rel`: the UAS "MUST send any non-100
 /// provisional response reliably". When it only supports `100rel`, siphon may,
 /// and does when the callee sent this provisional reliably, so the caller keeps
-/// the reliability the callee asked for. Otherwise never.
+/// the reliability the callee asked for, and when it carries a session
+/// description, so the early media it announces is not lost on the way.
+/// Otherwise never.
 pub fn sends_reliably(
     caller_requires: bool,
     caller_supports: bool,
     callee_sent_reliably: bool,
+    carries_session_description: bool,
 ) -> bool {
-    caller_requires || (caller_supports && callee_sent_reliably)
+    caller_requires || (caller_supports && (callee_sent_reliably || carries_session_description))
 }
 
 /// A provisional for the caller that has to wait its turn.
@@ -315,7 +318,7 @@ fn cseq_number(response: &SipMessage) -> Option<u32> {
 /// Whether a provisional carries a session description, which the 2xx must not
 /// overtake. Any body counts: a provisional's body is SDP in practice, and
 /// holding a 2xx for one that was not only delays the answer by a PRACK.
-fn carries_session_description(response: &SipMessage) -> bool {
+pub fn carries_session_description(response: &SipMessage) -> bool {
     !response.body.is_empty()
 }
 
@@ -360,12 +363,13 @@ mod tests {
     }
 
     #[test]
-    fn reliability_follows_the_callers_require_or_its_support_and_the_callees_choice() {
-        assert!(sends_reliably(true, false, false));
-        assert!(sends_reliably(true, true, false));
-        assert!(sends_reliably(false, true, true));
-        assert!(!sends_reliably(false, true, false));
-        assert!(!sends_reliably(false, false, true));
+    fn reliability_follows_the_callers_require_or_its_support_with_the_callees_choice_or_sdp() {
+        assert!(sends_reliably(true, false, false, false));
+        assert!(sends_reliably(true, true, false, false));
+        assert!(sends_reliably(false, true, true, false));
+        assert!(sends_reliably(false, true, false, true));
+        assert!(!sends_reliably(false, true, false, false));
+        assert!(!sends_reliably(false, false, true, true));
     }
 
     #[test]
