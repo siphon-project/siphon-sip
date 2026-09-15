@@ -246,15 +246,19 @@ pub fn arm_reliable_provisional_retransmit(
 /// created (see `handle_b2bua_invite`), so the transaction layer never
 /// retransmits the A-leg 2xx — and the IST would step aside on 2xx anyway
 /// ("TU owns retransmissions"). Without this, a single lost 200 leaves the
-/// caller ringing until it CANCELs. Stores a `Notify` under the internal call
-/// ID and spawns a task that resends `response` on the RFC 3261 §17.2.1 UAS
-/// schedule (T1 = 500 ms doubling to T2 = 4 s, give up after 64×T1 = 32 s).
-/// The A-leg ACK handler fires the `Notify` when the caller's ACK arrives.
+/// caller ringing until it CANCELs. Stores an [`UnackedAnswer`] under the
+/// internal call ID and spawns a task that resends `response` on the RFC 3261
+/// §17.2.1 UAS schedule (T1 doubling to T2) until the caller's ACK cancels it
+/// or 64×T1 has passed.
 ///
-/// Mirrors [`arm_reliable_provisional_retransmit`]. On give-up it removes its
-/// own entry and warns (a genuinely abandoned answered call is reclaimed by the
-/// session timer / orphan sweep) rather than tearing down from the task, which
-/// would need a `&DispatcherState` the spawned future cannot hold.
+/// What happens at 64×T1 is not the task's to decide. [`sweep_unacked_uas_2xx`],
+/// on the dispatcher's timer tick, ends the call: the task holds no
+/// `&DispatcherState` to run the teardown with, and leaving the entry in the
+/// store until the sweep claims it is what lets an ACK that races the deadline
+/// win. Every 2xx siphon sends the caller is armed here, relayed
+/// (`b_leg_answered`) or its own (`b2bua_send_uas_response`, behind
+/// `call.answer()` and the control plane's answer), so both are held to the
+/// same deadline.
 pub fn arm_b2bua_2xx_retransmit(
     internal_call_id: &str,
     response: SipMessage,
@@ -264,36 +268,38 @@ pub fn arm_b2bua_2xx_retransmit(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
-    let entry = Arc::new(tokio::sync::Notify::new());
-    state
+    let timers = crate::transaction::timer::TimerConfig::default();
+    let unacked = Arc::new(UnackedAnswer {
+        cancel: tokio::sync::Notify::new(),
+        deadline: tokio::time::Instant::now() + timers.t1 * 64,
+    });
+    // A second 2xx armed for the same call replaces the first: stop the task
+    // still retransmitting the one it replaced.
+    if let Some(replaced) = state
         .uas_2xx_retransmits
-        .insert(internal_call_id.to_string(), Arc::clone(&entry));
+        .insert(internal_call_id.to_string(), Arc::clone(&unacked))
+    {
+        replaced.cancel.notify_one();
+    }
 
-    let store = Arc::clone(&state.uas_2xx_retransmits);
     let outbound = Arc::clone(&state.outbound);
     let key = internal_call_id.to_string();
 
     tokio::spawn(async move {
-        // RFC 3261 §17.2.1 UAS timing: start at T1 = 500 ms, double on each
-        // retransmit up to T2 = 4 s, give up after 64 × T1 = 32 s if no ACK.
-        let mut interval = std::time::Duration::from_millis(500);
-        let cap = std::time::Duration::from_secs(4);
-        let started = tokio::time::Instant::now();
-        let deadline = started + std::time::Duration::from_secs(32);
+        let mut interval = timers.t1;
         let bytes = bytes::Bytes::from(response.to_bytes());
 
         loop {
             let sleep = tokio::time::sleep(interval);
             tokio::pin!(sleep);
             tokio::select! {
-                _ = entry.notified() => break,
+                _ = unacked.cancel.notified() => break,
                 _ = &mut sleep => {
-                    if tokio::time::Instant::now() >= deadline {
-                        warn!(
+                    if tokio::time::Instant::now() >= unacked.deadline {
+                        debug!(
                             call_id = %key,
-                            "RFC 3261 §13.3.1.4: no ACK after 32s — giving up A-leg 2xx retransmits"
+                            "A-leg 2xx still unACKed at 64*T1: retransmission stopped, the timer sweep ends the call"
                         );
-                        store.remove(&key);
                         break;
                     }
                     debug!(
@@ -309,11 +315,66 @@ pub fn arm_b2bua_2xx_retransmit(
                         source_local_addr,
                         server_name: None,
                     });
-                    interval = (interval * 2).min(cap);
+                    interval = (interval * 2).min(timers.t2);
                 }
             }
         }
     });
+}
+
+/// End every call whose 2xx to the caller went 64×T1 without an ACK, and drop
+/// the retransmit entries of calls that ended some other way.
+///
+/// RFC 3261 §13.3.1.4: when the 2xx has been retransmitted for 64×T1 with no
+/// ACK, "the dialog is confirmed, but the session SHOULD be terminated", with a
+/// BYE. [`b2bua_unacked_answer_terminate`] runs it through the ordinary
+/// teardown, so both legs are BYEd and media, charging and the CDR are closed.
+/// Before this the retransmit task only logged, and the call stayed up with a
+/// caller that never confirmed it until something else ended it.
+///
+/// An entry is claimed with a `remove_if` on the very `Arc` found, and only a
+/// claimed entry is acted on. The caller's ACK removes the same entry, so of
+/// the two, whichever gets to it first decides: an ACK processed before the
+/// sweep, even one that lands after the deadline, leaves nothing to claim and
+/// no BYE follows it. A call already torn down gets no BYE here either; its
+/// entry is just removed, which also stops its 2xx being retransmitted.
+///
+/// Runs on the 100 ms timer tick. Entries exist only for answers still waiting
+/// for their ACK, and an empty store returns straight away.
+pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
+    if state.uas_2xx_retransmits.is_empty() {
+        return;
+    }
+    let now = tokio::time::Instant::now();
+    // Snapshot first: nothing below runs while a store shard is locked.
+    let armed: Vec<(String, Arc<UnackedAnswer>)> = state
+        .uas_2xx_retransmits
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    for (call_id, unacked) in armed {
+        let call_ended = state.call_actors.get_call(&call_id).is_none();
+        if !call_ended && now < unacked.deadline {
+            continue;
+        }
+        let claimed = state
+            .uas_2xx_retransmits
+            .remove_if(&call_id, |_, current| Arc::ptr_eq(current, &unacked))
+            .is_some();
+        if !claimed {
+            continue;
+        }
+        unacked.cancel.notify_one();
+        if call_ended {
+            debug!(call_id = %call_id, "A-leg 2xx retransmission stopped: the call already ended");
+            continue;
+        }
+        warn!(
+            call_id = %call_id,
+            "RFC 3261 §13.3.1.4: the caller never ACKed the 2xx within 64*T1, ending the call"
+        );
+        b2bua_unacked_answer_terminate(&call_id, state);
+    }
 }
 
 /// Handle an A-leg PRACK in a B2BUA call (RFC 3262).

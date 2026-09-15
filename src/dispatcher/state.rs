@@ -202,9 +202,10 @@ pub struct DispatcherState {
     /// the A-leg INVITE before an IST exists (see `handle_b2bua_invite`), and
     /// the IST steps aside on 2xx anyway ("TU owns retransmissions"), so nothing
     /// else recovers a lost A-leg 200 — without this the caller rings until it
-    /// CANCELs. The entry's `Notify` is fired by the A-leg ACK handler when the
-    /// caller's ACK arrives; the retransmit task otherwise gives up at 64×T1.
-    pub uas_2xx_retransmits: Arc<DashMap<String, Arc<tokio::sync::Notify>>>,
+    /// CANCELs. The A-leg ACK handler removes the entry and cancels the
+    /// retransmit task when the caller's ACK arrives; otherwise the task stops at
+    /// 64×T1 and `sweep_unacked_uas_2xx` removes the entry and ends the call.
+    pub uas_2xx_retransmits: Arc<DashMap<String, Arc<UnackedAnswer>>>,
     /// INVITE server transactions whose CANCEL has already been accepted,
     /// keyed by the INVITE's transaction key.
     ///
@@ -334,6 +335,19 @@ impl ProxyRfState {
     pub(crate) fn rf_session(&self) -> &crate::diameter::rf_service::RfChargingSession {
         &self.session
     }
+}
+
+/// One 2xx siphon sent the caller that is still waiting for its ACK
+/// (RFC 3261 §13.3.1.4).
+pub struct UnackedAnswer {
+    /// Notified by the caller's ACK, by `sweep_unacked_uas_2xx` when it claims
+    /// the entry, or by a later 2xx armed for the same call. The retransmit loop
+    /// selects on this; once notified it stops sending and exits.
+    pub cancel: tokio::sync::Notify,
+    /// 64×T1 after the 2xx was first sent. Past it, with the entry still in the
+    /// store, the sweep ends the call. A tokio instant, so a paused test clock
+    /// moves it.
+    pub deadline: tokio::time::Instant,
 }
 
 /// State for one outstanding reliable provisional response (RFC 3262 §3).

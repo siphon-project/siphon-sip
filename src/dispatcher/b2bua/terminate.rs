@@ -413,6 +413,30 @@ pub fn b2bua_max_duration_terminate(call_id: &str, state: &DispatcherState) {
     );
 }
 
+/// End a call whose 2xx the caller never ACKed (RFC 3261 §13.3.1.4) — BYE both
+/// legs through the same framework teardown as the session timer and the
+/// maximum call duration (Rf/Ro ACR-STOP, CDR, SIPREC, media release,
+/// `StasisEnd`). Returns `false` when the call is already gone, so a call torn
+/// down another way is never sent a second BYE.
+///
+/// §13.3.1.4 is explicit that the dialog is confirmed by then and the session
+/// SHOULD be ended with a BYE, and §15 allows that BYE once the 2xx has gone
+/// 64*T1 without its ACK. Like the other timer teardowns, no Python handler
+/// fires; the CDR records `disconnect_initiator="timeout"` with the Reason below.
+pub fn b2bua_unacked_answer_terminate(call_id: &str, state: &DispatcherState) -> bool {
+    // Q.850 cause 102 = "recovery on timer expiry". A local timer ended an
+    // established call and neither party hung up, which is the case the session
+    // timer and the maximum call duration already report with 102. Not 16
+    // (normal clearing): nothing about this ending was normal. The text names
+    // the timer, so a CDR tells it apart from those two.
+    b2bua_terminate_call_inner(
+        call_id,
+        Some("Q.850;cause=102;text=\"No ACK received\""),
+        "timeout",
+        state,
+    )
+}
+
 /// Handle to the running dispatcher, published once at startup so imperative
 /// script APIs (e.g. `b2bua.terminate`) can reach dialog state and the tokio
 /// runtime from any thread — an event-callback driver, a timer, or an async-pool

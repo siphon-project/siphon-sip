@@ -10,7 +10,8 @@
 //! Driven through the dispatcher: the B-leg is dialled by
 //! [`b2bua_send_b_leg_invite`], answers through [`handle_b2bua_response`], and the
 //! caller's ACK arrives through [`handle_request`], with everything siphon sends
-//! read back off the UDP egress channel.
+//! read back off the UDP egress channel. The harness is shared with
+//! `unacked_answer_tests`, which drives the other half of the same exchange.
 
 use super::lcr_ring_timeout_tests::top_via_branch;
 use super::test_dispatcher::{test_dispatcher, TestDispatcher};
@@ -18,7 +19,7 @@ use super::*;
 
 const CALLER: &str = "192.0.2.10:5060";
 const CALLEE: &str = "198.51.100.77:5060";
-const CALLER_CALL_ID: &str = "caller-call@192.0.2.10";
+pub(super) const CALLER_CALL_ID: &str = "caller-call@192.0.2.10";
 
 /// The callee's remote target: an opaque userpart and parameters whose names are
 /// mixed case and whose values carry `_` and `-`. The ACK has to name it exactly
@@ -27,7 +28,7 @@ const CALLEE_TARGET: &str =
     "sip:opaque-7f3a@198.51.100.77:5060;transport=udp;Tk=ab_12;RouteId=9;LegRef=0a0a-0b0b";
 
 /// The caller's INVITE, with an offer in it.
-fn caller_invite() -> SipMessage {
+pub(super) fn caller_invite() -> SipMessage {
     let sdp = concat!(
         "v=0\r\n",
         "o=- 1 1 IN IP4 192.0.2.10\r\n",
@@ -62,11 +63,41 @@ fn caller_invite() -> SipMessage {
     parse_sip_message_bytes(raw.as_bytes()).expect("the caller's INVITE parses")
 }
 
+/// The caller's leg, with the dialog state `handle_b2bua_invite` takes off the
+/// INVITE: siphon's Contact toward the caller, the caller's Contact as the remote
+/// target, and the From/To an in-dialog request from siphon carries (RFC 3261
+/// §12.1.1).
+pub(super) fn caller_leg() -> Leg {
+    let invite = caller_invite();
+    let mut leg = Leg::new_a_leg(
+        CALLER_CALL_ID.to_string(),
+        "caller-tag".to_string(),
+        "z9hG4bK-caller-invite".to_string(),
+        LegTransport {
+            remote_addr: CALLER.parse().expect("a literal address"),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    leg.dialog.local_contact = Some("<sip:192.0.2.1:5060;transport=udp>".to_string());
+    leg.dialog.remote_contact = invite
+        .headers
+        .get("Contact")
+        .map(|contact| crate::b2bua::actor::extract_contact_uri(contact));
+    leg.dialog.local_from_uri = invite
+        .headers
+        .to()
+        .map(|to| format!("{to};tag={}", leg.dialog.local_tag));
+    leg.dialog.remote_to_uri = invite.headers.from().cloned();
+    leg
+}
+
 /// One message siphon put on the wire, with the socket it asked to leave from.
-struct Sent {
-    destination: SocketAddr,
+pub(super) struct Sent {
+    pub(super) destination: SocketAddr,
     source_local_addr: Option<SocketAddr>,
-    message: SipMessage,
+    pub(super) message: SipMessage,
 }
 
 impl Sent {
@@ -76,34 +107,23 @@ impl Sent {
 }
 
 /// A caller's call bridged to one callee through a real dispatcher.
-struct Call {
-    state: Arc<DispatcherState>,
+pub(super) struct Call {
+    pub(super) state: Arc<DispatcherState>,
     udp: flume::Receiver<OutboundMessage>,
-    call_id: String,
+    pub(super) call_id: String,
     invite: SipMessage,
     invite_source: Option<SocketAddr>,
 }
 
 impl Call {
     /// The caller's INVITE arrives and siphon dials the callee.
-    fn dial() -> Call {
-        let TestDispatcher { state, udp } = test_dispatcher();
-        let state = Arc::new(state);
-        let call_id = state.call_actors.create_call(Leg::new_a_leg(
-            CALLER_CALL_ID.to_string(),
-            "caller-tag".to_string(),
-            "z9hG4bK-caller-invite".to_string(),
-            LegTransport {
-                remote_addr: CALLER.parse().expect("a literal address"),
-                connection_id: ConnectionId::default(),
-                transport: Transport::Udp,
-                local_addr: None,
-            },
-        ));
-        let a_leg_invite = Arc::new(Mutex::new(caller_invite()));
-        state
+    pub(super) fn dial() -> Call {
+        let (state, udp, call_id) = Call::caller_alone();
+        let a_leg_invite = state
             .call_actors
-            .set_a_leg_invite(&call_id, Arc::clone(&a_leg_invite));
+            .get_call(&call_id)
+            .and_then(|call| call.a_leg_invite.clone())
+            .expect("the caller's INVITE is stored on the call");
         let dialled = {
             let guard = a_leg_invite.lock().expect("the A-leg INVITE lock");
             b2bua_send_b_leg_invite(
@@ -138,13 +158,81 @@ impl Call {
         }
     }
 
+    /// The caller's call bridged to the callee with the B-leg registered exactly
+    /// as `b2bua_send_b_leg_invite` registers it, without dialling.
+    ///
+    /// The dial resolves its next hop with a blocking resolver call, which a
+    /// paused-clock (current_thread) runtime refuses, so a test that steps the
+    /// clock builds the call this way. Everything after the INVITE — the callee's
+    /// responses, the caller's ACK, the teardown — is the same dispatcher code.
+    pub(super) fn bridged() -> Call {
+        let (state, udp, call_id) = Call::caller_alone();
+        let invite = Call::callee_invite();
+        let mut leg = Leg::new_b_leg(
+            "b2b-callee@192.0.2.1".to_string(),
+            "sb-callee-leg".to_string(),
+            "sip:15550100042@198.51.100.77:5060".to_string(),
+            "z9hG4bK-callee-invite".to_string(),
+            LegTransport {
+                remote_addr: callee(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        );
+        leg.dialog.local_contact = Some("<sip:192.0.2.1:5060;transport=udp>".to_string());
+        leg.dialog.local_from_uri = invite.headers.from().cloned();
+        leg.dialog.remote_to_uri = invite.headers.to().cloned();
+        state.call_actors.add_b_leg(&call_id, leg);
+        Call {
+            state,
+            udp,
+            call_id,
+            invite_source: None,
+            invite,
+        }
+    }
+
+    /// The INVITE [`Call::bridged`] stands for: what siphon sends the callee.
+    fn callee_invite() -> SipMessage {
+        let raw = concat!(
+            "INVITE sip:15550100042@198.51.100.77:5060 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-callee-invite\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:15550100001@192.0.2.1>;tag=sb-callee-leg\r\n",
+            "To: <sip:15550100042@198.51.100.77>\r\n",
+            "Call-ID: b2b-callee@192.0.2.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:192.0.2.1:5060;transport=udp>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        parse_sip_message_bytes(raw.as_bytes()).expect("the callee INVITE parses")
+    }
+
+    /// The caller's call and nothing dialled: the shape of a call siphon answers
+    /// itself. Returns the dispatcher, its UDP egress and the internal call id.
+    pub(super) fn caller_alone() -> (
+        Arc<DispatcherState>,
+        flume::Receiver<OutboundMessage>,
+        String,
+    ) {
+        let TestDispatcher { state, udp } = test_dispatcher();
+        let state = Arc::new(state);
+        let call_id = state.call_actors.create_call(caller_leg());
+        state
+            .call_actors
+            .set_a_leg_invite(&call_id, Arc::new(Mutex::new(caller_invite())));
+        (state, udp, call_id)
+    }
+
     /// Everything siphon has put on the wire since the last look, in order.
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         drain(&self.udp)
     }
 
     /// The callee sends `response` for the INVITE siphon sent it.
-    fn callee_sends(&self, response: &str) {
+    pub(super) fn callee_sends(&self, response: &str) {
         let mut message =
             parse_sip_message_bytes(response.as_bytes()).expect("the callee's response parses");
         let status_code = message.status_code().expect("a response");
@@ -191,7 +279,7 @@ impl Call {
 
     /// The callee rings and answers, with `extra` headers on the 200. Returns the
     /// 200 as sent, for a test to retransmit.
-    fn callee_answers(&self, extra: &str) -> String {
+    pub(super) fn callee_answers(&self, extra: &str) -> String {
         self.callee_sends(&self.callee_response("180 Ringing", "", ""));
         let answer = self.callee_response(
             "200 OK",
@@ -220,39 +308,8 @@ impl Call {
     }
 
     /// The caller ACKs the 200 siphon relayed to it.
-    fn caller_acks(&self, relayed_200: &SipMessage) {
-        let raw = format!(
-            concat!(
-                "ACK sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
-                "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-ack\r\n",
-                "Max-Forwards: 70\r\n",
-                "From: {from}\r\n",
-                "To: {to}\r\n",
-                "Call-ID: {call_id}\r\n",
-                "CSeq: 1 ACK\r\n",
-                "Content-Length: 0\r\n",
-                "\r\n",
-            ),
-            from = relayed_200
-                .headers
-                .from()
-                .expect("the relayed 200 has a From"),
-            to = relayed_200.headers.to().expect("the relayed 200 has a To"),
-            call_id = CALLER_CALL_ID,
-        );
-        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's ACK parses");
-        handle_request(
-            InboundMessage {
-                connection_id: ConnectionId::default(),
-                transport: Transport::Udp,
-                local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
-                remote_addr: CALLER.parse().expect("a literal address"),
-                data: Bytes::from(raw),
-            },
-            message,
-            "ACK".to_string(),
-            &self.state,
-        );
+    pub(super) fn caller_acks(&self, relayed_200: &SipMessage) {
+        caller_acks(&self.state, relayed_200);
     }
 
     fn callee_leg_acked(&self) -> bool {
@@ -267,8 +324,44 @@ impl Call {
     }
 }
 
+/// The caller ACKs `relayed_200`, the 2xx siphon sent it (RFC 3261 §13.2.2.4).
+pub(super) fn caller_acks(state: &Arc<DispatcherState>, relayed_200: &SipMessage) {
+    let raw = format!(
+        concat!(
+            "ACK sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-ack\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: {from}\r\n",
+            "To: {to}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 ACK\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        from = relayed_200
+            .headers
+            .from()
+            .expect("the relayed 200 has a From"),
+        to = relayed_200.headers.to().expect("the relayed 200 has a To"),
+        call_id = CALLER_CALL_ID,
+    );
+    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's ACK parses");
+    handle_request(
+        InboundMessage {
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
+            remote_addr: CALLER.parse().expect("a literal address"),
+            data: Bytes::from(raw),
+        },
+        message,
+        "ACK".to_string(),
+        state,
+    );
+}
+
 /// Everything on `udp` so far, in the order siphon sent it.
-fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
+pub(super) fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = udp.try_recv() {
         sent.push(Sent {
@@ -286,16 +379,16 @@ fn acks(sent: &[Sent]) -> Vec<&Sent> {
     sent.iter().filter(|sent| sent.is_ack()).collect()
 }
 
-fn request_line(message: &SipMessage) -> String {
+pub(super) fn request_line(message: &SipMessage) -> String {
     let text = String::from_utf8(message.to_bytes()).expect("serialized SIP is UTF-8");
     text.split("\r\n").next().expect("a start line").to_string()
 }
 
-fn caller() -> SocketAddr {
+pub(super) fn caller() -> SocketAddr {
     CALLER.parse().expect("a literal address")
 }
 
-fn callee() -> SocketAddr {
+pub(super) fn callee() -> SocketAddr {
     CALLEE.parse().expect("a literal address")
 }
 

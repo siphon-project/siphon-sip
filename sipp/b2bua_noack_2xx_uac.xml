@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA caller that never ACKs the 200.
+
+  RFC 3261 §13.3.1.4: siphon retransmits its 200 for 64*T1 (32 s) and then ends
+  the session with a BYE. This caller absorbs the retransmitted 200s, sends no
+  ACK, and requires siphon's BYE, with the timer-expiry Reason, inside 45 s.
+  The callee (b2bua_noack_2xx_uas.xml) requires the same BYE on its leg.
+-->
+<scenario name="B2BUA caller that never ACKs">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" />
+
+  <!-- No ACK. The BYE must come after 64*T1 (32 s); no ontimeout, so a BYE
+       that never comes fails the call. -->
+  <recv request="BYE" timeout="45000">
+    <action>
+      <ereg regexp="Q\.850;cause=102"
+            search_in="hdr" header="Reason:" check_it="true"
+            assign_to="bye_reason" />
+      <log message="BYE for the unACKed 2xx carries Reason [$bye_reason]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

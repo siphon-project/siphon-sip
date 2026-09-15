@@ -792,6 +792,16 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-delayed-offer rm -sf sipp-b2bua-delayed-offer-uac sipp-b2bua-delayed-offer-uas sipp-b2bua-delayed-offer-register sipp-b2bua-delayed-offer-deregister 2>/dev/null || true
 
+      # RFC 3261 §13.3.1.4: a caller that never ACKs the 200 has its session
+      # ended after 64*T1, with a BYE to both legs. T1 is fixed at 500 ms, so
+      # this case takes about 33 s. Both sides carry the assertion.
+      - name: B2BUA caller that never ACKs is sent a BYE after 64*T1 (RFC 3261 §13.3.1.4)
+        run: COMPOSE_PROFILES=b2bua,b2bua-noack-2xx bash sipp/run_call.sh sipp-b2bua-noack-uac sipp-b2bua-noack-uas
+
+      - name: Cleanup noack-2xx containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-noack-2xx rm -sf sipp-b2bua-noack-uac sipp-b2bua-noack-uas sipp-b2bua-noack-register sipp-b2bua-noack-deregister 2>/dev/null || true
+
       - name: Deregister bob (clear previous contacts)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-deregister-bob
 
@@ -807,7 +817,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-unacked-2xx --profile b2bua-delayed-offer --profile b2bua-failure down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-unacked-2xx --profile b2bua-delayed-offer --profile b2bua-noack-2xx --profile b2bua-failure down --remove-orphans
 
       - name: Upload logs
         if: always()
