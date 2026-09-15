@@ -1046,6 +1046,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `backend`, gives an `rtpengine`, `siphon_rtp` or `rtpproxy` block, or sets
   `profiles` or `events`.
 
+- **The admin API no longer reports a media engine for a `media:` block that has
+  none.** `/admin/metrics.json` filled `rtpengine` for any `media:` block, so a
+  node with only `sdp_name` or `sdp_strip_attributes` showed a media card with
+  no instances in it. `rtpengine` is now `null` there, as on a node with no
+  block, and the dashboard's Media view says media anchoring is not configured.
+  It still reports wherever an engine is configured, reachable or not. The key
+  and its shape are unchanged.
+
 - **Pending auth vectors now expire.** An entry is consumed on use, times out
   after 120 s, and is pruned as new challenges are issued, so an unanswered
   challenge no longer retains it for the life of the process. Affects both AKA
