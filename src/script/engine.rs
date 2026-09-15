@@ -2650,6 +2650,85 @@ def route(request):
         );
     }
 
+    /// Every load builds a new `siphon` module whose decorators register into
+    /// the one registry, so a reload must leave each handler and timer
+    /// registered once: not added to what the replaced load registered, and not
+    /// lost to a reload that failed in between. The running timer tasks follow
+    /// the registrations: one per timer, still running after a failed reload.
+    ///
+    /// A Tokio test because a reload restarts the timer tasks.
+    #[tokio::test]
+    async fn a_reload_registers_each_handler_and_timer_once() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let script = directory.path().join("reload_registrations.py");
+        let source = concat!(
+            "from siphon import proxy, timer\n",
+            "\n",
+            "@proxy.on_request\n",
+            "def route(request):\n",
+            "    pass\n",
+            "\n",
+            "@timer.every(seconds=30, name=\"sweep\")\n",
+            "def sweep():\n",
+            "    pass\n",
+        );
+        std::fs::write(&script, source).unwrap();
+        let registered = |engine: &ScriptEngine| {
+            let state = engine.state();
+            let timers: Vec<String> = state
+                .timer_handlers()
+                .iter()
+                .filter_map(|handler| match &handler.kind {
+                    HandlerKind::TimerEvery { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            (state.handlers.len(), timers)
+        };
+        let once = (2, vec!["sweep".to_string()]);
+        let one_running_timer = |engine: &ScriptEngine, context: &str| {
+            let handles = engine
+                .timer_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(handles.len(), 1, "{context}: one timer task per timer");
+            assert!(!handles[0].is_finished(), "{context}: the timer task runs");
+        };
+
+        let engine = ScriptEngine::new(&reload_test_config(&script)).expect("initial load");
+        engine.restart_timers();
+        assert_eq!(registered(&engine), once);
+        one_running_timer(&engine, "startup");
+
+        for _ in 0..3 {
+            engine.reload().expect("reload of an unchanged script");
+            assert_eq!(
+                registered(&engine),
+                once,
+                "a reload must register each handler and timer once"
+            );
+            one_running_timer(&engine, "reload");
+        }
+
+        std::fs::write(
+            &script,
+            "raise RuntimeError('this load fails on purpose')\n",
+        )
+        .unwrap();
+        assert!(engine.reload().is_err());
+        assert_eq!(
+            registered(&engine),
+            once,
+            "a failed reload keeps the registrations of the script it keeps"
+        );
+        one_running_timer(&engine, "failed reload");
+
+        std::fs::write(&script, source).unwrap();
+        engine.reload().expect("reload after a failed one");
+        assert_eq!(registered(&engine), once);
+        one_running_timer(&engine, "reload after a failed one");
+    }
+
     #[test]
     fn proxy_on_reply_registers() {
         let source = r#"
