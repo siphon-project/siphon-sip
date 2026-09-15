@@ -21,106 +21,120 @@ pub mod ws;
 pub(crate) mod testutil {
     use std::net::SocketAddr;
 
-    /// Reserve `port` for this process across every test binary on the machine.
+    /// Hold the port number `port` for this process, against every other test
+    /// binary on the machine, until the process exits.
     ///
-    /// The counter below only stops two callers *in one process* being handed
-    /// the same port, and that is not the situation that bites: the lib and
-    /// integration binaries run separately, a second worktree runs its own, and
-    /// each starts its counter from the same base. The file is created
-    /// exclusively, so exactly one process wins a given port; a reservation
-    /// older than an hour belonged to a run that is long gone and is taken over.
+    /// The hold is a TCP socket bound to the port without `SO_REUSEADDR`. The
+    /// kernel refuses a second bind like it, so exactly one process holds a
+    /// given number, and the hold ends with the process. It replaces claim
+    /// files in the temp directory, which two binaries starting together could
+    /// both take over: each found the claim an earlier run had left, saw that
+    /// process gone, and wrote its own pid, and then both bound the port.
+    #[cfg(feature = "sctp")]
     fn claim_port(port: u16) -> bool {
-        let directory = std::env::temp_dir().join("siphon-test-ports");
-        if std::fs::create_dir_all(&directory).is_err() {
-            // No shared directory to coordinate through — fall back to the
-            // probe alone rather than failing every test.
-            return true;
-        }
-        let path = directory.join(port.to_string());
-        let pid = std::process::id();
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        static HOLDS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+
+        let Ok(hold) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        else {
+            return false;
+        };
+        if hold
+            .bind(&SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .is_err()
         {
-            Ok(_) => std::fs::write(&path, pid.to_string()).is_ok(),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A reservation whose process has exited is free again. On Linux
-                // that is knowable immediately, which matters because a run that
-                // could not reuse its own ports would walk up the range on every
-                // invocation; elsewhere, fall back to the file's age.
-                let owner = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|text| text.trim().parse::<u32>().ok());
-                let gone = owner.is_some_and(|owner| {
-                    !std::path::Path::new("/proc")
-                        .join(owner.to_string())
-                        .exists()
-                });
-                let old = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .map(|modified| {
-                        modified.elapsed().unwrap_or_default()
-                            > std::time::Duration::from_secs(3600)
-                    })
-                    .unwrap_or(false);
-                (gone || old) && std::fs::write(&path, pid.to_string()).is_ok()
-            }
-            Err(_) => true,
+            return false;
         }
+        HOLDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(hold);
+        true
     }
 
-    /// A loopback address reserved for this test, on a port nothing else on this
-    /// machine will bind.
+    /// A loopback address for an SCTP listener, on a port no other test binary
+    /// on this machine is handed.
     ///
-    /// The obvious version — bind port 0, read the address, drop the socket —
-    /// looks fine and is the reason these tests flapped. Three things go wrong:
-    ///
-    /// * the kernel auto-assigns from the ephemeral range (32768-60999 here),
-    ///   so between the probe closing and the real bind, any outbound socket in
-    ///   this process can take that exact port,
-    /// * `listen()` used to bind on a **spawned task**, so the caller returned
-    ///   before the socket existed and a connect could be refused for no reason
-    ///   but scheduling. The listeners now bind before spawning, so awaiting
-    ///   `listen` means the socket is accepting; this helper still matters for
-    ///   the collision above, and
-    /// * a counter is per process, and several test binaries run at once on one
-    ///   machine. Two of them hand out the same port, and the probe below is the
-    ///   thing that then fails the *other* process: the probe socket carries no
-    ///   `SO_REUSEPORT` and `bind_tcp_listener` sets it, and Linux refuses a
-    ///   `SO_REUSEPORT` bind when an existing socket on the port lacks it — so
-    ///   one process's probe turns the other's listener into `AddrInUse`. That
-    ///   is the `AddrInUse` these tests saw, and why it never reproduced when
-    ///   the binary ran on its own.
-    ///
-    /// Handing out ports from a counter *below* the ephemeral range removes the
-    /// first collision at its source: nothing is auto-assigned there, so only an
-    /// explicit bind can take one. [`claim_port`] removes the third by making
-    /// the reservation machine-wide. The probe then confirms the port is
-    /// actually free before it is used.
+    /// Ports come from a counter below the ephemeral range (32768-60999 here),
+    /// where the kernel assigns nothing on its own, and [`claim_port`] makes
+    /// each one this process's alone. TCP listeners use [`free_tcp_port`]: the
+    /// claim holds the TCP number, which they could not then bind.
+    #[cfg(feature = "sctp")]
     pub(crate) fn free_port() -> SocketAddr {
         use std::sync::atomic::{AtomicU16, Ordering};
         // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
         // privileged range and clear of the SIP defaults these tests also use.
-        static NEXT: AtomicU16 = AtomicU16::new(21000);
+        // Starts above 21000, where builds still on claim files count from:
+        // those cannot see a hold.
+        static NEXT: AtomicU16 = AtomicU16::new(26000);
 
         for _ in 0..2048 {
             let port = NEXT.fetch_add(1, Ordering::Relaxed);
             assert!(port < 32000, "exhausted the reserved test port range");
-            if !claim_port(port) {
-                continue;
+            if claim_port(port) {
+                return SocketAddr::from(([127, 0, 0, 1], port));
             }
-            // TCP and UDP are separate namespaces and these tests bind either,
-            // so a port is only free when it is free on both.
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-                continue;
-            }
-            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
-                continue;
-            }
-            return SocketAddr::from(([127, 0, 0, 1], port));
         }
         panic!("no free loopback port in the reserved test range");
+    }
+
+    /// A loopback TCP port the kernel picked, kept bound by this process for
+    /// the rest of its life so nothing else can take it.
+    ///
+    /// The reservation is a socket bound to port 0 with `SO_REUSEADDR` and
+    /// `SO_REUSEPORT`, and never listened on. The kernel does not auto-assign a
+    /// port that is already bound, to a port-0 `bind` or to a `connect`, so no
+    /// other socket lands on it by chance. The listener under test binds the
+    /// same address with the same options, which Linux allows for the same
+    /// user, and only listening sockets are handed connections, so the anchor
+    /// never takes one. Until something listens, connects are refused.
+    ///
+    /// TCP only: the anchor holds the TCP port, not the SCTP one, so the SCTP
+    /// tests use [`free_port`].
+    pub(crate) fn free_tcp_port() -> SocketAddr {
+        static ANCHORS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+
+        let anchor = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .expect("create the port anchor");
+        anchor
+            .set_reuse_address(true)
+            .expect("SO_REUSEADDR on the port anchor");
+        #[cfg(unix)]
+        anchor
+            .set_reuse_port(true)
+            .expect("SO_REUSEPORT on the port anchor");
+        anchor
+            .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .expect("bind the port anchor");
+        let address = anchor
+            .local_addr()
+            .expect("port anchor address")
+            .as_socket()
+            .expect("port anchor is an IP socket");
+
+        ANCHORS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(anchor);
+        address
+    }
+
+    /// The reservation has to coexist with the options the production listeners
+    /// bind with, or every test using it fails on its own anchor.
+    #[tokio::test]
+    async fn a_reserved_tcp_port_refuses_connects_until_a_listener_binds_it() {
+        let address = free_tcp_port();
+
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "nothing listens on a freshly reserved port"
+        );
+
+        let listener = crate::transport::stream::bind_tcp_listener(address, None)
+            .expect("a production listener binds the reserved port");
+        let (connected, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        connected.expect("connect to the listener on the reserved port");
+        accepted.expect("the listener, not the anchor, takes the connection");
     }
 }
 
@@ -884,39 +898,55 @@ mod tests {
             .unwrap_or(0.0)
     }
 
+    /// Runs in a process of its own. The gauge is process-wide, and every
+    /// connection another test in this binary accepts or closes moves it too:
+    /// one closing between the two readings here read as a delta of 0, not 1.
     #[test]
     fn connection_gauge_releases_on_drop() {
-        crate::metrics::init().unwrap();
-        let before = connections_gauge(Transport::Tcp);
+        crate::own_process::run(
+            concat!(module_path!(), "::connection_gauge_releases_on_drop"),
+            || {
+                crate::metrics::init().unwrap();
+                let before = connections_gauge(Transport::Tcp);
 
-        {
-            let _first = ConnectionGauge::register(Transport::Tcp);
-            assert_eq!(connections_gauge(Transport::Tcp) - before, 1.0);
-            let _second = ConnectionGauge::register(Transport::Tcp);
-            assert_eq!(connections_gauge(Transport::Tcp) - before, 2.0);
-        }
+                {
+                    let _first = ConnectionGauge::register(Transport::Tcp);
+                    assert_eq!(connections_gauge(Transport::Tcp) - before, 1.0);
+                    let _second = ConnectionGauge::register(Transport::Tcp);
+                    assert_eq!(connections_gauge(Transport::Tcp) - before, 2.0);
+                }
 
-        assert_eq!(
-            connections_gauge(Transport::Tcp),
-            before,
-            "the gauge must return to its starting value — it can only drift \
-             upward, so a missed release climbs for the life of the process"
+                assert_eq!(
+                    connections_gauge(Transport::Tcp),
+                    before,
+                    "the gauge must return to its starting value — it can only drift \
+                     upward, so a missed release climbs for the life of the process"
+                );
+            },
         );
     }
 
+    /// Runs in a process of its own, for the same reason as
+    /// `connection_gauge_releases_on_drop`: TLS and WSS connections in other
+    /// tests move these series too.
     #[test]
     fn connection_gauge_separates_transports() {
-        crate::metrics::init().unwrap();
-        let before_tls = connections_gauge(Transport::Tls);
-        let before_wss = connections_gauge(Transport::WebSocketSecure);
+        crate::own_process::run(
+            concat!(module_path!(), "::connection_gauge_separates_transports"),
+            || {
+                crate::metrics::init().unwrap();
+                let before_tls = connections_gauge(Transport::Tls);
+                let before_wss = connections_gauge(Transport::WebSocketSecure);
 
-        let _tls = ConnectionGauge::register(Transport::Tls);
+                let _tls = ConnectionGauge::register(Transport::Tls);
 
-        assert_eq!(connections_gauge(Transport::Tls) - before_tls, 1.0);
-        assert_eq!(
-            connections_gauge(Transport::WebSocketSecure),
-            before_wss,
-            "TLS and WSS must not share a series"
+                assert_eq!(connections_gauge(Transport::Tls) - before_tls, 1.0);
+                assert_eq!(
+                    connections_gauge(Transport::WebSocketSecure),
+                    before_wss,
+                    "TLS and WSS must not share a series"
+                );
+            },
         );
     }
 

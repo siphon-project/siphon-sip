@@ -883,12 +883,12 @@ mod tests {
     #[tokio::test]
     async fn a_collector_that_accepts_late_still_gets_the_first_record() {
         // The address has to be real but unbound: the point is that nothing is
-        // listening when the first record is delivered. Port 0 would put it in
-        // the kernel's ephemeral range, where any outbound socket in this
-        // process can claim it in the window before the rebind below — which is
-        // what made this test flap. `free_port` hands out from a reserved range
-        // the kernel never auto-assigns.
-        let address = crate::transport::testutil::free_port();
+        // listening when the first record is delivered. A port-0 probe that is
+        // closed again can be taken by any outbound socket in the window before
+        // the rebind below, which is what made this test flap. `free_tcp_port`
+        // keeps the port bound, and refusing connects, until the collector
+        // listens on it.
+        let address = crate::transport::testutil::free_tcp_port();
 
         let config = Arc::new(LiX2Config {
             delivery_address: address.to_string(),

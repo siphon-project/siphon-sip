@@ -214,8 +214,24 @@ _surface_json = json.dumps(surface, indent=2, sort_keys=True)
     }
 
     /// The guard the split runs against.
+    ///
+    /// Runs in a process of its own. Every `install_siphon_module` in a process
+    /// re-executes the package into the same `siphon` module object:
+    /// `PyModule::from_code` goes through `PyImport_ExecCodeModuleEx`, which
+    /// reuses a module already in `sys.modules`. Whatever an earlier install
+    /// mounted therefore stays on it after its registry entry is cleared, so the
+    /// probe namespaces and extensions other tests in this binary register
+    /// (`probe_ns`, `ext_alpha`, `ModuleExtensionProbe`) showed up here as ADDED
+    /// whenever one of those tests had run first.
     #[test]
     fn python_surface_is_unchanged() {
+        crate::own_process::run(
+            concat!(module_path!(), "::python_surface_is_unchanged"),
+            compare_surface_with_fixture,
+        );
+    }
+
+    fn compare_surface_with_fixture() {
         let captured = capture_surface();
 
         if std::env::var("UPDATE_PYTHON_SURFACE").as_deref() == Ok("1") {

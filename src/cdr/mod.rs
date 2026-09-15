@@ -1668,7 +1668,7 @@ mod tests {
         let path = directory.join("cdr.jsonl");
         let _ = std::fs::remove_file(&path);
 
-        let address = crate::transport::testutil::free_port();
+        let address = crate::transport::testutil::free_tcp_port();
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .expect("bind collector");
@@ -1721,7 +1721,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         // Reserved and never listened on, so every POST is refused.
-        let dead = crate::transport::testutil::free_port();
+        let dead = crate::transport::testutil::free_tcp_port();
 
         let sinks = vec![
             CdrBackendType::File {
@@ -1768,7 +1768,7 @@ mod tests {
         let path = directory.join("cdr.jsonl");
         let _ = std::fs::remove_file(&path);
 
-        let dead = crate::transport::testutil::free_port();
+        let dead = crate::transport::testutil::free_tcp_port();
         let sinks = vec![
             CdrBackendType::File {
                 path: path.to_string_lossy().to_string(),

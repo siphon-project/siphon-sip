@@ -378,6 +378,23 @@ fn backlogged(destination: SocketAddr, timeout: Duration) -> std::io::Error {
     )
 }
 
+/// Drop `key`'s pool entry, but only while it is still `connection_id`.
+///
+/// A dead connection gets noticed by more than one party: a sender that finds
+/// its channel closed, and the connection's own reader, which outlives the
+/// writer and only ends with the socket (the peer closes, or the idle
+/// timeout). By the time either acts, a replacement may hold the slot, and a
+/// plain `remove(key)` evicts that live replacement instead. The replacement
+/// is then orphaned, still open but never offered for reuse, and the next send
+/// to that peer opens yet another connection.
+fn evict_if_current(
+    connections: &DashMap<PoolKey, PoolEntry>,
+    key: &PoolKey,
+    connection_id: ConnectionId,
+) {
+    connections.remove_if(key, |_, entry| entry.connection_id == connection_id);
+}
+
 impl ConnectionPool {
     pub fn new(
         connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
@@ -471,7 +488,7 @@ impl ConnectionPool {
                     }
                     // Writer task gone — drop the corpse and establish afresh.
                     Enqueued::Closed => {
-                        self.connections.remove(&key);
+                        evict_if_current(&self.connections, &key, connection_id);
                     }
                 }
             }
@@ -522,7 +539,7 @@ impl ConnectionPool {
                         // enqueue.  Evict and take the second attempt, which
                         // will establish.
                         Enqueued::Closed => {
-                            self.connections.remove(&key);
+                            evict_if_current(&self.connections, &key, connection_id);
                         }
                     }
                 }
@@ -758,7 +775,7 @@ impl ConnectionPool {
                 }
             }
             conn_map.remove(&connection_id);
-            connections.remove(&key_for_cleanup);
+            evict_if_current(&connections, &key_for_cleanup, connection_id);
         });
 
         // Write task
@@ -874,7 +891,7 @@ impl ConnectionPool {
                 Enqueued::Backlogged => return Err(backlogged(destination, self.enqueue_timeout)),
                 // Connection dead — remove and create new
                 Enqueued::Closed => {
-                    self.connections.remove(&key);
+                    evict_if_current(&self.connections, &key, connection_id);
                 }
             }
         }
@@ -1055,7 +1072,7 @@ impl ConnectionPool {
                             if let Err(error) = inbound_tx.send_async(message).await {
                                 error!("pool: TLS inbound enqueue failed: {}", error);
                                 conn_map.remove(&connection_id);
-                                connections.remove(&key_for_cleanup);
+                                evict_if_current(&connections, &key_for_cleanup, connection_id);
                                 if let Some(ref stream_connections) = stream_connections {
                                     stream_connections.unregister(&destination);
                                 }
@@ -1070,7 +1087,7 @@ impl ConnectionPool {
                 }
             }
             conn_map.remove(&connection_id);
-            connections.remove(&key_for_cleanup);
+            evict_if_current(&connections, &key_for_cleanup, connection_id);
             if let Some(ref stream_connections) = stream_connections {
                 stream_connections.unregister(&destination);
             }
@@ -1296,7 +1313,15 @@ mod tests {
     /// The small receive buffer is what keeps the test fast: the peer's window
     /// closes after a few KB instead of the megabytes autotuning would otherwise
     /// allow.
-    async fn spawn_non_draining_peer() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    ///
+    /// Every accepted socket is handed to the test over the returned channel,
+    /// never read. A socket stays open while it sits in the channel or the test
+    /// holds it, so the test decides when the peer closes a connection, and
+    /// awaiting `recv()` is an explicit "the peer has accepted" point: the
+    /// accept loop is its own task and can lag the kernel handshake that has
+    /// already let `send_tcp` return.
+    async fn spawn_non_draining_peer(
+    ) -> (SocketAddr, mpsc::UnboundedReceiver<tokio::net::TcpStream>) {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_reuseaddr(true).unwrap();
         socket2::SockRef::from(&socket)
@@ -1306,29 +1331,48 @@ mod tests {
         let listener = socket.listen(16).unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let accepted_clone = Arc::clone(&accepted);
+        let (accepted_sender, accepted) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            // Hold every accepted socket open, and never read from any of them.
-            let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
-                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                held.push(socket);
+                if accepted_sender.send(socket).is_err() {
+                    return;
+                }
             }
         });
         (addr, accepted)
+    }
+
+    /// The pool key a default-bound `send_tcp` to `peer` lands under.
+    fn tcp_key(pool: &ConnectionPool, peer: SocketAddr) -> PoolKey {
+        PoolKey {
+            destination: peer,
+            transport: Transport::Tcp,
+            bind: Some(SocketAddr::new(pool.local_addr.ip(), 0)),
+        }
     }
 
     /// Keep sending until the pool refuses, bounded so the test fails by
     /// *hanging* rather than by asserting a count if the enqueue is ever
     /// unbounded again. 8 KB per message fills a closed window and then the
     /// 64-slot channel in well under a second.
-    async fn send_until_refused(pool: &ConnectionPool, peer: SocketAddr) -> usize {
+    ///
+    /// Returns how many sends went out before the refusal, and every
+    /// connection they went out on. That is normally one, but a writer that
+    /// gives up while the channel is still filling is replaced mid-round, which
+    /// is the behaviour under test rather than a reason to fail.
+    async fn send_until_refused(
+        pool: &ConnectionPool,
+        peer: SocketAddr,
+    ) -> (usize, std::collections::HashSet<ConnectionId>) {
         let payload = Bytes::from(vec![b'x'; 8 * 1024]);
         tokio::time::timeout(Duration::from_secs(10), async {
+            let mut carried_on = std::collections::HashSet::new();
             for attempt in 0..2000usize {
-                if pool.send_tcp(peer, payload.clone()).await.is_err() {
-                    return attempt;
+                match pool.send_tcp(peer, payload.clone()).await {
+                    Ok(connection_id) => {
+                        carried_on.insert(connection_id);
+                    }
+                    Err(_) => return (attempt, carried_on),
                 }
             }
             panic!("2000 sends to a peer that never reads all reported success");
@@ -2256,7 +2300,7 @@ mod tests {
         pool.enqueue_timeout = Duration::from_millis(50);
         pool.write_timeout = Duration::from_millis(200);
 
-        let refused_at = send_until_refused(&pool, peer).await;
+        let (refused_at, _) = send_until_refused(&pool, peer).await;
 
         assert!(
             refused_at > 0,
@@ -2272,33 +2316,127 @@ mod tests {
     /// permanent 503s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stalled_connection_is_replaced_on_the_next_send() {
-        let (peer, accepted) = spawn_non_draining_peer().await;
+        let (peer, mut accepted) = spawn_non_draining_peer().await;
 
         let mut pool = test_pool();
         pool.enqueue_timeout = Duration::from_millis(50);
         pool.write_timeout = Duration::from_millis(200);
+        let key = tcp_key(&pool, peer);
 
-        send_until_refused(&pool, peer).await;
-        let first_round = accepted.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(first_round, 1, "one connection so far");
+        let (_, carried_on) = send_until_refused(&pool, peer).await;
+        let (stalled_id, stalled_sender) = pool
+            .pooled(&key)
+            .expect("the refused send leaves the backed-up connection pooled");
 
-        // Past the writer's own timeout, so it has given up and closed the
-        // channel behind it.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // The writer's own timeout is what gives up on the peer, and it does so
+        // by dropping its receiver. Wait for exactly that instead of sleeping
+        // past the timeout and hoping the runtime has polled the writer since.
+        tokio::time::timeout(Duration::from_secs(10), stalled_sender.closed())
+            .await
+            .expect("the writer must give up on a peer that never drains");
 
         // The next send must establish a *new* connection rather than error
         // forever against the wedged entry.
-        let _ = tokio::time::timeout(
+        let replacement_id = tokio::time::timeout(
             Duration::from_secs(10),
             pool.send_tcp(peer, Bytes::from_static(b"PING")),
         )
         .await
-        .expect("a send after the writer gave up must not park either");
+        .expect("a send after the writer gave up must not park either")
+        .expect("a send after the writer gave up must establish a new connection");
 
-        assert!(
-            accepted.load(std::sync::atomic::Ordering::SeqCst) > first_round,
+        assert_ne!(
+            replacement_id, stalled_id,
             "a stalled connection must be replaced, not kept as a corpse every \
              later caller queues behind"
+        );
+        assert_eq!(
+            pool.pooled(&key).map(|(connection_id, _)| connection_id),
+            Some(replacement_id),
+            "later callers must be offered the replacement"
+        );
+
+        // And the peer really saw it: one accept for every connection the pool
+        // opened, the replacement included.
+        let mut held = Vec::new();
+        for _ in 0..=carried_on.len() {
+            let socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .expect("every connection the pool opened must reach the peer")
+                .expect("the peer's accept loop is still running");
+            held.push(socket);
+        }
+    }
+
+    /// A connection's reader outlives its writer. Once the writer gives up on a
+    /// peer that stopped draining, the next send replaces the pool entry while
+    /// the old reader is still parked on the socket, and that reader only ends
+    /// later: when the peer closes, or at the idle timeout. Its cleanup must
+    /// remove the connection it belongs to, not whichever connection holds the
+    /// slot by then. Evicting the replacement orphans a live connection, still
+    /// open but never offered for reuse, and makes the next send to that peer
+    /// open yet another one.
+    ///
+    /// Current-thread on purpose: the reader's cleanup drops the connection from
+    /// `connection_map` and from the pool within one poll, so once this task
+    /// sees the first removal the second has happened too.
+    #[tokio::test]
+    async fn an_old_connection_closing_does_not_evict_its_replacement() {
+        let (peer, mut accepted) = spawn_non_draining_peer().await;
+
+        let mut pool = test_pool();
+        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.write_timeout = Duration::from_millis(200);
+        let key = tcp_key(&pool, peer);
+
+        let (_, carried_on) = send_until_refused(&pool, peer).await;
+        let (_, stalled_sender) = pool
+            .pooled(&key)
+            .expect("the refused send leaves the backed-up connection pooled");
+        tokio::time::timeout(Duration::from_secs(10), stalled_sender.closed())
+            .await
+            .expect("the writer must give up on a peer that never drains");
+
+        // The peer's end of every connection opened so far, so the test can
+        // close exactly those.
+        let mut old_sockets = Vec::new();
+        for _ in 0..carried_on.len() {
+            let socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .expect("every connection the pool opened must reach the peer")
+                .expect("the peer's accept loop is still running");
+            old_sockets.push(socket);
+        }
+
+        let replacement_id = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.send_tcp(peer, Bytes::from_static(b"PING")),
+        )
+        .await
+        .expect("a send after the writer gave up must not park")
+        .expect("a send after the writer gave up must establish a new connection");
+        let _replacement_socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+            .await
+            .expect("the replacement must reach the peer")
+            .expect("the peer's accept loop is still running");
+
+        // The peer closes the old connections, which ends their readers.
+        drop(old_sockets);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while carried_on
+                .iter()
+                .any(|connection_id| pool.connection_map.contains_key(connection_id))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old connections' readers must see the peer close");
+
+        assert_eq!(
+            pool.pooled(&key).map(|(connection_id, _)| connection_id),
+            Some(replacement_id),
+            "an old connection's cleanup evicted the live connection that replaced it"
         );
     }
 
