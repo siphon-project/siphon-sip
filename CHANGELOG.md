@@ -468,6 +468,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   that answer ends the call the same way, with
   `Reason: Q.850;cause=47;text="Media anchor failed"`.
 
+- **A B2BUA call whose caller never ACKs the 2xx is ended after 64*T1.**
+  RFC 3261 §13.3.1.4 has a UAS that retransmits its 2xx for 64*T1 without an
+  ACK terminate the session with a BYE. siphon retransmitted the 200 it sent
+  the caller and then only logged, so the call stayed up, both legs and the
+  media with it, until something else ended it. Now both legs get a BYE with
+  `Reason: Q.850;cause=102;text="No ACK received"`, through the same teardown
+  as the session timer and the maximum call duration: media released, Rf/Ro
+  `ACR-STOP`, a CDR with `disconnect_initiator="timeout"`, `StasisEnd` on the
+  control rail, and no Python handler. It covers a relayed answer and one
+  siphon sends itself (`call.answer()`, the control plane's answer). An ACK
+  processed before the call is ended always wins, a call already torn down is
+  not sent a second BYE, and a 2xx for a call that has ended is no longer
+  retransmitted. A callee whose own 2xx carried the offer, and whose ACK is
+  still waiting for the caller's answer, is sent that ACK first, with every
+  stream rejected, right before its BYE.
+
 - **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
   the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the
   profile offered the plain RTP core `RTP/SAVP` and answered the SRTP UE with `RTP/AVP`, so neither

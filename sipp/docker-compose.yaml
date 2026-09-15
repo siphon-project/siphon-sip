@@ -874,6 +874,7 @@ services:
       - b2bua-refer
       - b2bua-unacked-2xx
       - b2bua-delayed-offer
+      - b2bua-noack-2xx
 
   # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
   sipp-b2bua-register:
@@ -2523,6 +2524,122 @@ services:
       - -trace_err
     profiles:
       - b2bua-delayed-offer
+
+  # --- B2BUA caller that never ACKs the 2xx (RFC 3261 §13.3.1.4) ---
+  # siphon retransmits the caller's 200 for 64*T1 (32 s, T1 is not configurable)
+  # and then ends the session: both the caller and the callee must receive a BYE
+  # with the timer-expiry Reason. bob's earlier contacts are removed and bob is
+  # registered from the callee's address, so the fork reaches only this callee.
+  #   172.20.0.210  caller
+  #   172.20.0.211  callee, and the REGISTER that points bob at it
+  #   172.20.0.212  wildcard de-REGISTER of bob
+
+  sipp-b2bua-noack-deregister:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.212
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/deregister.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-noack-2xx
+
+  sipp-b2bua-noack-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-noack-deregister:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.211
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact_noack.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-noack-2xx
+
+  sipp-b2bua-noack-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-noack-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.211
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_noack_2xx_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -trace_err
+    profiles:
+      - b2bua-noack-2xx
+
+  sipp-b2bua-noack-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-noack-register:
+        condition: service_completed_successfully
+      sipp-b2bua-noack-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.210
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_noack_2xx_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "60"
+      - -trace_err
+    profiles:
+      - b2bua-noack-2xx
 
   # --- B2BUA in-dialog INFO relay (RFC 6086) ---
   # The A-leg sends INFO with a DTMF body mid-call; the UAS asserts it arrives

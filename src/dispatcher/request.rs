@@ -228,10 +228,13 @@ pub(super) fn handle_request(
                     // for the answer this ACK carries, and goes now.
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
                         // The caller's ACK stops A-leg 2xx retransmission
-                        // (RFC 3261 §13.3.1.4). Fire the Notify so the retransmit
-                        // task exits; no-op if none is armed (non-2xx ACK).
-                        if let Some((_, notify)) = state.uas_2xx_retransmits.remove(&internal_id) {
-                            notify.notify_one();
+                        // (RFC 3261 §13.3.1.4). Removing the entry is also what
+                        // keeps the 64*T1 sweep from ending the call: the sweep
+                        // only acts on an entry it removes itself, so an ACK
+                        // processed first always wins. No-op if none is armed
+                        // (the ACK for a non-2xx).
+                        if let Some((_, unacked)) = state.uas_2xx_retransmits.remove(&internal_id) {
+                            unacked.cancel.notify_one();
                         }
                         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;

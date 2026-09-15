@@ -225,6 +225,14 @@ reports which *peer* hung up, and here neither did, which is also how a
 session-timer expiry and `call.terminate()` behave. The CDR is the record; its
 `sip_reason` is what distinguishes a duration cut from a session-timer one.
 
+One more timer ends an answered call the same way. siphon retransmits every 2xx
+it sends the caller, relayed or its own `call.answer()`, until the caller's ACK
+arrives. If none has arrived after 64×T1 (32 s), RFC 3261 §13.3.1.4 has the
+session ended, and siphon sends both legs a BYE with
+`Reason: Q.850;cause=102;text="No ACK received"`, through the same teardown and
+with the same CDR `disconnect_initiator="timeout"`. An ACK that siphon processes
+before the teardown runs keeps the call up.
+
 ::: siphon_sdk.call.Call.set_max_duration
 
 ## `MediaHandle`
