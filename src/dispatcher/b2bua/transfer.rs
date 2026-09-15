@@ -284,21 +284,38 @@ pub fn b2bua_bridge_inbound_replaces(
     }
 
     // The survivor's SDP, or the engine's answer built from it, reaches the new
-    // party in this 200, so it gets `media.sdp_strip_attributes` here. The
-    // survivor's re-INVITE below is stripped where every siphon-originated
-    // re-INVITE is.
+    // party in this 200, so it gets the topology hiding every relayed answer gets:
+    // siphon's `o=` owner, `s=` and `o=` address (the listener the newcomer's
+    // INVITE arrived on) in place of the survivor's, and the configured
+    // attributes stripped. The newcomer now holds the A-leg slot, so the `o=` is
+    // that leg's session id at its next version (RFC 3264 §8). The survivor's
+    // re-INVITE below gets the same on the siphon-originated re-INVITE path.
     let mut sdp_for_new_party = sdp_for_new_party;
-    strip_relayed_sdp_body(&mut sdp_for_new_party, state);
+    let newcomer_host = state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport);
+    own_sdp_toward_leg(
+        &mut sdp_for_new_party,
+        "application/sdp",
+        state,
+        &replaced_call_id,
+        true,
+        Some(&newcomer_host),
+    );
 
     // Accept the takeover. Sent before the BYE below so the transferee is
     // connected to the surviving party before the replaced one is told to go.
-    if !b2bua_answer_call(
+    // Sent on the dispatcher in hand rather than through the process-wide
+    // control handle: the takeover already runs inside the dispatcher, and this
+    // 200 always carries a body, so the early-media fallback `b2bua_answer_call`
+    // adds has nothing to do.
+    if !send_uas_response(
+        state,
         &replaced_call_id,
         invite,
         200,
         "OK",
         Some(sdp_for_new_party),
         Some("application/sdp"),
+        true,
     ) {
         warn!(call_id = %replaced_call_id, "B2BUA Replaces: failed to answer the taking-over INVITE");
     }

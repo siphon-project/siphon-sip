@@ -2,6 +2,11 @@
 //! SDP siphon relays between the two legs of a B2BUA call, at session and media
 //! level, in both directions, on every path an offer or an answer crosses.
 //!
+//! Also the `o=`/`s=` topology hiding on the paths that send a leg SDP someone
+//! else described: a 422 retry, a session refresh, a siphon-originated
+//! re-INVITE and the 200 to a `Replaces` newcomer, `o=` session version included
+//! (RFC 3264 §8).
+//!
 //! Every test drives the real relay path and reads the SDP off what the far
 //! party would have been sent: the UDP egress channel, or the message a path
 //! hands to the send. With nothing configured the relayed SDP is the one siphon
@@ -507,21 +512,82 @@ async fn with_nothing_configured_the_offer_to_the_callee_is_unchanged() {
     assert_crossed_unchanged(&offer, &offer_sdp, "INVITE to the callee");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_422_retry_to_the_callee_loses_the_named_attributes() {
-    // The higher-Session-Expires retry is rebuilt from the caller's INVITE, not
-    // from the stripped one the callee refused.
-    let mut dispatcher = strip_dispatcher(&STRIP);
+/// The line of `message`'s SDP that starts with `prefix` (`"o="`, `"s="`),
+/// without its line ending.
+fn sdp_line(message: &SipMessage, prefix: &str) -> Option<String> {
+    body_text(message)
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .map(str::to_string)
+}
+
+/// `status_code` from the callee for `invite`, as its server transaction would
+/// send it (RFC 3261 §8.2.6.2): the INVITE's Via, From, Call-ID and CSeq, and
+/// its To with the callee's tag.
+fn response_to_request(invite: &SipMessage, status_code: u16, reason: &str) -> SipMessage {
+    let header = |name: &str| {
+        invite
+            .headers
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("the INVITE has no {name}"))
+    };
+    parse(&format!(
+        concat!(
+            "SIP/2.0 {status_code} {reason}\r\n",
+            "Via: {via}\r\n",
+            "From: {from}\r\n",
+            "To: {to};tag={callee_tag}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: {cseq}\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        status_code = status_code,
+        reason = reason,
+        via = header("Via"),
+        from = header("From"),
+        to = header("To"),
+        callee_tag = CALLEE_TAG,
+        call_id = header("Call-ID"),
+        cseq = header("CSeq"),
+    ))
+}
+
+/// The session timer siphon runs, with an interval a callee can refuse.
+fn with_session_timer(dispatcher: &mut TestDispatcher) {
     dispatcher.state.session_timer_config =
         Some(serde_yaml_ng::from_str("session_expires: 90\n").expect("a session timer config"));
-    let call_id = ringing_call(&dispatcher);
-    let mut too_small = callee_response(
-        422,
-        "Session Interval Too Small",
-        B_LEG_BRANCH,
-        "1 INVITE",
-        "",
+}
+
+/// A 422 retry re-sends the offer the callee refused (RFC 4028 §6), so it is
+/// rebuilt from the INVITE siphon sent the callee rather than the caller's: the
+/// same topology-hidden `o=` and `s=`, the attributes still stripped, siphon's
+/// own Contact, and the next CSeq (RFC 3261 §8.1.3.5). An identical offer keeps
+/// its `o=` version (RFC 3264 §8), and the leg the retry supersedes hands over
+/// its session id, so the next offer on the dialog goes on from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_422_retry_resends_the_offer_the_callee_was_sent() {
+    let mut dispatcher = strip_dispatcher(&STRIP);
+    with_session_timer(&mut dispatcher);
+    let call_id = caller_call(&dispatcher);
+    dial_callee(
+        &dispatcher,
+        &call_id,
+        &caller_invite(&endpoint_sdp("192.0.2.10")),
     );
+    let refused = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
+    let (branch, session_id) = dispatcher
+        .state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| {
+            call.b_legs
+                .first()
+                .map(|leg| (leg.branch.clone(), leg.dialog.sdp_session_id))
+        })
+        .expect("the callee's leg");
+    let mut too_small = response_to_request(&refused, 422, "Session Interval Too Small");
     too_small.headers.set("Min-SE", "1800".to_string());
 
     assert!(retry_after_422(
@@ -529,11 +595,43 @@ async fn the_422_retry_to_the_callee_loses_the_named_attributes() {
         &mut too_small,
         422,
         &dispatcher.state,
-        &snapshot(&dispatcher, &call_id, B_LEG_BRANCH),
+        &snapshot(&dispatcher, &call_id, &branch),
     ));
 
     let retry = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
+    assert_eq!(sdp_line(&retry, "o="), sdp_line(&refused, "o="));
+    assert_eq!(sdp_line(&retry, "s="), Some("s=siphon".to_string()));
     assert_stripped(&retry, "422 retry to the callee");
+    assert_eq!(
+        retry.headers.get("Contact"),
+        refused.headers.get("Contact"),
+        "the retry names the caller's Contact instead of siphon's"
+    );
+    assert_eq!(retry.headers.cseq().map(String::as_str), Some("2 INVITE"));
+    assert_eq!(
+        retry.headers.get("Session-Expires").map(String::as_str),
+        Some("1800;refresher=uac")
+    );
+    assert_eq!(
+        retry.headers.get("Min-SE").map(String::as_str),
+        Some("1800")
+    );
+
+    let (retry_branch, retry_origin) = dispatcher
+        .state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| {
+            call.b_legs.first().map(|leg| {
+                (
+                    leg.branch.clone(),
+                    (leg.dialog.sdp_session_id, leg.dialog.sdp_version),
+                )
+            })
+        })
+        .expect("the retry's leg");
+    assert_ne!(retry_branch, branch, "the retry did not supersede the leg");
+    assert_eq!(retry_origin, (session_id, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -839,6 +937,164 @@ async fn a_session_refresh_carrying_the_callers_sdp_loses_the_named_attributes()
 
     let refresh = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
     assert_stripped(&refresh, "session refresh to the callee");
+}
+
+// ---------------------------------------------------------------------------
+// o= and s= on the paths that carry SDP from elsewhere
+// ---------------------------------------------------------------------------
+
+const NEWCOMER: &str = "192.0.2.50:5060";
+const NEWCOMER_CALL_ID: &str = "sdp-strip-newcomer@192.0.2.50";
+
+/// The SDP session id siphon owns toward the caller (`on_a_leg`) or the callee.
+fn leg_session_id(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool) -> u64 {
+    dispatcher
+        .state
+        .call_actors
+        .clone_leg(call_id, on_a_leg)
+        .map(|leg| leg.dialog.sdp_session_id)
+        .expect("the leg")
+}
+
+/// A session refresh re-offers the caller's stored SDP to the callee, so it gets
+/// the topology hiding every SDP toward the callee gets: siphon's `s=`, and an
+/// `o=` with siphon's owner and address. Each refresh is the next version of the
+/// callee leg's own session (RFC 3264 §8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_refresh_hides_the_callers_session_name_and_origin() {
+    let dispatcher = strip_dispatcher(&[]);
+    let call_id = answered_call(&dispatcher);
+    let session_id = leg_session_id(&dispatcher, &call_id, false);
+    let host = dispatcher.state.via_host(&Transport::Udp);
+
+    b2bua_send_refresh_reinvite(&call_id, &dispatcher.state);
+    let first = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
+    b2bua_send_refresh_reinvite(&call_id, &dispatcher.state);
+    let second = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
+
+    for (refresh, version) in [(&first, 0), (&second, 1)] {
+        assert_eq!(sdp_line(refresh, "s="), Some("s=siphon".to_string()));
+        assert_eq!(
+            sdp_line(refresh, "o="),
+            Some(format!("o=siphon {session_id} {version} IN IP4 {host}"))
+        );
+    }
+}
+
+/// A re-INVITE siphon sends with SDP another party described keeps the `o=` that
+/// leg has always had from siphon: siphon's owner and address, the leg's own
+/// session id at its next version. RFC 3264 §8 lets only the version change, and
+/// the other party's address in `o=` was both a leak and a change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_invite_siphon_sends_with_the_other_legs_sdp_carries_siphons_origin() {
+    for surviving_on_a_leg in [true, false] {
+        let dispatcher = strip_dispatcher(&[]);
+        let call_id = answered_call(&dispatcher);
+        let target = if surviving_on_a_leg { CALLER } else { CALLEE };
+        let session_id = leg_session_id(&dispatcher, &call_id, surviving_on_a_leg);
+        let host = dispatcher
+            .state
+            .a_leg_advertised_host(None, &Transport::Udp);
+
+        b2bua_send_media_reinvite(
+            &call_id,
+            surviving_on_a_leg,
+            endpoint_sdp("203.0.113.40").into_bytes(),
+            &dispatcher.state,
+        );
+
+        let reinvite = request_to(&wire(&dispatcher), target, Method::Invite);
+        assert_eq!(
+            sdp_line(&reinvite, "o="),
+            Some(format!("o=siphon {session_id} 0 IN IP4 {host}")),
+            "re-INVITE to {target}"
+        );
+        assert_eq!(
+            sdp_line(&reinvite, "s="),
+            Some("s=siphon".to_string()),
+            "re-INVITE to {target}"
+        );
+    }
+}
+
+/// The INVITE with `Replaces` that takes over the caller's dialog.
+fn newcomer_invite(body: &str) -> SipMessage {
+    parse(&format!(
+        concat!(
+            "INVITE sip:callee@siphon.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.50:5060;branch=z9hG4bK-newcomer\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:newcomer@example.com>;tag=newcomer-tag\r\n",
+            "To: <sip:callee@siphon.example.com>\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:newcomer@192.0.2.50:5060>\r\n",
+            "Replaces: {replaced};to-tag=siphon-a-tag;from-tag={caller_tag}\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length: {length}\r\n",
+            "\r\n",
+            "{body}",
+        ),
+        call_id = NEWCOMER_CALL_ID,
+        replaced = A_LEG_CALL_ID,
+        caller_tag = CALLER_TAG,
+        length = body.len(),
+        body = body,
+    ))
+}
+
+/// The 200 that accepts a `Replaces` takeover (RFC 3891) hands the newcomer the
+/// survivor's SDP, so it gets the hiding every relayed answer gets: siphon's
+/// `s=`, an `o=` with siphon's owner and address and the newcomer leg's own
+/// session id at its first version (RFC 3264 §8), and the attributes stripped.
+/// Driven through the takeover itself, reading the 200 off the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_200_to_a_replaces_newcomer_hides_the_survivors_sdp() {
+    let dispatcher = strip_dispatcher(&STRIP);
+    let state = &dispatcher.state;
+    let replaced_call_id = answered_call(&dispatcher);
+    state.call_actors.set_leg_last_sdp(
+        &replaced_call_id,
+        false,
+        endpoint_sdp("198.51.100.20").as_bytes(),
+    );
+    let newcomer_leg = Leg::new_a_leg(
+        NEWCOMER_CALL_ID.to_string(),
+        "newcomer-tag".to_string(),
+        "z9hG4bK-newcomer".to_string(),
+        udp_transport(NEWCOMER),
+    );
+    let session_id = newcomer_leg.dialog.sdp_session_id;
+    let new_call_id = state.call_actors.create_call(newcomer_leg);
+    let invite = newcomer_invite(&endpoint_sdp("192.0.2.50"));
+    state.call_actors.set_a_leg_invite(
+        &new_call_id,
+        Arc::new(std::sync::Mutex::new(invite.clone())),
+    );
+    let inbound = inbound_from(NEWCOMER);
+    let pending = crate::b2bua::actor::PendingReplaces {
+        replaced_call_id: replaced_call_id.clone(),
+        replaced_on_a_leg: true,
+        early_only: false,
+    };
+
+    b2bua_bridge_inbound_replaces(&inbound, &invite, &new_call_id, &pending, state);
+
+    let accepted = response_to(&wire(&dispatcher), NEWCOMER, 200);
+    let host = state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport);
+    assert_eq!(
+        sdp_line(&accepted, "o="),
+        Some(format!("o=siphon {session_id} 0 IN IP4 {host}"))
+    );
+    assert_eq!(sdp_line(&accepted, "s="), Some("s=siphon".to_string()));
+    assert_stripped(&accepted, "200 to the Replaces newcomer");
+    assert_eq!(
+        state
+            .call_actors
+            .reserve_leg_sdp_version(&replaced_call_id, true),
+        Some((session_id, 1)),
+        "the newcomer's next SDP does not go on from the version it was answered with"
+    );
 }
 
 // ---------------------------------------------------------------------------

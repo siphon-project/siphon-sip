@@ -854,6 +854,29 @@ fn call_actor_replace_b_leg_supersedes_in_place() {
     assert_eq!(call.b_legs.len(), 2);
 }
 
+/// A retry continues the leg it supersedes, so it keeps that leg's SDP session
+/// id and version. The INVITE it re-sends carries the superseded leg's `o=`, and
+/// every later offer on the dialog has to present that same session id with a
+/// greater version (RFC 3264 §8). A retry leg is built with a fresh identity of
+/// its own, which the dialog would otherwise switch to.
+#[test]
+fn call_actor_replace_b_leg_keeps_the_superseded_legs_sdp_origin() {
+    let mut call = CallActor::new(make_a_leg());
+    let mut original = make_b_leg(0);
+    original.dialog.sdp_version = 1;
+    let session_id = original.dialog.sdp_session_id;
+    call.add_b_leg(original);
+
+    let mut retry = make_b_leg(0);
+    retry.branch = "z9hG4bK-bleg0-retry".to_string();
+    retry.dialog.sdp_session_id = session_id.wrapping_add(1);
+    assert!(call.replace_b_leg(0, retry).is_some());
+
+    assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry");
+    assert_eq!(call.b_legs[0].dialog.sdp_session_id, session_id);
+    assert_eq!(call.b_legs[0].dialog.sdp_version, 1);
+}
+
 #[test]
 fn call_actor_losers() {
     let mut call = CallActor::new(make_a_leg());

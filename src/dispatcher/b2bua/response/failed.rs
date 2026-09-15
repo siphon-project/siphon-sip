@@ -348,10 +348,10 @@ pub fn retry_after_422(
                     .and_then(|v| v.split(';').next())
                     .and_then(|v| v.trim().parse::<u32>().ok());
 
-                if let (Some(min_se), Some(target_uri), Some(invite_arc)) = (
+                if let (Some(min_se), Some(target_uri), Some(stored_invite_arc)) = (
                     remote_min_se,
                     &snapshot.b_leg_target,
-                    &snapshot.a_leg_invite,
+                    &snapshot.b_leg_stored_invite,
                 ) {
                     if min_se > timer_config.session_expires {
                         info!(
@@ -377,122 +377,54 @@ pub fn retry_after_422(
                                     None => return true,
                                 };
 
-                            // Build retry INVITE from stored A-leg INVITE
-                            let Ok(original) = invite_arc.lock() else {
-                                error!(call_id = %call_id, "invite_arc lock poisoned during fork retry");
-                                return true;
-                            };
-                            let mut retry = original.clone();
-                            drop(original);
-
-                            // Replace Via with new branch. The retry continues
-                            // the same B-leg, so it keeps the leg's sent-by —
-                            // the flow socket when it was dialled over one.
+                            // Rebuilt from the INVITE siphon sent the callee, as the
+                            // 401/407 retry is. The offer the callee refused is
+                            // re-sent as it went out, so the SDP keeps its `o=`/`s=`
+                            // hiding, its attribute strip and its `o=` version (an
+                            // identical offer keeps it, RFC 3264 §8), and the
+                            // headers keep the header policy, siphon's Contact and
+                            // the From topology hiding. The caller's INVITE, which
+                            // this was rebuilt from before, carried none of that.
+                            // Only the transaction (a new Via branch, the next CSeq)
+                            // and the session interval the callee asked for change.
                             let new_branch = TransactionKey::generate_branch();
+                            // The retry continues the same B-leg, so it keeps the
+                            // leg's sent-by: the flow socket when it was dialled
+                            // over one.
                             let (retry_via_host, retry_via_port) =
                                 b_leg_sent_by(snapshot.b_leg_local_addr, state, &transport);
                             let via_value = format!(
                                 "SIP/2.0/{} {}:{};branch={}",
                                 transport, retry_via_host, retry_via_port, new_branch,
                             );
-                            retry.headers.set("Via", via_value);
-
-                            // Update Request-URI
-                            if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                retry.start_line =
-                                    StartLine::Request(crate::sip::message::RequestLine {
-                                        method: crate::sip::message::Method::Invite,
-                                        request_uri: target_parsed,
-                                        version: crate::sip::message::Version::sip_2_0(),
-                                    });
-                            }
-
-                            // Set updated session timer headers
-                            retry.headers.remove("Session-Expires");
-                            retry.headers.remove("Min-SE");
-                            retry
-                                .headers
-                                .add("Session-Expires", format!("{};refresher=uac", min_se));
-                            retry.headers.add("Min-SE", min_se.to_string());
-
-                            // Reuse B-leg dialog identifiers from the failed attempt.
-                            // Retry source is the original A-leg INVITE — out-of-dialog,
-                            // To has no tag, so pass None for new_to_tag.
-                            let (retry_call_id, retry_from_tag) =
-                                snapshot.b_leg_dialog.clone().unwrap_or_else(|| {
-                                    (
-                                        snapshot.a_leg.dialog.call_id.clone(),
-                                        snapshot
-                                            .a_leg
-                                            .dialog
-                                            .remote_tag
-                                            .clone()
-                                            .unwrap_or_default(),
-                                    )
-                                });
-                            crate::b2bua::actor::Dialog::rewrite_headers(
-                                &mut retry,
-                                &retry_call_id,
-                                snapshot.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                                &retry_from_tag,
-                                None,
-                            );
-                            // Rebuilt from the caller's INVITE rather than from
-                            // the stripped one the callee refused, so it needs its
-                            // own `media.sdp_strip_attributes` pass.
-                            strip_relayed_sdp_attributes(&mut retry, state);
-
-                            let mut b_leg = Leg::new_b_leg(
-                                retry_call_id,
-                                retry_from_tag,
-                                target_uri.clone(),
-                                new_branch,
-                                LegTransport {
-                                    remote_addr: destination,
-                                    connection_id: reuse_connection_id,
-                                    transport,
-                                    // The retry IS this B-leg continuing, so
-                                    // it keeps the leg's anchored socket.
-                                    local_addr: snapshot.b_leg_local_addr,
-                                },
-                            );
-                            // Stash the retry INVITE so a caller CANCEL during
-                            // alerting can rebuild the CANCEL from it (RFC 3261
-                            // §9.1 — same Via branch + CSeq). The original 422'd
-                            // leg's stash is discarded by the in-place supersede
-                            // below; without re-stashing here the live retry
-                            // transaction would be left un-cancellable.
-                            b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
+                            let retry = {
+                                let Ok(original) = stored_invite_arc.lock() else {
+                                    error!(call_id = %call_id, "b_leg_invite lock poisoned during 422 retry");
+                                    return true;
+                                };
+                                let mut retry = build_retry_invite(
+                                    &original,
+                                    via_value,
+                                    snapshot.b_leg_local_cseq,
+                                );
+                                retry
+                                    .headers
+                                    .set("Session-Expires", format!("{min_se};refresher=uac"));
+                                retry.headers.set("Min-SE", min_se.to_string());
+                                retry
+                            };
 
                             // RFC 4028: the 422'd INVITE transaction is complete,
                             // so the higher-Session-Expires retry continues the
-                            // same logical B-leg — supersede in place rather than
-                            // append (see the 401/407 path for why appending
-                            // strands a dead leg that a later CANCEL hits).
-                            match snapshot.b_leg_index {
-                                Some(idx) => {
-                                    state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
-                                    spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
-                                }
-                                None => {
-                                    state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                    spawn_b_leg_actor(call_id, &b_leg, state);
-                                }
-                            }
-
-                            let data = Bytes::from(retry.to_bytes());
-                            // Egress from the leg's anchored socket (UDP only —
-                            // a stream leg is reached over its connection).
-                            let retry_source = match transport {
-                                Transport::Udp => snapshot.b_leg_local_addr,
-                                _ => None,
-                            };
-                            send_to_target(
-                                data,
+                            // same logical B-leg.
+                            supersede_b_leg_with_retry(
+                                call_id,
+                                target_uri,
+                                retry,
+                                new_branch,
+                                (destination, transport, reuse_connection_id),
                                 &relay_target,
-                                transport,
-                                reuse_connection_id,
-                                retry_source,
+                                snapshot,
                                 state,
                             );
                         }
@@ -730,90 +662,17 @@ pub fn retry_with_credentials(
                                 )
                             };
 
-                            // Reuse the failed B-leg's dialog identity (Call-ID +
-                            // From-tag); the stored INVITE already carries them.
-                            let (retry_call_id, retry_from_tag) =
-                                snapshot.b_leg_dialog.clone().unwrap_or_else(|| {
-                                    (
-                                        snapshot.a_leg.dialog.call_id.clone(),
-                                        snapshot
-                                            .a_leg
-                                            .dialog
-                                            .remote_tag
-                                            .clone()
-                                            .unwrap_or_default(),
-                                    )
-                                });
-
-                            let mut b_leg = Leg::new_b_leg(
-                                retry_call_id,
-                                retry_from_tag,
-                                target_uri.clone(),
-                                new_branch,
-                                LegTransport {
-                                    remote_addr: destination,
-                                    connection_id: reuse_connection_id,
-                                    transport,
-                                    // The retry IS this B-leg continuing, so
-                                    // it keeps the leg's anchored socket.
-                                    local_addr: snapshot.b_leg_local_addr,
-                                },
-                            );
-                            // Preserve dialog state from the failed attempt:
-                            //  - local_cseq advances past the retry CSeq.
-                            //  - local_contact / from_uri / to_uri stay so mid-dialog
-                            //    requests on this leg work.
-                            b_leg.dialog.local_cseq = snapshot.b_leg_local_cseq.saturating_add(1);
-                            b_leg.dialog.local_contact = retry.headers.get("Contact").cloned();
-                            b_leg.dialog.local_from_uri = retry.headers.from().cloned();
-                            b_leg.dialog.remote_to_uri = retry.headers.to().cloned();
-                            if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                                b_leg.dialog.remote_aor_host =
-                                    Some(if let Some(port) = target_parsed.port {
-                                        format!("{}:{}", target_parsed.host, port)
-                                    } else {
-                                        target_parsed.host.clone()
-                                    });
-                            }
-                            // Persist the retry INVITE so a chained re-challenge
-                            // (e.g. nonce stale) rebuilds from the right snapshot.
-                            b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
-
                             // RFC 3261 §9.1: the CSeq-1 INVITE transaction is
                             // complete after its 401/407 + ACK, so the retry is
-                            // the *same* logical B-leg continuing with credentials
-                            // — supersede the failed leg in place rather than
-                            // appending. Appending leaves the dead leg in
-                            // `b_legs`, so a later CANCEL fans out to its
-                            // already-final-responded transaction too (→ a
-                            // spurious 481). `snapshot.b_leg_index` is the slot the
-                            // challenged response matched; it is always Some here
-                            // (a B-leg response only reaches this path with a
-                            // matched leg), but fall back to append defensively.
-                            match snapshot.b_leg_index {
-                                Some(idx) => {
-                                    state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
-                                    spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
-                                }
-                                None => {
-                                    state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                    spawn_b_leg_actor(call_id, &b_leg, state);
-                                }
-                            }
-
-                            let data = Bytes::from(retry.to_bytes());
-                            // Egress from the leg's anchored socket (UDP only —
-                            // a stream leg is reached over its connection).
-                            let retry_source = match transport {
-                                Transport::Udp => snapshot.b_leg_local_addr,
-                                _ => None,
-                            };
-                            send_to_target(
-                                data,
+                            // the same logical B-leg continuing with credentials.
+                            supersede_b_leg_with_retry(
+                                call_id,
+                                target_uri,
+                                retry,
+                                new_branch,
+                                (destination, transport, reuse_connection_id),
                                 &relay_target,
-                                transport,
-                                reuse_connection_id,
-                                retry_source,
+                                snapshot,
                                 state,
                             );
                         }
@@ -825,6 +684,101 @@ pub fn retry_with_credentials(
     }
 
     false
+}
+
+/// Supersede the B-leg a retried INVITE continues with a leg carrying `retry`,
+/// and send the retry over `route`: the trunk member the failed INVITE reached
+/// (`select_b2bua_retry_destination`, RFC 5923).
+///
+/// Shared by the 401/407 and 422 retries. The failed INVITE transaction is
+/// complete once its final response is ACKed (RFC 3261 §9.1), so the retry is
+/// the same logical B-leg continuing, not a new fork branch. It takes the failed
+/// leg's slot: appending would leave the dead leg in `b_legs` for a later CANCEL
+/// to fan out to, drawing a spurious 481. The new leg keeps the failed leg's
+/// dialog identity and, through `replace_b_leg`, its SDP session.
+fn supersede_b_leg_with_retry(
+    call_id: &str,
+    target_uri: &str,
+    retry: SipMessage,
+    new_branch: String,
+    route: (SocketAddr, Transport, ConnectionId),
+    relay_target: &RelayTarget,
+    snapshot: &BLegResponseSnapshot,
+    state: &DispatcherState,
+) {
+    let (destination, transport, reuse_connection_id) = route;
+    // Reuse the failed B-leg's dialog identity (Call-ID + From-tag); the stored
+    // INVITE already carries them.
+    let (retry_call_id, retry_from_tag) = snapshot.b_leg_dialog.clone().unwrap_or_else(|| {
+        (
+            snapshot.a_leg.dialog.call_id.clone(),
+            snapshot.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+        )
+    });
+
+    let mut b_leg = Leg::new_b_leg(
+        retry_call_id,
+        retry_from_tag,
+        target_uri.to_string(),
+        new_branch,
+        LegTransport {
+            remote_addr: destination,
+            connection_id: reuse_connection_id,
+            transport,
+            // The retry IS this B-leg continuing, so it keeps the leg's anchored
+            // socket.
+            local_addr: snapshot.b_leg_local_addr,
+        },
+    );
+    // Preserve dialog state from the failed attempt:
+    //  - local_cseq advances past the retry CSeq.
+    //  - local_contact / from_uri / to_uri stay so mid-dialog requests on this
+    //    leg work.
+    b_leg.dialog.local_cseq = snapshot.b_leg_local_cseq.saturating_add(1);
+    b_leg.dialog.local_contact = retry.headers.get("Contact").cloned();
+    b_leg.dialog.local_from_uri = retry.headers.from().cloned();
+    b_leg.dialog.remote_to_uri = retry.headers.to().cloned();
+    if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+        b_leg.dialog.remote_aor_host = Some(if let Some(port) = target_parsed.port {
+            format!("{}:{}", target_parsed.host, port)
+        } else {
+            target_parsed.host.clone()
+        });
+    }
+    // Stash the retry INVITE. A chained re-challenge (a stale nonce) or a further
+    // 422 rebuilds from it, and a caller CANCEL during alerting builds its CANCEL
+    // from it (RFC 3261 §9.1: the same Via branch and CSeq).
+    b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
+
+    // `snapshot.b_leg_index` is the slot the failed response matched. It is
+    // always Some here, since a B-leg response only reaches a retry with a matched
+    // leg, but fall back to appending defensively.
+    match snapshot.b_leg_index {
+        Some(idx) => {
+            state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
+            spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+        }
+        None => {
+            state.call_actors.add_b_leg(call_id, b_leg.clone());
+            spawn_b_leg_actor(call_id, &b_leg, state);
+        }
+    }
+
+    let data = Bytes::from(retry.to_bytes());
+    // Egress from the leg's anchored socket (UDP only; a stream leg is reached
+    // over its connection).
+    let retry_source = match transport {
+        Transport::Udp => snapshot.b_leg_local_addr,
+        _ => None,
+    };
+    send_to_target(
+        data,
+        relay_target,
+        transport,
+        reuse_connection_id,
+        retry_source,
+        state,
+    );
 }
 
 /// Where a carrier's final failure left its route sequence, when the call is to
