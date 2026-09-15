@@ -633,11 +633,13 @@ async fn a_caller_ack_without_an_answer_rejects_every_stream_and_ends_the_call()
 
 /// A call ended by siphon while the callee's ACK waits still owes that ACK: sent
 /// with every stream rejected, right before the BYE (RFC 3261 §13.2.2.4, §15).
+/// The caller has not ACKed either, so its own BYE waits for its ACK, and that ACK
+/// sends the callee nothing more.
 #[tokio::test(flavor = "multi_thread")]
 async fn ending_the_call_while_the_ack_is_held_sends_it_rejecting_the_offer_before_the_bye() {
     let call = OfferlessCall::dial("");
     call.callee_answers_with_an_offer();
-    call.wire();
+    let relayed = relayed_answer(&call.wire());
 
     assert!(b2bua_terminate_call_inner(
         &call.call_id,
@@ -647,8 +649,27 @@ async fn ending_the_call_while_the_ack_is_held_sends_it_rejecting_the_offer_befo
     ));
     let sent = call.wire();
     assert_rejecting_ack_then_bye(&sent);
-    assert!(to_caller(&sent).iter().any(|sent| sent.is(Method::Bye)));
+    assert!(
+        !to_caller(&sent).iter().any(|sent| sent.is(Method::Bye)),
+        "the caller's BYE waits for its ACK"
+    );
     assert!(!call.call_is_up());
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+    let sent = call.wire();
+    assert_eq!(
+        to_caller(&sent)
+            .iter()
+            .filter(|sent| sent.is(Method::Bye))
+            .count(),
+        1,
+        "the caller's ACK releases its BYE"
+    );
+    assert!(
+        to_callee(&sent).is_empty(),
+        "the callee was ACKed and BYEd already"
+    );
+    assert!(call.state.held_byes.is_empty());
 }
 
 /// The caller hangs up before it ACKs: the held ACK goes to the callee, offer

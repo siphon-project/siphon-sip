@@ -327,6 +327,10 @@ pub struct CallActor {
     /// then kept as sent so every retransmission of the 2xx gets it again. `None`
     /// for a call whose INVITE carried an offer: that 2xx is ACKed on arrival.
     pub delayed_offer_ack: Option<DelayedOfferAck>,
+    /// Set by the first teardown to take this call over
+    /// ([`CallActorStore::claim_teardown`]): only that teardown sends BYEs and
+    /// removes the call, so two racing each other cannot BYE a leg twice.
+    pub teardown_claimed: bool,
     /// Resolved header policy for this call (preset + per-call deltas) — set
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
@@ -469,6 +473,17 @@ pub struct EarlyMediaAnchor {
     pub profile: String,
 }
 impl CallActor {
+    /// Whether one of this call's legs carries the dialog `sip_call_id`. A
+    /// transfer or a takeover can release a party from the call, and move one to
+    /// another slot, while the call goes on.
+    pub fn carries_dialog(&self, sip_call_id: &str) -> bool {
+        self.a_leg.dialog.call_id == sip_call_id
+            || self
+                .b_legs
+                .iter()
+                .any(|leg| leg.dialog.call_id == sip_call_id)
+    }
+
     /// Create a new call actor with an A-leg.
     pub fn new(a_leg: Leg) -> Self {
         Self {
@@ -497,6 +512,7 @@ impl CallActor {
             contact_user_override: None,
             contact_override: None,
             delayed_offer_ack: None,
+            teardown_claimed: false,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
             auth_retry_count: 0,

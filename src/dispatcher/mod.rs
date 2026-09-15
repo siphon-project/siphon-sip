@@ -81,6 +81,8 @@ mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
+mod held_bye_tests;
+#[cfg(test)]
 mod late_provisional_tests;
 #[cfg(test)]
 mod lcr_number_policy_tests;
@@ -99,9 +101,13 @@ mod ro_orphan_backstop_tests;
 #[cfg(test)]
 mod sdp_strip_tests;
 #[cfg(test)]
+mod teardown_race_tests;
+#[cfg(test)]
 mod test_dispatcher;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transfer_bye_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
 
@@ -455,6 +461,7 @@ pub async fn run(
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),
+        held_byes: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         is_draining: drain.clone(),
         rf_charger,

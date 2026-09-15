@@ -87,18 +87,15 @@ impl PendingInboundReferStore {
 /// A `BYE` for a replaced referrer leg, held back until the terminating
 /// `NOTIFY` that shares its dialog has been answered.
 ///
-/// Serialized at registration rather than rebuilt at send time: the leg it is
-/// addressed to has already been promoted out of the call by then, so there is
-/// nothing left to build it from. The frame is byte-identical to the one the
-/// immediate send produced.
+/// Built at registration rather than at send time: the leg it is addressed to has
+/// already been promoted out of the call by then, so the leg is kept here with
+/// the frame, which is byte-identical to the one the immediate send produced.
 pub struct DeferredReferrerBye {
     /// The fully built `BYE`, ready to serialize.
     pub message: SipMessage,
-    /// The flow the terminating `NOTIFY` went out on — the `BYE` follows it.
-    pub transport: Transport,
-    pub destination: SocketAddr,
-    pub connection_id: ConnectionId,
-    pub local_addr: Option<SocketAddr>,
+    /// The referrer's leg, off the call: the dialog the `BYE` ends, and the flow
+    /// the terminating `NOTIFY` went out on, which the `BYE` follows.
+    pub leg: Leg,
     /// When the sweep gives up waiting for the `NOTIFY` to be answered.
     pub deadline: std::time::Instant,
     /// For the log line on either path.
@@ -192,10 +189,7 @@ pub const DEFERRED_REFERRER_BYE_TIMEOUT: std::time::Duration =
 pub fn send_deferred_referrer_bye(deferred: DeferredReferrerBye, state: &DispatcherState) {
     let DeferredReferrerBye {
         message,
-        transport,
-        destination,
-        connection_id,
-        local_addr,
+        leg,
         call_id,
         ..
     } = deferred;
@@ -203,14 +197,9 @@ pub fn send_deferred_referrer_bye(deferred: DeferredReferrerBye, state: &Dispatc
         call_id = %call_id,
         "B2BUA REFER (terminate): terminating NOTIFY settled — releasing the referrer BYE"
     );
-    send_message_from(
-        message,
-        transport,
-        destination,
-        connection_id,
-        local_addr,
-        state,
-    );
+    // Sent now, or after the referrer ACKs a 2xx it has not ACKed yet (RFC 3261
+    // §15): an answered NOTIFY does not confirm the dialog.
+    send_or_hold_bye(&call_id, &leg, message, ByeSender::Dialog, state);
 }
 
 /// Release the referrer `BYE` waiting on this response's branch, if there is

@@ -13,6 +13,11 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
+            // The call ended while its 2xx waited for this caller's ACK, with the
+            // caller's BYE held for it: the dialog is still the caller's to end.
+            if answer_caller_bye_for_held_dialog(&inbound, &message, &sip_call_id, state) {
+                return;
+            }
             // Lost a race with a concurrent teardown — the dispatch gate saw
             // this call, and it is gone by now. Same answer as the no-dialog-leg
             // arm below: 481, never a silent drop (RFC 3261 §15.1.2).
@@ -107,6 +112,26 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         return;
     }
 
+    // One teardown per call ([`CallActorStore::claim_teardown`]). A BYE that
+    // arrives while another teardown already has the call (the 64×T1 sweep, a
+    // timer, a script, the other party's own BYE) is answered, and that teardown
+    // sends what is owed: running this one too would BYE a leg twice.
+    if !state.call_actors.claim_teardown(&call_id) {
+        let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(
+            bye_response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        debug!(call_id = %call_id, "B2BUA BYE: the call is already being torn down — answered");
+        return;
+    }
+    #[cfg(test)]
+    teardown_race::claimed();
+
     // Extract the rest from the DashMap ref and drop it before entering Python
     let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow) =
         match state.call_actors.get_call(&call_id) {
@@ -198,19 +223,22 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // disconnecting side (caller vs callee).
     cdr_finalize_b2bua_stop(state, &call_id, from_a_leg, &message);
 
-    // The callee's 2xx carried the offer and still waits for the caller's answer,
-    // and the caller has hung up without one: that ACK goes to the callee, every
-    // stream rejected, right before its BYE (RFC 3261 §13.2.2.4, §15). Taken
-    // here, before the call is read below, since taking it writes to the call.
-    let held_ack = if from_a_leg {
-        take_held_ack_rejecting_offer(&call_id, state)
-    } else {
-        None
-    };
-
-    // Re-acquire the call ref for BYE bridging
-    let call = match state.call_actors.get_call(&call_id) {
-        Some(c) => c,
+    // The other party's leg, and the rtpengine session key, read and the call
+    // dropped before anything is sent: the BYE's dialog may still be owed an ACK
+    // or have its BYE held, and both write to the call. The session is keyed by
+    // the A-leg Call-ID (the store key), which is NOT the incoming BYE's Call-ID
+    // when the BYE comes from the B-leg (or from the survivor/target after a
+    // terminate-transfer re-anchor).
+    let (other_leg, media_key) = match state.call_actors.get_call(&call_id) {
+        Some(call) => {
+            let other_leg = if from_a_leg {
+                call.winner
+                    .and_then(|winner_index| call.b_legs.get(winner_index).cloned())
+            } else {
+                Some(call.a_leg.clone())
+            };
+            (other_leg, call.a_leg.dialog.call_id.clone())
+        }
         None => return,
     };
 
@@ -227,58 +255,27 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         state,
     );
 
-    // Forward BYE to the other leg with full B2BUA header rewriting:
-    // - Dialog headers (Call-ID, From/To tags)
-    // - From URI host (topology hiding)
-    // - CSeq (independent per dialog, RFC 3261)
-    // - Max-Forwards (decrement per RFC 7332)
-    if from_a_leg {
-        // BYE from A → generate new B-leg BYE from stored dialog state.
-        // A B2BUA MUST NOT forward the A-leg BYE — it generates a fresh request
-        // using only B-leg dialog identifiers, route set, and Contact.
-        if let Some(winner_index) = call.winner {
-            if let Some(b_leg) = call.b_legs.get(winner_index) {
-                if let Some(bye) = build_b2bua_bye(b_leg, state) {
-                    debug!(call_id = %call_id, "B2BUA: sending BYE to B-leg");
-                    send_bye_to_b_leg(b_leg, bye, held_ack, state);
+    // A fresh BYE for the other leg, built from its own dialog state — a B2BUA
+    // MUST NOT forward the BYE it received: Call-ID and tags, From host (topology
+    // hiding), CSeq (independent per dialog, RFC 3261) and route set are that
+    // dialog's. It goes after whatever that dialog is still owed
+    // (`send_or_hold_bye`): a party that has not ACKed siphon's 2xx gets it after
+    // the ACK (§15), and a delayed offer's ACK goes first (§13.2.2.4).
+    match other_leg {
+        Some(leg) => match build_b2bua_bye(&leg, state) {
+            Some(bye) => {
+                let sender = if from_a_leg {
+                    ByeSender::BLeg
                 } else {
-                    warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
-                }
-            } else {
-                warn!(call_id = %call_id, "B2BUA: no winning B-leg for BYE");
+                    ByeSender::Dialog
+                };
+                debug!(call_id = %call_id, from_a_leg, "B2BUA: sending BYE to the other leg");
+                send_or_hold_bye(&call_id, &leg, bye, sender, state);
             }
-        } else {
-            warn!(call_id = %call_id, "B2BUA: no winner set for BYE");
-        }
-    } else {
-        // BYE from B → generate new A-leg BYE from stored dialog state.
-        if let Some(bye) = build_b2bua_bye(&call.a_leg, state) {
-            let (destination, transport) = resolve_in_dialog_destination(
-                &call.a_leg.dialog.route_set,
-                state,
-                call.a_leg.transport.remote_addr,
-                call.a_leg.transport.transport,
-            );
-            // Source the siphon-originated BYE from the A-leg's anchored socket so a
-            // strict peer sees it from the port the dialog runs on (Via matches — see
-            // build_b2bua_bye). No-op for single-listener hosts.
-            send_message_from(
-                bye,
-                transport,
-                destination,
-                call.a_leg.transport.connection_id,
-                call.a_leg.transport.local_addr,
-                state,
-            );
-        }
+            None => warn!(call_id = %call_id, "B2BUA: failed to build the other leg's BYE"),
+        },
+        None => warn!(call_id = %call_id, "B2BUA: no winning B-leg for BYE"),
     }
-
-    // The rtpengine session is keyed by the A-leg Call-ID (the store key), which
-    // is NOT the incoming BYE's Call-ID when the BYE comes from the B-leg (or from
-    // the survivor/target after a terminate-transfer re-anchor). Capture it before
-    // dropping the call so the safety-net delete below hits the right key.
-    let media_key = call.a_leg.dialog.call_id.clone();
-    drop(call);
 
     // Safety-net: if an RTPEngine media session exists for this call but the
     // script didn't delete it, clean up in the background.

@@ -61,20 +61,32 @@ pub fn format_normal_clearing_reason(reason: &str) -> String {
 /// Full B2BUA call teardown initiated by the framework — session-timer expiry or
 /// an imperative `b2bua.terminate` — NOT by an inbound BYE. Sends an in-dialog
 /// BYE to BOTH legs from stored dialog state (a single-leg UAS call degrades to
-/// just the A-leg), emits Rf ACR-STOP + a CDR + stops SIPREC (matching the
+/// just the A-leg); a party that has not ACKed its 2xx gets its BYE once it
+/// does, or at 64×T1 (RFC 3261 §15, [`send_or_hold_bye`]). Emits Rf
+/// ACR-STOP + a CDR + stops SIPREC (matching the
 /// inbound-BYE teardown in [`handle_b2bua_bye`] so those per-call stores drain
 /// here too), tears down media, and removes all dialog/registry state.
 ///
 /// `reason_header` is a full RFC 3326 `Reason:` value added to each BYE and
 /// recorded as the CDR `sip_reason`. `disconnect_initiator` is the CDR
 /// disconnecting side (`"b2bua"` for a script terminate, `"timeout"` for
-/// session-timer expiry). Returns `true` if the call existed.
+/// session-timer expiry).
+///
+/// One teardown per call: the call is claimed first
+/// ([`CallActorStore::claim_teardown`]), and a teardown that finds it claimed by
+/// another (the 64×T1 sweep and a script at the same moment, a BYE crossing a
+/// timer) does nothing, so no leg is sent two BYEs. Returns `true` when this
+/// teardown ended the call, `false` when the call was gone or already being torn
+/// down.
 pub fn b2bua_terminate_call_inner(
     internal_call_id: &str,
     reason_header: Option<&str>,
     disconnect_initiator: &str,
     state: &DispatcherState,
 ) -> bool {
+    if !state.call_actors.claim_teardown(internal_call_id) {
+        return false;
+    }
     let (a_leg, winner_b_leg, sip_call_id) = match state.call_actors.get_call(internal_call_id) {
         Some(call) => {
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
@@ -82,6 +94,8 @@ pub fn b2bua_terminate_call_inner(
         }
         None => return false,
     };
+    #[cfg(test)]
+    teardown_race::claimed();
 
     // Rf ACR-STOP (TS 32.299 §6.2.2). A framework-initiated teardown maps to the
     // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
@@ -112,30 +126,17 @@ pub fn b2bua_terminate_call_inner(
         }
         Some(bye)
     };
+    // Each BYE goes after whatever its dialog is still owed (`send_or_hold_bye`):
+    // a party that has not ACKed siphon's 2xx gets it after the ACK (RFC 3261
+    // §15), and a 2xx that carried an offer still waiting for the caller's answer
+    // is ACKed first, every stream rejected (§13.2.2.4). Everything else in this
+    // teardown runs now either way.
     if let Some(bye_msg) = build_bye(&a_leg) {
-        let (destination, transport) = resolve_in_dialog_destination(
-            &a_leg.dialog.route_set,
-            state,
-            a_leg.transport.remote_addr,
-            a_leg.transport.transport,
-        );
-        // Source the framework BYE from the A-leg's anchored socket (Via matches).
-        send_message_from(
-            bye_msg,
-            transport,
-            destination,
-            a_leg.transport.connection_id,
-            a_leg.transport.local_addr,
-            state,
-        );
+        send_or_hold_bye(internal_call_id, &a_leg, bye_msg, ByeSender::Dialog, state);
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_bye(b_leg) {
-            // A 2xx that carried the offer and is still waiting for the caller's
-            // answer is ACKed first, every stream rejected (RFC 3261 §13.2.2.4,
-            // §15). Sourced from the B-leg's anchored socket (Via matches).
-            let held_ack = take_held_ack_rejecting_offer(internal_call_id, state);
-            send_bye_to_b_leg(b_leg, bye_msg, held_ack, state);
+            send_or_hold_bye(internal_call_id, b_leg, bye_msg, ByeSender::BLeg, state);
         }
     }
 
@@ -475,4 +476,33 @@ pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
         "b2bua",
         &control.state,
     )
+}
+
+/// A test-only ordering hook for teardowns that race each other.
+///
+/// Two teardowns of one call can run at once (the 64×T1 sweep and a BYE, a timer
+/// and a script), and only an interleaving the scheduler rarely produces shows
+/// whether both send BYEs. A test sets a hook, and the next teardown on its
+/// thread runs it at the point where it has taken the call over, which is where
+/// the other teardown has to be stopped.
+#[cfg(test)]
+pub(crate) mod teardown_race {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_CLAIM: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` inside the next teardown this thread starts.
+    pub(crate) fn run_inside_next_teardown(hook: impl FnOnce() + 'static) {
+        AFTER_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Called by a teardown once it has the call. Runs the hook, once.
+    pub(crate) fn claimed() {
+        let hook = AFTER_CLAIM.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }

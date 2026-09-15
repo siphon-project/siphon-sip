@@ -583,6 +583,25 @@ impl CallActorStore {
         self.registry.lookup_call_id(sip_call_id)
     }
 
+    /// Take the call over for a teardown. `true` for the first teardown to ask,
+    /// and `false` for every later one, and for a call that is gone.
+    ///
+    /// Two teardowns of one call can start at the same moment: the 64×T1 sweep
+    /// and a script, a BYE and a timer. Each reads the call, sends its BYEs and
+    /// only then removes it, so without a claim both send, and each leg gets two
+    /// BYEs. The check and the set happen under the call's shard lock, so exactly
+    /// one teardown wins.
+    pub fn claim_teardown(&self, call_id: &str) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        if call.teardown_claimed {
+            return false;
+        }
+        call.teardown_claimed = true;
+        true
+    }
+
     /// Look up internal call ID by Via branch.
     pub fn call_id_for_branch(&self, branch: &str) -> Option<String> {
         self.registry.lookup_branch(branch)
