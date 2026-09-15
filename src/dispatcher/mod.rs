@@ -79,6 +79,8 @@ mod timers;
 #[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
+mod delayed_offer_ack_tests;
+#[cfg(test)]
 mod late_provisional_tests;
 #[cfg(test)]
 mod lcr_number_policy_tests;

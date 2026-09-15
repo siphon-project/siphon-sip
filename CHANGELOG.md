@@ -441,6 +441,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   ACK no longer sends anything to the callee. A re-INVITE from the callee that
   comes before the caller has ACKed is still answered 491.
 
+  One call still waits for the caller, on purpose. When the B-leg INVITE went
+  out without an offer, the callee's 2xx carries the offer and the ACK has to
+  carry the answer (RFC 3264 §4), and only the caller has one, in its own ACK.
+  So that ACK goes out when the caller's arrives, carrying the caller's answer,
+  and every later copy of the 2xx gets the same ACK again, answer included. It
+  used to go out with no body at all. A call that ends before the caller
+  answers (a caller BYE, `b2bua.terminate`, an `@b2bua.on_answer` that raised)
+  still ACKs the callee, with every stream rejected, right before the BYE. A
+  caller that ACKs the offer without an answer has the offer rejected toward the
+  callee and the call ended, with
+  `Reason: Q.850;cause=111;text="No SDP answer in ACK"`. On a media-anchored
+  call the caller's answer is relayed unanchored, and siphon logs that.
+
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
   `auth.require_aka_digest()` can set up IPsec.** Only the HSS path
   (`require_ims_digest`) put CK and IK into `WWW-Authenticate`. Behind local

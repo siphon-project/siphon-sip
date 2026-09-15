@@ -131,20 +131,11 @@ pub fn b2bua_terminate_call_inner(
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_bye(b_leg) {
-            let (destination, transport) = resolve_in_dialog_destination(
-                &b_leg.dialog.route_set,
-                state,
-                b_leg.transport.remote_addr,
-                b_leg.transport.transport,
-            );
-            // Source it from the B-leg's anchored socket (Via matches).
-            send_b2bua_to_bleg(
-                bye_msg,
-                transport,
-                destination,
-                b_leg.transport.local_addr,
-                state,
-            );
+            // A 2xx that carried the offer and is still waiting for the caller's
+            // answer is ACKed first, every stream rejected (RFC 3261 §13.2.2.4,
+            // §15). Sourced from the B-leg's anchored socket (Via matches).
+            let held_ack = take_held_ack_rejecting_offer(internal_call_id, state);
+            send_bye_to_b_leg(b_leg, bye_msg, held_ack, state);
         }
     }
 

@@ -438,14 +438,40 @@ pub fn absorb_answered_retransmit(
 /// so it draws the same ACK on a fresh branch. It leaves from the socket the
 /// INVITE did and names that socket in its Via.
 ///
-/// It carries no body. An answer the caller puts in its own ACK, for a B-leg
-/// INVITE that went out without an offer (RFC 3264 §4), is not relayed here.
+/// One call is the exception: a B-leg INVITE that went out without an offer. Its
+/// 2xx carries the offer and the ACK has to carry the answer (§13.2.2.4, RFC 3264
+/// §4), which only the caller can give, in its own ACK. So that ACK is held on the
+/// call (`CallActor::delayed_offer_ack`) and copies of the 2xx are absorbed until
+/// [`send_delayed_offer_ack`] sends it with the caller's answer. After that every
+/// copy is ACKed with that same ACK, answer included. A call that ends before the
+/// caller answers sends it with every stream rejected, ahead of the BYE
+/// ([`take_held_ack_rejecting_offer`]).
 pub fn ack_b_leg_2xx(
     call_id: &str,
     message: &SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) {
+    if let Some(held) = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.delayed_offer_ack.clone())
+        .filter(|held| Some(held.b_leg_index) == snapshot.b_leg_index)
+    {
+        if held.sent {
+            debug!(call_id = %call_id, "B2BUA: ACKing a retransmitted B-leg 2xx with the ACK that carried the answer");
+            send_b2bua_to_bleg(
+                held.ack,
+                held.transport,
+                held.destination,
+                held.local_addr,
+                state,
+            );
+        } else {
+            debug!(call_id = %call_id, "B2BUA: absorbing a B-leg 2xx copy while its ACK waits for the caller's answer");
+        }
+        return;
+    }
     let Some((leg_destination, leg_transport)) = snapshot.b_leg_dest else {
         warn!(
             call_id = %call_id,
@@ -483,6 +509,32 @@ pub fn ack_b_leg_2xx(
         if let (Some(uri), StartLine::Request(request_line)) = (fallback, &mut ack.start_line) {
             request_line.request_uri = uri;
         }
+    }
+    let invite_carried_no_offer = snapshot
+        .b_leg_stored_invite
+        .as_ref()
+        .and_then(|invite| invite.lock().ok())
+        .is_some_and(|invite| invite.body.is_empty());
+    if invite_carried_no_offer && !message.body.is_empty() {
+        if let Some(index) = snapshot.b_leg_index {
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                // The first copy to get here holds it; a copy racing it adds
+                // nothing.
+                if call.delayed_offer_ack.is_none() {
+                    call.delayed_offer_ack = Some(crate::b2bua::actor::DelayedOfferAck {
+                        ack,
+                        offer: message.body.clone(),
+                        transport,
+                        destination,
+                        local_addr: snapshot.b_leg_local_addr,
+                        b_leg_index: index,
+                        sent: false,
+                    });
+                }
+            }
+        }
+        debug!(call_id = %call_id, "B2BUA: the B-leg 2xx carries the offer, its ACK waits for the caller's answer (RFC 3261 §13.2.2.4)");
+        return;
     }
     send_b2bua_to_bleg(
         ack,

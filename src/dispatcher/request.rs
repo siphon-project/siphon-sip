@@ -222,9 +222,10 @@ pub(super) fn handle_request(
                     }
 
                     // B2BUA: the caller's ACK for the 2xx siphon relayed. It
-                    // confirms the A-leg's dialog and nothing else. The B-leg's
-                    // 2xx was ACKed when it arrived (RFC 3261 §13.2.2.4, see
-                    // `ack_b_leg_2xx`), so nothing goes to the B-leg from here.
+                    // confirms the A-leg's dialog. The B-leg's 2xx was ACKed
+                    // when it arrived (RFC 3261 §13.2.2.4, see `ack_b_leg_2xx`),
+                    // except when that 2xx carried the offer: its ACK has waited
+                    // for the answer this ACK carries, and goes now.
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
                         // The caller's ACK stops A-leg 2xx retransmission
                         // (RFC 3261 §13.3.1.4). Fire the Notify so the retransmit
@@ -234,10 +235,8 @@ pub(super) fn handle_request(
                         }
                         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;
-                            if let Some(b_leg) = call.winner.and_then(|i| call.b_legs.get_mut(i)) {
-                                b_leg.initial_acked = true;
-                            }
                         }
+                        send_delayed_offer_ack(&internal_id, &message, state);
                         debug!(call_id = %internal_id, "B2BUA: absorbed A-leg ACK");
                         return;
                     }

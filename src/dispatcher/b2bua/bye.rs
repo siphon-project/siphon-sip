@@ -198,6 +198,16 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // disconnecting side (caller vs callee).
     cdr_finalize_b2bua_stop(state, &call_id, from_a_leg, &message);
 
+    // The callee's 2xx carried the offer and still waits for the caller's answer,
+    // and the caller has hung up without one: that ACK goes to the callee, every
+    // stream rejected, right before its BYE (RFC 3261 §13.2.2.4, §15). Taken
+    // here, before the call is read below, since taking it writes to the call.
+    let held_ack = if from_a_leg {
+        take_held_ack_rejecting_offer(&call_id, state)
+    } else {
+        None
+    };
+
     // Re-acquire the call ref for BYE bridging
     let call = match state.call_actors.get_call(&call_id) {
         Some(c) => c,
@@ -229,24 +239,8 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 if let Some(bye) = build_b2bua_bye(b_leg, state) {
-                    // RFC 3261 §12.2.1.1: next hop is the first Route URI, not
-                    // the cached destination of the original INVITE (which may
-                    // have traversed nodes — e.g. an IMS I-CSCF — that don't
-                    // Record-Route and so aren't in the dialog route set).
-                    let (destination, transport) = resolve_in_dialog_destination(
-                        &b_leg.dialog.route_set,
-                        state,
-                        b_leg.transport.remote_addr,
-                        b_leg.transport.transport,
-                    );
-                    debug!(call_id = %call_id, %destination, "B2BUA: sending BYE to B-leg");
-                    send_b2bua_to_bleg(
-                        bye,
-                        transport,
-                        destination,
-                        b_leg.transport.local_addr,
-                        state,
-                    );
+                    debug!(call_id = %call_id, "B2BUA: sending BYE to B-leg");
+                    send_bye_to_b_leg(b_leg, bye, held_ack, state);
                 } else {
                     warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
                 }
