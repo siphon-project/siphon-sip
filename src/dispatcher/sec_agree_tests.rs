@@ -105,6 +105,27 @@ async fn an_unprotected_invite_requiring_sec_agree_is_refused_494() {
     }
 }
 
+/// The 494 to an unprotected request names what siphon supports: one
+/// `ipsec-3gpp` line per transform, with its algorithms and no SPI or port,
+/// since there is no association for those to name.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_494_to_an_unprotected_invite_lists_the_mechanisms_siphon_supports() {
+    let sent = place_call(DIAL, "Require: sec-agree\r\n");
+    assert_eq!(summaries(&sent), [format!("494 to {CALLER}")]);
+    let lines = sent[0]
+        .message
+        .headers
+        .get_all("Security-Server")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    for line in &lines {
+        assert!(line.starts_with("ipsec-3gpp; alg="), "{line}");
+        assert!(line.contains("; ealg="), "{line}");
+        assert!(!line.contains("spi-") && !line.contains("port-"), "{line}");
+    }
+}
+
 /// An INVITE that does not require `sec-agree` is not held to it: merely
 /// supporting the extension is no reason to verify anything.
 #[tokio::test(flavor = "multi_thread")]
@@ -217,4 +238,14 @@ async fn a_required_sec_agree_on_an_unverified_call_is_refused_494_at_routing() 
         summaries(&sent),
         [format!("100 to {CALLER}"), format!("494 to {CALLER}")]
     );
+    // RFC 3329 §2.3.1 has every 494 list the server's mechanisms, and this
+    // caller arrived over no association for them to name.
+    let lines = sent[1]
+        .message
+        .headers
+        .get_all("Security-Server")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert!(lines.iter().all(|line| !line.contains("spi-")), "{lines:?}");
 }

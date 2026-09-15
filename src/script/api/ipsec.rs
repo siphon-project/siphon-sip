@@ -736,6 +736,10 @@ impl PyPendingSA {
                 manager = Arc::clone(&guard.manager);
                 sa_new = guard.sa.clone();
             }
+            // The Security-Server recorded on the stored pair when its 401 was
+            // relayed is not on this copy; keep it across the delete below. The
+            // 401 for this re-key records it again.
+            crate::ipsec::sec_agree::carry_recorded_security_server(&manager, &mut sa_new);
             // Tear down the old SAs first; ignore errors (xfrm may have
             // already lost them — we still want the new ones to land).
             if let Err(error) = manager
@@ -1039,6 +1043,7 @@ impl PyIpsec {
                 // The IMPI the offer's REGISTER authenticated as, which a later
                 // protected REGISTER is checked against before it is trusted.
                 impi: offer.impi.clone(),
+                security_server: None,
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -1917,6 +1922,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1972,6 +1978,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -2023,6 +2030,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -2064,6 +2072,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         };
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
@@ -2320,6 +2329,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         }
     }
 }

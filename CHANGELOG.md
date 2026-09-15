@@ -803,12 +803,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Before the script runs, an INVITE whose `Require` or `Proxy-Require` lists
   `sec-agree` is now answered 494 unless it arrived on a P-CSCF protected port
-  over an active security association and its `Security-Verify` names that
-  association: `ipsec-3gpp` with its algorithms, SPIs and protected ports. The
-  494 carries the association's `Security-Server` when there is one. siphon
-  keeps the association, not the `Security-Server` line a script sent, so
-  parameters the association does not record (`q`, `prot`, `mod`) are not
-  compared. `sec-agree` counts as honoured for the Require check only on a
+  over an active security association and its `Security-Verify` mirrors the
+  `Security-Server` siphon relayed on the 401 for the REGISTER that set that
+  association up. siphon records that value on the association as it relays the
+  401 and compares parameter for parameter, `q`, `prot` and `mod` included:
+  names and values ignore case (quoted strings must match exactly), whitespace
+  is ignored, and parameters and entries can come in any order. A
+  `PendingSA.refresh()` re-key carries the value over, and the re-key's own 401
+  records it again. An association with nothing recorded (installed before the
+  upgrade, or set up from a 401 siphon generated rather than relayed) is checked
+  on its `ipsec-3gpp` algorithms, SPIs and protected ports instead. A 494 over an
+  association carries the recorded `Security-Server`, or one built from the
+  association. A 494 to an unprotected request, and to a call a script made
+  require `sec-agree` without a verified agreement, lists what siphon supports:
+  one `ipsec-3gpp` line per transform with `alg` and `ealg` and no SPIs or ports.
+  TS 33.203 Annex H makes those mandatory for `ipsec-3gpp`; leaving them out is
+  a deliberate reading of RFC 3329 §2.3.1, which asks for the server's list of
+  mechanisms, and there are no SPIs or ports before an association exists.
+  `sec-agree` counts as honoured for the Require check only on a
   verified call, and a script that makes an unverified call require it gets
   the call refused 494 rather than 420. On the B-leg INVITE `sec-agree` is
   removed from `Require` and `Proxy-Require`, each dropped when empty, and the

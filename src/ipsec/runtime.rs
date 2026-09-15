@@ -95,6 +95,43 @@ pub(crate) fn config_installed() -> bool {
 static IPSEC_MANAGER_REF: OnceLock<Arc<IpsecManager>> = OnceLock::new();
 static IPSEC_CONFIG_REF: OnceLock<Arc<IpsecConfig>> = OnceLock::new();
 
+/// Record the `Security-Server` of `response`, a 401 siphon relays to the UE at
+/// `ue_addr` for its REGISTER, on the SA pair it names
+/// ([`IpsecManager::record_security_server`]), so a later `Security-Verify` is
+/// checked against exactly that value. Nothing happens without IPsec or without
+/// a `Security-Server`.
+pub fn record_security_server(
+    ue_addr: &std::net::IpAddr,
+    response: &crate::sip::message::SipMessage,
+) {
+    let Some(manager) = IPSEC_MANAGER_REF.get() else {
+        return;
+    };
+    let Some(lines) = response.headers.get_all("Security-Server") else {
+        return;
+    };
+    if !manager.record_security_server(ue_addr, &lines.join(", ")) {
+        tracing::debug!(
+            ue = %ue_addr,
+            "IPsec: the Security-Server on a relayed REGISTER 401 names no SA pair of that UE"
+        );
+    }
+}
+
+/// The `Security-Server` lines of a 494 refusing a request from `remote_addr`
+/// that arrived on local port `local_port`: the SA it came over, when that is a
+/// protected port with an SA, and otherwise what siphon supports
+/// ([`crate::ipsec::sec_agree::refusal_security_server`]).
+pub fn refusal_security_server_for(
+    local_port: Option<u16>,
+    remote_addr: std::net::SocketAddr,
+) -> Vec<String> {
+    let sa = local_port
+        .filter(|port| is_protected_local_port(*port))
+        .and_then(|_| find_sa_for_ue(&remote_addr.ip(), remote_addr.port()));
+    crate::ipsec::sec_agree::refusal_security_server(sa.as_ref())
+}
+
 /// Whether the given local port matches one of the configured P-CSCF
 /// protected ports (`pcscf_port_c` / `pcscf_port_s`).  Returns `false`
 /// when no IPsec config is wired (i.e. siphon is not running as P-CSCF).
@@ -413,6 +450,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             role: crate::ipsec::SaRole::PCscf,
             impi: None,
+            security_server: None,
         }
     }
 

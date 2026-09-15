@@ -136,9 +136,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // RFC 3329 §2.3.1: a request that requires the security agreement is checked
     // against the association it arrived over before anything is done with it. An
     // unprotected one, or one whose Security-Verify does not mirror that
-    // association, is answered 494 here, before any call or script exists; the
-    // 494 carries the association's Security-Server, "the server's unmodified
-    // list", when there is one to name.
+    // association, is answered 494 here, before any call or script exists. The
+    // 494 carries "the server's unmodified list": the association's recorded
+    // Security-Server, or with no association the mechanisms siphon supports.
     let protected_sa = crate::ipsec::runtime::is_protected_local_port(inbound.local_addr.port())
         .then(|| {
             crate::ipsec::runtime::find_sa_for_ue(
@@ -167,11 +167,8 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 state.server_header.as_deref(),
                 &[],
             );
-            if let Some(sa) = protected_sa.as_ref() {
-                response.headers.set(
-                    "Security-Server",
-                    crate::ipsec::sec_agree::security_server_value(sa),
-                );
+            for line in crate::ipsec::sec_agree::refusal_security_server(protected_sa.as_ref()) {
+                response.headers.add("Security-Server", line);
             }
             send_message_from(
                 response,
