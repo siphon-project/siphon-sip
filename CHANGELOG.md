@@ -6,13 +6,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-### Changed
-
-- **`siphon-rtp-proto` 0.7.1.** The control contract is unchanged (only a doc comment moved), so
-  nothing in siphon's use of it changes. The bump tracks siphon-rtp 0.7.1, whose engine now
-  terminates a DTLS-SRTP (WebRTC) caller toward a plain RTP callee on `offer`/`answer`, which is
-  what the built-in `wss_to_rtp` profile asks for.
-
 ## [1.9.0] — 2026-09-15
 
 ### Added
@@ -282,12 +275,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ### Changed
 
 - **The `media.backend: siphon-rtp` control contract moves to
-  `siphon-rtp-proto` 0.7.0.** The wire stays compatible in both directions:
+  `siphon-rtp-proto` 0.7.1.** The wire stays compatible in both directions:
   0.7.0 only adds optional keys (the call summary's wall-clock start and end,
   and each leg's media addresses, egress SSRC and payload type), which siphon
   decodes but does not use yet, and which an older engine simply does not send.
-  The engine image the SIPp media jobs run moves from 0.2.0 to 0.7.0 with it, so
-  CI exercises the pairing that ships.
+  0.7.1 changes only a doc comment. It tracks the siphon-rtp 0.7.1 engine, which
+  terminates a DTLS-SRTP (WebRTC) caller toward a plain RTP callee on
+  `offer`/`answer`, the shape the built-in `wss_to_rtp` profile asks for. The
+  engine image the SIPp media jobs run moves from 0.2.0 to 0.7.1 with it, so CI
+  exercises the pairing that ships.
 
 - **An LCR sequence that runs out on a ring timeout, with no carrier showing
   progress, fails the call with `503 Service Unavailable` instead of `408`.**

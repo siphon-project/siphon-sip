@@ -5187,7 +5187,7 @@ services:
   #   docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native \
   #     up --abort-on-container-exit sipp-rtp-native-uac
   siphon-rtp-engine:
-    image: ghcr.io/siphon-project/siphon-rtp:0.7.0
+    image: ghcr.io/siphon-project/siphon-rtp:0.7.1
     container_name: siphon-rtp-engine
     command:
       - "--control"
