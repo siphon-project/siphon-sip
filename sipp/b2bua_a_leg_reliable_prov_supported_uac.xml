@@ -63,7 +63,9 @@ a=fmtp:101 0-15
             check_it="true" assign_to="junk" />
       <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
             check_it="true" assign_to="junk,rseq_progress" />
-      <ereg regexp="^[[:space:]]*42[[:space:]]*$" search_in="hdr" header="RSeq:"
+      <!-- Not anchored: SIPp matches against " 42", which an anchored
+           bracket-class pattern never matched. -->
+      <ereg regexp="(^|[^0-9])42([^0-9]|$)" search_in="hdr" header="RSeq:"
             check_it_inverse="true" assign_to="junk" />
     </action>
   </recv>

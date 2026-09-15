@@ -96,7 +96,10 @@ Content-Length: 0
             check_it="true" assign_to="junk" />
       <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
             check_it="true" assign_to="junk,rseq_progress" />
-      <ereg regexp="^[[:space:]]*42[[:space:]]*$" search_in="hdr" header="RSeq:"
+      <!-- SIPp matches against the value with its leading space (" 42"), and
+           an anchored bracket-class pattern never matched it: 42 set off by
+           anything but a digit is what fails the call. -->
+      <ereg regexp="(^|[^0-9])42([^0-9]|$)" search_in="hdr" header="RSeq:"
             check_it_inverse="true" assign_to="junk" />
     </action>
   </recv>
