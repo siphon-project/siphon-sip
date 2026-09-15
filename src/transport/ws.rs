@@ -211,7 +211,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     }
 
     connection_map.remove(&connection_id);
-    stream_connections.unregister(&remote_addr);
+    stream_connections.unregister(&remote_addr, connection_id);
     // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
     // any binding that arrived on this WS/WSS connection.  Best-effort.
     if let Some(close_tx) = &close_tx {
@@ -436,6 +436,74 @@ mod tests {
     /// Loopback, port 0: the kernel picks the port and `listen` returns it.
     fn any_loopback_port() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A WebSocket connection's cleanup removes its own registry entry, never
+    /// one a later connection from the same address put there.
+    ///
+    /// The registry is the only way back to a WebSocket UE (RFC 7118 §5), and it
+    /// holds one connection per source address. A UE that reconnects before the
+    /// old connection is torn down, or reaches a WS and a WSS listener from one
+    /// source address, has the newer connection take the slot over; when the
+    /// older one then closed, removing by address alone left the UE with a live
+    /// connection that nothing routed to.
+    #[tokio::test]
+    async fn a_closing_websocket_does_not_unregister_the_one_that_replaced_it() {
+        let registry = StreamConnections::new();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let local_addr: SocketAddr = "127.0.0.1:5062".parse().unwrap();
+        let remote_addr: SocketAddr = "198.51.100.231:50462".parse().unwrap();
+
+        let connect = |connection_id: ConnectionId| {
+            let (client, server) = tokio::io::duplex(16 * 1024);
+            let permit = crate::security::try_accept_connection(remote_addr.ip())
+                .expect("no connection limit applies to this test");
+            let served = tokio::spawn(handle_connection(
+                server,
+                Transport::WebSocket,
+                connection_id,
+                local_addr,
+                remote_addr,
+                permit,
+                inbound_tx.clone(),
+                Arc::clone(&connection_map),
+                registry.clone(),
+                None,
+            ));
+            let registry = registry.clone();
+            async move {
+                let (websocket, _) =
+                    tokio_tungstenite::client_async("ws://127.0.0.1:5062/", client)
+                        .await
+                        .expect("the WebSocket upgrade must succeed");
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while registry.get(&remote_addr) != Some((Transport::WebSocket, connection_id))
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the connection must register");
+                (websocket, served)
+            }
+        };
+
+        let (old_websocket, old_served) = connect(ConnectionId(501)).await;
+        let (_replacement_websocket, _replacement_served) = connect(ConnectionId(502)).await;
+
+        drop(old_websocket);
+        tokio::time::timeout(std::time::Duration::from_secs(10), old_served)
+            .await
+            .expect("the old connection must end once its peer closes")
+            .expect("the old connection's task must not panic");
+
+        assert_eq!(
+            registry.get(&remote_addr),
+            Some((Transport::WebSocket, ConnectionId(502))),
+            "the old connection's cleanup unregistered the live connection that replaced it"
+        );
     }
 
     #[tokio::test]

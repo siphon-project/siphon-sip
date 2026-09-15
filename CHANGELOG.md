@@ -510,6 +510,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   to the peer opened yet another. A reader's cleanup, and a sender that finds a closed channel, now
   only remove the pool entry while it is still their own connection.
 
+- **A closing TLS or WebSocket connection could unregister the connection that replaced it.** The
+  stream-connection registry holds one connection per peer address. Relays to a WebSocket UE or a
+  TLS peer reuse it, `Flow.is_alive` reads it, and so does the registrant's liveness check. A TLS or
+  WebSocket connection, inbound or pooled outbound, removed its address's entry when it closed, no
+  matter which connection held the entry by then. A newer connection to or from the same address
+  takes the entry over: a pooled TLS connection replaced after a client-certificate reload or a
+  stalled write, a UE that reconnected before its old connection was torn down, or a trunk that
+  sends from its listening port, which puts its inbound connection and siphon's outbound one on the
+  same address. The older one closing then left a live connection nothing reused and a flow that
+  reported dead, and a TLS registrant took its live trunk connection for lost and re-registered on
+  every 5 s liveness tick. Each connection now removes only its own entry. For crate embedders,
+  `StreamConnections::unregister` takes the connection id.
+
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own

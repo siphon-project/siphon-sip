@@ -1074,7 +1074,7 @@ impl ConnectionPool {
                                 conn_map.remove(&connection_id);
                                 evict_if_current(&connections, &key_for_cleanup, connection_id);
                                 if let Some(ref stream_connections) = stream_connections {
-                                    stream_connections.unregister(&destination);
+                                    stream_connections.unregister(&destination, connection_id);
                                 }
                                 return;
                             }
@@ -1089,7 +1089,7 @@ impl ConnectionPool {
             conn_map.remove(&connection_id);
             evict_if_current(&connections, &key_for_cleanup, connection_id);
             if let Some(ref stream_connections) = stream_connections {
-                stream_connections.unregister(&destination);
+                stream_connections.unregister(&destination, connection_id);
             }
         });
 
@@ -2437,6 +2437,98 @@ mod tests {
             pool.pooled(&key).map(|(connection_id, _)| connection_id),
             Some(replacement_id),
             "an old connection's cleanup evicted the live connection that replaced it"
+        );
+    }
+
+    /// The TLS half of `an_old_connection_closing_does_not_evict_its_replacement`,
+    /// for the stream-connection registry.
+    ///
+    /// An outbound TLS connection also registers under its destination, which
+    /// is what relays reuse and what the registrant's liveness check reads. A
+    /// client-certificate reload retires the pooled entry and the next send
+    /// opens a replacement, whose registration takes the destination over while
+    /// the old connection is still open. When the old reader then ends, its
+    /// cleanup must leave the replacement registered: removing by destination
+    /// alone made a live trunk connection look lost, and the registrant
+    /// re-registered on every liveness tick.
+    ///
+    /// Current-thread on purpose: the reader's cleanup drops the connection from
+    /// `connection_map` and from the registry within one poll.
+    #[tokio::test]
+    async fn an_old_tls_connection_closing_does_not_unregister_its_replacement() {
+        ensure_crypto_provider();
+        let certs = generate_mtls_certs();
+        let acceptor = plain_server_acceptor(&certs);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        // Every accepted connection is handed to the test and never read, so the
+        // test decides when the peer closes each one.
+        let (accepted_sender, mut accepted) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let accepted_sender = accepted_sender.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(tcp).await {
+                        let _ = accepted_sender.send(tls);
+                    }
+                });
+            }
+        });
+
+        let registry = StreamConnections::new();
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            Arc::clone(&connection_map),
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            Some(registry.clone()),
+            None,
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        );
+        let ping = || Bytes::from_static(b"OPTIONS sip:peer@example.com SIP/2.0\r\n\r\n");
+
+        let old_id = pool
+            .send_tls(peer, Some("localhost"), ping())
+            .await
+            .expect("establish the first TLS connection");
+        let old_socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+            .await
+            .expect("the first connection must reach the peer")
+            .expect("the peer's accept loop is still running");
+
+        pool.reload_tls_client_config(
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        );
+        let replacement_id = pool
+            .send_tls(peer, Some("localhost"), ping())
+            .await
+            .expect("a send after the reload must establish a new connection");
+        assert_ne!(
+            replacement_id, old_id,
+            "the reload must retire the first connection"
+        );
+        let _replacement_socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+            .await
+            .expect("the replacement must reach the peer")
+            .expect("the peer's accept loop is still running");
+        assert_eq!(registry.reuse(peer, Transport::Tls), Some(replacement_id));
+
+        // The peer closes the old connection, which ends its reader.
+        drop(old_socket);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while connection_map.contains_key(&old_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old connection's reader must see the peer close");
+
+        assert!(
+            registry.is_alive(peer, Transport::Tls, replacement_id),
+            "an old connection's cleanup unregistered the live connection that replaced it"
         );
     }
 
