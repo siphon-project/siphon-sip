@@ -616,7 +616,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
 
     connection_map.remove(&connection_id);
     if let Some(registry) = stream_connections.as_ref() {
-        registry.unregister(&remote_addr);
+        registry.unregister(&remote_addr, connection_id);
     }
     // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
     // any binding that arrived on this connection. Best-effort.
@@ -1573,6 +1573,75 @@ mod tests {
         assert!(!connection_map.contains_key(&ConnectionId(42)));
         // RFC 5626 §4.2.2 flow failure is reported to the registrar.
         assert_eq!(close_rx.recv_async().await.unwrap(), 42);
+    }
+
+    /// The registry holds one connection per peer address, and a later
+    /// connection from the same address takes the slot over. When the earlier
+    /// one then closes, its cleanup must leave the slot alone.
+    ///
+    /// Two live connections from one address are ordinary for a trunk: SIP
+    /// peers commonly send from their listening port, so the peer's inbound
+    /// connection to siphon and siphon's outbound connection to that peer land
+    /// on one key, and so do connections from that port to two siphon
+    /// listeners. Removing by address alone dropped the survivor, leaving a
+    /// live connection that relays could no longer reuse and a flow that
+    /// reported dead.
+    #[tokio::test]
+    async fn a_closing_flow_does_not_unregister_the_flow_that_replaced_it() {
+        let registry = StreamConnections::new();
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let serve = |server: tokio::io::DuplexStream, connection_id: ConnectionId| {
+            let (reader, writer) = tokio::io::split(server);
+            tokio::spawn(serve_sip_stream(
+                reader,
+                writer,
+                StreamContext {
+                    transport: Transport::Tls,
+                    connection_id,
+                    ..context()
+                },
+                BytesMut::new(),
+                inbound_tx.clone(),
+                connection_map.clone(),
+                Some(registry.clone()),
+                None,
+                None,
+            ))
+        };
+        let remote_addr = context().remote_addr;
+        let registered = |connection_id: ConnectionId| {
+            let registry = registry.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while registry.get(&remote_addr) != Some((Transport::Tls, connection_id)) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the connection must register");
+            }
+        };
+
+        let (old_client, old_server) = tokio::io::duplex(4096);
+        let old_served = serve(old_server, ConnectionId(42));
+        registered(ConnectionId(42)).await;
+
+        let (_replacement_client, replacement_server) = tokio::io::duplex(4096);
+        let _replacement_served = serve(replacement_server, ConnectionId(43));
+        registered(ConnectionId(43)).await;
+
+        drop(old_client);
+        tokio::time::timeout(Duration::from_secs(10), old_served)
+            .await
+            .expect("the old connection must end once its peer closes")
+            .expect("the old connection's task must not panic");
+
+        assert_eq!(
+            registry.get(&remote_addr),
+            Some((Transport::Tls, ConnectionId(43))),
+            "the old connection's cleanup unregistered the live connection that replaced it"
+        );
     }
 
     #[tokio::test]

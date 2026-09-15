@@ -749,9 +749,19 @@ impl StreamConnections {
         self.map.insert(peer, (transport, connection_id));
     }
 
-    /// Remove the registration for `peer` (connection closed / errored).
-    pub fn unregister(&self, peer: &SocketAddr) {
-        self.map.remove(peer);
+    /// Remove `peer`'s registration, but only while it is still `connection_id`
+    /// (the connection closed or errored).
+    ///
+    /// A peer address can have two live connections at once, and the later one
+    /// takes the registration over: a pooled connection replaced while the old
+    /// one is still open, a UE that reconnects before its old connection is torn
+    /// down, or a trunk that sends from its listening port, which puts its
+    /// inbound connection and siphon's outbound one to it on the same address.
+    /// Removing by address alone let the older connection's cleanup drop the
+    /// survivor's registration.
+    pub fn unregister(&self, peer: &SocketAddr, connection_id: ConnectionId) {
+        self.map
+            .remove_if(peer, |_, (_, registered)| *registered == connection_id);
     }
 
     /// Exact-match lookup of the connection for `peer`, if any.
@@ -1264,7 +1274,7 @@ mod tests {
         assert!(!registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(11)));
         assert!(registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(12)));
         // Unregistered → dead.
-        registry.unregister(&peer);
+        registry.unregister(&peer, ConnectionId(12));
         assert!(!registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(12)));
     }
 
@@ -1302,9 +1312,26 @@ mod tests {
         let registry = StreamConnections::new();
         let peer = addr("10.0.0.1:50000");
         registry.register(peer, Transport::Tls, ConnectionId(5));
-        registry.unregister(&peer);
+        registry.unregister(&peer, ConnectionId(5));
         assert!(registry.is_empty());
         assert_eq!(registry.get(&peer), None);
+    }
+
+    /// A connection that has been replaced unregisters nothing: the entry
+    /// belongs to its replacement by then.
+    #[test]
+    fn stream_connections_unregister_leaves_a_replacement_registered() {
+        let registry = StreamConnections::new();
+        let peer = addr("10.0.0.1:5061");
+        registry.register(peer, Transport::Tls, ConnectionId(5));
+        registry.register(peer, Transport::Tls, ConnectionId(6));
+
+        registry.unregister(&peer, ConnectionId(5));
+        assert_eq!(registry.get(&peer), Some((Transport::Tls, ConnectionId(6))));
+        assert!(registry.is_alive(peer, Transport::Tls, ConnectionId(6)));
+
+        registry.unregister(&peer, ConnectionId(6));
+        assert!(registry.is_empty());
     }
 
     #[test]
