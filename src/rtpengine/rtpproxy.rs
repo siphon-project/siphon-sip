@@ -254,6 +254,9 @@ impl RtpProxyClient {
             let (relay_address, relay_port) = parse_session_response(&response, self.address.ip())?;
 
             parsed.media_sections[index].port = relay_port;
+            // rtpproxy anchors the stream on one relay port, so a `/count` the
+            // offer carried would advertise relay ports it never allocated.
+            parsed.media_sections[index].port_count = None;
             if media_connection.is_some() {
                 set_media_connection(&mut parsed.media_sections[index], &relay_address);
             }
@@ -1165,6 +1168,54 @@ mod tests {
         assert!(text.contains("m=audio 0 RTP/AVP 0"), "sdp: {text}");
         // No stream anchored → session c= left as-is.
         assert!(text.contains("c=IN IP4 0.0.0.0"), "sdp: {text}");
+    }
+
+    #[tokio::test]
+    async fn t38_stream_keeps_its_format_through_the_relay_rewrite() {
+        // `t38` is a token, not a payload type (RFC 8866 §5.14); the rewritten
+        // body must still name it, or the m= line carries no format at all.
+        let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        let fax = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=image 8000 udptl t38\r\n",
+            "a=T38FaxVersion:0\r\n",
+        )
+        .as_bytes();
+        let rewritten = client.offer("fax", "ft", fax, &flags).await.unwrap();
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.contains("m=image 30000 udptl t38\r\n"), "sdp: {text}");
+        assert!(text.contains("a=T38FaxVersion:0\r\n"), "sdp: {text}");
+    }
+
+    #[tokio::test]
+    async fn anchored_stream_drops_the_port_count() {
+        // `8000/2` is port 8000 and a second port (RFC 8866 §5.14), not a port
+        // that fails to parse and reads as a held stream. The relay gives the
+        // stream one port, so the rewritten m= line must not claim two.
+        let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        let layered = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 10.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=video 8000/2 RTP/AVP 31\r\n",
+        )
+        .as_bytes();
+        let rewritten = client
+            .offer("layered", "ft", layered, &flags)
+            .await
+            .unwrap();
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.contains("m=video 30000 RTP/AVP 31\r\n"), "sdp: {text}");
     }
 
     #[tokio::test]

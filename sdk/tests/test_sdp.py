@@ -242,8 +242,10 @@ class TestCodecFiltering:
     def test_filter_codecs(self, sdp):
         sdp.filter_codecs(["PCMU", "PCMA"])
         assert sdp.media[0].codecs == ["PCMU", "PCMA"]
-        # Video section unchanged (H264 not in keep list).
-        assert sdp.media[1].codecs == []
+        # H264 is not in the keep list, so the video stream is rejected
+        # rather than left with an m= line that has no format.
+        assert sdp.media[1].port == 0
+        assert "m=video 0 RTP/AVP 96\r\n" in str(sdp)
 
     def test_filter_codecs_case_insensitive(self, sdp):
         sdp.filter_codecs(["pcmu", "Opus"])
@@ -256,6 +258,97 @@ class TestCodecFiltering:
         codecs = sdp.media[0].codecs
         assert "telephone-event" not in codecs
         assert "PCMU" in codecs
+
+    def test_filter_rejects_a_stream_left_with_no_codec(self, ns):
+        s = ns.parse(
+            "v=0\r\n"
+            "m=audio 49170 RTP/AVP 0 8\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+        )
+        s.filter_codecs(["G722"])
+        # RFC 3264 §6: port 0 rejects the stream, and the m= line keeps one
+        # format because SDP requires at least one.
+        assert str(s) == (
+            "v=0\r\n"
+            "m=audio 0 RTP/AVP 0\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+        )
+
+    def test_removing_every_codec_rejects_the_stream(self, ns):
+        s = ns.parse("v=0\r\nm=audio 49170/2 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n")
+        s.remove_codecs(["PCMA"])
+        assert str(s) == "v=0\r\nm=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+
+
+# Every format below except the audio stream's is a token rather than an RTP
+# payload type number (RFC 8866 §5.14): T.38 fax, a WebRTC data channel, MSRP,
+# and a floor-control stream whose format also keys an fmtp line.
+MIXED_FORMATS_SDP = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.10\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.10\r\n"
+    "t=0 0\r\n"
+    "m=audio 49170 RTP/AVP 8 101\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=fmtp:101 0-15\r\n"
+    "m=image 49172 udptl t38\r\n"
+    "a=T38FaxVersion:0\r\n"
+    "a=T38FaxRateManagement:transferredTCF\r\n"
+    "m=application 49174 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+    "a=sctp-port:5000\r\n"
+    "m=message 49176 TCP/MSRP *\r\n"
+    "a=accept-types:message/cpim text/plain\r\n"
+    "m=application 49178 udp MCPTT\r\n"
+    "a=fmtp:MCPTT mc_queueing;mc_priority=5\r\n"
+)
+
+
+class TestFormatTokens:
+    """Formats that are not RTP payload types survive parsing and filtering."""
+
+    def test_round_trip_is_lossless(self, ns):
+        assert str(ns.parse(MIXED_FORMATS_SDP)) == MIXED_FORMATS_SDP
+
+    def test_filter_leaves_sections_that_are_not_rtp_alone(self, ns):
+        s = ns.parse(MIXED_FORMATS_SDP)
+        s.filter_codecs(["PCMA"])
+        output = str(s)
+        assert "m=audio 49170 RTP/AVP 8\r\n" in output
+        assert "telephone-event" not in output
+        assert "m=image 49172 udptl t38\r\n" in output
+        assert "m=application 49174 UDP/DTLS/SCTP webrtc-datachannel\r\n" in output
+        assert "m=message 49176 TCP/MSRP *\r\n" in output
+        assert "m=application 49178 udp MCPTT\r\n" in output
+        assert "a=fmtp:MCPTT mc_queueing;mc_priority=5\r\n" in output
+
+    def test_sections_that_are_not_rtp_have_no_codecs(self, ns):
+        s = ns.parse(MIXED_FORMATS_SDP)
+        assert s.media[0].codecs == ["PCMA", "telephone-event"]
+        assert [m.codecs for m in s.media[1:]] == [[], [], [], []]
+
+    def test_port_count_is_kept(self, ns):
+        body = "v=0\r\nm=video 49170/2 RTP/AVP 31\r\n"
+        s = ns.parse(body)
+        assert s.media[0].port == 49170
+        assert str(s) == body
+
+    def test_unreadable_rtpmap_and_fmtp_lines_are_kept(self, ns):
+        body = (
+            "v=0\r\n"
+            "m=audio 49170 RTP/AVP 97\r\n"
+            "a=rtpmap:dynamic opus/48000/2\r\n"
+            "a=fmtp:97\r\n"
+        )
+        assert str(ns.parse(body)) == body
+
+    def test_m_line_without_protocol_is_not_given_one(self, ns):
+        body = "v=0\r\nm=audio 5060\r\n"
+        s = ns.parse(body)
+        assert s.media[0].protocol == ""
+        assert str(s) == body
 
 
 class TestMediaRemoval:

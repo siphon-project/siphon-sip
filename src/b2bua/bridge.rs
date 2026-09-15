@@ -1084,6 +1084,50 @@ mod tests {
     }
 
     #[test]
+    fn direction_rewrite_keeps_formats_that_are_not_payload_types() {
+        // A re-bridge re-serializes the whole body, so a T.38 or data channel
+        // section has to come back out with its token format (RFC 8866 §5.14),
+        // not as an m= line with no format.
+        let mixed = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 192.0.2.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 0 RTP/AVP 0\r\n",
+            "a=recvonly\r\n",
+            "m=image 40002 udptl t38\r\n",
+            "a=T38FaxVersion:0\r\n",
+            "a=recvonly\r\n",
+            "m=application 40004 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+            "a=sctp-port:5000\r\n",
+        );
+        let text = String::from_utf8(set_media_direction(
+            mixed.as_bytes(),
+            MediaDirection::SendRecv,
+        ))
+        .expect("utf-8");
+        assert_eq!(
+            text,
+            concat!(
+                "v=0\r\n",
+                "o=- 1 1 IN IP4 192.0.2.1\r\n",
+                "s=-\r\n",
+                "c=IN IP4 192.0.2.1\r\n",
+                "t=0 0\r\n",
+                "m=audio 0 RTP/AVP 0\r\n",
+                "a=sendrecv\r\n",
+                "m=image 40002 udptl t38\r\n",
+                "a=T38FaxVersion:0\r\n",
+                "a=sendrecv\r\n",
+                "m=application 40004 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+                "a=sctp-port:5000\r\n",
+                "a=sendrecv\r\n",
+            )
+        );
+    }
+
+    #[test]
     fn direction_rewrite_leaves_a_non_sdp_body_untouched() {
         assert_eq!(
             set_media_direction(b"not sdp at all", MediaDirection::SendRecv),
