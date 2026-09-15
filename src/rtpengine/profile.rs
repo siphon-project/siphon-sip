@@ -220,17 +220,20 @@ impl ProfileRegistry {
 
     // --- Built-in profiles ---
 
+    // Applied to a call an SRTP UE on the external side originates. The offer half shapes what the
+    // plain RTP core is offered, the answer half what the UE is answered with, so the offer half is
+    // plain `RTP/AVP` and the answer half `RTP/SAVP`: the mirror image of `rtp_to_srtp`.
     fn builtin_srtp_to_rtp() -> ProfileEntry {
         ProfileEntry {
             offer: NgFlags {
-                transport_protocol: Some("RTP/SAVP".into()),
+                transport_protocol: Some("RTP/AVP".into()),
                 ice: Some("remove".into()),
                 replace: vec!["origin".into()],
                 direction: vec!["external".into(), "internal".into()],
                 ..NgFlags::default()
             },
             answer: NgFlags {
-                transport_protocol: Some("RTP/AVP".into()),
+                transport_protocol: Some("RTP/SAVP".into()),
                 ice: Some("remove".into()),
                 replace: vec!["origin".into()],
                 direction: vec!["internal".into(), "external".into()],
@@ -1304,11 +1307,14 @@ mod tests {
         );
     }
 
+    // An SRTP UE's INVITE is offered on toward the plain RTP core, so the offer half must be plain
+    // RTP and the answer half, which the UE receives, must be SRTP. `rtp_to_srtp` is the mirror.
+
     #[test]
     fn srtp_to_rtp_offer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("srtp_to_rtp").unwrap();
-        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/SAVP"));
+        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/AVP"));
         assert_eq!(entry.offer.ice.as_deref(), Some("remove"));
         assert!(entry.offer.dtls.is_none());
         assert_eq!(entry.offer.replace, vec!["origin"]);
@@ -1320,8 +1326,10 @@ mod tests {
     fn srtp_to_rtp_answer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("srtp_to_rtp").unwrap();
-        assert_eq!(entry.answer.transport_protocol.as_deref(), Some("RTP/AVP"));
+        assert_eq!(entry.answer.transport_protocol.as_deref(), Some("RTP/SAVP"));
         assert_eq!(entry.answer.ice.as_deref(), Some("remove"));
+        assert!(entry.answer.dtls.is_none());
+        assert_eq!(entry.answer.replace, vec!["origin"]);
         assert_eq!(entry.answer.direction, vec!["internal", "external"]);
     }
 

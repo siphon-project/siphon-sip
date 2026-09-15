@@ -3,14 +3,12 @@
 A copy of examples/proxy_rtpengine.py with one deliberate change: the profile is
 `rtp_passthrough` rather than `srtp_to_rtp`.
 
-Why it matters. `srtp_to_rtp` makes the engine rewrite the offer toward the B
-leg as `RTP/SAVP` with an `a=crypto` line. The SIPp UAS (sipp/rtpengine_uas.xml)
-ignores that and answers plain `RTP/AVP` with no crypto, so on the answer the
-engine is being asked to complete an SRTP negotiation the far end never joined.
-A spec-following engine rejects that (RFC 4568 §5.1.2 — the answerer must return
-a crypto attribute for the accepted suite), and the real engine does:
-
-    control command failed verb="answer" reason="SAVP answer: missing a=crypto"
+Why it matters. `srtp_to_rtp` is for an SRTP offerer calling a plain-RTP
+answerer: its answer half asks for `RTP/SAVP` toward the offerer. The SIPp UAC
+(sipp/rtpengine_uac.xml) offers plain `RTP/AVP` with no crypto, so the profile
+describes an SRTP interworking this scenario does not perform. An SDES answer
+toward that offerer would have no crypto attribute to accept (RFC 4568 §5.1.2):
+the offer carries none.
 
 The control-plane mock never noticed, because it echoes SDP back without
 negotiating anything. That is the difference this whole test exists to expose,
@@ -18,8 +16,9 @@ so the fix is to stop asking for an SRTP interworking the scenario does not
 perform, not to relax the engine. Both legs here are plain RTP, so
 `rtp_passthrough` is what the flow actually is.
 
-Testing the real SRTP interworking path needs a UAS that answers SAVP with a
-crypto line; that is a separate scenario, not this one.
+Testing the real SRTP interworking path needs a UAC that offers SAVP with a
+crypto line (or, for `rtp_to_srtp`, a UAS that answers with one); that is a
+separate scenario, not this one.
 """
 
 import os
