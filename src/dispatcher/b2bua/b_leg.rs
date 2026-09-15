@@ -787,12 +787,24 @@ pub fn build_digest_retry_invite(
     auth_header: &str,
     auth_value: String,
 ) -> SipMessage {
-    let mut retry = original.clone();
-    retry.headers.set("Via", new_via);
-    retry.headers.set("CSeq", format!("{cseq} INVITE"));
+    let mut retry = build_retry_invite(original, new_via, cseq);
     retry.headers.remove("Authorization");
     retry.headers.remove("Proxy-Authorization");
     retry.headers.add(auth_header, auth_value);
+    retry
+}
+
+/// Retry a B-leg INVITE as a new transaction on the same leg: the INVITE siphon
+/// sent, under a new Via and the next CSeq (RFC 3261 §8.1.3.5).
+///
+/// Everything else goes out again as it went out the first time, the SDP
+/// included, so the retry keeps the hygiene the original had: header policy,
+/// siphon's Contact, From topology hiding, and the SDP's `o=`/`s=` hiding,
+/// attribute strip and `o=` version.
+pub fn build_retry_invite(original: &SipMessage, new_via: String, cseq: u32) -> SipMessage {
+    let mut retry = original.clone();
+    retry.headers.set("Via", new_via);
+    retry.headers.set("CSeq", format!("{cseq} INVITE"));
     retry
 }
 

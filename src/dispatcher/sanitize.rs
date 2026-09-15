@@ -378,11 +378,37 @@ pub(super) fn strip_relayed_sdp_attributes(message: &mut SipMessage, state: &Dis
     }
 }
 
-/// [`strip_relayed_sdp_attributes`] for an SDP body siphon is about to send under
-/// its own `Content-Type: application/sdp`, before the message exists.
-pub(super) fn strip_relayed_sdp_body(body: &mut Vec<u8>, state: &DispatcherState) {
+/// siphon's identity on an SDP body it sends toward one leg of a call when
+/// someone else described that SDP: the other party, a transfer target, a
+/// `Replaces` newcomer, or the caller's stored offer on a session refresh.
+///
+/// The steps every relay path takes, in their order: [`sanitize_sdp_identity`]
+/// puts siphon's name in the `o=` owner and `s=` (and siphon's `o=` address, when
+/// `address` is given), [`stamp_sdp_origin`] gives the `o=` the leg's own session
+/// id at its next version (RFC 3264 §8: one session id for the life of the leg,
+/// the version moving on with each SDP it is sent), and the configured
+/// `media.sdp_strip_attributes` go last. `content_type` scopes the strip to the
+/// SDP part of a multipart body. An empty body is left alone and reserves no
+/// version.
+pub(super) fn own_sdp_toward_leg(
+    body: &mut Vec<u8>,
+    content_type: &str,
+    state: &DispatcherState,
+    call_id: &str,
+    on_a_leg: bool,
+    address: Option<&str>,
+) {
+    if body.is_empty() {
+        return;
+    }
+    sanitize_sdp_identity(body, &state.sdp_name, address);
+    if let Some((session_id, version)) =
+        state.call_actors.reserve_leg_sdp_version(call_id, on_a_leg)
+    {
+        stamp_sdp_origin(body, &state.sdp_name, session_id, version, address);
+    }
     if !state.sdp_strip_attributes.is_empty() {
-        crate::media::sdp::strip_attributes(body, &state.sdp_strip_attributes);
+        crate::media::body::strip_sdp_attributes(content_type, body, &state.sdp_strip_attributes);
     }
 }
 

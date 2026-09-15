@@ -934,6 +934,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   challenge no longer retains it for the life of the process. Affects both AKA
   paths.
 
+- **SDP someone else described now gets siphon's `o=` and `s=` on every path
+  that sends it.** Four paths skipped the topology hiding the relay paths apply.
+  A 422 retry rebuilt the INVITE from the caller's, so the callee got the
+  caller's raw SDP, and with it the caller's Contact, the caller's CSeq and none
+  of the header policy; it is now rebuilt from the INVITE the callee was sent, as
+  the 401/407 retry already was, and goes out with the next CSeq. A session
+  refresh stamped `o=` but passed the caller's `s=` through. The 200 accepting a
+  `Replaces` takeover handed the newcomer the survivor's SDP as the survivor
+  wrote it. A re-INVITE siphon sends with another party's SDP (transfer
+  re-anchor, `Replaces`, controller bridge) kept that party's address in `o=`.
+  All four now apply the same rewrite, and `media.sdp_strip_attributes` where it
+  was not applied yet. The `o=` version follows RFC 3264 §8 on each: the 422
+  retry keeps the version of the identical offer it re-sends, and the others
+  take the leg's next one. A 401/407 or 422 retry leg also keeps the SDP session
+  id of the leg it supersedes. It used to start a fresh one, so a later re-offer
+  on that dialog named a session the callee had never seen.
+
 ### Security
 
 - **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3

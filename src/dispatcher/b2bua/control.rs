@@ -267,7 +267,38 @@ pub fn b2bua_send_uas_response(
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread (async-pool asyncio loop), so establish the runtime.
+    let _enter = control.runtime.enter();
+    send_uas_response(
+        &control.state,
+        internal_call_id,
+        invite,
+        code,
+        reason,
+        body,
+        content_type,
+        final_response,
+    )
+}
+
+/// [`b2bua_send_uas_response`] on the dispatcher the caller already holds.
+///
+/// For a path inside the dispatcher that answers a call itself (the `Replaces`
+/// takeover), where the tokio runtime is already current and reaching for the
+/// process-wide control handle adds nothing. It is also what lets a test drive
+/// that path: the handle is set once per process, and tests elsewhere rely on it
+/// being absent.
+pub fn send_uas_response(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    final_response: bool,
+) -> bool {
     let (transport, remote_addr, connection_id, local_addr, local_tag) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
@@ -279,9 +310,6 @@ pub fn b2bua_send_uas_response(
             ),
             None => return false,
         };
-    // The send path may spawn (TCP/TLS connect) and the caller may be on a
-    // non-tokio thread (async-pool asyncio loop), so establish the runtime.
-    let _enter = control.runtime.enter();
 
     // RFC 3261 §12.1.1: tag the To header with the A-leg dialog local_tag for any
     // dialog-establishing response (2xx) or early-dialog provisional (18x).

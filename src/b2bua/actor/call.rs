@@ -850,6 +850,15 @@ impl CallActor {
     /// `index` is out of range.
     pub fn replace_b_leg(&mut self, index: usize, leg: Leg) -> Option<String> {
         if index < self.b_legs.len() {
+            // The retry continues this leg's SDP session. The INVITE it re-sends
+            // carries the superseded leg's `o=`, and every later offer on the
+            // dialog has to present that session id with a greater version
+            // (RFC 3264 §8), so the fresh identity the retry leg was built with
+            // gives way to the one the callee has already seen.
+            let mut leg = leg;
+            let superseded = &self.b_legs[index].dialog;
+            leg.dialog.sdp_session_id = superseded.sdp_session_id;
+            leg.dialog.sdp_version = superseded.sdp_version;
             let old_branch = std::mem::replace(&mut self.b_legs[index], leg).branch;
             self.b_leg_status[index] = BLegStatus::Trying;
             self.b_leg_handles[index] = None;

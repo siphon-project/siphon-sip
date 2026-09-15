@@ -158,29 +158,26 @@ pub fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // Reset timer preemptively (will be confirmed on 200 OK)
     state.call_actors.reset_session_timer(call_id);
 
-    // Own the o= identity toward the B-leg on the refresh (RFC 3264 §8) so a
-    // session-timer keepalive shares this leg's stable session-id + a monotonic
-    // version rather than re-presenting the caller's forwarded o= (which would
-    // read as a session change relative to the initial B-leg INVITE).
-    if !reinvite.body.is_empty() {
-        if let Some((sess_id, version)) = state.call_actors.reserve_leg_sdp_version(call_id, false)
-        {
-            stamp_sdp_origin(
-                &mut reinvite.body,
-                &state.sdp_name,
-                sess_id,
-                version,
-                Some(&b2bua_host),
-            );
-            reinvite
-                .headers
-                .set("Content-Length", reinvite.body.len().to_string());
-        }
-    }
-
     // The refresh is a clone of the caller's stored INVITE, body included, so the
-    // caller's SDP crosses to the callee again and gets `media.sdp_strip_attributes`.
-    strip_relayed_sdp_attributes(&mut reinvite, state);
+    // caller's SDP crosses to the callee again and gets the topology hiding every
+    // SDP toward the callee gets: siphon's `o=` owner and address and `s=` in
+    // place of the caller's, and the configured attributes stripped. Its `o=` is
+    // this leg's stable session id at the next version (RFC 3264 §8) rather than
+    // the caller's, which would read to the callee as a different session.
+    let content_type = message_content_type(&reinvite).to_string();
+    own_sdp_toward_leg(
+        &mut reinvite.body,
+        &content_type,
+        state,
+        call_id,
+        false,
+        Some(&b2bua_host),
+    );
+    if !reinvite.body.is_empty() {
+        reinvite
+            .headers
+            .set("Content-Length", reinvite.body.len().to_string());
+    }
 
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
     send_b2bua_to_bleg(
@@ -248,27 +245,30 @@ pub fn b2bua_send_reinvite_on_leg(
     let Some(surviving) = state.call_actors.clone_leg(call_id, surviving_on_a_leg) else {
         return false;
     };
-    // Re-originate the offered SDP under siphon's o= identity (RFC 3264 §5 /
-    // RFC 4566 §5.2) — the target's answer SDP still carries the target's o=
-    // owner, which a B2BUA must not leak to the surviving leg. The connection
-    // address is left untouched (`None`) so, absent a media anchor, the surviving
-    // leg still learns the target's media address.
+    // Re-originate the offered SDP under siphon's identity toward the surviving
+    // leg. It was described by someone else (a transfer target, a `Replaces`
+    // newcomer, a bridge peer), whose `o=` owner and address and `s=` a B2BUA must
+    // not pass on (RFC 3264 §5 / RFC 4566 §5.2). The `o=` address is siphon's, as
+    // on every SDP this leg has been sent before: RFC 3264 §8 lets only the
+    // version change between them. The `c=` lines are not identity and stay, so
+    // absent a media anchor the surviving leg still learns where the media is.
+    // The `o=` is this leg's stable session id at a strictly greater version, so a
+    // strict answerer does not take the changed media as unchanged, and the
+    // configured attributes are stripped last, after any media engine rewrite the
+    // caller made.
     let mut sdp_body = sdp_body;
-    sanitize_sdp_identity(&mut sdp_body, &state.sdp_name, None);
-    // Own the o= session-id/version toward the surviving leg so this re-anchor
-    // offer carries a strictly greater version than the last SDP that leg saw
-    // (RFC 3264 §8) under a stable session-id — otherwise a strict answerer may
-    // treat the changed media as unchanged. Connection address left untouched.
-    if let Some((sess_id, version)) = state
-        .call_actors
-        .reserve_leg_sdp_version(call_id, surviving_on_a_leg)
-    {
-        stamp_sdp_origin(&mut sdp_body, &state.sdp_name, sess_id, version, None);
-    }
-    // SDP another party described (a transfer target, a `Replaces` newcomer, a
-    // bridge peer), after any media engine rewrite the caller made:
-    // `media.sdp_strip_attributes`, last.
-    strip_relayed_sdp_body(&mut sdp_body, state);
+    let surviving_host = state.a_leg_advertised_host(
+        surviving.transport.local_addr,
+        &surviving.transport.transport,
+    );
+    own_sdp_toward_leg(
+        &mut sdp_body,
+        "application/sdp",
+        state,
+        call_id,
+        surviving_on_a_leg,
+        Some(&surviving_host),
+    );
     let Some(reinvite) = build_b2bua_in_dialog_request(
         &surviving,
         state,
