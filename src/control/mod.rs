@@ -216,7 +216,7 @@ pub fn spawn_control_plane(config: &ControlConfig, extra_adapters: Vec<Arc<dyn C
 
 /// The command consumer. One task; each command is applied on its own spawned
 /// task so a slow adapter for one command never head-of-line-blocks another.
-async fn run_consumer(
+pub(crate) async fn run_consumer(
     bus: Arc<ControlBus>,
     adapters: Arc<HashMap<String, Arc<dyn ControlAdapter>>>,
     command_rx: flume::Receiver<ControlCommand>,

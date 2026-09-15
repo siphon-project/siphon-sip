@@ -425,26 +425,21 @@ impl PyB2buaControl {
 fn session_timer_from_dict(
     dict: &Bound<'_, pyo3::types::PyDict>,
 ) -> PyResult<crate::script::api::call::SessionTimerOverride> {
-    use crate::script::api::call::SessionTimerOverride;
+    use crate::b2bua::session_timer::{SessionTimerField, SessionTimerFields};
+    use pyo3::exceptions::PyValueError;
 
-    let mut expires = SessionTimerOverride::DEFAULT_EXPIRES;
-    let mut min_se = SessionTimerOverride::DEFAULT_MIN_SE;
-    let mut refresher = SessionTimerOverride::DEFAULT_REFRESHER.to_string();
+    let mut fields = SessionTimerFields::default();
     for (key, value) in dict.iter() {
         let key: String = key.extract()?;
-        match key.as_str() {
-            "expires" => expires = value.extract()?,
-            "min_se" => min_se = value.extract()?,
-            "refresher" => refresher = value.extract()?,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "b2bua.originate session_timer= takes expires, min_se and refresher, \
-                     not {other:?}"
-                )));
-            }
+        let field = SessionTimerField::named(&key)
+            .map_err(|message| PyValueError::new_err(format!("b2bua.originate {message}")))?;
+        match field {
+            SessionTimerField::Expires => fields.expires = Some(value.extract()?),
+            SessionTimerField::MinSe => fields.min_se = Some(value.extract()?),
+            SessionTimerField::Refresher => fields.refresher = Some(value.extract()?),
         }
     }
-    SessionTimerOverride::from_script(expires, min_se, &refresher)
+    fields.build().map_err(PyValueError::new_err)
 }
 
 #[cfg(test)]

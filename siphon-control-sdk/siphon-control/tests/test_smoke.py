@@ -882,3 +882,110 @@ def test_transfer_outcome_helpers():
     assert transfer_outcome({"kind": "TransferRequested", "payload": {}}) is None
     assert transfer_outcome({"kind": "StasisEnd", "payload": {}}) is None
     assert transfer_outcome({"kind": "TransferFailed"}) is None
+
+
+def test_originate_verb_roundtrip():
+    """`client.originate(...)` emits the module-level `originate` command with the
+    exact args the server parses, the session timer among them, and refuses what
+    the server would refuse before anything is sent."""
+
+    async def scenario():
+        frames = []
+
+        async def originate_stub(websocket):
+            auth = websocket.request.headers.get("Authorization", "")
+            if auth != f"Bearer {TOKEN}":
+                await websocket.close(code=1008, reason="unauthorized")
+                return
+            said_hello = False
+            async for message in websocket:
+                frame = json.loads(message)
+                frame_id = frame.get("id")
+                if not said_hello:
+                    assert frame.get("verb") == "hello", "first frame must be hello"
+                    await _reply_ok(
+                        websocket,
+                        frame_id,
+                        {"app": APP, "protocol": 1, "subprotocol": SUBPROTOCOL},
+                    )
+                    said_hello = True
+                    continue
+                frames.append(frame)
+                await _reply_ok(
+                    websocket,
+                    frame_id,
+                    {
+                        "channel": frame["args"]["channel"],
+                        "call_id": "call-uuid",
+                        "sip_call_id": "sipcid@host",
+                        "state": "calling",
+                    },
+                )
+
+        async with websockets.serve(
+            originate_stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = ControlClient(
+                app=APP, token=TOKEN, url=f"ws://127.0.0.1:{port}/control/ws"
+            )
+            await client.connect()
+
+            placed = await client.originate(
+                "out-1",
+                "sip:1001@pbx.example",
+                media=True,
+                from_uri="sip:alarm@pbx.example",
+                timeout=20,
+                session_timer={"expires": 90, "refresher": "UAC"},
+            )
+            assert placed == {
+                "channel": "out-1",
+                "call_id": "call-uuid",
+                "sip_call_id": "sipcid@host",
+            }
+            await client.originate(
+                "out-2", "sip:1001@pbx.example", sdp="v=0\r\n"
+            )
+
+            # What the server would refuse is refused here, before a frame goes
+            # out: a timer siphon cannot run, and a media plan that is not
+            # exactly one.
+            for session_timer in ({"refresher": "sometimes"}, {"interval": 90}):
+                with pytest.raises(ValueError, match="session_timer|refresher"):
+                    await client.originate(
+                        "out-3",
+                        "sip:1001@pbx.example",
+                        media=True,
+                        session_timer=session_timer,
+                    )
+            with pytest.raises(ValueError, match="media"):
+                await client.originate("out-4", "sip:1001@pbx.example")
+            with pytest.raises(ValueError, match="media"):
+                await client.originate(
+                    "out-5", "sip:1001@pbx.example", media=True, sdp="v=0\r\n"
+                )
+
+            assert [frame["args"]["channel"] for frame in frames] == ["out-1", "out-2"]
+            first = frames[0]
+            assert first["module"] == "sip"
+            assert first["verb"] == "originate"
+            assert first.get("target") is None
+            assert first["args"] == {
+                "channel": "out-1",
+                "to": "sip:1001@pbx.example",
+                "media": True,
+                "from": "sip:alarm@pbx.example",
+                "timeout": 20,
+                "session_timer": {"expires": 90, "refresher": "uac"},
+            }
+            # No timer asked for: nothing sent, so the configured one runs.
+            assert frames[1]["args"] == {
+                "channel": "out-2",
+                "to": "sip:1001@pbx.example",
+                "sdp": "v=0\r\n",
+            }
+
+            client.close()
+
+    asyncio.run(scenario())

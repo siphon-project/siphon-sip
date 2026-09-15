@@ -6,6 +6,7 @@ use super::media::{
 };
 use super::originate::{
     originate, originate_error, originate_with_bus, parse_originate_media, parse_privacy,
+    parse_session_timer,
 };
 use super::routing::{parse_dial_target, parse_route_target, route};
 use super::transfer::{
@@ -499,6 +500,38 @@ async fn originate_dispatches_through_apply_as_a_module_level_verb() {
         }
         other => panic!("expected an error from the un-booted stack, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_session_timer_reads_absent_as_none_and_defaults_each_key_left_out() {
+    use crate::b2bua::session_timer::SessionTimerOverride;
+    use crate::config::SessionRefresher;
+
+    // Absent or null runs the configured timer, if any: no override.
+    assert_eq!(parse_session_timer(None), Ok(None));
+    assert_eq!(
+        parse_session_timer(Some(&serde_json::Value::Null)),
+        Ok(None)
+    );
+    // Keys left out default as in call.session_timer().
+    assert_eq!(
+        parse_session_timer(Some(&serde_json::json!({}))),
+        Ok(Some(SessionTimerOverride {
+            session_expires: 1800,
+            min_se: 90,
+            refresher: SessionRefresher::B2bua,
+        }))
+    );
+    assert_eq!(
+        parse_session_timer(Some(&serde_json::json!({
+            "expires": 900, "min_se": 120, "refresher": "UAS"
+        }))),
+        Ok(Some(SessionTimerOverride {
+            session_expires: 900,
+            min_se: 120,
+            refresher: SessionRefresher::Uas,
+        }))
+    );
 }
 
 #[test]

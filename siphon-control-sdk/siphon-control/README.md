@@ -93,6 +93,12 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.connect()` / `await client.run()` — connect / drive (reconnect + resync).
 - `await client.command(verb, module=None, target=None, args=None)` — the generic
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
+- `await client.originate(channel, to, *, media=False, sdp=None, body=None, content_type=None, …, session_timer=None)`
+  — place an outbound call under a channel id you choose; resolves to
+  `{"channel", "call_id", "sip_call_id"}` once the INVITE is on the wire. Exactly one
+  media plan (`media=True`, `sdp=` or `body=`). `session_timer={"expires", "min_se",
+  "refresher"}` runs an RFC 4028 session timer on the call, each key left out taking the
+  server's default. What the server would refuse raises `ValueError` before a frame goes out.
 - `await client.describe()` — adapter schema.
 - `client.shutdown()` — stop the client and unblock `run()`.
 - `client.close()` — shutdown, plus drop the handler so nothing else is

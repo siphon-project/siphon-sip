@@ -31,7 +31,9 @@ use siphon_control_proto::{ChannelSnapshot, EventFrame};
 use crate::client::{ClientConfig, ClientEvent, ControlClient};
 use crate::error::ControlError;
 use crate::originate::originate_on;
-pub use crate::originate::{OriginateMedia, OriginateOptions, OriginatePrivacy, Originated};
+pub use crate::originate::{
+    OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, SessionRefresher, SessionTimer,
+};
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 
@@ -1651,6 +1653,65 @@ mod tests {
         assert_eq!(args["body"], "hello");
         assert_eq!(args["content_type"], "text/plain");
         assert!(args.get("media").is_none(), "{args}");
+    }
+
+    #[tokio::test]
+    async fn a_session_timer_goes_out_as_the_object_the_server_parses_and_only_when_set() {
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default().session_timer(
+                SessionTimer::default()
+                    .expires(90)
+                    .refresher(SessionRefresher::Uac),
+            ),
+        )
+        .await
+        .expect("originate");
+        originate_on(
+            &transport,
+            "out-2",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default().session_timer(
+                SessionTimer::default()
+                    .expires(1800)
+                    .min_se(120)
+                    .refresher(SessionRefresher::B2bua),
+            ),
+        )
+        .await
+        .expect("originate");
+        originate_on(
+            &transport,
+            "out-3",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        let calls = lock(&recorder.calls).clone();
+        // Only the keys set: one left out takes the server's default.
+        assert_eq!(
+            calls[0].args["session_timer"],
+            json!({ "expires": 90, "refresher": "uac" })
+        );
+        assert_eq!(
+            calls[1].args["session_timer"],
+            json!({ "expires": 1800, "min_se": 120, "refresher": "b2bua" })
+        );
+        // No timer asked for: the configured one runs, so nothing is sent.
+        assert!(
+            calls[2].args.get("session_timer").is_none(),
+            "{}",
+            calls[2].args
+        );
     }
 
     #[tokio::test]

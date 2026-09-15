@@ -120,6 +120,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   than discovered at runtime. Returns the channel id, siphon's call id and the
   SIP Call-ID; the call is `calling`, and the answer still arrives as an event.
 
+- **The control plane's `originate` verb takes a `session_timer`**, `{expires, min_se,
+  refresher}`: the RFC 4028 session timer to run on the call over the `session_timer:` block,
+  each key left out defaulting as in `call.session_timer()`. A call a controller places now asks
+  for it and refreshes or releases its dialog exactly like one `b2bua.originate(session_timer=...)`
+  places, where before a controller only ever got the configured timer. It is validated by the
+  same rules as the script API, and a timer siphon cannot run (a key no timer has, a `refresher`
+  other than `uac`, `uas` or `b2bua`, an interval that is not a whole number of seconds) is
+  `bad_request`. Left out, the configured timer runs, as before. The control SDKs carry it,
+  omitted by default so existing callers are unchanged: Rust `OriginateOptions::session_timer(
+  SessionTimer)`, TypeScript `sessionTimer`, and Python `session_timer={...}` on a new typed
+  `ControlClient.originate()`, which the Python SDK lacked (placing a call meant the raw
+  `command`). Each refuses a timer the server would refuse before a frame goes out.
+
 - **`auth.backend: database` is implemented.** A SQL credential source under
   `auth.database`: a libpq `url`, a `query` that binds the digest username to
   `$1` (and the realm to `$2` when the statement references it), and `ha1` to
