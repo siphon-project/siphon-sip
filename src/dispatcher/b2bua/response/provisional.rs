@@ -70,6 +70,9 @@ pub fn b_leg_provisional(
         // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
         // This lets scripts process early media through RTPEngine before forwarding.
         let has_sdp_body = !message.body.is_empty();
+        // Headers @b2bua.on_early_media set or removed on the response, which
+        // reach the caller as the script left them.
+        let mut reply_shaped_headers: Vec<String> = Vec::new();
         if has_sdp_body {
             let engine_state = state.engine.state();
             let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
@@ -90,19 +93,19 @@ pub fn b_leg_provisional(
                             response_source.port(),
                         );
 
-                    Python::attach(|python| {
+                    reply_shaped_headers = Python::attach(|python| -> Vec<String> {
                         let call_obj = match Py::new(python, py_call) {
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyCall for on_early_media: {error}");
-                                return;
+                                return Vec::new();
                             }
                         };
                         let reply_obj = match Py::new(python, py_reply) {
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyReply for on_early_media: {error}");
-                                return;
+                                return Vec::new();
                             }
                         };
 
@@ -124,6 +127,8 @@ pub fn b_leg_provisional(
                                 }
                             }
                         }
+                        let reply = reply_obj.borrow(python);
+                        reply.script_shaped_headers().to_vec()
                     });
 
                     // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
@@ -165,13 +170,14 @@ pub fn b_leg_provisional(
             }
         }
         // Sanitize B-leg headers before forwarding to A-leg
-        sanitize_b2bua_response(
+        sanitize_b2bua_response_keeping(
             message,
             state,
             snapshot.a_leg.transport.transport,
             snapshot.a_leg_local_addr,
             snapshot.a_leg_supports_100rel,
             call_id,
+            &reply_shaped_headers,
         );
         // `media.sdp_strip_attributes`, after `@b2bua.on_early_media` had the
         // media engine rewrite the early media SDP.

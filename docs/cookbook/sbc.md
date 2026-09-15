@@ -186,6 +186,15 @@ number policy and a carrier's caller ID and CLIR on the identity headers, LCR ro
 headers, SIPhon's `Session-Expires` / `Min-SE` when it runs the session timer, and
 `replaces` merged into `Supported`.
 
+Responses work the same way. What a script does to a B-leg response in
+`@b2bua.on_answer` or `@b2bua.on_early_media` with `reply.set_header()` /
+`reply.remove_header()` / `reply.remove_headers_matching()` reaches the caller as the
+script left it, over the response policy and SIPhon's own `Supported` / `Allow`.
+SIPhon still sets the caller's `Contact`, drops the callee's `Record-Route`, removes
+`Require: 100rel` and `RSeq` toward a caller that never advertised `100rel`, adds its
+`Supported: timer` / `Session-Expires` when absent while it runs the session timer,
+merges `replaces` into `Supported`, and rewrites the SDP origin.
+
 !!! note "One intentional change from pre-policy SIPhon"
     Every preset strips `Proxy-Authenticate` on B→A responses. RFC 3261 §22.3 makes
     it hop-by-hop, so passing it through would point the A-leg's

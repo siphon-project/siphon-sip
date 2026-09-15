@@ -733,6 +733,7 @@ async fn the_answer_relayed_to_the_caller_loses_the_named_attributes() {
         &mut answer,
         &dispatcher.state,
         &snapshot(&dispatcher, &call_id, B_LEG_BRANCH),
+        &[],
     );
 
     assert_stripped(&answer, "2xx to the caller");

@@ -212,11 +212,25 @@ class Reply:
         return []
 
     def set_header(self, name: str, value: str) -> None:
-        """Set (replace) a header value."""
+        """Set (replace) a header value.
+
+        On a B2BUA response in ``@b2bua.on_answer`` or
+        ``@b2bua.on_early_media`` the value reaches the caller as written: the
+        header policy neither strips nor rewrites it, and siphon's own
+        ``Supported`` / ``Allow`` do not replace it (``replaces`` is still
+        merged into ``Supported``). siphon keeps its own ``Contact``, drops the
+        callee's ``Record-Route``, and removes ``Require: 100rel`` / ``RSeq``
+        toward a caller that never advertised ``100rel``.
+        """
         self._headers[name] = value
 
     def remove_header(self, name: str) -> None:
-        """Remove a header entirely."""
+        """Remove a header entirely.
+
+        On a B2BUA response in ``@b2bua.on_answer`` or
+        ``@b2bua.on_early_media`` the removal stands: neither the header policy
+        nor siphon's own ``Supported`` / ``Allow`` put the header back.
+        """
         self._headers = {
             k: v for k, v in self._headers.items()
             if k.lower() != name.lower()

@@ -464,6 +464,29 @@ pub fn apply_to_response(response: &mut SipMessage, policy: &ResolvedPolicy, ctx
     apply(response, policy, ctx, /*is_request=*/ false, &[]);
 }
 
+/// [`apply_to_response`], leaving every header named in `kept` exactly as it
+/// is: the headers a script set or removed on the response in
+/// `@b2bua.on_answer` / `@b2bua.on_early_media`. Precedence 1, the same as a
+/// script's headers on the B-leg INVITE ([`apply_to_request_keeping`]).
+pub fn apply_to_response_keeping(
+    response: &mut SipMessage,
+    policy: &ResolvedPolicy,
+    ctx: &PolicyContext,
+    kept: &[String],
+) {
+    apply(response, policy, ctx, /*is_request=*/ false, kept);
+}
+
+/// Whether `name` is among the headers a script set or removed (`shaped`, as
+/// the script spelled them): case-insensitive, compact forms folded. The one
+/// test every precedence-1 decision makes, on the B-leg INVITE and on a relayed
+/// response alike.
+pub fn is_script_shaped(shaped: &[String], name: &str) -> bool {
+    shaped
+        .iter()
+        .any(|shaped_name| crate::sip::headers::same_header_name(shaped_name, name))
+}
+
 fn apply(
     message: &mut SipMessage,
     policy: &ResolvedPolicy,

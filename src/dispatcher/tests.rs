@@ -2738,6 +2738,7 @@ fn relayed_response_capabilities_mirror_the_b_leg_rule() {
     headers.set("Allow", "INVITE, ACK, BYE".to_string());
     advertise_relayed_response_capabilities(
         &mut headers,
+        &[],
         &builtin_policy("ims-trust-domain-boundary@2026"),
     );
     assert_eq!(
@@ -2821,6 +2822,7 @@ fn relayed_response_capabilities_add_siphons_own_to_an_empty_response() {
     let mut headers = SipHeaders::new();
     advertise_relayed_response_capabilities(
         &mut headers,
+        &[],
         &builtin_policy("transparent-b2bua@2026"),
     );
     assert_eq!(

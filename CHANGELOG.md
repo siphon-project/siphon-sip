@@ -391,6 +391,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `Require` the script set counts as reaching the callee when siphon decides
   whether to answer `420 Bad Extension`.
 
+  The same holds for a response siphon relays to the caller. A header a script
+  sets or removes on it with `reply.set_header()`, `reply.remove_header()` or
+  `reply.remove_headers_matching()` in `@b2bua.on_answer` or
+  `@b2bua.on_early_media` reaches the caller as the script left it, over the
+  response policy's strips and rewrites and over siphon's own `Supported` and
+  `Allow`, which used to replace a script's `Allow` under every preset. What
+  stays siphon's on a response is done regardless: its `Contact`, no callee
+  `Record-Route`, `Require: 100rel` and `RSeq` removed toward a caller that never
+  advertised `100rel`, `Supported: timer` and `Session-Expires` added when absent
+  while siphon runs the session timer toward the caller, `replaces` merged into
+  `Supported`, and the SDP origin rewrite.
+
 - **The `media.backend: siphon-rtp` control contract moves to
   `siphon-rtp-proto` 0.7.1.** The wire stays compatible in both directions:
   0.7.0 only adds optional keys (the call summary's wall-clock start and end,

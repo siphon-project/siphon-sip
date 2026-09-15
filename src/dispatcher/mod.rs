@@ -103,6 +103,8 @@ mod public_api_surface;
 #[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]
+mod reply_script_header_tests;
+#[cfg(test)]
 mod retransmit_capture_tests;
 #[cfg(test)]
 mod ro_orphan_backstop_tests;

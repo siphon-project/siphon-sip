@@ -771,6 +771,7 @@ async fn early_media_sdp_is_the_session_in_force_when_the_answer_carries_none() 
         &mut answer,
         &dispatcher.state,
         &snapshot(&dispatcher, &call_id, B_LEG_BRANCH),
+        &[],
     );
 
     let in_force = dispatcher

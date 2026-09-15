@@ -397,7 +397,7 @@ async fn a_relayed_answer_echoes_the_callers_own_from_and_to() {
     let snapshot = snapshot(&call_id, &dispatcher);
     let mut answer = b_leg_response(200, "OK", Some("carrier-tag"), "");
 
-    prepare_a_leg_answer(&call_id, &mut answer, &dispatcher.state, &snapshot);
+    prepare_a_leg_answer(&call_id, &mut answer, &dispatcher.state, &snapshot, &[]);
 
     assert_caller_identity(&answer, Some(&local_tag));
 }

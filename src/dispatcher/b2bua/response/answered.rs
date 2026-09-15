@@ -84,6 +84,9 @@ pub fn b_leg_answered(
         // see the gate below the handler block.
         let mut answer_handler_raised = false;
         let mut answer_wants_terminate = false;
+        // Headers @b2bua.on_answer set or removed on the response, which reach
+        // the caller as the script left them.
+        let mut reply_shaped_headers: Vec<String> = Vec::new();
 
         // Invoke @b2bua.on_answer handlers with (PyCall, PyReply)
         let engine_state = state.engine.state();
@@ -114,20 +117,20 @@ pub fn b_leg_answered(
                 // error for the Python objects counts, since a handler that was
                 // never called cannot have made the media decision the call
                 // depends on.
-                let (answer_action, raised) =
-                    Python::attach(|python| -> (Option<CallAction>, bool) {
+                let (answer_action, raised, shaped) =
+                    Python::attach(|python| -> (Option<CallAction>, bool, Vec<String>) {
                         let call_obj = match Py::new(python, py_call) {
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyCall for on_answer: {error}");
-                                return (None, true);
+                                return (None, true, Vec::new());
                             }
                         };
                         let reply_obj = match Py::new(python, py_reply) {
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyReply for on_answer: {error}");
-                                return (None, true);
+                                return (None, true, Vec::new());
                             }
                         };
 
@@ -150,9 +153,15 @@ pub fn b_leg_answered(
                             }
                         }
                         let borrowed = call_obj.borrow(python);
-                        (Some(borrowed.action().clone()), raised)
+                        let reply = reply_obj.borrow(python);
+                        (
+                            Some(borrowed.action().clone()),
+                            raised,
+                            reply.script_shaped_headers().to_vec(),
+                        )
                     });
                 answer_handler_raised = raised;
+                reply_shaped_headers = shaped;
 
                 // Deferred call.refer() from @b2bua.on_answer: an outbound
                 // REFER to the A-leg (the connected caller).
@@ -238,7 +247,13 @@ pub fn b_leg_answered(
                 .clone(),
         };
 
-        prepare_a_leg_answer(call_id, &mut response, state, snapshot);
+        prepare_a_leg_answer(
+            call_id,
+            &mut response,
+            state,
+            snapshot,
+            &reply_shaped_headers,
+        );
 
         // RFC 4028: negotiate the session timer of each dialog, and put the
         // caller's on this 2xx. After the sanitize above, so the Session-Expires
@@ -644,6 +659,8 @@ pub fn prepare_a_leg_answer(
     response: &mut SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
+    // Headers `@b2bua.on_answer` set or removed on this response.
+    script_shaped_headers: &[String],
 ) {
     // Rewrite B-leg dialog headers back to A-leg identifiers.
     // The To-tag MUST be rewritten to A-leg's local_tag (RFC 3261 §12.2.1.1):
@@ -691,13 +708,14 @@ pub fn prepare_a_leg_answer(
         .unwrap_or_default();
 
     // Sanitize B-leg headers before forwarding to A-leg
-    sanitize_b2bua_response(
+    sanitize_b2bua_response_keeping(
         response,
         state,
         snapshot.a_leg.transport.transport,
         snapshot.a_leg_local_addr,
         snapshot.a_leg_supports_100rel,
         call_id,
+        script_shaped_headers,
     );
 
     // Own the o= identity toward the A-leg on the answer it receives (RFC

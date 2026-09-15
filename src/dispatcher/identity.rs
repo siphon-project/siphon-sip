@@ -102,10 +102,9 @@ pub(super) fn unhonourable_required_tags(
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) -> Vec<String> {
-    let require_crosses = script_shaped_headers
-        .iter()
-        .any(|shaped| crate::sip::headers::same_header_name(shaped, "Require"))
-        || policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
+    let require_crosses =
+        crate::b2bua::header_policy::is_script_shaped(script_shaped_headers, "Require")
+            || policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
     required_tags_not_honoured(invite, |tag| {
         implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag))
     })
@@ -185,14 +184,25 @@ fn keep_claimable_option_tags(
 /// mirrored: `Supported` keeps the far leg's claimable tags
 /// ([`keep_claimable_option_tags`]) plus `replaces`, and `Allow` is siphon's
 /// method set.
+///
+/// A header a script set or removed on the response (`script_shaped_headers`,
+/// from `@b2bua.on_answer` / `@b2bua.on_early_media`) is left as the script
+/// left it, precedence 1 as on the B-leg INVITE; `replaces` is still merged
+/// into its `Supported`.
 pub(super) fn advertise_relayed_response_capabilities(
     headers: &mut SipHeaders,
+    script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) {
-    keep_claimable_option_tags(headers, policy);
+    use crate::b2bua::header_policy::is_script_shaped;
+    if !is_script_shaped(script_shaped_headers, "Supported") {
+        keep_claimable_option_tags(headers, policy);
+    }
     advertise_supported_options(headers);
-    headers.remove("Allow");
-    advertise_supported_methods(headers);
+    if !is_script_shaped(script_shaped_headers, "Allow") {
+        headers.remove("Allow");
+        advertise_supported_methods(headers);
+    }
 }
 
 /// Settle the B-leg INVITE's `Supported` and `Allow` once the header policy has
@@ -217,17 +227,12 @@ pub(super) fn advertise_b_leg_capabilities(
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) {
-    let shaped_by_script = |name: &str| {
-        script_shaped_headers
-            .iter()
-            .any(|shaped| crate::sip::headers::same_header_name(shaped, name))
-    };
-
-    if !shaped_by_script("Supported") {
+    use crate::b2bua::header_policy::is_script_shaped;
+    if !is_script_shaped(script_shaped_headers, "Supported") {
         keep_claimable_option_tags(outbound, policy);
     }
 
-    if !shaped_by_script("Allow") {
+    if !is_script_shaped(script_shaped_headers, "Allow") {
         outbound.remove("Allow");
         advertise_supported_methods(outbound);
     }

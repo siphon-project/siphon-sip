@@ -389,6 +389,7 @@ async fn the_answers_siphon_sends_the_caller_are_the_session_in_force_on_its_dia
         &mut answer,
         &dispatcher.state,
         &snapshot(&dispatcher, &call_id, B_LEG_BRANCH),
+        &[],
     );
     assert_eq!(
         caller_session(&dispatcher, &call_id),
