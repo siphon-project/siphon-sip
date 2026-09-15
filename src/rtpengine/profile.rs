@@ -258,18 +258,24 @@ impl ProfileRegistry {
         }
     }
 
+    // The two WebSocket profiles are applied to a call a WebSocket UE originates. Each half shapes
+    // the SDP the engine *generates*: the offer half is what the RTP core is offered, the answer
+    // half is what the UE is answered with. Toward the core: plain RTP, no ICE, and RTCP on its own
+    // port, since a core peer need not multiplex (RFC 5761 §5.1.1).
+
     fn builtin_ws_to_rtp() -> ProfileEntry {
         ProfileEntry {
             offer: NgFlags {
-                transport_protocol: Some("RTP/AVPF".into()),
-                ice: Some("force".into()),
+                transport_protocol: Some("RTP/AVP".into()),
+                ice: Some("remove".into()),
+                rtcp_mux: vec!["demux".into()],
                 replace: vec!["origin".into()],
                 direction: vec!["external".into(), "internal".into()],
                 ..NgFlags::default()
             },
             answer: NgFlags {
-                transport_protocol: Some("RTP/AVP".into()),
-                ice: Some("remove".into()),
+                transport_protocol: Some("RTP/AVPF".into()),
+                ice: Some("force".into()),
                 replace: vec!["origin".into()],
                 direction: vec!["internal".into(), "external".into()],
                 ..NgFlags::default()
@@ -280,17 +286,22 @@ impl ProfileRegistry {
     fn builtin_wss_to_rtp() -> ProfileEntry {
         ProfileEntry {
             offer: NgFlags {
-                transport_protocol: Some("RTP/SAVPF".into()),
-                ice: Some("force".into()),
-                dtls: Some("passive".into()),
+                transport_protocol: Some("RTP/AVP".into()),
+                ice: Some("remove".into()),
+                dtls: Some("off".into()),
+                rtcp_mux: vec!["demux".into()],
                 replace: vec!["origin".into()],
                 direction: vec!["external".into(), "internal".into()],
                 ..NgFlags::default()
             },
             answer: NgFlags {
-                transport_protocol: Some("RTP/AVP".into()),
-                ice: Some("remove".into()),
-                dtls: Some("off".into()),
+                // The full RFC 5764 protocol: `RTP/SAVPF` alone names SDES keying.
+                transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                ice: Some("force".into()),
+                // No DTLS role imposed: answering a browser's `actpass`, the engine takes `active`
+                // as RFC 5763 §5 recommends.
+                // A browser requires RTP/RTCP multiplexing (RFC 9429 §4.1.1).
+                rtcp_mux: vec!["require".into()],
                 replace: vec!["origin".into()],
                 direction: vec!["internal".into(), "external".into()],
                 ..NgFlags::default()
@@ -1314,30 +1325,59 @@ mod tests {
         assert_eq!(entry.answer.direction, vec!["internal", "external"]);
     }
 
+    // A profile half shapes the SDP the media engine *generates*: the offer half is what the
+    // answerer is offered, the answer half is what the offerer is answered. A WebSocket UE's
+    // INVITE is offered on toward the RTP core, so the offer half must be plain RTP without ICE
+    // and the answer half must be what the UE speaks.
+
     #[test]
     fn ws_to_rtp_offer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("ws_to_rtp").unwrap();
-        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/AVPF"));
-        assert_eq!(entry.offer.ice.as_deref(), Some("force"));
+        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/AVP"));
+        assert_eq!(entry.offer.ice.as_deref(), Some("remove"));
+        assert!(entry.offer.dtls.is_none());
+        assert_eq!(entry.offer.rtcp_mux, vec!["demux"]);
+        assert_eq!(entry.offer.direction, vec!["external", "internal"]);
+    }
+
+    #[test]
+    fn ws_to_rtp_answer_flags() {
+        let registry = ProfileRegistry::new();
+        let entry = registry.get("ws_to_rtp").unwrap();
+        assert_eq!(entry.answer.transport_protocol.as_deref(), Some("RTP/AVPF"));
+        assert_eq!(entry.answer.ice.as_deref(), Some("force"));
+        assert!(entry.answer.dtls.is_none());
+        assert_eq!(entry.answer.direction, vec!["internal", "external"]);
     }
 
     #[test]
     fn wss_to_rtp_offer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("wss_to_rtp").unwrap();
-        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/SAVPF"));
-        assert_eq!(entry.offer.ice.as_deref(), Some("force"));
-        assert_eq!(entry.offer.dtls.as_deref(), Some("passive"));
+        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/AVP"));
+        assert_eq!(entry.offer.ice.as_deref(), Some("remove"));
+        assert_eq!(entry.offer.dtls.as_deref(), Some("off"));
+        assert_eq!(entry.offer.rtcp_mux, vec!["demux"]);
+        assert_eq!(entry.offer.direction, vec!["external", "internal"]);
     }
 
     #[test]
     fn wss_to_rtp_answer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("wss_to_rtp").unwrap();
-        assert_eq!(entry.answer.transport_protocol.as_deref(), Some("RTP/AVP"));
-        assert_eq!(entry.answer.ice.as_deref(), Some("remove"));
-        assert_eq!(entry.answer.dtls.as_deref(), Some("off"));
+        // The full RFC 5764 protocol string: `RTP/SAVPF` alone names SDES keying.
+        assert_eq!(
+            entry.answer.transport_protocol.as_deref(),
+            Some("UDP/TLS/RTP/SAVPF")
+        );
+        assert_eq!(entry.answer.ice.as_deref(), Some("force"));
+        // No role is imposed: the engine answers a browser's `actpass` as `active`, as
+        // RFC 5763 §5 recommends.
+        assert!(entry.answer.dtls.is_none());
+        // A browser requires RTP/RTCP multiplexing (RFC 9429 §4.1.1).
+        assert_eq!(entry.answer.rtcp_mux, vec!["require"]);
+        assert_eq!(entry.answer.direction, vec!["internal", "external"]);
     }
 
     #[test]
@@ -1372,6 +1412,7 @@ mod tests {
         assert!(keys.contains(&"transport-protocol"));
         assert!(keys.contains(&"ICE"));
         assert!(keys.contains(&"DTLS"));
+        assert!(keys.contains(&"rtcp-mux"));
         assert!(keys.contains(&"replace"));
         assert!(keys.contains(&"direction"));
         // No flags for WSS offer.
