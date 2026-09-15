@@ -95,7 +95,7 @@
       "originate": {
         "doc": "Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.",
         "kind": "method_descriptor",
-        "sig": "($self, to, from_uri=None, from_display=None, to_display=None, next_hop=None, p_asserted_identity=None, privacy=None, headers=None, sdp=None, media=False, profile=None, ws_uri=None, timeout=30, body=None, content_type=None)"
+        "sig": "($self, to, from_uri=None, from_display=None, to_display=None, next_hop=None, p_asserted_identity=None, privacy=None, headers=None, sdp=None, media=False, profile=None, ws_uri=None, timeout=30, body=None, content_type=None, session_timer=None)"
       },
       "refer": {
         "kind": "method_descriptor",
@@ -333,7 +333,7 @@
         "kind": "getset_descriptor"
       },
       "session_timer": {
-        "doc": "Set per-call session timer parameters (overrides global config).",
+        "doc": "Run an RFC 4028 session timer on this call, over the `session_timer:` block.",
         "kind": "method_descriptor",
         "sig": "($self, expires=1800, min_se=90, refresher=\"b2bua\")"
       },

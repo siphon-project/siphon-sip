@@ -25,6 +25,43 @@ pub fn forward_update_response(
     if let Some(direction) = update_direction {
         let is_a2b = direction == "a2b";
 
+        // The response as the responder sent it: its Session-Expires decides the
+        // session timer of the responder's dialog.
+        let responder_headers = message.headers.clone();
+
+        // An UPDATE siphon originated (a session refresh) has no originator to
+        // relay the response to, which its tracking leg says by carrying no stored
+        // Via. Its response only moves the session timer on.
+        if snapshot.b_leg_stored_vias.is_empty() {
+            if let Some(index) = snapshot.b_leg_index {
+                if (200..300).contains(&status_code) {
+                    state.call_actors.set_b_leg_target_uri(
+                        call_id,
+                        index,
+                        format!("update_done:{direction}"),
+                    );
+                } else if status_code >= 300 {
+                    state.call_actors.remove_b_leg(call_id, index);
+                }
+            }
+            session_timer_on_response(
+                call_id,
+                !is_a2b,
+                &snapshot.branch,
+                status_code,
+                &responder_headers,
+                snapshot.b_leg_request_session_expires,
+                state,
+            );
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                direction = direction,
+                "B2BUA: absorbed the response to a siphon-originated UPDATE"
+            );
+            return true;
+        }
+
         // 4th element: the responder leg's anchored egress socket (see the
         // re-INVITE response path above).
         let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
@@ -193,8 +230,25 @@ pub fn forward_update_response(
                 &message.body,
             );
 
-            // Session timer refresh on successful UPDATE (RFC 4028 §10).
-            state.call_actors.reset_session_timer(call_id);
+            // The 2xx refreshes both dialogs the UPDATE crossed: the responder's
+            // from its own 2xx (RFC 4028 §7.2), and the originator's with siphon's
+            // answer on the copy relayed there (§9).
+            session_timer_on_response(
+                call_id,
+                !is_a2b,
+                &snapshot.branch,
+                status_code,
+                &responder_headers,
+                snapshot.b_leg_request_session_expires,
+                state,
+            );
+            negotiate_relayed_session_timer(
+                call_id,
+                is_a2b,
+                snapshot.b_leg_session_refresh_request.as_ref(),
+                &mut message.headers,
+                state,
+            );
 
             // Mark the UPDATE entry done so retransmitted 2xx can be absorbed.
             if let Some(idx) = snapshot.b_leg_index {
@@ -211,6 +265,16 @@ pub fn forward_update_response(
             if let Some(idx) = snapshot.b_leg_index {
                 state.call_actors.remove_b_leg(call_id, idx);
             }
+            // A 422 still teaches the responder's dialog its Min-SE (RFC 4028 §7.4).
+            session_timer_on_response(
+                call_id,
+                !is_a2b,
+                &snapshot.branch,
+                status_code,
+                &responder_headers,
+                snapshot.b_leg_request_session_expires,
+                state,
+            );
         }
 
         // Forward response to the originator.

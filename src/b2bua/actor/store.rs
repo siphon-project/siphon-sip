@@ -19,6 +19,7 @@ use super::*;
 mod failure;
 mod fork;
 mod route_progress;
+mod session_timer;
 
 /// How long a torn-down call's SIP Call-IDs stay answerable with 481.
 ///
@@ -902,20 +903,6 @@ impl CallActorStore {
     pub fn set_a_leg_invite(&self, call_id: &str, message: Arc<Mutex<SipMessage>>) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.set_a_leg_invite(message);
-        }
-    }
-
-    /// Set session timer state.
-    pub fn set_session_timer(&self, call_id: &str, timer: SessionTimerState) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.set_session_timer(timer);
-        }
-    }
-
-    /// Reset session timer.
-    pub fn reset_session_timer(&self, call_id: &str) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.reset_session_timer();
         }
     }
 

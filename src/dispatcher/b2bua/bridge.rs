@@ -676,13 +676,14 @@ pub fn handle_bridge_reinvite_response(
     branch: &str,
     message: &SipMessage,
     status_code: u16,
-    a_leg: &Leg,
-    b_leg_index: Option<usize>,
+    snapshot: &BLegResponseSnapshot,
     state: &DispatcherState,
 ) {
     if status_code < 200 {
         return;
     }
+    let a_leg = &snapshot.a_leg;
+    let b_leg_index = snapshot.b_leg_index;
     let success = (200..300).contains(&status_code);
     let ack_branch = if success {
         TransactionKey::generate_branch()
@@ -717,7 +718,26 @@ pub fn handle_bridge_reinvite_response(
         }
     }
     state.call_actors.set_pending_reinvite(call_id, true, false);
-    state.call_actors.reset_session_timer(call_id);
+    // A final response to a re-INVITE siphon sent on the leg's dialog, which
+    // asked for the dialog's session timer: a 2xx sets it, refresher included
+    // (RFC 4028 §7.2), and makes the offer it accepted the session in force
+    // there.
+    if success {
+        if let Some(offer) = &snapshot.b_leg_offered_sdp {
+            state
+                .call_actors
+                .set_leg_sent_sdp(call_id, true, offer.clone());
+        }
+    }
+    session_timer_on_response(
+        call_id,
+        true,
+        branch,
+        status_code,
+        &message.headers,
+        snapshot.b_leg_request_session_expires,
+        state,
+    );
 
     match stage {
         // The hold offer an `unbridge` sent. The leg is only *parted* now that

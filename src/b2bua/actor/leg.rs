@@ -19,15 +19,39 @@ use super::*;
 
 // ---------------------------------------------------------------------------
 
-/// Tracks the negotiated session timer state for a call (RFC 4028).
+/// The RFC 4028 session timer of one dialog: its session interval, which side
+/// refreshes, and when the session was last refreshed (§7.2, §9). The rules that
+/// drive it are in [`crate::b2bua::session_timer`].
 #[derive(Debug, Clone)]
 pub struct SessionTimerState {
-    /// Negotiated Session-Expires value in seconds.
+    /// The session interval in seconds: the `Session-Expires` of the most recent
+    /// 2xx to a session refresh request on the dialog.
     pub session_expires: u32,
-    /// Who is refreshing: "uac" or "uas" (RFC 4028).
-    pub refresher: String,
-    /// When the timer was last reset (on 200 OK or successful refresh).
+    /// Whether siphon is the refresher on the dialog. The `refresher` parameter
+    /// names a role in the transaction that set it, so the same value names
+    /// siphon on one dialog of a call and the other party on the other.
+    pub siphon_refreshes: bool,
+    /// The dialog's `Min-SE`: the largest of siphon's own minimum and any
+    /// received on the dialog in a 422 or a session refresh request (§7.4).
+    pub min_se: u32,
+    /// When the 2xx that last refreshed the session was sent or received.
     pub last_refresh: std::time::Instant,
+    /// siphon's refresh on the dialog that has not had a final response.
+    pub refresh_in_flight: Option<RefreshInFlight>,
+    /// When siphon tries again after a refused refresh. `None` means at half the
+    /// session interval.
+    pub retry_at: Option<std::time::Instant>,
+}
+
+/// A session refresh siphon sent and has not had a final response to.
+#[derive(Debug, Clone)]
+pub struct RefreshInFlight {
+    /// The refresh's Via branch, which its response carries.
+    pub branch: String,
+    /// When it went out.
+    pub sent_at: std::time::Instant,
+    /// The session interval its `Session-Expires` asked for, in seconds.
+    pub session_expires: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +140,12 @@ pub struct Dialog {
     /// so a held call stays held and an unchanged session keeps its `o=` version
     /// (RFC 3264 §8). `None` until siphon has sent the peer a session description.
     pub last_sent_sdp: Option<Vec<u8>>,
+    /// The RFC 4028 session timer of this dialog, negotiated by the 2xx of the
+    /// last session refresh request on it. `None` when the dialog runs none.
+    pub session_timer: Option<SessionTimerState>,
+    /// Whether the peer on this dialog listed UPDATE in its `Allow`, which makes
+    /// a session refresh without an offer an UPDATE (RFC 4028 §7.4).
+    pub peer_allows_update: bool,
 }
 impl Dialog {
     /// Create a new outbound dialog (B-leg / UAC side).
@@ -136,6 +166,8 @@ impl Dialog {
             sdp_session_id: generate_sdp_session_id(),
             sdp_version: 0,
             last_sent_sdp: None,
+            session_timer: None,
+            peer_allows_update: false,
         }
     }
 
@@ -158,6 +190,8 @@ impl Dialog {
             sdp_session_id: generate_sdp_session_id(),
             sdp_version: 0,
             last_sent_sdp: None,
+            session_timer: None,
+            peer_allows_update: false,
         }
     }
 
@@ -339,6 +373,19 @@ pub struct Leg {
     /// responder accepts it with a 2xx, so a refused offer, a hold the far end
     /// turned down, never becomes what a later session refresh offers again.
     pub offered_sdp: Option<Vec<u8>>,
+    /// On a B-leg: the SDP of the last early media response from it that siphon
+    /// relayed to the caller, as the caller got it. The session description in
+    /// force on the caller's dialog when this leg answers with a 2xx that carries
+    /// none.
+    pub early_answer_sent: Option<Vec<u8>>,
+    /// On a re-INVITE or UPDATE tracking leg: the session interval the request's
+    /// `Session-Expires` asked for, which a 2xx without one leaves siphon
+    /// refreshing at (RFC 4028 §7.2).
+    pub request_session_expires: Option<u32>,
+    /// On a tracking leg for a relayed re-INVITE or UPDATE: the originator's
+    /// `Session-Expires`, `Min-SE`, `Supported` and `Require`, from which siphon
+    /// answers the refresh on the originator's dialog (RFC 4028 §9).
+    pub session_refresh_request: Option<crate::sip::headers::SipHeaders>,
 }
 impl Leg {
     /// Create a new A-leg from an inbound INVITE.
@@ -366,6 +413,9 @@ impl Leg {
             pending_cancel: false,
             auth_challenged: false,
             offered_sdp: None,
+            early_answer_sent: None,
+            request_session_expires: None,
+            session_refresh_request: None,
         }
     }
 
@@ -417,6 +467,9 @@ impl Leg {
             pending_cancel: false,
             auth_challenged: false,
             offered_sdp: None,
+            early_answer_sent: None,
+            request_session_expires: None,
+            session_refresh_request: None,
         }
     }
 

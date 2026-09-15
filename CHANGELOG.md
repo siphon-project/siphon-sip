@@ -542,6 +542,56 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   still needs a restart, and the reload fails saying so. Declaring one name twice in one load is
   still an error, and a metric keeps the help text it was first registered with.
 
+- **A B2BUA call honours the RFC 4028 session timer refresher negotiated on each of its dialogs.**
+  siphon ran one timer per call. It refreshed only the callee, and only when the callee's 2xx
+  carried no `refresher`, so a callee answering `refresher=uac`, which names siphon, was never
+  refreshed and ended the call at expiry. The caller was sent the callee's `Session-Expires`, which
+  describes the other dialog, and never refreshed when that said `refresher=uas`. Each dialog now
+  has its own timer. The callee's comes from its 2xx (§7.2). The caller's comes from the caller's
+  INVITE (§9 Table 2): the interval is never raised or taken below the caller's `Min-SE`, a
+  refresher the caller chose stands, and a caller without timer support is refreshed by siphon.
+  siphon refreshes the dialogs it is the refresher of, on that leg's own dialog with the session
+  description in force there. It ends the call a third of the interval (at most 32 s) before a
+  session the other side refreshes runs out (§10). A refresh answered 408 or 481, or unanswered for
+  64*T1, ends the call; one answered 422 is retried at the larger `Min-SE`; any other failure is
+  retried before expiry. Every such ending goes through the call's one teardown, so a caller that
+  has not ACKed its 2xx gets its BYE after the ACK (RFC 3261 §15), and a call another teardown has
+  claimed is left to it. Sending a refresh no longer counts as one.
+  `session_timer.refresher` and `call.session_timer(refresher=...)` were accepted and never read.
+  They are now the preference where the negotiation leaves siphon the choice: `uac` (siphon
+  refreshes the callee, the caller refreshes itself), `uas` (the reverse) or `b2bua` (siphon
+  refreshes both). `call.session_timer()` raises `ValueError` for anything else, and runs a timer
+  without a `session_timer:` block, where before it was ignored. Early media SDP relayed to the
+  caller is the session in force when the 2xx carries none. On a dialog with no session description
+  in force, a refresh is an UPDATE without a body toward a peer that allows UPDATE, otherwise a
+  re-INVITE without an offer. siphon relays the offer that re-INVITE's 2xx brings to the other party
+  in a re-INVITE on that party's dialog, through the media engine where the call is anchored, and
+  puts that party's answer in the ACK, so media continues as the two agree. A party that refuses the
+  relayed offer or never answers it ends the call through its teardown, the held ACK going out with
+  every stream rejected ahead of the BYE. A call siphon answers itself (`call.answer()`, a
+  handover's answer, the control plane's) negotiates the caller's timer from its INVITE the same
+  way, a `call.session_timer()` set before `call.answer()` included. A call siphon places asks for
+  the configured timer, or the one `b2bua.originate(session_timer={...})` sets, and takes the
+  refresher from the callee's 2xx. Every re-INVITE siphon sends on a dialog of its own accord (a
+  bridge step, a transfer's media re-INVITE) carries that dialog's timer or asks for siphon's, and
+  its 2xx sets the timer, so bridged legs are refreshed and released like any other. An SDP siphon
+  sent as it was given (a script's or media engine's answer, an originate's offer) keeps its own
+  `o=` session id, so a refresh offers it unchanged. In-dialog re-INVITEs and UPDATEs siphon
+  originates are now retransmitted over UDP, each copy captured to HEP like the first. The admin
+  API's call `session_timer` changes shape: `{caller, callee}`, one object per dialog or `null`,
+  with `refresher` now `siphon` or `peer`.
+
+- **A B2BUA refuses a session interval below its minimum with 422 Session Interval Too Small (RFC
+  4028 §9).** A party that supports session timers and asked for a `Session-Expires` below siphon's
+  `min_se` (the `session_timer:` block's, or `call.session_timer(min_se=...)`) was taken at that
+  interval, and siphon's own refreshes then raised it. siphon now answers 422 with its minimum in
+  `Min-SE`, so the party can retry at that interval (§7.3). An initial INVITE is refused once the
+  script has decided, before the call is dialled, handed over or answered (`call.answer()`
+  included), and the call ends like any call that never connected (CDR, media, Ro reservation)
+  without running `@b2bua.on_failure`. A re-INVITE or UPDATE refresh from either party is refused
+  on its own dialog and not relayed, and the call carries on. A party without timer support cannot
+  act on a 422, so its request is taken as before.
+
 - **The built-in `ws_to_rtp` and `wss_to_rtp` profiles had their halves the wrong way round.** A
   profile's offer half shapes the SDP the media engine offers to the answerer, and its answer half
   the SDP it answers the offerer with. Both profiles offered the RTP core the WebSocket UE's own

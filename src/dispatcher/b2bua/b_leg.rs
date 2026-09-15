@@ -482,22 +482,17 @@ pub fn b2bua_send_b_leg_invite(
     // caller's `Min-SE: 300` is not a longer list, it is two contradictory
     // floors, and which one the far end honours is undefined. Getting the lower
     // one through negotiates a refresh below the interval the caller demanded.
-    let session_timer = per_call_override
-        .as_ref()
-        .map(|override_config| (override_config.session_expires, override_config.min_se))
-        .or_else(|| {
-            state
-                .session_timer_config
-                .as_ref()
-                .filter(|timer_config| timer_config.enabled)
-                .map(|timer_config| (timer_config.session_expires, timer_config.min_se))
-        });
-    if let Some((session_expires, min_se)) = session_timer {
-        b_leg_invite.headers.set(
-            "Session-Expires",
-            format!("{session_expires};refresher=uac"),
-        );
-        b_leg_invite.headers.set("Min-SE", min_se.to_string());
+    //
+    // The refresher parameter is the configured preference as a UAC may state it
+    // (RFC 4028 §7.1): `refresher=uac` where siphon would refresh, left out where
+    // it would have the callee refresh.
+    if let Some(policy) = session_timer_policy_for(state, per_call_override.as_ref()) {
+        b_leg_invite
+            .headers
+            .set("Session-Expires", policy.uac_request_value());
+        b_leg_invite
+            .headers
+            .set("Min-SE", policy.min_se.to_string());
         // `Supported` *is* a list header (RFC 3261 §7.3.1), so a second line is
         // legal — but it is still the same option tag twice on the wire. Merge
         // the tag into the `Supported` already settled on above instead.

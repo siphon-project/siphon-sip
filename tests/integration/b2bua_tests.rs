@@ -914,44 +914,39 @@ fn session_timer_state_lifecycle() {
     let call_id = store.create_call(a_leg);
 
     // No timer initially
-    {
-        let call = store.get_call(&call_id).unwrap();
-        assert!(call.session_timer.is_none());
-    }
+    assert!(store.leg_session_timer(&call_id, true).is_none());
 
     // Add B-leg and set to Answered
     let b_leg = make_b_leg("10.0.0.2:5060");
     store.add_b_leg(&call_id, b_leg);
     store.set_winner(&call_id, 0);
+    assert!(store.leg_session_timer(&call_id, false).is_none());
 
-    // Activate session timer (simulating 200 OK processing)
-    let timer = SessionTimerState {
-        session_expires: 1800,
-        refresher: "b2bua".to_string(),
-        last_refresh: std::time::Instant::now(),
-    };
-    store.set_session_timer(&call_id, timer);
+    // Activate the callee dialog's session timer (simulating 200 OK processing:
+    // the callee's 2xx named siphon the refresher)
+    let timer = SessionTimerState::new(1800, true, 90, std::time::Instant::now());
+    store.set_leg_session_timer(&call_id, false, Some(timer));
 
-    // Verify timer is active
+    // Verify timer is active on the callee's dialog only
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
-        let timer = call.session_timer.as_ref().unwrap();
-        assert_eq!(timer.session_expires, 1800);
-        assert_eq!(timer.refresher, "b2bua");
     }
+    let timer = store.leg_session_timer(&call_id, false).unwrap();
+    assert_eq!(timer.session_expires, 1800);
+    assert!(timer.siphon_refreshes);
+    assert!(store.leg_session_timer(&call_id, true).is_none());
 
-    // Reset timer (simulating successful refresh)
-    let before = {
-        let call = store.get_call(&call_id).unwrap();
-        call.session_timer.as_ref().unwrap().last_refresh
-    };
+    // Refresh the session (simulating a 2xx to a refresh)
+    let before = timer.last_refresh;
     std::thread::sleep(std::time::Duration::from_millis(10));
-    store.reset_session_timer(&call_id);
-    let after = {
-        let call = store.get_call(&call_id).unwrap();
-        call.session_timer.as_ref().unwrap().last_refresh
-    };
+    assert!(store.update_leg_session_timer(&call_id, false, |timer| {
+        timer.last_refresh = std::time::Instant::now()
+    }));
+    let after = store
+        .leg_session_timer(&call_id, false)
+        .unwrap()
+        .last_refresh;
     assert!(after > before);
 
     // Remove call cleans up timer
@@ -961,6 +956,7 @@ fn session_timer_state_lifecycle() {
 
 #[test]
 fn session_timer_per_call_override_on_call_actor_store() {
+    use siphon::config::SessionRefresher;
     use siphon::script::api::call::SessionTimerOverride;
 
     let store = CallActorStore::new();
@@ -972,7 +968,7 @@ fn session_timer_per_call_override_on_call_actor_store() {
         call_ref.session_timer_override = Some(SessionTimerOverride {
             session_expires: 3600,
             min_se: 120,
-            refresher: "uas".to_string(),
+            refresher: SessionRefresher::Uas,
         });
     }
 
@@ -981,7 +977,7 @@ fn session_timer_per_call_override_on_call_actor_store() {
     let stored = call_ref.session_timer_override.as_ref().unwrap();
     assert_eq!(stored.session_expires, 3600);
     assert_eq!(stored.min_se, 120);
-    assert_eq!(stored.refresher, "uas");
+    assert_eq!(stored.refresher, SessionRefresher::Uas);
 }
 
 // ---------------------------------------------------------------------------

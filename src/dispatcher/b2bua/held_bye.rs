@@ -85,7 +85,17 @@ pub fn send_or_hold_bye(
         return;
     }
 
-    if let Some(held_ack) = take_held_ack_rejecting_offer(internal_call_id, leg, state) {
+    // An ACK held for an offer: the callee's delayed offer, or the offer a peer
+    // answered siphon's offerless session refresh with.
+    let held_ack = take_held_ack_rejecting_offer(internal_call_id, leg, state)
+        .map(|held| HeldAck {
+            ack: held.ack,
+            transport: held.transport,
+            destination: held.destination,
+            local_addr: held.local_addr,
+        })
+        .or_else(|| take_held_refresh_ack_rejecting_offer(internal_call_id, leg, state));
+    if let Some(held_ack) = held_ack {
         // One ordered unit when they share a next hop: sent separately over UDP
         // they can reach the peer BYE first, for a dialog it has not yet seen
         // confirmed.

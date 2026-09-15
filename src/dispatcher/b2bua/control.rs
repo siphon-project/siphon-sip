@@ -299,6 +299,14 @@ pub fn send_uas_response(
     content_type: Option<&str>,
     final_response: bool,
 ) -> bool {
+    // RFC 4028 §9: an INVITE asking for too brief a session interval is answered
+    // 422, never 2xx, and the call ends.
+    if final_response && (200..300).contains(&code) {
+        if let Some(response) = session_interval_refusal(state, internal_call_id, invite) {
+            end_failed_call(internal_call_id, FailedCallEnd::Refusal { response }, state);
+            return false;
+        }
+    }
     let (transport, remote_addr, connection_id, local_addr, local_tag) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
@@ -378,10 +386,17 @@ pub fn send_uas_response(
     // ring on until it gave up. Cancelled by the caller's ACK in the A-leg ACK
     // handler (search `uas_2xx_retransmits`).
     // An answer siphon gives the caller itself is the session description in
-    // force on the caller's dialog. A provisional's early media is not, until a
-    // 2xx confirms it.
+    // force on the caller's dialog, under the `o=` it went out with. A
+    // provisional's early media is not, until a 2xx confirms it. The 2xx answers
+    // the caller's request for a session timer as well (RFC 4028 §9).
     if final_response && (200..300).contains(&code) {
-        record_sdp_sent_to_leg(
+        negotiate_uas_answer_session_timer(
+            internal_call_id,
+            Some(&invite.headers),
+            &mut response.headers,
+            state,
+        );
+        adopt_sdp_sent_to_leg(
             state,
             internal_call_id,
             true,

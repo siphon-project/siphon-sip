@@ -138,30 +138,27 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
     }
 }
 
-/// RFC 4028 §10: re-INVITE each session whose refresh is due, and end the
-/// ones nothing refreshed.
+/// RFC 4028 §10: refresh each session whose refresh is due, and end the ones
+/// nothing refreshed.
+///
+/// Runs whether or not a `session_timer:` block is configured: a script's
+/// `call.session_timer()` runs a session timer on a call without one. A call
+/// with no session timer costs the sweep one check.
 pub fn spawn_session_timer_refresh(state: &Arc<DispatcherState>) {
-    // Spawn background task: RFC 4028 session timer refresh
-    if state
-        .session_timer_config
-        .as_ref()
-        .is_some_and(|c| c.enabled)
-    {
-        let state = Arc::clone(state);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                // Run in spawn_blocking since it accesses DashMap and may build SIP messages
-                let state = Arc::clone(&state);
-                tokio::task::spawn_blocking(move || {
-                    session_timer_sweep(&state);
-                })
-                .await
-                .ok();
-            }
-        });
-    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            // Run in spawn_blocking since it accesses DashMap and may build SIP messages
+            let state = Arc::clone(&state);
+            tokio::task::spawn_blocking(move || {
+                session_timer_sweep(&state);
+            })
+            .await
+            .ok();
+        }
+    });
 }
 
 /// Registration state changes to the script's `@registrar.on_change`, and

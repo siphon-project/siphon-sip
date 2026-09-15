@@ -675,6 +675,7 @@ class MockB2bua:
         timeout: int = 30,
         body: Optional[Union[str, bytes]] = None,
         content_type: Optional[str] = None,
+        session_timer: Optional[dict] = None,
     ) -> str:
         """Place an outbound call siphon owns, with no inbound INVITE behind it.
 
@@ -736,6 +737,13 @@ class MockB2bua:
             content_type: Content-Type for ``body`` (e.g.
                 ``"multipart/mixed;boundary=…"``). Defaults to
                 ``"application/sdp"``, which makes ``body`` identical to ``sdp``.
+            session_timer: the RFC 4028 session timer to run on the call, over
+                the ``session_timer:`` block: a dict with ``expires``,
+                ``min_se`` and ``refresher``, each defaulting as in
+                ``call.session_timer()`` (1800, 90, ``"b2bua"``). The INVITE asks
+                for it, the callee's 2xx decides who refreshes, and siphon
+                refreshes the dialog or ends the call at expiry. ``None`` runs the
+                configured timer, if any.
 
         Returns:
             str: the new leg's SIP Call-ID.
@@ -801,10 +809,31 @@ class MockB2bua:
                 f"got '{privacy}'"
             )
 
+        timer = None
+        if session_timer is not None:
+            unknown = set(session_timer) - {"expires", "min_se", "refresher"}
+            if unknown:
+                raise ValueError(
+                    "b2bua.originate session_timer= takes expires, min_se and "
+                    f"refresher, not {sorted(unknown)!r}"
+                )
+            refresher = str(session_timer.get("refresher", "b2bua")).lower()
+            if refresher not in ("uac", "uas", "b2bua"):
+                raise ValueError(
+                    'refresher must be "uac", "uas" or "b2bua", '
+                    f"not {session_timer.get('refresher')!r}"
+                )
+            timer = {
+                "expires": session_timer.get("expires", 1800),
+                "min_se": session_timer.get("min_se", 90),
+                "refresher": refresher,
+            }
+
         self._originate_seq += 1
         call_id = f"b2b-originate-{self._originate_seq}"
         self.originates.append({
             "call_id": call_id,
+            "session_timer": timer,
             "to": to,
             "from_uri": from_uri,
             "from_display": from_display,

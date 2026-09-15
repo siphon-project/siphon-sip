@@ -484,6 +484,17 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer up --abort-on-container-exit --exit-code-from sipp-b2bua-st-uac sipp-b2bua-st-uac sipp-b2bua-st-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-session-timer rm -sf sipp-b2bua-st-uac sipp-b2bua-st-uas 2>/dev/null || true
 
+  # RFC 4028 at the 90 s floor, on a dedicated instance (session_timer 90 s,
+  # refresher uac): siphon refreshes the callee's dialog at half the interval and
+  # ends the call when the caller, its own dialog's refresher, never refreshes.
+  # Runs through run_call.sh so the callee, which carries the refresh assertion,
+  # is graded too. Takes about 70 s.
+  echo "=== B2BUA session timer at the RFC 4028 floor (refresh, then expiry BYE) ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-session-timer-floor up -d --wait siphon-b2bua-session-timer-floor
+  run_sipp env COMPOSE_PROFILES=b2bua-session-timer-floor bash sipp/run_call.sh sipp-b2bua-session-timer-floor-uac sipp-b2bua-session-timer-floor-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-session-timer-floor rm -sf sipp-b2bua-session-timer-floor-uac sipp-b2bua-session-timer-floor-uas sipp-b2bua-session-timer-floor-register 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-session-timer-floor stop siphon-b2bua-session-timer-floor 2>/dev/null || true
+
   echo "=== B2BUA re-INVITE test (hold/resume) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true

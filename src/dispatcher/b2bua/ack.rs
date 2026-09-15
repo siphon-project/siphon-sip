@@ -566,6 +566,58 @@ pub fn stamp_b_leg_origin(
     crate::media::body::strip_sdp_attributes(content_type, body, &state.sdp_strip_attributes);
 }
 
+/// Absorb an ACK for a 2xx siphon sent on the dialog named `dialog_call_id`, and
+/// do what it releases. Returns `false` when the ACK belongs to no such dialog.
+///
+/// It confirms that dialog. The B-leg's 2xx was ACKed when it arrived (RFC 3261
+/// §13.2.2.4, see `ack_b_leg_2xx`), except when that 2xx carried the offer: its
+/// ACK has waited for the answer this ACK carries, and goes now. The ACK stops
+/// the retransmission of the 2xx siphon sent on this dialog (RFC 3261 §13.3.1.4);
+/// the store is keyed by the dialog's Call-ID. Removing the entry is also what
+/// keeps the 64*T1 sweep from ending the call: the sweep only acts on an entry it
+/// removes itself, so an ACK processed first always wins. No-op if none is armed
+/// (the ACK for a non-2xx).
+pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &DispatcherState) -> bool {
+    let acked_now = match state.uas_2xx_retransmits.remove(dialog_call_id) {
+        Some((_, unacked)) => {
+            unacked.cancel.notify_one();
+            true
+        }
+        None => false,
+    };
+    if let Some(internal_id) = state.call_actors.find_by_sip_call_id(dialog_call_id) {
+        // The leg carrying this dialog is confirmed, whichever slot a takeover
+        // has moved it to.
+        if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
+            if call.a_leg.dialog.call_id == dialog_call_id {
+                call.a_leg.initial_acked = true;
+            } else if let Some(leg) = call
+                .b_legs
+                .iter_mut()
+                .find(|leg| leg.dialog.call_id == dialog_call_id)
+            {
+                leg.initial_acked = true;
+            }
+        }
+        send_delayed_offer_ack(&internal_id, ack, state);
+        // A teardown that began while this ACK was on its way may have held the
+        // BYE for it (RFC 3261 §15): it goes out now, right after the ACK. Only
+        // the ACK that took the answer can find one.
+        if acked_now {
+            release_held_bye(dialog_call_id, state);
+        }
+        debug!(call_id = %internal_id, "B2BUA: absorbed A-leg ACK");
+        return true;
+    }
+    // The dialog has ended while its 2xx waited for this ACK, and its BYE was held
+    // for it (RFC 3261 §15): the ACK sends it.
+    if release_held_bye(dialog_call_id, state) || acked_now {
+        debug!(sip_call_id = %dialog_call_id, "B2BUA: ACK for a dialog that has ended");
+        return true;
+    }
+    false
+}
+
 /// Send the B-leg ACK held for a delayed offer (see `ack_b_leg_2xx`) with the
 /// answer the caller's ACK carries. Called for every caller ACK on a B2BUA call,
 /// and a no-op unless an ACK is still held.

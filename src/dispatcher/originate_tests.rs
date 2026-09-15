@@ -12,6 +12,7 @@ fn params(media: OriginateMedia) -> OriginateParams {
         headers: Vec::new(),
         timeout_secs: 30,
         media,
+        session_timer: None,
     }
 }
 
@@ -30,7 +31,7 @@ fn identity<'a>() -> OriginateIdentity<'a> {
 
 fn build_result(params: &OriginateParams) -> Result<SipMessage, OriginateError> {
     let uri = parse_uri_standalone(&params.to).expect("target parses");
-    build_originate_invite(params, uri, identity())
+    build_originate_invite(params, uri, identity(), None)
 }
 
 fn build(params: &OriginateParams) -> SipMessage {

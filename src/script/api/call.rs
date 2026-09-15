@@ -11,13 +11,7 @@ use pyo3::types::PyDict;
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
 
-/// Per-call session timer override set by Python scripts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionTimerOverride {
-    pub session_expires: u32,
-    pub min_se: u32,
-    pub refresher: String,
-}
+pub use super::session_timer::SessionTimerOverride;
 
 /// The action the script chose for this call.
 ///
@@ -1571,8 +1565,7 @@ impl PyCall {
     ///     await rtpengine.echo(call)
     /// ```
     ///
-    /// Synchronous — no `await` needed (the send is a queue push). The A-leg
-    /// dialog is confirmed and `@b2bua.on_bye` takes over when the UAC BYEs.
+    /// Synchronous (a queue push); `@b2bua.on_bye` takes over when the UAC BYEs.
     ///
     /// Args:
     ///     code: Final response status (must be 2xx).
@@ -1599,6 +1592,9 @@ impl PyCall {
         };
 
         let invite = self.locked_invite()?;
+        if let Some(timer) = &self.session_timer_override {
+            crate::dispatcher::b2bua_set_session_timer(&self.id, timer.clone());
+        }
         let sent = crate::dispatcher::b2bua_answer_call(
             &self.id,
             &invite,
@@ -1608,10 +1604,9 @@ impl PyCall {
             content_type,
         );
         if !sent {
-            tracing::error!(call_id = %self.id, "call.answer(): no live B2BUA call to answer");
+            tracing::error!(call_id = %self.id, "call.answer(): no 2xx sent: the call is gone, or its session interval was refused 422");
         }
-        // Marker so the dispatcher keeps the actor alive after the handler
-        // returns (the 2xx has already been sent by b2bua_answer_call).
+        // Keeps the actor alive after the handler returns: the 2xx is already sent.
         self.action = CallAction::Answered;
         Ok(())
     }
@@ -1956,17 +1951,20 @@ impl PyCall {
         self.max_duration_secs = Some(seconds);
     }
 
-    /// Set per-call session timer parameters (overrides global config).
+    /// Run an RFC 4028 session timer on this call, over the `session_timer:` block.
+    /// `refresher` is who siphon would have refresh each dialog where the
+    /// negotiation leaves it the choice: `"uac"` (siphon the callee, the caller
+    /// itself), `"uas"` (the callee itself, siphon the caller) or `"b2bua"`
+    /// (siphon both). Anything else raises `ValueError`.
     ///
     /// Usage in Python:
     ///   call.session_timer(expires=1800, min_se=90, refresher="b2bua")
     #[pyo3(signature = (expires=1800, min_se=90, refresher="b2bua"))]
-    pub fn session_timer(&mut self, expires: u32, min_se: u32, refresher: &str) {
-        self.session_timer_override = Some(SessionTimerOverride {
-            session_expires: expires,
-            min_se,
-            refresher: refresher.to_string(),
-        });
+    pub fn session_timer(&mut self, expires: u32, min_se: u32, refresher: &str) -> PyResult<()> {
+        self.session_timer_override = Some(SessionTimerOverride::from_script(
+            expires, min_se, refresher,
+        )?);
+        Ok(())
     }
 
     /// The carrier route that won an LCR sequence (`call.route(...)`), or `None`
@@ -3778,11 +3776,24 @@ mod tests {
         );
         assert!(call.session_timer_override().is_none());
 
-        call.session_timer(3600, 120, "uas");
+        call.session_timer(3600, 120, "UAS")
+            .expect("a refresher siphon negotiates");
         let override_config = call.session_timer_override().unwrap();
         assert_eq!(override_config.session_expires, 3600);
         assert_eq!(override_config.min_se, 120);
-        assert_eq!(override_config.refresher, "uas");
+        assert_eq!(
+            override_config.refresher,
+            crate::config::SessionRefresher::Uas
+        );
+
+        // A refresher siphon cannot negotiate is refused, and the override set
+        // before it stands.
+        assert!(call.session_timer(1800, 90, "sometimes").is_err());
+        assert_eq!(
+            call.session_timer_override()
+                .map(|config| config.session_expires),
+            Some(3600)
+        );
     }
 
     #[test]

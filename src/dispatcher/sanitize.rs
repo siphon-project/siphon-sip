@@ -434,6 +434,26 @@ pub(super) fn record_sdp_sent_to_leg(
     }
 }
 
+/// [`record_sdp_sent_to_leg`] for a session description siphon sent a leg as it
+/// was given, without putting its own `o=` on it: a script's or a media engine's
+/// answer, the offer of a call siphon placed. Its `o=` session id and version
+/// become the dialog's (RFC 3264 §8), so a session refresh offers it unchanged
+/// and a later SDP on the dialog keeps that session id.
+pub(super) fn adopt_sdp_sent_to_leg(
+    state: &DispatcherState,
+    call_id: &str,
+    on_a_leg: bool,
+    content_type: &str,
+    body: &[u8],
+) {
+    if let Some(sdp) = sdp_in_body(content_type, body) {
+        let origin = sdp_origin_identity(&sdp);
+        state
+            .call_actors
+            .adopt_leg_sent_sdp(call_id, on_a_leg, sdp, origin);
+    }
+}
+
 /// The `<sess-id>` and `<sess-version>` of an SDP's `o=` line, when the line has
 /// the six fields RFC 4566 §5.2 gives it.
 pub(super) fn sdp_origin_identity(sdp: &[u8]) -> Option<(u64, u64)> {

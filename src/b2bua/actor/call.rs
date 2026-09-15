@@ -274,9 +274,8 @@ pub struct CallActor {
     /// response back out the same listener (source-socket parity with the
     /// inbound-driven send path on a multi-homed host).
     pub a_leg_local_addr: Option<std::net::SocketAddr>,
-    /// RFC 4028 session timer state (set after 200 OK negotiation).
-    pub session_timer: Option<SessionTimerState>,
-    /// Per-call session timer override from Python script.
+    /// Per-call session timer override from Python script. The session timers
+    /// themselves are per dialog, on each leg ([`Dialog::session_timer`]).
     pub session_timer_override: Option<crate::script::api::call::SessionTimerOverride>,
     /// Active transfer context (REFER handling).
     pub transfer: Option<crate::b2bua::transfer::TransferContext>,
@@ -332,6 +331,11 @@ pub struct CallActor {
     /// then kept as sent so every retransmission of the 2xx gets it again. `None`
     /// for a call whose INVITE carried an offer: that 2xx is ACKed on arrival.
     pub delayed_offer_ack: Option<DelayedOfferAck>,
+    /// The ACKs held for 2xx responses that brought an offer back to siphon's
+    /// offerless session refresh of a dialog, one per refresh, while the other
+    /// party answers that offer (RFC 3261 §13.2.2.4). Kept once sent, so copies of
+    /// the 2xx get the same ACK.
+    pub refresh_offer_relays: Vec<RefreshOfferRelay>,
     /// Set by the first teardown to take this call over
     /// ([`CallActorStore::claim_teardown`]): only that teardown sends BYEs and
     /// removes the call, so two racing each other cannot BYE a leg twice.
@@ -503,7 +507,6 @@ impl CallActor {
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
             a_leg_local_addr: None,
-            session_timer: None,
             session_timer_override: None,
             transfer: None,
             pending_replaces: None,
@@ -518,6 +521,7 @@ impl CallActor {
             contact_override: None,
             script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,
+            refresh_offer_relays: Vec::new(),
             teardown_claimed: false,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
@@ -1238,18 +1242,6 @@ impl CallActor {
         self.a_leg_invite = Some(message);
     }
 
-    /// Set session timer state.
-    pub fn set_session_timer(&mut self, timer: SessionTimerState) {
-        self.session_timer = Some(timer);
-    }
-
-    /// Reset session timer's last_refresh.
-    pub fn reset_session_timer(&mut self) {
-        if let Some(ref mut timer) = self.session_timer {
-            timer.last_refresh = std::time::Instant::now();
-        }
-    }
-
     /// Set the actor handle for a B-leg.
     pub fn set_b_leg_handle(&mut self, index: usize, handle: LegHandle) {
         if index < self.b_leg_handles.len() {
@@ -1365,5 +1357,33 @@ pub struct DelayedOfferAck {
     /// The B-leg that sent the 2xx.
     pub b_leg_index: usize,
     /// Whether the ACK has gone out. Until it has, copies of the 2xx are absorbed.
+    pub sent: bool,
+}
+
+/// The ACK owed to a 2xx that brought an offer back to siphon's offerless session
+/// refresh, while that offer is out to the other party of the call for the answer
+/// the ACK has to carry (see `CallActor::refresh_offer_relays`).
+#[derive(Debug, Clone)]
+pub struct RefreshOfferRelay {
+    /// Whether the refreshed dialog is the A-leg's.
+    pub refreshed_on_a_leg: bool,
+    /// The Via branch of siphon's refresh, which copies of its 2xx carry.
+    pub refresh_branch: String,
+    /// The 2xx's headers as they arrived, which set the refreshed dialog's session
+    /// timer once its ACK goes out.
+    pub refresh_answer_headers: crate::sip::headers::SipHeaders,
+    /// The Via branch of the re-INVITE carrying the offer to the other party.
+    pub relay_branch: Option<String>,
+    /// The ACK, built from the 2xx. Carries the answer once `sent`.
+    pub ack: crate::sip::message::SipMessage,
+    /// The offer the 2xx carried, as it arrived.
+    pub offer: Vec<u8>,
+    pub transport: crate::transport::Transport,
+    /// The ACK's next hop.
+    pub destination: std::net::SocketAddr,
+    pub connection_id: crate::transport::ConnectionId,
+    /// The socket the refreshed dialog is anchored on.
+    pub local_addr: Option<std::net::SocketAddr>,
+    /// Whether the ACK has gone out.
     pub sent: bool,
 }

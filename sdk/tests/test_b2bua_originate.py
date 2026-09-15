@@ -219,3 +219,48 @@ def reminders():
         assert harness.b2bua.originates
         harness.reset()
         assert harness.b2bua.originates == []
+
+    def test_a_session_timer_is_recorded_with_the_runtime_defaults(self, harness):
+        # RFC 4028: the INVITE asks for this session timer, over the
+        # session_timer: block. Keys left out default as in call.session_timer().
+        import siphon
+
+        siphon.b2bua.originate(
+            to="sip:1@carrier.example",
+            media=True,
+            session_timer={"expires": 90, "refresher": "UAC"},
+        )
+        placed = harness.b2bua.originates[-1]
+        assert placed["session_timer"] == {
+            "expires": 90,
+            "min_se": 90,
+            "refresher": "uac",
+        }
+
+    def test_no_session_timer_is_recorded_as_none(self, harness):
+        import siphon
+
+        siphon.b2bua.originate(to="sip:1@carrier.example", media=True)
+        assert harness.b2bua.originates[-1]["session_timer"] is None
+
+    def test_an_unknown_session_timer_key_is_a_hard_error(self, harness):
+        import siphon
+
+        with pytest.raises(ValueError, match="session_timer"):
+            siphon.b2bua.originate(
+                to="sip:1@carrier.example",
+                media=True,
+                session_timer={"interval": 90},
+            )
+        assert harness.b2bua.originates == []
+
+    def test_an_unknown_session_timer_refresher_is_a_hard_error(self, harness):
+        import siphon
+
+        with pytest.raises(ValueError, match="refresher"):
+            siphon.b2bua.originate(
+                to="sip:1@carrier.example",
+                media=True,
+                session_timer={"refresher": "sometimes"},
+            )
+        assert harness.b2bua.originates == []

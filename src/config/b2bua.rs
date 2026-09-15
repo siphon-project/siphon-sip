@@ -186,9 +186,9 @@ impl B2buaConfig {
 
 /// RFC 4028 session timer configuration for B2BUA mode.
 ///
-/// Session timers prevent resource leaks from calls whose BYE was lost.
-/// The B2BUA sends periodic re-INVITEs to keep the session alive and tears
-/// down calls that fail to refresh within the negotiated interval.
+/// Session timers prevent resource leaks from calls whose BYE was lost. siphon
+/// negotiates a session timer on each dialog of a call, refreshes the dialogs it
+/// is the refresher of, and ends a call whose session runs out on either dialog.
 ///
 /// Example siphon.yaml:
 /// ```yaml
@@ -206,7 +206,8 @@ pub struct SessionTimerConfig {
     /// Minimum acceptable Session-Expires (Min-SE header). Default: 90.
     #[serde(default = "default_min_se")]
     pub min_se: u32,
-    /// Who sends the refresh re-INVITE: uac (default) or uas.
+    /// Who siphon would have refresh each dialog, where the negotiation leaves it
+    /// the choice: uac (default), uas or b2bua. See [`SessionRefresher`].
     #[serde(default = "default_refresher")]
     pub refresher: SessionRefresher,
     /// Enable/disable session timers entirely. Default: true.
@@ -214,16 +215,36 @@ pub struct SessionTimerConfig {
     pub enabled: bool,
 }
 
-/// Who is responsible for sending refresh re-INVITEs (RFC 4028).
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+/// Who siphon would have refresh the session on each dialog of a call (RFC 4028).
+///
+/// A preference, not a decision: the refresher of a dialog is what the 2xx that
+/// negotiated it says. siphon asks for its preference where RFC 4028 lets it
+/// choose, and a caller that chose its own refresher, or cannot refresh at all,
+/// keeps what §9 gives it. On the callee's dialog siphon is the UAC of the
+/// INVITE, on the caller's the UAS.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionRefresher {
-    /// The calling party (UAC) refreshes (default).
+    /// The UAC of each dialog refreshes (default): siphon refreshes the callee,
+    /// and the caller refreshes itself.
     Uac,
-    /// The called party (UAS) refreshes.
+    /// The UAS of each dialog refreshes: the callee refreshes itself, and siphon
+    /// refreshes the caller.
     Uas,
-    /// The B2BUA itself handles refresh re-INVITEs on both legs.
+    /// siphon refreshes both dialogs.
     B2bua,
+}
+
+impl SessionRefresher {
+    /// The refresher called `name`: `uac`, `uas` or `b2bua`, in any case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "uac" => Some(Self::Uac),
+            "uas" => Some(Self::Uas),
+            "b2bua" => Some(Self::B2bua),
+            _ => None,
+        }
+    }
 }
 
 fn default_session_expires() -> u32 {

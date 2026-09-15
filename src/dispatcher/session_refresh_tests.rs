@@ -103,6 +103,13 @@ fn refreshable_call(dispatcher: &TestDispatcher) -> (String, u64) {
             callee.dialog.sdp_version = 1;
             callee.dialog.last_sent_sdp =
                 Some(session_toward_callee(session_id, 0, "sendrecv").into_bytes());
+            // The callee's 2xx named siphon the refresher of this dialog.
+            callee.dialog.session_timer = Some(crate::b2bua::actor::SessionTimerState::new(
+                1800,
+                true,
+                90,
+                std::time::Instant::now(),
+            ));
             callee.b_leg_invite = Some(Arc::new(std::sync::Mutex::new(
                 invite_siphon_sent_the_callee(),
             )));
@@ -114,7 +121,7 @@ fn refreshable_call(dispatcher: &TestDispatcher) -> (String, u64) {
 /// Send a session refresh, and return the one INVITE siphon put on the wire with
 /// where it went.
 fn refresh(dispatcher: &TestDispatcher, call_id: &str) -> (SocketAddr, SipMessage) {
-    b2bua_send_refresh_reinvite(call_id, &dispatcher.state);
+    b2bua_send_session_refresh(call_id, false, &dispatcher.state);
     let mut invites: Vec<(SocketAddr, SipMessage)> = wire(dispatcher)
         .into_iter()
         .filter(|(_, message)| message.method() == Some(&Method::Invite))

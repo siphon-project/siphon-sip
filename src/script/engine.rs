@@ -2832,7 +2832,10 @@ def new_call(call):
                 .expect("session_timer_override should be set after handler runs");
             assert_eq!(override_config.session_expires, 3600);
             assert_eq!(override_config.min_se, 120);
-            assert_eq!(override_config.refresher, "uas");
+            assert_eq!(
+                override_config.refresher,
+                crate::config::SessionRefresher::Uas
+            );
 
             // Also check that dial() set the action
             let action = borrowed.action();
@@ -3366,7 +3369,10 @@ def new_call(call):
             // Defaults from #[pyo3(signature = (expires=1800, min_se=90, refresher="b2bua"))]
             assert_eq!(override_config.session_expires, 1800);
             assert_eq!(override_config.min_se, 90);
-            assert_eq!(override_config.refresher, "b2bua");
+            assert_eq!(
+                override_config.refresher,
+                crate::config::SessionRefresher::B2bua
+            );
         });
     }
 

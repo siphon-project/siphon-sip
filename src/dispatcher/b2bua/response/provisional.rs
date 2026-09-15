@@ -176,6 +176,17 @@ pub fn b_leg_provisional(
         // `media.sdp_strip_attributes`, after `@b2bua.on_early_media` had the
         // media engine rewrite the early media SDP.
         strip_relayed_sdp_attributes(message, state);
+        // The early media answer as the caller receives it, which is the session
+        // description in force on the caller's dialog when this leg's 2xx carries
+        // none.
+        if let (Some(index), Some(sdp)) = (
+            snapshot.b_leg_index,
+            sdp_in_body(message_content_type(message), &message.body),
+        ) {
+            state
+                .call_actors
+                .set_b_leg_early_answer(call_id, index, sdp);
+        }
         // Pin the reply egress socket to the A-leg INVITE's arrival listener
         // (`snapshot.a_leg_local_addr`) so a multi-homed UDP host answers on the port it
         // received on. No-op for stream transports and single-listener hosts.
