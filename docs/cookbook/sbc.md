@@ -258,6 +258,16 @@ def on_failure(call, code, reason):
         call.dial(str(call.ruri), header_policy="ims-intra-trust-domain@2026")
 ```
 
+The paths that answer the caller or dial for it without a script's routing action
+refuse the same 420 and end the call without `@b2bua.on_failure`. When SIPhon answers
+the call itself (`call.answer()`, the control plane's `answer`,
+`call.handover(answer=True)`), it is the only UAS the caller has, so any tag it does
+not implement is refused whatever the policy, before an answer-first handover anchors
+media. The control plane's `dial` and `route` are checked under the call's policy
+when they dial; a refused `dial` reports `DialFailed` with code `420`. An INVITE with
+`Replaces` is refused on its own transaction before the call it names is touched.
+`call.progress()` is not checked, since a provisional answers nothing.
+
 ## Add media anchoring
 
 `call.media.anchor(engine="rtpengine")` hides the media path too. For SRTP↔RTP

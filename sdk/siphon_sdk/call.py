@@ -564,6 +564,12 @@ class Call:
         keep working — e.g. play a prompt to completion before starting echo —
         without delaying the 200 OK. Synchronous; no ``await`` needed.
 
+        Answering the call itself makes siphon the caller's only UAS, so a
+        caller that ``Require``-s an extension siphon does not implement (any
+        but ``100rel``, ``timer``, ``replaces``, ``sec-agree``) is refused
+        ``420 Bad Extension`` with ``Unsupported`` instead, whatever the
+        header policy, and the call ends (RFC 3261 §8.2.2.3).
+
         Args:
             code: Final 2xx status code (200, 202, etc.).
             reason: Reason phrase.

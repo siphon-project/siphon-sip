@@ -1604,7 +1604,7 @@ impl PyCall {
             content_type,
         );
         if !sent {
-            tracing::error!(call_id = %self.id, "call.answer(): no 2xx sent: the call is gone, or its session interval was refused 422");
+            tracing::error!(call_id = %self.id, "call.answer(): no 2xx sent: the call is gone, or it was refused 420 for an extension it requires or 422 for its session interval");
         }
         // Keeps the actor alive after the handler returns: the 2xx is already sent.
         self.action = CallAction::Answered;

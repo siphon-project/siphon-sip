@@ -101,6 +101,24 @@ pub(super) fn unhonourable_required_tags(
 ) -> Vec<String> {
     let require_crosses =
         policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
+    required_tags_not_honoured(invite, |tag| {
+        implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag))
+    })
+}
+
+/// The option tags in `invite`'s `Require` that siphon does not implement
+/// itself ([`implements_option_tag`]), in the caller's order, each once.
+///
+/// What a call cannot honour when siphon answers it itself: siphon is then the
+/// only UAS the caller has, so no header policy can hand the extension to a
+/// callee (RFC 3261 §8.2.2.3).
+pub(super) fn unimplemented_required_tags(invite: &SipHeaders) -> Vec<String> {
+    required_tags_not_honoured(invite, implements_option_tag)
+}
+
+/// The tags in every `Require` line of `invite` for which `honoured` is false,
+/// in order, a tag repeated in another case listed once in its first spelling.
+fn required_tags_not_honoured(invite: &SipHeaders, honoured: impl Fn(&str) -> bool) -> Vec<String> {
     let mut unhonourable: Vec<String> = Vec::new();
     let required = invite
         .get_all("Require")
@@ -110,9 +128,7 @@ pub(super) fn unhonourable_required_tags(
         .map(str::trim)
         .filter(|tag| !tag.is_empty());
     for tag in required {
-        let honoured =
-            implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag));
-        if !honoured
+        if !honoured(tag)
             && !unhonourable
                 .iter()
                 .any(|listed| listed.eq_ignore_ascii_case(tag))

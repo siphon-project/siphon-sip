@@ -102,7 +102,20 @@ pub fn b2bua_route_call(
     let Some(control) = B2BUA_CONTROL.get() else {
         return Ok(false);
     };
-    let state = &control.state;
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread — establish the runtime.
+    let _enter = control.runtime.enter();
+    b2bua_route_call_with_state(sip_call_id, targets, extra_headers, &control.state)
+}
+
+/// [`b2bua_route_call`] past its argument checks, on a dispatcher already in
+/// hand, from inside its runtime.
+pub(crate) fn b2bua_route_call_with_state(
+    sip_call_id: &str,
+    targets: Vec<RouteTarget>,
+    extra_headers: &[(String, String)],
+    state: &DispatcherState,
+) -> Result<bool, RouteError> {
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         warn!(%sip_call_id, "b2bua_route_call: no such call");
         return Ok(false);
@@ -126,10 +139,6 @@ pub fn b2bua_route_call(
         invite.clone()
     };
 
-    // The send path may spawn (TCP/TLS connect) and the caller may be on a
-    // non-tokio thread — establish the runtime.
-    let _enter = control.runtime.enter();
-
     // Build the failover queue from the targets (R-URI-only carriers).
     let default_timeout = 30u32;
     let routes = route_verb_routes(targets, extra_headers, default_timeout);
@@ -144,6 +153,18 @@ pub fn b2bua_route_call(
         }
     }
     state.call_actors.release_control_owner(&internal_call_id);
+
+    // RFC 3261 §8.2.2.3, checked as `call.route()` is, under the call's policy,
+    // before any carrier is dialled: refused the way a route with no routable
+    // carrier ends the call.
+    let unsupported = unhonourable_required_tags(
+        &template.headers,
+        &state.resolve_header_policy(&internal_call_id),
+    );
+    if !unsupported.is_empty() {
+        refuse_bad_extension(&internal_call_id, &template, unsupported, state);
+        return Ok(true);
+    }
 
     // Un-park: start the sequential-failover sequence and dial the first carrier.
     let carrier_count = routes.len();
@@ -285,10 +306,10 @@ pub fn b2bua_send_uas_response(
 /// [`b2bua_send_uas_response`] on the dispatcher the caller already holds.
 ///
 /// For a path inside the dispatcher that answers a call itself (the `Replaces`
-/// takeover), where the tokio runtime is already current and reaching for the
-/// process-wide control handle adds nothing. It is also what lets a test drive
-/// that path: the handle is set once per process, and tests elsewhere rely on it
-/// being absent.
+/// takeover, `call.answer()` refused or answered on a dispatcher in hand), where
+/// the tokio runtime is already current and reaching for the process-wide control
+/// handle adds nothing. It is also what lets a test drive that path: the handle
+/// is set once per process, and tests elsewhere rely on it being absent.
 pub fn send_uas_response(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -452,17 +473,46 @@ pub fn b2bua_answer_call(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
 ) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let _enter = control.runtime.enter();
+    b2bua_answer_call_with_state(
+        internal_call_id,
+        invite,
+        code,
+        reason,
+        body,
+        content_type,
+        &control.state,
+    )
+}
+
+/// [`b2bua_answer_call`] on a dispatcher already in hand, from inside its
+/// runtime.
+pub(crate) fn b2bua_answer_call_with_state(
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    state: &DispatcherState,
+) -> bool {
+    // RFC 3261 §8.2.2.3: answering the call itself makes siphon the only UAS the
+    // caller has, so a required extension siphon does not implement is refused
+    // `420`, whatever the header policy would have relayed to a callee.
+    let unsupported = unimplemented_required_tags(&invite.headers);
+    if !unsupported.is_empty() {
+        refuse_bad_extension(internal_call_id, invite, unsupported, state);
+        return false;
+    }
     // After anchored early media the caller already holds siphon's SDP answer
     // from the 18x; a 2xx sent without a body repeats it (RFC 3264 §4) rather
     // than reaching the caller as a 200 that silently drops the session.
     let (body, content_type) = match body {
         Some(body) => (Some(body), content_type),
-        None => match B2BUA_CONTROL.get().and_then(|control| {
-            control
-                .state
-                .call_actors
-                .early_media_anchor(internal_call_id)
-        }) {
+        None => match state.call_actors.early_media_anchor(internal_call_id) {
             Some(anchor) => (
                 Some(anchor.answer_sdp.into_bytes()),
                 Some("application/sdp"),
@@ -470,7 +520,8 @@ pub fn b2bua_answer_call(
             None => (None, content_type),
         },
     };
-    b2bua_send_uas_response(
+    send_uas_response(
+        state,
         internal_call_id,
         invite,
         code,
@@ -789,7 +840,29 @@ pub fn b2bua_dial_call(
     let Some(control) = B2BUA_CONTROL.get() else {
         return Ok(false);
     };
-    let state = &control.state;
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread.
+    let _enter = control.runtime.enter();
+    b2bua_dial_call_with_state(
+        sip_call_id,
+        targets,
+        parallel,
+        timeout_secs,
+        extra_headers,
+        &control.state,
+    )
+}
+
+/// [`b2bua_dial_call`] past its argument checks (`parallel` is the parsed
+/// strategy), on a dispatcher already in hand, from inside its runtime.
+pub(crate) fn b2bua_dial_call_with_state(
+    sip_call_id: &str,
+    targets: Vec<DialTarget>,
+    parallel: bool,
+    timeout_secs: u32,
+    extra_headers: &[(String, String)],
+    state: &DispatcherState,
+) -> Result<bool, DialError> {
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         warn!(%sip_call_id, "b2bua_dial_call: no such call");
         return Ok(false);
@@ -824,9 +897,27 @@ pub fn b2bua_dial_call(
         invite.clone()
     };
 
-    // The send path may spawn (TCP/TLS connect) and the caller may be on a
-    // non-tokio thread.
-    let _enter = control.runtime.enter();
+    // RFC 3261 §8.2.2.3, checked as `call.dial()` is, under the call's policy.
+    // A controller cannot change that policy, so no other dial could connect the
+    // caller either: it is refused now, not reported as a dial to retry.
+    let unsupported = unhonourable_required_tags(
+        &template.headers,
+        &state.resolve_header_policy(&internal_call_id),
+    );
+    if !unsupported.is_empty() {
+        control_notify_channel_event(
+            sip_call_id,
+            "DialFailed",
+            serde_json::json!({
+                "code": 420,
+                "reason": "Bad Extension",
+                "timed_out": false,
+                "unsupported": unsupported.clone(),
+            }),
+        );
+        refuse_bad_extension(&internal_call_id, &template, unsupported, state);
+        return Ok(true);
+    }
 
     // The controller has acted, so the handoff deadline no longer applies: what
     // bounds the call now is the dial's own timeout.

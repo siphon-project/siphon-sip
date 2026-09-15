@@ -717,8 +717,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   decides is carried out, so it can release per-call state, reject with its own
   response, or route again under a policy that relays the extension, which is
   checked the same way. A script that rewrites or removes `Require` with
-  `call.set_header()` decides what the caller is held to. A
-  `call.handover()` is not checked.
+  `call.set_header()` decides what the caller is held to.
+
+  The paths that answer the caller, or dial for it, without a script's routing
+  action refuse the same 420 and end the call without `@b2bua.on_failure`,
+  which exists to revisit a script's routing:
+
+  - siphon answering the call itself: `call.answer()`, the control plane's
+    `answer`, and `call.handover(answer=True)`, which is refused before any
+    media is anchored. siphon is then the only UAS, so a tag it does not
+    implement is refused whatever the policy.
+  - the control plane's `dial` and `route`, checked like `call.dial()` under the
+    call's policy when they dial. A refused `dial` reports `DialFailed` with
+    code `420` and the channel ends; a refused `route` ends the call as a route
+    with no carrier does.
+  - an INVITE with `Replaces`, refused on its own transaction before the call it
+    names is touched.
+
+  `call.progress()` is not checked: a provisional answers nothing, and the
+  script can still route the call under a policy that relays the extension or
+  answer it, which is where the check falls.
 
 - **HEP capture sees the messages siphon sends from background tasks, the
   retransmissions above all.** The 2xx siphon retransmits to a caller until

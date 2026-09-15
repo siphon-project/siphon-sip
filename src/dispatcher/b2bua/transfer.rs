@@ -119,6 +119,27 @@ pub fn b2bua_bridge_inbound_replaces(
         state.call_event_receivers.remove(new_call_id);
     };
 
+    // siphon answers the takeover itself (RFC 3261 §8.2.2.3): a required
+    // extension it does not implement is refused on this INVITE's transaction.
+    let unsupported = unimplemented_required_tags(&invite.headers);
+    if !unsupported.is_empty() {
+        let mut response = build_response(invite, 420, "Bad Extension", None, &[]);
+        response.headers.set("Unsupported", unsupported.join(", "));
+        let local = Some(inbound.local_addr);
+        let (transport, remote) = (inbound.transport, inbound.remote_addr);
+        send_message_from(
+            response,
+            transport,
+            remote,
+            inbound.connection_id,
+            local,
+            state,
+        );
+        state.call_actors.remove_call(new_call_id);
+        state.call_event_receivers.remove(new_call_id);
+        return;
+    }
+
     // The transferee offers (RFC 5589 §7). An offerless INVITE would make siphon
     // the offerer and push the answer into the ACK, which is a different
     // negotiation than the one the surviving leg is already in.
