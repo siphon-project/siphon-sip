@@ -9,6 +9,7 @@
 //! Python scripts interact via `from siphon import rtpengine` or
 //! `call.media.anchor()`.
 
+pub(crate) mod answer;
 pub mod backend;
 pub mod bencode;
 pub mod client;
@@ -18,6 +19,8 @@ pub mod profile;
 pub mod rtpproxy;
 pub mod session;
 pub mod siphon_rtp;
+#[cfg(test)]
+pub(crate) mod test_engine;
 
 pub use backend::MediaBackend;
 pub use client::{RtpEngineClient, RtpEngineSet};

@@ -43,6 +43,10 @@ pub fn b2bua_transfer_rtpengine_offer(
 /// target's answer SDP (`target_sdp`, under `target_tag`) against the offerer
 /// (`survivor_tag`), and return the SDP to re-INVITE the survivor with. `None`
 /// if media control is not configured or the answer failed.
+///
+/// It also completes an anchored delayed offer with the caller's answer
+/// (`send_delayed_offer_ack`): the offerer is then the callee, and the answer the
+/// caller's.
 pub fn b2bua_transfer_rtpengine_answer(
     state: &DispatcherState,
     cid_new: &str,
@@ -66,7 +70,7 @@ pub fn b2bua_transfer_rtpengine_answer(
     }) {
         Ok(rewritten) => Some(rewritten),
         Err(error) => {
-            warn!(rtpengine_call_id = %cid_new, "REFER terminate: rtpengine answer failed: {error}");
+            warn!(rtpengine_call_id = %cid_new, "rtpengine answer failed: {error}");
             None
         }
     }

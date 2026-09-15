@@ -16,11 +16,82 @@
 use super::lcr_ring_timeout_tests::top_via_branch;
 use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
+use crate::rtpengine::test_engine::TestEngine;
 
 const CALLER: &str = "192.0.2.20:5060";
 const CALLEE: &str = "198.51.100.90:5060";
 const CALLER_CALL_ID: &str = "offerless-call@192.0.2.20";
 const NO_ANSWER_REASON: &str = "Q.850;cause=111;text=\"No SDP answer in ACK\"";
+const MEDIA_ANCHOR_FAILED_REASON: &str = "Q.850;cause=47;text=\"Media anchor failed\"";
+
+/// An anchored call with a delayed offer. `rtpengine.answer` sent the callee's
+/// offer to the media engine, so the caller's answer in its ACK has to go through
+/// the engine as the `answer` that completes it. The callee's ACK carries the
+/// engine's SDP, never the caller's own address.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchored_delayed_offer_is_answered_through_the_media_engine() {
+    let engine = TestEngine::start(false).await;
+    let call = OfferlessCall::dial_anchored(&engine).await;
+    call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+    let sent = call.wire();
+    let callee_acks: Vec<&Sent> = to_callee(&sent)
+        .into_iter()
+        .filter(|sent| sent.is(Method::Ack))
+        .collect();
+    assert_eq!(callee_acks.len(), 1, "the callee is ACKed once");
+    let answer = body_text(&callee_acks[0].message);
+    assert!(
+        answer.contains("c=IN IP4 203.0.113.50"),
+        "the callee gets the answer the engine rewrote:\n{answer}"
+    );
+    assert!(
+        !answer.contains("192.0.2.20"),
+        "the caller's own address never reaches the callee:\n{answer}"
+    );
+
+    let answers = engine.commands("answer");
+    assert_eq!(answers.len(), 1, "the engine is sent the caller's answer");
+    assert_eq!(answers[0].call_id.as_deref(), Some(CALLER_CALL_ID));
+    assert_eq!(
+        answers[0].from_tag.as_deref(),
+        Some("callee-tag"),
+        "answering the callee's offer"
+    );
+    assert_eq!(answers[0].to_tag.as_deref(), Some("caller-tag"));
+    assert_eq!(answers[0].sdp.as_deref(), Some(CALLER_ANSWER));
+    let session = call
+        .state
+        .rtpengine_sessions
+        .as_ref()
+        .and_then(|sessions| sessions.get(CALLER_CALL_ID))
+        .expect("the media session");
+    assert_eq!(session.to_tag.as_deref(), Some("caller-tag"));
+    assert!(call.call_is_up());
+}
+
+/// The engine refusing the caller's answer leaves the callee's anchored offer with
+/// no answer to give. The call ends the way a caller ACK with no answer ends it:
+/// the callee ACKed with every stream rejected, then a BYE to both legs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchored_delayed_offer_the_engine_cannot_answer_ends_the_call() {
+    let engine = TestEngine::start(true).await;
+    let call = OfferlessCall::dial_anchored(&engine).await;
+    call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+    let sent = call.wire();
+    let (_, bye) = assert_rejecting_ack_then_bye(&sent);
+    assert_eq!(
+        bye.headers.get("Reason").map(String::as_str),
+        Some(MEDIA_ANCHOR_FAILED_REASON)
+    );
+    assert!(to_caller(&sent).iter().any(|sent| sent.is(Method::Bye)));
+    assert!(!call.call_is_up());
+}
 
 /// The offer the callee puts in its 2xx: an audio and a video stream.
 const CALLEE_OFFER: &str = concat!(
@@ -125,7 +196,33 @@ impl OfferlessCall {
     /// The caller's INVITE arrives and siphon dials the callee, with `script`
     /// running.
     fn dial(script: &str) -> OfferlessCall {
-        let TestDispatcher { state, udp } = test_dispatcher_with_script(script);
+        OfferlessCall::dial_on(test_dispatcher_with_script(script))
+    }
+
+    /// [`OfferlessCall::dial`] with media anchored on `engine`, and the session
+    /// `rtpengine.answer` records for a 2xx that carries the offer: the callee as
+    /// offerer, no answerer yet.
+    async fn dial_anchored(engine: &TestEngine) -> OfferlessCall {
+        let TestDispatcher { mut state, udp } = test_dispatcher_with_script("");
+        state.rtpengine_set = Some(engine.backend().await);
+        let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
+        sessions.insert(crate::rtpengine::MediaSession {
+            call_id: CALLER_CALL_ID.to_string(),
+            rtpengine_call_id: CALLER_CALL_ID.to_string(),
+            from_tag: "callee-tag".to_string(),
+            to_tag: None,
+            profile: "rtp_passthrough".to_string(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            created_at: std::time::Instant::now(),
+        });
+        state.rtpengine_sessions = Some(sessions);
+        state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
+        OfferlessCall::dial_on(TestDispatcher { state, udp })
+    }
+
+    fn dial_on(TestDispatcher { state, udp }: TestDispatcher) -> OfferlessCall {
         let state = Arc::new(state);
         let call_id = state.call_actors.create_call(caller_leg());
         let a_leg_invite = Arc::new(Mutex::new(caller_invite()));

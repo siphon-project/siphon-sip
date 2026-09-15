@@ -452,7 +452,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   caller that ACKs the offer without an answer has the offer rejected toward the
   callee and the call ended, with
   `Reason: Q.850;cause=111;text="No SDP answer in ACK"`. On a media-anchored
-  call the caller's answer is relayed unanchored, and siphon logs that.
+  call both halves go through the media engine: `rtpengine.answer(reply)` sees
+  the INVITE carried no SDP and sends the callee's offer to the engine as an
+  `offer`, and siphon sends the caller's answer from the ACK as the engine
+  `answer` and puts the engine's SDP in the callee's ACK. An engine that refuses
+  that answer ends the call the same way, with
+  `Reason: Q.850;cause=47;text="Media anchor failed"`.
 
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
   `auth.require_aka_digest()` can set up IPsec.** Only the HSS path

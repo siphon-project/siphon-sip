@@ -391,6 +391,12 @@ pub fn reject_unanchorable_offer(
 /// and no party hung up. The text says which rule was broken.
 const NO_ANSWER_IN_ACK_REASON: &str = "Q.850;cause=111;text=\"No SDP answer in ACK\"";
 
+/// What a call ended because the media engine refused the caller's answer to an
+/// anchored delayed offer carries on its BYEs. Q.850 cause 47, "resource
+/// unavailable, unspecified": the media resource the call is anchored on could
+/// not complete the session.
+const MEDIA_ANCHOR_FAILED_REASON: &str = "Q.850;cause=47;text=\"Media anchor failed\"";
+
 /// An SDP answer that declines every stream `offer` makes (RFC 3264 §6): one
 /// `m=` line for each offered one, in the same order, with port 0 and the first
 /// format the offer listed.
@@ -466,10 +472,12 @@ pub fn stamp_b_leg_origin(
 /// with and no media agreed on either leg, so it ends the call: the teardown ACKs
 /// the callee with every stream rejected and BYEs both legs.
 ///
-/// The answer is relayed as the caller wrote it, never through the media
-/// engine: an anchored call is driven from the script's handlers, and none runs
-/// on an ACK. One that reaches this path is logged, since its answer bypasses the
-/// anchor.
+/// On a media-anchored call the callee's offer went to the media engine when
+/// `rtpengine.answer` saw the 2xx carry it, and the engine is still waiting for
+/// the answer. The caller's answer goes to the engine as that `answer`, and the
+/// callee's ACK carries the SDP the engine returns, so both parties' media runs
+/// through the anchor. An engine that refuses leaves no valid answer to give the
+/// callee: the call is ended the same way, with Q.850 cause 47.
 pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &DispatcherState) {
     let held = state.call_actors.get_call(call_id).is_some_and(|call| {
         call.delayed_offer_ack
@@ -494,7 +502,20 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
         .or_else(|| caller_ack.headers.get("c"))
         .cloned()
         .unwrap_or_else(|| "application/sdp".to_string());
-    let (sent, a_leg_call_id) = {
+    let answer = match anchored_answer(call_id, caller_ack, state) {
+        AnchoredAnswer::NotAnchored => caller_ack.body.clone(),
+        AnchoredAnswer::Rewritten(answer) => answer,
+        AnchoredAnswer::Refused => {
+            warn!(
+                call_id = %call_id,
+                "B2BUA: the media engine refused the caller's answer to an anchored delayed offer; \
+                 rejecting the offer toward the callee and ending the call"
+            );
+            b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
+            return;
+        }
+    };
+    let sent = {
         let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
             return;
         };
@@ -503,7 +524,7 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
         let Some(held) = call.delayed_offer_ack.clone().filter(|held| !held.sent) else {
             return;
         };
-        let mut body = caller_ack.body.clone();
+        let mut body = answer;
         if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
             stamp_b_leg_origin(&mut body, leg, &held.transport, state);
             leg.initial_acked = true;
@@ -516,19 +537,8 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
             ..held
         };
         call.delayed_offer_ack = Some(sent.clone());
-        (sent, call.a_leg.dialog.call_id.clone())
+        sent
     };
-    if state
-        .rtpengine_sessions
-        .as_ref()
-        .is_some_and(|sessions| sessions.get(&a_leg_call_id).is_some())
-    {
-        warn!(
-            call_id = %call_id,
-            "B2BUA: delayed offer on a media-anchored call: the caller's answer is relayed to \
-             the callee as it was written, not through the media engine"
-        );
-    }
     debug!(call_id = %call_id, destination = %sent.destination, "B2BUA: sent the callee's ACK with the caller's answer");
     send_b2bua_to_bleg(
         sent.ack,
@@ -537,6 +547,71 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
         sent.local_addr,
         state,
     );
+}
+
+/// How the caller's answer to a delayed offer reaches the callee.
+enum AnchoredAnswer {
+    /// The call's media is not anchored: the caller's SDP goes as written.
+    NotAnchored,
+    /// The media engine's answer, for the callee's ACK.
+    Rewritten(Vec<u8>),
+    /// The media engine refused the answer.
+    Refused,
+}
+
+/// Send the caller's answer to the media engine when the callee's offer is
+/// anchored there and waiting for it: `rtpengine.answer` recorded the session
+/// from that offer, with the callee as offerer and no answerer yet.
+fn anchored_answer(
+    call_id: &str,
+    caller_ack: &SipMessage,
+    state: &DispatcherState,
+) -> AnchoredAnswer {
+    let Some(a_leg_call_id) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    let Some(sessions) = state.rtpengine_sessions.as_ref() else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    let Some(session) = sessions.get(&a_leg_call_id) else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    if session.to_tag.is_some() {
+        // The engine already has an answer for this call, so there is no offer
+        // for this ACK to complete there.
+        warn!(
+            call_id = %call_id,
+            "B2BUA: delayed offer on a media-anchored call whose engine session is already answered; \
+             the caller's answer is relayed to the callee as it was written"
+        );
+        return AnchoredAnswer::NotAnchored;
+    }
+    let Some(caller_tag) = caller_ack
+        .typed_from()
+        .ok()
+        .flatten()
+        .and_then(|from| from.tag)
+    else {
+        return AnchoredAnswer::Refused;
+    };
+    match b2bua_transfer_rtpengine_answer(
+        state,
+        session.rtpengine_id(),
+        &session.from_tag,
+        &caller_tag,
+        &caller_ack.body,
+        &session.profile,
+    ) {
+        Some(answer) => {
+            sessions.set_to_tag(&a_leg_call_id, caller_tag);
+            AnchoredAnswer::Rewritten(answer)
+        }
+        None => AnchoredAnswer::Refused,
+    }
 }
 
 /// The B-leg ACK still held for a delayed offer, completed with an answer that
