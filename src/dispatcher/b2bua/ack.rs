@@ -164,7 +164,8 @@ pub fn build_owned_leg_ack(
 /// short-circuit in [`run`].
 ///
 /// The transport-layer write goes through `state.outbound`, the same channel
-/// the dispatcher uses, so retransmits look identical to the original send.
+/// the dispatcher uses, so retransmits look identical to the original send, and
+/// each copy is captured to HEP as the original was ([`TaskCapture`]).
 pub fn arm_reliable_provisional_retransmit(
     rseq: u32,
     request: &SipMessage,
@@ -195,6 +196,7 @@ pub fn arm_reliable_provisional_retransmit(
     // Retransmit the reliable 1xx on the same listener the request arrived on so a
     // multi-homed UDP host keeps a consistent source port (matches the initial send).
     let source_local_addr = Some(inbound.local_addr);
+    let capture = TaskCapture::for_task(state, transport, source_local_addr);
     let key = (call_id.clone(), rseq);
 
     tokio::spawn(async move {
@@ -224,6 +226,9 @@ pub fn arm_reliable_provisional_retransmit(
                         call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
                         "retransmitting reliable 1xx (RFC 3262)"
                     );
+                    if let Some(capture) = &capture {
+                        capture.capture(destination, transport, &bytes);
+                    }
                     let _ = outbound.send(OutboundMessage {
                         followups: None,
                         connection_id,
@@ -290,6 +295,8 @@ pub fn arm_b2bua_2xx_retransmit(
     }
 
     let outbound = Arc::clone(&state.outbound);
+    // Each copy is captured to HEP as the first send was.
+    let capture = TaskCapture::for_task(state, transport, source_local_addr);
     let key = internal_call_id.to_string();
 
     tokio::spawn(async move {
@@ -313,6 +320,9 @@ pub fn arm_b2bua_2xx_retransmit(
                         call_id = %key, interval_ms = interval.as_millis() as u64,
                         "retransmitting A-leg 2xx (RFC 3261 §13.3.1.4)"
                     );
+                    if let Some(capture) = &capture {
+                        capture.capture(destination, transport, &bytes);
+                    }
                     let _ = outbound.send(OutboundMessage {
                         followups: None,
                         connection_id,

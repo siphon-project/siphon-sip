@@ -269,6 +269,8 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let source = std::net::SocketAddr::new(ue_addr, ue_port_c);
     let data = bytes::Bytes::from(retry_message.to_bytes());
     let outbound = state.outbound.clone();
+    // Sent from the task below, past `send_outbound_from`'s capture.
+    let capture = TaskCapture::for_task(state, transport, Some(source));
     let registrant_task = Arc::clone(registrant);
     let aor_task = aor.to_string();
 
@@ -293,6 +295,9 @@ pub(super) fn handle_registrant_ipsec_challenge(
             warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
             registrant_task.handle_failure(&aor_task, 0, None);
             return;
+        }
+        if let Some(capture) = &capture {
+            capture.capture(destination, transport, &data);
         }
         let outbound_message = crate::transport::OutboundMessage {
             followups: None,

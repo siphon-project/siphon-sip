@@ -491,6 +491,16 @@ pub(super) fn relay_request(
     //     `connection_map`.  No DNS, no pool lookup.
     //   - URI-relay: the legacy path through `send_to_target`.
     let outcome = if let Some(local) = flow_local_addr {
+        // This branch bypasses `send_to_target`, so it has to do that helper's
+        // HEP capture itself, as the fork and B-leg flow paths do.
+        if let Some(ref hep) = state.hep_sender {
+            hep.capture_outbound(
+                state.hep_local_addr(local, outbound_transport),
+                destination,
+                outbound_transport,
+                &data,
+            );
+        }
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
