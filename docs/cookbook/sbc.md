@@ -182,6 +182,60 @@ only; prefix patterns are a config-side feature.
     `Proxy-Authorization` at the wrong realm. Opt back in with
     `copy=["Proxy-Authenticate"]` if you really want the old transparent behaviour.
 
+### `Supported` and `Allow` on both legs
+
+SIPhon is the UAC of the B-leg and the UAS of the A-leg, so the B-leg INVITE's
+`Supported` and `Allow`, and those of every response it relays back to the caller,
+say what SIPhon supports (RFC 3261 §20.37, §20.5). They are not a copy of the other
+party's lists, whatever the preset does with the rest of the headers.
+
+A relayed response follows the same rule as the INVITE, mirrored: the callee's
+`100rel`/`timer` and the end-to-end tags below survive, plus `replaces`, and `Allow`
+is SIPhon's. `transparent-b2bua@2026` strips the callee's `Supported` on responses
+before that, so its responses carry just `Supported: replaces`.
+
+On the B-leg INVITE:
+
+- `Allow` is SIPhon's method set, the same one its responses advertise.
+- `Supported` is `replaces`, plus `timer` when SIPhon runs the session timer, plus
+  the caller's `100rel` and `timer` if it offered them. On top of that go the tags of
+  extensions the two endpoints negotiate with each other through SIPhon, if the
+  caller offered them and the policy copies what they negotiate with on requests
+  *and* on responses:
+
+| Tag | Needs the policy to copy |
+|---|---|
+| `precondition` (RFC 3312) | `Supported` and `Require`, both ways |
+| `histinfo` (RFC 7044) | `History-Info`, both ways |
+| `resource-priority` (RFC 4412) | `Resource-Priority` on the request, `Accept-Resource-Priority` on the response |
+
+Half a negotiation is no negotiation: a callee's `Require: precondition` that cannot
+reach the caller leaves preconditions stuck. A caller offering
+`Supported: 100rel, timer, precondition, histinfo, resource-priority, outbound, path`:
+
+| Preset | B-leg INVITE carries |
+|---|---|
+| `transparent-b2bua@2026` | `Supported: 100rel,timer,histinfo,resource-priority,replaces` |
+| `ims-intra-trust-domain@2026` | `Supported: 100rel,timer,precondition,histinfo,resource-priority,replaces` |
+| `ims-trust-domain-boundary@2026` | `Supported: 100rel,timer,precondition,replaces` |
+| `sip-trunk-edge@2026` | `Supported: 100rel,timer,precondition,resource-priority,replaces` |
+
+Any other tag the caller lists is dropped. Per-call deltas feed the same test:
+`copy=["Supported", "Require"]` lets `precondition` cross under the default preset,
+`strip=["History-Info"]` keeps `histinfo` off anywhere, and
+`copy=["Resource-Priority", "Accept-Resource-Priority"]` opens `resource-priority` at
+the trust boundary. `copy=["Supported"]` on its own does not relay the caller's list,
+since every preset already copies `Supported` on requests. When a far end really needs
+the caller's list, set it from the script, which is precedence 1 and goes out as
+written even past a `strip=`:
+
+```python
+call.set_header("Supported", call.get_header("Supported"))
+```
+
+`replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
+`Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
+
 ## Add media anchoring
 
 `call.media.anchor(engine="rtpengine")` hides the media path too. For SRTP↔RTP

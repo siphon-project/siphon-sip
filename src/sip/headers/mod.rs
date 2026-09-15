@@ -96,6 +96,13 @@ fn canonical_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// Whether two header field names name the same header: case-insensitive
+/// (RFC 3261 §7.3.1), with a compact form equal to its long name (§7.3.3), so
+/// `k` is `Supported`.
+pub fn same_header_name(first: &str, second: &str) -> bool {
+    canonical_key(first) == canonical_key(second)
+}
+
 impl SipHeaders {
     pub fn new() -> Self {
         Self {
@@ -303,6 +310,16 @@ mod tests {
                 "long `{long}` should be readable as compact `{compact}`",
             );
         }
+    }
+
+    #[test]
+    fn same_header_name_folds_case_and_compact_forms() {
+        assert!(same_header_name("Supported", "supported"));
+        assert!(same_header_name("k", "Supported"));
+        assert!(same_header_name("ALLOW", "Allow"));
+        assert!(!same_header_name("Supported", "Require"));
+        // A single letter with no registered compact form is only itself.
+        assert!(!same_header_name("q", "Supported"));
     }
 
     /// The on-the-wire name is preserved: canonicalization is lookup-only.

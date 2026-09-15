@@ -321,6 +321,11 @@ pub struct CallActor {
     /// in-dialog anchor off siphon, so the deployment must route it back or the
     /// dialog breaks. Takes precedence over `contact_user_override`.
     pub contact_override: Option<String>,
+    /// Headers a script set or removed on the A-leg INVITE, gathered from every
+    /// handler that ran on this call (`@b2bua.on_invite`, `@b2bua.on_failure`).
+    /// Their values on the stored INVITE are the script's, so the B-leg builder
+    /// keeps them where it would otherwise put siphon's own `Supported`/`Allow`.
+    pub script_shaped_headers: Vec<String>,
     /// The winning B-leg's ACK when its INVITE went out without an offer, so the
     /// 2xx carried the offer and the ACK has to carry the answer (RFC 3261
     /// §13.2.2.4, RFC 3264 §4). Held until the caller's ACK brings that answer,
@@ -511,6 +516,7 @@ impl CallActor {
             to_host_override: None,
             contact_user_override: None,
             contact_override: None,
+            script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,
             teardown_claimed: false,
             resolved_header_policy: None,

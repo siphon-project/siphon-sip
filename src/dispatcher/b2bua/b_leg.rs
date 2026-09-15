@@ -242,6 +242,7 @@ pub fn b2bua_send_b_leg_invite(
         to_host_override,
         contact_user_override,
         contact_override,
+        script_shaped_headers,
     ) = match state.call_actors.get_call(call_id) {
         Some(c) => (
             c.session_timer_override.clone(),
@@ -252,6 +253,7 @@ pub fn b2bua_send_b_leg_invite(
             c.to_host_override.clone(),
             c.contact_user_override.clone(),
             c.contact_override.clone(),
+            c.script_shaped_headers.clone(),
         ),
         None => (
             None,
@@ -262,6 +264,7 @@ pub fn b2bua_send_b_leg_invite(
             None,
             None,
             None,
+            Vec::new(),
         ),
     };
 
@@ -419,6 +422,18 @@ pub fn b2bua_send_b_leg_invite(
             server_header: state.server_header.as_deref(),
         };
         crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
+
+        // siphon is the UAC of this INVITE, so `Supported` and `Allow` say what
+        // siphon supports (RFC 3261 §20.37, §20.5). Relaying the caller's lists
+        // claimed whatever it happened to name — `outbound`, `path`, `gruu` —
+        // for a leg where nothing implements them. Settled right after the
+        // policy, so the per-carrier headers below still land last.
+        advertise_b_leg_capabilities(
+            &mut b_leg_invite.headers,
+            &original_request.headers,
+            &script_shaped_headers,
+            &policy,
+        );
     }
 
     // Per-carrier (LCR) presented CLI: substitute the calling number before the
@@ -485,14 +500,14 @@ pub fn b2bua_send_b_leg_invite(
         b_leg_invite.headers.set("Min-SE", min_se.to_string());
         // `Supported` *is* a list header (RFC 3261 §7.3.1), so a second line is
         // legal — but it is still the same option tag twice on the wire. Merge
-        // the tag into what the caller already advertised instead.
+        // the tag into the `Supported` already settled on above instead.
         advertise_option_tag(&mut b_leg_invite.headers, "timer");
     }
 
-    // The B-leg is siphon's own UA surface too, so it carries siphon's option
-    // tags rather than whatever the A-leg advertised. RFC 5589 §7.3 needs the
-    // transfer *target* to advertise `replaces` as well as the transferee, and
-    // the callee learns siphon's capability from this INVITE.
+    // siphon's unconditional option tag, merged into whichever `Supported` the
+    // steps above settled on: siphon's own, the script's, or a carrier's. RFC
+    // 5589 §7.3 needs the transfer *target* to advertise `replaces` as well as
+    // the transferee, and the callee learns siphon's capability from this INVITE.
     advertise_supported_options(&mut b_leg_invite.headers);
 
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite

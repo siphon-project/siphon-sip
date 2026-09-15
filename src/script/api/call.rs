@@ -356,6 +356,8 @@ pub struct PyCall {
     contact_user_override: Option<String>,
     /// When set, replace the whole B-leg Contact URI. Set via `set_contact_uri()`.
     contact_override: Option<String>,
+    /// Headers `set_header` / `remove_header` / `remove_headers_matching` touched.
+    script_shaped_headers: Vec<String>,
     /// Per-call header policy input captured from `call.dial(header_policy=…, …)`
     /// or `call.fork(…)`.  The dispatcher resolves `policy_name` against
     /// the preset registry and applies deltas to produce a
@@ -486,6 +488,7 @@ impl PyCall {
             to_host_override: None,
             contact_user_override: None,
             contact_override: None,
+            script_shaped_headers: Vec::new(),
             header_policy_input: None,
             auth_passthrough_flag: false,
             max_duration_secs: None,
@@ -953,6 +956,11 @@ impl PyCall {
         self.from_host_override.as_deref()
     }
 
+    /// Headers the script set or removed; the B-leg builder keeps their values.
+    pub fn script_shaped_headers(&self) -> &[String] {
+        &self.script_shaped_headers
+    }
+
     /// Script-pinned B-leg To host, if `set_to_host()` was called.
     /// Read by the dispatcher when building the B-leg INVITE — when `Some`,
     /// it replaces the dial-target rewrite of the To URI host.
@@ -1296,11 +1304,12 @@ impl PyCall {
     }
 
     /// Set a header value (for B-leg INVITE generation).
-    fn set_header(&self, name: &str, value: &str) -> PyResult<()> {
+    fn set_header(&mut self, name: &str, value: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         message.headers.set(name, value.to_string());
+        self.script_shaped_headers.push(name.to_string());
         Ok(())
     }
 
@@ -1351,16 +1360,17 @@ impl PyCall {
     }
 
     /// Remove a header.
-    fn remove_header(&self, name: &str) -> PyResult<()> {
+    fn remove_header(&mut self, name: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         message.headers.remove(name);
+        self.script_shaped_headers.push(name.to_string());
         Ok(())
     }
 
     /// Remove all headers whose names start with a given prefix (case-insensitive).
-    fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
+    fn remove_headers_matching(&mut self, prefix: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
@@ -1374,6 +1384,7 @@ impl PyCall {
             .collect();
         for name in names_to_remove {
             message.headers.remove(&name);
+            self.script_shaped_headers.push(name);
         }
         Ok(())
     }
@@ -4416,7 +4427,7 @@ mod tests {
     #[test]
     fn call_set_and_remove_header() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new(
+        let mut call = PyCall::new(
             "test-id".to_string(),
             message,
             "10.0.0.1".to_string(),

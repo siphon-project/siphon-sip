@@ -36,6 +36,11 @@ pub struct CallHandlerOutcome {
     /// how long the call may stay answered. `None` inherits
     /// `b2bua.max_call_duration_secs`.
     pub max_duration_secs: Option<u32>,
+    /// Headers the script set or removed on the A-leg INVITE (`set_header`,
+    /// `remove_header`, `remove_headers_matching`). Where the B-leg builder
+    /// would put siphon's own value (`Supported`, `Allow`), it keeps the
+    /// script's instead.
+    pub script_shaped_headers: Vec<String>,
 }
 
 impl CallHandlerOutcome {
@@ -69,6 +74,7 @@ impl CallHandlerOutcome {
             auth_passthrough: call.auth_passthrough(),
             auth_user: call.get_auth_user().map(String::from),
             max_duration_secs: call.max_duration_secs(),
+            script_shaped_headers: call.script_shaped_headers().to_vec(),
         }
     }
 }
@@ -946,6 +952,7 @@ pub fn apply_handler_side_state(
         auth_passthrough,
         auth_user,
         max_duration_secs,
+        script_shaped_headers,
     } = outcome;
 
     // A caller that answered a digest challenge inside `@b2bua.on_invite`
@@ -1021,6 +1028,7 @@ pub fn apply_handler_side_state(
         && contact_override.is_none()
         && !auth_passthrough
         && max_duration_secs.is_none()
+        && script_shaped_headers.is_empty()
     {
         return;
     }
@@ -1057,6 +1065,9 @@ pub fn apply_handler_side_state(
     if auth_passthrough {
         call.auth_passthrough = true;
     }
+    // Added to, never replaced: a header `@b2bua.on_invite` set is still the
+    // script's value on the stored INVITE when `@b2bua.on_failure` routes again.
+    call.script_shaped_headers.extend(script_shaped_headers);
     // Stored, not turned into a deadline: the clock starts at the answer, which
     // has not happened yet. Applies to every action shape — a dial, a fork, an
     // LCR sequence, a UAS-mode answer, a handover — because it lives on the

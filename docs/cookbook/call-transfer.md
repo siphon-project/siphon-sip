@@ -328,10 +328,10 @@ def on_refer(call):
     nowhere to go and usually reports the transfer as failed.
 
     siphon advertises `replaces` on the A-leg 2xx, the B-leg INVITE and the 202
-    to a `REFER`, so this works by default. What can still suppress it is your
-    own script: `call.set_header("Supported", …)` is policy precedence 1 and
-    wins over the framework, so a script that sets the header wholesale needs to
-    keep `replaces` in the list it sets.
+    to a `REFER`, so this works by default. On the B-leg INVITE the tag is
+    merged into whatever `Supported` goes out, one your script set with
+    `call.set_header("Supported", …)` included, so setting the header wholesale
+    cannot drop it by accident.
 
     Note this is the *transferee* half and is always on. It is separate from
     `b2bua.accept_replaces` below, which governs the unrelated question of

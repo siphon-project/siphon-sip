@@ -770,7 +770,20 @@ class Call:
                 namespace, so a custom policy is indistinguishable from
                 a built-in here.  Reach for one of those when the posture
                 is "that preset, except for these headers", rather than
-                repeating ``copy=[…]`` on every call site.
+                repeating ``copy=[…]`` on every call site.  Whatever the
+                policy, the B-leg INVITE's ``Supported`` and ``Allow`` are
+                siphon's own, because siphon is that leg's UAC: ``Allow``
+                is siphon's method set, and ``Supported`` is ``replaces``
+                plus the caller's ``100rel`` / ``timer``, with the caller's
+                ``precondition`` / ``histinfo`` / ``resource-priority``
+                only when the policy copies what that extension negotiates
+                with in both directions (``Supported`` + ``Require``,
+                ``History-Info``, ``Resource-Priority`` out and
+                ``Accept-Resource-Priority`` back).  A value set with
+                :meth:`set_header` goes out instead.  Responses relayed back
+                to the caller get the same treatment with the callee's tags:
+                siphon's ``Allow``, and ``Supported`` narrowed the same way
+                plus ``replaces``.
             copy: Per-call delta — headers to copy verbatim regardless of
                 the preset's default verb (e.g. ``["X-Operator-Tag"]``).
             strip: Per-call delta — headers to strip regardless of the
@@ -1702,7 +1715,16 @@ class Call:
         return self.get_header(name)
 
     def set_header(self, name: str, value: str) -> None:
-        """Set (replace) a header value."""
+        """Set (replace) a header value on the captured A-leg INVITE.
+
+        The B-leg INVITE is built from this message.  ``Supported`` and
+        ``Allow`` set here (or removed with :meth:`remove_header`) go out as
+        written, in place of the capabilities siphon would otherwise
+        advertise and past a ``strip=`` delta; ``replaces`` is still merged
+        into a ``Supported`` set this way.  To relay the caller's own list::
+
+            call.set_header("Supported", call.get_header("Supported"))
+        """
         self._headers[name] = value
 
     def set_body(
