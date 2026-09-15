@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA caller that takes the refresher role at the RFC 4028 floor and never
+  refreshes.
+
+  The INVITE asks for a 90 s session with this caller as the refresher, and
+  Min-SE 90. siphon is the UAS of this dialog, so its 200 has to grant the 90 s
+  with refresher=uac and require the extension (RFC 4028 §9). This caller then
+  never refreshes, and siphon has to end the call a third of the interval ahead
+  of expiry (§10): a BYE with the timer-expiry Reason 60 s after the answer,
+  which siphon's 5 s timer sweep can hold back by up to 5 s. It must come 55 to
+  72 s after the 200. A re-INVITE or any other request before it is unexpected
+  and fails the call, and so does no BYE within 75 s.
+
+  The callee (b2bua_session_timer_floor_uas.xml) checks that siphon refreshes
+  the callee's dialog in the meantime, and gets the same BYE.
+-->
+<scenario name="B2BUA caller that never refreshes its session">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Supported: timer
+Session-Expires: 90;refresher=uac
+Min-SE: 90
+User-Agent: SIPp/b2bua-session-timer-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <!-- RFC 4028 §9: the 90 s granted, this caller the refresher, and timer
+       required, since the refresher is the UAC. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <gettimeofday assign_to="answered_seconds,answered_microseconds" />
+      <ereg regexp="^[[:space:]]*90;refresher=uac[[:space:]]*$"
+            search_in="hdr" header="Session-Expires:" check_it="true"
+            assign_to="granted_session_expires" />
+      <ereg regexp="timer"
+            search_in="hdr" header="Require:" check_it="true"
+            assign_to="required_extension" />
+      <log message="200 grants Session-Expires [$granted_session_expires] and requires [$required_extension]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- No refresh from this caller. No ontimeout, so a BYE that never comes
+       fails the call, and so does anything else that arrives first. -->
+  <recv request="BYE" timeout="75000">
+    <action>
+      <gettimeofday assign_to="ended_seconds,ended_microseconds" />
+      <assign assign_to="elapsed" variable="ended_seconds" />
+      <subtract assign_to="elapsed" variable="answered_seconds" />
+      <assign assign_to="fraction" variable="ended_microseconds" />
+      <subtract assign_to="fraction" variable="answered_microseconds" />
+      <divide assign_to="fraction" value="1000000" />
+      <add assign_to="elapsed" variable="fraction" />
+      <test assign_to="too_early" variable="elapsed" compare="less_than" value="55" />
+      <test assign_to="too_late" variable="elapsed" compare="greater_than" value="72" />
+      <ereg regexp="Q\.850;cause=102"
+            search_in="hdr" header="Reason:" check_it="true"
+            assign_to="bye_reason" />
+      <log message="BYE [$elapsed] s after the 200, Reason [$bye_reason]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <nop next="wrong_time" test="too_early" />
+  <nop next="wrong_time" test="too_late" />
+  <nop next="done" />
+
+  <label id="wrong_time" />
+  <nop>
+    <action>
+      <log message="WRONG TIME: siphon's BYE came [$elapsed] s after the 200, expected 55 to 72 s" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_TIME" timeout="100" />
+
+  <label id="done" />
+
+</scenario>

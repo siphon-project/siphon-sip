@@ -1,0 +1,51 @@
+# siphon.b2bua-session-timer-floor-test.yaml: B2BUA session timers at the RFC 4028 floor
+#
+# Used with: sipp/docker-compose.yaml (b2bua-session-timer-floor profile)
+# Script:    scripts/b2bua_default.py
+# Tests:     a 90 s session timer on each dialog of one call. siphon refreshes
+#            the callee's dialog at half the interval, and ends the call when the
+#            caller, the refresher of its own dialog, never refreshes.
+#
+# siphon.b2bua-test.yaml with this instance's own address and the session_timer
+# block at the floor.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.216"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_default.py"
+  reload: auto
+
+advertised_address: "172.20.0.216"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+# 90 s is the shortest session interval any Min-SE allows (RFC 4028 §4, §5).
+# refresher uac: siphon refreshes the dialog it is the UAC of (the callee's),
+# and the UAC of the dialog siphon answers (the caller) refreshes that one.
+session_timer:
+  session_expires: 90
+  min_se: 90
+  refresher: uac
+  enabled: true
+
+log:
+  level: debug
+  format: pretty

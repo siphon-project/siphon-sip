@@ -2754,6 +2754,121 @@ services:
     profiles:
       - b2bua-bye-before-ack
 
+  # --- B2BUA session timers at the RFC 4028 floor (§7, §9, §10) ---
+  # One call at Session-Expires 90 and Min-SE 90, against its own siphon instance
+  # (session_timer 90 s, refresher uac), with a session timer on each dialog.
+  # siphon is the refresher of the callee's dialog and must re-INVITE it at half
+  # the interval. The caller is the refresher of its own dialog and never
+  # refreshes, so siphon must end the call 60 s after the answer, with a BYE to
+  # both legs. Both sides carry the assertion. The call takes about 70 s.
+  #   172.20.0.216  siphon-b2bua-session-timer-floor
+  #   172.20.0.217  caller
+  #   172.20.0.218  callee, and the REGISTER that points bob at it
+
+  siphon-b2bua-session-timer-floor:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-session-timer-floor-test
+    volumes:
+      - ./configs/siphon.b2bua-session-timer-floor-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.216
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-session-timer-floor
+
+  sipp-b2bua-session-timer-floor-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-session-timer-floor:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.218
+    entrypoint:
+      - sipp
+      - "172.20.0.216:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact_session_timer_floor.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-session-timer-floor
+
+  sipp-b2bua-session-timer-floor-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-session-timer-floor-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.218
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_session_timer_floor_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "100"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-session-timer-floor
+
+  sipp-b2bua-session-timer-floor-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-session-timer-floor:
+        condition: service_healthy
+      sipp-b2bua-session-timer-floor-register:
+        condition: service_completed_successfully
+      sipp-b2bua-session-timer-floor-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.217
+    entrypoint:
+      - sipp
+      - "172.20.0.216:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_session_timer_floor_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "100"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-session-timer-floor
+
   # --- B2BUA in-dialog INFO relay (RFC 6086) ---
   # The A-leg sends INFO with a DTMF body mid-call; the UAS asserts it arrives
   # with the body intact and answers, and the UAC asserts the 200 comes back.

@@ -886,6 +886,47 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov down --remove-orphans 2>/dev/null || true
 
+  # ── B2BUA session timers at the RFC 4028 floor ──────────────────────────
+  # One call at Session-Expires 90 and Min-SE 90, with a session timer on each
+  # dialog. On the callee's, siphon is the refresher and must re-INVITE at half
+  # the interval. On the caller's, the caller is, never refreshes, and siphon
+  # must end the call 60 s after the answer with a BYE to both legs (RFC 4028
+  # §10). Both sides carry assertions with time windows, so a refresh or a BYE
+  # that never comes, or comes at the wrong time, fails the run.
+  #
+  # Its own job because it needs its own siphon instance (a 90 s session_timer,
+  # refresher uac) and because the call alone takes about 70 s.
+  sipp-b2bua-session-timer-floor:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-session-timer-floor
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-session-timer-floor up -d --wait siphon-b2bua-session-timer-floor
+
+      - name: Callee refreshed at half the interval, both legs BYEd when the caller never refreshes (RFC 4028 §10)
+        run: COMPOSE_PROFILES=b2bua-session-timer-floor bash sipp/run_call.sh sipp-b2bua-session-timer-floor-uac sipp-b2bua-session-timer-floor-uas
+
+      - name: Collect siphon logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-session-timer-floor > siphon-session-timer-floor.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-session-timer-floor-logs
+          path: siphon-session-timer-floor.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-session-timer-floor down --remove-orphans 2>/dev/null || true
+
   # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ───────────────
   # call.fork() rings every target and the first answer wins, which puts the
   # hard parts on the branches that do not win. One failing early must not fail
