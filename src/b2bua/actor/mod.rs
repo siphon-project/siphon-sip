@@ -31,6 +31,7 @@ mod call;
 mod helpers;
 mod leg;
 mod leg_actor;
+mod prack_bridge;
 mod reliable;
 mod store;
 
@@ -44,6 +45,7 @@ pub use call::*;
 pub use helpers::*;
 pub use leg::*;
 pub use leg_actor::*;
+pub use prack_bridge::*;
 pub use reliable::*;
 pub use store::*;
 

@@ -760,8 +760,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `call.answer()` follow the same rules.
   The callee's `RSeq` and `100rel` never reach the caller, and neither do a
   script's from `@b2bua.on_early_media`. Rf ACR-START and the Ro answer report
-  go out with the caller's 2xx rather than on the callee's. A PRACK body is
-  still not bridged; an early `UPDATE` is.
+  go out with the caller's 2xx rather than on the callee's.
+
+- **Offer and answer in a PRACK cross a B2BUA call (RFC 3262 §5).** siphon
+  PRACKed the callee's reliable provisional as it arrived and answered the
+  caller's PRACK itself, so SDP in either never reached the other side. A callee
+  that offered in a reliable 18x, to an INVITE siphon sent without SDP, never
+  got an answer, and an offer in the caller's PRACK was answered with nothing.
+
+  Now siphon's PRACK to the callee waits for the caller's PRACK of siphon's copy
+  and carries what that PRACK carried, with siphon's `o=` and `s=` and
+  `media.sdp_strip_attributes` applied. The caller's answer to an early offer
+  goes to the callee, through the media engine's `answer` on an anchored call.
+  An offer in the caller's PRACK goes to the callee the same way (a re-offer on
+  an anchored call) and the callee's answer comes back in the 200 to the
+  caller's PRACK. Until then the caller's PRACK retransmissions are absorbed; a
+  retransmission after it gets the same 200 again, and a 2xx from the callee
+  waits behind it. Retransmissions of a reliable provisional siphon already has
+  are discarded (RFC 3262 §4) rather than relayed as a new one. A caller that
+  PRACKs an early offer with no answer is refused 488, and the callee gets a
+  PRACK rejecting every stream. A callee that refuses the offer in the PRACK, or
+  leaves it unanswered for 64*T1, fails the call 500 through the teardown claim:
+  the caller's PRACK gets a 200 rejecting every stream, and the callee is
+  CANCELled, or BYEd if it already answered. Toward a caller without `100rel`
+  siphon still PRACKs at once, rejecting an early offer it cannot pass on. A
+  callee may answer before the PRACK of a reliable provisional without SDP, and
+  siphon's copy then stops being retransmitted, so a PRACK still waiting for the
+  caller's goes to the callee with the caller's 2xx. What a PRACK exchange agrees
+  is the session a later refresh offers: the answer in siphon's PRACK is in force
+  on the callee's dialog as it goes, and an offer in it once the callee answers,
+  with the answer siphon relays to the caller in force on the caller's.
 
 - **A B2BUA INVITE that requires `sec-agree` is verified against the IPsec
   security association it arrived over, and the agreement stops at siphon.**

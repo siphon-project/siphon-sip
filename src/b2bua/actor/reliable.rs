@@ -43,6 +43,7 @@ pub fn sends_reliably(
 struct Queued {
     response: SipMessage,
     reliable: bool,
+    link: Option<u64>,
 }
 
 /// A provisional to put on the wire now. `rseq` is `Some` for a reliable one,
@@ -99,6 +100,9 @@ pub enum PrackOutcome {
         rseq: u32,
         release: Vec<ProvisionalSend>,
         answer: Option<Box<HeldAnswer>>,
+        /// The link the acknowledged provisional carried to the callee's PRACK
+        /// held for it ([`super::PrackBridge`]).
+        link: Option<u64>,
     },
     /// A retransmission of a PRACK already answered: 200 again.
     AlreadyAcknowledged,
@@ -113,6 +117,7 @@ struct Unacknowledged {
     carries_sdp: bool,
     sent_at: Instant,
     stop: Arc<tokio::sync::Notify>,
+    link: Option<u64>,
 }
 
 /// The A-leg's reliable provisionals (RFC 3262 §3), one per call: siphon's
@@ -134,23 +139,41 @@ pub struct ALegReliableProvisionals {
 
 impl ALegReliableProvisionals {
     /// Offer a provisional for the caller, sent reliably when `reliable`.
+    /// `link` ties it to the callee's PRACK held for it, which the caller's PRACK
+    /// of this provisional releases.
     ///
     /// It goes out now unless something is already waiting, or it is reliable
     /// and a reliable one before it is unacknowledged; then it queues, so the
     /// caller sees the provisionals in the order the call produced them.
-    pub fn offer(&mut self, response: SipMessage, reliable: bool, now: Instant) -> Offered {
+    pub fn offer(
+        &mut self,
+        response: SipMessage,
+        reliable: bool,
+        link: Option<u64>,
+        now: Instant,
+    ) -> Offered {
         if self.finished {
             return Offered::AfterFinal;
         }
         if !self.queued.is_empty() || (reliable && self.unacknowledged.is_some()) {
-            self.queued.push_back(Queued { response, reliable });
+            self.queued.push_back(Queued {
+                response,
+                reliable,
+                link,
+            });
             return Offered::Queued;
         }
-        Offered::Send(self.dispatch(response, reliable, now))
+        Offered::Send(self.dispatch(response, reliable, link, now))
     }
 
     /// Number and record a provisional that goes out now.
-    fn dispatch(&mut self, response: SipMessage, reliable: bool, now: Instant) -> ProvisionalSend {
+    fn dispatch(
+        &mut self,
+        response: SipMessage,
+        reliable: bool,
+        link: Option<u64>,
+        now: Instant,
+    ) -> ProvisionalSend {
         if self.invite_cseq.is_none() {
             self.invite_cseq = cseq_number(&response);
         }
@@ -177,6 +200,7 @@ impl ALegReliableProvisionals {
             carries_sdp: carries_session_description(&response),
             sent_at: now,
             stop: Arc::clone(&stop),
+            link,
         });
         ProvisionalSend {
             response,
@@ -230,12 +254,12 @@ impl ALegReliableProvisionals {
                 PrackOutcome::Unmatched
             };
         }
-        self.unacknowledged = None;
+        let link = self.unacknowledged.take().and_then(|pending| pending.link);
         self.highest_acknowledged = Some(rseq);
         let mut release = Vec::new();
         while let Some(next) = self.queued.pop_front() {
             let reliable = next.reliable;
-            let send = self.dispatch(next.response, reliable, now);
+            let send = self.dispatch(next.response, reliable, next.link, now);
             let sent_reliably = send.rseq.is_some();
             release.push(send);
             if sent_reliably {
@@ -253,6 +277,7 @@ impl ALegReliableProvisionals {
             rseq,
             release,
             answer,
+            link,
         }
     }
 
@@ -376,11 +401,11 @@ mod tests {
     fn a_second_reliable_provisional_queues_and_takes_the_next_rseq_on_the_prack() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let first = sent(state.offer(provisional(180, false), true, now));
+        let first = sent(state.offer(provisional(180, false), true, None, now));
         let rseq = first.rseq.expect("reliable");
         assert!((1..=0x3FFF_FFFF).contains(&rseq));
         assert!(matches!(
-            state.offer(provisional(183, true), true, now),
+            state.offer(provisional(183, true), true, None, now),
             Offered::Queued
         ));
 
@@ -389,6 +414,7 @@ mod tests {
                 rseq: acknowledged,
                 release,
                 answer,
+                ..
             } => {
                 assert_eq!(acknowledged, rseq);
                 assert_eq!(release.len(), 1);
@@ -404,15 +430,15 @@ mod tests {
     fn an_unreliable_provisional_goes_out_beside_an_unacknowledged_one_but_not_past_the_queue() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let first = sent(state.offer(provisional(183, true), true, now));
-        let unreliable = sent(state.offer(provisional(180, false), false, now));
+        let first = sent(state.offer(provisional(183, true), true, None, now));
+        let unreliable = sent(state.offer(provisional(180, false), false, None, now));
         assert!(unreliable.rseq.is_none());
         assert!(matches!(
-            state.offer(provisional(183, true), true, now),
+            state.offer(provisional(183, true), true, None, now),
             Offered::Queued
         ));
         assert!(matches!(
-            state.offer(provisional(180, false), false, now),
+            state.offer(provisional(180, false), false, None, now),
             Offered::Queued
         ));
 
@@ -441,7 +467,7 @@ mod tests {
     fn a_prack_is_matched_on_its_rseq_and_the_invite_cseq() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let rseq = sent(state.offer(provisional(183, true), true, now))
+        let rseq = sent(state.offer(provisional(183, true), true, None, now))
             .rseq
             .expect("reliable");
         assert!(matches!(
@@ -470,7 +496,7 @@ mod tests {
     fn the_answer_waits_for_the_prack_of_a_provisional_with_sdp_only() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let rseq = sent(state.offer(provisional(183, true), true, now))
+        let rseq = sent(state.offer(provisional(183, true), true, None, now))
             .rseq
             .expect("reliable");
         assert!(matches!(state.answer(answer()), AnswerStep::Held));
@@ -480,7 +506,7 @@ mod tests {
         }
 
         let mut state = ALegReliableProvisionals::default();
-        sent(state.offer(provisional(180, false), true, now));
+        sent(state.offer(provisional(180, false), true, None, now));
         assert!(matches!(state.answer(answer()), AnswerStep::Send(_)));
     }
 
@@ -488,10 +514,10 @@ mod tests {
     fn the_answer_waits_behind_a_queued_provisional() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let rseq = sent(state.offer(provisional(180, false), true, now))
+        let rseq = sent(state.offer(provisional(180, false), true, None, now))
             .rseq
             .expect("reliable");
-        state.offer(provisional(183, true), true, now);
+        state.offer(provisional(183, true), true, None, now);
         assert!(matches!(state.answer(answer()), AnswerStep::Held));
         match state.acknowledge(rseq, 7, now) {
             PrackOutcome::Acknowledged {
@@ -512,8 +538,8 @@ mod tests {
     async fn a_final_response_stops_the_retransmits_and_drops_what_waited() {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
-        let first = sent(state.offer(provisional(183, true), true, now));
-        state.offer(provisional(180, false), true, now);
+        let first = sent(state.offer(provisional(183, true), true, None, now));
+        state.offer(provisional(180, false), true, None, now);
         assert!(matches!(state.answer(answer()), AnswerStep::Held));
 
         assert!(state.finish().is_some(), "the held 2xx comes back");
@@ -522,7 +548,7 @@ mod tests {
             .await
             .expect("the retransmits were told to stop");
         assert!(matches!(
-            state.offer(provisional(180, false), false, now),
+            state.offer(provisional(180, false), false, None, now),
             Offered::AfterFinal
         ));
         let rseq = first.rseq.expect("reliable");
@@ -537,17 +563,37 @@ mod tests {
         let now = Instant::now();
         let mut state = ALegReliableProvisionals::default();
         assert!(!state.overdue(now + PRACK_WAIT));
-        sent(state.offer(provisional(183, true), true, now));
+        sent(state.offer(provisional(183, true), true, None, now));
         assert!(!state.overdue(now + PRACK_WAIT - Duration::from_millis(1)));
         assert!(state.overdue(now + PRACK_WAIT));
         state.finish();
         assert!(!state.overdue(now + PRACK_WAIT));
     }
 
+    #[test]
+    fn the_link_a_provisional_carries_comes_back_with_its_prack_even_after_queueing() {
+        let now = Instant::now();
+        let mut state = ALegReliableProvisionals::default();
+        let first = sent(state.offer(provisional(180, false), true, Some(1), now));
+        assert!(matches!(
+            state.offer(provisional(183, true), true, Some(2), now),
+            Offered::Queued
+        ));
+        let rseq = first.rseq.expect("reliable");
+        match state.acknowledge(rseq, 7, now) {
+            PrackOutcome::Acknowledged { link, .. } => assert_eq!(link, Some(1)),
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+        match state.acknowledge(rseq + 1, 7, now) {
+            PrackOutcome::Acknowledged { link, .. } => assert_eq!(link, Some(2)),
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn dropping_the_state_stops_the_retransmits() {
         let mut state = ALegReliableProvisionals::default();
-        let first = sent(state.offer(provisional(183, true), true, Instant::now()));
+        let first = sent(state.offer(provisional(183, true), true, None, Instant::now()));
         drop(state);
         let stop = first.stop.expect("a reliable provisional has a stop");
         tokio::time::timeout(Duration::from_millis(50), stop.notified())

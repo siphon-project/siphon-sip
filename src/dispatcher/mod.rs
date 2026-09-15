@@ -101,6 +101,8 @@ mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
+mod prack_offer_answer_tests;
+#[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
 mod relayed_identity_tests;

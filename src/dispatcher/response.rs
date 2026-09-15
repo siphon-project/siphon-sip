@@ -249,6 +249,15 @@ pub(super) fn handle_response(
         return;
     }
 
+    // A response to a PRACK siphon sent a callee (RFC 3262). siphon registers no
+    // branch for those, so it is told by the branch prefix siphon gives them and
+    // matched to its call by the dialog's Call-ID: the 2xx answering an offer the
+    // caller's PRACK carried goes on to the caller, and the rest is absorbed.
+    if branch.starts_with(PRACK_BRANCH_PREFIX) {
+        handle_callee_prack_response(&message, status_code, inbound.remote_addr, state);
+        return;
+    }
+
     // Check if this response belongs to a B2BUA call
     let mut torn_down_call = None;
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {

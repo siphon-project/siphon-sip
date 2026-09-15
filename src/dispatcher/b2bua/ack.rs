@@ -736,7 +736,7 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
 }
 
 /// How the caller's answer to a delayed offer reaches the callee.
-enum AnchoredAnswer {
+pub enum AnchoredAnswer {
     /// The call's media is not anchored: the caller's SDP goes as written.
     NotAnchored,
     /// The media engine's answer, for the callee's ACK.
@@ -748,7 +748,7 @@ enum AnchoredAnswer {
 /// Send the caller's answer to the media engine when the callee's offer is
 /// anchored there and waiting for it: `rtpengine.answer` recorded the session
 /// from that offer, with the callee as offerer and no answerer yet.
-fn anchored_answer(
+pub fn anchored_answer(
     call_id: &str,
     caller_ack: &SipMessage,
     state: &DispatcherState,

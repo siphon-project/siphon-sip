@@ -38,6 +38,11 @@ pub fn b_leg_provisional(
             return;
         }
 
+        // The PRACK siphon holds for it, which the caller's PRACK of siphon's copy
+        // releases (RFC 3262 §5), found before the response is rewritten for the
+        // caller.
+        let prack_link = callee_prack_link(call_id, snapshot.b_leg_index, message, state);
+
         // Drop a stray provisional that arrives after the call is already
         // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
         // fork branch's late 18x. A B2BUA must not forward a provisional after
@@ -52,6 +57,11 @@ pub fn b_leg_provisional(
         if !state.call_actors.try_mark_ringing(call_id) {
             debug!(call_id = %call_id, status = status_code,
         "B2BUA: dropping provisional received after answer");
+            // Not relayed, so the caller never PRACKs it: the callee still gets
+            // siphon's PRACK (RFC 3262 §4).
+            if let Some(link) = prack_link {
+                release_unanswered_callee_prack(call_id, link, state);
+            }
             return;
         }
 
@@ -199,6 +209,12 @@ pub fn b_leg_provisional(
         }
         // To the caller: reliably on siphon's own numbering when it asked for
         // that (RFC 3262 §3), after the PRACK of a reliable one before it.
-        send_a_leg_provisional(call_id, message.clone(), callee_sent_reliably, state);
+        send_a_leg_provisional(
+            call_id,
+            message.clone(),
+            callee_sent_reliably,
+            prack_link,
+            state,
+        );
     }
 }

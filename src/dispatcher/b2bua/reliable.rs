@@ -5,7 +5,8 @@
 //! that PRACK is answered here. A 2xx that must not overtake a reliable
 //! provisional waits for its PRACK, and a caller that never PRACKs is refused.
 //! The callee's reliable provisionals are the B-leg's: siphon PRACKs them there
-//! ([`auto_prack_b_leg`]) and none of their reliability reaches the caller.
+//! ([`auto_prack_b_leg`]), once the caller has PRACKed siphon's copy when there
+//! is one, and that PRACK carries what the caller's did ([`bridge_caller_prack`]).
 //!
 //! What goes out when is decided by the call's
 //! [`crate::b2bua::actor::ALegReliableProvisionals`]; this puts it on the wire.
@@ -13,7 +14,8 @@
 use std::time::Instant;
 
 use crate::b2bua::actor::{
-    sends_reliably, AnswerStep, HeldAnswer, Offered, PrackOutcome, ProvisionalSend,
+    sends_reliably, AnswerStep, HeldAnswer, HeldCalleePrack, Offered, PrackOutcome,
+    ProvisionalSend, RequestSource,
 };
 use crate::dispatcher::*;
 
@@ -80,47 +82,60 @@ impl CallerRoute {
 /// It goes out reliably (RFC 3262 §3) when the caller required `100rel`, or
 /// supports it and either the callee sent this provisional reliably
 /// (`callee_sent_reliably`, `false` for siphon's own provisional) or it carries
-/// SDP: with siphon's
-/// next `RSeq` on the caller's dialog, retransmitted until the caller's PRACK.
-/// While a reliable provisional before it is unacknowledged it waits, and goes
-/// out when that PRACK arrives. Returns `false` when the call is gone.
+/// SDP: with siphon's next `RSeq` on the caller's dialog, retransmitted until the
+/// caller's PRACK. While a reliable provisional before it is unacknowledged it
+/// waits, and goes out when that PRACK arrives. `link` names the PRACK siphon
+/// holds for the callee's reliable provisional this copies, which the caller's
+/// PRACK of this copy releases, and which goes to the callee at once when the
+/// caller will never PRACK it. Returns `false` when the call is gone.
 pub fn send_a_leg_provisional(
     call_id: &str,
     response: SipMessage,
     callee_sent_reliably: bool,
+    link: Option<u64>,
     state: &DispatcherState,
 ) -> bool {
     let now = Instant::now();
-    let Some((route, messages)) = state.call_actors.get_call_mut(call_id).map(|mut call| {
-        let reliable = sends_reliably(
-            call.a_leg_requires_100rel,
-            call.a_leg_supports_100rel,
-            callee_sent_reliably,
-            crate::b2bua::actor::carries_session_description(&response),
-        );
-        let route = CallerRoute::of(&call);
-        let messages = match call.a_leg_reliability.offer(response, reliable, now) {
-            Offered::Send(send) => prepare_provisionals(vec![send], &route, state),
-            Offered::Queued => {
-                debug!(
-                    call_id = %call_id,
-                    "B2BUA: provisional for the caller waits for the PRACK of the reliable one before it (RFC 3262 §3)"
-                );
-                Vec::new()
-            }
-            Offered::AfterFinal => {
-                debug!(
-                    call_id = %call_id,
-                    "B2BUA: dropping a provisional for a caller that already has its final response"
-                );
-                Vec::new()
-            }
-        };
-        (route, messages)
-    }) else {
+    let Some((route, messages, unanswered)) =
+        state.call_actors.get_call_mut(call_id).map(|mut call| {
+            let reliable = sends_reliably(
+                call.a_leg_requires_100rel,
+                call.a_leg_supports_100rel,
+                callee_sent_reliably,
+                crate::b2bua::actor::carries_session_description(&response),
+            );
+            let route = CallerRoute::of(&call);
+            let offered =
+                call.a_leg_reliability
+                    .offer(response, reliable, link.filter(|_| reliable), now);
+            let unanswered =
+                link.filter(|_| !reliable || matches!(offered, Offered::AfterFinal));
+            let messages = match offered {
+                Offered::Send(send) => prepare_provisionals(vec![send], &route, state),
+                Offered::Queued => {
+                    debug!(
+                        call_id = %call_id,
+                        "B2BUA: provisional for the caller waits for the PRACK of the reliable one before it (RFC 3262 §3)"
+                    );
+                    Vec::new()
+                }
+                Offered::AfterFinal => {
+                    debug!(
+                        call_id = %call_id,
+                        "B2BUA: dropping a provisional for a caller that already has its final response"
+                    );
+                    Vec::new()
+                }
+            };
+            (route, messages, unanswered)
+        })
+    else {
         return false;
     };
     send_to_caller(messages, &route, state);
+    if let Some(link) = unanswered {
+        release_unanswered_callee_prack(call_id, link, state);
+    }
     true
 }
 
@@ -203,10 +218,17 @@ fn send_to_caller(messages: Vec<SipMessage>, route: &CallerRoute, state: &Dispat
 /// case it follows that PRACK's 200.
 pub fn answer_a_leg(call_id: &str, answer: HeldAnswer, state: &DispatcherState) {
     let Some((route, step)) = state.call_actors.get_call_mut(call_id).map(|mut call| {
-        (
-            CallerRoute::of(&call),
-            call.a_leg_reliability.answer(Box::new(answer)),
-        )
+        let step = match call.a_leg_reliability.answer(Box::new(answer)) {
+            // An offer the caller's PRACK carried is still with the callee: the
+            // 2xx follows the 200 that answers that PRACK (RFC 3262 §5), so no
+            // final response lands on an offer the caller has no answer to yet.
+            AnswerStep::Send(answer) if call.prack_bridge.offer_pending() => {
+                call.prack_bridge.defer_answer(answer);
+                AnswerStep::Held
+            }
+            step => step,
+        };
+        (CallerRoute::of(&call), step)
     }) else {
         warn!(call_id = %call_id, "B2BUA: the call was gone before its answer went to the caller");
         return;
@@ -217,7 +239,7 @@ pub fn answer_a_leg(call_id: &str, answer: HeldAnswer, state: &DispatcherState) 
         }
         AnswerStep::Held => debug!(
             call_id = %call_id,
-            "B2BUA: the caller's 2xx waits for the PRACK of a reliable provisional (RFC 3262 §3)"
+            "B2BUA: the caller's 2xx waits for a PRACK of a reliable provisional (RFC 3262 §3), or for the 200 answering an offer in one (§5)"
         ),
     }
 }
@@ -249,6 +271,9 @@ fn deliver_a_leg_answer(
     // signalling drops a 2xx sourced from a different local port.
     leading.push(response);
     send_to_caller(leading, route, state);
+    // The caller has its final response, so the PRACKs siphon still holds for the
+    // caller's go to their callees now (RFC 3262 §4).
+    release_held_callee_pracks(call_id, state);
 
     // The B2BUA has no INVITE server transaction for the caller, so nothing else
     // recovers a lost 2xx. Cancelled by the caller's ACK in the late-ACK handler
@@ -300,14 +325,35 @@ fn deliver_a_leg_answer(
     }
 }
 
-/// Answer a PRACK from a B2BUA caller (RFC 3262 §3).
+/// What a caller's PRACK matched, decided under the call's lock.
+enum CallerPrack {
+    /// It acknowledged siphon's reliable provisional `rseq`, releasing what waited
+    /// for that PRACK, and the callee's PRACK held for the provisional.
+    Acknowledged {
+        rseq: u32,
+        released: Vec<SipMessage>,
+        answer: Option<Box<HeldAnswer>>,
+        held: Option<HeldCalleePrack>,
+    },
+    /// A retransmission of a PRACK already answered, with the 200 that answered
+    /// it when that one carried the callee's answer to an offer.
+    Retransmitted(Option<SipMessage>),
+    /// A retransmission of a PRACK whose offer the callee has not answered yet.
+    OfferPending,
+    Unmatched,
+}
+
+/// Answer a PRACK from a B2BUA caller (RFC 3262 §3, §5).
 ///
 /// Matched on its `RAck` against the reliable provisionals siphon sent on the
-/// caller's dialog, which the PRACK names by siphon's To-tag: 200 for the one
-/// awaiting it, and whatever that PRACK released goes out right behind the 200
-/// (the next provisional, or the held 2xx); 200 again for a retransmission of a
-/// PRACK already answered; 481 for one that matches nothing. None is relayed to
-/// the callee, whose provisionals siphon PRACKs on the B-leg itself.
+/// caller's dialog, which the PRACK names by siphon's To-tag. The one awaiting it
+/// gets its 200, and whatever that PRACK released goes out right behind the 200
+/// (the next provisional, or the held 2xx). The PRACK siphon held for the callee's
+/// provisional goes to the callee now, carrying what the caller's carried
+/// ([`bridge_caller_prack`]); when that is an offer, the 200 waits for the
+/// callee's answer. A retransmission of a PRACK already answered gets its 200
+/// again, and is absorbed while its offer waits; one that matches nothing gets
+/// 481.
 pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let reply = |status_code: u16, reason: &str| {
         build_response(
@@ -357,6 +403,7 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                     rseq,
                     release,
                     answer,
+                    link,
                 } => {
                     if let Some((_, entry)) = state
                         .reliable_provisionals
@@ -364,35 +411,119 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                     {
                         entry.cancel.notify_one();
                     }
-                    Some((prepare_provisionals(release, &route, state), answer))
+                    CallerPrack::Acknowledged {
+                        rseq,
+                        released: prepare_provisionals(release, &route, state),
+                        answer,
+                        held: link.and_then(|link| call.prack_bridge.take(link)),
+                    }
                 }
-                PrackOutcome::AlreadyAcknowledged => Some((Vec::new(), None)),
-                PrackOutcome::Unmatched => None,
+                PrackOutcome::AlreadyAcknowledged
+                    if call.prack_bridge.offer_waits_on(rack.response_number) =>
+                {
+                    CallerPrack::OfferPending
+                }
+                PrackOutcome::AlreadyAcknowledged => CallerPrack::Retransmitted(
+                    call.prack_bridge.answered_response(rack.response_number),
+                ),
+                PrackOutcome::Unmatched => CallerPrack::Unmatched,
             };
             Some((call_id, route, decision))
         });
 
     match decided {
-        Some((call_id, route, Some((released, answer)))) => {
+        Some((
+            call_id,
+            route,
+            CallerPrack::Acknowledged {
+                rseq,
+                released,
+                answer,
+                held,
+            },
+        )) => {
+            let bridged = match held {
+                Some(held) => bridge_caller_prack(&call_id, held, &message, &inbound, rseq, state),
+                None => {
+                    if !message.body.is_empty() {
+                        warn!(
+                            call_id = %call_id,
+                            rseq,
+                            "B2BUA: the caller's PRACK carries a body, but no PRACK to the callee waits for it \
+                             (the provisional was siphon's own, or its PRACK went with the caller's 2xx); \
+                             answered without crossing"
+                        );
+                    }
+                    CallerPrackBridged::Answer
+                }
+            };
+            match bridged {
+                CallerPrackBridged::Answer => {
+                    debug!(
+                        call_id = %call_id,
+                        rseq,
+                        "B2BUA: the caller's PRACK acknowledges a reliable provisional — 200 OK"
+                    );
+                    let mut messages = Vec::with_capacity(released.len() + 2);
+                    let ok = reply(200, "OK");
+                    if route.carried(&inbound) {
+                        messages.push(ok);
+                    } else {
+                        to_inbound(ok);
+                    }
+                    messages.extend(released);
+                    match answer {
+                        Some(answer) => {
+                            deliver_a_leg_answer(&call_id, answer, messages, &route, state)
+                        }
+                        None => send_to_caller(messages, &route, state),
+                    }
+                }
+                CallerPrackBridged::WaitForCallee => {
+                    debug!(
+                        call_id = %call_id,
+                        rseq,
+                        "B2BUA: the caller's PRACK carries an offer; its 200 waits for the callee's answer (RFC 3262 §5)"
+                    );
+                    send_to_caller(released, &route, state);
+                    defer_released_answer(&call_id, answer, state);
+                }
+                CallerPrackBridged::Fail {
+                    answer: prack_answer,
+                    status,
+                } => {
+                    let mut ok = reply(200, "OK");
+                    if let Some(sdp) = prack_answer {
+                        set_sdp_body(&mut ok, sdp, "application/sdp");
+                    }
+                    to_inbound(ok);
+                    defer_released_answer(&call_id, answer, state);
+                    if let Some(refusal) = claim_refusal(&call_id, state, |_| true) {
+                        carry_out_refusal(
+                            &call_id,
+                            refusal,
+                            status,
+                            "the caller's PRACK could not complete the offer/answer exchange with the callee (RFC 3262 §5)",
+                            state,
+                        );
+                    }
+                }
+            }
+        }
+        Some((call_id, _, CallerPrack::OfferPending)) => debug!(
+            call_id = %call_id,
+            rseq = rack.response_number,
+            "B2BUA: absorbing a retransmitted PRACK whose offer the callee has not answered yet"
+        ),
+        Some((call_id, _, CallerPrack::Retransmitted(answered))) => {
             debug!(
                 call_id = %call_id,
                 rseq = rack.response_number,
-                "B2BUA: the caller's PRACK acknowledges a reliable provisional — 200 OK"
+                "B2BUA: the caller retransmitted a PRACK already answered — 200 OK again"
             );
-            let mut messages = Vec::with_capacity(released.len() + 2);
-            let ok = reply(200, "OK");
-            if route.carried(&inbound) {
-                messages.push(ok);
-            } else {
-                to_inbound(ok);
-            }
-            messages.extend(released);
-            match answer {
-                Some(answer) => deliver_a_leg_answer(&call_id, answer, messages, &route, state),
-                None => send_to_caller(messages, &route, state),
-            }
+            to_inbound(answered.unwrap_or_else(|| reply(200, "OK")));
         }
-        Some((call_id, _, None)) => {
+        Some((call_id, _, CallerPrack::Unmatched)) => {
             debug!(
                 call_id = %call_id,
                 rseq = rack.response_number,
@@ -407,6 +538,71 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                 to_inbound(reply(481, "Call/Transaction Does Not Exist"));
             }
         }
+    }
+}
+
+/// The caller's 2xx a PRACK released while that PRACK's own exchange with the
+/// callee is still open: it waits for the 200 that answers the PRACK.
+fn defer_released_answer(call_id: &str, answer: Option<Box<HeldAnswer>>, state: &DispatcherState) {
+    let Some(answer) = answer else {
+        return;
+    };
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        call.prack_bridge.defer_answer(answer);
+    }
+}
+
+/// Send the caller's 2xx `answer`, which waited behind the 200 answering a PRACK.
+pub fn deliver_deferred_answer(call_id: &str, answer: Box<HeldAnswer>, state: &DispatcherState) {
+    let Some(route) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| CallerRoute::of(&call))
+    else {
+        return;
+    };
+    deliver_a_leg_answer(call_id, answer, Vec::new(), &route, state);
+}
+
+/// Send `response`, answering a caller's PRACK that arrived over `source`, then
+/// the caller's 2xx `answer` that PRACK released, if any: as one ordered group
+/// when the PRACK came over the caller's own route, since sent apart on UDP they
+/// can overtake each other.
+pub fn send_caller_prack_response(
+    call_id: &str,
+    response: SipMessage,
+    source: &RequestSource,
+    answer: Option<Box<HeldAnswer>>,
+    state: &DispatcherState,
+) {
+    let route = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| CallerRoute::of(&call));
+    let on_route = route.as_ref().is_some_and(|route| {
+        route.transport == source.transport
+            && route.remote_addr == source.remote_addr
+            && route.connection_id == source.connection_id
+    });
+    let mut leading = Vec::with_capacity(1);
+    if on_route {
+        leading.push(response);
+    } else {
+        send_message_from(
+            response,
+            source.transport,
+            source.remote_addr,
+            source.connection_id,
+            Some(source.local_addr),
+            state,
+        );
+    }
+    let Some(route) = route else {
+        return;
+    };
+    match answer {
+        Some(answer) => deliver_a_leg_answer(call_id, answer, leading, &route, state),
+        None => send_to_caller(leading, &route, state),
     }
 }
 
@@ -516,11 +712,12 @@ pub fn end_held_answer_for_caller(
         .get_call_mut(internal_call_id)
         .and_then(|mut call| {
             if call.a_leg.dialog.call_id != leg.dialog.call_id
-                || !call.a_leg_reliability.holds_answer()
+                || !(call.a_leg_reliability.holds_answer() || call.prack_bridge.holds_answer())
             {
                 return None;
             }
             let _dropped = call.a_leg_reliability.finish();
+            let _deferred = call.prack_bridge.take_deferred_answer();
             Some((
                 call.a_leg.clone(),
                 call.a_leg_invite.clone(),
@@ -555,7 +752,9 @@ pub fn end_held_answer_for_caller(
 }
 
 /// Refuse every caller that has let a reliable provisional go unacknowledged for
-/// 64*T1 (RFC 3262 §3). Runs on the dispatcher's fast call-lifetime interval.
+/// 64*T1 (RFC 3262 §3), and fail every call whose callee has left an offer
+/// siphon's PRACK carried unanswered as long (§5). Runs on the dispatcher's fast
+/// call-lifetime interval.
 pub fn check_b2bua_prack_timeouts(state: &DispatcherState) {
     check_b2bua_prack_timeouts_at(state, Instant::now());
 }
@@ -572,60 +771,111 @@ pub fn check_b2bua_prack_timeouts_at(state: &DispatcherState, now: Instant) {
     for call_id in overdue {
         refuse_unacknowledging_caller(&call_id, now, state);
     }
+    let unanswered: Vec<String> = state
+        .call_actors
+        .iter_calls()
+        .filter(|entry| entry.value().prack_bridge.offer_overdue(now))
+        .map(|entry| entry.key().clone())
+        .collect();
+    for call_id in unanswered {
+        fail_overdue_prack_offer(&call_id, now, state);
+    }
 }
 
 /// RFC 3262 §3: "If a reliable provisional response is retransmitted for 64*T1
 /// seconds without reception of a corresponding PRACK, the UAS SHOULD reject the
 /// original request with a 5xx response."
 ///
-/// It is a teardown, so it takes the call over first, the claim
-/// [`CallActorStore::claim_teardown`] makes, under the same lock that re-checks
-/// the deadline: a call another teardown already has is left to that one, and a
-/// PRACK that arrived meanwhile keeps the call. The callee is let go next: still
-/// ringing, it is CANCELled (RFC 3261 §9.1); answered, with its 2xx held for this
-/// PRACK, its dialog is BYEd and the answer no longer stands. The caller then
-/// gets the 5xx, without `@b2bua.on_failure`, since routing the call elsewhere
-/// cannot make the caller PRACK.
+/// The deadline is re-checked under the lock that claims the call, so a PRACK
+/// that arrived meanwhile keeps the call.
 fn refuse_unacknowledging_caller(call_id: &str, now: Instant, state: &DispatcherState) {
-    let Some((sip_call_id, rseq, held, winner, handles)) = state
-        .call_actors
-        .get_call_mut(call_id)
-        .and_then(|mut call| {
-            // Re-checked under the lock: the PRACK may have arrived since the
-            // sweep read the call, or another teardown may have taken it.
-            if !call.a_leg_reliability.overdue(now) || call.teardown_claimed {
-                return None;
-            }
-            call.teardown_claimed = true;
-            let rseq = call.a_leg_reliability.unacknowledged_rseq();
-            let held = call.a_leg_reliability.finish();
-            for b_leg in &call.b_legs {
-                state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-            }
-            let handles: Vec<_> = call
-                .b_leg_handles
-                .iter()
-                .flatten()
-                .map(|handle| handle.tx.clone())
-                .collect();
-            let winner = call
-                .winner
-                .and_then(|index| call.b_legs.get(index).cloned());
-            Some((
-                call.a_leg.dialog.call_id.clone(),
-                rseq,
-                held,
-                winner,
-                handles,
-            ))
-        })
+    let Some(refusal) = claim_refusal(call_id, state, |call| call.a_leg_reliability.overdue(now))
     else {
         return;
     };
+    carry_out_refusal(
+        call_id,
+        refusal,
+        UNACKNOWLEDGED_STATUS,
+        "the caller did not PRACK a reliable provisional within 64*T1 (RFC 3262 §3)",
+        state,
+    );
+}
+
+/// A teardown a call's PRACKs make certain, taken over by [`claim_refusal`] and
+/// carried out by [`carry_out_refusal`].
+pub struct Refusal {
+    sip_call_id: String,
+    rseq: Option<u32>,
+    held: Option<Box<HeldAnswer>>,
+    winner: Option<Leg>,
+}
+
+/// Take `call_id` over for a teardown its PRACKs make certain, with the claim
+/// [`CallActorStore::claim_teardown`] makes, when `condition` holds under the same
+/// lock. `None`, changing nothing, for a call another teardown already has, one
+/// `condition` no longer holds for, or one that is gone; `condition` only runs on
+/// a call no teardown has claimed.
+///
+/// Nothing more goes to the caller reliably, and a callee still ringing is
+/// CANCELled (RFC 3261 §9.1) on the spot. A 2xx held for a PRACK, or deferred
+/// behind one, no longer stands.
+pub fn claim_refusal(
+    call_id: &str,
+    state: &DispatcherState,
+    condition: impl FnOnce(&mut crate::b2bua::actor::CallActor) -> bool,
+) -> Option<Refusal> {
+    let mut call = state.call_actors.get_call_mut(call_id)?;
+    if call.teardown_claimed || !condition(&mut call) {
+        return None;
+    }
+    call.teardown_claimed = true;
+    let rseq = call.a_leg_reliability.unacknowledged_rseq();
+    let held = call
+        .a_leg_reliability
+        .finish()
+        .or_else(|| call.prack_bridge.take_deferred_answer());
+    for b_leg in &call.b_legs {
+        state.b2bua_retransmits.disarm_branch(&b_leg.branch);
+    }
+    if held.is_none() {
+        for handle in call.b_leg_handles.iter().flatten() {
+            let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+        }
+    }
+    let winner = call
+        .winner
+        .and_then(|index| call.b_legs.get(index).cloned());
+    Some(Refusal {
+        sip_call_id: call.a_leg.dialog.call_id.clone(),
+        rseq,
+        held,
+        winner,
+    })
+}
+
+/// Carry out `refusal`, logged with `reason`. The callee is let go: still ringing,
+/// its CANCEL goes out; answered, with its 2xx held for a PRACK, its dialog is
+/// BYEd and the answer no longer stands. The caller then gets `status_code`,
+/// without `@b2bua.on_failure`, since routing the call elsewhere cannot complete
+/// the caller's PRACKs.
+pub fn carry_out_refusal(
+    call_id: &str,
+    refusal: Refusal,
+    status_code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) {
+    let Refusal {
+        sip_call_id,
+        rseq,
+        held,
+        winner,
+    } = refusal;
     warn!(
         call_id = %call_id,
         rseq = ?rseq,
-        "B2BUA: the caller did not PRACK a reliable provisional within 64*T1 — refusing the call {UNACKNOWLEDGED_STATUS} (RFC 3262 §3)"
+        "B2BUA: {reason} — refusing the call {status_code}"
     );
     if let Some(rseq) = rseq {
         if let Some((_, entry)) = state.reliable_provisionals.remove(&(sip_call_id, rseq)) {
@@ -636,11 +886,8 @@ fn refuse_unacknowledging_caller(call_id: &str, now: Instant, state: &Dispatcher
         release_held_answer(call_id, held, winner, state);
         cdr_clear_b2bua_answer(state, call_id);
     } else {
-        for handle in &handles {
-            let _ = handle.try_send(crate::b2bua::actor::LegMessage::Cancel);
-        }
         let cancelled = state.call_actors.cancel_ringing_branches(call_id);
         cancel_settled_branches(&cancelled, state);
     }
-    end_call_without_rerouting(call_id, UNACKNOWLEDGED_STATUS, state);
+    end_call_without_rerouting(call_id, status_code, state);
 }

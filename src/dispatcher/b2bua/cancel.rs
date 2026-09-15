@@ -50,10 +50,11 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // Only cancel if call is still in Calling or Ringing state
     if call.state != CallState::Calling && call.state != CallState::Ringing {
         // Unless the callee answered and the caller's 2xx is still held for a
-        // PRACK (RFC 3262 §3): the caller has had no final response, so its
+        // PRACK (RFC 3262 §3), or for the 200 answering an offer in one (§5):
+        // the caller has had no final response, so its
         // CANCEL still ends the call (RFC 3261 §9.2). The teardown sends the
         // caller its 487 and the callee, which answered, a BYE.
-        let answer_held = call.a_leg_reliability.holds_answer();
+        let answer_held = call.a_leg_reliability.holds_answer() || call.prack_bridge.holds_answer();
         drop(call);
         let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
         send_message_from(

@@ -227,7 +227,9 @@ pub fn handle_b2bua_response(
     if absorb_cancelled_branch_response(call_id, branch, message, status_code, state) {
         return true;
     }
-    auto_prack_b_leg(call_id, message, status_code, state, &snapshot);
+    if auto_prack_b_leg(call_id, message, status_code, state, &snapshot) {
+        return true;
+    }
 
     // Absorb the B-leg's 200 OK PRACK so it never gets forwarded to the
     // A-leg (the A-leg never sent a PRACK — siphon did, locally). The

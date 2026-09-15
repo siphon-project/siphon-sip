@@ -411,7 +411,7 @@ pub fn send_uas_response(
     if !final_response && (101..200).contains(&code) {
         // siphon's own provisional is reliable toward a caller that required
         // `100rel` (RFC 3262 §3), and waits behind an unacknowledged one.
-        return send_a_leg_provisional(internal_call_id, response, false, state);
+        return send_a_leg_provisional(internal_call_id, response, false, None, state);
     }
     if final_response && (200..300).contains(&code) {
         // An answer siphon gives the caller itself is the session description in

@@ -176,7 +176,9 @@ async fn a_late_provisional_from_a_failed_fork_branch_is_dropped() {
 
 /// A reliable 183 from the carrier in flight is PRACKed at its early dialog's
 /// Contact (RFC 3262 §4) and relayed to the caller. Its retransmission, sent
-/// while the PRACK was on the way, draws no second PRACK.
+/// while the PRACK was on the way, draws no second PRACK, and is discarded:
+/// "Once a reliable provisional response is received, retransmissions of that
+/// response MUST be discarded" (§4).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reliable_provisional_from_the_carrier_in_flight_is_pracked_once() {
     let sequence = Sequence::start_with_script(vec![carrier("carrier-a", FIRST_CARRIER, 2)], 5, "");
@@ -212,8 +214,8 @@ async fn a_reliable_provisional_from_the_carrier_in_flight_is_pracked_once() {
     carrier_answers_reliably(&sequence, FIRST_CARRIER, &first, 183, "Session Progress");
     assert_eq!(
         summaries(&sequence.wire()),
-        [format!("183 to {CALLER}")],
-        "the retransmitted 183 is not PRACKed again"
+        Vec::<String>::new(),
+        "the retransmitted 183 is neither PRACKed again nor relayed"
     );
 }
 

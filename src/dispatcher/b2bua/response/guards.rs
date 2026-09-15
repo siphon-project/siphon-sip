@@ -48,171 +48,154 @@ pub fn auto_prack_b_leg(
     status_code: u16,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
-) {
-    // RFC 3262 auto-PRACK for the B-leg side: when the B-leg sends a
-    // reliable provisional response (`Require: 100rel` + `RSeq: <n>`),
-    // the B2BUA must answer with a PRACK. We do that locally here using
-    // the B-leg dialog state. Reliability is per leg: the callee's markers are
-    // removed in `sanitize_b2bua_response`, and a provisional reaches the caller
-    // reliably on siphon's own numbering when the caller asked for that.
-    // We don't track a client transaction for the PRACK — the B-leg's
-    // 200 OK PRACK that comes back will hit the response handler with no
-    // matching session and be dropped, which is the correct behavior here.
+) -> bool {
+    // RFC 3262 PRACK for the B-leg side: a reliable provisional from the callee
+    // (`Require: 100rel` + `RSeq: <n>`) is PRACKed by siphon on the callee's
+    // early dialog. Reliability is per leg: the callee's markers are removed in
+    // `sanitize_b2bua_response`, and a provisional reaches the caller reliably on
+    // siphon's own numbering when the caller asked for that. siphon's PRACK then
+    // waits for the caller's PRACK of that copy, so whatever the caller's PRACK
+    // carries crosses on it (RFC 3262 §5, `hold_or_send_callee_prack`). The
+    // callee's response to it is told by its branch (`PRACK_BRANCH_PREFIX`).
+    //
+    // Returns `true` for a retransmission of a reliable provisional already
+    // received, which is discarded.
     let needs_prack = (100..200).contains(&status_code)
         && status_code != 100
         && crate::sip::headers::rseq::requires_100rel(&message.headers);
-    if needs_prack {
-        if let (Some(rseq), Some(idx)) = (
-            crate::sip::headers::rseq::parse_rseq(&message.headers),
-            snapshot.b_leg_index,
-        ) {
-            // No PRACK for a leg that has ended. It is the check
-            // `b_leg_provisional` drops the provisional on, so siphon never
-            // PRACKs a provisional it does not relay.
-            //
-            // A final response is already in (a failed fork branch, an LCR
-            // carrier settled by its failure, the winner's 2xx): the INVITE
-            // client transaction is over (RFC 3261 §17.1.1.2), and a non-2xx
-            // final ended every early dialog it opened (§12.3). The far end has
-            // no unacknowledged provisional left for a PRACK to match and answers
-            // it 481 (RFC 3262 §3).
-            //
-            // siphon CANCELled the leg and its 487 is not back yet: the
-            // transaction still lives, so RFC 3262 §4 on its own would PRACK.
-            // siphon does not. The far end answers the CANCEL with a 487 at once
-            // (RFC 3261 §9.2), may do so with a provisional unacknowledged (RFC
-            // 3262 §3), and sends no provisional after a final (RFC 3261
-            // §17.2.1), so that 487 is what stops the retransmissions. A PRACK
-            // can only leave behind the CANCEL, reaches the far end after the 487
-            // in the ordinary case, and meets the same 481. Were the CANCEL lost,
-            // the far end rejects the INVITE after 64*T1 without its PRACK (RFC
-            // 3262 §3), which ends the leg siphon was ending anyway. While the
-            // branch is kept answerable, `absorb_cancelled_branch_response`
-            // already dropped the provisional before this runs; this covers the
-            // leg once it is not.
-            if state.call_actors.is_ended_branch(call_id, idx) {
-                debug!(
-                    call_id = %call_id,
-                    rseq = rseq.response_number,
-                    "B2BUA: no PRACK for a reliable provisional from a leg that already ended"
-                );
-                return;
+    if !needs_prack {
+        return false;
+    }
+    let (Some(rseq), Some(idx)) = (
+        crate::sip::headers::rseq::parse_rseq(&message.headers),
+        snapshot.b_leg_index,
+    ) else {
+        return false;
+    };
+    // No PRACK for a leg that has ended. It is the check `b_leg_provisional`
+    // drops the provisional on, so siphon never PRACKs a provisional it does not
+    // relay.
+    //
+    // A final response is already in (a failed fork branch, an LCR carrier
+    // settled by its failure, the winner's 2xx): the INVITE client transaction is
+    // over (RFC 3261 §17.1.1.2), and a non-2xx final ended every early dialog it
+    // opened (§12.3). The far end has no unacknowledged provisional left for a
+    // PRACK to match and answers it 481 (RFC 3262 §3).
+    //
+    // siphon CANCELled the leg and its 487 is not back yet: the transaction still
+    // lives, so RFC 3262 §4 on its own would PRACK. siphon does not. The far end
+    // answers the CANCEL with a 487 at once (RFC 3261 §9.2), may do so with a
+    // provisional unacknowledged (RFC 3262 §3), and sends no provisional after a
+    // final (RFC 3261 §17.2.1), so that 487 is what stops the retransmissions. A
+    // PRACK can only leave behind the CANCEL, reaches the far end after the 487
+    // in the ordinary case, and meets the same 481. Were the CANCEL lost, the far
+    // end rejects the INVITE after 64*T1 without its PRACK (RFC 3262 §3), which
+    // ends the leg siphon was ending anyway. While the branch is kept answerable,
+    // `absorb_cancelled_branch_response` already dropped the provisional before
+    // this runs; this covers the leg once it is not.
+    if state.call_actors.is_ended_branch(call_id, idx) {
+        debug!(
+            call_id = %call_id,
+            rseq = rseq.response_number,
+            "B2BUA: no PRACK for a reliable provisional from a leg that already ended"
+        );
+        return false;
+    }
+
+    // RFC 3262 §4 + RFC 3261 §12.1.2: this reliable provisional establishes (or
+    // refreshes) an early dialog. Build the PRACK from THIS response's remote
+    // target — Contact (→ Request-URI), To (carries the early-dialog remote tag),
+    // and Record-Route (reversed → route set) — rather than from the single
+    // per-Leg Dialog, so a downstream fork producing several early dialogs on
+    // this one INVITE branch PRACKs each to its OWN remote target instead of
+    // collapsing them onto the first dialog's Contact. Without the Contact the
+    // Request-URI falls back to the To AoR, which an IMS I-CSCF treats as an
+    // initial terminating request and rejects 482 Loop Detected.
+    let target = early_dialog_target_from_response(message);
+    // The early dialog is keyed by its remote To-tag; dedup PRACK per tag
+    // (forked dialogs have independent RSeq spaces, RFC 3262 §3). A missing tag
+    // (malformed reliable 1xx) degrades to one shared key.
+    let early_to_tag = crate::b2bua::actor::extract_to_tag(message);
+    let dedup_key = early_to_tag.as_deref().unwrap_or("");
+
+    // RFC 3262 §4: "Once a reliable provisional response is received,
+    // retransmissions of that response MUST be discarded." The callee is
+    // retransmitting because siphon's PRACK is in flight, lost, or still waiting
+    // for the caller's. The PRACK has its own retransmissions, and the caller has
+    // siphon's copy on siphon's own timer, so relaying it again would only show
+    // the caller a new reliable provisional.
+    if !state
+        .call_actors
+        .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)
+    {
+        debug!(
+            call_id = %call_id,
+            rseq = rseq.response_number,
+            "B2BUA: discarding a retransmission of a reliable provisional (RFC 3262 §4)"
+        );
+        return true;
+    }
+
+    // Establish the FIRST early dialog's remote target on the canonical Dialog
+    // (§12.1.2 — set once, not updated by later provisionals) so the eventual
+    // 2xx / BYE / re-INVITE have a target before answer. The confirming 2xx
+    // refreshes remote_tag / remote_contact to the winning dialog.
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(leg) = call.b_legs.get_mut(idx) {
+            if leg.dialog.remote_tag.is_none() {
+                if let Some(ref tag) = early_to_tag {
+                    leg.dialog.remote_tag = Some(tag.clone());
+                }
             }
-
-            // RFC 3262 §4 + RFC 3261 §12.1.2: this reliable provisional
-            // establishes (or refreshes) an early dialog. Build the auto-PRACK
-            // from THIS response's remote target — Contact (→ Request-URI), To
-            // (carries the early-dialog remote tag), and Record-Route (reversed
-            // → route set) — rather than from the single per-Leg Dialog, so a
-            // downstream fork producing several early dialogs on this one INVITE
-            // branch PRACKs each to its OWN remote target instead of collapsing
-            // them onto the first dialog's Contact. Without the Contact the
-            // Request-URI falls back to the To AoR, which an IMS I-CSCF treats
-            // as an initial terminating request and rejects 482 Loop Detected.
-            let target = early_dialog_target_from_response(message);
-            // The early dialog is keyed by its remote To-tag; dedup PRACK per
-            // tag (forked dialogs have independent RSeq spaces, RFC 3262 §3). A
-            // missing tag (malformed reliable 1xx) degrades to one shared key.
-            let early_to_tag = crate::b2bua::actor::extract_to_tag(message);
-            let dedup_key = early_to_tag.as_deref().unwrap_or("");
-
-            // Skip if we've already PRACKed this RSeq for this early dialog —
-            // the B-leg is just retransmitting the reliable 1xx because our
-            // PRACK is in flight or got delayed; one PRACK per (dialog, RSeq)
-            // is correct. Fall through either way so the 1xx still reaches the
-            // A-leg, where its reliability is siphon's own.
-            if state
-                .call_actors
-                .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)
-            {
-                // Establish the FIRST early dialog's remote target on the
-                // canonical Dialog (§12.1.2 — set once, not updated by later
-                // provisionals) so the eventual 2xx / BYE / re-INVITE have a
-                // target before answer. The confirming 2xx refreshes remote_tag
-                // / remote_contact to the winning dialog (2xx block below).
-                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                    if let Some(leg) = call.b_legs.get_mut(idx) {
-                        if leg.dialog.remote_tag.is_none() {
-                            if let Some(ref tag) = early_to_tag {
-                                leg.dialog.remote_tag = Some(tag.clone());
-                            }
-                        }
-                        if leg.dialog.remote_contact.is_none() {
-                            if let Some(ref contact) = target.remote_contact {
-                                leg.dialog.remote_contact = Some(contact.clone());
-                            }
-                        }
-                        if leg.dialog.route_set.is_empty() && !target.route_set.is_empty() {
-                            leg.dialog.route_set = target.route_set.clone();
-                        }
-                    }
+            if leg.dialog.remote_contact.is_none() {
+                if let Some(ref contact) = target.remote_contact {
+                    leg.dialog.remote_contact = Some(contact.clone());
                 }
-
-                // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
-                let response_cseq_num: u32 = message
-                    .headers
-                    .cseq()
-                    .and_then(|c| c.split_whitespace().next())
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(1);
-                let response_cseq_method = message
-                    .headers
-                    .cseq()
-                    .and_then(|c| c.split_whitespace().nth(1))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "INVITE".to_string());
-
-                if let Some(prack_cseq) = state.call_actors.next_b_leg_local_cseq(call_id, idx) {
-                    let prack = state.call_actors.get_call(call_id).and_then(|call| {
-                        let leg = call.b_legs.get(idx)?;
-                        build_b2bua_prack(
-                            leg,
-                            state,
-                            &target,
-                            rseq.response_number,
-                            response_cseq_num,
-                            &response_cseq_method,
-                            prack_cseq,
-                        )
-                    });
-                    if let Some(prack) = prack {
-                        if let Some((dest, transport)) = snapshot.b_leg_dest {
-                            // PRACK follows THIS early dialog's route set (RFC
-                            // 3262 §4 + RFC 3261 §12.2.1.1), from the reliable
-                            // 1xx's Record-Route. Empty (direct B-leg, no
-                            // proxies) → resolve_in_dialog_destination falls back
-                            // to the cached destination, correct there.
-                            let (destination, prack_transport) = resolve_in_dialog_destination(
-                                &target.route_set,
-                                state,
-                                dest,
-                                transport,
-                            );
-                            debug!(
-                                call_id = %call_id,
-                                rseq = rseq.response_number,
-                                %destination,
-                                "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
-                            );
-                            send_b2bua_to_bleg(
-                                prack,
-                                prack_transport,
-                                destination,
-                                snapshot.b_leg_local_addr,
-                                state,
-                            );
-                        }
-                    }
-                }
-            } else {
-                debug!(
-                    call_id = %call_id,
-                    rseq = rseq.response_number,
-                    "B2BUA: already PRACKed this RSeq, skipping"
-                );
+            }
+            if leg.dialog.route_set.is_empty() && !target.route_set.is_empty() {
+                leg.dialog.route_set = target.route_set.clone();
             }
         }
     }
+
+    // CSeq number + method from the 1xx (it echoes the INVITE's), for the RAck.
+    let cseq_number: u32 = message
+        .headers
+        .cseq()
+        .and_then(|cseq| cseq.split_whitespace().next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(1);
+    let cseq_method = message
+        .headers
+        .cseq()
+        .and_then(|cseq| cseq.split_whitespace().nth(1))
+        .map(str::to_string)
+        .unwrap_or_else(|| "INVITE".to_string());
+    // SDP in a reliable provisional to an INVITE siphon sent without one is the
+    // callee's offer, which the PRACK answers (RFC 3262 §5).
+    let invite_carried_no_offer = snapshot
+        .b_leg_stored_invite
+        .as_ref()
+        .and_then(|invite| invite.lock().ok())
+        .is_some_and(|invite| invite.body.is_empty());
+    let offer = (invite_carried_no_offer && !message.body.is_empty()).then(|| message.body.clone());
+    hold_or_send_callee_prack(
+        call_id,
+        crate::b2bua::actor::HeldCalleePrack {
+            b_leg_index: idx,
+            to_tag: dedup_key.to_string(),
+            rseq: rseq.response_number,
+            cseq_number,
+            cseq_method,
+            remote_contact: target.remote_contact,
+            to_header: target.to_header,
+            route_set: target.route_set,
+            offer: None,
+        },
+        offer,
+        state,
+    );
+    false
 }
 
 /// A retransmitted 200 OK for a re-INVITE already completed: re-ACK the
