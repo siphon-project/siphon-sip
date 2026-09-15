@@ -142,12 +142,18 @@ fn caller_invite(offer: Option<&str>) -> String {
     raw
 }
 
+/// What the callee lists in `Allow` unless a test says otherwise: UPDATE among
+/// it, so siphon may carry an offer to it in one (RFC 3311 §4).
+const CALLEE_ALLOW: &str = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE";
+
 /// A caller's call that supports `100rel`, dialled to one callee.
 struct PrackCall {
     state: Arc<DispatcherState>,
     udp: flume::Receiver<OutboundMessage>,
     call_id: String,
     callee_invite: SipMessage,
+    /// The `Allow` every response of the callee's to the INVITE carries, when any.
+    callee_allow: Option<String>,
 }
 
 impl PrackCall {
@@ -180,6 +186,7 @@ impl PrackCall {
             udp,
             call_id,
             callee_invite,
+            callee_allow: Some(CALLEE_ALLOW.to_string()),
         }
     }
 
@@ -266,6 +273,9 @@ impl PrackCall {
         raw.push_str(&format!("Call-ID: {}\r\n", header("Call-ID")));
         raw.push_str(&format!("CSeq: {}\r\n", header("CSeq")));
         raw.push_str("Contact: <sip:callee@198.51.100.70:5060>\r\n");
+        if let Some(allow) = &self.callee_allow {
+            raw.push_str(&format!("Allow: {allow}\r\n"));
+        }
         if let Some(rseq) = rseq {
             raw.push_str(&format!("Require: 100rel\r\nRSeq: {rseq}\r\n"));
         }
@@ -276,12 +286,25 @@ impl PrackCall {
     /// The callee answers siphon's `prack` with `status_code` and `body`, through
     /// the dispatcher's response entry point.
     fn callee_answers_prack(&self, prack: &SipMessage, status_code: u16, body: &str) {
+        self.callee_answers_request(prack, status_code, body, &[]);
+    }
+
+    /// The callee answers siphon's `request`, a PRACK or an UPDATE, with
+    /// `status_code`, `body` and `extra_headers`, through the dispatcher's
+    /// response entry point.
+    fn callee_answers_request(
+        &self,
+        request: &SipMessage,
+        status_code: u16,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+    ) {
         let header = |name: &str| {
-            prack
+            request
                 .headers
                 .get(name)
                 .cloned()
-                .unwrap_or_else(|| panic!("siphon's PRACK has no {name}"))
+                .unwrap_or_else(|| panic!("siphon's request has no {name}"))
         };
         let mut raw = format!("SIP/2.0 {status_code} Reason\r\n");
         raw.push_str(&format!("Via: {}\r\n", header("Via")));
@@ -289,6 +312,9 @@ impl PrackCall {
         raw.push_str(&format!("To: {}\r\n", header("To")));
         raw.push_str(&format!("Call-ID: {}\r\n", header("Call-ID")));
         raw.push_str(&format!("CSeq: {}\r\n", header("CSeq")));
+        for (name, value) in extra_headers {
+            raw.push_str(&format!("{name}: {value}\r\n"));
+        }
         push_body(&mut raw, body);
         let inbound = InboundMessage {
             connection_id: ConnectionId::default(),
@@ -977,9 +1003,21 @@ async fn an_offer_in_the_callers_prack_is_in_force_on_both_dialogs_once_the_call
 fn place_with_callee_rendezvous(
     offer: Option<&str>,
 ) -> (PrackCall, flume::Receiver<OutboundMessage>) {
+    place_with_split_egress(offer, Some(0))
+}
+
+/// [`place_with_callee_rendezvous`] with room for `callee_capacity` messages to
+/// the callee, `None` for as many as siphon sends.
+fn place_with_split_egress(
+    offer: Option<&str>,
+    callee_capacity: Option<usize>,
+) -> (PrackCall, flume::Receiver<OutboundMessage>) {
     let TestDispatcher { mut state, udp } = test_dispatcher_with_script(DIAL);
     drop(udp);
-    let (to_callee, callee) = flume::bounded(0);
+    let (to_callee, callee) = match callee_capacity {
+        Some(capacity) => flume::bounded(capacity),
+        None => flume::unbounded(),
+    };
     let (to_caller, caller) = flume::unbounded();
     let (to_stream, _) = flume::unbounded();
     state.outbound = Arc::new(OutboundRouter {
@@ -1020,6 +1058,7 @@ fn place_with_callee_rendezvous(
         udp: caller,
         call_id,
         callee_invite,
+        callee_allow: Some(CALLEE_ALLOW.to_string()),
     };
     (call, callee)
 }
@@ -1181,6 +1220,453 @@ async fn an_early_offer_in_a_reliable_18x_is_in_force_on_the_callers_dialog_once
         sessions_in_force(&call).caller_session,
         Some(progress.body.clone())
     );
+}
+
+fn updates(messages: &[SipMessage]) -> Vec<SipMessage> {
+    messages
+        .iter()
+        .filter(|message| message.method() == Some(&Method::Update))
+        .cloned()
+        .collect()
+}
+
+/// The one response to the caller's PRACK among `messages`.
+fn prack_response(messages: &[SipMessage]) -> SipMessage {
+    let responses: Vec<&SipMessage> = messages
+        .iter()
+        .filter(|message| message.status_code().is_some() && cseq_method(message) == "PRACK")
+        .collect();
+    assert_eq!(responses.len(), 1, "one response to the PRACK");
+    responses[0].clone()
+}
+
+impl PrackCall {
+    /// Whether a teardown has taken the call, or it is gone.
+    fn is_ending(&self) -> bool {
+        self.state
+            .call_actors
+            .get_call(&self.call_id)
+            .map_or(true, |actor| actor.teardown_claimed)
+    }
+}
+
+/// A caller that supports `100rel` whose callee, listing `allow`, sends a reliable
+/// 180 without SDP and answers the INVITE's offer at once. The caller has its 2xx
+/// without having PRACKed the 180, and siphon's PRACK went to the callee with that
+/// 2xx. Returns the call and the caller's copy of the 180.
+fn answered_before_the_callers_prack(allow: Option<&str>) -> (PrackCall, SipMessage) {
+    let mut call = PrackCall::place(Some(CALLER_OFFER));
+    call.callee_allow = allow.map(str::to_string);
+    call.callee_responds(180, "Ringing", Some(42), "");
+    let ringing = to(&call.wire(), CALLER)
+        .into_iter()
+        .find(|message| message.status_code() == Some(180))
+        .expect("a 180 to the caller");
+    assert!(ringing.headers.get("RSeq").is_some(), "sent reliably");
+
+    call.callee_responds(200, "OK", None, CALLEE_ANSWER);
+    let sent = call.wire();
+    assert!(
+        to(&sent, CALLER)
+            .iter()
+            .any(|message| message.status_code() == Some(200) && cseq_method(message) == "INVITE"),
+        "{:?}",
+        summaries(&sent)
+    );
+    assert_eq!(
+        pracks(&to(&sent, CALLEE)).len(),
+        1,
+        "{:?}",
+        summaries(&sent)
+    );
+    (call, ringing)
+}
+
+/// An offer in a PRACK that arrives once the caller has its 2xx, when siphon's
+/// PRACK already went to the callee, goes to the callee in an UPDATE on its dialog
+/// (RFC 3311). The callee's answer comes back in the 200 to the caller's PRACK
+/// (RFC 3262 §5), and both are the session in force on their dialogs. The caller's
+/// PRACK is not answered before, and a retransmission of it gets that 200 again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_offer_in_the_callers_prack_reaches_the_callee_in_an_update() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    assert!(to(&sent, CALLER).is_empty(), "{:?}", summaries(&sent));
+    let update = updates(&to(&sent, CALLEE));
+    assert_eq!(update.len(), 1, "{:?}", summaries(&sent));
+    let offer = body_text(&update[0]);
+    assert!(offer.contains("m=audio 40002 RTP/AVP 0"), "{offer}");
+    assert!(!offer.contains("o=caller"), "siphon's origin:\n{offer}");
+    assert!(
+        update[0].headers.get("Contact").is_some(),
+        "a target refresh"
+    );
+    assert_eq!(
+        update[0].headers.get("Content-Type").map(String::as_str),
+        Some("application/sdp")
+    );
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    assert_eq!(
+        summaries(&call.wire()),
+        Vec::<String>::new(),
+        "absorbed while the UPDATE is out"
+    );
+
+    call.callee_answers_prack(&update[0], 200, CALLEE_NEW_ANSWER);
+    let sent = call.wire();
+    let answer = prack_response(&to(&sent, CALLER));
+    assert_eq!(answer.status_code(), Some(200));
+    let answer_sdp = body_text(&answer);
+    assert!(
+        answer_sdp.contains("m=audio 30002 RTP/AVP 0"),
+        "{answer_sdp}"
+    );
+    assert!(!answer_sdp.contains("o=callee"), "{answer_sdp}");
+    assert!(call.call_is_up());
+
+    let sessions = sessions_in_force(&call);
+    assert_eq!(sessions.callee_session, Some(update[0].body.clone()));
+    assert_eq!(sessions.caller_session, Some(answer.body.clone()));
+    assert_eq!(
+        sessions.callee_sdp,
+        Some(CALLEE_NEW_ANSWER.as_bytes().to_vec())
+    );
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    let again = prack_response(&to(&sent, CALLER));
+    assert_eq!(body_text(&again), answer_sdp);
+    assert!(to(&sent, CALLEE).is_empty(), "{:?}", summaries(&sent));
+}
+
+/// A callee that refuses the UPDATE leaves the session as it was (RFC 3311 §5.3),
+/// so the caller's offer is refused the same way and the call carries on:
+/// 488 and 606 refuse the offer itself (488), 491 is glare and 504 an answer
+/// that needs the user, both passed on as they are, and anything else is a failure
+/// that is not the offer's (500).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callee_that_refuses_the_update_refuses_the_late_offer_and_keeps_the_call() {
+    for (callee_status, caller_status) in [
+        (488, 488),
+        (606, 488),
+        (491, 491),
+        (504, 504),
+        (403, 500),
+        (503, 500),
+    ] {
+        let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+        let before = sessions_in_force(&call);
+        call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+        let update = updates(&to(&call.wire(), CALLEE));
+        assert_eq!(update.len(), 1, "callee {callee_status}");
+
+        call.callee_answers_prack(&update[0], callee_status, "");
+        let sent = call.wire();
+        let refusal = prack_response(&to(&sent, CALLER));
+        assert_eq!(
+            refusal.status_code(),
+            Some(caller_status),
+            "callee {callee_status}"
+        );
+        assert!(refusal.body.is_empty(), "callee {callee_status}");
+        assert!(
+            to(&sent, CALLEE)
+                .iter()
+                .all(|message| message.method() != Some(&Method::Bye)),
+            "callee {callee_status}: {:?}",
+            summaries(&sent)
+        );
+        assert!(!call.is_ending(), "callee {callee_status}");
+        let after = sessions_in_force(&call);
+        assert_eq!(after.caller_session, before.caller_session);
+        assert_eq!(after.callee_session, before.callee_session);
+    }
+}
+
+/// A callee with an offer of its own unanswered refuses the UPDATE 500 with a
+/// Retry-After (RFC 3311 §5.2), and the caller gets both, so it can offer again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_500_with_retry_after_for_the_update_reaches_the_caller_with_it() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let update = updates(&to(&call.wire(), CALLEE));
+    call.callee_answers_request(&update[0], 500, "", &[("Retry-After", "4")]);
+    let refusal = prack_response(&to(&call.wire(), CALLER));
+    assert_eq!(refusal.status_code(), Some(500));
+    assert_eq!(
+        refusal.headers.get("Retry-After").map(String::as_str),
+        Some("4")
+    );
+    assert!(!call.is_ending());
+}
+
+/// A 481 or a 408 for the UPDATE means the callee's dialog is gone, and RFC 3311
+/// §5.3 has the UAC terminate it: the caller's PRACK is refused 500 and the call
+/// ends, the callee getting a BYE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callee_dialog_that_is_gone_ends_the_call_on_the_late_offer() {
+    for callee_status in [481, 408] {
+        let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+        call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+        let update = updates(&to(&call.wire(), CALLEE));
+        call.callee_answers_prack(&update[0], callee_status, "");
+        let sent = call.wire();
+        assert_eq!(
+            prack_response(&to(&sent, CALLER)).status_code(),
+            Some(500),
+            "callee {callee_status}"
+        );
+        assert!(
+            to(&sent, CALLEE)
+                .iter()
+                .any(|message| message.method() == Some(&Method::Bye)),
+            "callee {callee_status}: {:?}",
+            summaries(&sent)
+        );
+        assert!(call.is_ending(), "callee {callee_status}");
+    }
+}
+
+/// No response to the UPDATE in 64*T1 ends the call the same way (RFC 3311 §5.3).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_the_callee_never_answers_ends_the_call() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    assert_eq!(updates(&to(&call.wire(), CALLEE)).len(), 1);
+
+    check_b2bua_prack_timeouts_at(&call.state, Instant::now() + Duration::from_secs(33));
+    let sent = call.wire();
+    assert_eq!(prack_response(&to(&sent, CALLER)).status_code(), Some(500));
+    assert!(
+        to(&sent, CALLEE)
+            .iter()
+            .any(|message| message.method() == Some(&Method::Bye)),
+        "{:?}",
+        summaries(&sent)
+    );
+    assert!(call.is_ending());
+}
+
+/// A callee that did not list UPDATE in Allow is sent none (RFC 3311 §4), and a
+/// re-INVITE would let it wait for its user (§5.1), which the PRACK cannot: the caller's
+/// offer is refused 488, the session stays, and the caller may offer again on its
+/// own dialog. The same without any Allow.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_offer_to_a_callee_without_update_is_refused_488() {
+    for allow in [Some("INVITE, ACK, CANCEL, BYE, PRACK"), None] {
+        let (call, ringing) = answered_before_the_callers_prack(allow);
+        call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+        let sent = call.wire();
+        assert_eq!(
+            prack_response(&to(&sent, CALLER)).status_code(),
+            Some(488),
+            "allow {allow:?}"
+        );
+        assert!(to(&sent, CALLEE).is_empty(), "{:?}", summaries(&sent));
+        assert!(!call.is_ending(), "allow {allow:?}");
+    }
+}
+
+/// A caller that still owes the answer to the callee's offer in the 2xx (a delayed
+/// offer, answered in the ACK) and offers in a PRACK meanwhile has two offers
+/// crossing: refused 491 (RFC 3311 §5.2), with nothing sent to the callee.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_offer_while_the_caller_owes_an_answer_is_refused_491() {
+    let call = PrackCall::place(None);
+    call.callee_responds(180, "Ringing", Some(42), "");
+    let ringing = to(&call.wire(), CALLER)
+        .into_iter()
+        .find(|message| message.status_code() == Some(180))
+        .expect("a 180 to the caller");
+    call.callee_responds(200, "OK", None, CALLEE_OFFER);
+    call.wire();
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    assert_eq!(prack_response(&to(&sent, CALLER)).status_code(), Some(491));
+    assert!(
+        updates(&to(&sent, CALLEE)).is_empty(),
+        "{:?}",
+        summaries(&sent)
+    );
+    assert!(!call.is_ending());
+}
+
+/// An UPDATE carrying a late offer that the transport refuses reaches nobody, so
+/// nothing will answer the offer: it is taken back rather than left to wait out
+/// 64*T1, and the caller's PRACK is refused 500 at once, as a 503 from the callee
+/// would have it (RFC 3261 §8.1.3.1). The session and the call stay as they were
+/// (RFC 3311 §5.3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_offer_whose_update_the_transport_refuses_is_refused_500_and_not_left_waiting() {
+    let (call, callee) = place_with_split_egress(Some(CALLER_OFFER), None);
+    call.callee_responds(180, "Ringing", Some(42), "");
+    let ringing = to(&call.wire(), CALLER)
+        .into_iter()
+        .find(|message| message.status_code() == Some(180))
+        .expect("a 180 to the caller");
+    call.callee_responds(200, "OK", None, CALLEE_ANSWER);
+    assert!(
+        to(&call.wire(), CALLER)
+            .iter()
+            .any(|message| message.status_code() == Some(200) && cseq_method(message) == "INVITE"),
+        "the caller has its 2xx"
+    );
+    drop(callee);
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+
+    let pending = call
+        .state
+        .call_actors
+        .get_call(&call.call_id)
+        .is_some_and(|actor| actor.prack_bridge.offer_pending());
+    assert!(
+        !pending,
+        "an offer nobody was sent is still waiting for its answer"
+    );
+    let refusal = prack_response(&to(&call.wire(), CALLER));
+    assert_eq!(refusal.status_code(), Some(500));
+    assert!(refusal.body.is_empty());
+    assert!(!call.is_ending());
+}
+
+/// A new PRACK from the caller with another offer while the UPDATE carrying its
+/// first is still out is not a retransmission to absorb: two offers cross on the
+/// callee's dialog, so it is refused 500 with a Retry-After of at most 10 seconds
+/// (RFC 3311 §5.2), nothing more goes to the callee, and the first offer's answer
+/// still reaches the caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_prack_with_an_offer_while_the_update_is_out_is_refused_500_with_retry_after() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let update = updates(&to(&call.wire(), CALLEE));
+    assert_eq!(update.len(), 1);
+
+    call.caller_pracks(&ringing, 3, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    let refusal = prack_response(&to(&sent, CALLER));
+    assert_eq!(refusal.status_code(), Some(500), "{:?}", summaries(&sent));
+    assert_eq!(refusal.headers.cseq().map(String::as_str), Some("3 PRACK"));
+    let retry_after: u32 = refusal
+        .headers
+        .get("Retry-After")
+        .and_then(|value| value.trim().parse().ok())
+        .expect("a Retry-After in seconds");
+    assert!(retry_after <= 10, "{retry_after}");
+    assert!(to(&sent, CALLEE).is_empty(), "{:?}", summaries(&sent));
+
+    call.callee_answers_prack(&update[0], 200, CALLEE_NEW_ANSWER);
+    let answer = prack_response(&to(&call.wire(), CALLER));
+    assert_eq!(answer.status_code(), Some(200));
+    assert_eq!(answer.headers.cseq().map(String::as_str), Some("2 PRACK"));
+    assert!(!call.is_ending());
+}
+
+/// A caller refused 500 with a Retry-After offers again in a new PRACK, as that
+/// Retry-After invites: the new offer goes to the callee in an UPDATE of its own and
+/// the callee's answer comes back in the 200 to that PRACK. An offer in a PRACK is
+/// never answered with a 200 that carries no answer (RFC 3262 §5).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_in_a_new_prack_after_a_refusal_reaches_the_callee_in_an_update() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let update = updates(&to(&call.wire(), CALLEE));
+    call.callee_answers_request(&update[0], 500, "", &[("Retry-After", "1")]);
+    assert_eq!(
+        prack_response(&to(&call.wire(), CALLER)).status_code(),
+        Some(500)
+    );
+
+    call.caller_pracks(&ringing, 3, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    assert!(to(&sent, CALLER).is_empty(), "{:?}", summaries(&sent));
+    let update = updates(&to(&sent, CALLEE));
+    assert_eq!(update.len(), 1, "{:?}", summaries(&sent));
+
+    call.callee_answers_prack(&update[0], 200, CALLEE_NEW_ANSWER);
+    let answer = prack_response(&to(&call.wire(), CALLER));
+    assert_eq!(answer.status_code(), Some(200));
+    assert_eq!(answer.headers.cseq().map(String::as_str), Some("3 PRACK"));
+    assert!(
+        body_text(&answer).contains("m=audio 30002 RTP/AVP 0"),
+        "{}",
+        body_text(&answer)
+    );
+    assert_eq!(
+        sessions_in_force(&call).callee_session,
+        Some(update[0].body.clone())
+    );
+    assert!(call.call_is_up());
+}
+
+/// A retransmission of a PRACK whose offer was refused gets that refusal again,
+/// with nothing sent to the callee (RFC 3261 §17.2.2), and a new PRACK without the
+/// offer, which RFC 6337 §2.3 has the caller send after a 488, gets a 200 of its
+/// own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_prack_is_refused_again_and_a_new_one_without_the_offer_gets_200() {
+    let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let update = updates(&to(&call.wire(), CALLEE));
+    call.callee_answers_prack(&update[0], 488, "");
+    assert_eq!(
+        prack_response(&to(&call.wire(), CALLER)).status_code(),
+        Some(488)
+    );
+
+    call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+    let sent = call.wire();
+    assert_eq!(prack_response(&to(&sent, CALLER)).status_code(), Some(488));
+    assert!(to(&sent, CALLEE).is_empty(), "{:?}", summaries(&sent));
+
+    call.caller_pracks(&ringing, 3, "");
+    let sent = call.wire();
+    let ok = prack_response(&to(&sent, CALLER));
+    assert_eq!(ok.status_code(), Some(200));
+    assert!(ok.body.is_empty());
+    assert!(to(&sent, CALLEE).is_empty(), "{:?}", summaries(&sent));
+    assert!(!call.is_ending());
+}
+
+/// The caller's own SDP, which siphon keeps for a transfer that offers the caller's
+/// media to someone else.
+fn caller_sdp(call: &PrackCall) -> Option<Vec<u8>> {
+    call.state
+        .call_actors
+        .clone_leg(&call.call_id, true)
+        .and_then(|leg| leg.last_sdp)
+}
+
+/// A late offer the callee refuses changes neither party's session (RFC 3311
+/// §5.3), so the caller's own SDP stays what its INVITE offered; an offer the callee
+/// accepts replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_late_offer_the_callee_accepts_becomes_the_callers_own_sdp() {
+    for (callee_status, body, callers_sdp) in [
+        (488, "", CALLER_OFFER),
+        (200, CALLEE_NEW_ANSWER, CALLER_NEW_OFFER),
+    ] {
+        let (call, ringing) = answered_before_the_callers_prack(Some(CALLEE_ALLOW));
+        assert_eq!(
+            caller_sdp(&call).as_deref(),
+            Some(CALLER_OFFER.as_bytes()),
+            "callee {callee_status}"
+        );
+        call.caller_pracks(&ringing, 2, CALLER_NEW_OFFER);
+        let update = updates(&to(&call.wire(), CALLEE));
+        assert_eq!(update.len(), 1, "callee {callee_status}");
+        call.callee_answers_prack(&update[0], callee_status, body);
+        call.wire();
+        assert_eq!(
+            caller_sdp(&call).as_deref(),
+            Some(callers_sdp.as_bytes()),
+            "callee {callee_status}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

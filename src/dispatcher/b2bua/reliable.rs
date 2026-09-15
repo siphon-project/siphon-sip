@@ -463,14 +463,38 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                         held: link.and_then(|link| call.prack_bridge.take(link)),
                     }
                 }
-                PrackOutcome::AlreadyAcknowledged
-                    if call.prack_bridge.offer_waits_on(rack.response_number) =>
-                {
-                    CallerPrack::OfferPending
+                PrackOutcome::AlreadyAcknowledged => {
+                    let answered = call
+                        .prack_bridge
+                        .answered_response(rack.response_number)
+                        .filter(|answered| answered.headers.cseq() == message.headers.cseq());
+                    let same_transaction = call
+                        .prack_bridge
+                        .offer_waits_on(rack.response_number, message.headers.cseq());
+                    match answered {
+                        // A retransmission of a PRACK already answered gets that
+                        // answer again (RFC 3261 §17.2.2).
+                        Some(answered) => CallerPrack::Retransmitted(Some(answered)),
+                        // A retransmission of the PRACK whose offer the callee has
+                        // still waits for the callee's answer.
+                        None if same_transaction => CallerPrack::OfferPending,
+                        // A new PRACK for the same provisional with an offer in it
+                        // is a new offer, which needs an answer or a refusal
+                        // (RFC 3264 §4): the caller offering again after a refusal,
+                        // or one crossing an offer still out. It goes the way an
+                        // offer in a PRACK after the 2xx does.
+                        None if !message.body.is_empty() => CallerPrack::Acknowledged {
+                            rseq: rack.response_number,
+                            released: Vec::new(),
+                            answer: None,
+                            held: None,
+                        },
+                        // One without an offer, such as the PRACK sent again without
+                        // the offer a refusal turned down (RFC 6337 §2.3), gets a 200
+                        // of its own.
+                        None => CallerPrack::Retransmitted(None),
+                    }
                 }
-                PrackOutcome::AlreadyAcknowledged => CallerPrack::Retransmitted(
-                    call.prack_bridge.answered_response(rack.response_number),
-                ),
                 PrackOutcome::Unmatched => CallerPrack::Unmatched,
             };
             Some((call_id, route, decision))
@@ -489,18 +513,14 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
         )) => {
             let bridged = match held {
                 Some(held) => bridge_caller_prack(&call_id, held, &message, &inbound, rseq, state),
-                None => {
-                    if !message.body.is_empty() {
-                        warn!(
-                            call_id = %call_id,
-                            rseq,
-                            "B2BUA: the caller's PRACK carries a body, but no PRACK to the callee waits for it \
-                             (the provisional was siphon's own, or its PRACK went with the caller's 2xx); \
-                             answered without crossing"
-                        );
-                    }
-                    CallerPrackBridged::Answer
+                // No PRACK of siphon's waits for this one: the provisional was
+                // siphon's own, or its PRACK went to the callee with the caller's
+                // 2xx. An offer in it goes to the callee in an UPDATE, or is
+                // refused without changing the session.
+                None if !message.body.is_empty() => {
+                    carry_late_prack_offer(&call_id, &message, &inbound, rseq, state)
                 }
+                None => CallerPrackBridged::Answer,
             };
             match bridged {
                 CallerPrackBridged::Answer => {
@@ -552,6 +572,22 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
                             state,
                         );
                     }
+                }
+                CallerPrackBridged::Refuse {
+                    status,
+                    retry_after,
+                } => {
+                    let mut refusal = reply(status, prack_refusal_reason(status));
+                    if let Some(retry_after) = retry_after {
+                        refusal.headers.set("Retry-After", retry_after);
+                    }
+                    // A retransmission of this PRACK gets the same refusal.
+                    if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+                        call.prack_bridge.record_answered(rseq, refusal.clone());
+                    }
+                    to_inbound(refusal);
+                    send_to_caller(released, &route, state);
+                    defer_released_answer(&call_id, answer, state);
                 }
             }
         }

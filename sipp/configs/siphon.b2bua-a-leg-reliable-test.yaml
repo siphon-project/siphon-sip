@@ -11,7 +11,9 @@
 #            provisional with SDP. Also offer/answer in PRACK (RFC 3262 §5):
 #            the callee's early offer answered in the caller's PRACK (carol),
 #            and a new offer in the caller's PRACK answered by the callee
-#            (dave), each crossing on siphon's own PRACK.
+#            (dave), each crossing on siphon's own PRACK; and an offer in a
+#            PRACK sent after the caller's 2xx, carried to the callee in an
+#            UPDATE (erin).
 #
 # Pins `ims-intra-trust-domain@2026`, whose response policy copies `Require`
 # and `RSeq`: the callee's RSeq 42 would pass straight through if the caller's
@@ -46,6 +48,7 @@ auth:
     bob: "secret"
     carol: "secret"
     dave: "secret"
+    erin: "secret"
 
 b2bua:
   default_header_policy: "ims-intra-trust-domain@2026"
