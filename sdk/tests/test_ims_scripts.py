@@ -29,7 +29,7 @@ class TestPcscf:
     )
 
     def setup_method(self):
-        self.harness = SipTestHarness(local_domains=[REALM, "10.0.0.10"])
+        self.harness = SipTestHarness(local_domains=[REALM, "192.0.2.10"])
         self.harness.auth._allow = True
         self.harness.load_script(_PCSCF_SCRIPT)
 
@@ -136,7 +136,7 @@ class TestIcscf:
     """I-CSCF: Diameter Cx UAR/LIR for S-CSCF discovery."""
 
     def setup_method(self):
-        self.harness = SipTestHarness(local_domains=[REALM, "10.0.0.20"])
+        self.harness = SipTestHarness(local_domains=[REALM, "192.0.2.20"])
         self.hss = self.harness.hss
         self.hss.add_subscriber(
             impi=f"alice@{REALM}",
@@ -202,7 +202,7 @@ class TestScscf:
     """S-CSCF: auth + SAR + registrar + location lookup."""
 
     def setup_method(self):
-        self.harness = SipTestHarness(local_domains=[REALM, "10.0.0.30"])
+        self.harness = SipTestHarness(local_domains=[REALM, "192.0.2.30"])
         self.hss = self.harness.hss
         self.hss.add_subscriber(
             impi=f"alice@{REALM}",

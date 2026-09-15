@@ -19,13 +19,13 @@ import os
 from siphon import b2bua, registration, log
 
 # Must match ims_ue_b2bua.yaml.
-UE_IP = os.environ.get("UE_IP", "10.0.0.20")          # this host's IP on the SA
-PCSCF_IP = os.environ.get("PCSCF_IP", "10.0.0.10")    # used to detect MT calls
+UE_IP = os.environ.get("UE_IP", "192.0.2.20")         # this host's IP on the SA
+PCSCF_IP = os.environ.get("PCSCF_IP", "192.0.2.10")   # used to detect MT calls
 HOME = os.environ.get("IMS_HOME", "ims.mnc01.mcc001.3gppnetwork.org")
 IMPU = os.environ.get("IMPU", "sip:001010000000001@" + HOME)  # == registrant aor
 
 # Where incoming (MT) calls are bridged to — the plain-SIP tester.
-TESTER = os.environ.get("TESTER", "sip:5555@10.0.0.100:5060")
+TESTER = os.environ.get("TESTER", "sip:5555@192.0.2.100:5060")
 
 log.info(f"IMS UE B2BUA loaded; bridging tester <-> IMS for {IMPU}")
 

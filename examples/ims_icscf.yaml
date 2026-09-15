@@ -25,12 +25,12 @@ listen:
   tcp:
     - "0.0.0.0:4060"
 
-advertised_address: "10.0.0.20"
+advertised_address: "192.0.2.20"
 
 domain:
   local:
     - "ims.example.com"
-    - "10.0.0.20"
+    - "192.0.2.20"
 
 script:
   path: "examples/ims_icscf.py"
