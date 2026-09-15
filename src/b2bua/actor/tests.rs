@@ -877,6 +877,26 @@ fn call_actor_replace_b_leg_keeps_the_superseded_legs_sdp_origin() {
     assert_eq!(call.b_legs[0].dialog.sdp_version, 1);
 }
 
+/// The retry also keeps the session description in force on the leg: it re-sends
+/// the same offer, and a session refresh on the dialog it goes on to establish
+/// has to offer that again rather than nothing.
+#[test]
+fn call_actor_replace_b_leg_keeps_the_session_description_in_force() {
+    let mut call = CallActor::new(make_a_leg());
+    let mut original = make_b_leg(0);
+    original.dialog.last_sent_sdp = Some(b"v=0\r\ns=siphon\r\n".to_vec());
+    call.add_b_leg(original);
+
+    let mut retry = make_b_leg(0);
+    retry.branch = "z9hG4bK-bleg0-retry".to_string();
+    assert!(call.replace_b_leg(0, retry).is_some());
+
+    assert_eq!(
+        call.b_legs[0].dialog.last_sent_sdp.as_deref(),
+        Some(&b"v=0\r\ns=siphon\r\n"[..])
+    );
+}
+
 #[test]
 fn call_actor_losers() {
     let mut call = CallActor::new(make_a_leg());

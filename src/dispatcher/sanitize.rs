@@ -412,6 +412,44 @@ pub(super) fn own_sdp_toward_leg(
     }
 }
 
+/// The session description a body carries: the whole body under
+/// `application/sdp`, or the SDP part of a multipart body. `None` for an empty
+/// body or one that carries no SDP.
+pub(super) fn sdp_in_body(content_type: &str, body: &[u8]) -> Option<Vec<u8>> {
+    if body.is_empty() {
+        return None;
+    }
+    crate::media::body::sdp_from_body(content_type, body).ok()
+}
+
+/// Record a body's session description as the one siphon has in force on a
+/// leg's dialog (`Dialog::last_sent_sdp`), the A-leg or the winning B-leg: the
+/// answer siphon just sent that leg, or an offer the leg just accepted. A body
+/// with no SDP records nothing.
+pub(super) fn record_sdp_sent_to_leg(
+    state: &DispatcherState,
+    call_id: &str,
+    on_a_leg: bool,
+    content_type: &str,
+    body: &[u8],
+) {
+    if let Some(sdp) = sdp_in_body(content_type, body) {
+        state.call_actors.set_leg_sent_sdp(call_id, on_a_leg, sdp);
+    }
+}
+
+/// The `<sess-id>` and `<sess-version>` of an SDP's `o=` line, when the line has
+/// the six fields RFC 4566 §5.2 gives it.
+pub(super) fn sdp_origin_identity(sdp: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(sdp).ok()?;
+    let origin = text.lines().find_map(|line| line.strip_prefix("o="))?;
+    let fields: Vec<&str> = origin.trim_end_matches('\r').split(' ').collect();
+    if fields.len() != 6 {
+        return None;
+    }
+    Some((fields[1].parse().ok()?, fields[2].parse().ok()?))
+}
+
 /// Flip SDP direction attributes for an SRS answer.
 ///
 /// The SRC offers `a=sendonly` (it sends forked media to the SRS).  The SRS

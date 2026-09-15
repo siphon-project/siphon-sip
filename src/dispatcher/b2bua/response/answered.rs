@@ -795,6 +795,15 @@ pub fn prepare_a_leg_answer(
     // engine answer and after the o= stamp. The A-leg 2xx retransmit is cloned
     // from this message.
     strip_relayed_sdp_attributes(response, state);
+    // The answer as the caller receives it is the session description in force on
+    // the caller's dialog.
+    record_sdp_sent_to_leg(
+        state,
+        call_id,
+        true,
+        message_content_type(response),
+        &response.body,
+    );
 
     // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).
     // sanitize_b2bua_response strips all Record-Route (B-leg path). The A-leg

@@ -612,6 +612,9 @@ pub fn handle_b2bua_reinvite(
         // The route set the forwarded re-INVITE carries, so the ACK for its 200
         // is routed identically (RFC 3261 §12.2.1.1).
         reinvite_leg.dialog.route_set = target_route_set.clone();
+        // The offer as the target leg is sent it. It is committed to that leg's
+        // dialog only when the leg answers 2xx (`forward_reinvite_response`).
+        reinvite_leg.offered_sdp = sdp_in_body(message_content_type(&forwarded), &forwarded.body);
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
         // Forward to the target leg. A→B: destination-keyed reuse via
@@ -775,6 +778,8 @@ pub fn answer_one_legged_reoffer(
 
     match answer_sdp {
         Ok(sdp) => {
+            // The answer is the session description now in force on the leg.
+            record_sdp_sent_to_leg(state, call_id, true, "application/sdp", sdp.as_bytes());
             debug!(call_id = %call_id, what, "B2BUA: answered a one-legged re-offer from the media engine");
             send_one_legged_ok(inbound, message, sdp.into_bytes(), state);
         }

@@ -874,6 +874,9 @@ impl CallActor {
             let superseded = &self.b_legs[index].dialog;
             leg.dialog.sdp_session_id = superseded.sdp_session_id;
             leg.dialog.sdp_version = superseded.sdp_version;
+            // The retry re-sends the superseded INVITE's offer, so the session
+            // description in force on the dialog is the same one.
+            leg.dialog.last_sent_sdp = superseded.last_sent_sdp.clone();
             let old_branch = std::mem::replace(&mut self.b_legs[index], leg).branch;
             self.b_leg_status[index] = BLegStatus::Trying;
             self.b_leg_handles[index] = None;

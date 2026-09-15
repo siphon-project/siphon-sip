@@ -103,6 +103,8 @@ mod ro_orphan_backstop_tests;
 #[cfg(test)]
 mod sdp_strip_tests;
 #[cfg(test)]
+mod session_refresh_tests;
+#[cfg(test)]
 mod teardown_race_tests;
 #[cfg(test)]
 mod test_dispatcher;

@@ -493,6 +493,9 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         // the responder-dialog URIs the relayed answer carries.
         update_leg.stored_from = message.headers.from().map(|f| f.to_string());
         update_leg.stored_to = message.headers.to().map(|t| t.to_string());
+        // The offer as the target leg is sent it, committed to that leg's dialog
+        // only when the leg answers 2xx (`forward_update_response`).
+        update_leg.offered_sdp = sdp_in_body(message_content_type(&forwarded), &forwarded.body);
         state.call_actors.add_b_leg(&call_id, update_leg);
 
         // Forward to the target leg. A→B: destination-keyed reuse via

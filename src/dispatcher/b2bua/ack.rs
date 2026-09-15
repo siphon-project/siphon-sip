@@ -635,6 +635,11 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
         if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
             stamp_b_leg_origin(&mut body, &content_type, leg, &held.transport, state);
             leg.initial_acked = true;
+            // The answer as the callee gets it is the session description in
+            // force on the callee's dialog.
+            if let Some(sdp) = sdp_in_body(&content_type, &body) {
+                leg.dialog.last_sent_sdp = Some(sdp);
+            }
         }
         let mut ack = held.ack.clone();
         set_sdp_body(&mut ack, body, &content_type);
@@ -753,6 +758,7 @@ pub fn take_held_ack_rejecting_offer(
         Some(leg) => {
             stamp_b_leg_origin(&mut body, "application/sdp", leg, &held.transport, state);
             leg.initial_acked = true;
+            leg.dialog.last_sent_sdp = Some(body.clone());
         }
         None => {
             let mut detached = dialog_leg.clone();

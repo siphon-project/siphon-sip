@@ -177,6 +177,22 @@ pub fn forward_update_response(
         strip_relayed_sdp_attributes(message, state);
 
         if (200..300).contains(&status_code) {
+            // The responder took the offer (when the UPDATE carried one), so it is
+            // the session description in force on the responder's dialog, and the
+            // answer relayed back is in force on the originator's.
+            if let Some(offer) = &snapshot.b_leg_offered_sdp {
+                state
+                    .call_actors
+                    .set_leg_sent_sdp(call_id, !is_a2b, offer.clone());
+            }
+            record_sdp_sent_to_leg(
+                state,
+                call_id,
+                is_a2b,
+                message_content_type(message),
+                &message.body,
+            );
+
             // Session timer refresh on successful UPDATE (RFC 4028 §10).
             state.call_actors.reset_session_timer(call_id);
 
