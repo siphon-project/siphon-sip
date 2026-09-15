@@ -24,6 +24,36 @@ pub(super) fn sanitize_b2bua_response(
     a_leg_supports_100rel: bool,
     call_id: &str,
 ) {
+    sanitize_b2bua_response_keeping(
+        response,
+        state,
+        a_leg_transport,
+        a_leg_local_addr,
+        a_leg_supports_100rel,
+        call_id,
+        &[],
+    );
+}
+
+/// [`sanitize_b2bua_response`] for a response a script shaped in
+/// `@b2bua.on_answer` / `@b2bua.on_early_media`.
+///
+/// `script_shaped_headers` are the headers the script set or removed on it.
+/// They go to the caller as the script left them, precedence 1 as on the B-leg
+/// INVITE: the response policy neither strips nor rewrites them, and siphon's
+/// own `Supported` / `Allow` do not replace them. What stays the framework's is
+/// done regardless: siphon's `Contact`, no B-leg `Record-Route`, the `100rel`
+/// strip toward a caller without it, `replaces` merged into `Supported`, and the
+/// SDP origin.
+pub(super) fn sanitize_b2bua_response_keeping(
+    response: &mut SipMessage,
+    state: &DispatcherState,
+    a_leg_transport: Transport,
+    a_leg_local_addr: Option<SocketAddr>,
+    a_leg_supports_100rel: bool,
+    call_id: &str,
+    script_shaped_headers: &[String],
+) {
     // Contact: must point to siphon so in-dialog requests (ACK, BYE, re-INVITE)
     // route through us, not directly to the B-leg.
     // via_host() applies advertised_address fallback and substitutes the
@@ -87,7 +117,12 @@ pub(super) fn sanitize_b2bua_response(
         user_agent_header: state.user_agent_header.as_deref(),
         server_header: state.server_header.as_deref(),
     };
-    crate::b2bua::header_policy::apply_to_response(response, &policy, &ctx);
+    crate::b2bua::header_policy::apply_to_response_keeping(
+        response,
+        &policy,
+        &ctx,
+        script_shaped_headers,
+    );
 
     // Advertise siphon's own capabilities, under every preset. A B2BUA terminates
     // the dialog, so the far leg's `Allow` and extensions are not siphon's to
@@ -98,7 +133,7 @@ pub(super) fn sanitize_b2bua_response(
     // method this way and never send a REFER without it), and `Supported`
     // carries `replaces`, which RFC 5589 §7.3 has a transferor read off exactly
     // this response to decide whether it can offer an attended transfer.
-    advertise_relayed_response_capabilities(&mut response.headers, &policy);
+    advertise_relayed_response_capabilities(&mut response.headers, script_shaped_headers, &policy);
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.

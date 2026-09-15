@@ -94,13 +94,17 @@ fn implements_option_tag(tag: &str) -> bool {
 /// ([`ResolvedPolicy::passes_end_to_end`](crate::b2bua::header_policy::ResolvedPolicy::passes_end_to_end))
 /// and copies `Require` onto the B-leg, so the callee is actually told it is
 /// required. `invite` is the A-leg INVITE as the script left it: a script that
-/// rewrites or removes `Require` decides what the caller is held to.
+/// rewrites or removes `Require` decides what the caller is held to, and a
+/// `Require` among `script_shaped_headers` reaches the callee whatever the
+/// policy, since script headers are precedence 1.
 pub(super) fn unhonourable_required_tags(
     invite: &SipHeaders,
+    script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) -> Vec<String> {
     let require_crosses =
-        policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
+        crate::b2bua::header_policy::is_script_shaped(script_shaped_headers, "Require")
+            || policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
     required_tags_not_honoured(invite, |tag| {
         implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag))
     })
@@ -180,14 +184,25 @@ fn keep_claimable_option_tags(
 /// mirrored: `Supported` keeps the far leg's claimable tags
 /// ([`keep_claimable_option_tags`]) plus `replaces`, and `Allow` is siphon's
 /// method set.
+///
+/// A header a script set or removed on the response (`script_shaped_headers`,
+/// from `@b2bua.on_answer` / `@b2bua.on_early_media`) is left as the script
+/// left it, precedence 1 as on the B-leg INVITE; `replaces` is still merged
+/// into its `Supported`.
 pub(super) fn advertise_relayed_response_capabilities(
     headers: &mut SipHeaders,
+    script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) {
-    keep_claimable_option_tags(headers, policy);
+    use crate::b2bua::header_policy::is_script_shaped;
+    if !is_script_shaped(script_shaped_headers, "Supported") {
+        keep_claimable_option_tags(headers, policy);
+    }
     advertise_supported_options(headers);
-    headers.remove("Allow");
-    advertise_supported_methods(headers);
+    if !is_script_shaped(script_shaped_headers, "Allow") {
+        headers.remove("Allow");
+        advertise_supported_methods(headers);
+    }
 }
 
 /// Settle the B-leg INVITE's `Supported` and `Allow` once the header policy has
@@ -195,8 +210,8 @@ pub(super) fn advertise_relayed_response_capabilities(
 ///
 /// siphon is the UAC of the B-leg, so both are siphon's own claims (RFC 3261
 /// §20.37, §20.5), not the caller's to relay. `outbound` is the B-leg INVITE
-/// after the policy, `script` the A-leg INVITE the script shaped, and
-/// `script_shaped_headers` the headers the script set or removed.
+/// after the policy, and `script_shaped_headers` the headers the script set or
+/// removed.
 ///
 /// - `Supported`: the caller's claimable tags ([`keep_claimable_option_tags`]).
 ///   The tags siphon claims unconditionally — `replaces`, and `timer` when it
@@ -204,42 +219,22 @@ pub(super) fn advertise_relayed_response_capabilities(
 ///   per-carrier headers, as they always were.
 /// - `Allow`: siphon's method set, the one its responses advertise.
 ///
-/// A header the script set or removed is the script's value as written: script
-/// headers are policy precedence 1, above the per-call deltas and the preset.
-/// It is read back from `script` because the policy may have stripped it from
-/// `outbound` already.
+/// A header the script set or removed is left exactly as it is: script headers
+/// are precedence 1, so the policy already kept the script's value, or its
+/// absence, and siphon's own does not replace it.
 pub(super) fn advertise_b_leg_capabilities(
     outbound: &mut SipHeaders,
-    script: &SipHeaders,
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
 ) {
-    let shaped_by_script = |name: &str| {
-        script_shaped_headers
-            .iter()
-            .any(|shaped| crate::sip::headers::same_header_name(shaped, name))
-    };
-
-    if shaped_by_script("Supported") {
-        restore_script_header(outbound, script, "Supported");
-    } else {
+    use crate::b2bua::header_policy::is_script_shaped;
+    if !is_script_shaped(script_shaped_headers, "Supported") {
         keep_claimable_option_tags(outbound, policy);
     }
 
-    if shaped_by_script("Allow") {
-        restore_script_header(outbound, script, "Allow");
-    } else {
+    if !is_script_shaped(script_shaped_headers, "Allow") {
         outbound.remove("Allow");
         advertise_supported_methods(outbound);
-    }
-}
-
-/// Put `name` on `outbound` exactly as the script left it on `script`: every
-/// line it has, or none at all.
-fn restore_script_header(outbound: &mut SipHeaders, script: &SipHeaders, name: &str) {
-    match script.get_all(name) {
-        Some(values) => outbound.set_all(name, values.clone()),
-        None => outbound.remove(name),
     }
 }
 

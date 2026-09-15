@@ -2634,8 +2634,7 @@ fn builtin_policy(name: &str) -> crate::b2bua::header_policy::ResolvedPolicy {
 fn b_leg_supported(offered: &str, policy_name: &str) -> Option<String> {
     let mut outbound = SipHeaders::new();
     outbound.set("Supported", offered.to_string());
-    let script = outbound.clone();
-    advertise_b_leg_capabilities(&mut outbound, &script, &[], &builtin_policy(policy_name));
+    advertise_b_leg_capabilities(&mut outbound, &[], &builtin_policy(policy_name));
     outbound.get("Supported").cloned()
 }
 
@@ -2668,10 +2667,8 @@ fn b_leg_capabilities_read_every_supported_line_and_the_compact_form() {
     let mut outbound = SipHeaders::new();
     outbound.add("Supported", "outbound".to_string());
     outbound.add("k", "precondition, 100rel".to_string());
-    let script = outbound.clone();
     advertise_b_leg_capabilities(
         &mut outbound,
-        &script,
         &[],
         &builtin_policy("ims-intra-trust-domain@2026"),
     );
@@ -2686,10 +2683,8 @@ fn b_leg_capabilities_replace_the_callers_allow_with_siphons_methods() {
     // RFC 3261 §20.5: Allow lists the methods the sender supports.
     let mut outbound = SipHeaders::new();
     outbound.set("Allow", "INVITE, ACK, BYE".to_string());
-    let script = outbound.clone();
     advertise_b_leg_capabilities(
         &mut outbound,
-        &script,
         &[],
         &builtin_policy("ims-trust-domain-boundary@2026"),
     );
@@ -2700,15 +2695,13 @@ fn b_leg_capabilities_replace_the_callers_allow_with_siphons_methods() {
 }
 
 #[test]
-fn b_leg_capabilities_keep_the_scripts_value_even_where_the_policy_stripped_it() {
-    let mut script = SipHeaders::new();
-    script.set("Supported", "x-lab-tag, outbound".to_string());
-    script.set("Allow", "INVITE, ACK, BYE".to_string());
-    // The policy already removed both from the B-leg.
+fn b_leg_capabilities_leave_a_script_shaped_header_alone() {
+    // The policy kept the script's values; siphon's own must not replace them.
     let mut outbound = SipHeaders::new();
+    outbound.set("Supported", "x-lab-tag, outbound".to_string());
+    outbound.set("Allow", "INVITE, ACK, BYE".to_string());
     advertise_b_leg_capabilities(
         &mut outbound,
-        &script,
         // Recorded as the script spelled them; `k` is `Supported`.
         &["k".to_string(), "ALLOW".to_string()],
         &builtin_policy("transparent-b2bua@2026"),
@@ -2724,14 +2717,10 @@ fn b_leg_capabilities_keep_the_scripts_value_even_where_the_policy_stripped_it()
 }
 
 #[test]
-fn b_leg_capabilities_honour_a_script_removal() {
+fn b_leg_capabilities_do_not_refill_a_header_the_script_removed() {
     let mut outbound = SipHeaders::new();
-    outbound.set("Supported", "100rel".to_string());
-    outbound.set("Allow", "INVITE".to_string());
-    let script = SipHeaders::new();
     advertise_b_leg_capabilities(
         &mut outbound,
-        &script,
         &["Supported".to_string(), "Allow".to_string()],
         &builtin_policy("transparent-b2bua@2026"),
     );
@@ -2749,6 +2738,7 @@ fn relayed_response_capabilities_mirror_the_b_leg_rule() {
     headers.set("Allow", "INVITE, ACK, BYE".to_string());
     advertise_relayed_response_capabilities(
         &mut headers,
+        &[],
         &builtin_policy("ims-trust-domain-boundary@2026"),
     );
     assert_eq!(
@@ -2776,12 +2766,16 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
     // Supported/Require); histinfo can, and Require reaches the callee. The
     // duplicate vendor tag is listed once, in the caller's spelling.
     assert_eq!(
-        unhonourable_required_tags(&invite, &builtin_policy("transparent-b2bua@2026")),
+        unhonourable_required_tags(&invite, &[], &builtin_policy("transparent-b2bua@2026")),
         vec!["precondition".to_string(), "X-Lab-Extension".to_string()]
     );
     // The trust boundary relays precondition but not History-Info.
     assert_eq!(
-        unhonourable_required_tags(&invite, &builtin_policy("ims-trust-domain-boundary@2026")),
+        unhonourable_required_tags(
+            &invite,
+            &[],
+            &builtin_policy("ims-trust-domain-boundary@2026")
+        ),
         vec!["X-Lab-Extension".to_string(), "histinfo".to_string()]
     );
 }
@@ -2791,10 +2785,24 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
     let mut invite = SipHeaders::new();
     invite.set("Require", "precondition, replaces".to_string());
     let mut no_require = builtin_policy("ims-intra-trust-domain@2026");
-    assert!(unhonourable_required_tags(&invite, &no_require).is_empty());
+    assert!(unhonourable_required_tags(&invite, &[], &no_require).is_empty());
     no_require.deltas_strip = vec!["Require".to_string()];
     assert_eq!(
-        unhonourable_required_tags(&invite, &no_require),
+        unhonourable_required_tags(&invite, &[], &no_require),
+        vec!["precondition".to_string()]
+    );
+    // A Require the script set goes out over the strip, so the callee is shown
+    // it: histinfo (History-Info still relayed) is honoured again, while
+    // precondition is not, since the strip also keeps the callee's Require on
+    // the response from the caller.
+    let mut history = SipHeaders::new();
+    history.set("Require", "histinfo, precondition".to_string());
+    assert_eq!(
+        unhonourable_required_tags(&history, &[], &no_require),
+        vec!["histinfo".to_string(), "precondition".to_string()]
+    );
+    assert_eq!(
+        unhonourable_required_tags(&history, &["require".to_string()], &no_require),
         vec!["precondition".to_string()]
     );
 }
@@ -2803,7 +2811,8 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
 fn unhonourable_required_tags_is_empty_without_require() {
     let invite = SipHeaders::new();
     assert!(
-        unhonourable_required_tags(&invite, &builtin_policy("transparent-b2bua@2026")).is_empty()
+        unhonourable_required_tags(&invite, &[], &builtin_policy("transparent-b2bua@2026"))
+            .is_empty()
     );
 }
 
@@ -2813,6 +2822,7 @@ fn relayed_response_capabilities_add_siphons_own_to_an_empty_response() {
     let mut headers = SipHeaders::new();
     advertise_relayed_response_capabilities(
         &mut headers,
+        &[],
         &builtin_policy("transparent-b2bua@2026"),
     );
     assert_eq!(

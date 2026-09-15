@@ -421,19 +421,22 @@ pub fn b2bua_send_b_leg_invite(
             user_agent_header: state.user_agent_header.as_deref(),
             server_header: state.server_header.as_deref(),
         };
-        crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
+        // A header the script set or removed on the A-leg INVITE is precedence 1:
+        // the policy leaves it as the script left it. The framework-managed
+        // headers were already rewritten above and are not the policy's anyway.
+        crate::b2bua::header_policy::apply_to_request_keeping(
+            &mut b_leg_invite,
+            &policy,
+            &ctx,
+            &script_shaped_headers,
+        );
 
         // siphon is the UAC of this INVITE, so `Supported` and `Allow` say what
         // siphon supports (RFC 3261 §20.37, §20.5). Relaying the caller's lists
         // claimed whatever it happened to name — `outbound`, `path`, `gruu` —
         // for a leg where nothing implements them. Settled right after the
         // policy, so the per-carrier headers below still land last.
-        advertise_b_leg_capabilities(
-            &mut b_leg_invite.headers,
-            &original_request.headers,
-            &script_shaped_headers,
-            &policy,
-        );
+        advertise_b_leg_capabilities(&mut b_leg_invite.headers, &script_shaped_headers, &policy);
     }
 
     // Per-carrier (LCR) presented CLI: substitute the calling number before the

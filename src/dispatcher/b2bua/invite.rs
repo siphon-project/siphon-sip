@@ -705,8 +705,14 @@ pub fn apply_routing_action(
         action,
         CallAction::Dial { .. } | CallAction::Fork { .. } | CallAction::RouteSequence { .. }
     ) {
+        let script_shaped_headers = state
+            .call_actors
+            .get_call(call_id)
+            .map(|call| call.script_shaped_headers.clone())
+            .unwrap_or_default();
         let unsupported = unhonourable_required_tags(
             &message_guard.headers,
+            &script_shaped_headers,
             &state.resolve_header_policy(call_id),
         );
         if !unsupported.is_empty() {

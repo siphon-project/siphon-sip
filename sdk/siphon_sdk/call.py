@@ -1743,11 +1743,18 @@ class Call:
     def set_header(self, name: str, value: str) -> None:
         """Set (replace) a header value on the captured A-leg INVITE.
 
-        The B-leg INVITE is built from this message.  ``Supported`` and
-        ``Allow`` set here (or removed with :meth:`remove_header`) go out as
-        written, in place of the capabilities siphon would otherwise
-        advertise and past a ``strip=`` delta; ``replaces`` is still merged
-        into a ``Supported`` set this way.  To relay the caller's own list::
+        The B-leg INVITE is built from this message, and a header set here
+        (or removed with :meth:`remove_header` /
+        :meth:`remove_headers_matching`) goes out as written: the header
+        policy, preset and ``copy=`` / ``strip=`` / ``translate=`` deltas
+        alike, neither strips, rewrites nor translates it.  The
+        framework-managed headers (``Via``, ``Call-ID``, ``CSeq``,
+        ``Max-Forwards``, ``Content-Length``, ``From``, ``To``, ``Contact``,
+        ``Record-Route``, ``Route``) stay siphon's, and the number policy,
+        session-timer headers and LCR route headers still apply on top.
+        ``Supported`` and ``Allow`` set here replace the capabilities siphon
+        would advertise; ``replaces`` is still merged into a ``Supported`` set
+        this way.  To relay the caller's own list::
 
             call.set_header("Supported", call.get_header("Supported"))
         """

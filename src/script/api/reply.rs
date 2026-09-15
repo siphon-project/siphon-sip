@@ -36,6 +36,11 @@ pub struct PyReply {
     /// downstream branch(es).  Stays `None` for a 2xx (a proxy cannot retract a
     /// final answer) so the normal forward path runs unchanged.
     reject_action: Option<(u16, String)>,
+    /// Headers the script set or removed on this response with `set_header`,
+    /// `remove_header` or `remove_headers_matching`, recorded the way `Call`
+    /// records them on the A-leg INVITE. On a B2BUA response they go to the
+    /// caller as the script left them.
+    script_shaped_headers: Vec<String>,
 }
 
 impl PyReply {
@@ -56,7 +61,13 @@ impl PyReply {
             response_source_port: None,
             a_leg_message: None,
             reject_action: None,
+            script_shaped_headers: Vec::new(),
         }
+    }
+
+    /// Headers the script set or removed on this response.
+    pub fn script_shaped_headers(&self) -> &[String] {
+        &self.script_shaped_headers
     }
 
     /// Set the source address of the entity that sent this response.
@@ -300,25 +311,27 @@ impl PyReply {
     }
 
     /// Set (replace) a header value.
-    fn set_header(&self, name: &str, value: &str) -> PyResult<()> {
+    fn set_header(&mut self, name: &str, value: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         message.headers.set(name, value.to_string());
+        self.script_shaped_headers.push(name.to_string());
         Ok(())
     }
 
     /// Remove a header entirely.
-    fn remove_header(&self, name: &str) -> PyResult<()> {
+    fn remove_header(&mut self, name: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         message.headers.remove(name);
+        self.script_shaped_headers.push(name.to_string());
         Ok(())
     }
 
     /// Remove all headers whose names start with a given prefix (case-insensitive).
-    fn remove_headers_matching(&self, prefix: &str) -> PyResult<()> {
+    fn remove_headers_matching(&mut self, prefix: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
@@ -332,6 +345,7 @@ impl PyReply {
             .collect();
         for name in names_to_remove {
             message.headers.remove(&name);
+            self.script_shaped_headers.push(name);
         }
         Ok(())
     }
@@ -690,7 +704,7 @@ mod tests {
     #[test]
     fn header_operations() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(message);
+        let mut reply = PyReply::new(message);
 
         assert!(reply.has_header("Via").unwrap());
         assert!(!reply.has_header("X-Custom").unwrap());
@@ -885,9 +899,20 @@ mod tests {
     }
 
     #[test]
+    fn header_edits_are_recorded_as_script_shaped() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let mut reply = PyReply::new(message);
+        assert!(reply.script_shaped_headers().is_empty());
+        reply.set_header("X-Lab-Tag", "1").unwrap();
+        reply.remove_header("Allow").unwrap();
+        reply.remove_headers_matching("Vi").unwrap();
+        assert_eq!(reply.script_shaped_headers(), ["X-Lab-Tag", "Allow", "Via"]);
+    }
+
+    #[test]
     fn mutations_visible_on_underlying_message() {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
-        let reply = PyReply::new(Arc::clone(&message));
+        let mut reply = PyReply::new(Arc::clone(&message));
 
         reply
             .set_header("P-Asserted-Identity", "sip:alice@example.com")

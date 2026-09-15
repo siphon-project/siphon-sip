@@ -168,13 +168,32 @@ only; prefix patterns are a config-side feature.
 
 ### Precedence (highest wins)
 
-1. Script `call.set_header()` / `call.remove_header()` — always wins
+1. Script `call.set_header()` / `call.remove_header()` / `call.remove_headers_matching()`
+   on the A-leg INVITE. The header goes out on the B-leg as the script left it: no
+   preset or per-call delta strips, rewrites or translates it.
 2. `copy=` / `strip=` / `translate=` per-call deltas
 3. The named preset's overrides
 4. The named preset's default copy/strip set
-5. **Framework-auto headers** — `Via`, `Call-ID`, `CSeq`, `Max-Forwards`,
-   `Content-Length`, `From`, `To`, `Contact`, `Record-Route`, `Route`,
-   `Proxy-Authorization`, `Proxy-Authenticate`. Never policy-able.
+
+Outside the list, the **framework-managed headers** are SIPhon's whatever the script
+or the policy says: `Via`, `Call-ID`, `CSeq`, `Max-Forwards`, `Content-Length`,
+`From`, `To`, `Contact`, `Record-Route`, `Route`. `Proxy-Authorization` and
+`Proxy-Authenticate` are not among them: every preset strips them (RFC 3261 §22.3),
+but `copy=` or a script can carry them.
+
+A few steps run after the policy and still apply on top of a script's value: the
+number policy and a carrier's caller ID and CLIR on the identity headers, LCR route
+headers, SIPhon's `Session-Expires` / `Min-SE` when it runs the session timer, and
+`replaces` merged into `Supported`.
+
+Responses work the same way. What a script does to a B-leg response in
+`@b2bua.on_answer` or `@b2bua.on_early_media` with `reply.set_header()` /
+`reply.remove_header()` / `reply.remove_headers_matching()` reaches the caller as the
+script left it, over the response policy and SIPhon's own `Supported` / `Allow`.
+SIPhon still sets the caller's `Contact`, drops the callee's `Record-Route`, removes
+`Require: 100rel` and `RSeq` toward a caller that never advertised `100rel`, adds its
+`Supported: timer` / `Session-Expires` when absent while it runs the session timer,
+merges `replaces` into `Supported`, and rewrites the SDP origin.
 
 !!! note "One intentional change from pre-policy SIPhon"
     Every preset strips `Proxy-Authenticate` on B→A responses. RFC 3261 §22.3 makes
