@@ -1522,6 +1522,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `MediaLine::formats` is now `Vec<String>`, `MediaLine::fmtp` is keyed by
   `String`, and `MediaLine` has a new `port_count` field.
 
+- **The `SecurityServerParams.protocol` docs no longer cite RFC 3329 §2.2 for
+  `protocol=`.** No sec-agree spec defines that parameter (RFC 3329, 3GPP
+  TS 33.203 Annex H); siphon appends `protocol=tcp` only for a TCP-pinned SA.
+
 ### Security
 
 - **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3

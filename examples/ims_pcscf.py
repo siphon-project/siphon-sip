@@ -259,8 +259,10 @@ async def _handle_401_register(request, reply):
         return
 
     params = pending.security_server_params()
-    # RFC 3329 §2.2: only emit `protocol=` when the UE didn't use the
-    # default UDP — keeps the wire format every existing UE expects.
+    # Leave `protocol=` off unless the SA was pinned to TCP. No sec-agree
+    # spec defines that parameter (RFC 3329 §2.2 and Appendix A, TS 33.203
+    # Annex H), and one SA pair carries UDP and TCP alike (TS 33.203 §7.1),
+    # so the header without it is the standard shape.
     proto_param = f"; protocol={params.protocol}" if params.protocol != "udp" else ""
     reply.set_header(
         "Security-Server",
