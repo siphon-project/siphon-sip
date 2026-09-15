@@ -179,7 +179,9 @@ that carrier to show progress (a 101-199) rather than for its answer. A carrier
 that has rung keeps the call up to `timeout=`, then the call fails with `408`
 instead of going to the next carrier. A sequence that ends on the ring timeout
 of a carrier that never sent a 101-199 fails with `503` instead, and
-`@b2bua.on_failure` gets `503`: no carrier reached the callee. See
+`@b2bua.on_failure` gets `503`: no carrier reached the callee. So does a
+sequence that moves on and finds none of the carriers left can be dialled,
+whatever the carrier before them did. See
 [ring timeout and progress](../cookbook/least-cost-routing.md#ring-timeout-and-progress).
 
 `max_duration=` bounds the **talk**. The clock starts at the answer, so a call

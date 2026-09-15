@@ -182,7 +182,7 @@ fn fail_call_on_b_leg_failure(
     // a configured reroute cause and more carriers remain, advance to the next
     // instead of failing the call — the A-leg sees an error only once the list is
     // exhausted or the response is definitive.
-    let Some(b_leg_acked_for_reroute) = advance_route_sequence(
+    let Some(sequence_end) = advance_route_sequence(
         call_id,
         branch,
         message,
@@ -200,7 +200,7 @@ fn fail_call_on_b_leg_failure(
     // retransmitting. Skipped when the LCR reroute path already ACKed this carrier
     // before trying (and failing to route) the next one, and for a fork's best
     // failure, ACKed when it arrived — no double ACK.
-    if !b_leg_acked_for_reroute && !acked {
+    if !sequence_end.b_leg_acked && !acked {
         ack_b_leg_non2xx(branch, message, state, snapshot);
     }
 
@@ -211,17 +211,40 @@ fn fail_call_on_b_leg_failure(
         return;
     }
 
+    // A route sequence that went on from this carrier and found only carriers it
+    // could not dial ends on those, not on this carrier's failure: siphon's own
+    // 503, whatever this carrier sent and whatever the §16.7 ranking of the
+    // attempts would pick. A controller's sequential `dial` reports the same code.
+    let undialable_status = sequence_end
+        .ended_on_undialable
+        .then_some(LCR_UNDIALED_STATUS);
+
     // A controller-issued `dial` owns this outcome: the caller is still unanswered
     // and still the controller's, so the failure is reported to it rather than the
     // call being failed — no @b2bua.on_failure, no CDR close, no teardown. The
     // B-leg has been ACKed above, which is all it is owed.
-    if report_control_dial_failure(
-        call_id,
-        status_code,
-        response_reason_phrase(message),
-        false,
-        state,
-    ) {
+    let (reported_status, reported_reason) = match undialable_status {
+        Some(undialable) => (undialable, best_error_reason(undialable)),
+        None => (status_code, response_reason_phrase(message)),
+    };
+    if report_control_dial_failure(call_id, reported_status, reported_reason, false, state) {
+        return;
+    }
+
+    if let Some(undialable) = undialable_status {
+        warn!(
+            call_id = %call_id,
+            status = undialable,
+            "LCR: no carrier left that could be dialled, failing the call"
+        );
+        conclude_failed_call(
+            call_id,
+            FailedCallEnd::Local {
+                status_code: undialable,
+                reason: best_error_reason(undialable).to_string(),
+            },
+            state,
+        );
         return;
     }
 
@@ -797,8 +820,21 @@ pub fn retry_with_credentials(
     false
 }
 
+/// Where a carrier's final failure left its route sequence, when the call is to
+/// fail on it rather than go on to another carrier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteSequenceEnd {
+    /// Whether the carrier's non-2xx was already ACKed, on the way to trying
+    /// the next carrier.
+    pub b_leg_acked: bool,
+    /// Whether the sequence went on and found only carriers it could not dial
+    /// ([`RouteAdvance::ended_on_undialable`]).
+    pub ended_on_undialable: bool,
+}
+
 /// LCR: try the next carrier in the route sequence. `None` when the failure
-/// was consumed by a retry; otherwise whether the B-leg was already ACKed.
+/// was consumed by a retry or another carrier was dialled; otherwise how the
+/// sequence ended.
 pub fn advance_route_sequence(
     call_id: &str,
     branch: &str,
@@ -807,8 +843,8 @@ pub fn advance_route_sequence(
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
     relay_challenge: bool,
-) -> Option<bool> {
-    let mut b_leg_acked_for_reroute = false;
+) -> Option<RouteSequenceEnd> {
+    let mut sequence_end = RouteSequenceEnd::default();
     if !relay_challenge && state.call_actors.is_route_sequence(call_id) {
         // Settle this carrier's leg on its final response before anything else
         // looks at the call, so nothing later takes it for a carrier still
@@ -869,7 +905,7 @@ pub fn advance_route_sequence(
                     ack_via_port,
                 );
                 send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
-                b_leg_acked_for_reroute = true;
+                sequence_end.b_leg_acked = true;
             }
             let advanced = match snapshot.a_leg_invite.as_ref().map(|arc| arc.lock()) {
                 Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
@@ -882,10 +918,11 @@ pub fn advance_route_sequence(
         "LCR: advanced to next carrier");
                 return None;
             }
+            sequence_end.ended_on_undialable = advanced.ended_on_undialable();
         }
         info!(call_id = %call_id, status = status_code, reroute,
 "LCR: forwarding carrier response to A-leg (definitive or exhausted)");
     }
 
-    Some(b_leg_acked_for_reroute)
+    Some(sequence_end)
 }
