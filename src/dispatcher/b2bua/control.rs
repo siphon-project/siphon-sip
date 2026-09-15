@@ -377,6 +377,18 @@ pub fn send_uas_response(
     // exists, so nothing under this recovers a lost 200 and the caller would
     // ring on until it gave up. Cancelled by the caller's ACK in the A-leg ACK
     // handler (search `uas_2xx_retransmits`).
+    // An answer siphon gives the caller itself is the session description in
+    // force on the caller's dialog. A provisional's early media is not, until a
+    // 2xx confirms it.
+    if final_response && (200..300).contains(&code) {
+        record_sdp_sent_to_leg(
+            state,
+            internal_call_id,
+            true,
+            message_content_type(&response),
+            &response.body,
+        );
+    }
     let retransmit = if final_response && (200..300).contains(&code) {
         Some(response.clone())
     } else {

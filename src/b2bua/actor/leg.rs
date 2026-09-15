@@ -110,6 +110,12 @@ pub struct Dialog {
     /// SDP the peer saw — otherwise a strict RFC 3264 §8 answerer may treat the
     /// changed offer as unchanged and skip re-answering.
     pub sdp_version: u64,
+    /// The session description siphon has in force toward this leg's peer: the
+    /// SDP of the last offer the peer accepted, or of the last answer siphon sent
+    /// it, as it went on the wire. What an RFC 4028 session refresh offers again,
+    /// so a held call stays held and an unchanged session keeps its `o=` version
+    /// (RFC 3264 §8). `None` until siphon has sent the peer a session description.
+    pub last_sent_sdp: Option<Vec<u8>>,
 }
 impl Dialog {
     /// Create a new outbound dialog (B-leg / UAC side).
@@ -129,6 +135,7 @@ impl Dialog {
             remote_to_uri: None,
             sdp_session_id: generate_sdp_session_id(),
             sdp_version: 0,
+            last_sent_sdp: None,
         }
     }
 
@@ -150,6 +157,7 @@ impl Dialog {
             remote_to_uri: None,
             sdp_session_id: generate_sdp_session_id(),
             sdp_version: 0,
+            last_sent_sdp: None,
         }
     }
 
@@ -325,6 +333,12 @@ pub struct Leg {
     /// (RFC 3261 §8.2.2.2) and rejects 482. Set once on the first challenge;
     /// subsequent challenges on this branch are absorbed (re-ACKed only).
     pub auth_challenged: bool,
+    /// On a re-INVITE or UPDATE tracking leg: the SDP offer siphon sent the
+    /// responder, as it went on the wire. It becomes the session description in
+    /// force on the responder's dialog ([`Dialog::last_sent_sdp`]) only when the
+    /// responder accepts it with a 2xx, so a refused offer, a hold the far end
+    /// turned down, never becomes what a later session refresh offers again.
+    pub offered_sdp: Option<Vec<u8>>,
 }
 impl Leg {
     /// Create a new A-leg from an inbound INVITE.
@@ -351,6 +365,7 @@ impl Leg {
             b_leg_invite: None,
             pending_cancel: false,
             auth_challenged: false,
+            offered_sdp: None,
         }
     }
 
@@ -401,6 +416,7 @@ impl Leg {
             b_leg_invite: None,
             pending_cancel: false,
             auth_challenged: false,
+            offered_sdp: None,
         }
     }
 

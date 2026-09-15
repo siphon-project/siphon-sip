@@ -1084,6 +1084,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   id of the leg it supersedes. It used to start a fresh one, so a later re-offer
   on that dialog named a session the callee had never seen.
 
+- **The RFC 4028 session refresh siphon sends the callee is a request on the
+  callee's own dialog.** It was a copy of the caller's stored INVITE with a few
+  headers rewritten, so it carried every other header of the caller's
+  (P-Asserted-Identity, Record-Route, vendor headers), no Route header for the
+  callee dialog's route set, and no To-tag. Its offer was the caller's original
+  SDP, so a call on hold was taken off hold at the next refresh. The refresh is
+  now built from the callee leg's dialog like any in-dialog request siphon sends:
+  its Call-ID, tags, route set, CSeq and remote target, siphon's Contact, and the
+  `Supported`, `Require` and `Proxy-Require` of the INVITE that set the dialog up
+  (RFC 4028 §7.4). Its offer is the session description in force on that dialog:
+  the offer the callee last accepted or the answer siphon last sent it, the
+  answer in a delayed offer's ACK included and a refused offer excluded. An unchanged session goes out with the same `o=` version, and
+  one that follows a refused offer takes the next version (RFC 3264 §8). The
+  refresh is still a re-INVITE, and siphon still refreshes only toward the
+  callee.
+
 ### Security
 
 - **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3

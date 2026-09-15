@@ -46,6 +46,9 @@ pub struct BLegResponseSnapshot {
     pub b_leg_handle_tx: Option<tokio::sync::mpsc::Sender<crate::b2bua::actor::LegMessage>>,
     pub b_leg_stored_invite: Option<Arc<Mutex<SipMessage>>>,
     pub b_leg_local_cseq: u32,
+    /// On a re-INVITE / UPDATE tracking leg, the SDP offer siphon sent the
+    /// responder (`Leg::offered_sdp`), committed to its dialog on a 2xx.
+    pub b_leg_offered_sdp: Option<Vec<u8>>,
     a_leg_supports_100rel: bool,
     pub a_leg_local_addr: Option<SocketAddr>,
 }
@@ -108,6 +111,7 @@ pub fn b_leg_response_snapshot(
         b_leg_handle_tx: handle_tx,
         b_leg_stored_invite: stored_invite,
         b_leg_local_cseq: local_cseq,
+        b_leg_offered_sdp: matching_b.and_then(|b| b.offered_sdp.clone()),
         a_leg_supports_100rel: call.a_leg_supports_100rel,
         a_leg_local_addr: call.a_leg_local_addr,
     })

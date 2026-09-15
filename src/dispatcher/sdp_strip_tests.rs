@@ -15,27 +15,27 @@
 use super::test_dispatcher::{test_dispatcher, TestDispatcher};
 use super::*;
 
-const CALLER: &str = "192.0.2.10:5060";
-const CALLEE: &str = "198.51.100.20:5060";
-const CALLEE_TARGET: &str = "sip:callee@198.51.100.20:5060";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
+pub(super) const CALLEE: &str = "198.51.100.20:5060";
+pub(super) const CALLEE_TARGET: &str = "sip:callee@198.51.100.20:5060";
 
-const A_LEG_CALL_ID: &str = "sdp-strip-a@192.0.2.10";
-const CALLER_TAG: &str = "caller-tag";
-const B_LEG_CALL_ID: &str = "sdp-strip-b@192.0.2.1";
+pub(super) const A_LEG_CALL_ID: &str = "sdp-strip-a@192.0.2.10";
+pub(super) const CALLER_TAG: &str = "caller-tag";
+pub(super) const B_LEG_CALL_ID: &str = "sdp-strip-b@192.0.2.1";
 /// siphon's own From-tag on the B-leg.
-const B_LEG_TAG: &str = "b-leg-tag";
-const CALLEE_TAG: &str = "callee-tag";
-const B_LEG_BRANCH: &str = "z9hG4bK-sdp-strip-b";
+pub(super) const B_LEG_TAG: &str = "b-leg-tag";
+pub(super) const CALLEE_TAG: &str = "callee-tag";
+pub(super) const B_LEG_BRANCH: &str = "z9hG4bK-sdp-strip-b";
 
 /// What the tests configure: one name in the case the SDP uses and one in a
 /// different case.
-const STRIP: [&str; 2] = ["msid", "X-HIDDEN"];
+pub(super) const STRIP: [&str; 2] = ["msid", "X-HIDDEN"];
 
 /// An endpoint's SDP. It carries the configured attributes at both levels,
 /// `x-hidden` with and without a value and in a different case than configured,
 /// next to attributes that must survive: `msid-semantic` shares a prefix with
 /// `msid` and is a different attribute.
-fn endpoint_sdp(address: &str) -> String {
+pub(super) fn endpoint_sdp(address: &str) -> String {
     format!(
         concat!(
             "v=0\r\n",
@@ -57,7 +57,7 @@ fn endpoint_sdp(address: &str) -> String {
 }
 
 /// The same endpoint SDP with none of the configured attributes in it.
-fn plain_sdp(address: &str) -> String {
+pub(super) fn plain_sdp(address: &str) -> String {
     format!(
         concat!(
             "v=0\r\n",
@@ -74,18 +74,18 @@ fn plain_sdp(address: &str) -> String {
     )
 }
 
-fn strip_dispatcher(configured: &[&str]) -> TestDispatcher {
+pub(super) fn strip_dispatcher(configured: &[&str]) -> TestDispatcher {
     let mut dispatcher = test_dispatcher();
     dispatcher.state.sdp_strip_attributes =
         configured.iter().map(|name| name.to_string()).collect();
     dispatcher
 }
 
-fn address(literal: &str) -> SocketAddr {
+pub(super) fn address(literal: &str) -> SocketAddr {
     literal.parse().expect("a literal address")
 }
 
-fn udp_transport(remote: &str) -> LegTransport {
+pub(super) fn udp_transport(remote: &str) -> LegTransport {
     LegTransport {
         remote_addr: address(remote),
         connection_id: ConnectionId::default(),
@@ -94,7 +94,7 @@ fn udp_transport(remote: &str) -> LegTransport {
     }
 }
 
-fn inbound_from(remote: &str) -> InboundMessage {
+pub(super) fn inbound_from(remote: &str) -> InboundMessage {
     InboundMessage {
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
@@ -104,12 +104,12 @@ fn inbound_from(remote: &str) -> InboundMessage {
     }
 }
 
-fn parse(raw: &str) -> SipMessage {
+pub(super) fn parse(raw: &str) -> SipMessage {
     parse_sip_message_bytes(raw.as_bytes()).expect("the test message parses")
 }
 
 /// The caller's INVITE, carrying `body` as its offer.
-fn caller_invite(body: &str) -> SipMessage {
+pub(super) fn caller_invite(body: &str) -> SipMessage {
     parse(&format!(
         concat!(
             "INVITE sip:callee@siphon.example.com SIP/2.0\r\n",
@@ -133,7 +133,7 @@ fn caller_invite(body: &str) -> SipMessage {
 }
 
 /// An in-dialog request from the caller (`from_caller`) or from the callee.
-fn in_dialog_request(method: &str, from_caller: bool, body: &str) -> SipMessage {
+pub(super) fn in_dialog_request(method: &str, from_caller: bool, body: &str) -> SipMessage {
     let (via, from, to, call_id, contact) = if from_caller {
         (
             "192.0.2.10:5060;branch=z9hG4bK-caller-2",
@@ -178,7 +178,7 @@ fn in_dialog_request(method: &str, from_caller: bool, body: &str) -> SipMessage 
 }
 
 /// A response from the callee in the B-leg dialog.
-fn callee_response(
+pub(super) fn callee_response(
     status_code: u16,
     reason: &str,
     branch: &str,
@@ -213,7 +213,12 @@ fn callee_response(
 
 /// A response from the caller in the A-leg dialog, where siphon's tag is
 /// `siphon_tag`.
-fn caller_response(branch: &str, cseq: &str, siphon_tag: &str, body: &str) -> SipMessage {
+pub(super) fn caller_response(
+    branch: &str,
+    cseq: &str,
+    siphon_tag: &str,
+    body: &str,
+) -> SipMessage {
     parse(&format!(
         concat!(
             "SIP/2.0 200 OK\r\n",
@@ -240,7 +245,7 @@ fn caller_response(branch: &str, cseq: &str, siphon_tag: &str, body: &str) -> Si
 
 /// A call from the caller with no B-leg yet. Its stored INVITE carries the
 /// caller's offer.
-fn caller_call(dispatcher: &TestDispatcher) -> String {
+pub(super) fn caller_call(dispatcher: &TestDispatcher) -> String {
     let state = &dispatcher.state;
     let mut a_leg = Leg::new_a_leg(
         A_LEG_CALL_ID.to_string(),
@@ -263,7 +268,7 @@ fn caller_call(dispatcher: &TestDispatcher) -> String {
 }
 
 /// A call whose INVITE is out to the callee and not yet answered.
-fn ringing_call(dispatcher: &TestDispatcher) -> String {
+pub(super) fn ringing_call(dispatcher: &TestDispatcher) -> String {
     let call_id = caller_call(dispatcher);
     let mut b_leg = Leg::new_b_leg(
         B_LEG_CALL_ID.to_string(),
@@ -278,7 +283,7 @@ fn ringing_call(dispatcher: &TestDispatcher) -> String {
 }
 
 /// A call the callee answered and both parties ACKed.
-fn answered_call(dispatcher: &TestDispatcher) -> String {
+pub(super) fn answered_call(dispatcher: &TestDispatcher) -> String {
     let state = &dispatcher.state;
     let call_id = caller_call(dispatcher);
     if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -304,7 +309,7 @@ fn answered_call(dispatcher: &TestDispatcher) -> String {
 }
 
 /// siphon's own tag on the A-leg dialog.
-fn siphon_a_leg_tag(dispatcher: &TestDispatcher, call_id: &str) -> String {
+pub(super) fn siphon_a_leg_tag(dispatcher: &TestDispatcher, call_id: &str) -> String {
     dispatcher
         .state
         .call_actors
@@ -316,7 +321,7 @@ fn siphon_a_leg_tag(dispatcher: &TestDispatcher, call_id: &str) -> String {
 /// Register the tracking leg a forwarded re-INVITE or UPDATE leaves on the call,
 /// the way `handle_b2bua_reinvite` / `handle_b2bua_update` do, and return its
 /// branch. `toward_callee` is the direction the request was forwarded in.
-fn track_forwarded(
+pub(super) fn track_forwarded(
     dispatcher: &TestDispatcher,
     call_id: &str,
     method: &str,
@@ -349,12 +354,16 @@ fn track_forwarded(
     branch
 }
 
-fn snapshot(dispatcher: &TestDispatcher, call_id: &str, branch: &str) -> BLegResponseSnapshot {
+pub(super) fn snapshot(
+    dispatcher: &TestDispatcher,
+    call_id: &str,
+    branch: &str,
+) -> BLegResponseSnapshot {
     b_leg_response_snapshot(call_id, branch, &dispatcher.state).expect("the call is live")
 }
 
 /// Everything siphon has put on the wire since the last look.
-fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
+pub(super) fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
     dispatcher
         .udp
         .try_iter()
@@ -367,14 +376,18 @@ fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)> {
         .collect()
 }
 
-fn request_to(sent: &[(SocketAddr, SipMessage)], destination: &str, method: Method) -> SipMessage {
+pub(super) fn request_to(
+    sent: &[(SocketAddr, SipMessage)],
+    destination: &str,
+    method: Method,
+) -> SipMessage {
     sent.iter()
         .find(|(to, message)| *to == address(destination) && message.method() == Some(&method))
         .map(|(_, message)| message.clone())
         .unwrap_or_else(|| panic!("no {method:?} to {destination} among {} sent", sent.len()))
 }
 
-fn response_to(
+pub(super) fn response_to(
     sent: &[(SocketAddr, SipMessage)],
     destination: &str,
     status_code: u16,
@@ -392,13 +405,13 @@ fn response_to(
         })
 }
 
-fn body_text(message: &SipMessage) -> String {
+pub(super) fn body_text(message: &SipMessage) -> String {
     String::from_utf8(message.body.clone()).expect("the SDP is text")
 }
 
 /// None of the configured attributes crossed, everything else of the SDP did,
 /// and `Content-Length` still describes the body.
-fn assert_stripped(message: &SipMessage, context: &str) {
+pub(super) fn assert_stripped(message: &SipMessage, context: &str) {
     let body = body_text(message);
     for line in body.lines() {
         if let Some(attribute) = line.strip_prefix("a=") {
@@ -428,7 +441,7 @@ fn assert_stripped(message: &SipMessage, context: &str) {
 
 /// Every line of `sent` other than the origin and the session name, the two
 /// lines topology hiding owns, crossed byte for byte and in order.
-fn assert_crossed_unchanged(message: &SipMessage, sent: &str, context: &str) {
+pub(super) fn assert_crossed_unchanged(message: &SipMessage, sent: &str, context: &str) {
     fn without_identity(sdp: &str) -> Vec<&str> {
         sdp.split_inclusive('\n')
             .filter(|line| !line.starts_with("o=") && !line.starts_with("s="))
@@ -448,7 +461,7 @@ fn assert_crossed_unchanged(message: &SipMessage, sent: &str, context: &str) {
 }
 
 /// Dial the callee with `invite` as the A-leg INVITE.
-fn dial_callee(dispatcher: &TestDispatcher, call_id: &str, invite: &SipMessage) {
+pub(super) fn dial_callee(dispatcher: &TestDispatcher, call_id: &str, invite: &SipMessage) {
     assert!(
         b2bua_send_b_leg_invite(
             call_id,
@@ -514,7 +527,7 @@ async fn with_nothing_configured_the_offer_to_the_callee_is_unchanged() {
 
 /// The line of `message`'s SDP that starts with `prefix` (`"o="`, `"s="`),
 /// without its line ending.
-fn sdp_line(message: &SipMessage, prefix: &str) -> Option<String> {
+pub(super) fn sdp_line(message: &SipMessage, prefix: &str) -> Option<String> {
     body_text(message)
         .lines()
         .find(|line| line.starts_with(prefix))
@@ -524,7 +537,11 @@ fn sdp_line(message: &SipMessage, prefix: &str) -> Option<String> {
 /// `status_code` from the callee for `invite`, as its server transaction would
 /// send it (RFC 3261 §8.2.6.2): the INVITE's Via, From, Call-ID and CSeq, and
 /// its To with the callee's tag.
-fn response_to_request(invite: &SipMessage, status_code: u16, reason: &str) -> SipMessage {
+pub(super) fn response_to_request(
+    invite: &SipMessage,
+    status_code: u16,
+    reason: &str,
+) -> SipMessage {
     let header = |name: &str| {
         invite
             .headers
@@ -555,7 +572,7 @@ fn response_to_request(invite: &SipMessage, status_code: u16, reason: &str) -> S
 }
 
 /// The session timer siphon runs, with an interval a callee can refuse.
-fn with_session_timer(dispatcher: &mut TestDispatcher) {
+pub(super) fn with_session_timer(dispatcher: &mut TestDispatcher) {
     dispatcher.state.session_timer_config =
         Some(serde_yaml_ng::from_str("session_expires: 90\n").expect("a session timer config"));
 }
@@ -664,7 +681,7 @@ async fn early_media_relayed_to_the_caller_loses_the_named_attributes() {
 
 /// Relay one 183 carrying `sdp` through a dispatcher configured with
 /// `configured`, and return what the caller was sent.
-fn relayed_early_media(configured: &[&str], sdp: &str) -> SipMessage {
+pub(super) fn relayed_early_media(configured: &[&str], sdp: &str) -> SipMessage {
     let dispatcher = strip_dispatcher(configured);
     let call_id = ringing_call(&dispatcher);
     let mut progress = callee_response(183, "Session Progress", B_LEG_BRANCH, "1 INVITE", sdp);
@@ -928,57 +945,21 @@ async fn a_re_invite_siphon_sends_with_the_other_legs_sdp_loses_the_named_attrib
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_session_refresh_carrying_the_callers_sdp_loses_the_named_attributes() {
-    let dispatcher = strip_dispatcher(&STRIP);
-    let call_id = answered_call(&dispatcher);
-
-    b2bua_send_refresh_reinvite(&call_id, &dispatcher.state);
-
-    let refresh = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
-    assert_stripped(&refresh, "session refresh to the callee");
-}
-
 // ---------------------------------------------------------------------------
 // o= and s= on the paths that carry SDP from elsewhere
 // ---------------------------------------------------------------------------
 
-const NEWCOMER: &str = "192.0.2.50:5060";
-const NEWCOMER_CALL_ID: &str = "sdp-strip-newcomer@192.0.2.50";
+pub(super) const NEWCOMER: &str = "192.0.2.50:5060";
+pub(super) const NEWCOMER_CALL_ID: &str = "sdp-strip-newcomer@192.0.2.50";
 
 /// The SDP session id siphon owns toward the caller (`on_a_leg`) or the callee.
-fn leg_session_id(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool) -> u64 {
+pub(super) fn leg_session_id(dispatcher: &TestDispatcher, call_id: &str, on_a_leg: bool) -> u64 {
     dispatcher
         .state
         .call_actors
         .clone_leg(call_id, on_a_leg)
         .map(|leg| leg.dialog.sdp_session_id)
         .expect("the leg")
-}
-
-/// A session refresh re-offers the caller's stored SDP to the callee, so it gets
-/// the topology hiding every SDP toward the callee gets: siphon's `s=`, and an
-/// `o=` with siphon's owner and address. Each refresh is the next version of the
-/// callee leg's own session (RFC 3264 §8).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_session_refresh_hides_the_callers_session_name_and_origin() {
-    let dispatcher = strip_dispatcher(&[]);
-    let call_id = answered_call(&dispatcher);
-    let session_id = leg_session_id(&dispatcher, &call_id, false);
-    let host = dispatcher.state.via_host(&Transport::Udp);
-
-    b2bua_send_refresh_reinvite(&call_id, &dispatcher.state);
-    let first = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
-    b2bua_send_refresh_reinvite(&call_id, &dispatcher.state);
-    let second = request_to(&wire(&dispatcher), CALLEE, Method::Invite);
-
-    for (refresh, version) in [(&first, 0), (&second, 1)] {
-        assert_eq!(sdp_line(refresh, "s="), Some("s=siphon".to_string()));
-        assert_eq!(
-            sdp_line(refresh, "o="),
-            Some(format!("o=siphon {session_id} {version} IN IP4 {host}"))
-        );
-    }
 }
 
 /// A re-INVITE siphon sends with SDP another party described keeps the `o=` that
@@ -1018,7 +999,7 @@ async fn a_re_invite_siphon_sends_with_the_other_legs_sdp_carries_siphons_origin
 }
 
 /// The INVITE with `Replaces` that takes over the caller's dialog.
-fn newcomer_invite(body: &str) -> SipMessage {
+pub(super) fn newcomer_invite(body: &str) -> SipMessage {
     parse(&format!(
         concat!(
             "INVITE sip:callee@siphon.example.com SIP/2.0\r\n",

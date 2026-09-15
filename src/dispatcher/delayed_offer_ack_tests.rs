@@ -604,6 +604,51 @@ async fn an_offerless_invite_holds_the_callee_ack_until_the_caller_answers() {
     assert!(call.call_is_up());
 }
 
+/// The answer siphon puts in the callee's ACK is the session description in force
+/// on the callee's dialog, the one a session refresh there offers again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_in_the_callee_ack_is_the_session_in_force_on_its_dialog() {
+    let call = OfferlessCall::dial("");
+    call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+
+    let sent = call.wire();
+    let ack = acks(&sent)
+        .first()
+        .map(|sent| sent.message.clone())
+        .expect("the callee's ACK");
+    assert_eq!(callee_session_in_force(&call), Some(ack.body.clone()));
+}
+
+/// The ACK a dialog ending before the caller answered still owes the callee
+/// carries siphon's rejecting answer, and that answer is what siphon last sent
+/// the callee's dialog.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rejecting_answer_in_a_held_ack_is_the_session_in_force_on_its_dialog() {
+    let call = OfferlessCall::dial("");
+    call.callee_answers_with_an_offer();
+    let callee = call
+        .state
+        .call_actors
+        .clone_leg(&call.call_id, false)
+        .expect("the callee's leg");
+
+    let held = take_held_ack_rejecting_offer(&call.call_id, &callee, &call.state)
+        .expect("the ACK held for the caller's answer");
+
+    assert_eq!(callee_session_in_force(&call), Some(held.ack.body.clone()));
+}
+
+/// The session description siphon has in force on the callee's dialog.
+fn callee_session_in_force(call: &OfferlessCall) -> Option<Vec<u8>> {
+    call.state
+        .call_actors
+        .clone_leg(&call.call_id, false)
+        .and_then(|leg| leg.dialog.last_sent_sdp)
+}
+
 /// A caller that ACKs the offer without an answer leaves nothing to put in the
 /// callee's ACK. The callee is ACKed with every stream rejected, and the call is
 /// ended: a session with no media agreed on either leg carries nothing.

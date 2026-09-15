@@ -330,6 +330,24 @@ pub fn forward_reinvite_response(
         };
 
         if (200..300).contains(&status_code) {
+            // The responder took the offer, so it is now the session description
+            // in force on the responder's dialog (a re-INVITE toward the B-leg when
+            // `is_a2b`). The answer relayed back is in force on the originator's.
+            if let Some(offer) = &snapshot.b_leg_offered_sdp {
+                state
+                    .call_actors
+                    .set_leg_sent_sdp(call_id, !is_a2b, offer.clone());
+            }
+            if is_bridged_reinvite {
+                record_sdp_sent_to_leg(
+                    state,
+                    call_id,
+                    is_a2b,
+                    message_content_type(message),
+                    &message.body,
+                );
+            }
+
             // ACK the responder with a new branch (end-to-end ACK for 2xx)
             send_reinvite_ack(TransactionKey::generate_branch(), state);
             debug!(

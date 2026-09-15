@@ -1087,6 +1087,23 @@ impl CallActorStore {
         }
     }
 
+    /// Record the session description siphon has in force on one leg's dialog
+    /// (`Dialog::last_sent_sdp`), the A-leg or the winning B-leg: what a session
+    /// refresh there offers again. A no-op if the call or leg is absent.
+    pub fn set_leg_sent_sdp(&self, call_id: &str, on_a_leg: bool, sdp: Vec<u8>) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            let winner = call.winner;
+            let leg = if on_a_leg {
+                Some(&mut call.a_leg)
+            } else {
+                winner.and_then(|index| call.b_legs.get_mut(index))
+            };
+            if let Some(leg) = leg {
+                leg.dialog.last_sent_sdp = Some(sdp);
+            }
+        }
+    }
+
     /// Clone one leg of a call (the A-leg, or the winning B-leg). Used to build
     /// siphon-originated in-dialog requests off a snapshot without holding the
     /// call lock across the send.
