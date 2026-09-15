@@ -250,3 +250,60 @@ async fn a_2xx_siphon_answered_itself_is_bound_by_the_same_deadline() {
     caller_acks(&state, &relayed);
     assert!(super::b_leg_2xx_ack_tests::drain(&udp).is_empty());
 }
+
+/// A 2xx that carried the offer, because the INVITE went out without one, has its
+/// ACK held for the caller's answer, and a caller that never ACKs never answers. At
+/// 64*T1 the callee is still owed that ACK: it goes out with every stream rejected
+/// (RFC 3261 §13.2.2.4), right before the BYE both legs get (§13.3.1.4, §15).
+#[tokio::test(start_paused = true)]
+async fn a_held_delayed_offer_ack_goes_out_rejecting_the_offer_before_the_64_t1_bye() {
+    let call = Call::bridged_without_an_offer();
+    call.callee_answers("");
+    assert!(
+        call.wire()
+            .iter()
+            .all(|sent| sent.message.method() != Some(&Method::Ack)),
+        "the callee's ACK waits for an answer the caller never sends"
+    );
+
+    tokio::time::sleep(Duration::from_secs(33)).await;
+    sweep_unacked_uas_2xx(&call.state);
+    let sent = call.wire();
+    let to_callee: Vec<&Sent> = sent
+        .iter()
+        .filter(|sent| sent.destination == callee())
+        .collect();
+    let ack_at = to_callee
+        .iter()
+        .position(|sent| sent.message.method() == Some(&Method::Ack))
+        .expect("the callee is sent the ACK its 2xx is owed");
+    let bye_at = to_callee
+        .iter()
+        .position(|sent| sent.message.method() == Some(&Method::Bye))
+        .expect("the callee is sent a BYE");
+    assert_eq!(bye_at, ack_at + 1, "the ACK goes out right before the BYE");
+    let ack = &to_callee[ack_at].message;
+    assert_eq!(
+        ack.headers.get("Content-Type").map(String::as_str),
+        Some("application/sdp")
+    );
+    let answer = String::from_utf8(ack.body.clone()).expect("an SDP body is UTF-8");
+    assert!(
+        answer.contains("m=audio 0 RTP/AVP 0\r\n"),
+        "every stream rejected:\n{answer}"
+    );
+    assert_eq!(
+        to_callee[bye_at]
+            .message
+            .headers
+            .get("Reason")
+            .map(String::as_str),
+        Some(NO_ACK_REASON)
+    );
+    assert!(
+        byes(&sent).iter().any(|bye| bye.destination == caller()),
+        "the caller is sent a BYE too"
+    );
+    assert!(!call_is_up(&call));
+    assert!(call.state.uas_2xx_retransmits.is_empty());
+}

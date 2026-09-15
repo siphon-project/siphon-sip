@@ -166,6 +166,17 @@ impl Call {
     /// clock builds the call this way. Everything after the INVITE — the callee's
     /// responses, the caller's ACK, the teardown — is the same dispatcher code.
     pub(super) fn bridged() -> Call {
+        Call::bridged_with(false)
+    }
+
+    /// [`Call::bridged`] with the callee's INVITE stored on the leg the way the dial
+    /// stores it, and that INVITE carrying no offer: the callee's 2xx then carries
+    /// the offer, and its ACK waits for the caller's answer (RFC 3261 §13.2.2.4).
+    pub(super) fn bridged_without_an_offer() -> Call {
+        Call::bridged_with(true)
+    }
+
+    fn bridged_with(store_offerless_invite: bool) -> Call {
         let (state, udp, call_id) = Call::caller_alone();
         let invite = Call::callee_invite();
         let mut leg = Leg::new_b_leg(
@@ -183,6 +194,9 @@ impl Call {
         leg.dialog.local_contact = Some("<sip:192.0.2.1:5060;transport=udp>".to_string());
         leg.dialog.local_from_uri = invite.headers.from().cloned();
         leg.dialog.remote_to_uri = invite.headers.to().cloned();
+        if store_offerless_invite {
+            leg.b_leg_invite = Some(Arc::new(Mutex::new(invite.clone())));
+        }
         state.call_actors.add_b_leg(&call_id, leg);
         Call {
             state,
@@ -360,16 +374,18 @@ pub(super) fn caller_acks(state: &Arc<DispatcherState>, relayed_200: &SipMessage
     );
 }
 
-/// Everything on `udp` so far, in the order siphon sent it.
+/// Every frame on `udp` so far, in the order siphon sent it, the followers of an
+/// ordered group (an ACK and the BYE right behind it) included.
 pub(super) fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = udp.try_recv() {
-        sent.push(Sent {
-            destination: outbound.destination,
-            source_local_addr: outbound.source_local_addr,
-            message: parse_sip_message_bytes(&outbound.data)
-                .expect("siphon sent a message that parses"),
-        });
+        for frame in outbound.frames() {
+            sent.push(Sent {
+                destination: outbound.destination,
+                source_local_addr: outbound.source_local_addr,
+                message: parse_sip_message_bytes(frame).expect("siphon sent a message that parses"),
+            });
+        }
     }
     sent
 }
