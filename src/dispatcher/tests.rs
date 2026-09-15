@@ -171,7 +171,7 @@ fn option_tag_merges_into_the_callers_supported() {
 /// This is the invariant behind the callee actually being ACKed. When the
 /// leg actor's `CallEvent` decided this instead, a 2xx processed while its
 /// own 18x's event was still queued read as `Provisional` — skipping
-/// `set_winner` and the deferred B-leg ACK, so the callee's 200 was never
+/// `set_winner` and the B-leg ACK, so the callee's 200 was never
 /// ACKed and it retransmitted until the dialog collapsed. Measured at
 /// 8-15% of plain calls on a loopback B2BUA.
 #[test]

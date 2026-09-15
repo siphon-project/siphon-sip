@@ -202,7 +202,7 @@ pub struct DispatcherState {
     /// the A-leg INVITE before an IST exists (see `handle_b2bua_invite`), and
     /// the IST steps aside on 2xx anyway ("TU owns retransmissions"), so nothing
     /// else recovers a lost A-leg 200 — without this the caller rings until it
-    /// CANCELs. The entry's `Notify` is fired by the late-ACK handler when the
+    /// CANCELs. The entry's `Notify` is fired by the A-leg ACK handler when the
     /// caller's ACK arrives; the retransmit task otherwise gives up at 64×T1.
     pub uas_2xx_retransmits: Arc<DashMap<String, Arc<tokio::sync::Notify>>>,
     /// INVITE server transactions whose CANCEL has already been accepted,

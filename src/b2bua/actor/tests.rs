@@ -1416,27 +1416,18 @@ fn try_win_claims_the_answer_exactly_once() {
         assert_eq!(call.state, CallState::Answered);
     }
 
-    // A retransmit of the winner's 200 before the B-leg ACK went out:
-    // already answered, absorb silently.
+    // A retransmit of the winner's 200: already answered, not a second win.
     assert!(matches!(
         store.try_win(&call_id, 0),
-        WinOutcome::AlreadyAnswered { b_leg_acked: false }
+        WinOutcome::AlreadyAnswered
     ));
     // A losing fork branch's 200 (B-leg 1): also already answered, not a win.
     assert!(matches!(
         store.try_win(&call_id, 1),
-        WinOutcome::AlreadyAnswered { b_leg_acked: false }
+        WinOutcome::AlreadyAnswered
     ));
     // The winner is unchanged (still B-leg 0).
     assert_eq!(store.get_call(&call_id).unwrap().winner, Some(0));
-
-    // Once the winner's ACK has gone out, a further retransmit reports
-    // acked=true so the caller re-ACKs to stop the UAS retransmitting.
-    store.get_call_mut(&call_id).unwrap().b_legs[0].initial_acked = true;
-    assert!(matches!(
-        store.try_win(&call_id, 0),
-        WinOutcome::AlreadyAnswered { b_leg_acked: true }
-    ));
 }
 
 /// Answering a fork cancels the branches still ringing, under the same lock that

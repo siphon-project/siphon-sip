@@ -321,13 +321,12 @@ pub struct CallActor {
     /// in-dialog anchor off siphon, so the deployment must route it back or the
     /// dialog breaks. Takes precedence over `contact_user_override`.
     pub contact_override: Option<String>,
-    /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
-    /// Contains (ACK message, transport, destination address).
-    pub pending_b_leg_ack: Option<(
-        SipMessage,
-        crate::transport::Transport,
-        std::net::SocketAddr,
-    )>,
+    /// The winning B-leg's ACK when its INVITE went out without an offer, so the
+    /// 2xx carried the offer and the ACK has to carry the answer (RFC 3261
+    /// §13.2.2.4, RFC 3264 §4). Held until the caller's ACK brings that answer,
+    /// then kept as sent so every retransmission of the 2xx gets it again. `None`
+    /// for a call whose INVITE carried an offer: that 2xx is ACKed on arrival.
+    pub delayed_offer_ack: Option<DelayedOfferAck>,
     /// Resolved header policy for this call (preset + per-call deltas) — set
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
@@ -497,7 +496,7 @@ impl CallActor {
             to_host_override: None,
             contact_user_override: None,
             contact_override: None,
-            pending_b_leg_ack: None,
+            delayed_offer_ack: None,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
@@ -1198,6 +1197,9 @@ impl CallActor {
         }
         self.winner = None;
         self.answered_at = None;
+        // An ACK held for that answer's offer belonged to the failed answer; the
+        // failure path has already ACKed the leg it came from.
+        self.delayed_offer_ack = None;
         self.transition_to(CallState::Calling);
     }
 
@@ -1315,9 +1317,28 @@ pub enum WinOutcome {
     /// was cancelled under it too. `cancelled` holds those branches, for the
     /// caller to CANCEL (RFC 3261 §9.1).
     FirstWin { cancelled: Vec<Leg> },
-    /// The call was already answered — this 2xx is a retransmit of the winning
-    /// B-leg's answer (or a losing fork branch). `b_leg_acked` reports whether
-    /// the winning B-leg's ACK has already gone out, so the caller can re-ACK
-    /// to stop the retransmit vs. absorb silently while awaiting the A-leg ACK.
-    AlreadyAnswered { b_leg_acked: bool },
+    /// The call was already answered: this 2xx is a retransmission of the
+    /// winning B-leg's answer (or a losing fork branch's). It is not relayed to
+    /// the caller again, and it is ACKed like every 2xx (RFC 3261 §13.2.2.4).
+    AlreadyAnswered,
+}
+
+/// The ACK owed to a B-leg 2xx that carried the offer, because the INVITE went
+/// out without one (see `CallActor::delayed_offer_ack`).
+#[derive(Debug, Clone)]
+pub struct DelayedOfferAck {
+    /// The ACK, built from the 2xx. Carries the answer once `sent`.
+    pub ack: crate::sip::message::SipMessage,
+    /// The offer the 2xx carried: what a rejecting answer is built against when
+    /// the call ends before the caller answers.
+    pub offer: Vec<u8>,
+    pub transport: crate::transport::Transport,
+    /// The ACK's next hop, the first of the 2xx's route set or the leg's address.
+    pub destination: std::net::SocketAddr,
+    /// The socket the INVITE left from, for a flow-pinned leg.
+    pub local_addr: Option<std::net::SocketAddr>,
+    /// The B-leg that sent the 2xx.
+    pub b_leg_index: usize,
+    /// Whether the ACK has gone out. Until it has, copies of the 2xx are absorbed.
+    pub sent: bool,
 }

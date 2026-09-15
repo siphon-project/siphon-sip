@@ -292,7 +292,7 @@ pub fn handle_b2bua_response(
     // Filtering `Terminated` (see `recv_b_leg_classification_event`) fixed one
     // source of that skew; this removes the dependency instead of chasing the
     // rest. A 2xx read as its predecessor's `Provisional` skips `set_winner` and
-    // the deferred B-leg ACK, so the callee's 200 is never ACKed and it
+    // the B-leg ACK, so the callee's 200 is never ACKed and it
     // retransmits until the dialog collapses — measured at 8-15% of plain calls
     // on a loopback B2BUA before this change.
     //

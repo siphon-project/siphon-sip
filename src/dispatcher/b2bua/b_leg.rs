@@ -885,7 +885,7 @@ pub enum ResponseClass {
 /// the leg actor's `CallEvent`, which is delivered on a per-call channel shared
 /// by every leg and is not guaranteed to describe the response being handled;
 /// a 2xx read as its predecessor's `Provisional` skips `set_winner` and the
-/// deferred B-leg ACK, so the callee's 200 is never ACKed and it retransmits
+/// B-leg ACK, so the callee's 200 is never ACKed and it retransmits
 /// until the dialog collapses.
 pub fn classify_b_leg_response(status_code: u16) -> Option<ResponseClass> {
     if (200..300).contains(&status_code) {

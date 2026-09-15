@@ -872,6 +872,8 @@ services:
       - b2bua-early-media
       - b2bua-topology
       - b2bua-refer
+      - b2bua-unacked-2xx
+      - b2bua-delayed-offer
 
   # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
   sipp-b2bua-register:
@@ -2020,7 +2022,7 @@ services:
     profiles:
       - b2bua-replaces
 
-  # --- The callee is ACKed on every answered call (RFC 3261 §14.1) ---
+  # --- The callee is ACKed on every answered call (RFC 3261 §13.2.2.4) ---
   # Reuses the replaces siphon (a plain bridge to one fixed callee) and drives
   # calls in a tight loop, which is what makes a 18x and its 200 land on
   # different workers at once.
@@ -2289,6 +2291,238 @@ services:
       - -trace_err
     profiles:
       - b2bua-failure
+
+  # --- B2BUA callee ACKed without waiting for the caller (RFC 3261 §13.2.2.4) ---
+  # The caller holds its ACK for 4 s after the 200. The callee must be ACKed
+  # within 2 s, with its own Contact as the Request-URI. bob's earlier contacts
+  # are removed and bob is registered from the callee's address, so the fork
+  # reaches only this callee.
+  #   172.20.0.207  caller
+  #   172.20.0.208  callee, and the REGISTER that points bob at it
+  #   172.20.0.209  wildcard de-REGISTER of bob
+
+  sipp-b2bua-unacked-deregister:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.209
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/deregister.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-unacked-2xx
+
+  sipp-b2bua-unacked-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-unacked-deregister:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.208
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact_unacked.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-unacked-2xx
+
+  sipp-b2bua-unacked-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-unacked-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.208
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_unacked_2xx_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-unacked-2xx
+
+  sipp-b2bua-unacked-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-unacked-register:
+        condition: service_completed_successfully
+      sipp-b2bua-unacked-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.207
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_unacked_2xx_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-unacked-2xx
+
+  # --- B2BUA delayed offer: the callee's ACK carries the caller's answer ---
+  # RFC 3261 §13.2.2.4, RFC 3264 §4. The caller's INVITE has no SDP, the callee
+  # offers in its 200, the caller answers in its ACK, and the ACK siphon sends
+  # the callee must carry that answer. bob's earlier contacts are removed and bob
+  # is registered from the callee's address, so the fork reaches only this callee.
+  #   172.20.0.213  caller
+  #   172.20.0.214  callee, and the REGISTER that points bob at it
+  #   172.20.0.215  wildcard de-REGISTER of bob
+
+  sipp-b2bua-delayed-offer-deregister:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.215
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/deregister.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-delayed-offer
+
+  sipp-b2bua-delayed-offer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-delayed-offer-deregister:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.214
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact_delayed_offer.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-delayed-offer
+
+  sipp-b2bua-delayed-offer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-delayed-offer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.214
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_delayed_offer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-delayed-offer
+
+  sipp-b2bua-delayed-offer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-delayed-offer-register:
+        condition: service_completed_successfully
+      sipp-b2bua-delayed-offer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.213
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_delayed_offer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-delayed-offer
 
   # --- B2BUA in-dialog INFO relay (RFC 6086) ---
   # The A-leg sends INFO with a DTMF body mid-call; the UAS asserts it arrives

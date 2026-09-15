@@ -323,7 +323,23 @@ pub fn b2bua_ack_and_bye_answered_leg(
         resolve_in_dialog_destination(&route_set, state, destination, transport);
 
     // ACK on every call — a lost ACK leaves the callee retransmitting.
-    let ack = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port);
+    let mut ack = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port);
+    // A 2xx that carried the offer, because the INVITE went out without one, is
+    // owed an ACK with an answer (RFC 3261 §13.2.2.4). Nothing on this path has
+    // the caller's, and the dialog is being released: every stream rejected.
+    let invite_carried_no_offer = leg
+        .b_leg_invite
+        .as_ref()
+        .and_then(|invite| invite.lock().ok())
+        .is_some_and(|invite| invite.body.is_empty());
+    if let Some(ack) = ack
+        .as_mut()
+        .filter(|_| invite_carried_no_offer && !response.body.is_empty())
+    {
+        let mut body = rejecting_answer(&response.body);
+        stamp_b_leg_origin(&mut body, "application/sdp", &mut leg, &transport, state);
+        set_sdp_body(ack, body, "application/sdp");
+    }
 
     if !send_bye {
         if let Some(ack) = ack {

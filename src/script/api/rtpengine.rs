@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
+use crate::rtpengine::answer::{exchange_answer, AnswerExchange};
 use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::{
     validate_ws_sample_rate, NgFlags, ProfileRegistry, WsTeeDirection, WsVadEngine,
@@ -769,6 +770,12 @@ impl PyRtpEngine {
     ///   3. ``DEFAULT_PROFILE`` (``rtp_passthrough``) when no offer was ever
     ///      recorded for this Call-ID.
     ///
+    /// Delayed offer (RFC 3264 §4): when the INVITE carried no SDP, the reply's
+    /// SDP is the offer, not an answer. It goes to the engine as an ``offer``
+    /// from the replying party's side, and siphon completes it with the caller's
+    /// answer from the ACK itself, so a script calls ``answer`` the same way for
+    /// both.
+    ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
     ///     profile: RTP profile name. When omitted, the profile recorded by
@@ -824,8 +831,21 @@ impl PyRtpEngine {
             None
         };
 
+        // A delayed offer (RFC 3264 §4): the A-leg INVITE carried no SDP, so the
+        // reply's SDP is not an answer but the offer, and the caller answers it in
+        // its ACK. The engine is sent it as an `offer` from the replying party's
+        // side, and siphon completes it with the caller's answer when that ACK
+        // arrives (`send_delayed_offer_ack`).
+        let delayed_offer = match &a_leg_msg {
+            Some(a_msg) => lock_message(a_msg)?.body.is_empty(),
+            None => false,
+        };
+
         let (call_id, from_tag, to_tag, sdp) = if let Some(ref a_msg) = a_leg_msg {
-            let (cid, ftag, _sdp) = extract_offer_params(a_msg)?;
+            let (cid, ftag) = {
+                let a_leg_invite = lock_message(a_msg)?;
+                dialog_ids(&a_leg_invite)?
+            };
             let (_reply_cid, _reply_ftag, ttag, reply_sdp) = extract_answer_params(&message)?;
             (cid, ftag, ttag, reply_sdp)
         } else {
@@ -839,16 +859,18 @@ impl PyRtpEngine {
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        let flags = entry.answer.clone();
+        // The flags of the command the engine is actually sent.
+        let side = if delayed_offer {
+            &entry.offer
+        } else {
+            &entry.answer
+        };
+        let flags = side.clone();
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
-        let resolved_ws_uri = resolve_ws_uri(
-            ws_uri,
-            &self.sessions,
-            &call_id,
-            entry.answer.ws_uri.as_deref(),
-        );
+        let resolved_ws_uri =
+            resolve_ws_uri(ws_uri, &self.sessions, &call_id, side.ws_uri.as_deref());
         let resolved_ws_uri = match resolved_ws_uri {
             Some(template) => {
                 let (from_user, to_user) =
@@ -879,7 +901,7 @@ impl PyRtpEngine {
         let flags = finalise_flags(
             flags,
             &self.client,
-            resolved_ws_uri,
+            resolved_ws_uri.clone(),
             overrides,
             source_ip.as_deref(),
             &profile_name,
@@ -887,27 +909,26 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
+        let exchange = AnswerExchange {
+            call_id,
+            from_tag,
+            to_tag,
+            sdp,
+            flags,
+            delayed_offer,
+            profile: profile_name,
+            ws_uri: resolved_ws_uri,
+        };
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = client
-                .answer(&call_id, &from_tag, &to_tag, &sdp, &flags)
+            let rewritten_sdp = exchange_answer(&client, &sessions, exchange)
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "rtpengine.answer failed: {error}"
                     ))
                 })?;
-
-            debug!(
-                call_id = %call_id,
-                sdp_len = rewritten_sdp.len(),
-                "RTPEngine answer: SDP rewritten"
-            );
-
             replace_body(&message, &rewritten_sdp)?;
-
-            sessions.set_to_tag(&call_id, to_tag);
-
             Ok(true)
         })
     }
@@ -2640,7 +2661,14 @@ pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
 /// Extract call-id, from-tag, and SDP body from a SIP message (offer direction).
 fn extract_offer_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, String, Vec<u8>)> {
     let message = lock_message(message)?;
+    let (call_id, from_tag) = dialog_ids(&message)?;
+    let sdp = extract_sdp_body(&message)?;
+    Ok((call_id, from_tag, sdp))
+}
 
+/// The Call-ID and From-tag of a SIP message: what the engine keys a call and
+/// its offerer on.
+fn dialog_ids(message: &SipMessage) -> PyResult<(String, String)> {
     let call_id = message
         .headers
         .get("Call-ID")
@@ -2658,9 +2686,7 @@ fn extract_offer_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, S
         pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
     })?;
 
-    let sdp = extract_sdp_body(&message)?;
-
-    Ok((call_id, from_tag, sdp))
+    Ok((call_id, from_tag))
 }
 
 /// Extract call-id, from-tag, to-tag, and SDP body from a SIP message (answer direction).

@@ -221,9 +221,11 @@ pub(super) fn handle_request(
                         return;
                     }
 
-                    // B2BUA late ACK: absorb A-leg's ACK, then send deferred
-                    // ACK to the winning B-leg. This completes both legs of the
-                    // INVITE transaction simultaneously (RFC 3261 §14.1).
+                    // B2BUA: the caller's ACK for the 2xx siphon relayed. It
+                    // confirms the A-leg's dialog. The B-leg's 2xx was ACKed
+                    // when it arrived (RFC 3261 §13.2.2.4, see `ack_b_leg_2xx`),
+                    // except when that 2xx carried the offer: its ACK has waited
+                    // for the answer this ACK carries, and goes now.
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
                         // The caller's ACK stops A-leg 2xx retransmission
                         // (RFC 3261 §13.3.1.4). Fire the Notify so the retransmit
@@ -231,37 +233,11 @@ pub(super) fn handle_request(
                         if let Some((_, notify)) = state.uas_2xx_retransmits.remove(&internal_id) {
                             notify.notify_one();
                         }
-                        // Take the pending ACK and mark both legs as ACKed.
-                        // Grab the winning B-leg's anchored egress socket in the
-                        // same pass — the ACK has to leave from where its INVITE
-                        // did (flow-dialled legs; see `send_b2bua_to_bleg`).
-                        let (pending_ack, b_leg_local_addr) = if let Some(mut call) =
-                            state.call_actors.get_call_mut(&internal_id)
-                        {
+                        if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;
-                            let mut b_leg_local_addr = None;
-                            if let Some(b_leg) = call.winner.and_then(|i| call.b_legs.get_mut(i)) {
-                                b_leg.initial_acked = true;
-                                b_leg_local_addr = b_leg.transport.local_addr;
-                            }
-                            (call.pending_b_leg_ack.take(), b_leg_local_addr)
-                        } else {
-                            (None, None)
-                        };
-
-                        // Send the pre-built ACK to B-leg
-                        if let Some((ack, b_transport, b_dest)) = pending_ack {
-                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
-                            debug!(
-                                call_id = %internal_id,
-                                "B2BUA: sent deferred ACK to B-leg (A-leg ACKed)"
-                            );
-                        } else {
-                            debug!(
-                                call_id = %internal_id,
-                                "B2BUA: absorbed A-leg ACK (no pending B-leg ACK)"
-                            );
                         }
+                        send_delayed_offer_ack(&internal_id, &message, state);
+                        debug!(call_id = %internal_id, "B2BUA: absorbed A-leg ACK");
                         return;
                     }
                 }

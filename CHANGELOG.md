@@ -435,6 +435,38 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
   `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
   shape matches the DTLS profiles in the WhatsApp calling example.
+- **A B2BUA ACKs the callee's 2xx as soon as it arrives, and ACKs every
+  retransmission of it, instead of holding the ACK until the caller ACKs.**
+  siphon is the UAC of the B-leg, and RFC 3261 §13.2.2.4 has it ACK each 2xx
+  its INVITE draws. It kept that ACK back until the caller's ACK for the A-leg
+  arrived, and dropped every retransmission of the 2xx in the meantime. So when
+  the caller's ACK was late or never came, the callee was never ACKed at all:
+  it retransmitted its 200 for the full 64*T1, and a callee that only starts
+  media once the ACK arrives never started it. The ACK now goes out once the
+  2xx has been handled, each retransmission draws another, and a re-ACK now
+  carries the dialog's route set too, which it used to leave out. The caller's
+  ACK no longer sends anything to the callee. A re-INVITE from the callee that
+  comes before the caller has ACKed is still answered 491.
+
+  One call still waits for the caller, on purpose. When the B-leg INVITE went
+  out without an offer, the callee's 2xx carries the offer and the ACK has to
+  carry the answer (RFC 3264 §4), and only the caller has one, in its own ACK.
+  So that ACK goes out when the caller's arrives, carrying the caller's answer
+  the way any relayed SDP goes, with siphon's `o=`/`s=` and the configured
+  `media.sdp_strip_attributes` removed, and every later copy of the 2xx gets the
+  same ACK again, answer included. It
+  used to go out with no body at all. A call that ends before the caller
+  answers (a caller BYE, `b2bua.terminate`, an `@b2bua.on_answer` that raised)
+  still ACKs the callee, with every stream rejected, right before the BYE. A
+  caller that ACKs the offer without an answer has the offer rejected toward the
+  callee and the call ended, with
+  `Reason: Q.850;cause=111;text="No SDP answer in ACK"`. On a media-anchored
+  call both halves go through the media engine: `rtpengine.answer(reply)` sees
+  the INVITE carried no SDP and sends the callee's offer to the engine as an
+  `offer`, and siphon sends the caller's answer from the ACK as the engine
+  `answer` and puts the engine's SDP in the callee's ACK. An engine that refuses
+  that answer ends the call the same way, with
+  `Reason: Q.850;cause=47;text="Media anchor failed"`.
 
 - **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
   the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the

@@ -3363,6 +3363,12 @@ class MockRtpEngine:
            get the directional flags from the offer-side profile.
         3. ``"rtp_passthrough"`` when no offer was ever recorded.
 
+        Delayed offer (RFC 3264 §4): when the INVITE carried no SDP, the
+        reply's SDP is the offer, not an answer. It goes to the engine as an
+        ``offer`` from the replying party's side, and siphon completes it with
+        the caller's answer from the ACK itself, so a script calls ``answer``
+        the same way for both.
+
         Args:
             reply: Reply or Call object with SDP body.
             profile: Optional explicit RTP profile name. When omitted, the

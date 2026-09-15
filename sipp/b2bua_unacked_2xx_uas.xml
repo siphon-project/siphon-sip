@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA callee whose answer must be ACKed on arrival (RFC 3261 §13.2.2.4).
+
+  The caller (b2bua_unacked_2xx_uac.xml) holds its own ACK for 4 s. siphon is
+  the UAC of this leg, and the ACK it owes this 200 does not depend on the
+  caller's: it has to arrive within 2 s, or the call fails here. Before, siphon
+  held it until the caller ACKed and silently absorbed every retransmission of
+  the 200 in the meantime.
+
+  The remote target has an opaque userpart and parameters with mixed-case names
+  and `_` / `-` in their values. The ACK Request-URI has to be that Contact,
+  exactly (§12.1.2).
+-->
+<scenario name="B2BUA callee ACKed without the caller's ACK">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:opaque-7f3a@[local_ip]:[local_port];transport=udp;Tk=ab_12;RouteId=9;LegRef=0a0a-0b0b>
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:opaque-7f3a@[local_ip]:[local_port];transport=udp;Tk=ab_12;RouteId=9;LegRef=0a0a-0b0b>
+Supported: timer
+Require: timer
+Session-Expires: 1800;refresher=uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=callee 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <!-- No ontimeout: an ACK that waits for the caller's fails the call. -->
+  <recv request="ACK" timeout="2000" crlf="true">
+    <action>
+      <ereg regexp="ACK sip:opaque-7f3a@[^ ;>]+;transport=udp;Tk=ab_12;RouteId=9;LegRef=0a0a-0b0b SIP/2\.0"
+            search_in="msg" check_it="true" assign_to="ack_target" />
+      <log message="B-leg ACK Request-URI is the 2xx Contact: [$ack_target]" />
+    </action>
+  </recv>
+
+  <recv request="BYE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

@@ -249,7 +249,7 @@ pub fn arm_reliable_provisional_retransmit(
 /// caller ringing until it CANCELs. Stores a `Notify` under the internal call
 /// ID and spawns a task that resends `response` on the RFC 3261 §17.2.1 UAS
 /// schedule (T1 = 500 ms doubling to T2 = 4 s, give up after 64×T1 = 32 s).
-/// The late-ACK handler fires the `Notify` when the caller's ACK arrives.
+/// The A-leg ACK handler fires the `Notify` when the caller's ACK arrives.
 ///
 /// Mirrors [`arm_reliable_provisional_retransmit`]. On give-up it removes its
 /// own entry and warns (a genuinely abandoned answered call is reclaimed by the
@@ -382,4 +382,405 @@ pub fn reject_unanchorable_offer(
         Some(inbound.local_addr),
         state,
     );
+}
+
+/// What a call ended because the caller ACKed an offer without an answer
+/// carries on its BYEs. Q.850 cause 111, "protocol error, unspecified": the
+/// caller broke the offer/answer exchange (RFC 3264 §4 puts the answer to an
+/// offer in a 2xx into the ACK). Not 16: nothing about this ending was normal,
+/// and no party hung up. The text says which rule was broken.
+const NO_ANSWER_IN_ACK_REASON: &str = "Q.850;cause=111;text=\"No SDP answer in ACK\"";
+
+/// What a call ended because the media engine refused the caller's answer to an
+/// anchored delayed offer carries on its BYEs. Q.850 cause 47, "resource
+/// unavailable, unspecified": the media resource the call is anchored on could
+/// not complete the session.
+const MEDIA_ANCHOR_FAILED_REASON: &str = "Q.850;cause=47;text=\"Media anchor failed\"";
+
+/// An SDP answer that declines every stream `offer` makes (RFC 3264 §6): one
+/// `m=` line for each offered one, in the same order, with port 0 and the first
+/// format the offer listed.
+///
+/// siphon puts it in the ACK to a 2xx that carried the offer when it has to ACK
+/// that 2xx and has no answer from the caller to give: RFC 3261 §13.2.2.4 has an
+/// ACK to a 2xx offer carry an answer, and a dialog ending without one still owes
+/// it. The origin and connection lines are placeholders, stamped with siphon's
+/// own identity by [`stamp_b_leg_origin`].
+pub fn rejecting_answer(offer: &[u8]) -> Vec<u8> {
+    let mut answer =
+        String::from("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n");
+    for line in String::from_utf8_lossy(offer).lines() {
+        let Some(media) = line.trim_end_matches('\r').strip_prefix("m=") else {
+            continue;
+        };
+        let mut fields = media.split_whitespace();
+        let (Some(kind), Some(_port), Some(protocol)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // An m= line lists at least one format, and the answer's has to be one
+        // the offer named.
+        let format = fields.next().unwrap_or("0");
+        answer.push_str(&format!("m={kind} 0 {protocol} {format}\r\n"));
+    }
+    answer.into_bytes()
+}
+
+/// Put `body` on `message`, typed `content_type`, with a Content-Length to match.
+pub fn set_sdp_body(message: &mut SipMessage, body: Vec<u8>, content_type: &str) {
+    message
+        .headers
+        .set("Content-Type", content_type.to_string());
+    message.body = body;
+    message
+        .headers
+        .set("Content-Length", message.body.len().to_string());
+}
+
+/// Give an SDP body siphon sends a B-leg what every SDP relayed toward a leg gets,
+/// in the same order as [`own_sdp_toward_leg`]: siphon's `o=` owner, `s=` and `o=`
+/// address (topology hiding), the leg's session id at its next version (RFC 3264
+/// §8), which this advances, and then the configured `media.sdp_strip_attributes`
+/// removed. `content_type` scopes the strip to the SDP part of a multipart body.
+///
+/// For a caller that already holds the leg, under the call's lock or detached
+/// from the call, where `own_sdp_toward_leg` would reserve the version through
+/// the store again.
+pub fn stamp_b_leg_origin(
+    body: &mut Vec<u8>,
+    content_type: &str,
+    leg: &mut Leg,
+    transport: &Transport,
+    state: &DispatcherState,
+) {
+    let host = state.via_host(transport);
+    sanitize_sdp_identity(body, &state.sdp_name, Some(&host));
+    stamp_sdp_origin(
+        body,
+        &state.sdp_name,
+        leg.dialog.sdp_session_id,
+        leg.dialog.sdp_version,
+        Some(&host),
+    );
+    leg.dialog.sdp_version += 1;
+    crate::media::body::strip_sdp_attributes(content_type, body, &state.sdp_strip_attributes);
+}
+
+/// Send the B-leg ACK held for a delayed offer (see `ack_b_leg_2xx`) with the
+/// answer the caller's ACK carries. Called for every caller ACK on a B2BUA call,
+/// and a no-op unless an ACK is still held.
+///
+/// The answer is the caller's SDP with siphon's own identity, as every SDP
+/// relayed toward the callee gets. The ACK is then kept as sent, so a
+/// retransmission of the 2xx is ACKed with it again, answer included.
+///
+/// A caller ACK with no body has not answered the offer siphon relayed it
+/// (RFC 3264 §4 puts the answer there). siphon has nothing to answer the callee
+/// with and no media agreed on either leg, so it ends the call: the teardown ACKs
+/// the callee with every stream rejected and BYEs both legs.
+///
+/// On a media-anchored call the callee's offer went to the media engine when
+/// `rtpengine.answer` saw the 2xx carry it, and the engine is still waiting for
+/// the answer. The caller's answer goes to the engine as that `answer`, and the
+/// callee's ACK carries the SDP the engine returns, so both parties' media runs
+/// through the anchor. An engine that refuses leaves no valid answer to give the
+/// callee: the call is ended the same way, with Q.850 cause 47.
+pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &DispatcherState) {
+    let held = state.call_actors.get_call(call_id).is_some_and(|call| {
+        call.delayed_offer_ack
+            .as_ref()
+            .is_some_and(|held| !held.sent)
+    });
+    if !held {
+        return;
+    }
+    if caller_ack.body.is_empty() {
+        warn!(
+            call_id = %call_id,
+            "B2BUA: the caller ACKed the callee's offer without an answer (RFC 3264 §4); \
+             rejecting the offer toward the callee and ending the call"
+        );
+        b2bua_terminate_call_inner(call_id, Some(NO_ANSWER_IN_ACK_REASON), "b2bua", state);
+        return;
+    }
+    let content_type = caller_ack
+        .headers
+        .get("Content-Type")
+        .or_else(|| caller_ack.headers.get("c"))
+        .cloned()
+        .unwrap_or_else(|| "application/sdp".to_string());
+    let answer = match anchored_answer(call_id, caller_ack, state) {
+        AnchoredAnswer::NotAnchored => caller_ack.body.clone(),
+        AnchoredAnswer::Rewritten(answer) => answer,
+        AnchoredAnswer::Refused => {
+            warn!(
+                call_id = %call_id,
+                "B2BUA: the media engine refused the caller's answer to an anchored delayed offer; \
+                 rejecting the offer toward the callee and ending the call"
+            );
+            b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
+            return;
+        }
+    };
+    let sent = {
+        let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
+            return;
+        };
+        // Claimed under the call's lock, so a retransmitted caller ACK racing
+        // this one finds it sent and adds nothing.
+        let Some(held) = call.delayed_offer_ack.clone().filter(|held| !held.sent) else {
+            return;
+        };
+        let mut body = answer;
+        if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
+            stamp_b_leg_origin(&mut body, &content_type, leg, &held.transport, state);
+            leg.initial_acked = true;
+        }
+        let mut ack = held.ack.clone();
+        set_sdp_body(&mut ack, body, &content_type);
+        let sent = crate::b2bua::actor::DelayedOfferAck {
+            ack,
+            sent: true,
+            ..held
+        };
+        call.delayed_offer_ack = Some(sent.clone());
+        sent
+    };
+    debug!(call_id = %call_id, destination = %sent.destination, "B2BUA: sent the callee's ACK with the caller's answer");
+    send_b2bua_to_bleg(
+        sent.ack,
+        sent.transport,
+        sent.destination,
+        sent.local_addr,
+        state,
+    );
+}
+
+/// How the caller's answer to a delayed offer reaches the callee.
+enum AnchoredAnswer {
+    /// The call's media is not anchored: the caller's SDP goes as written.
+    NotAnchored,
+    /// The media engine's answer, for the callee's ACK.
+    Rewritten(Vec<u8>),
+    /// The media engine refused the answer.
+    Refused,
+}
+
+/// Send the caller's answer to the media engine when the callee's offer is
+/// anchored there and waiting for it: `rtpengine.answer` recorded the session
+/// from that offer, with the callee as offerer and no answerer yet.
+fn anchored_answer(
+    call_id: &str,
+    caller_ack: &SipMessage,
+    state: &DispatcherState,
+) -> AnchoredAnswer {
+    let Some(a_leg_call_id) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    let Some(sessions) = state.rtpengine_sessions.as_ref() else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    let Some(session) = sessions.get(&a_leg_call_id) else {
+        return AnchoredAnswer::NotAnchored;
+    };
+    if session.to_tag.is_some() {
+        // The engine already has an answer for this call, so there is no offer
+        // for this ACK to complete there.
+        warn!(
+            call_id = %call_id,
+            "B2BUA: delayed offer on a media-anchored call whose engine session is already answered; \
+             the caller's answer is relayed to the callee as it was written"
+        );
+        return AnchoredAnswer::NotAnchored;
+    }
+    let Some(caller_tag) = caller_ack
+        .typed_from()
+        .ok()
+        .flatten()
+        .and_then(|from| from.tag)
+    else {
+        return AnchoredAnswer::Refused;
+    };
+    match b2bua_transfer_rtpengine_answer(
+        state,
+        session.rtpengine_id(),
+        &session.from_tag,
+        &caller_tag,
+        &caller_ack.body,
+        &session.profile,
+    ) {
+        Some(answer) => {
+            sessions.set_to_tag(&a_leg_call_id, caller_tag);
+            AnchoredAnswer::Rewritten(answer)
+        }
+        None => AnchoredAnswer::Refused,
+    }
+}
+
+/// The B-leg ACK still held for a delayed offer, completed with an answer that
+/// rejects every stream, for a call ending before the caller answered. Marks it
+/// sent. `None` when no ACK is held.
+///
+/// RFC 3261 §13.2.2.4 still has the 2xx ACKed with a valid answer, and §15 lets
+/// the dialog be released with a BYE only once it is. The returned ACK goes out
+/// right before that BYE: see [`send_bye_to_b_leg`].
+pub fn take_held_ack_rejecting_offer(
+    call_id: &str,
+    state: &DispatcherState,
+) -> Option<crate::b2bua::actor::DelayedOfferAck> {
+    let mut call = state.call_actors.get_call_mut(call_id)?;
+    let held = call.delayed_offer_ack.clone().filter(|held| !held.sent)?;
+    let mut body = rejecting_answer(&held.offer);
+    if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
+        stamp_b_leg_origin(&mut body, "application/sdp", leg, &held.transport, state);
+        leg.initial_acked = true;
+    }
+    let mut ack = held.ack.clone();
+    set_sdp_body(&mut ack, body, "application/sdp");
+    let sent = crate::b2bua::actor::DelayedOfferAck {
+        ack,
+        sent: true,
+        ..held
+    };
+    call.delayed_offer_ack = Some(sent.clone());
+    Some(sent)
+}
+
+/// Send `bye` to the winning B-leg `b_leg`, preceded by `held_ack`, the ACK its
+/// 2xx was still owed ([`take_held_ack_rejecting_offer`]).
+///
+/// The two go out as one ordered unit when they share a next hop: sent
+/// separately over UDP they can reach the callee BYE first, for a dialog it has
+/// not yet seen confirmed (RFC 3261 §13.2.2.4, §15).
+pub fn send_bye_to_b_leg(
+    b_leg: &Leg,
+    bye: SipMessage,
+    held_ack: Option<crate::b2bua::actor::DelayedOfferAck>,
+    state: &DispatcherState,
+) {
+    // RFC 3261 §12.2.1.1: next hop is the first Route URI, not the cached
+    // destination of the original INVITE (which may have traversed nodes, an
+    // IMS I-CSCF say, that don't Record-Route and so aren't in the route set).
+    let (destination, transport) = resolve_in_dialog_destination(
+        &b_leg.dialog.route_set,
+        state,
+        b_leg.transport.remote_addr,
+        b_leg.transport.transport,
+    );
+    match held_ack {
+        Some(held) if held.destination == destination && held.transport == transport => {
+            send_b2bua_sequence_to_bleg(
+                vec![held.ack, bye],
+                transport,
+                destination,
+                b_leg.transport.local_addr,
+                state,
+            );
+        }
+        Some(held) => {
+            send_b2bua_to_bleg(
+                held.ack,
+                held.transport,
+                held.destination,
+                held.local_addr,
+                state,
+            );
+            send_b2bua_to_bleg(
+                bye,
+                transport,
+                destination,
+                b_leg.transport.local_addr,
+                state,
+            );
+        }
+        None => {
+            send_b2bua_to_bleg(
+                bye,
+                transport,
+                destination,
+                b_leg.transport.local_addr,
+                state,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer_text(offer: &str) -> String {
+        String::from_utf8(rejecting_answer(offer.as_bytes())).expect("the answer is UTF-8")
+    }
+
+    /// RFC 3264 §6: one m= line per offered stream, in order, port 0, with a
+    /// format the offer named.
+    #[test]
+    fn a_rejecting_answer_declines_every_offered_stream_in_order() {
+        let answer = answer_text(concat!(
+            "v=0\r\n",
+            "o=callee 1 1 IN IP4 198.51.100.5\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.5\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 8 0 101\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "m=video 30002 RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "m=application 30004 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+        ));
+        let media: Vec<&str> = answer
+            .lines()
+            .filter(|line| line.starts_with("m="))
+            .collect();
+        assert_eq!(
+            media,
+            [
+                "m=audio 0 RTP/AVP 8",
+                "m=video 0 RTP/SAVPF 96",
+                "m=application 0 UDP/DTLS/SCTP webrtc-datachannel",
+            ]
+        );
+        assert!(answer.starts_with("v=0\r\no="), "{answer}");
+        assert!(
+            !answer.contains("a="),
+            "a rejected stream carries no attributes"
+        );
+    }
+
+    #[test]
+    fn a_rejecting_answer_to_an_offer_with_no_streams_is_a_bare_session() {
+        let answer = answer_text("v=0\r\no=- 1 1 IN IP4 198.51.100.5\r\ns=-\r\nt=0 0\r\n");
+        assert!(!answer.contains("m="), "{answer}");
+        assert!(answer.contains("t=0 0\r\n"));
+    }
+
+    #[test]
+    fn a_body_set_on_a_message_carries_its_own_type_and_length() {
+        let mut message = SipMessageBuilder::new()
+            .request(Method::Ack, SipUri::new("198.51.100.5".to_string()))
+            .via("SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-body".to_string())
+            .from("<sip:a@192.0.2.1>;tag=a".to_string())
+            .to("<sip:b@198.51.100.5>;tag=b".to_string())
+            .call_id("body@192.0.2.1".to_string())
+            .cseq("1 ACK".to_string())
+            .content_length(0)
+            .build()
+            .expect("an ACK builds");
+        set_sdp_body(&mut message, b"v=0\r\n".to_vec(), "application/sdp");
+        assert_eq!(
+            message.headers.get("Content-Type").map(String::as_str),
+            Some("application/sdp")
+        );
+        assert_eq!(
+            message.headers.get("Content-Length").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(message.body, b"v=0\r\n");
+    }
 }
