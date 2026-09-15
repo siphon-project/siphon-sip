@@ -419,12 +419,13 @@ fn the_policy_shapes_the_number_in_an_explicit_ruri() {
     assert!(target.contains("user=phone"), "{target}");
 }
 
-/// Captured log output, for asserting on a warning.
+/// Captured log output, for asserting on a warning. Shared with the other
+/// dispatcher test modules that assert on a startup warning.
 #[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+pub(super) struct LogBuffer(Arc<Mutex<Vec<u8>>>);
 
 impl LogBuffer {
-    fn rendered(&self) -> String {
+    pub(super) fn rendered(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("the log buffer lock")).into_owned()
     }
 }

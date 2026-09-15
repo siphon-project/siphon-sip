@@ -302,6 +302,20 @@ pub async fn run(
         }
     }
 
+    // A TLS or WSS listener advertising an IP literal its certificate does not
+    // carry fails every peer that reconnects to it, and siphon never sees the
+    // failure. Say so once, here, where the advertised hosts and the listener set
+    // are final. TLS/WSS listeners only start when a `tls:` block is configured.
+    if let Some(ref tls) = config.tls {
+        warn_secure_listeners_advertising_ip_literals(
+            &tls.certificate,
+            &listener_registry,
+            &merged_advertised,
+            &listen_addrs,
+            via_addr.ip(),
+        );
+    }
+
     // B2BUA header policy library: the built-in presets plus every
     // operator-defined policy from `header_policies:`.  Both were already
     // resolved and validated at config load, so neither arm below should be

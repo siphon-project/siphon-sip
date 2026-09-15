@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -178,6 +178,44 @@ pub(crate) fn server_config(
     })
 }
 
+/// Read one PEM certificate chain, end-entity certificate first.
+///
+/// Shared by [`load_certified_key`], which pairs the chain with its private key,
+/// and [`certificate_ip_addresses`], which reads only its names, so a missing,
+/// unparseable or empty file reports the same path-tagged error either way.
+fn load_certificate_chain(
+    certificate_path: &str,
+) -> io::Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateDer;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let certificate_file = File::open(certificate_path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("failed to open certificate file '{certificate_path}': {error}"),
+        )
+    })?;
+    let certificates: Vec<_> =
+        CertificateDer::pem_reader_iter(&mut BufReader::new(certificate_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse certificate PEM '{certificate_path}': {error}"),
+                )
+            })?;
+
+    if certificates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("certificate file '{certificate_path}' contains no certificates"),
+        ));
+    }
+    Ok(certificates)
+}
+
 /// Load one PEM certificate chain + private key into a rustls `CertifiedKey`.
 ///
 /// Shared by the default `tls.certificate`/`tls.private_key` pair and by every
@@ -188,32 +226,12 @@ fn load_certified_key(
     private_key_path: &str,
 ) -> io::Result<Arc<CertifiedKey>> {
     use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls_pki_types::PrivateKeyDer;
     use std::fs::File;
     use std::io::BufReader;
 
     // Load certificate chain
-    let cert_file = File::open(certificate_path).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("failed to open certificate file '{certificate_path}': {error}"),
-        )
-    })?;
-    let certificates: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to parse certificate PEM '{certificate_path}': {error}"),
-            )
-        })?;
-
-    if certificates.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("certificate file '{certificate_path}' contains no certificates"),
-        ));
-    }
+    let certificates = load_certificate_chain(certificate_path)?;
 
     // Load private key
     let key_file = File::open(private_key_path).map_err(|error| {
@@ -254,6 +272,106 @@ fn load_certified_key(
                 ),
             )
         })
+}
+
+/// The iPAddress subjectAltNames (RFC 5280 §4.2.1.6) of the end-entity
+/// certificate in `certificate_path`, in the order the certificate lists them.
+///
+/// These are the only names a peer that dials siphon by IP can validate it
+/// against. Such a peer sends no SNI (RFC 6066 §3 forbids a literal there), so
+/// it is served the default `tls.certificate` and never a `tls.certificates`
+/// entry, and certificate validation matches an IP reference identity against
+/// iPAddress entries only, never a dNSName or the subject Common Name.
+pub(crate) fn certificate_ip_addresses(certificate_path: &str) -> io::Result<Vec<IpAddr>> {
+    use x509_cert::der::Decode;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::SubjectAltName;
+
+    let chain = load_certificate_chain(certificate_path)?;
+    let end_entity = chain.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("certificate file '{certificate_path}' contains no certificates"),
+        )
+    })?;
+    let certificate = x509_cert::Certificate::from_der(end_entity.as_ref()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to decode certificate '{certificate_path}': {error}"),
+        )
+    })?;
+    let subject_alt_names = certificate
+        .tbs_certificate()
+        .get_extension::<SubjectAltName>()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to decode the subjectAltName extension of '{certificate_path}': {error}"
+                ),
+            )
+        })?;
+    let Some((_critical, SubjectAltName(names))) = subject_alt_names else {
+        return Ok(Vec::new());
+    };
+
+    Ok(names
+        .iter()
+        .filter_map(|name| match name {
+            // Four octets for IPv4, sixteen for IPv6, in network byte order. Any
+            // other length names no address a peer could have dialled.
+            GeneralName::IpAddress(octets) => {
+                let bytes = octets.as_bytes();
+                <[u8; 4]>::try_from(bytes)
+                    .map(IpAddr::from)
+                    .or_else(|_| <[u8; 16]>::try_from(bytes).map(IpAddr::from))
+                    .ok()
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Why a peer that dials siphon at an advertised IP literal cannot validate the
+/// certificate it is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdvertisedIpProblem {
+    /// The certificate carries no iPAddress subjectAltName equal to the IP.
+    NotInCertificate,
+    /// The certificate could not be read, so the check was not possible.
+    CertificateUnreadable(String),
+}
+
+/// Whether a listener that advertises `advertised_host` hands TLS peers an IP
+/// literal they cannot validate siphon's certificate against, and why.
+///
+/// A problem only on TLS and WSS, and only for an IPv4 or IPv6 literal (bare, or
+/// bracketed as a SIP header carries it) that `certificate_ip_addresses` does
+/// not contain. A certificate that could not be read counts as not containing
+/// it: a check that could not run must not read as one that passed. A DNS name
+/// is never a problem here, whatever the certificate holds.
+///
+/// Pure, so the rule is testable without a listener; the dispatcher's startup
+/// warning runs it for every host a TLS or WSS listener advertises.
+pub(crate) fn advertised_ip_problem(
+    transport: Transport,
+    advertised_host: &str,
+    certificate_ip_addresses: Result<&[IpAddr], &str>,
+) -> Option<(IpAddr, AdvertisedIpProblem)> {
+    if !matches!(transport, Transport::Tls | Transport::WebSocketSecure) {
+        return None;
+    }
+    let ip = crate::sip::uri::strip_ipv6_brackets(advertised_host)
+        .parse::<IpAddr>()
+        .ok()?;
+    match certificate_ip_addresses {
+        Ok(addresses) if addresses.contains(&ip) => None,
+        Ok(_) => Some((ip, AdvertisedIpProblem::NotInCertificate)),
+        Err(error) => Some((
+            ip,
+            AdvertisedIpProblem::CertificateUnreadable(error.to_string()),
+        )),
+    }
 }
 
 /// Picks the server certificate from the SNI server name in the ClientHello
@@ -1674,5 +1792,180 @@ mod tests {
             der_of(&default_cert_path),
             "an unmatched SNI must be served the default certificate"
         );
+    }
+
+    // --- Advertised IP literal vs the certificate's iPAddress SANs ---------
+
+    /// Write a self-signed certificate for `names` and read back its iPAddress
+    /// subjectAltNames the way startup does. rcgen writes an IP literal as an
+    /// iPAddress SAN and anything else as a dNSName.
+    fn ip_addresses_of_certificate_for(names: &[&str]) -> Vec<IpAddr> {
+        let directory = tempfile::tempdir().unwrap();
+        let (certificate_path, _private_key_path) = write_pair(&directory, "advertised", names);
+        certificate_ip_addresses(&certificate_path).expect("read the certificate SANs")
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn certificate_ip_addresses_reads_only_ip_subject_alt_names() {
+        assert_eq!(
+            ip_addresses_of_certificate_for(&["sip.example.com", "192.0.2.10", "2001:db8::10"]),
+            vec![ip("192.0.2.10"), ip("2001:db8::10")]
+        );
+        assert!(ip_addresses_of_certificate_for(&["sip.example.com"]).is_empty());
+    }
+
+    #[test]
+    fn certificate_ip_addresses_fails_without_a_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        let error = certificate_ip_addresses(empty.to_str().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("contains no certificates"),
+            "{error}"
+        );
+
+        let missing = directory.path().join("missing.pem");
+        let error = certificate_ip_addresses(missing.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("missing.pem"), "{error}");
+    }
+
+    #[test]
+    fn advertised_ipv4_literal_the_certificate_lacks_is_a_problem() {
+        let certificate = ip_addresses_of_certificate_for(&["sip.example.com"]);
+        assert_eq!(
+            advertised_ip_problem(Transport::Tls, "192.0.2.10", Ok(certificate.as_slice())),
+            Some((ip("192.0.2.10"), AdvertisedIpProblem::NotInCertificate))
+        );
+    }
+
+    #[test]
+    fn advertised_ipv6_literal_the_certificate_lacks_is_a_problem() {
+        let certificate = ip_addresses_of_certificate_for(&["sip.example.com"]);
+        // Bracketed, as the resolver formats it for a SIP header, and bare.
+        for host in ["[2001:db8::10]", "2001:db8::10"] {
+            assert_eq!(
+                advertised_ip_problem(Transport::Tls, host, Ok(certificate.as_slice())),
+                Some((ip("2001:db8::10"), AdvertisedIpProblem::NotInCertificate)),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_dns_name_is_never_a_problem() {
+        let certificate = ip_addresses_of_certificate_for(&["192.0.2.10"]);
+        assert_eq!(certificate, vec![ip("192.0.2.10")], "fixture");
+        assert_eq!(
+            advertised_ip_problem(
+                Transport::Tls,
+                "sip.example.com",
+                Ok(certificate.as_slice())
+            ),
+            None
+        );
+        // Not even when the certificate could not be read: a DNS name needs no
+        // iPAddress SAN.
+        assert_eq!(
+            advertised_ip_problem(Transport::Tls, "sip.example.com", Err("unreadable")),
+            None
+        );
+    }
+
+    #[test]
+    fn advertised_ip_carried_as_an_ip_subject_alt_name_is_not_a_problem() {
+        let certificate =
+            ip_addresses_of_certificate_for(&["sip.example.com", "192.0.2.10", "2001:db8::10"]);
+        // Guard: without it an unread certificate would pass this vacuously.
+        assert_eq!(certificate.len(), 2, "fixture: {certificate:?}");
+        for host in ["192.0.2.10", "[2001:db8::10]"] {
+            assert_eq!(
+                advertised_ip_problem(Transport::Tls, host, Ok(certificate.as_slice())),
+                None,
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_ip_not_matching_the_certificate_ip_subject_alt_name_is_a_problem() {
+        let certificate = ip_addresses_of_certificate_for(&["192.0.2.11", "2001:db8::11"]);
+        assert_eq!(certificate.len(), 2, "fixture: {certificate:?}");
+        assert_eq!(
+            advertised_ip_problem(Transport::Tls, "192.0.2.10", Ok(certificate.as_slice())),
+            Some((ip("192.0.2.10"), AdvertisedIpProblem::NotInCertificate))
+        );
+        assert_eq!(
+            advertised_ip_problem(Transport::Tls, "[2001:db8::10]", Ok(certificate.as_slice())),
+            Some((ip("2001:db8::10"), AdvertisedIpProblem::NotInCertificate))
+        );
+    }
+
+    #[test]
+    fn unreadable_certificate_is_a_problem_for_an_ip_literal() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.pem");
+        let error = certificate_ip_addresses(missing.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            advertised_ip_problem(Transport::Tls, "192.0.2.10", Err(&error)),
+            Some((
+                ip("192.0.2.10"),
+                AdvertisedIpProblem::CertificateUnreadable(error.clone())
+            ))
+        );
+    }
+
+    #[test]
+    fn wss_follows_the_same_rules_and_plaintext_transports_are_never_checked() {
+        let certificate = ip_addresses_of_certificate_for(&["sip.example.com", "192.0.2.10"]);
+        assert_eq!(certificate, vec![ip("192.0.2.10")], "fixture");
+        for transport in [Transport::Tls, Transport::WebSocketSecure] {
+            assert_eq!(
+                advertised_ip_problem(transport, "198.51.100.1", Ok(certificate.as_slice())),
+                Some((ip("198.51.100.1"), AdvertisedIpProblem::NotInCertificate)),
+                "{transport}"
+            );
+            assert_eq!(
+                advertised_ip_problem(transport, "192.0.2.10", Ok(certificate.as_slice())),
+                None,
+                "{transport}"
+            );
+            assert_eq!(
+                advertised_ip_problem(transport, "sip.example.com", Ok(certificate.as_slice())),
+                None,
+                "{transport}"
+            );
+            assert_eq!(
+                advertised_ip_problem(transport, "198.51.100.1", Err("unreadable")),
+                Some((
+                    ip("198.51.100.1"),
+                    AdvertisedIpProblem::CertificateUnreadable("unreadable".to_string())
+                )),
+                "{transport}"
+            );
+        }
+        for transport in [
+            Transport::Udp,
+            Transport::Tcp,
+            Transport::WebSocket,
+            Transport::Sctp,
+        ] {
+            assert_eq!(
+                advertised_ip_problem(transport, "198.51.100.1", Ok(certificate.as_slice())),
+                None,
+                "{transport}"
+            );
+            assert_eq!(
+                advertised_ip_problem(transport, "198.51.100.1", Err("unreadable")),
+                None,
+                "{transport}"
+            );
+        }
     }
 }
