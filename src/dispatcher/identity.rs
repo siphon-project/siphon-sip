@@ -44,8 +44,14 @@ pub(super) fn advertise_supported_methods(headers: &mut SipHeaders) {
 /// transferee, turning a REFER's `Replaces` into the INVITE it sends the
 /// target — is unconditional, and that is the half this tag unblocks.
 pub(super) fn advertise_supported_options(headers: &mut SipHeaders) {
-    advertise_option_tag(headers, "replaces");
+    for tag in UNCONDITIONAL_OPTION_TAGS {
+        advertise_option_tag(headers, tag);
+    }
 }
+
+/// Option tags siphon claims on every leg and every relayed response, whatever
+/// anyone offered: see [`advertise_supported_options`].
+const UNCONDITIONAL_OPTION_TAGS: &[&str] = &["replaces"];
 
 /// Option tags siphon implements itself but claims on one leg only when the
 /// party on the other leg offered them — the rule both have always followed.
@@ -59,6 +65,79 @@ pub(super) fn advertise_supported_options(headers: &mut SipHeaders) {
 /// itself (§9). When siphon runs the session timer, the B-leg builder adds
 /// `timer` whatever the caller offered.
 const OFFERED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
+
+/// Option tags for extensions siphon implements on the hop it terminates and
+/// never advertises across a B2BUA: `sec-agree`, the RFC 3329 security agreement
+/// behind 3GPP TS 33.203 IPsec, which a UE requires on every request it sends
+/// over its security association.
+const HOP_OPTION_TAGS: &[&str] = &["sec-agree"];
+
+/// Whether siphon implements the extension `tag` names itself, so a caller may
+/// `Require` it of a B2BUA call whatever the header policy: the tags it claims
+/// unconditionally, on the other party's offer, or on its own hop.
+fn implements_option_tag(tag: &str) -> bool {
+    UNCONDITIONAL_OPTION_TAGS
+        .iter()
+        .chain(OFFERED_OPTION_TAGS)
+        .chain(HOP_OPTION_TAGS)
+        .any(|implemented| implemented.eq_ignore_ascii_case(tag))
+}
+
+/// The option tags in `invite`'s `Require` that a B2BUA call routed under
+/// `policy` cannot honour, in the order the caller listed them, each once.
+///
+/// RFC 3261 §8.2.2.3: a UAS that does not understand a required extension
+/// refuses the request `420 Bad Extension`, listing it in `Unsupported`. siphon
+/// is the caller's UAS, so a tag passes only when either siphon honours it
+/// itself ([`implements_option_tag`]) or the callee can: the policy passes the
+/// extension end to end
+/// ([`ResolvedPolicy::passes_end_to_end`](crate::b2bua::header_policy::ResolvedPolicy::passes_end_to_end))
+/// and copies `Require` onto the B-leg, so the callee is actually told it is
+/// required. `invite` is the A-leg INVITE as the script left it: a script that
+/// rewrites or removes `Require` decides what the caller is held to.
+pub(super) fn unhonourable_required_tags(
+    invite: &SipHeaders,
+    policy: &crate::b2bua::header_policy::ResolvedPolicy,
+) -> Vec<String> {
+    let require_crosses =
+        policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
+    required_tags_not_honoured(invite, |tag| {
+        implements_option_tag(tag) || (require_crosses && policy.passes_end_to_end(tag))
+    })
+}
+
+/// The option tags in `invite`'s `Require` that siphon does not implement
+/// itself ([`implements_option_tag`]), in the caller's order, each once.
+///
+/// What a call cannot honour when siphon answers it itself: siphon is then the
+/// only UAS the caller has, so no header policy can hand the extension to a
+/// callee (RFC 3261 §8.2.2.3).
+pub(super) fn unimplemented_required_tags(invite: &SipHeaders) -> Vec<String> {
+    required_tags_not_honoured(invite, implements_option_tag)
+}
+
+/// The tags in every `Require` line of `invite` for which `honoured` is false,
+/// in order, a tag repeated in another case listed once in its first spelling.
+fn required_tags_not_honoured(invite: &SipHeaders, honoured: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut unhonourable: Vec<String> = Vec::new();
+    let required = invite
+        .get_all("Require")
+        .into_iter()
+        .flatten()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty());
+    for tag in required {
+        if !honoured(tag)
+            && !unhonourable
+                .iter()
+                .any(|listed| listed.eq_ignore_ascii_case(tag))
+        {
+            unhonourable.push(tag.to_string());
+        }
+    }
+    unhonourable
+}
 
 /// Narrow the far party's `Supported`, as the header policy left it, to the tags
 /// siphon may claim on this leg: [`OFFERED_OPTION_TAGS`] and the ones the policy

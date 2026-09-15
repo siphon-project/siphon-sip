@@ -94,6 +94,11 @@ pub fn control_handover(
                 info!(call_id = %call_id, %app, "B2BUA: answer-first handover — 200 OK sent, media anchored to voice_ai bridge");
             }
             Err(reason) => {
+                // Refused with a final response already (a 420 for an extension
+                // siphon does not implement), and the call is gone.
+                if state.call_actors.get_call(call_id).is_none() {
+                    return;
+                }
                 warn!(call_id = %call_id, %app, %reason, "handover(answer=True) failed — rejecting 503 (no fake 200)");
                 reject_and_drop(503, "AI Media Unavailable");
                 return;
@@ -199,6 +204,17 @@ pub fn answer_first_anchor(
     ws_uri: Option<&str>,
     state: &DispatcherState,
 ) -> Result<(), String> {
+    // Checked before anything is anchored: siphon answers this call itself, so
+    // a required extension it does not implement is refused `420` (RFC 3261
+    // §8.2.2.3) instead of opening media for a call that will not connect.
+    let unsupported = unimplemented_required_tags(&invite.headers);
+    if !unsupported.is_empty() {
+        let refused = unsupported.join(", ");
+        refuse_bad_extension(call_id, invite, unsupported, state);
+        return Err(format!(
+            "refused 420 Bad Extension: the caller requires {refused}, which siphon does not implement"
+        ));
+    }
     // Anchored early media already put this leg on the engine and sent its SDP
     // answer in an 18x. The 2xx repeats that answer (RFC 3264 §4: the exchange
     // completed when the 18x carried it) and must not anchor a second time — a
@@ -211,13 +227,14 @@ pub fn answer_first_anchor(
 
     // Send the 2xx with the synthesized answer SDP (marks the A-leg Answered +
     // stamps the CDR answer time).
-    if !b2bua_answer_call(
+    if !b2bua_answer_call_with_state(
         call_id,
         invite,
         code,
         reason,
         Some(answer_sdp.into_bytes()),
         Some("application/sdp"),
+        state,
     ) {
         return Err(format!(
             "failed to send {code} {reason} (call gone / dispatcher down)"

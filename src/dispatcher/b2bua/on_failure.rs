@@ -107,6 +107,10 @@ pub enum FailedCallEnd<'a> {
     /// the headers only that refusal carries: a 422 (Session Interval Too Small)
     /// and its `Min-SE` (RFC 4028 §9). Sent as it is.
     Refusal { response: SipMessage },
+    /// `420 Bad Extension` for a caller that `Require`s extensions the call
+    /// cannot honour, listed in `Unsupported` (RFC 3261 §8.2.2.3). Built from the
+    /// caller's INVITE like [`FailedCallEnd::Local`].
+    BadExtension { unsupported: Vec<String> },
 }
 
 impl FailedCallEnd<'_> {
@@ -119,6 +123,9 @@ impl FailedCallEnd<'_> {
                 status_code,
                 reason,
             } => return (*status_code, reason.clone()),
+            FailedCallEnd::BadExtension { .. } => {
+                return (420, "Bad Extension".to_string());
+            }
         };
         match &response.start_line {
             StartLine::Response(status_line) => {
@@ -413,15 +420,48 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
                 state,
             );
         }
+        FailedCallEnd::BadExtension { unsupported } => {
+            if let Some(mut response) = a_leg_final_response(
+                call_id,
+                &a_leg,
+                a_leg_invite.as_ref(),
+                status_code,
+                &reason,
+                state,
+            ) {
+                // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
+                response.headers.set("Unsupported", unsupported.join(", "));
+                send_message_from(
+                    response,
+                    a_leg.transport.transport,
+                    a_leg.transport.remote_addr,
+                    a_leg.transport.connection_id,
+                    a_leg_local_addr,
+                    state,
+                );
+            }
+        }
     }
 
+    finish_failed_call(call_id, &a_leg, status_code, &reason, state);
+}
+
+/// What ends every failed call once the caller has its final response: tell a
+/// control app why, release the media and the Ro reservation, remove the call.
+fn finish_failed_call(
+    call_id: &str,
+    a_leg: &crate::b2bua::actor::Leg,
+    status_code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) {
     // A controlled call learns which status ended it (no-op otherwise): "failed"
     // alone does not say whether nobody answered or the callee refused.
     control_notify_terminated_with_cause(
         &a_leg.dialog.call_id,
         "failed",
         Some(status_code),
-        Some(&reason),
+        Some(reason),
     );
     release_failed_call_media(&a_leg.dialog.call_id, state);
     // Release any Ro reservation `call.ro_authorize()` made before the call was
@@ -434,6 +474,58 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
     );
     state.call_actors.remove_call(call_id);
     state.call_event_receivers.remove(call_id);
+}
+
+/// Refuse the caller `420 Bad Extension`, listing `unsupported`, and end the
+/// call, on a path no `@b2bua.on_failure` decision applies to.
+///
+/// RFC 3261 §8.2.2.3. [`FailedCallEnd::BadExtension`] is the same refusal for
+/// a script's own routing action, where `@b2bua.on_failure` may still route
+/// again under another policy. These paths have no such decision to revisit:
+/// siphon answering the call itself is siphon as the only UAS, so no policy can
+/// help, and a control plane `dial` or `route` is a controller's decision, not
+/// the script's. Several of them also run while holding the A-leg INVITE's
+/// lock (`call.answer()` inside its handler), so the handler could not take it
+/// again. `invite` is that INVITE, read as the path holds it, never locked
+/// here.
+pub fn refuse_bad_extension(
+    call_id: &str,
+    invite: &SipMessage,
+    unsupported: Vec<String>,
+    state: &DispatcherState,
+) {
+    let Some((a_leg, a_leg_local_addr)) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| (call.a_leg.clone(), call.a_leg_local_addr))
+    else {
+        return;
+    };
+    info!(
+        call_id = %call_id,
+        unsupported = %unsupported.join(", "),
+        "B2BUA: the caller requires extensions this call cannot honour — refusing with 420"
+    );
+    cdr_finalize_b2bua_fail(state, call_id, 420);
+    let mut response = build_a_leg_final_response(
+        invite,
+        &a_leg.dialog.local_tag,
+        a_leg.stored_from.as_ref(),
+        a_leg.stored_to.as_ref(),
+        420,
+        "Bad Extension",
+        state.server_header.as_deref(),
+    );
+    response.headers.set("Unsupported", unsupported.join(", "));
+    send_message_from(
+        response,
+        a_leg.transport.transport,
+        a_leg.transport.remote_addr,
+        a_leg.transport.connection_id,
+        a_leg_local_addr,
+        state,
+    );
+    finish_failed_call(call_id, &a_leg, 420, "Bad Extension", state);
 }
 
 /// Release the media session a call that never connected still holds. No BYE

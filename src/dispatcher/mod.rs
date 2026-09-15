@@ -81,6 +81,8 @@ mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod bad_extension_tests;
+#[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
@@ -122,6 +124,8 @@ mod test_dispatcher;
 mod tests;
 #[cfg(test)]
 mod transfer_bye_tests;
+#[cfg(test)]
+mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
 

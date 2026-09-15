@@ -2762,6 +2762,52 @@ fn relayed_response_capabilities_mirror_the_b_leg_rule() {
 }
 
 #[test]
+fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
+    let mut invite = SipHeaders::new();
+    invite.add(
+        "Require",
+        "100rel, precondition, X-Lab-Extension".to_string(),
+    );
+    invite.add(
+        "Require",
+        "sec-agree, x-lab-extension, histinfo, TIMER".to_string(),
+    );
+    // Under the default preset precondition cannot cross (responses strip
+    // Supported/Require); histinfo can, and Require reaches the callee. The
+    // duplicate vendor tag is listed once, in the caller's spelling.
+    assert_eq!(
+        unhonourable_required_tags(&invite, &builtin_policy("transparent-b2bua@2026")),
+        vec!["precondition".to_string(), "X-Lab-Extension".to_string()]
+    );
+    // The trust boundary relays precondition but not History-Info.
+    assert_eq!(
+        unhonourable_required_tags(&invite, &builtin_policy("ims-trust-domain-boundary@2026")),
+        vec!["X-Lab-Extension".to_string(), "histinfo".to_string()]
+    );
+}
+
+#[test]
+fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
+    let mut invite = SipHeaders::new();
+    invite.set("Require", "precondition, replaces".to_string());
+    let mut no_require = builtin_policy("ims-intra-trust-domain@2026");
+    assert!(unhonourable_required_tags(&invite, &no_require).is_empty());
+    no_require.deltas_strip = vec!["Require".to_string()];
+    assert_eq!(
+        unhonourable_required_tags(&invite, &no_require),
+        vec!["precondition".to_string()]
+    );
+}
+
+#[test]
+fn unhonourable_required_tags_is_empty_without_require() {
+    let invite = SipHeaders::new();
+    assert!(
+        unhonourable_required_tags(&invite, &builtin_policy("transparent-b2bua@2026")).is_empty()
+    );
+}
+
+#[test]
 fn relayed_response_capabilities_add_siphons_own_to_an_empty_response() {
     // The default preset stripped the callee's Supported and Allow already.
     let mut headers = SipHeaders::new();

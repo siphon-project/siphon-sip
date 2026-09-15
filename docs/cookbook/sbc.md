@@ -236,6 +236,38 @@ call.set_header("Supported", call.get_header("Supported"))
 `replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
 `Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
 
+### A caller's `Require`
+
+The same rule decides whether SIPhon can take a call whose INVITE *requires* an
+extension. SIPhon is the caller's UAS, so a `Require` the call cannot honour is
+refused `420 Bad Extension` with the tags listed in `Unsupported` (RFC 3261 §8.2.2.3),
+before any B-leg goes out. A tag is honoured when SIPhon implements it (`100rel`,
+`timer`, `replaces`, `sec-agree`), or when the policy passes it end to end per the
+table above *and* copies `Require` to the callee. `Require: precondition` under
+`transparent-b2bua@2026` is refused; under `ims-intra-trust-domain@2026` it is dialled.
+
+The check runs when `call.dial()` / `fork()` / `route()` is carried out, since that
+is when the policy is known. The 420 then goes through `@b2bua.on_failure` like any
+call that could not be connected, so the handler can route again under a relaying
+policy:
+
+```python
+@b2bua.on_failure
+def on_failure(call, code, reason):
+    if code == 420:
+        call.dial(str(call.ruri), header_policy="ims-intra-trust-domain@2026")
+```
+
+The paths that answer the caller or dial for it without a script's routing action
+refuse the same 420 and end the call without `@b2bua.on_failure`. When SIPhon answers
+the call itself (`call.answer()`, the control plane's `answer`,
+`call.handover(answer=True)`), it is the only UAS the caller has, so any tag it does
+not implement is refused whatever the policy, before an answer-first handover anchors
+media. The control plane's `dial` and `route` are checked under the call's policy
+when they dial; a refused `dial` reports `DialFailed` with code `420`. An INVITE with
+`Replaces` is refused on its own transaction before the call it names is touched.
+`call.progress()` is not checked, since a provisional answers nothing.
+
 ## Add media anchoring
 
 `call.media.anchor(engine="rtpengine")` hides the media path too. For SRTP↔RTP
