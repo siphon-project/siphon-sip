@@ -6,14 +6,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-### Fixed
-
-- **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
-  the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the
-  profile offered the plain RTP core `RTP/SAVP` and answered the SRTP UE with `RTP/AVP`, so neither
-  side got the transport it speaks. The offer half now presents `RTP/AVP` and the answer half
-  `RTP/SAVP`, mirroring `rtp_to_srtp`. ICE removal, origin replacement and `direction` are unchanged.
-
 ## [1.9.0] — 2026-09-15
 
 ### Added
@@ -436,6 +428,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   for `wss_to_rtp`). The answer half presents what the UE speaks: `RTP/AVPF` with ICE for
   `ws_to_rtp`, and `UDP/TLS/RTP/SAVPF` with ICE and required RTCP multiplexing for `wss_to_rtp`. The
   shape matches the DTLS profiles in the WhatsApp calling example.
+
+- **The built-in `srtp_to_rtp` profile had its halves the wrong way round.** The offer half shapes
+  the SDP offered to the answerer and the answer half the SDP the offerer is answered with, yet the
+  profile offered the plain RTP core `RTP/SAVP` and answered the SRTP UE with `RTP/AVP`, so neither
+  side got the transport it speaks. The offer half now presents `RTP/AVP` and the answer half
+  `RTP/SAVP`, mirroring `rtp_to_srtp`. ICE removal, origin replacement and `direction` are unchanged.
+  A deployment that relied on the old halves, SRTP toward the callee and plain RTP toward the
+  caller, was getting `rtp_to_srtp`'s transports with the interfaces the other way round: use
+  `rtp_to_srtp`, or a custom profile if its interfaces run external to internal.
 
 - **The local Milenage 401 carries `ck=`/`ik=`, so a P-CSCF in front of
   `auth.require_aka_digest()` can set up IPsec.** Only the HSS path
