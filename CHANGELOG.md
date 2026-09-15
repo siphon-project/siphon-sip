@@ -256,6 +256,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   in the CDR's `lcr_attempts` and in `@b2bua.on_route_failure`. A plain
   `call.dial()` or a parallel fork that rings out is unchanged.
 
+  A sequence that goes on to its next carriers and finds that none of them can
+  be dialled (no gateway group member, next-hop or R-URI to route by, or an
+  INVITE that could not be sent) fails `503` as well, whatever the carrier
+  before them did. That covers a carrier that sent a `180`, moved on anyway
+  (`reroute_after_progress`) and rang out, which used to fail the call `408`,
+  and a carrier that failed with a reroute cause, which used to fail it with
+  the §16.7 best of the attempts: a relayed `503` went upstream as `500`, and a
+  carrier's own `408` outranked the undialable carriers. Each undialable carrier
+  was already its own `503` attempt (`dialed: false`) and fires
+  `@b2bua.on_route_failure` in sequence order, and a sequential control-plane
+  `dial` now reports that `503` in `DialFailed` too. A carrier kept by progress
+  never moves on, so its ring-out still fails `408` without reaching the
+  carriers behind it, and a sequence that ends on its last dialled carrier's own
+  outcome is unchanged.
+
 - **Crate embedders: `registrar::Contact`, `registrar::backend::StoredContact`,
   `ipsec::SecurityAssociationPair` and `script::api::ipsec::PySecurityOffer`
   each gained a public field** (`auth_user`, `auth_user`, `impi`, `impi`).

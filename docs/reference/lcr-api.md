@@ -104,7 +104,11 @@ Top-level:
   code is a reroute cause (per-route `reroute_causes` > per-gateway
   `gateway.groups[].reroute_causes` > global `lcr.reroute_causes`, default
   `[408, 500, 502, 503, 504]`). A definitive response (486, 603) is forwarded to
-  the caller.
+  the caller. When the sequence moves on and none of the carriers left can be
+  dialled (no healthy gateway group member, next-hop or `ruri`, or an INVITE
+  that could not be sent), each is recorded as its own `503` attempt with
+  `dialed: false`, and the call fails `503` whatever the carrier before them
+  sent, a ring-out after progress included.
 - **Ring timeout and progress**: `timeout_secs` bounds how long siphon waits
   for a carrier to show progress, not how long it waits for the answer.
   Progress is any provisional from 101 to 199 from the carrier in flight. A

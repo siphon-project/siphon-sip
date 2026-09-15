@@ -107,6 +107,13 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
   own that is not turned into `500`. If it had, the callee was reached and did
   not answer, and the caller gets `408`. `@b2bua.on_failure` gets the same code.
   The attempt itself is recorded as `408` either way.
+- When the sequence moves on and **none of the carriers left can be dialled**,
+  it ends on them: the caller and `@b2bua.on_failure` get siphon's own `503`,
+  whatever the carrier before them did. A carrier with `reroute_after_progress`
+  that rang and then rang out gives `503` here, not `408`, and a carrier's `503`
+  is not turned into `500`. Each of those carriers is its own `503` attempt,
+  with `dialed: False`. A sequential control-plane `dial` reports the same code
+  in `DialFailed`.
 - On answer, `call.active_route` is the carrier that won.
 - `call.route_attempts` lists the carriers it **burned** to get there — one
   entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`, `dialed`),

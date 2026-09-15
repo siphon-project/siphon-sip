@@ -985,7 +985,9 @@ class Call:
                 ``reroute_after_progress``).  ``0`` leaves that ring unbounded.
                 A sequence that ends on the ring timeout of a carrier that never
                 sent a 101-199 fails with 503 instead: no carrier reached the
-                callee.
+                callee.  So does one that moves on and finds none of the
+                carriers left can be dialled, whatever the carrier before them
+                did.
             max_duration: Cap on how long the call may stay answered, in
                 seconds — same semantics as :meth:`dial`.  Per call, not per
                 attempt: ``timeout`` bounds each carrier's ring, but the

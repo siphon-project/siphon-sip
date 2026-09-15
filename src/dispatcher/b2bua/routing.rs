@@ -260,10 +260,28 @@ impl RouteAdvance {
             burned: Vec::new(),
         }
     }
+
+    /// Whether this pass ended the sequence on carriers it could not dial: it
+    /// burned at least one and dialled none, so every carrier that was left was
+    /// undialable.
+    ///
+    /// The call then fails [`LCR_UNDIALED_STATUS`], whatever the carrier before
+    /// them did. That carrier's own outcome is already on the attempt list, and
+    /// the sequence did not end on it: it went on, and ran out on carriers
+    /// siphon could not reach. So a carrier that rang and moved on anyway
+    /// (`reroute_after_progress`) does not make it a `408`, and a carrier's
+    /// relayed `503` does not become the `500` §16.7 step 6 sends upstream.
+    pub fn ended_on_undialable(&self) -> bool {
+        !self.dialed && !self.burned.is_empty()
+    }
 }
 
-/// Status recorded against a carrier the sequence burned without dialling it.
+/// Status recorded against a carrier the sequence burned without dialling it,
+/// and the status a call fails with when its sequence ends on such carriers
+/// ([`RouteAdvance::ended_on_undialable`]).
 ///
+/// siphon has no more specific code for either kind of undialable carrier (a
+/// route with nothing to route it by, or an INVITE that could not be sent), and
 /// `503` is what the A-leg already receives when no carrier at all is routable
 /// (`503 No Route`), so an exhausted sequence hands the caller the same code
 /// however it got there. The attempt's `dialed: false` is what says the carrier

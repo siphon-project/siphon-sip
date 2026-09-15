@@ -164,6 +164,11 @@ pub fn check_pending_inbound_refer_timeouts(state: &DispatcherState) {
 /// `reroute_after_progress`, that ends on a phone that rang still reached a
 /// callee who did not answer. Any other ring timeout, a dial's or a parallel
 /// fork's, stays 408.
+///
+/// This is the status of a sequence that ends on the carrier that rang out. One
+/// that goes on from it and finds only carriers it cannot dial ends on those
+/// instead, and fails 503 even after a carrier that rang
+/// ([`RouteAdvance::ended_on_undialable`]).
 pub fn ring_timeout_failure_status(route_sequence: bool, carrier_progressed: bool) -> u16 {
     if route_sequence && !carrier_progressed {
         503
@@ -252,7 +257,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // flight sent a 101-199 is read here, before anything below can advance the
     // sequence, which takes the next carrier and clears it.
     let route_sequence = state.call_actors.is_route_sequence(call_id);
-    let failure_status = ring_timeout_failure_status(
+    let mut failure_status = ring_timeout_failure_status(
         route_sequence,
         state.call_actors.route_attempt_progressed(call_id),
     );
@@ -317,7 +322,12 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             info!(call_id = %call_id, "LCR: advanced to next carrier after ring-timeout");
             return;
         }
-        // else fall through to the normal 408 teardown (queue exhausted).
+        // The queue is exhausted. When the carriers left could not be dialled,
+        // the sequence ended on them rather than on this carrier's ring-out, and
+        // the call fails 503 even if this carrier rang.
+        if advanced.ended_on_undialable() {
+            failure_status = LCR_UNDIALED_STATUS;
+        }
     }
 
     // A controller-issued `dial` that nobody answered in time. The rung legs

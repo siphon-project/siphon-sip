@@ -158,6 +158,9 @@ impl Sequence {
             let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
             b2bua_advance_route(&sequence.call_id, &guard, state)
         };
+        // As the INVITE path does once its guard is released: a carrier burned
+        // on the way to the first dial is reported like any other.
+        b2bua_dispatch_burned_routes(&sequence.call_id, &advance.burned, state);
         assert!(advance.dialed, "the first carrier was not dialled");
         sequence.redialled();
         sequence

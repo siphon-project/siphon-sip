@@ -415,9 +415,8 @@ async fn a_carrier_that_rings_out_and_is_failed_over_is_recorded_once() {
 }
 
 /// A ring timeout whose advance finds no routable carrier left records the
-/// carrier that rang out once, then each carrier burned once, and then fails:
-/// 503, since the carrier that rang out showed no progress and no other could
-/// be dialled.
+/// carrier that rang out once, then each carrier burned once, and then fails
+/// 503: every carrier left could not be dialled.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_carrier_that_rings_out_onto_unroutable_carriers_is_recorded_once() {
     let sequence = Sequence::start_with_script(
@@ -555,4 +554,304 @@ async fn a_hunt_whose_last_target_rang_fails_the_call_408() {
         events(&sequence),
         "route:phone-a:408;route:phone-b:408;failure:408:phone-a=408,phone-b=408;"
     );
+}
+
+/// A carrier siphon cannot put an INVITE on the wire for: a next-hop that is
+/// neither a socket address nor a SIP URI, so it fails before any DNS lookup.
+fn unsendable(carrier_id: &str) -> crate::lcr::Route {
+    crate::lcr::Route {
+        carrier_id: carrier_id.to_string(),
+        next_hop: Some("not a uri".to_string()),
+        timeout_secs: Some(2),
+        ..Default::default()
+    }
+}
+
+/// A carrier with nothing to route it by: no gateway group, next-hop or R-URI.
+fn unroutable(carrier_id: &str) -> crate::lcr::Route {
+    crate::lcr::Route {
+        carrier_id: carrier_id.to_string(),
+        ..Default::default()
+    }
+}
+
+/// A silent carrier rings out and the only carrier left cannot be sent to. The
+/// carrier that rang out is one 408 attempt, the one that could not be dialled
+/// is one 503 attempt, `@b2bua.on_route_failure` fires for each in sequence
+/// order, and the caller and `@b2bua.on_failure` get 503, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_carrier_ringing_out_onto_an_undialable_carrier_fails_503() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            unsendable("carrier-b"),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    invite_to(sequence.wire(), FIRST_CARRIER);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("503 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;route:carrier-b:503;failure:503:carrier-a=408,carrier-b=503;"
+    );
+    assert!(sequence.call_is_gone());
+}
+
+/// A carrier that rang and moves on anyway (`reroute_after_progress`) rings out
+/// onto carriers none of which can be dialled. It reached a callee, but the
+/// sequence ended on the carriers it could not reach, so the call fails 503 and
+/// not the 408 a ringing carrier's own ring-out would give.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_that_rang_and_moves_on_onto_undialable_carriers_fails_503() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            crate::lcr::Route {
+                reroute_after_progress: true,
+                ..carrier("carrier-a", FIRST_CARRIER, 2)
+            },
+            unroutable("carrier-b"),
+            unsendable("carrier-c"),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 180, "Ringing");
+    assert_eq!(summaries(&sequence.wire()), [format!("180 to {CALLER}")]);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("503 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        concat!(
+            "route:carrier-a:408;route:carrier-b:503;route:carrier-c:503;",
+            "failure:503:carrier-a=408,carrier-b=503,carrier-c=503;"
+        )
+    );
+    assert!(sequence.call_is_gone());
+}
+
+/// A carrier fails with a reroute cause and every carrier left is undialable.
+/// The §16.7 best of `[503, 503]` would reach the caller as a 500; the sequence
+/// ended on carriers siphon could not reach, so it is siphon's own 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_failing_onto_undialable_carriers_fails_503() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            unroutable("carrier-b"),
+            unsendable("carrier-c"),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("ACK to {FIRST_CARRIER}"),
+            format!("503 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        concat!(
+            "route:carrier-a:503;route:carrier-b:503;route:carrier-c:503;",
+            "failure:503:carrier-a=503,carrier-b=503,carrier-c=503;"
+        )
+    );
+    assert!(sequence.call_is_gone());
+}
+
+/// The same after the carrier rang: a 183 and then a 408 of its own, which
+/// would otherwise outrank the undialable carriers' 503s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_that_rang_and_failed_onto_an_undialable_carrier_fails_503() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            unsendable("carrier-b"),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 183, "Session Progress");
+    assert_eq!(summaries(&sequence.wire()), [format!("183 to {CALLER}")]);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 408, "Request Timeout");
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("ACK to {FIRST_CARRIER}"),
+            format!("503 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;route:carrier-b:503;failure:503:carrier-a=408,carrier-b=503;"
+    );
+}
+
+/// Unchanged: a carrier kept by progress never advances, so its ring-out fails
+/// 408 and the undialable carrier behind it is never reached or recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_kept_by_progress_rings_out_without_reaching_undialable_carriers() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            carrier("carrier-a", FIRST_CARRIER, 2),
+            unroutable("carrier-b"),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 183, "Session Progress");
+    assert_eq!(summaries(&sequence.wire()), [format!("183 to {CALLER}")]);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(summaries(&sequence.wire()), Vec::<String>::new());
+
+    sequence.ring_for(Duration::from_secs(5));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("CANCEL to {FIRST_CARRIER}"),
+            format!("408 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:408;failure:408:carrier-a=408;"
+    );
+}
+
+/// Unchanged: a carrier that could not be dialled before the last dialled one
+/// does not end the sequence. The last dialled carrier's own failure does, and
+/// the caller gets the §16.7 best of the attempts, a 503 going upstream as 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sequence_ending_on_its_last_dialled_carrier_keeps_the_best_failure() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            unroutable("carrier-a"),
+            carrier("carrier-b", SECOND_CARRIER, 2),
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    let second = invite_to(sequence.wire(), SECOND_CARRIER);
+    sequence.carrier_answers(SECOND_CARRIER, &second, 503, "Service Unavailable");
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [
+            format!("ACK to {SECOND_CARRIER}"),
+            format!("500 to {CALLER}")
+        ]
+    );
+    assert_eq!(
+        events(&sequence),
+        "route:carrier-a:503;route:carrier-b:503;failure:500:carrier-a=503,carrier-b=503;"
+    );
+}
+
+/// Hand the call's outcome to a controller, as a sequential control-plane
+/// `dial` does, whose targets all move on after progress.
+fn owned_by_controller(sequence: &Sequence) {
+    sequence
+        .dispatcher
+        .state
+        .call_actors
+        .set_control_dial(&sequence.call_id, true);
+}
+
+/// A sequential control-plane `dial` whose phone rang and rang out onto targets
+/// it cannot dial reports the failure to its controller, the code chosen by the
+/// same rule as a route sequence: the caller is left unanswered and parked,
+/// `@b2bua.on_failure` does not run, and both targets are on the attempt list.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_controller_dial_ringing_out_onto_undialable_targets_leaves_the_caller_parked() {
+    let hunted = |carrier_id: &str, address: &str| crate::lcr::Route {
+        reroute_after_progress: true,
+        ..carrier(carrier_id, address, 2)
+    };
+    let sequence = Sequence::start_with_script(
+        vec![
+            hunted("phone-a", FIRST_CARRIER),
+            crate::lcr::Route {
+                reroute_after_progress: true,
+                ..unsendable("phone-b")
+            },
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    owned_by_controller(&sequence);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 180, "Ringing");
+    assert_eq!(summaries(&sequence.wire()), [format!("180 to {CALLER}")]);
+
+    sequence.ring_for(Duration::from_secs(2));
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [format!("CANCEL to {FIRST_CARRIER}")],
+        "nothing goes to the caller"
+    );
+    assert_eq!(events(&sequence), "route:phone-a:408;route:phone-b:503;");
+    assert_eq!(attempts(&sequence), ["phone-a=408", "phone-b=503"]);
+    assert!(!sequence.call_is_gone());
+    assert!(!sequence
+        .dispatcher
+        .state
+        .call_actors
+        .is_control_dial(&sequence.call_id));
+}
+
+/// The same for a target that fails with a reroute cause onto targets that
+/// cannot be dialled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_controller_dial_failing_onto_undialable_targets_leaves_the_caller_parked() {
+    let sequence = Sequence::start_with_script(
+        vec![
+            crate::lcr::Route {
+                reroute_after_progress: true,
+                ..carrier("phone-a", FIRST_CARRIER, 2)
+            },
+            crate::lcr::Route {
+                reroute_after_progress: true,
+                ..unroutable("phone-b")
+            },
+        ],
+        5,
+        RECORD_EVENTS,
+    );
+    owned_by_controller(&sequence);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [format!("ACK to {FIRST_CARRIER}")],
+        "nothing goes to the caller"
+    );
+    assert_eq!(events(&sequence), "route:phone-a:503;route:phone-b:503;");
+    assert!(!sequence.call_is_gone());
+    assert!(!sequence
+        .dispatcher
+        .state
+        .call_actors
+        .is_control_dial(&sequence.call_id));
 }
