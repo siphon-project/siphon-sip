@@ -1541,6 +1541,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an informational field naming what the pair is pinned to, and
   `examples/ims_pcscf.py` drops the `proto_param` it used to concatenate.
 
+- **`hmac-sha-256-128` is documented as a siphon extension, not a 3GPP
+  transform.** The transform is HMAC-SHA-256-128 per RFC 4868, but its 256-bit
+  key comes from siphon's own expansion, `HMAC-SHA-256(IK,
+  "ipsec-int-sha256-128")`. No 3GPP release checked here lists
+  `hmac-sha-256-128` in Annex H, whose own key expansion lives in Annex I, and
+  the label is arbitrary, so two implementations each inventing one would not
+  interoperate. The transform and its wire format are unchanged. The docs also
+  note that Rel-13 Annex H drops `hmac-md5-96` and adds `aes-gmac` / `aes-gcm`,
+  which siphon does not implement.
+
 ### Security
 
 - **rustls moves to 0.23.45 for RUSTSEC-2026-0285.** rustls accepted TLS 1.3

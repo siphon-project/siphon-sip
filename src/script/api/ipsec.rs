@@ -37,11 +37,8 @@
 //! 7. On de-REGISTER: ``pending.cleanup()`` (or auto-cleanup via the
 //!    dispatcher de-register hook).
 //!
-//! What's intentionally *not* in this module today (Phase 2/3 deferrals):
+//! What's intentionally *not* in this module today (Phase 3 deferrals):
 //!
-//! * HMAC-SHA-256 / AES-CBC transforms.
-//! * 3GPP TS 33.203 Annex H key derivation (we use raw CK/IK with
-//!   zero-padding, matching the existing ``IpsecManager`` behaviour).
 //! * Replacement of ``ip xfrm`` shell-out with rtnetlink.
 //! * Real ``request.is_ipsec_protected`` / ``request.matched_sa`` — these
 //!   getters are stubbed (always ``False``/``None``) until the transport
@@ -155,12 +152,14 @@ impl PySecurityOffer {
 
 /// Operator policy choice for which IPsec transform to install.
 ///
-/// Phase 1 shipped the two NULL-encryption transforms we already had
-/// kernel ``xfrm`` algorithm names for.  Phase 2 adds:
-///
-/// * HMAC-SHA-256-128 integrity (RFC 4868) — required for newer IMS
-///   profiles, with 256-bit keys derived via 3GPP TS 33.203 Annex H.
-/// * AES-CBC-128 encryption variants for confidentiality.
+/// * HMAC-SHA-1-96 and HMAC-MD5-96, with NULL or AES-CBC-128 encryption,
+///   are the 3GPP TS 33.203 Annex H transforms.  Rel-13 Annex H drops
+///   ``hmac-md5-96`` and adds ``aes-gmac`` / ``aes-gcm``, which siphon
+///   does not implement.
+/// * HMAC-SHA-256-128 (RFC 4868) is a siphon extension: no 3GPP release
+///   checked here lists ``hmac-sha-256-128`` in Annex H, and its 256-bit
+///   key comes from siphon's own expansion, so it interoperates only
+///   siphon-to-siphon.
 ///
 /// All transforms install identical xfrm policies; only the algorithm
 /// IDs and key material change.
@@ -235,6 +234,9 @@ impl PyTransform {
     /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``alg``
     /// parameter, RFC 3329 Appendix A / 3GPP TS 33.203 Annex H), e.g.
     /// ``"hmac-sha-1-96"``.
+    ///
+    /// ``"hmac-sha-256-128"`` is the exception: that name is siphon's own,
+    /// not one Annex H defines.
     ///
     /// Lets a script advertise its transform policy as a capability list
     /// without first allocating an SA — :class:`SecurityServerParams` is
@@ -1009,10 +1011,11 @@ impl PyIpsec {
             let aalg = transform.aalg();
             let ealg = transform.ealg();
 
-            // 3GPP TS 33.203 Annex H key derivation — produces a key
-            // matching the algorithm's required length.  Falls back to
-            // raw IK on derivation failure (which only happens with a
-            // non-128-bit IK, never in practice for IMS-AKA).
+            // Integrity key sized for the transform: the IK directly for
+            // the Annex H transforms, siphon's own expansion for
+            // HMAC-SHA-256-128.  Falls back to raw IK on derivation
+            // failure (which only happens with a non-128-bit IK, never in
+            // practice for IMS-AKA).
             let integrity_bytes = crate::ipsec::IpsecManager::derive_integrity_key(aalg, &keys.ik)
                 .unwrap_or_else(|| keys.ik.to_vec());
             let integrity_key = crate::ipsec::bytes_to_hex(&integrity_bytes);
@@ -1490,7 +1493,8 @@ mod tests {
 
     /// Every transform variant with its ``alg`` / ``ealg`` wire spelling
     /// (the ``ipsec-3gpp`` parameters of RFC 3329 Appendix A and 3GPP
-    /// TS 33.203 Annex H).  One
+    /// TS 33.203 Annex H, except ``hmac-sha-256-128``, which is siphon's
+    /// own name).  One
     /// table shared by the three tests below, so a newly added variant
     /// cannot be pinned in one of them and forgotten in the others.
     const RFC3329_NAMES: [(PyTransform, &str, &str); 6] = [

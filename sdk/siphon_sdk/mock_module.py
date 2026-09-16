@@ -5449,7 +5449,8 @@ class MockRegistration:
             ue_port_c: UE protected client port (must also be a listen.udp port).
             ue_port_s: UE protected server port (must also be a listen.udp port).
             ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
-                "hmac-md5-96", or "hmac-sha-256-128".
+                "hmac-md5-96", or "hmac-sha-256-128" (a siphon extension, not
+                a 3GPP Annex H transform).
             ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
 
         Raises:
@@ -8572,7 +8573,13 @@ class MockSecurityOffer:
 
 
 class MockTransform:
-    """Mock :class:`Transform` enum — operator policy choice."""
+    """Mock :class:`Transform` enum — operator policy choice.
+
+    ``hmac-sha-1-96`` and ``hmac-md5-96`` are the 3GPP TS 33.203 Annex H
+    transforms.  ``hmac-sha-256-128`` is a siphon extension: the transform is
+    RFC 4868, but its 256-bit key comes from siphon's own expansion, so it
+    interoperates only siphon-to-siphon.
+    """
 
     def __init__(self, name: str, alg: str, ealg: str = "null") -> None:
         self._name = name

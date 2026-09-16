@@ -87,8 +87,8 @@ pub fn global_manager() -> Option<Arc<IpsecManager>> {
 // ---------------------------------------------------------------------------
 
 /// HMAC-SHA-256 (RFC 2104) — single-shot helper.  Used by
-/// `derive_integrity_key` for 3GPP TS 33.203 Annex H key derivation.  No
-/// extra crate dependency: SHA-256 is already available via `sha2`.
+/// `derive_integrity_key` for siphon's own 256-bit key expansion, not a 3GPP
+/// construction.  No extra crate dependency: SHA-256 comes from `sha2`.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
     const BLOCK_SIZE: usize = 64;
     const OPAD: u8 = 0x5c;
@@ -356,11 +356,14 @@ impl std::fmt::Display for EncryptionAlgorithm {
 /// Integrity algorithm for IPsec SA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityAlgorithm {
-    /// HMAC-MD5-96 (RFC 2403).
+    /// HMAC-MD5-96 (RFC 2403).  A 3GPP TS 33.203 Annex H transform through
+    /// Rel-12; Rel-13 drops it and adds `aes-gmac` / `aes-gcm`, which siphon
+    /// does not implement.
     HmacMd5,
     /// HMAC-SHA-1-96 (RFC 2404) — most common in IMS deployments today.
     HmacSha1,
-    /// HMAC-SHA-256-128 (RFC 4868) — required for newer IMS profiles.
+    /// HMAC-SHA-256-128 (RFC 4868).  A siphon extension, with a 256-bit key
+    /// from siphon's own expansion (see `derive_integrity_key`).
     HmacSha256,
 }
 
@@ -382,8 +385,8 @@ impl IntegrityAlgorithm {
     ///
     /// Note: SHA-1 uses a 160-bit (20-byte) key per RFC 4868; the IMS
     /// IK is 128-bit, so the legacy zero-padding approach in
-    /// `create_sa_pair` extends it to 20 bytes.  SHA-256 uses a full
-    /// 256-bit (32-byte) key derived per 3GPP TS 33.203 Annex H.
+    /// `create_sa_pair` extends it to 20 bytes.  SHA-256 uses a 256-bit
+    /// (32-byte) key from siphon's own expansion, not a 3GPP one.
     pub fn key_length(&self) -> usize {
         match self {
             Self::HmacMd5 => 16,
@@ -2048,17 +2051,20 @@ impl IpsecManager {
         Self::run_ip_command(&args).await
     }
 
-    /// 3GPP TS 33.203 Annex H IPsec key derivation.
+    /// The IPsec integrity key for `aalg`, from the 128-bit IMS IK.
     ///
-    /// For algorithms requiring keys longer than the 128-bit IK (HMAC-
-    /// SHA-256-128 with a 256-bit key), Annex H specifies derivation via
-    /// HMAC-SHA-256(IK, label).  For algorithms that fit inside the
-    /// 128-bit IK (HMAC-MD5, HMAC-SHA-1 with zero-pad), the IK is used
-    /// directly.
+    /// HMAC-MD5-96 and HMAC-SHA-1-96 use the IK directly (SHA-1 zero-padded to
+    /// its 160-bit key length).  Those are the 3GPP TS 33.203 Annex H
+    /// transforms, whose key expansion is Annex I, not Annex H.
     ///
-    /// `ik` must be 16 bytes (128-bit IK from Milenage).  Returns the
-    /// derived integrity key as raw bytes.  Returns `None` if the
-    /// requested length cannot be derived.
+    /// HMAC-SHA-256-128 is a siphon extension: the transform is RFC 4868, but
+    /// no 3GPP release checked here lists it in Annex H, so nothing specifies
+    /// stretching the IK to 256 bits.  siphon uses its own
+    /// `HMAC-SHA-256(IK, "ipsec-int-sha256-128")`, an arbitrary label, so it
+    /// interoperates only siphon-to-siphon.
+    ///
+    /// `ik` must be 16 bytes (128-bit IK from Milenage); returns the derived
+    /// key as raw bytes, or `None` if it cannot be derived.
     pub fn derive_integrity_key(aalg: IntegrityAlgorithm, ik: &[u8]) -> Option<Vec<u8>> {
         if ik.len() != 16 {
             return None;
@@ -2073,10 +2079,8 @@ impl IpsecManager {
                 Some(key)
             }
             IntegrityAlgorithm::HmacSha256 => {
-                // 256-bit key — derived via HMAC-SHA-256(IK, "ipsec-int")
-                // per 3GPP TS 33.203 Annex H.  This pattern follows the
-                // Annex H "P-key derivation" template using the algorithm
-                // name as the FC label.
+                // 256-bit key from siphon's own expansion, not a 3GPP
+                // construction.  See the note on this function.
                 Some(hmac_sha256(ik, b"ipsec-int-sha256-128"))
             }
         }
