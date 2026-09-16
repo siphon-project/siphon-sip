@@ -41,6 +41,7 @@ use crate::config::TlsServerConfig;
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_stream, spawn_outbound_distributor, PrefixedStream,
     StreamContext, StreamProtocol,
@@ -81,6 +82,11 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these senders.
+    // One read serves both halves: the header precedes the SIP start-line and
+    // the WebSocket GET alike.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     let secure = tls_config.is_some();
     let (sip_transport, websocket_transport) = if secure {
@@ -128,7 +134,7 @@ pub async fn listen(
 
     tokio::spawn(async move {
         loop {
-            let (tcp_stream, remote_addr) = match listener.accept().await {
+            let (mut tcp_stream, remote_addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     tracing::error!(
@@ -140,6 +146,18 @@ pub async fn listen(
             if !acl.is_allowed(remote_addr.ip()) {
                 debug!("{sip_transport}+{websocket_transport} mux rejected {remote_addr} by ACL");
                 continue;
+            }
+            // A listener behind a front talks to the front and nobody else.
+            // Refused before the spawn; not a ban signal, since the likeliest
+            // cause is a second front never added to the list.
+            if let Some(allowlist) = &proxy_protocol {
+                if !allowlist.allows(remote_addr.ip()) {
+                    warn!(
+                        "{sip_transport}+{websocket_transport} mux refusing {remote_addr} on the \
+                         proxy_protocol listener {bound}: not in proxy_protocol.from"
+                    );
+                    continue;
+                }
             }
             // See the TLS listener for why this is taken here, before the spawn,
             // and dropped silently rather than banned.
@@ -165,8 +183,31 @@ pub async fn listen(
             let stream_connections = stream_connections.clone();
             let crlf_pong_tracker = crlf_pong_tracker.clone();
             let close_tx = close_tx.clone();
+            let proxy_protocol = proxy_protocol.clone();
 
             tokio::spawn(async move {
+                // Captured before wrapping: for the TLS arm, `get_ref().0`
+                // stops being the `TcpStream` once a `PrefixedStream` is inside.
+                let local_addr = tcp_stream.local_addr().unwrap_or(bound);
+                // One read, ahead of the `match`, so it covers both arms: the
+                // header is cleartext and precedes the ClientHello as much as it
+                // precedes a SIP start-line or a WebSocket GET.
+                let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                    match accept_proxied(
+                        &mut tcp_stream,
+                        remote_addr,
+                        sip_transport,
+                        &bound.to_string(),
+                    )
+                    .await
+                    {
+                        Some(accepted) => accepted,
+                        None => return,
+                    }
+                } else {
+                    (remote_addr, None, bytes::BytesMut::new())
+                };
+                let tcp_stream = PrefixedStream::new(tcp_stream, replay);
                 match acceptor {
                     Some(acceptor) => {
                         // Bounded handshake so a peer that connects and stalls
@@ -189,7 +230,6 @@ pub async fn listen(
                                 return;
                             }
                         };
-                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         dispatch(
                             tls_stream,
                             (Transport::Tls, Transport::WebSocketSecure),
@@ -206,7 +246,6 @@ pub async fn listen(
                         .await;
                     }
                     None => {
-                        let local_addr = tcp_stream.local_addr().unwrap_or(bound);
                         dispatch(
                             tcp_stream,
                             (Transport::Tcp, Transport::WebSocket),
@@ -267,6 +306,17 @@ async fn dispatch<S>(
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
             warn!("non-SIP, non-WebSocket bytes from {remote_addr} on the {sip_transport}+{websocket_transport} mux; dropping connection");
             crate::security::record_malformed_message(remote_addr.ip(), &sip_transport.to_string());
+            return;
+        }
+        // A misconfigured front, not abuse: close it, name the listener, and
+        // credit the ban store nothing.
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            warn!(
+                "a PROXY header arrived from {remote_addr} on the \
+                 {sip_transport}+{websocket_transport} mux, which does not have proxy_protocol \
+                 set; dropping the connection. Set proxy_protocol.from on this listener, or stop \
+                 the front sending the header."
+            );
             return;
         }
         Err(error) => {
@@ -375,6 +425,7 @@ mod tests {
             inbound_tx,
             Arc::new(TransportAcl::new(vec![], vec![])),
             StreamConnections::new(),
+            None,
             None,
             None,
             None,

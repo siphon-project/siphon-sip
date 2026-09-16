@@ -669,6 +669,14 @@ pub(crate) enum Sniff {
     Decided(StreamProtocol),
     /// Neither SIP nor HTTP — a scanner probe or binary garbage.
     Garbage,
+    /// A PROXY header on a listener that does not have `proxy_protocol` set.
+    ///
+    /// Held apart from [`Sniff::Garbage`] because the cause is almost always a
+    /// front pointed at the wrong listener, and the old behaviour was to score
+    /// it as a malformed message — siphon banning its own load balancer, with
+    /// nothing in the log saying why. The connection still closes; it just
+    /// closes loudly and costs the sender no ban credit.
+    ProxyHeaderNotEnabled,
 }
 
 /// Classify a connection from its first line.
@@ -683,6 +691,23 @@ pub(crate) enum Sniff {
 /// skipped for the decision but left in the buffer — the SIP read loop still
 /// sees them and answers the ping.
 pub(crate) fn sniff_first_line(buffer: &[u8]) -> Sniff {
+    // Checked first, and deliberately ahead of the control-byte scan below: the
+    // v2 signature's fifth byte is 0x00, so the garbage check would claim it and
+    // this arm would never fire. The v1 line is plain ASCII and would instead
+    // fall through to the start-line test and be called garbage. Either way the
+    // operator gets "non-SIP bytes" for a misconfigured front.
+    //
+    // A *complete* signature is required, never a prefix. This buffer may hold
+    // one short segment of a first line that is still arriving, and the v2
+    // signature opens with `\r\n` — so prefix-matching here would claim every
+    // RFC 5626 §4.4.1 CRLF keepalive and drop the connection answering it, and
+    // would claim a partial `PRACK`/`PUBLISH` line as well. A viable prefix
+    // falls through instead and the logic below answers `NeedMore`.
+    if buffer.starts_with(crate::transport::proxy_protocol::V1_PREFIX)
+        || buffer.starts_with(crate::transport::proxy_protocol::V2_SIGNATURE)
+    {
+        return Sniff::ProxyHeaderNotEnabled;
+    }
     // A C0 control byte (other than CR/LF/HT) never appears in a SIP start-line
     // or an HTTP request line — catches binary probes (a TLS ClientHello on the
     // plaintext port, random bytes) before a CRLF is even seen.
@@ -747,6 +772,15 @@ pub(crate) async fn sniff_stream<S: AsyncRead + Unpin>(
                     "neither SIP nor an HTTP upgrade",
                 ))
             }
+            // A distinct kind, so the callers can close the connection without
+            // crediting abuse — `InvalidData` is the arm that feeds the ban
+            // store.
+            Sniff::ProxyHeaderNotEnabled => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "a PROXY header arrived on a listener without proxy_protocol",
+                ))
+            }
             Sniff::NeedMore => {}
         }
         match tokio::time::timeout_at(deadline, stream.read(&mut read_buf)).await {
@@ -776,6 +810,9 @@ pub(crate) enum SipOnlyVerdict {
     /// Ended before a first line arrived. Drop, but count nothing: an L4 health
     /// check (connect, then close, no data) is indistinguishable from this.
     Gone,
+    /// A PROXY header on a listener without `proxy_protocol`. Drop, log the
+    /// listener, and count nothing — this is a misconfigured front, not abuse.
+    ProxyHeaderNotEnabled,
 }
 
 /// Classify a connection accepted on a listener that speaks only raw SIP.
@@ -799,6 +836,9 @@ pub(crate) async fn classify_sip_only<S: AsyncRead + Unpin>(stream: &mut S) -> S
         Ok((StreamProtocol::WebSocket, _)) => SipOnlyVerdict::Abuse("an HTTP request line"),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
             SipOnlyVerdict::Abuse("non-SIP bytes")
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            SipOnlyVerdict::ProxyHeaderNotEnabled
         }
         Err(_) => SipOnlyVerdict::Gone,
     }
@@ -827,6 +867,14 @@ pub(crate) async fn sniff_sip_or_drop<S: AsyncRead + Unpin>(
         }
         SipOnlyVerdict::Gone => {
             debug!("{transport} connection from {remote_addr} ended before its first line");
+            None
+        }
+        SipOnlyVerdict::ProxyHeaderNotEnabled => {
+            warn!(
+                "a PROXY header arrived from {remote_addr} on the {transport} listener, which \
+                 does not have proxy_protocol set; dropping the connection. Set \
+                 proxy_protocol.from on this listener, or stop the front sending the header."
+            );
             None
         }
     }
@@ -1431,6 +1479,45 @@ mod tests {
         let (protocol, prefix) = sniff_stream(&mut server).await.unwrap();
         assert_eq!(protocol, StreamProtocol::Sip);
         assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn a_proxy_header_on_a_listener_without_the_option_is_held_apart_from_garbage() {
+        // Both signatures, and a partial one, because a front's first segment
+        // can be short. The v2 case is the one that would otherwise be caught
+        // by the control-byte scan (its fifth byte is 0x00) and the v1 case by
+        // the start-line test — both landing on `Garbage`, which credits the
+        // ban store against siphon's own front.
+        assert_eq!(
+            sniff_first_line(b"PROXY TCP4 192.0.2.10 198.51.100.7 51234 5061\r\n"),
+            Sniff::ProxyHeaderNotEnabled
+        );
+        let v2 = [
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ];
+        assert_eq!(sniff_first_line(&v2), Sniff::ProxyHeaderNotEnabled);
+        // A partial signature must NOT claim this arm. `\r\n\r\n` is also the
+        // opening of an RFC 5626 §4.4.1 keepalive burst, and four bytes cannot
+        // tell the two apart — deciding here dropped every keepalive.
+        assert_eq!(sniff_first_line(&v2[..4]), Sniff::NeedMore);
+        // Still garbage, so the ban store keeps working for real probes.
+        assert_eq!(sniff_first_line(b"\x00\x01\x02binary"), Sniff::Garbage);
+    }
+
+    #[tokio::test]
+    async fn sniff_stream_reports_a_proxy_header_without_crediting_abuse() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"PROXY TCP4 192.0.2.10 198.51.100.7 51234 5061\r\n")
+            .await
+            .unwrap();
+        let error = sniff_stream(&mut server).await.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "must not be InvalidData — that is the arm that feeds the ban store"
+        );
     }
 
     #[tokio::test]

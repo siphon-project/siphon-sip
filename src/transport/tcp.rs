@@ -13,14 +13,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
-    StreamContext,
+    PrefixedStream, StreamContext,
 };
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
@@ -47,6 +48,10 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these
+    // senders. `None` is the default and leaves the accept path untouched.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     // Bind before spawning, so that awaiting `listen` means the socket is
     // already accepting. With the bind inside the task, the caller returned
@@ -71,10 +76,25 @@ pub async fn listen(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut socket, remote_addr)) => {
+                Ok((socket, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TCP rejected {} by ACL", remote_addr);
                         continue;
+                    }
+                    // A listener behind a front talks to the front and nobody
+                    // else. Refused here, before the spawn, so a sender that
+                    // may not speak for anyone costs one accept() and nothing
+                    // more. Not an auto-ban signal: the likeliest cause by far
+                    // is a second front that was never added to the list, and
+                    // banning it would turn a misconfiguration into an outage.
+                    if let Some(allowlist) = &proxy_protocol {
+                        if !allowlist.allows(remote_addr.ip()) {
+                            warn!(
+                                "TCP refusing {remote_addr} on the proxy_protocol listener \
+                                 {bound}: not in proxy_protocol.from"
+                            );
+                            continue;
+                        }
                     }
                     // See the TLS listener for why this is taken here, before
                     // the spawn, and dropped silently rather than banned.
@@ -94,8 +114,38 @@ pub async fn listen(
 
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
+                    let proxy_protocol = proxy_protocol.clone();
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(bound);
+                        // Split before the PROXY read so the bytes read past
+                        // the header can be pushed back in front of the read
+                        // half — `into_split` is not available once the socket
+                        // is wrapped, and the framer needs them either way.
+                        let (mut reader, writer) = socket.into_split();
+                        // The PROXY header comes before anything else on the
+                        // wire, so it is read before the SIP sniff, and the
+                        // client address it carries replaces the front's for
+                        // every consumer downstream: the ban store, the
+                        // registrar's `received`, capture and the CDR.
+                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                            match accept_proxied(
+                                &mut reader,
+                                remote_addr,
+                                Transport::Tcp,
+                                &bound.to_string(),
+                            )
+                            .await
+                            {
+                                Some(accepted) => accepted,
+                                None => return,
+                            }
+                        } else {
+                            (remote_addr, None, bytes::BytesMut::new())
+                        };
+                        // Push the over-read back in front of the read half so
+                        // the framer sees the first SIP message the front sent
+                        // in the same segment as the header.
+                        let mut reader = PrefixedStream::new(reader, replay);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
                         // frames as a complete "message" and would otherwise be
@@ -104,18 +154,19 @@ pub async fn listen(
                         // the connection id also keeps a probe out of the
                         // connection map and out of the accept log.
                         let Some(seed) =
-                            sniff_sip_or_drop(&mut socket, remote_addr, Transport::Tcp).await
+                            sniff_sip_or_drop(&mut reader, remote_addr, Transport::Tcp).await
                         else {
                             return;
                         };
                         // Confirmed SIP: the handshake slot goes back, the
-                        // connection slot stays with `permit` below.
+                        // connection slot stays with `permit` below. Still
+                        // after the PROXY read, so the header is covered by the
+                        // handshake ceiling rather than by nothing.
                         permit.handshake_done();
 
                         let connection_id = next_connection_id();
                         debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
-                        let (reader, writer) = socket.into_split();
                         serve_sip_stream(
                             reader,
                             writer,
@@ -805,6 +856,7 @@ mod tests {
             outbound_rx,
             Arc::new(DashMap::new()),
             Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
             None,
             None,
             None,

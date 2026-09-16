@@ -24,9 +24,10 @@ use crate::config::{TlsMethod, TlsServerConfig};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
-    StreamContext,
+    PrefixedStream, StreamContext,
 };
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
@@ -762,6 +763,9 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these senders.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     let acceptor = build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
         eprintln!("Failed to build TLS acceptor: {error}");
@@ -787,10 +791,25 @@ pub async fn listen(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((tcp_stream, remote_addr)) => {
+                Ok((mut tcp_stream, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TLS rejected {} by ACL", remote_addr);
                         continue;
+                    }
+                    // A listener behind a front talks to the front and nobody
+                    // else. Refused before the spawn, so a sender that may not
+                    // speak for anyone costs one accept() and nothing more.
+                    // Not a ban signal: the likeliest cause is a second front
+                    // never added to the list, and banning it would turn a
+                    // misconfiguration into an outage.
+                    if let Some(allowlist) = &proxy_protocol {
+                        if !allowlist.allows(remote_addr.ip()) {
+                            warn!(
+                                "TLS refusing {remote_addr} on the proxy_protocol listener \
+                                 {bound}: not in proxy_protocol.from"
+                            );
+                            continue;
+                        }
                     }
                     // Take the connection + handshake slots before spawning, so
                     // a refusal costs one accept() and nothing else — no task,
@@ -815,10 +834,39 @@ pub async fn listen(
                     let stream_connections = stream_connections.clone();
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
+                    let proxy_protocol = proxy_protocol.clone();
 
                     configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
+                        // Captured before anything wraps the socket: once the
+                        // stream is a `PrefixedStream`, `get_ref().0` is no
+                        // longer the `TcpStream` and cannot answer local_addr.
+                        let local_addr = tcp_stream.local_addr().unwrap_or(bound);
+                        // The PROXY header is cleartext and arrives ahead of the
+                        // ClientHello, so it is read before the handshake. That
+                        // ordering is the whole point for a re-encrypting front:
+                        // it terminates the phone's TLS and opens its own, and
+                        // this is the only place the phone's address exists.
+                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                            match accept_proxied(
+                                &mut tcp_stream,
+                                remote_addr,
+                                Transport::Tls,
+                                &bound.to_string(),
+                            )
+                            .await
+                            {
+                                Some(accepted) => accepted,
+                                None => return,
+                            }
+                        } else {
+                            (remote_addr, None, bytes::BytesMut::new())
+                        };
+                        // Replay the over-read into the acceptor, so a
+                        // ClientHello that shared a segment with the header is
+                        // not lost.
+                        let tcp_stream = PrefixedStream::new(tcp_stream, replay);
                         // Perform TLS handshake under a bounded timeout so a peer
                         // that connects and stalls mid-handshake (slowloris) cannot
                         // pin a task + socket indefinitely.
@@ -852,7 +900,6 @@ pub async fn listen(
                             return;
                         }
 
-                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
                         // frames as a complete "message" and would otherwise
@@ -1199,6 +1246,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("tls listener must bind");
@@ -1284,6 +1332,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             stream_connections.clone(),
+            None,
             None,
             None,
             None,

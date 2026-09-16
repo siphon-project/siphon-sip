@@ -50,6 +50,7 @@ async fn bind_failure_reaches_the_caller() {
         None,
         None,
         None,
+        None,
     )
     .await;
 
@@ -224,6 +225,7 @@ async fn tcp_roundtrip() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("tcp listener must bind");
@@ -301,6 +303,7 @@ async fn tcp_close_notifies_flow_failure() {
         None,
         None,
         Some(close_tx),
+        None,
     )
     .await
     .expect("tcp listener must bind");
@@ -401,6 +404,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         Some(Arc::clone(&pool)),
         None,
         None,
+        None,
     )
     .await
     .expect("tcp listener must bind");
@@ -485,6 +489,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
         None,
         Some(Arc::clone(&tracker)),
         None,
+        None,
     )
     .await
     .expect("tcp listener must bind");
@@ -555,6 +560,7 @@ async fn tls_roundtrip() {
         Arc::clone(&connection_map),
         test_acl(),
         StreamConnections::new(),
+        None,
         None,
         None,
         None,
@@ -641,6 +647,7 @@ async fn ws_roundtrip() {
         Arc::clone(&connection_map),
         test_acl(),
         StreamConnections::new(),
+        None,
         None,
         None,
     )
@@ -730,6 +737,7 @@ async fn wss_roundtrip() {
         Arc::clone(&connection_map),
         test_acl(),
         StreamConnections::new(),
+        None,
         None,
         None,
     )
@@ -845,6 +853,7 @@ async fn multi_transport_shared_inbound_channel() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("tcp listener must bind");
@@ -855,6 +864,7 @@ async fn multi_transport_shared_inbound_channel() {
         Arc::clone(&ws_connection_map),
         test_acl(),
         StreamConnections::new(),
+        None,
         None,
         None,
     )

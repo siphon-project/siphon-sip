@@ -6,6 +6,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **`proxy_protocol` on a stream listener takes the client address from a
+  HAProxy PROXY header (v1 and v2), so a connection-terminating front stops
+  hiding the real client.** A front that terminates TLS opens its own
+  connection, so every consumer that keys on the source saw the front: auto-ban
+  banned the front rather than the abuser, `from_gateway()` and
+  `source_ip_in()` stopped discriminating, NAT return-routing advertised the
+  front, and `media.received_from` gated media ingress to it so no RTP was
+  accepted at all. The documented alternative, L4 source preservation, cannot
+  work for a front that terminates the connection, which is the point of using
+  one to terminate TLS.
+
+  Enabling it requires naming the senders allowed to assert an address:
+
+  ```yaml
+  listen:
+    tls:
+      - address: "198.51.100.10:5061"
+        proxy_protocol:
+          from: ["198.51.100.7/32"]
+  ```
+
+  `from` is mandatory and has no default. It deliberately does not fall back to
+  `security.trusted_cidrs`, which means "exempt from abuse controls" to all four
+  of its consumers and is where monitoring boxes and trunks are listed —
+  inheriting it would hand source-address forgery rights to hosts named there
+  for an unrelated reason. Stream transports only (`tcp`, `tls`, `ws`, `wss`); a
+  UDP listener is refused at config load, as is an empty `from` or an entry that
+  is not a CIDR. The header is read before the TLS handshake, so a front may
+  re-encrypt and no hop carries cleartext SIP. A connection with no header on an
+  enabled listener is rejected rather than quietly attributed to the front, and
+  a PROXY header arriving on a listener that has the option *off* is recognised
+  and refused with a log naming the listener, instead of being counted as binary
+  garbage and credited to the auto-ban store — siphon banning its own front.
+
 ### Fixed
 
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`

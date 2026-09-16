@@ -4,6 +4,7 @@ pub mod crlf_keepalive;
 pub mod flow;
 pub mod mux;
 pub mod pool;
+pub mod proxy_protocol;
 pub mod rate_limit;
 #[cfg(feature = "sctp")]
 pub mod sctp;
