@@ -19,8 +19,12 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use siphon::transport::acl::TransportAcl;
-use siphon::transport::{tcp, tls, udp, ws};
-use siphon::transport::{ConnectionId, OutboundMessage, StreamConnections, Transport};
+use siphon::transport::mux::MuxChannels;
+use siphon::transport::proxy_protocol::ProxyProtocolAcl;
+use siphon::transport::{mux, tcp, tls, udp, ws};
+use siphon::transport::{
+    ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
+};
 
 /// Helper: build a permissive ACL for tests.
 fn test_acl() -> Arc<TransportAcl> {
@@ -921,6 +925,821 @@ async fn multi_transport_shared_inbound_channel() {
         "missing WS: {:?}",
         transports_seen
     );
+}
+
+// ---------------------------------------------------------------------------
+// PROXY protocol — the client address behind a connection-terminating front
+//
+// The unit tests in `transport::proxy_protocol` cover `parse` and
+// `accept_proxied` in isolation; none of them reaches an `InboundMessage`. What
+// follows drives the real listeners, so it fails if the accept sites stop
+// calling the parser, stop substituting the address, or stop replaying the
+// bytes read past the header.
+// ---------------------------------------------------------------------------
+
+/// The front, for tests. Connections here come from loopback, so loopback is
+/// the only sender allowed to speak for someone else.
+fn loopback_proxy_acl() -> Arc<ProxyProtocolAcl> {
+    Arc::new(ProxyProtocolAcl::new(&["127.0.0.1/32".to_string()]))
+}
+
+/// An allowlist loopback is **not** in. A header from an unlisted sender is a
+/// source-address forgery, so the connection must die at the accept loop.
+fn foreign_proxy_acl() -> Arc<ProxyProtocolAcl> {
+    Arc::new(ProxyProtocolAcl::new(&["198.51.100.7/32".to_string()]))
+}
+
+/// A v1 header. The client it declares is nothing like loopback and nothing
+/// like the listener's own address, so no assertion below can pass by accident.
+const PROXY_V1: &[u8] = b"PROXY TCP4 192.0.2.10 198.51.100.7 51234 5061\r\n";
+
+/// The client endpoint `PROXY_V1` and [`proxy_v2`] both declare.
+const PROXIED_CLIENT: &str = "192.0.2.10:51234";
+
+/// The same endpoints as a v2 binary header.
+///
+/// Written out here rather than reusing siphon's own constants (they are
+/// `pub(crate)` anyway): a header built from the same constant the parser reads
+/// would still line up if that constant were wrong. This is the wire format
+/// from the spec, independently.
+fn proxy_v2() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&std::net::Ipv4Addr::new(192, 0, 2, 10).octets());
+    body.extend_from_slice(&std::net::Ipv4Addr::new(198, 51, 100, 7).octets());
+    body.extend_from_slice(&51234u16.to_be_bytes());
+    body.extend_from_slice(&5061u16.to_be_bytes());
+
+    let mut header = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    header.push(0x21); // version 2, PROXY command
+    header.push(0x11); // TCP over IPv4
+    header.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    header.extend_from_slice(&body);
+    header
+}
+
+fn proxied_client() -> SocketAddr {
+    PROXIED_CLIENT.parse().expect("addr")
+}
+
+/// The assertion every substitution test makes.
+///
+/// Spelled out once because the failure it guards against is specific: the
+/// dispatcher receiving loopback means the header was parsed and then thrown
+/// away, which is the bug the whole feature exists to prevent and which a
+/// "did a message arrive?" test passes straight through.
+fn assert_client_address_substituted(inbound: &InboundMessage, what: &str) {
+    assert_eq!(
+        inbound.remote_addr,
+        proxied_client(),
+        "{what}: the dispatcher must see the client from the PROXY header, not \
+         the front's own address ({})",
+        inbound.remote_addr
+    );
+}
+
+/// Prove a listener refused a connection: nothing reached the dispatcher and
+/// the socket is closed.
+async fn assert_connection_refused(
+    addr: SocketAddr,
+    opening: &[u8],
+    inbound_rx: &flume::Receiver<InboundMessage>,
+    what: &str,
+) {
+    let mut client = connect_with_retry(what, || TcpStream::connect(addr)).await;
+    // A refusal in the accept loop can close the socket before this write is
+    // scheduled, so a write error is one of the shapes of success here.
+    let _ = client.write_all(opening).await;
+
+    let mut buffer = [0u8; 64];
+    match tokio::time::timeout(TIMEOUT, client.read(&mut buffer)).await {
+        // EOF, or a reset: both are the connection being dropped.
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(size)) => panic!(
+            "{what}: expected the connection to be dropped, got {size} bytes back: {:?}",
+            String::from_utf8_lossy(&buffer[..size])
+        ),
+        Err(_) => panic!("{what}: the connection was held open instead of being dropped"),
+    }
+
+    // Wait a beat for a straggler rather than sampling once: a build that
+    // delivers the message would do it before closing, but the channel send
+    // and the socket close are not ordered with respect to each other.
+    let leaked = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        inbound_rx.recv_async(),
+    )
+    .await;
+    assert!(
+        leaked.is_err(),
+        "{what}: a refused connection must deliver nothing to the dispatcher"
+    );
+}
+
+/// A listener under test, with the channel ends the caller has to keep alive.
+struct ProxiedListener {
+    addr: SocketAddr,
+    inbound_rx: flume::Receiver<InboundMessage>,
+    /// Dropping these closes the outbound distributor, so they are held for the
+    /// life of the test and the listener stays in the shape production has.
+    _outbound: Vec<flume::Sender<OutboundMessage>>,
+}
+
+/// Start a TCP listener, optionally behind a front.
+async fn tcp_listener_with_proxy(proxy_protocol: Option<Arc<ProxyProtocolAcl>>) -> ProxiedListener {
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
+        inbound_tx,
+        outbound_rx,
+        connection_map,
+        test_acl(),
+        None,
+        None,
+        None,
+        None,
+        proxy_protocol,
+    )
+    .await
+    .expect("tcp listener must bind");
+    assert_bound(addr);
+    ProxiedListener {
+        addr,
+        inbound_rx,
+        _outbound: vec![outbound_tx],
+    }
+}
+
+#[tokio::test]
+async fn tcp_proxy_protocol_substitutes_the_client_address() {
+    let listener = tcp_listener_with_proxy(Some(loopback_proxy_acl())).await;
+    let (addr, inbound_rx) = (listener.addr, &listener.inbound_rx);
+
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
+    client.write_all(PROXY_V1).await.unwrap();
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "tcp v1");
+    assert_eq!(inbound.transport, Transport::Tcp);
+    // The bytes after the header have to survive the read that consumed it.
+    assert!(
+        String::from_utf8_lossy(&inbound.data).starts_with("OPTIONS"),
+        "the request must be replayed intact after the header: {:?}",
+        String::from_utf8_lossy(&inbound.data)
+    );
+}
+
+#[tokio::test]
+async fn tcp_proxy_protocol_v2_substitutes_the_client_address() {
+    // HAProxy's `send-proxy-v2` is the binary form, so this is what a real
+    // front actually emits.
+    let listener = tcp_listener_with_proxy(Some(loopback_proxy_acl())).await;
+    let (addr, inbound_rx) = (listener.addr, &listener.inbound_rx);
+
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
+    client.write_all(&proxy_v2()).await.unwrap();
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "tcp v2");
+    assert!(String::from_utf8_lossy(&inbound.data).starts_with("OPTIONS"));
+}
+
+#[tokio::test]
+async fn tls_proxy_protocol_substitutes_the_client_address() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    use tokio_rustls::rustls;
+
+    let directory = tempfile::tempdir().unwrap();
+    let tls_config = generate_test_tls_config(&directory);
+
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+
+    let addr = tls::listen(
+        LOOPBACK_ANY_PORT,
+        &tls_config,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        None,
+        None,
+        Some(loopback_proxy_acl()),
+    )
+    .await
+    .expect("tls listener must bind");
+    assert_bound(addr);
+
+    // The header is cleartext and goes out BEFORE the ClientHello. This
+    // ordering is the whole feature for a re-encrypting front, and it is also
+    // what breaks first: read the header after the handshake and rustls sees
+    // "PROXY TCP4 …" as a ClientHello and the connection dies here.
+    let mut tcp_stream = connect_with_retry("tls listener", || TcpStream::connect(addr)).await;
+    tcp_stream.write_all(PROXY_V1).await.unwrap();
+
+    let tls_connector = build_test_tls_connector(&tls_config);
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls_stream = tls_connector
+        .connect(server_name, tcp_stream)
+        .await
+        .expect("the handshake must run after the cleartext PROXY header");
+    tls_stream
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "tls");
+    assert_eq!(inbound.transport, Transport::Tls);
+}
+
+#[tokio::test]
+async fn ws_proxy_protocol_substitutes_the_client_address() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+
+    let addr = ws::listen(
+        LOOPBACK_ANY_PORT,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        Some(loopback_proxy_acl()),
+    )
+    .await
+    .expect("ws listener must bind");
+    assert_bound(addr);
+
+    // The header precedes the HTTP upgrade the same way it precedes a SIP
+    // start-line.
+    let mut tcp_stream = connect_with_retry("ws listener", || TcpStream::connect(addr)).await;
+    tcp_stream.write_all(PROXY_V1).await.unwrap();
+
+    let uri = format!("ws://127.0.0.1:{}", addr.port())
+        .parse::<http::Uri>()
+        .unwrap();
+    let (mut ws_stream, _) = tokio_tungstenite::client_async(uri, tcp_stream)
+        .await
+        .expect("the upgrade must run after the PROXY header");
+    ws_stream
+        .send(Message::text(sip_options_request()))
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "ws");
+    assert_eq!(inbound.transport, Transport::WebSocket);
+}
+
+#[tokio::test]
+async fn wss_proxy_protocol_substitutes_the_client_address() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    use futures_util::SinkExt;
+    use tokio_rustls::rustls;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let directory = tempfile::tempdir().unwrap();
+    let tls_config = generate_test_tls_config(&directory);
+
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+
+    let addr = ws::listen_secure(
+        LOOPBACK_ANY_PORT,
+        &tls_config,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        Some(loopback_proxy_acl()),
+    )
+    .await
+    .expect("wss listener must bind");
+    assert_bound(addr);
+
+    let mut tcp_stream = connect_with_retry("wss listener", || TcpStream::connect(addr)).await;
+    tcp_stream.write_all(PROXY_V1).await.unwrap();
+
+    let tls_connector = build_test_tls_connector(&tls_config);
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls_stream = tls_connector
+        .connect(server_name, tcp_stream)
+        .await
+        .expect("the handshake must run after the cleartext PROXY header");
+
+    let uri = format!("wss://localhost:{}", addr.port())
+        .parse::<http::Uri>()
+        .unwrap();
+    let (mut ws_stream, _) = tokio_tungstenite::client_async(uri, tls_stream)
+        .await
+        .expect("WSS upgrade failed");
+    ws_stream
+        .send(Message::text(sip_options_request()))
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "wss");
+    assert_eq!(inbound.transport, Transport::WebSocketSecure);
+}
+
+/// Start the tcp+ws mux, optionally behind a front.
+async fn mux_listener_with_proxy(proxy_protocol: Option<Arc<ProxyProtocolAcl>>) -> ProxiedListener {
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (sip_outbound_tx, sip_outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let (websocket_outbound_tx, websocket_outbound_rx) = flume::unbounded::<OutboundMessage>();
+
+    let addr = mux::listen(
+        LOOPBACK_ANY_PORT,
+        None,
+        MuxChannels {
+            sip_outbound_rx,
+            sip_connection_map: Arc::new(DashMap::new()),
+            websocket_outbound_rx,
+            websocket_connection_map: Arc::new(DashMap::new()),
+        },
+        inbound_tx,
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        None,
+        None,
+        proxy_protocol,
+    )
+    .await
+    .expect("mux listener must bind");
+    assert_bound(addr);
+    ProxiedListener {
+        addr,
+        inbound_rx,
+        _outbound: vec![sip_outbound_tx, websocket_outbound_tx],
+    }
+}
+
+#[tokio::test]
+async fn mux_proxy_protocol_substitutes_the_client_address() {
+    // One read serves both halves of the mux: the header precedes the SIP
+    // start-line and the WebSocket GET alike, so it is taken before the
+    // protocol sniff rather than inside either arm.
+    let listener = mux_listener_with_proxy(Some(loopback_proxy_acl())).await;
+    let (addr, inbound_rx) = (listener.addr, &listener.inbound_rx);
+
+    let mut client = connect_with_retry("mux listener", || TcpStream::connect(addr)).await;
+    client.write_all(PROXY_V1).await.unwrap();
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the proxied OPTIONS")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "mux");
+    assert_eq!(inbound.transport, Transport::Tcp);
+    assert!(String::from_utf8_lossy(&inbound.data).starts_with("OPTIONS"));
+}
+
+// --- Refusals -------------------------------------------------------------
+//
+// Both refusals below happen in the accept loop, before any TLS handshake or
+// WebSocket upgrade, so every transport can be driven with a plain socket.
+
+#[tokio::test]
+async fn a_sender_not_in_from_cannot_assert_a_client_address() {
+    // The security property. If this check goes away, anyone who can reach the
+    // port can claim to be any address on the internet, which turns the front
+    // door into a forgery primitive.
+    let mut opening = Vec::from(PROXY_V1);
+    opening.extend_from_slice(sip_options_request().as_bytes());
+
+    let tcp_listener = tcp_listener_with_proxy(Some(foreign_proxy_acl())).await;
+    assert_connection_refused(
+        tcp_listener.addr,
+        &opening,
+        &tcp_listener.inbound_rx,
+        "tcp unlisted sender",
+    )
+    .await;
+
+    let mux_listener = mux_listener_with_proxy(Some(foreign_proxy_acl())).await;
+    assert_connection_refused(
+        mux_listener.addr,
+        &opening,
+        &mux_listener.inbound_rx,
+        "mux unlisted sender",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unlisted_sender_is_refused_on_every_stream_listener() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let directory = tempfile::tempdir().unwrap();
+    let tls_config = generate_test_tls_config(&directory);
+    let mut opening = Vec::from(PROXY_V1);
+    opening.extend_from_slice(sip_options_request().as_bytes());
+
+    // tls
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let addr = tls::listen(
+        LOOPBACK_ANY_PORT,
+        &tls_config,
+        inbound_tx,
+        outbound_rx,
+        Arc::new(DashMap::new()),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        None,
+        None,
+        Some(foreign_proxy_acl()),
+    )
+    .await
+    .expect("tls listener must bind");
+    assert_connection_refused(addr, &opening, &inbound_rx, "tls unlisted sender").await;
+
+    // ws
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_ws_outbound_tx, ws_outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let addr = ws::listen(
+        LOOPBACK_ANY_PORT,
+        inbound_tx,
+        ws_outbound_rx,
+        Arc::new(DashMap::new()),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        Some(foreign_proxy_acl()),
+    )
+    .await
+    .expect("ws listener must bind");
+    assert_connection_refused(addr, &opening, &inbound_rx, "ws unlisted sender").await;
+
+    // wss
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_wss_outbound_tx, wss_outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let addr = ws::listen_secure(
+        LOOPBACK_ANY_PORT,
+        &tls_config,
+        inbound_tx,
+        wss_outbound_rx,
+        Arc::new(DashMap::new()),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        Some(foreign_proxy_acl()),
+    )
+    .await
+    .expect("wss listener must bind");
+    assert_connection_refused(addr, &opening, &inbound_rx, "wss unlisted sender").await;
+}
+
+#[tokio::test]
+async fn a_connection_with_no_header_is_dropped_rather_than_read_as_plain_sip() {
+    // The refusal that matters most: falling back to the socket's own address
+    // would hand the front's address to the registrar, the ban store and the
+    // CDR — silently, and for every call. On a listener that sits behind a
+    // front, plain SIP is a bypass, not a client.
+    let opening = sip_options_request().as_bytes().to_vec();
+
+    let tcp_listener = tcp_listener_with_proxy(Some(loopback_proxy_acl())).await;
+    assert_connection_refused(
+        tcp_listener.addr,
+        &opening,
+        &tcp_listener.inbound_rx,
+        "tcp headerless",
+    )
+    .await;
+
+    let mux_listener = mux_listener_with_proxy(Some(loopback_proxy_acl())).await;
+    assert_connection_refused(
+        mux_listener.addr,
+        &opening,
+        &mux_listener.inbound_rx,
+        "mux headerless",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tcp_proxy_protocol_replay_does_not_swallow_a_crlf_keepalive() {
+    // A front can put the header, an RFC 5626 §4.4.1 keepalive and a real
+    // request in ONE segment. An earlier cut of this feature classified every
+    // keepalive as a misconfigured PROXY header (`\r\n\r\n` is also how the v2
+    // signature opens) and killed the connection answering it, so both halves
+    // are asserted here: the pong comes back AND the request still frames.
+    use siphon::transport::crlf_keepalive::CrlfPongTracker;
+
+    let (inbound_tx, inbound_rx) = flume::unbounded();
+    let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+    let tracker = Arc::new(CrlfPongTracker::new());
+
+    let addr = tcp::listen(
+        LOOPBACK_ANY_PORT,
+        inbound_tx,
+        outbound_rx,
+        Arc::new(DashMap::new()),
+        test_acl(),
+        None,
+        None,
+        Some(Arc::clone(&tracker)),
+        None,
+        Some(loopback_proxy_acl()),
+    )
+    .await
+    .expect("tcp listener must bind");
+    assert_bound(addr);
+
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
+    let mut opening = Vec::from(PROXY_V1);
+    opening.extend_from_slice(b"\r\n\r\n");
+    opening.extend_from_slice(sip_options_request().as_bytes());
+    client.write_all(&opening).await.unwrap();
+
+    let mut pong = [0u8; 2];
+    tokio::time::timeout(TIMEOUT, client.read_exact(&mut pong))
+        .await
+        .expect("timed out waiting for the CRLF pong — the keepalive was swallowed")
+        .expect("read CRLF pong");
+    assert_eq!(&pong, b"\r\n", "server must answer the ping with `\\r\\n`");
+
+    let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
+        .await
+        .expect("timed out waiting for the OPTIONS behind the keepalive")
+        .expect("inbound channel closed");
+
+    assert_client_address_substituted(&inbound, "tcp keepalive");
+    assert!(
+        String::from_utf8_lossy(&inbound.data).starts_with("OPTIONS"),
+        "the request must not be polluted by the header or the keepalive: {:?}",
+        String::from_utf8_lossy(&inbound.data)
+    );
+}
+
+#[tokio::test]
+async fn a_proxy_header_on_a_listener_without_the_option_is_dropped_and_credits_no_ban() {
+    // A front pointed at the wrong listener is a misconfiguration, not abuse.
+    // Scoring it as a malformed message has siphon ban its own load balancer,
+    // which is an outage with nothing in the log explaining it.
+    //
+    // The observable is the malformed-message counter that feeds the ban store
+    // (`record_malformed_message` increments it and records the strong failure
+    // together). Both halves run in this one test so the reading is a delta
+    // against itself; no other test in this binary sends non-SIP bytes.
+    let _ = siphon::metrics::init();
+    let Some(metrics) = siphon::metrics::try_metrics() else {
+        panic!("metrics must initialise for this assertion to mean anything");
+    };
+
+    let listener = tcp_listener_with_proxy(None).await;
+    let (addr, inbound_rx) = (listener.addr, &listener.inbound_rx);
+
+    let before = metrics.malformed_messages_total.get();
+    assert_connection_refused(addr, PROXY_V1, inbound_rx, "proxy header, option off").await;
+    assert_eq!(
+        metrics.malformed_messages_total.get(),
+        before,
+        "a PROXY header on a listener without proxy_protocol must not be scored \
+         as a malformed message — that is siphon banning its own front"
+    );
+
+    // Control: real garbage on the same listener still counts, so the arm
+    // above cannot pass by the ban signal having been broken outright.
+    assert_connection_refused(
+        addr,
+        b"\x00\x01\x02not sip at all",
+        inbound_rx,
+        "binary garbage",
+    )
+    .await;
+    assert!(
+        metrics.malformed_messages_total.get() > before,
+        "non-SIP bytes must still be scored — the ban store has to keep working \
+         for real probes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The consumers: given the address the substitution produces, what do they
+// keep?
+//
+// These sit in this file because they are the second half of the claim the
+// tests above make. Together the two halves cover the path with one link
+// missing: the hop from `InboundMessage` into the `PyRequest` a script sees is
+// `dispatcher::request::handle_request`, which is private, so nothing in
+// `tests/integration/` can drive it. The SIPp case
+// (sipp/docker-compose.proxy-protocol.yaml) covers that hop end-to-end against
+// a real HAProxy instead.
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+use pyo3::prelude::*;
+use siphon::registrar::{Registrar, RegistrarConfig};
+use siphon::script::api::registrar::PyRegistrar;
+use siphon::script::api::request::PyRequest;
+use siphon::sip::builder::SipMessageBuilder;
+use siphon::sip::message::Method;
+use siphon::sip::uri::SipUri;
+
+const CLIENT_AOR: &str = "sip:ua@pbx.example";
+/// The client the PROXY header declares, split the way the dispatcher splits it.
+const PROXIED_CLIENT_IP: &str = "192.0.2.10";
+const PROXIED_CLIENT_PORT: u16 = 51234;
+/// The front. Nothing a consumer keeps may carry this.
+const FRONT_IP: &str = "198.51.100.7";
+
+/// A REGISTER as the dispatcher hands it to a script: the source is whatever
+/// the accept site decided, which behind a front is the header's client.
+///
+/// The Via sent-by and the Contact are the UE's own private address — a NATed
+/// handset, the case `fix_nated_register` exists for — so neither the client's
+/// nor the front's address can turn up in an assertion by accident.
+fn register_from(source_ip: &str, source_port: u16) -> PyRequest {
+    let message = SipMessageBuilder::new()
+        .request(Method::Register, SipUri::new("pbx.example".to_string()))
+        .via("SIP/2.0/TLS 10.0.0.5:5060;branch=z9hG4bK-behind-a-front".to_string())
+        .to(format!("<{CLIENT_AOR}>"))
+        .from(format!("<{CLIENT_AOR}>;tag=front"))
+        .call_id("behind-a-front@pbx.example".to_string())
+        .cseq("1 REGISTER".to_string())
+        .header(
+            "Contact",
+            "<sip:ua@10.0.0.5:5060;transport=tls>".to_string(),
+        )
+        .header("Expires", "3600".to_string())
+        .content_length(0)
+        .build()
+        .unwrap();
+    PyRequest::new(
+        Arc::new(Mutex::new(message)),
+        "tls".to_string(),
+        source_ip.to_string(),
+        source_port,
+    )
+}
+
+#[test]
+fn a_registration_behind_a_front_stores_the_client_address() {
+    // NAT return-routing, the liveness keepalive and `media.received_from` all
+    // key on the binding's source address. Storing the front's would point
+    // every one of them at the load balancer.
+    let registrar = Arc::new(Registrar::new(RegistrarConfig::default()));
+
+    Python::initialize();
+    Python::attach(|python| {
+        let namespace = Py::new(python, PyRegistrar::new(Arc::clone(&registrar))).unwrap();
+        let request = Py::new(
+            python,
+            register_from(PROXIED_CLIENT_IP, PROXIED_CLIENT_PORT),
+        )
+        .unwrap();
+        let saved: bool = namespace
+            .bind(python)
+            .call_method1("save", (request,))
+            .expect("registrar.save() must not raise")
+            .extract()
+            .unwrap();
+        assert!(saved, "the REGISTER must be accepted");
+    });
+
+    let contacts = registrar.lookup(CLIENT_AOR);
+    assert_eq!(contacts.len(), 1, "one binding must be stored");
+    assert_eq!(
+        contacts[0].source_addr,
+        Some(proxied_client()),
+        "the binding must record the client behind the front, not the front"
+    );
+}
+
+#[test]
+fn fix_nated_register_writes_the_client_into_received_and_rport() {
+    let request = register_from(PROXIED_CLIENT_IP, PROXIED_CLIENT_PORT);
+    // Taken before the request moves into Python; both point at one message.
+    let message = request.message();
+
+    Python::initialize();
+    Python::attach(|python| {
+        let request = Py::new(python, request).unwrap();
+        request
+            .bind(python)
+            .call_method0("fix_nated_register")
+            .expect("fix_nated_register must not raise");
+    });
+
+    let via = {
+        let guard = message.lock().expect("lock");
+        guard.headers.get("Via").cloned().expect("Via")
+    };
+    assert!(
+        via.contains(&format!("received={PROXIED_CLIENT_IP}")),
+        "received= must carry the client behind the front: {via}"
+    );
+    assert!(
+        via.contains(&format!("rport={PROXIED_CLIENT_PORT}")),
+        "rport= must carry the client's port: {via}"
+    );
+    assert!(
+        !via.contains(FRONT_IP),
+        "the front's own address must never reach the Via: {via}"
+    );
+}
+
+#[test]
+fn source_ip_predicates_see_the_client_not_the_front() {
+    // `source_ip_in` is how a script tells an access network from a trunk. Fed
+    // the front's address it stops discriminating at all, and every request
+    // lands in whichever branch the front happens to match.
+    Python::initialize();
+    Python::attach(|python| {
+        let request = Py::new(
+            python,
+            register_from(PROXIED_CLIENT_IP, PROXIED_CLIENT_PORT),
+        )
+        .unwrap();
+        let bound = request.bind(python);
+
+        let source_ip: String = bound
+            .getattr("source_ip")
+            .unwrap()
+            .extract()
+            .expect("source_ip is a string");
+        assert_eq!(source_ip, PROXIED_CLIENT_IP);
+
+        let in_client_range: bool = bound
+            .call_method1("source_ip_in", (vec!["192.0.2.0/24"],))
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert!(
+            in_client_range,
+            "the client's own prefix must match the client"
+        );
+
+        let in_front_range: bool = bound
+            .call_method1("source_ip_in", (vec!["198.51.100.0/24"],))
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert!(
+            !in_front_range,
+            "the front's prefix must not match: that is the misrouting this \
+             feature exists to stop"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
