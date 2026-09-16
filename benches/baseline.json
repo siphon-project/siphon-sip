@@ -31,6 +31,8 @@
   "sdp/parse": 351.67774247144337,
   "sdp/roundtrip_filter": 964.8689960911919,
   "sdp/serialize": 371.56718800496037,
+  "sdp/strip_attributes": 151.7073028266323,
+  "sdp/strip_attributes_no_match": 100.4777656964425,
   "serialize/invite_sdp_to_bytes": 304.86159387928217,
   "siphon_rtp_proto/decode_offer_response": 415.45210913855465,
   "siphon_rtp_proto/encode_offer_request": 291.8369024068579,
