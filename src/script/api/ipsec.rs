@@ -456,22 +456,19 @@ pub struct PySecurityServerParams {
     /// P-CSCF protected server port.
     #[pyo3(get)]
     pub port_s: u16,
-    /// Wire-form transport for the RFC 3329 ``Security-Server``
-    /// header, either ``"udp"`` or ``"tcp"``.  The caller appends
-    /// ``protocol=tcp`` to the header only when this field is ``"tcp"``
-    /// and leaves the parameter off for ``"udp"``.  ``protocol=`` is a
-    /// siphon convention: neither RFC 3329 (§2.2, Appendix A) nor 3GPP
-    /// TS 33.203 Annex H defines a transport parameter for
-    /// ``ipsec-3gpp``, and one SA pair carries UDP and TCP alike
-    /// (TS 33.203 §7.1), so the header without it is the standard shape.
+    /// Transport the SA pair is pinned to, ``"udp"`` or ``"tcp"``.
+    ///
+    /// Informational.  siphon's own ``Security-Server`` never carries a
+    /// transport ``protocol=`` parameter, so a script has nothing to
+    /// append: no sec-agree spec defines that parameter (RFC 3329 §2.2
+    /// and Appendix A, 3GPP TS 33.203 Annex H), and one SA pair carries
+    /// UDP and TCP alike (TS 33.203 §6.3, §7.1).
     ///
     /// Note: when :func:`siphon.ipsec.allocate` was called with the
-    /// multi-protocol default (no ``protocol`` kwarg), this field
-    /// reads ``"udp"``, so the parameter stays off, even
-    /// though the underlying SA pair covers both UDP and TCP.  For
-    /// diagnostics of the actual SA selector mode, inspect
-    /// :attr:`SAHandle.protocol`, which surfaces ``"any"`` in that
-    /// case.
+    /// multi-protocol default (no ``protocol`` kwarg), the pair covers
+    /// both transports and this field reads ``"udp"``.  For the actual
+    /// SA selector mode, inspect :attr:`SAHandle.protocol`, which
+    /// surfaces ``"any"`` in that case.
     #[pyo3(get)]
     pub protocol: String,
 }
@@ -825,15 +822,13 @@ fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
     }
 }
 
-/// Map an internal :data:`SaProtocol` to the wire-form value the
-/// script appends to the ``Security-Server`` ``protocol=`` parameter.
-/// `Any` collapses to ``"udp"`` so a script that appends the parameter
-/// only for ``"tcp"`` leaves it off, keeping the wire output identical
-/// to the pre-multi-protocol shape while the underlying SA covers both
-/// transports.  Off is the standard shape: ``protocol=`` is a siphon
-/// convention that RFC 3329 (§2.2, Appendix A) and 3GPP TS 33.203
-/// Annex H do not define, and TS 33.203 §7.1 has one SA carry UDP and
-/// TCP.
+/// Map an internal :data:`SaProtocol` to the value reported on
+/// :attr:`SecurityServerParams.protocol`, with `Any` collapsing to
+/// ``"udp"``.  The field is informational: siphon's ``Security-Server``
+/// carries no transport ``protocol=`` parameter for any SA, because no
+/// sec-agree spec defines one (RFC 3329 §2.2 and Appendix A, 3GPP
+/// TS 33.203 Annex H) and one pair carries UDP and TCP alike
+/// (TS 33.203 §6.3, §7.1).
 fn format_params_protocol(sa_protocol: SaProtocol) -> String {
     match sa_protocol {
         SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
@@ -1894,12 +1889,12 @@ mod tests {
         assert!(error.contains("sctp"));
     }
 
-    /// `Any` MUST collapse to wire-form ``"udp"`` so the existing
-    /// ``protocol=`` formatting in scripts
-    /// (``f"; protocol={params.protocol}" if params.protocol != "udp" else ""``)
-    /// keeps emitting parameter-less Security-Server headers, the
-    /// standard shape: no sec-agree spec defines ``protocol=`` (RFC 3329
-    /// §2.2 and Appendix A, 3GPP TS 33.203 Annex H).
+    /// `Any` collapses to ``"udp"`` on the informational
+    /// :attr:`SecurityServerParams.protocol`.  Nothing on the wire turns
+    /// on it: siphon emits no ``protocol=`` parameter on a
+    /// ``Security-Server``, for any SA, because no sec-agree spec
+    /// defines one (RFC 3329 §2.2 and Appendix A, 3GPP TS 33.203
+    /// Annex H).
     #[test]
     fn format_params_protocol_collapses_any_to_udp_for_wire() {
         assert_eq!(format_params_protocol(SaProtocol::Any), "udp");

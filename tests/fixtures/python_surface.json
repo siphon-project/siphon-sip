@@ -2463,7 +2463,7 @@
         "kind": "getset_descriptor"
       },
       "protocol": {
-        "doc": "Wire-form transport for the RFC 3329 ``Security-Server``",
+        "doc": "Transport the SA pair is pinned to, ``\"udp\"`` or ``\"tcp\"``.",
         "kind": "getset_descriptor"
       },
       "spi_c": {
