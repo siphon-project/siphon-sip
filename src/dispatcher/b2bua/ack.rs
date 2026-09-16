@@ -294,25 +294,10 @@ pub fn arm_reliable_provisional_retransmit_on(
     });
 }
 
-/// Arm B2BUA A-leg 2xx retransmission (RFC 3261 §13.3.1.4).
-///
-/// The B2BUA intercepts the A-leg INVITE before a server transaction is
-/// created (see `handle_b2bua_invite`), so the transaction layer never
-/// retransmits the A-leg 2xx — and the IST would step aside on 2xx anyway
-/// ("TU owns retransmissions"). Without this, a single lost 200 leaves the
-/// caller ringing until it CANCELs. Stores an [`UnackedAnswer`] under the
-/// dialog's Call-ID and spawns a task that resends `response` on the RFC 3261
-/// §17.2.1 UAS schedule (T1 doubling to T2) until the caller's ACK cancels it
-/// or 64×T1 has passed.
-///
-/// What happens at 64×T1 is not the task's to decide. [`sweep_unacked_uas_2xx`],
-/// on the dispatcher's timer tick, ends the call: the task holds no
-/// `&DispatcherState` to run the teardown with, and leaving the entry in the
-/// store until the sweep claims it is what lets an ACK that races the deadline
-/// win. Every 2xx siphon sends the caller is armed here, relayed
-/// (`b_leg_answered`) or its own (`b2bua_send_uas_response`, behind
-/// `call.answer()` and the control plane's answer), so both are held to the
-/// same deadline.
+/// [`register_unacked_answer`] then [`start_2xx_retransmits`], for a test that puts
+/// a 2xx under retransmission as if it had just been sent. siphon's own answer
+/// path registers before it sends, and starts the retransmissions after.
+#[cfg(test)]
 pub fn arm_b2bua_2xx_retransmit(
     internal_call_id: &str,
     response: SipMessage,
@@ -322,31 +307,89 @@ pub fn arm_b2bua_2xx_retransmit(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
+    let unacked = register_unacked_answer(internal_call_id, &response, state);
+    start_2xx_retransmits(
+        unacked,
+        response,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        state,
+    );
+}
+
+/// Record the caller's 2xx `response` as waiting for its ACK, under the Call-ID
+/// of the dialog it goes out on, which that ACK names: the first half of B2BUA
+/// A-leg 2xx retransmission (RFC 3261 §13.3.1.4), [`start_2xx_retransmits`] the
+/// second.
+///
+/// The B2BUA intercepts the A-leg INVITE before a server transaction is created
+/// (see `handle_b2bua_invite`), so the transaction layer never retransmits the
+/// A-leg 2xx, and the IST would step aside on a 2xx anyway ("TU owns
+/// retransmissions"). Without this, a single lost 200 leaves the caller ringing
+/// until it CANCELs. What happens at 64×T1 is not the retransmit task's to decide:
+/// [`sweep_unacked_uas_2xx`], on the dispatcher's timer tick, ends the call. The
+/// task holds no `&DispatcherState` to run the teardown with, and leaving the entry
+/// in the store until the sweep claims it is what lets an ACK that races the
+/// deadline win. Every 2xx siphon sends the caller is registered this way, relayed
+/// (`b_leg_answered`) or its own (`b2bua_send_uas_response`, behind `call.answer()`
+/// and the control plane's answer), so both are held to the same deadline.
+///
+/// From here a BYE for the dialog is held until the ACK (RFC 3261 §15,
+/// [`send_or_hold_bye`]), and the 64×T1 sweep holds the 2xx to its deadline. So
+/// it comes before anything a peer can react to is sent: the 2xx itself, and the
+/// ACK to a callee that may BYE the moment it is ACKed, on another worker. It
+/// changes nothing on the wire: retransmission starts only with
+/// [`start_2xx_retransmits`], once the 2xx is sent. A 2xx that is held (for a PRACK)
+/// is not registered until it goes out.
+pub fn register_unacked_answer(
+    internal_call_id: &str,
+    response: &SipMessage,
+    state: &DispatcherState,
+) -> Arc<UnackedAnswer> {
     let timers = crate::transaction::timer::TimerConfig::default();
     let unacked = Arc::new(UnackedAnswer {
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() + timers.t1 * 64,
         internal_call_id: internal_call_id.to_string(),
     });
-    // Keyed by the dialog the 2xx went out on, which its ACK names.
+    // Keyed by the dialog the 2xx goes out on, which its ACK names.
     let dialog_call_id = response
         .headers
         .call_id()
         .map(|call_id| call_id.to_string())
         .unwrap_or_else(|| internal_call_id.to_string());
-    // A second 2xx armed for the same dialog replaces the first: stop the task
-    // still retransmitting the one it replaced.
+    // A second 2xx registered for the same dialog replaces the first: stop the
+    // task still retransmitting the one it replaced.
     if let Some(replaced) = state
         .uas_2xx_retransmits
         .insert(dialog_call_id, Arc::clone(&unacked))
     {
         replaced.cancel.notify_one();
     }
+    unacked
+}
 
+/// Retransmit the caller's 2xx `response`, registered as `unacked`, on the RFC
+/// 3261 §17.2.1 UAS schedule (T1 doubling to T2) until the caller's ACK cancels it
+/// or 64×T1 has passed. Started once the 2xx is sent: the first copy follows it by
+/// T1. An ACK that arrived in between has already cancelled `unacked`, so the task
+/// ends before sending any.
+pub fn start_2xx_retransmits(
+    unacked: Arc<UnackedAnswer>,
+    response: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    let timers = crate::transaction::timer::TimerConfig::default();
     let outbound = Arc::clone(&state.outbound);
     // Each copy is captured to HEP as the first send was.
     let capture = TaskCapture::for_task(state, transport, source_local_addr);
-    let key = internal_call_id.to_string();
+    let key = unacked.internal_call_id.clone();
 
     tokio::spawn(async move {
         let mut interval = timers.t1;
