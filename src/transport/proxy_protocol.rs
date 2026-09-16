@@ -440,6 +440,41 @@ pub(crate) async fn read_proxy_header<S: AsyncRead + Unpin>(
     }
 }
 
+/// Re-apply the accept-path abuse controls to the client a header named.
+///
+/// The accept loop ran `TransportAcl::is_allowed` and `try_accept_connection`
+/// against the **front**, because that is the only address that exists before
+/// the header is read. Both are meaningless there once a front is in play: every
+/// connection carries the same source, so the per-source ceiling never trips and
+/// a ban never matches. Without this second pass the auto-ban store still
+/// *records* an abuser behind a front — and then never drops them, which is the
+/// functional half of the very problem `proxy_protocol` exists to fix.
+///
+/// Returns the client's own permit, which the caller must keep **in place of**
+/// the front's: dropping that one hands its slots back, so the connection is
+/// counted once, against the party responsible for it. `None` means drop the
+/// connection.
+pub(crate) fn admit_proxied_client(
+    client: SocketAddr,
+    acl: &super::acl::TransportAcl,
+    transport: Transport,
+) -> Option<crate::security::AcceptPermit> {
+    // One call covers the auto-ban store, APIBAN and the static deny/allow
+    // lists — the same gate the front passed at accept.
+    if !acl.is_allowed(client.ip()) {
+        debug!("{transport} dropping proxied client {client}: refused by ACL or auto-ban");
+        return None;
+    }
+    match crate::security::try_accept_connection(client.ip()) {
+        Ok(permit) => Some(permit),
+        Err(reason) => {
+            debug!("{transport} refusing proxied client {client} by connection limit: {reason}");
+            crate::security::record_connection_refused(reason);
+            None
+        }
+    }
+}
+
 /// Read a PROXY header at an accept site and apply its verdict.
 ///
 /// The caller has already established that `peer` may assert an address — the

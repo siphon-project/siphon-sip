@@ -184,6 +184,7 @@ pub async fn listen(
             let crlf_pong_tracker = crlf_pong_tracker.clone();
             let close_tx = close_tx.clone();
             let proxy_protocol = proxy_protocol.clone();
+            let acl = Arc::clone(&acl);
 
             tokio::spawn(async move {
                 // Captured before wrapping: for the TLS arm, `get_ref().0`
@@ -207,6 +208,20 @@ pub async fn listen(
                 } else {
                     (remote_addr, None, bytes::BytesMut::new())
                 };
+                // Re-check the client the header named, ahead of both arms: the
+                // accept loop could only test the front, where the per-source
+                // ceiling never trips and a ban never matches.
+                let mut permit = permit;
+                if proxy_protocol.is_some() {
+                    match crate::transport::proxy_protocol::admit_proxied_client(
+                        remote_addr,
+                        &acl,
+                        sip_transport,
+                    ) {
+                        Some(client_permit) => permit = client_permit,
+                        None => return,
+                    }
+                }
                 let tcp_stream = PrefixedStream::new(tcp_stream, replay);
                 match acceptor {
                     Some(acceptor) => {

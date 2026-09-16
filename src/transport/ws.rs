@@ -297,6 +297,7 @@ pub async fn listen(
                     let stream_connections = stream_connections.clone();
                     let close_tx = close_tx.clone();
                     let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -320,6 +321,21 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // Re-check the client the header named, before an upgrade
+                        // is spent on it: the accept loop could only test the
+                        // front, where the ceiling never trips and a ban never
+                        // matches.
+                        let mut permit = permit;
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::WebSocket,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
                         // A browser that reached the front over WSS arrives here
                         // as plain WS; the TLV is the only record of that.
                         let client_transport = crate::transport::proxy_protocol::client_transport(
@@ -432,6 +448,7 @@ pub async fn listen_secure(
                     let stream_connections = stream_connections.clone();
                     let close_tx = close_tx.clone();
                     let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -457,6 +474,21 @@ pub async fn listen_secure(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // Re-check the client the header named, before the
+                        // handshake: the accept loop could only test the front,
+                        // where the per-source ceiling never trips and a ban
+                        // never matches, so a banned client costs no TLS here.
+                        let mut permit = permit;
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::WebSocketSecure,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
                         let client_transport = crate::transport::proxy_protocol::client_transport(
                             edge_tls.as_ref(),
                             Transport::WebSocketSecure,

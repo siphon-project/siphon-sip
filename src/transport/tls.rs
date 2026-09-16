@@ -835,6 +835,7 @@ pub async fn listen(
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
                     let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
 
                     configure_tcp_socket(&tcp_stream, tos);
 
@@ -863,6 +864,20 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // Re-check the client the header named: the accept loop
+                        // could only test the front, where the ceiling never
+                        // trips and a ban never matches. Before the handshake, so
+                        // a banned client costs no TLS.
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::Tls,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
                         // A front that re-encrypts onto this TLS hop still
                         // reports the client's own session; it agrees with the
                         // hop here rather than contradicting it.

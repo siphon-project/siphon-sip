@@ -115,6 +115,7 @@ pub async fn listen(
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
                     let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(bound);
                         // Split before the PROXY read so the bytes read past
@@ -142,6 +143,22 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // The accept loop checked the ACL and the ceiling against
+                        // the front, where neither means anything: every
+                        // connection shares that address. Re-check the client the
+                        // header named, and hold its permit instead — dropping
+                        // the front's hands those slots back, so the connection
+                        // is counted once, against whoever is responsible.
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::Tcp,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
                         // What the phone spoke to the front, when the front
                         // re-encrypted and said so. Carried beside the hop, not
                         // over it — this connection is still plain TCP.
@@ -874,6 +891,82 @@ mod tests {
         .expect("tcp listener must bind");
         assert_ne!(addr.port(), 0, "listen must return the port it bound");
         (addr, inbound_rx)
+    }
+
+    /// The accept loop checks the ACL against whoever opened the socket — the
+    /// front — so a listener behind one applies every abuse control to an
+    /// address every client shares. This proves the accept site re-applies it to
+    /// the client the header named.
+    ///
+    /// Deliberately driven through the per-listener `TransportAcl` rather than
+    /// the auto-ban store or the connection limiter: those are process-global
+    /// `OnceLock`s owned by tests in `security.rs`, so a test depending on them
+    /// here would be ordering-dependent. The ACL is passed in per listener, so
+    /// this is deterministic. It exercises the same `admit_proxied_client` call
+    /// either way — `is_allowed` is what consults the ban store in production.
+    #[tokio::test]
+    async fn a_denied_client_is_dropped_even_though_the_front_is_allowed() {
+        use tokio::io::AsyncWriteExt;
+
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        // Denies the client the header will claim; says nothing about loopback,
+        // so the front itself passes the accept-loop check.
+        let acl = Arc::new(TransportAcl::new(
+            vec!["203.0.113.66/32".to_string()],
+            vec![],
+        ));
+        let allowlist = Arc::new(crate::transport::proxy_protocol::ProxyProtocolAcl::new(&[
+            "127.0.0.0/8".to_string(),
+        ]));
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            acl,
+            None,
+            None,
+            None,
+            None,
+            Some(allowlist),
+        )
+        .await
+        .expect("tcp listener must bind");
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"PROXY TCP4 203.0.113.66 198.51.100.7 51234 5060\r\n")
+            .await
+            .unwrap();
+        client
+            .write_all(
+                concat!(
+                    "OPTIONS sip:probe@example.com SIP/2.0\r\n",
+                    "Via: SIP/2.0/TCP 203.0.113.66:51234;branch=z9hG4bKdenied\r\n",
+                    "From: <sip:probe@example.com>;tag=denied\r\n",
+                    "To: <sip:probe@example.com>\r\n",
+                    "Call-ID: denied-client@example.com\r\n",
+                    "CSeq: 1 OPTIONS\r\n",
+                    "Content-Length: 0\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Nothing must reach the dispatcher: delete the re-check at the accept
+        // site and this OPTIONS arrives under a denied address.
+        let delivered = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            inbound_rx.recv_async(),
+        )
+        .await;
+        assert!(
+            delivered.is_err(),
+            "a client the ACL denies must be dropped even when the front carrying it is allowed"
+        );
     }
 
     #[tokio::test]
