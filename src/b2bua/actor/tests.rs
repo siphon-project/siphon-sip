@@ -515,6 +515,28 @@ fn dialog_has_stable_sdp_session_id_and_zero_version() {
 }
 
 #[test]
+fn a_dialog_adopts_the_origin_of_an_sdp_siphon_sent_as_given() {
+    // An SDP that went to the peer with an o= siphon did not version keeps that
+    // session-id, and the next SDP siphon stamps takes the version after it
+    // (RFC 3264 §8).
+    let mut dialog = Dialog::from_inbound("c@h".to_string(), "rt".to_string());
+    dialog.adopt_sent_sdp(b"v=0\r\n".to_vec(), Some((7, 7)));
+    assert_eq!((dialog.sdp_session_id, dialog.sdp_version), (7, 8));
+    assert_eq!(dialog.last_sent_sdp.as_deref(), Some(&b"v=0\r\n"[..]));
+
+    // Without a readable o= the dialog keeps its own identity.
+    let mut dialog = Dialog::from_inbound("c@h".to_string(), "rt".to_string());
+    let own = dialog.sdp_session_id;
+    dialog.adopt_sent_sdp(b"v=0\r\n".to_vec(), None);
+    assert_eq!((dialog.sdp_session_id, dialog.sdp_version), (own, 0));
+    assert!(dialog.last_sent_sdp.is_some());
+
+    // A version at the top of the range does not wrap.
+    dialog.adopt_sent_sdp(Vec::new(), Some((1, u64::MAX)));
+    assert_eq!(dialog.sdp_version, u64::MAX);
+}
+
+#[test]
 fn generated_sdp_session_id_fits_a_signed_64_bit_integer() {
     // RFC 3264 §5: the o= session-id MUST be representable in a signed
     // 64-bit integer.  The generator drew from the whole unsigned range, so

@@ -51,10 +51,24 @@ pub struct RequestSource {
     pub local_addr: SocketAddr,
 }
 
-/// An offer from the caller's PRACK, sent to the callee in siphon's PRACK and
-/// waiting for its answer.
+/// What carried an offer from the caller's PRACK to the callee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferVia {
+    /// siphon's own PRACK for the callee's reliable provisional (RFC 3262 §5): the
+    /// early dialog, so an offer the callee cannot take fails the call.
+    Prack,
+    /// An UPDATE on the callee's dialog (RFC 3311), for a PRACK that arrived once
+    /// the caller had its 2xx and siphon's PRACK had gone with it. A refusal
+    /// leaves the session as it was (§5.3), and is the caller's PRACK's answer.
+    Update,
+}
+
+/// An offer from the caller's PRACK, sent to the callee in siphon's PRACK, or in
+/// an UPDATE, and waiting for its answer.
 #[derive(Debug, Clone)]
 pub struct PendingPrackOffer {
+    /// What carried it to the callee.
+    pub via: OfferVia,
     /// The caller's PRACK, which the 200 carrying the answer responds to.
     pub caller_prack: SipMessage,
     pub source: RequestSource,
@@ -142,12 +156,14 @@ impl PrackBridge {
         self.pending_offer = Some(offer);
     }
 
-    /// Whether the caller's PRACK of siphon's `a_leg_rseq` carried an offer the
-    /// callee has not answered yet.
-    pub fn offer_waits_on(&self, a_leg_rseq: u32) -> bool {
-        self.pending_offer
-            .as_ref()
-            .is_some_and(|pending| pending.a_leg_rseq == a_leg_rseq)
+    /// Whether the caller's PRACK of siphon's `a_leg_rseq` with the CSeq
+    /// `caller_prack_cseq` carried an offer the callee has not answered yet: a
+    /// retransmission of that PRACK, and not a new PRACK of the same provisional.
+    pub fn offer_waits_on(&self, a_leg_rseq: u32, caller_prack_cseq: Option<&String>) -> bool {
+        self.pending_offer.as_ref().is_some_and(|pending| {
+            pending.a_leg_rseq == a_leg_rseq
+                && pending.caller_prack.headers.cseq() == caller_prack_cseq
+        })
     }
 
     /// Whether the pending offer went to the callee in siphon's PRACK `b_leg_cseq`
@@ -202,6 +218,11 @@ impl PrackBridge {
         } else {
             None
         }
+    }
+
+    /// What carried the offer still with the callee, if one is.
+    pub fn pending_offer_via(&self) -> Option<OfferVia> {
+        self.pending_offer.as_ref().map(|pending| pending.via)
     }
 
     /// Whether an offer from the caller's PRACK is still with the callee.
@@ -283,6 +304,7 @@ mod tests {
 
     fn pending(sent_at: Instant) -> PendingPrackOffer {
         PendingPrackOffer {
+            via: OfferVia::Prack,
             caller_prack: message(),
             source: RequestSource {
                 transport: Transport::Udp,
@@ -334,15 +356,18 @@ mod tests {
         assert!(!bridge.offer_pending());
         bridge.begin_offer(pending(now));
         assert!(bridge.offer_pending());
-        assert!(bridge.offer_waits_on(7));
-        assert!(!bridge.offer_waits_on(8));
+        let retransmission = "2 PRACK".to_string();
+        let new_prack = "3 PRACK".to_string();
+        assert!(bridge.offer_waits_on(7, Some(&retransmission)));
+        assert!(!bridge.offer_waits_on(8, Some(&retransmission)));
+        assert!(!bridge.offer_waits_on(7, Some(&new_prack)));
         assert!(bridge.take_offer("b-leg@198.51.100.70", 4).is_none());
         assert!(bridge.take_offer("another@198.51.100.70", 3).is_none());
         assert!(!bridge.offer_overdue(now + PRACK_OFFER_WAIT - Duration::from_millis(1)));
         assert!(bridge.take_overdue_offer(now).is_none());
         assert!(bridge.offer_overdue(now + PRACK_OFFER_WAIT));
         assert!(bridge.take_offer("b-leg@198.51.100.70", 3).is_some());
-        assert!(!bridge.offer_waits_on(7));
+        assert!(!bridge.offer_waits_on(7, Some(&retransmission)));
         assert!(
             bridge.offer_pending(),
             "a 2xx still waits for the 200 on its way"

@@ -195,6 +195,19 @@ impl Dialog {
         }
     }
 
+    /// Put `sdp`, a session description siphon sent this dialog's peer without
+    /// putting its own `o=` version on it, in force on the dialog, with `origin`,
+    /// its `o=` session id and version, as the dialog's own (RFC 3264 §8): a session
+    /// refresh offers it unchanged, and the next SDP siphon sends the peer keeps
+    /// that session id at the version after it.
+    pub fn adopt_sent_sdp(&mut self, sdp: Vec<u8>, origin: Option<(u64, u64)>) {
+        if let Some((session_id, version)) = origin {
+            self.sdp_session_id = session_id;
+            self.sdp_version = version.saturating_add(1);
+        }
+        self.last_sent_sdp = Some(sdp);
+    }
+
     /// Rewrite dialog headers (Call-ID + From-tag, optionally To-tag) on a SIP message.
     ///
     /// - Replaces `Call-ID` with `new_call_id`.

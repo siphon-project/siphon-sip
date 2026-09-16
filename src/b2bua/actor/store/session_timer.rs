@@ -88,11 +88,7 @@ impl CallActorStore {
     ) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(leg) = dialog_leg(&mut call, on_a_leg) {
-                if let Some((session_id, version)) = origin {
-                    leg.dialog.sdp_session_id = session_id;
-                    leg.dialog.sdp_version = version.saturating_add(1);
-                }
-                leg.dialog.last_sent_sdp = Some(sdp);
+                leg.dialog.adopt_sent_sdp(sdp, origin);
             }
         }
     }

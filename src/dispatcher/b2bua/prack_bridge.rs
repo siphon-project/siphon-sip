@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use crate::b2bua::actor::{HeldCalleePrack, PendingPrackOffer, RequestSource};
+use crate::b2bua::actor::{HeldCalleePrack, OfferVia, PendingPrackOffer, RequestSource};
 use crate::dispatcher::*;
 
 /// The status a caller that PRACKs the callee's offer without an answer is
@@ -34,6 +34,13 @@ pub enum CallerPrackBridged {
     Fail {
         answer: Option<Vec<u8>>,
         status: u16,
+    },
+    /// Refuse the offer in the caller's PRACK with `status`, and a `Retry-After`
+    /// when given, leaving the session as it was and the call up (RFC 3311 §5.2,
+    /// RFC 6337 §2.3).
+    Refuse {
+        status: u16,
+        retry_after: Option<String>,
     },
 }
 
@@ -434,6 +441,7 @@ pub fn bridge_caller_prack(
                 .get_call_mut(call_id)
                 .map(|mut call| {
                     call.prack_bridge.begin_offer(PendingPrackOffer {
+                        via: OfferVia::Prack,
                         caller_prack: caller_prack.clone(),
                         source: RequestSource {
                             transport: inbound.transport,
@@ -531,6 +539,10 @@ pub fn handle_callee_prack_response(
             Anchoring::Rewritten(answer) => Some(answer),
             Anchoring::Refused => None,
         };
+        if answer.is_none() && pending.via == OfferVia::Update {
+            end_call_on_unrelayable_update_answer(&call_id, pending, state);
+            return;
+        }
         if let Some(mut answer) = answer {
             // The callee took the offer siphon's PRACK carried, so that offer is the
             // session description in force on the callee's dialog now, and the
@@ -542,6 +554,14 @@ pub fn handle_callee_prack_response(
                     leg.dialog.last_sent_sdp = Some(offer);
                 }
             });
+            // An offer the callee accepts in an UPDATE is the caller's own SDP from
+            // now on. The call outlives a refused one, which changed nothing (RFC
+            // 3311 §5.3), so it is recorded only here.
+            if pending.via == OfferVia::Update {
+                state
+                    .call_actors
+                    .set_leg_last_sdp(&call_id, true, &pending.offer);
+            }
             let content_type = message
                 .headers
                 .get("Content-Type")
@@ -590,6 +610,14 @@ pub fn handle_callee_prack_response(
         }
     }
 
+    // An UPDATE after the caller's 2xx: its refusal leaves the session as it was
+    // and refuses the caller's PRACK the same way (RFC 3311 §5.3).
+    if pending.via == OfferVia::Update {
+        let retry_after = message.headers.get("Retry-After").cloned();
+        refuse_late_prack_offer(&call_id, pending, status_code, retry_after, state);
+        return;
+    }
+
     debug!(
         call_id = %call_id,
         status = status_code,
@@ -617,6 +645,16 @@ pub fn handle_callee_prack_response(
 /// unanswered for 64*T1, on the call's teardown claim. The caller's PRACK still
 /// gets its 200, with every stream of its offer rejected.
 pub fn fail_overdue_prack_offer(call_id: &str, now: Instant, state: &DispatcherState) {
+    // An UPDATE after the caller's 2xx left unanswered ends the call as a 408 for
+    // it would (RFC 3311 §5.3); there is no INVITE left to refuse.
+    let via = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.prack_bridge.pending_offer_via());
+    if via == Some(OfferVia::Update) {
+        end_call_on_overdue_update(call_id, now, state);
+        return;
+    }
     let mut pending = None;
     let Some(refusal) = claim_refusal(call_id, state, |call| {
         pending = call.prack_bridge.take_overdue_offer(now);
@@ -658,7 +696,7 @@ fn answer_caller_prack_rejecting(pending: &PendingPrackOffer, state: &Dispatcher
 }
 
 /// How an in-dialog offer or answer crosses the media engine.
-enum Anchoring {
+pub(super) enum Anchoring {
     /// The call's media is not anchored: the SDP goes as written.
     NotAnchored,
     /// The engine's SDP.
@@ -669,7 +707,7 @@ enum Anchoring {
 
 /// Send the caller's offer from its PRACK to the media engine as a re-offer from
 /// the caller's side, when the call is anchored.
-fn anchored_caller_offer(
+pub(super) fn anchored_caller_offer(
     call_id: &str,
     caller_prack: &SipMessage,
     inbound: &InboundMessage,
