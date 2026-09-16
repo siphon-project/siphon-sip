@@ -36,6 +36,10 @@ use crate::transport::{
 pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     transport_variant: Transport,
+    // What the client spoke, when a front's PROXY header declared a transport
+    // different from this hop. Stamped on every message alongside
+    // `transport_variant`, never in place of it.
+    client_transport: Option<Transport>,
     connection_id: ConnectionId,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -129,6 +133,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                     let message = InboundMessage {
                         connection_id,
                         transport: transport_variant,
+                        client_transport,
                         local_addr,
                         remote_addr,
                         data,
@@ -142,6 +147,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                     let message = InboundMessage {
                         connection_id,
                         transport: transport_variant,
+                        client_transport,
                         local_addr,
                         remote_addr,
                         data,
@@ -299,7 +305,7 @@ pub async fn listen(
                         // Before the upgrade: the header precedes the GET, and
                         // the client address it carries is what every consumer
                         // downstream keys on.
-                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
                             match accept_proxied(
                                 &mut tcp_stream,
                                 remote_addr,
@@ -314,10 +320,17 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // A browser that reached the front over WSS arrives here
+                        // as plain WS; the TLV is the only record of that.
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::WebSocket,
+                        );
                         info!("WS accepted {} as {:?}", remote_addr, connection_id);
                         handle_connection(
                             PrefixedStream::new(tcp_stream, replay),
                             Transport::WebSocket,
+                            client_transport,
                             connection_id,
                             local,
                             remote_addr,
@@ -429,7 +442,7 @@ pub async fn listen_secure(
                         // Cleartext, ahead of the ClientHello — the ordering
                         // that lets a front re-encrypt and still convey the
                         // phone's address.
-                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
                             match accept_proxied(
                                 &mut tcp_stream,
                                 remote_addr,
@@ -444,6 +457,10 @@ pub async fn listen_secure(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::WebSocketSecure,
+                        );
                         let tcp_stream = PrefixedStream::new(tcp_stream, replay);
                         // TLS handshake first, bounded the same way the TLS and
                         // mux listeners bound theirs — a peer that connects and
@@ -474,6 +491,7 @@ pub async fn listen_secure(
                         handle_connection(
                             tls_stream,
                             Transport::WebSocketSecure,
+                            client_transport,
                             connection_id,
                             local,
                             remote_addr,
@@ -535,6 +553,7 @@ mod tests {
             let served = tokio::spawn(handle_connection(
                 server,
                 Transport::WebSocket,
+                None,
                 connection_id,
                 local_addr,
                 remote_addr,

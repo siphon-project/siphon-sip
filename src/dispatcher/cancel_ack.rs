@@ -256,6 +256,7 @@ pub(super) fn start_next_fork_branch(
 
     if let Some(target_str) = target {
         let inbound_info = InboundMessage {
+            client_transport: None,
             remote_addr: source_addr,
             local_addr: state.local_addr,
             connection_id,

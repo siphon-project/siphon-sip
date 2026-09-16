@@ -491,7 +491,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         &call_id,
         &message,
         &inbound.remote_addr.ip().to_string(),
-        &format!("{}", inbound.transport).to_lowercase(),
+        // Descriptive field: the caller's own transport, which behind a
+        // TLS-terminating front is not the hop siphon accepted.
+        inbound.client_or_hop_transport().as_scheme(),
     );
 
     // Invoke @b2bua.on_invite

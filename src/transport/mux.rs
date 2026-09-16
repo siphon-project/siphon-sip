@@ -41,7 +41,7 @@ use crate::config::TlsServerConfig;
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
-use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
+use crate::transport::proxy_protocol::{accept_proxied, EdgeTls, ProxyProtocolAcl};
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_stream, spawn_outbound_distributor, PrefixedStream,
     StreamContext, StreamProtocol,
@@ -192,7 +192,7 @@ pub async fn listen(
                 // One read, ahead of the `match`, so it covers both arms: the
                 // header is cleartext and precedes the ClientHello as much as it
                 // precedes a SIP start-line or a WebSocket GET.
-                let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
                     match accept_proxied(
                         &mut tcp_stream,
                         remote_addr,
@@ -233,6 +233,7 @@ pub async fn listen(
                         dispatch(
                             tls_stream,
                             (Transport::Tls, Transport::WebSocketSecure),
+                            edge_tls,
                             local_addr,
                             remote_addr,
                             permit,
@@ -249,6 +250,7 @@ pub async fn listen(
                         dispatch(
                             tcp_stream,
                             (Transport::Tcp, Transport::WebSocket),
+                            edge_tls,
                             local_addr,
                             remote_addr,
                             permit,
@@ -275,6 +277,11 @@ pub async fn listen(
 async fn dispatch<S>(
     mut stream: S,
     transports: (Transport, Transport),
+    // The client's TLS session at the front, read once ahead of the protocol
+    // sniff because the header precedes a ClientHello, a SIP start-line and a
+    // WebSocket GET alike. Resolved against whichever hop the sniff lands on:
+    // the same TLV means TLS on the SIP arm and WSS on the WebSocket one.
+    edge_tls: Option<EdgeTls>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     // Connection slot taken at accept. Released when this function returns,
@@ -338,6 +345,10 @@ async fn dispatch<S>(
                 writer,
                 StreamContext {
                     transport: sip_transport,
+                    client_transport: crate::transport::proxy_protocol::client_transport(
+                        edge_tls.as_ref(),
+                        sip_transport,
+                    ),
                     connection_id,
                     local_addr,
                     remote_addr,
@@ -362,6 +373,10 @@ async fn dispatch<S>(
             crate::transport::ws::handle_connection(
                 PrefixedStream::new(stream, prefix),
                 websocket_transport,
+                crate::transport::proxy_protocol::client_transport(
+                    edge_tls.as_ref(),
+                    websocket_transport,
+                ),
                 connection_id,
                 local_addr,
                 remote_addr,

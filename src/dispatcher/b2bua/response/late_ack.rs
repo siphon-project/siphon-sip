@@ -189,6 +189,7 @@ mod tests {
 
     fn udp_from(remote: &str, local: &str) -> InboundMessage {
         InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: address(local),
@@ -526,6 +527,7 @@ mod tests {
             "<sip:198.51.100.52;lr;transport=tcp>".to_string(),
         );
         let arrived_on = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId(7),
             transport: Transport::Tcp,
             local_addr: address(SIPHON),

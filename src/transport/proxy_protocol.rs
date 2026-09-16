@@ -376,6 +376,23 @@ fn parse_ssl_value(value: &[u8]) -> EdgeTls {
     edge
 }
 
+/// What the client spoke, from the header's TLS detail and the hop it arrived on.
+///
+/// `Some` only when the front reported a real client TLS session. The TLV says
+/// the client used TLS but not which transport, so the answer is the secure
+/// form of the hop ([`Transport::secure_form`]). `None` — no header, no TLV, or
+/// a TLV with `PP2_CLIENT_SSL` clear — means nothing contradicts the hop, and
+/// every consumer falls back to it.
+///
+/// Deliberately never folded into the hop's own [`Transport`]: they are
+/// different facts, and conflating them would route a reply for a plaintext
+/// socket over a TLS map.
+pub(crate) fn client_transport(edge_tls: Option<&EdgeTls>, hop: Transport) -> Option<Transport> {
+    edge_tls
+        .filter(|edge| edge.used_tls)
+        .map(|_| hop.secure_form())
+}
+
 /// How long a front has to deliver its header. Same order as the SIP sniff and
 /// the TLS handshake: long enough for a slow link, short enough that a peer
 /// which connects and says nothing cannot pin a task and a socket.
@@ -745,6 +762,48 @@ mod tests {
         header.extend_from_slice(&4u16.to_be_bytes());
         header.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(parse(&header), ProxyHeader::Invalid);
+    }
+
+    // --- client_transport: the TLV applied to the hop ------------------------
+
+    #[test]
+    fn a_client_tls_session_reports_the_secure_form_of_the_hop() {
+        let used_tls = EdgeTls {
+            used_tls: true,
+            client_cert_verified: true,
+            version: Some("TLSv1.3".to_string()),
+        };
+        // The case the TLV exists for: a re-encrypting front leaves a plaintext
+        // hop behind it, and only the header knows the phone spoke TLS.
+        assert_eq!(
+            client_transport(Some(&used_tls), Transport::Tcp),
+            Some(Transport::Tls)
+        );
+        // A browser UA behind the same front was speaking WSS, not TLS.
+        assert_eq!(
+            client_transport(Some(&used_tls), Transport::WebSocket),
+            Some(Transport::WebSocketSecure)
+        );
+        // Already secure: the TLV agrees with the hop rather than contradicting it.
+        assert_eq!(
+            client_transport(Some(&used_tls), Transport::Tls),
+            Some(Transport::Tls)
+        );
+    }
+
+    #[test]
+    fn a_header_without_a_client_tls_session_leaves_the_hop_to_speak() {
+        assert_eq!(client_transport(None, Transport::Tcp), None);
+        let plaintext_client = EdgeTls {
+            used_tls: false,
+            client_cert_verified: false,
+            version: None,
+        };
+        assert_eq!(
+            client_transport(Some(&plaintext_client), Transport::Tcp),
+            None,
+            "PP2_CLIENT_SSL clear means the client did not use TLS"
+        );
     }
 
     // --- read_proxy_header: the bounded read around `parse` -----------------

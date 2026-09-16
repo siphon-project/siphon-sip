@@ -127,7 +127,7 @@ pub async fn listen(
                         // client address it carries replaces the front's for
                         // every consumer downstream: the ban store, the
                         // registrar's `received`, capture and the CDR.
-                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
                             match accept_proxied(
                                 &mut reader,
                                 remote_addr,
@@ -142,6 +142,13 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // What the phone spoke to the front, when the front
+                        // re-encrypted and said so. Carried beside the hop, not
+                        // over it — this connection is still plain TCP.
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::Tcp,
+                        );
                         // Push the over-read back in front of the read half so
                         // the framer sees the first SIP message the front sent
                         // in the same segment as the header.
@@ -172,6 +179,7 @@ pub async fn listen(
                             writer,
                             StreamContext {
                                 transport: Transport::Tcp,
+                                client_transport,
                                 connection_id,
                                 local_addr,
                                 remote_addr,
@@ -977,5 +985,131 @@ mod tests {
                 .unwrap();
         assert_eq!(&inbound.data[..], register.as_bytes());
         assert_eq!(inbound.transport, Transport::Tcp);
+    }
+
+    // --- end to end: the client's transport at the front ---------------------
+
+    /// Start a TCP SIP listener that sits behind a front and is given the
+    /// PROXY header by it.
+    async fn spawn_proxied_listener() -> (SocketAddr, flume::Receiver<InboundMessage>) {
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::new(ProxyProtocolAcl::new(
+                &["127.0.0.0/8".to_string()],
+            ))),
+        )
+        .await
+        .expect("tcp listener must bind");
+        (addr, inbound_rx)
+    }
+
+    /// A v2 `PROXY` header for TCP4, optionally carrying the `PP2_TYPE_SSL` TLV
+    /// that reports the client's TLS session with the front.
+    fn proxy_v2_tcp4(client_used_tls: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&std::net::Ipv4Addr::new(192, 0, 2, 10).octets());
+        body.extend_from_slice(&std::net::Ipv4Addr::new(198, 51, 100, 7).octets());
+        body.extend_from_slice(&51234u16.to_be_bytes());
+        body.extend_from_slice(&5061u16.to_be_bytes());
+        if client_used_tls {
+            // client=PP2_CLIENT_SSL, verify=0, then PP2_SUBTYPE_SSL_VERSION.
+            let mut ssl_value = vec![0x01u8, 0, 0, 0, 0];
+            ssl_value.push(0x21);
+            ssl_value.extend_from_slice(&7u16.to_be_bytes());
+            ssl_value.extend_from_slice(b"TLSv1.3");
+            body.push(0x20); // PP2_TYPE_SSL
+            body.extend_from_slice(&(ssl_value.len() as u16).to_be_bytes());
+            body.extend_from_slice(&ssl_value);
+        }
+        let mut header = Vec::from(
+            [
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ]
+            .as_slice(),
+        );
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x11); // TCP over IPv4
+        header.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        header.extend_from_slice(&body);
+        header
+    }
+
+    const PROXIED_REGISTER: &str = concat!(
+        "REGISTER sip:example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/TCP 192.0.2.10:51234;branch=z9hG4bK-edge\r\n",
+        "From: <sip:alice@example.com>;tag=abc123\r\n",
+        "To: <sip:alice@example.com>\r\n",
+        "Call-ID: edge-tls-test@example.com\r\n",
+        "CSeq: 1 REGISTER\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+
+    /// A re-encrypting front terminates the phone's TLS and opens its own
+    /// plaintext connection, so the hop is TCP while the client spoke TLS. The
+    /// `PP2_TYPE_SSL` TLV is the only record of that, and it has to reach the
+    /// dispatcher beside the hop rather than replacing it — the hop is what
+    /// decides the connection map, the Via token and the advertised address.
+    #[tokio::test]
+    async fn a_proxied_clients_edge_tls_reaches_the_dispatcher_beside_the_hop() {
+        use tokio::io::AsyncWriteExt;
+
+        let (addr, inbound_rx) = spawn_proxied_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&proxy_v2_tcp4(true)).await.unwrap();
+        client.write_all(PROXIED_REGISTER.as_bytes()).await.unwrap();
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("the proxied REGISTER must be dispatched")
+                .unwrap();
+
+        assert_eq!(
+            inbound.transport,
+            Transport::Tcp,
+            "the hop siphon accepted is still plaintext TCP"
+        );
+        assert_eq!(
+            inbound.client_transport,
+            Some(Transport::Tls),
+            "the SSL TLV says the phone reached the front over TLS"
+        );
+        assert_eq!(
+            inbound.remote_addr.ip().to_string(),
+            "192.0.2.10",
+            "the client address still comes from the header, not the front"
+        );
+    }
+
+    /// The same front without the TLV: nothing contradicts the hop, so no
+    /// client transport is invented for a connection that may well be plaintext
+    /// end to end.
+    #[tokio::test]
+    async fn a_proxied_client_without_the_tlv_reports_no_separate_transport() {
+        use tokio::io::AsyncWriteExt;
+
+        let (addr, inbound_rx) = spawn_proxied_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&proxy_v2_tcp4(false)).await.unwrap();
+        client.write_all(PROXIED_REGISTER.as_bytes()).await.unwrap();
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("the proxied REGISTER must be dispatched")
+                .unwrap();
+        assert_eq!(inbound.transport, Transport::Tcp);
+        assert_eq!(inbound.client_transport, None);
     }
 }

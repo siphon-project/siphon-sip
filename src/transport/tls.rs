@@ -848,7 +848,7 @@ pub async fn listen(
                         // ordering is the whole point for a re-encrypting front:
                         // it terminates the phone's TLS and opens its own, and
                         // this is the only place the phone's address exists.
-                        let (remote_addr, _edge_tls, replay) = if proxy_protocol.is_some() {
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
                             match accept_proxied(
                                 &mut tcp_stream,
                                 remote_addr,
@@ -863,6 +863,13 @@ pub async fn listen(
                         } else {
                             (remote_addr, None, bytes::BytesMut::new())
                         };
+                        // A front that re-encrypts onto this TLS hop still
+                        // reports the client's own session; it agrees with the
+                        // hop here rather than contradicting it.
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::Tls,
+                        );
                         // Replay the over-read into the acceptor, so a
                         // ClientHello that shared a segment with the header is
                         // not lost.
@@ -926,6 +933,7 @@ pub async fn listen(
                             writer,
                             StreamContext {
                                 transport: Transport::Tls,
+                                client_transport,
                                 connection_id,
                                 local_addr,
                                 remote_addr,

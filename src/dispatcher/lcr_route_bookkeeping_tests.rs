@@ -95,6 +95,7 @@ fn caller_cancels(sequence: &Sequence) {
     );
     let cancel = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's CANCEL parses");
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: sequence.dispatcher.state.local_addr,

@@ -72,6 +72,10 @@ pub(crate) struct StreamContext {
     /// Transport this connection speaks — stamped on every `InboundMessage`
     /// and used to key the [`StreamConnections`] registry.
     pub transport: Transport,
+    /// What the client spoke, when a front's PROXY header said so and it
+    /// differs from `transport`. Carried alongside the hop, never over it —
+    /// see [`InboundMessage::client_transport`](super::InboundMessage).
+    pub client_transport: Option<Transport>,
     pub connection_id: ConnectionId,
     /// Local (listener) address the connection arrived on.
     pub local_addr: SocketAddr,
@@ -434,6 +438,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
 {
     let StreamContext {
         transport,
+        client_transport,
         connection_id,
         local_addr,
         remote_addr,
@@ -534,6 +539,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
                 let message = InboundMessage {
                     connection_id,
                     transport,
+                    client_transport,
                     local_addr,
                     remote_addr,
                     data,
@@ -1241,6 +1247,7 @@ mod tests {
     fn context() -> StreamContext {
         StreamContext {
             transport: Transport::Tcp,
+            client_transport: None,
             connection_id: ConnectionId(42),
             local_addr: "127.0.0.1:5060".parse().unwrap(),
             remote_addr: "127.0.0.1:41234".parse().unwrap(),

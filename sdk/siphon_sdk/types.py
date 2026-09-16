@@ -265,6 +265,17 @@ class Contact:
     reg-event NOTIFY bodies (TS 24.229 §5.4.2.1.2) but are excluded
     from routing lookups."""
 
+    client_transport: Optional[str] = None
+    """Transport the client used to reach the front when this binding was
+    registered (``"tls"``, ``"wss"``, …), or ``None`` when no front declared
+    one.
+
+    Descriptive, like :attr:`received`: it records that a UE behind a
+    TLS-terminating front spoke TLS even though siphon accepted the REGISTER
+    over plain TCP.  Routing still follows :attr:`flow` and :attr:`uri`, which
+    name the socket the UE is actually reachable on.  ``None`` does not mean
+    insecure — it means nothing contradicted the hop the REGISTER arrived on."""
+
     auth_user: Optional[str] = None
     """Authenticated identity that stored this binding: what
     ``request.auth_user`` held when ``registrar.save()`` ran, which in IMS is

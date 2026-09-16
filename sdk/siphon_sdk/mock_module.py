@@ -1745,6 +1745,9 @@ class MockRegistrar:
                 # Whoever authenticated this REGISTER, and nobody else: no
                 # carry-over from the binding it replaces, as in the engine.
                 auth_user=getattr(request, "auth_user", None),
+                # Descriptive: what the UE spoke to a front, when one said so.
+                # The binding still routes by its flow and Contact URI.
+                client_transport=getattr(request, "client_transport", None),
             )
             if flow_token is not None:
                 binding.flow_token = flow_token

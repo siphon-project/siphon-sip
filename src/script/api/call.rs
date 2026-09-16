@@ -3359,6 +3359,7 @@ mod tests {
     /// `registrar.lookup()` hands it to a script.
     fn binding_with_path(uri: &str, path: Vec<String>) -> super::super::registrar::PyContact {
         let contact = crate::registrar::Contact {
+            client_transport: None,
             uri: crate::sip::parser::parse_uri_standalone(uri).unwrap(),
             q: 1.0,
             registered_at: std::time::Instant::now(),
