@@ -14,10 +14,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   connection, so every consumer that keys on the source saw the front: auto-ban
   banned the front rather than the abuser, `from_gateway()` and
   `source_ip_in()` stopped discriminating, NAT return-routing advertised the
-  front, and `media.received_from` gated media ingress to it so no RTP was
-  accepted at all. The documented alternative, L4 source preservation, cannot
-  work for a front that terminates the connection, which is the point of using
-  one to terminate TLS.
+  front in `received=`/`rport=`, `media.received_from` gated media ingress to it
+  so no RTP was accepted at all, and capture and the CDR recorded the front for
+  every call. The documented alternative, L4 source preservation, cannot work
+  for a front that terminates the connection, which is the point of using one to
+  terminate TLS.
 
   Enabling it requires naming the senders allowed to assert an address:
 
@@ -33,14 +34,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `security.trusted_cidrs`, which means "exempt from abuse controls" to all four
   of its consumers and is where monitoring boxes and trunks are listed —
   inheriting it would hand source-address forgery rights to hosts named there
-  for an unrelated reason. Stream transports only (`tcp`, `tls`, `ws`, `wss`); a
-  UDP listener is refused at config load, as is an empty `from` or an entry that
-  is not a CIDR. The header is read before the TLS handshake, so a front may
-  re-encrypt and no hop carries cleartext SIP. A connection with no header on an
-  enabled listener is rejected rather than quietly attributed to the front, and
-  a PROXY header arriving on a listener that has the option *off* is recognised
-  and refused with a log naming the listener, instead of being counted as binary
-  garbage and credited to the auto-ban store — siphon banning its own front.
+  for an unrelated reason. Stream listeners only (`tcp`, `tls`, `ws`, `wss`, and
+  a shared `tcp+ws` / `tls+wss` socket); a UDP listener is refused at config
+  load, as is an empty `from` or an entry that is not a CIDR. The header is read
+  before the TLS handshake, so a front may re-encrypt and no hop carries
+  cleartext SIP.
+
+  On an enabled listener, a connection from an address outside `from` and a
+  connection that opens without a header are both dropped rather than quietly
+  attributed to the front, and neither credits the auto-ban store — a second
+  front missing from the list is likelier than abuse, and banning your own
+  ingress is the worse outage. A v2 `LOCAL` or v1 `UNKNOWN` header (a front's own
+  health checks) is consumed and the socket's peer address stands. A PROXY header
+  arriving on a listener that has the option *off* is recognised and refused with
+  a log naming the listener, instead of being counted as binary garbage and
+  credited to the auto-ban store — siphon banning its own front. The v2
+  `PP2_TYPE_SSL` TLV is parsed but not yet passed to any consumer, so the
+  transport siphon reports is still the one this hop speaks.
 
 ### Fixed
 
