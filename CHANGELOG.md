@@ -48,9 +48,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   health checks) is consumed and the socket's peer address stands. A PROXY header
   arriving on a listener that has the option *off* is recognised and refused with
   a log naming the listener, instead of being counted as binary garbage and
-  credited to the auto-ban store — siphon banning its own front. The v2
-  `PP2_TYPE_SSL` TLV is parsed but not yet passed to any consumer, so the
-  transport siphon reports is still the one this hop speaks.
+  credited to the auto-ban store — siphon banning its own front.
+
+- **A re-encrypting front can tell siphon the client spoke TLS, via the v2
+  `PP2_TYPE_SSL` TLV.** A front that terminates the UE's TLS and opens a
+  plaintext connection to siphon leaves every consumer seeing `tcp`, so a script
+  gating on transport security would refuse a UE that did use TLS. The client's
+  transport is now carried *beside* the hop's, never over it: `request.transport`
+  still names the hop siphon accepted, and two new properties answer for the
+  client — `request.client_transport` (the front-declared transport, or `None`
+  when there is no front) and `request.client_is_secure`, which answers for the
+  client's effective hop so a UE connecting straight to a `tls` listener reports
+  `True` as well. `Contact.client_transport` persists it with the binding, and
+  the CDR records the client's transport rather than the front-facing one.
+  Mirrored in the SDK.
 
 ### Fixed
 

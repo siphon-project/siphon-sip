@@ -575,12 +575,25 @@ On a shared `tcp+ws` or `tls+wss` socket, set the same `proxy_protocol` on both
 halves — one socket takes one policy. siphon warns and uses the `tcp:` / `tls:`
 side when the two disagree.
 
-!!! note "The v2 TLS TLV is parsed, not yet used"
+!!! note "What the client spoke, beside what this hop speaks"
     A v2 header can carry `PP2_TYPE_SSL`, describing the TLS session the client
-    negotiated *with the front*. siphon parses it but does not yet feed it to
-    anything, so `request.transport` still reports this hop's transport — `tcp`
-    for a front that re-encrypts into a plaintext listener. Don't base trust
-    decisions on it yet.
+    negotiated *with the front*. siphon carries that **beside** the hop, never
+    over it: `request.transport` keeps naming the transport siphon itself
+    accepted — `tcp` for a front that re-encrypts into a plaintext listener —
+    because that is what decides which connection map, pool and Via/Contact
+    token the message belongs to.
+
+    Two properties answer for the client instead:
+
+    - `request.client_transport` — the transport the front says the client used,
+      or `None` when no front declared one.
+    - `request.client_is_secure` — whether the client's *effective* hop was
+      secure. A UE that connects straight to a `tls` listener reports `True`
+      too, so `if not request.client_is_secure: reject` is safe to write; reading
+      `client_transport is None` as "insecure" would lock out every direct-TLS UE.
+
+    `Contact.client_transport` persists it with the registrar binding, and the
+    CDR records the client's transport rather than the front-facing one.
 
 ---
 
