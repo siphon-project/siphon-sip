@@ -361,6 +361,60 @@ fn originate_with_a_bad_privacy_value_is_bad_request() {
     ));
 }
 
+#[test]
+fn originate_refuses_the_unimplemented_on_lost_fallback_policy() {
+    // `fallback` would re-dispatch the call through the Python handlers, which
+    // was never built: the control-loss path ends the call for every policy
+    // that is not `continue`. Config load refuses it, so the verb that carries
+    // it per call has to as well — otherwise a controller asking to keep its
+    // calls alive when it dies gets them hung up, on every call.
+    let result = originate_args(serde_json::json!({
+        "channel": "cb-1",
+        "to": "sip:1@carrier.example",
+        "media": true,
+        "on_lost": "fallback",
+    }));
+    match result {
+        ControlResult::Error { code, ref message } => {
+            assert_eq!(code, ControlErrorCode::BadRequest, "message was: {message}");
+            assert!(
+                message.contains("fallback") && message.contains("not implement"),
+                "the refusal must say fallback is not implemented: {message}"
+            );
+            assert!(
+                message.contains("hangup") && message.contains("continue"),
+                "and name the policies that do exist: {message}"
+            );
+        }
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+}
+
+#[test]
+fn originate_accepts_the_implemented_control_loss_policies() {
+    // The guard must refuse the policy that does not exist without refusing the
+    // two that do; these fail later, on the dispatcher this process does not
+    // run, which is a different code.
+    for policy in ["hangup", "continue"] {
+        let result = originate_args(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+            "media": true,
+            "on_lost": policy,
+        }));
+        assert!(
+            !matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "on_lost {policy} must not be refused as malformed: {result:?}"
+        );
+    }
+}
+
 fn test_bus() -> std::sync::Arc<ControlBus> {
     use crate::config::ControlAppConfig;
     let (command_tx, _rx) = flume::unbounded();
