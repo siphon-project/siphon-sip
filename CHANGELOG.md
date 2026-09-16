@@ -6,7 +6,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-## [1.9.0] — 2026-09-15
+## [1.9.0] — 2026-09-16
 
 ### Added
 
