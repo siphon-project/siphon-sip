@@ -6,7 +6,7 @@
 use std::net::IpAddr;
 
 use super::{
-    parse_security_client, EncryptionAlgorithm, IntegrityAlgorithm, IpsecManager, SaProtocol,
+    parse_security_client, EncryptionAlgorithm, IntegrityAlgorithm, IpsecManager,
     SecurityAssociationPair, SecurityClient,
 };
 use crate::sip::headers::SipHeaders;
@@ -122,10 +122,16 @@ fn mirrors(entry: &SecurityClient, sa: &SecurityAssociationPair) -> bool {
 /// The `Security-Server` value `sa` stands for, which a 494 refusing a request
 /// that arrived over it carries: "the server's unmodified list of supported
 /// security mechanisms" (RFC 3329 §2.3.1). Spelled the way a script builds the
-/// header from `SecurityServerParams`, with `protocol=tcp` only on an
-/// association pinned to TCP.
+/// header from `SecurityServerParams`.
+///
+/// No transport `protocol=` parameter, on any association. No sec-agree spec
+/// defines one: not RFC 3329 §2.2 or its Appendix A, and not TS 33.203 Annex H,
+/// whose `mech-parameters` list is closed and whose own `protocol` rule is
+/// `prot=ah|esp`. One pair carries UDP and TCP alike (TS 33.203 §6.3, §7.1), so
+/// there is no transport for the header to name. A `sa.protocol` pinned to TCP
+/// still narrows the kernel XFRM selectors; it just does not show up here.
 pub fn security_server_value(sa: &SecurityAssociationPair) -> String {
-    let mut value = format!(
+    format!(
         "ipsec-3gpp; alg={}; ealg={}; spi-c={}; spi-s={}; port-c={}; port-s={}",
         sa.aalg.sec_agree_name(),
         sa.ealg.sec_agree_name(),
@@ -133,11 +139,7 @@ pub fn security_server_value(sa: &SecurityAssociationPair) -> String {
         sa.spi_ps,
         sa.pcscf_port_c,
         sa.pcscf_port_s,
-    );
-    if sa.protocol == SaProtocol::Tcp {
-        value.push_str("; protocol=tcp");
-    }
-    value
+    )
 }
 
 /// Take the security agreement of the hop a request arrived on off the request
@@ -376,7 +378,7 @@ fn split_outside_quotes(text: &str, separator: char) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm, SaRole};
+    use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm, SaProtocol, SaRole};
 
     /// The association a P-CSCF at 192.0.2.10 set up for a UE at 198.51.100.20:
     /// SPIs 10000/10001 and protected ports 5064/5066 on its side,
@@ -499,25 +501,29 @@ mod tests {
         }
     }
 
+    /// No sec-agree spec defines a transport `protocol=` parameter: not RFC
+    /// 3329 §2.2 or its Appendix A, and not TS 33.203 Annex H, whose
+    /// `mech-parameters` list is closed and whose own `protocol` rule is
+    /// `prot=ah|esp`. One pair carries UDP and TCP alike (TS 33.203 §6.3, "all
+    /// shared by TCP and UDP"; §7.1, "The transport protocol selector shall
+    /// allow UDP and TCP"), so the transport a pair is pinned to is not
+    /// something the header has to carry. siphon leaves the parameter off for
+    /// every association, a TCP-pinned one included.
     #[test]
     fn the_security_server_value_names_the_association() {
-        assert_eq!(
-            security_server_value(&association(SaProtocol::Any)),
-            "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=10000; spi-s=10001; port-c=5064; port-s=5066"
-        );
-        assert!(security_server_value(&association(SaProtocol::Tcp)).ends_with("; protocol=tcp"));
-        // What siphon would send is what it accepts back.
-        let request = headers(&[
-            ("Require", "sec-agree"),
-            (
-                "Security-Verify",
-                &security_server_value(&association(SaProtocol::Any)),
-            ),
-        ]);
-        assert_eq!(
-            verify_sec_agree(&request, Some(&association(SaProtocol::Any))),
-            SecAgreeVerdict::Verified
-        );
+        const VALUE: &str = "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=10000; spi-s=10001; port-c=5064; port-s=5066";
+        for protocol in [SaProtocol::Any, SaProtocol::Udp, SaProtocol::Tcp] {
+            let value = security_server_value(&association(protocol));
+            assert_eq!(value, VALUE, "{protocol}");
+            assert!(!value.contains("protocol="), "{protocol}: {value}");
+            // What siphon sends is what it accepts back.
+            let request = headers(&[("Require", "sec-agree"), ("Security-Verify", &value)]);
+            assert_eq!(
+                verify_sec_agree(&request, Some(&association(protocol))),
+                SecAgreeVerdict::Verified,
+                "{protocol}"
+            );
+        }
     }
 
     /// What a P-CSCF script put on the 401 for [`association`]: a q-value and

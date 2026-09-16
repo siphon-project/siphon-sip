@@ -5449,7 +5449,8 @@ class MockRegistration:
             ue_port_c: UE protected client port (must also be a listen.udp port).
             ue_port_s: UE protected server port (must also be a listen.udp port).
             ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
-                "hmac-md5-96", or "hmac-sha-256-128".
+                "hmac-md5-96", or "hmac-sha-256-128" (a siphon extension, not
+                a 3GPP Annex H transform).
             ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
 
         Raises:
@@ -8572,7 +8573,13 @@ class MockSecurityOffer:
 
 
 class MockTransform:
-    """Mock :class:`Transform` enum — operator policy choice."""
+    """Mock :class:`Transform` enum — operator policy choice.
+
+    ``hmac-sha-1-96`` and ``hmac-md5-96`` are the 3GPP TS 33.203 Annex H
+    transforms.  ``hmac-sha-256-128`` is a siphon extension: the transform is
+    RFC 4868, but its 256-bit key comes from siphon's own expansion, so it
+    interoperates only siphon-to-siphon.
+    """
 
     def __init__(self, name: str, alg: str, ealg: str = "null") -> None:
         self._name = name
@@ -8684,10 +8691,11 @@ class MockSecurityServerParams:
         self.spi_s = spi_s
         self.port_c = port_c
         self.port_s = port_s
-        # Lower-case transport carrying ESP, "udp" or "tcp".  Only "tcp" gets
-        # `protocol=tcp` appended to the Security-Server header, and that is a
-        # siphon convention: RFC 3329 (§2.2, Appendix A) and TS 33.203 Annex H
-        # define no such parameter.  Mirrors the value passed to
+        # Lower-case transport the SA pair is pinned to, "udp" or "tcp".
+        # Informational: siphon's Security-Server carries no transport
+        # `protocol=` parameter for any SA, since no sec-agree spec defines one
+        # (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H) and one pair carries
+        # UDP and TCP alike (TS 33.203 §6.3, §7.1).  Mirrors the value passed to
         # ipsec.allocate(...).
         self.protocol = protocol
 
@@ -8814,11 +8822,12 @@ class MockIpsec:
         # 3GPP TS 33.203 requires: the SA pairs are "all shared by TCP and
         # UDP" (§6.3) and "The transport protocol selector shall allow UDP
         # and TCP." (§7.1).
-        # The wire-form ``protocol`` on the resulting
-        # :class:`SecurityServerParams` collapses to ``"udp"`` so a script
-        # leaves ``protocol=`` off, the standard shape: RFC 3329 (§2.2,
-        # Appendix A) and TS 33.203 Annex H define no such parameter, and
-        # TS 33.203 §7.1 has the SAs carry UDP and TCP alike.
+        # The ``protocol`` on the resulting :class:`SecurityServerParams`
+        # collapses to ``"udp"``.  It is informational: siphon's
+        # Security-Server carries no transport ``protocol=`` parameter for any
+        # SA, since no sec-agree spec defines one (RFC 3329 §2.2 and
+        # Appendix A, TS 33.203 Annex H) and TS 33.203 §6.3 / §7.1 have the SAs
+        # carry UDP and TCP alike.
         #
         # Explicit ``"udp"``/``"tcp"``/``"any"`` pin the selector to
         # that one inner protocol (single-transport deployments, tests).

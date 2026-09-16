@@ -335,6 +335,15 @@ Security-Server: ipsec-3gpp; alg=hmac-md5-96; ealg=aes-cbc
 Security-Server: ipsec-3gpp; alg=hmac-sha-256-128; ealg=aes-cbc
 ```
 
+`hmac-sha-256-128` in that list is a SIPhon extension, not a 3GPP transform. The
+transform is HMAC-SHA-256-128 per RFC 4868, but its 256-bit key comes from
+SIPhon's own expansion, `HMAC-SHA-256(IK, "ipsec-int-sha256-128")`: no 3GPP
+release we have checked lists `hmac-sha-256-128` in Annex H, whose key expansion
+lives in Annex I. The label is arbitrary, so two implementations each inventing
+one would not interoperate. Use it only where both ends are SIPhon. Note also
+that Rel-13 Annex H drops `hmac-md5-96` and adds `aes-gmac` and `aes-gcm`, which
+SIPhon does not implement.
+
 TS 33.203 Annex H makes `spi-c`, `spi-s`, `port-c` and `port-s` mandatory for
 `ipsec-3gpp`. Leaving them out is deliberate: RFC 3329 §2.3.1 asks the 494 for the
 server's list of supported mechanisms, and before an SA exists there are no SPIs or

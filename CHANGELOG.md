@@ -1524,11 +1524,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 - **The `SecurityServerParams.protocol` docs no longer cite RFC 3329 §2.2 for
   `protocol=`.** No sec-agree spec defines that parameter (RFC 3329, 3GPP
-  TS 33.203 Annex H); siphon appends `protocol=tcp` only for a TCP-pinned SA.
+  TS 33.203 Annex H).
 
 - **The `ipsec.allocate` docs and its address-family error cite TS 33.203 §6.3
   and §7.1 for one SA pair carrying UDP and TCP**, instead of a §7.2 quote the
   spec does not contain.
+
+- **siphon no longer appends `protocol=tcp` to a `Security-Server`.** No
+  sec-agree spec defines a transport `protocol=` parameter: not RFC 3329 §2.2 or
+  its Appendix A, and not 3GPP TS 33.203 Annex H, whose `mech-parameters` list is
+  closed and whose own `protocol` rule is `prot=ah|esp`. One SA pair carries UDP
+  and TCP alike (TS 33.203 §6.3, "all shared by TCP and UDP"; §7.1, "The
+  transport protocol selector shall allow UDP and TCP"), so the header never had
+  a transport to name. A TCP-pinned SA still narrows the kernel XFRM selectors;
+  only the header loses the parameter. `SecurityServerParams.protocol` stays as
+  an informational field naming what the pair is pinned to, and
+  `examples/ims_pcscf.py` drops the `proto_param` it used to concatenate.
+
+- **`hmac-sha-256-128` is documented as a siphon extension, not a 3GPP
+  transform.** The transform is HMAC-SHA-256-128 per RFC 4868, but its 256-bit
+  key comes from siphon's own expansion, `HMAC-SHA-256(IK,
+  "ipsec-int-sha256-128")`. No 3GPP release checked here lists
+  `hmac-sha-256-128` in Annex H, whose own key expansion lives in Annex I, and
+  the label is arbitrary, so two implementations each inventing one would not
+  interoperate. The transform and its wire format are unchanged. The docs also
+  note that Rel-13 Annex H drops `hmac-md5-96` and adds `aes-gmac` / `aes-gcm`,
+  which siphon does not implement.
 
 ### Security
 

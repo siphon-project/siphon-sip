@@ -37,11 +37,8 @@
 //! 7. On de-REGISTER: ``pending.cleanup()`` (or auto-cleanup via the
 //!    dispatcher de-register hook).
 //!
-//! What's intentionally *not* in this module today (Phase 2/3 deferrals):
+//! What's intentionally *not* in this module today (Phase 3 deferrals):
 //!
-//! * HMAC-SHA-256 / AES-CBC transforms.
-//! * 3GPP TS 33.203 Annex H key derivation (we use raw CK/IK with
-//!   zero-padding, matching the existing ``IpsecManager`` behaviour).
 //! * Replacement of ``ip xfrm`` shell-out with rtnetlink.
 //! * Real ``request.is_ipsec_protected`` / ``request.matched_sa`` — these
 //!   getters are stubbed (always ``False``/``None``) until the transport
@@ -155,12 +152,14 @@ impl PySecurityOffer {
 
 /// Operator policy choice for which IPsec transform to install.
 ///
-/// Phase 1 shipped the two NULL-encryption transforms we already had
-/// kernel ``xfrm`` algorithm names for.  Phase 2 adds:
-///
-/// * HMAC-SHA-256-128 integrity (RFC 4868) — required for newer IMS
-///   profiles, with 256-bit keys derived via 3GPP TS 33.203 Annex H.
-/// * AES-CBC-128 encryption variants for confidentiality.
+/// * HMAC-SHA-1-96 and HMAC-MD5-96, with NULL or AES-CBC-128 encryption,
+///   are the 3GPP TS 33.203 Annex H transforms.  Rel-13 Annex H drops
+///   ``hmac-md5-96`` and adds ``aes-gmac`` / ``aes-gcm``, which siphon
+///   does not implement.
+/// * HMAC-SHA-256-128 (RFC 4868) is a siphon extension: no 3GPP release
+///   checked here lists ``hmac-sha-256-128`` in Annex H, and its 256-bit
+///   key comes from siphon's own expansion, so it interoperates only
+///   siphon-to-siphon.
 ///
 /// All transforms install identical xfrm policies; only the algorithm
 /// IDs and key material change.
@@ -235,6 +234,9 @@ impl PyTransform {
     /// ``Security-Server`` header field (the ``ipsec-3gpp`` ``alg``
     /// parameter, RFC 3329 Appendix A / 3GPP TS 33.203 Annex H), e.g.
     /// ``"hmac-sha-1-96"``.
+    ///
+    /// ``"hmac-sha-256-128"`` is the exception: that name is siphon's own,
+    /// not one Annex H defines.
     ///
     /// Lets a script advertise its transform policy as a capability list
     /// without first allocating an SA — :class:`SecurityServerParams` is
@@ -456,22 +458,19 @@ pub struct PySecurityServerParams {
     /// P-CSCF protected server port.
     #[pyo3(get)]
     pub port_s: u16,
-    /// Wire-form transport for the RFC 3329 ``Security-Server``
-    /// header, either ``"udp"`` or ``"tcp"``.  The caller appends
-    /// ``protocol=tcp`` to the header only when this field is ``"tcp"``
-    /// and leaves the parameter off for ``"udp"``.  ``protocol=`` is a
-    /// siphon convention: neither RFC 3329 (§2.2, Appendix A) nor 3GPP
-    /// TS 33.203 Annex H defines a transport parameter for
-    /// ``ipsec-3gpp``, and one SA pair carries UDP and TCP alike
-    /// (TS 33.203 §7.1), so the header without it is the standard shape.
+    /// Transport the SA pair is pinned to, ``"udp"`` or ``"tcp"``.
+    ///
+    /// Informational.  siphon's own ``Security-Server`` never carries a
+    /// transport ``protocol=`` parameter, so a script has nothing to
+    /// append: no sec-agree spec defines that parameter (RFC 3329 §2.2
+    /// and Appendix A, 3GPP TS 33.203 Annex H), and one SA pair carries
+    /// UDP and TCP alike (TS 33.203 §6.3, §7.1).
     ///
     /// Note: when :func:`siphon.ipsec.allocate` was called with the
-    /// multi-protocol default (no ``protocol`` kwarg), this field
-    /// reads ``"udp"``, so the parameter stays off, even
-    /// though the underlying SA pair covers both UDP and TCP.  For
-    /// diagnostics of the actual SA selector mode, inspect
-    /// :attr:`SAHandle.protocol`, which surfaces ``"any"`` in that
-    /// case.
+    /// multi-protocol default (no ``protocol`` kwarg), the pair covers
+    /// both transports and this field reads ``"udp"``.  For the actual
+    /// SA selector mode, inspect :attr:`SAHandle.protocol`, which
+    /// surfaces ``"any"`` in that case.
     #[pyo3(get)]
     pub protocol: String,
 }
@@ -825,15 +824,13 @@ fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
     }
 }
 
-/// Map an internal :data:`SaProtocol` to the wire-form value the
-/// script appends to the ``Security-Server`` ``protocol=`` parameter.
-/// `Any` collapses to ``"udp"`` so a script that appends the parameter
-/// only for ``"tcp"`` leaves it off, keeping the wire output identical
-/// to the pre-multi-protocol shape while the underlying SA covers both
-/// transports.  Off is the standard shape: ``protocol=`` is a siphon
-/// convention that RFC 3329 (§2.2, Appendix A) and 3GPP TS 33.203
-/// Annex H do not define, and TS 33.203 §7.1 has one SA carry UDP and
-/// TCP.
+/// Map an internal :data:`SaProtocol` to the value reported on
+/// :attr:`SecurityServerParams.protocol`, with `Any` collapsing to
+/// ``"udp"``.  The field is informational: siphon's ``Security-Server``
+/// carries no transport ``protocol=`` parameter for any SA, because no
+/// sec-agree spec defines one (RFC 3329 §2.2 and Appendix A, 3GPP
+/// TS 33.203 Annex H) and one pair carries UDP and TCP alike
+/// (TS 33.203 §6.3, §7.1).
 fn format_params_protocol(sa_protocol: SaProtocol) -> String {
     match sa_protocol {
         SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
@@ -1014,10 +1011,11 @@ impl PyIpsec {
             let aalg = transform.aalg();
             let ealg = transform.ealg();
 
-            // 3GPP TS 33.203 Annex H key derivation — produces a key
-            // matching the algorithm's required length.  Falls back to
-            // raw IK on derivation failure (which only happens with a
-            // non-128-bit IK, never in practice for IMS-AKA).
+            // Integrity key sized for the transform: the IK directly for
+            // the Annex H transforms, siphon's own expansion for
+            // HMAC-SHA-256-128.  Falls back to raw IK on derivation
+            // failure (which only happens with a non-128-bit IK, never in
+            // practice for IMS-AKA).
             let integrity_bytes = crate::ipsec::IpsecManager::derive_integrity_key(aalg, &keys.ik)
                 .unwrap_or_else(|| keys.ik.to_vec());
             let integrity_key = crate::ipsec::bytes_to_hex(&integrity_bytes);
@@ -1495,7 +1493,8 @@ mod tests {
 
     /// Every transform variant with its ``alg`` / ``ealg`` wire spelling
     /// (the ``ipsec-3gpp`` parameters of RFC 3329 Appendix A and 3GPP
-    /// TS 33.203 Annex H).  One
+    /// TS 33.203 Annex H, except ``hmac-sha-256-128``, which is siphon's
+    /// own name).  One
     /// table shared by the three tests below, so a newly added variant
     /// cannot be pinned in one of them and forgotten in the others.
     const RFC3329_NAMES: [(PyTransform, &str, &str); 6] = [
@@ -1894,12 +1893,12 @@ mod tests {
         assert!(error.contains("sctp"));
     }
 
-    /// `Any` MUST collapse to wire-form ``"udp"`` so the existing
-    /// ``protocol=`` formatting in scripts
-    /// (``f"; protocol={params.protocol}" if params.protocol != "udp" else ""``)
-    /// keeps emitting parameter-less Security-Server headers, the
-    /// standard shape: no sec-agree spec defines ``protocol=`` (RFC 3329
-    /// §2.2 and Appendix A, 3GPP TS 33.203 Annex H).
+    /// `Any` collapses to ``"udp"`` on the informational
+    /// :attr:`SecurityServerParams.protocol`.  Nothing on the wire turns
+    /// on it: siphon emits no ``protocol=`` parameter on a
+    /// ``Security-Server``, for any SA, because no sec-agree spec
+    /// defines one (RFC 3329 §2.2 and Appendix A, 3GPP TS 33.203
+    /// Annex H).
     #[test]
     fn format_params_protocol_collapses_any_to_udp_for_wire() {
         assert_eq!(format_params_protocol(SaProtocol::Any), "udp");

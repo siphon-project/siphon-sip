@@ -260,16 +260,15 @@ async def _handle_401_register(request, reply):
         return
 
     params = pending.security_server_params()
-    # Leave `protocol=` off unless the SA was pinned to TCP. No sec-agree
-    # spec defines that parameter (RFC 3329 §2.2 and Appendix A, TS 33.203
-    # Annex H), and one SA pair carries UDP and TCP alike (TS 33.203 §7.1),
-    # so the header without it is the standard shape.
-    proto_param = f"; protocol={params.protocol}" if params.protocol != "udp" else ""
+    # No transport `protocol=` parameter. No sec-agree spec defines one
+    # (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H), and one SA pair
+    # carries UDP and TCP alike (TS 33.203 §6.3, §7.1), so there is no
+    # transport for the header to name.
     reply.set_header(
         "Security-Server",
         f"{params.mechanism}; alg={params.alg}; ealg={params.ealg}; "
         f"spi-c={params.spi_c}; spi-s={params.spi_s}; "
-        f"port-c={params.port_c}; port-s={params.port_s}{proto_param}",
+        f"port-c={params.port_c}; port-s={params.port_s}",
     )
 
     ipsec.stash(request.call_id, pending)
