@@ -4,6 +4,20 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Republish the SDK for a tag that is already released, without cutting a new
+  # version. Run it AT the release tag (ref = vX.Y.Z), so `verify-version` still
+  # compares Cargo.toml against that tag rather than being skipped. Only the
+  # PyPI job runs; everything else is already published and is guarded below.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SDK version to publish, e.g. 1.9.0 — checked against Cargo.toml and CHANGELOG.md"
+        required: true
+        type: string
+      ref:
+        description: "Tag to publish the SDK from, e.g. v1.9.0 (defaults to this run's ref)"
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,8 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Cargo.toml version must equal the tag
+        env:
+          # A dispatch runs from the default branch, so the ref name is not a
+          # version. Gate on the requested version instead: it still has to
+          # match Cargo.toml and carry a CHANGELOG section, so a republish
+          # cannot invent a version that was never released.
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${DISPATCH_VERSION:-${GITHUB_REF_NAME#v}}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
           echo "tag=$tag_version cargo=$cargo_version"
           if [ "$tag_version" != "$cargo_version" ]; then
@@ -157,6 +177,9 @@ jobs:
   crates-io:
     runs-on: ubuntu-latest
     needs: build
+    # A republish never re-uploads the crate: crates.io refuses an existing
+    # version, and the tag it was cut from is already published.
+    if: github.event_name == 'push'
     permissions:
       id-token: write   # mint a short-lived crates.io token via GitHub OIDC
     steps:
@@ -192,15 +215,32 @@ jobs:
           # hatch-vcs derives the version from the git tag; the default shallow
           # clone hides tags/history and breaks version resolution.
           fetch-depth: 0
+          # A republish checks out the released tag, so the wheel carries that
+          # tag's SDK tree rather than whatever has since landed on main.
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
+      # hatch-vcs resolves the version from the tag that describes HEAD. When a
+      # second tag sits on the same commit (control-sdk-vX.Y.Z), it can win and
+      # publish the SDK under that version — v1.9.0 shipped as 0.3.0 that way.
+      # sdk/pyproject.toml now matches only v* tags; a dispatch additionally
+      # pins the version outright, since the tagged tree it checks out predates
+      # that fix.
       - name: Build siphon-sip (SDK; version from tag via hatch-vcs)
+        env:
+          PINNED_VERSION: ${{ inputs.version }}
         run: |
           pip install build
+          if [ -n "${PINNED_VERSION:-}" ]; then
+            echo "pinning the SDK version to $PINNED_VERSION (republish)"
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$PINNED_VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SIPHON_SIP="$PINNED_VERSION"
+          fi
           cd sdk && python -m build
+          ls -l dist/
 
       - name: Publish to PyPI (Trusted Publishing — OIDC, no token)
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -215,6 +255,7 @@ jobs:
   # into a single multi-arch manifest list and applies the version tags.
   docker:
     needs: build
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -278,6 +319,7 @@ jobs:
   docker-merge:
     needs: docker
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - name: Download digests
         uses: actions/download-artifact@v8
@@ -324,6 +366,8 @@ jobs:
   sbom:
     runs-on: ubuntu-latest
     needs: verify-version
+    # The SBOMs are attached to the existing GitHub Release already.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -345,6 +389,8 @@ jobs:
   github-release:
     runs-on: ubuntu-latest
     needs: [build, crates-io, pypi, docker-merge, sbom]
+    # The release exists; a republish must not recreate it or regenerate notes.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
 

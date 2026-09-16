@@ -6,6 +6,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Python SDK takes its version from the release tag only.** `hatch-vcs`
+  accepted whichever tag described the release commit, so a `control-sdk-v*`
+  tag on that same commit set the SDK version: 1.9.0 built and published to
+  PyPI as 0.3.0. The SDK build now matches `v[0-9]*` tags, and `release.yaml`
+  gained a `workflow_dispatch` that republishes the SDK for an existing tag
+  with the version pinned, without re-running the crate, image, SBOM or
+  GitHub Release steps.
+
 ## [1.9.0] — 2026-09-16
 
 ### Added
