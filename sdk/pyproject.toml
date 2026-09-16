@@ -48,6 +48,18 @@ source = "vcs"
 
 [tool.hatch.version.raw-options]
 root = ".."
+# Match ONLY the release tags. Without this, any other tag on the same commit
+# counts: tagging control-sdk-v0.3.0 on the v1.9.0 release commit made the SDK
+# build and publish as 0.3.0 instead of 1.9.0.
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "v[0-9]*",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["siphon_sdk"]
