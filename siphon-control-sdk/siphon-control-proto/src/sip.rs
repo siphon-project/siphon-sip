@@ -61,6 +61,14 @@ pub enum SipVerb {
     ReplacePeer,
     /// Un-park the call and dial the B-leg via LCR sequential failover.
     Route,
+    /// Ring one or more targets as B-legs while the caller stays **unanswered**
+    /// and this application keeps the channel. Channel-addressed, unlike
+    /// [`SipVerb::Originate`], which creates the channel it places a call on.
+    ///
+    /// The first 2xx answers the caller and the pair becomes an ordinary two-leg
+    /// call; a failure or timeout arrives as `DialFailed` with the caller still
+    /// ringing and still parked, so the application decides what happens next.
+    Dial,
     /// Set a header on the stored A-leg INVITE.
     SetHeader,
     /// Remove a header from the stored A-leg INVITE.
@@ -81,6 +89,17 @@ pub enum SipVerb {
     StreamStart,
     /// Detach the WebSocket audio tee.
     StreamStop,
+    /// Record the call's decoded audio to a wav file, replying with the
+    /// `recording_id` that a later [`SipVerb::RecordStop`] and the
+    /// `RecordingFinished` event carry (siphon-rtp backend only).
+    ///
+    /// Not SIPREC: this writes a file, which is what a voicemail box is, and it
+    /// works on a single-leg engine-terminated call.
+    RecordStart,
+    /// Stop one recording by id, or every recording on the call when none is
+    /// named. The reply is the accept; `RecordingFinished` is what says the file
+    /// is closed and names its path.
+    RecordStop,
 }
 
 impl SipVerb {
@@ -100,6 +119,7 @@ impl SipVerb {
             SipVerb::Unbridge => "unbridge",
             SipVerb::ReplacePeer => "replace_peer",
             SipVerb::Route => "route",
+            SipVerb::Dial => "dial",
             SipVerb::SetHeader => "set_header",
             SipVerb::RemoveHeader => "remove_header",
             SipVerb::GetHeader => "get_header",
@@ -110,6 +130,8 @@ impl SipVerb {
             SipVerb::Unhold => "unhold",
             SipVerb::StreamStart => "stream_start",
             SipVerb::StreamStop => "stream_stop",
+            SipVerb::RecordStart => "record_start",
+            SipVerb::RecordStop => "record_stop",
         }
     }
 }
@@ -891,6 +913,11 @@ mod tests {
         assert_eq!(SipVerb::Unhold.as_str(), "unhold");
         assert_eq!(SipVerb::StreamStart.as_str(), "stream_start");
         assert_eq!(SipVerb::StreamStop.to_string(), "stream_stop");
+        // Channel-addressed, unlike the module-level `originate`: `dial` rings
+        // B-legs of a call this app already holds.
+        assert_eq!(SipVerb::Dial.as_str(), "dial");
+        assert_eq!(SipVerb::RecordStart.as_str(), "record_start");
+        assert_eq!(SipVerb::RecordStop.to_string(), "record_stop");
     }
 
     #[test]

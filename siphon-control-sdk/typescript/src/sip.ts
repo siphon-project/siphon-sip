@@ -335,6 +335,163 @@ export function originateArgs(
   return args;
 }
 
+/**
+ * One {@link Call.dial} target: a URI dialed as written, or an AoR forked to
+ * every contact registered against it.
+ *
+ * Two shapes rather than a bare string, because the server accepts both and they
+ * do entirely different things. A URI is dialed as written and resolved by DNS.
+ * An AoR is resolved against the registrar and forked to *every* registered
+ * contact, each branch over that contact's own captured flow — the only way to
+ * reach a phone registered over TCP, TLS or WSS behind NAT, since such a contact
+ * is reachable only on the connection it registered over.
+ * `"sip:204@pbx.example"` is a plausible spelling of both, and the wrong one
+ * places a call that connects to nothing while the trace looks healthy.
+ */
+export type DialTarget =
+  | {
+      /** The B-leg request URI, dialed as written. */
+      uri: string;
+      /** Send the INVITE here instead; the R-URI keeps `uri`'s shape. */
+      nextHop?: string;
+      /** Headers injected on this branch's INVITE, over the command's. */
+      headers?: Record<string, string>;
+    }
+  | {
+      /**
+       * The address of record to fork to its registered contacts. It takes no
+       * `nextHop`: each branch routes over its own binding's captured flow, so
+       * there would be nothing for one to apply to.
+       */
+      aor: string;
+      /** Headers injected on every branch the AoR expands to. */
+      headers?: Record<string, string>;
+    };
+
+/**
+ * Optional shaping for {@link Call.dial}; anything left out takes the server's
+ * own default rather than a copy of it pinned here.
+ */
+export interface DialOptions {
+  /** How to try the targets (`"parallel"` server-side when unset). */
+  strategy?: "parallel" | "sequential";
+  /** Ring timeout in seconds (30 server-side when unset, clamped to 1..3600). */
+  timeout?: number;
+  /** Headers injected on every branch's INVITE, under each target's own. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * What the server answers an accepted `dial` with: the INVITEs are on the wire
+ * and nobody has answered yet.
+ */
+export interface Dialing {
+  /** The channel the targets are being rung for — still the caller's. */
+  channel: string;
+  /**
+   * How many **branches** the server resolved, which an AoR expands: a single
+   * AoR target registered on three devices reports three.
+   */
+  targets?: number;
+  /** The strategy in force (the server's default when none was asked for). */
+  strategy?: string;
+  /** The ring timeout in force, in seconds. */
+  timeout?: number;
+}
+
+/** Which side of the call {@link Call.recordStart} writes. */
+export type RecordDirection = "ingress" | "egress" | "both";
+
+/** The channel layout of the recorded file. */
+export type RecordChannels = "mono" | "stereo";
+
+/** Optional shaping for {@link Call.recordStart}. */
+export interface RecordOptions {
+  /** Which side to record (`"ingress"` server-side when unset). */
+  direction?: RecordDirection;
+  /** The file's channel layout (`"mono"` server-side when unset). */
+  channels?: RecordChannels;
+  /** Stop after this many milliseconds of recording. */
+  maxDurationMs?: number;
+  /** Stop after this many milliseconds of silence. */
+  silenceMs?: number;
+  /** Where the engine writes the file. */
+  path?: string;
+}
+
+/** What the server answers an accepted `record_start` with. */
+export interface Recording {
+  /** The channel being recorded. */
+  channel: string;
+  /**
+   * The id a later {@link Call.recordStop} and the `RecordingFinished` event
+   * carry.
+   */
+  recordingId?: string;
+}
+
+function dialTargetToWire(target: DialTarget): unknown {
+  const uri = (target as { uri?: unknown }).uri;
+  const aor = (target as { aor?: unknown }).aor;
+  const nextHop = (target as { nextHop?: unknown }).nextHop;
+  const headers = (target as { headers?: Record<string, string> }).headers;
+  if (typeof uri === "string" && typeof aor === "string") {
+    throw new TypeError(
+      'a dial target names "uri" or "aor", never both — siphon reads the aor ' +
+        "and ignores the uri beside it, so this would place a different call",
+    );
+  }
+  if (typeof aor === "string") {
+    if (nextHop !== undefined) {
+      throw new TypeError(
+        'an aor target takes no "nextHop": each of its branches routes over ' +
+          "its own contact's captured flow",
+      );
+    }
+    const object: Record<string, unknown> = { aor };
+    if (headers !== undefined) object.headers = headers;
+    return object;
+  }
+  if (typeof uri !== "string") {
+    throw new TypeError('a dial target requires a string "uri" or "aor"');
+  }
+  // A bare URI with no overrides is a plain string on the wire.
+  if (nextHop === undefined && headers === undefined) return uri;
+  const object: Record<string, unknown> = { uri };
+  if (nextHop !== undefined) object.next_hop = nextHop;
+  if (headers !== undefined) object.headers = headers;
+  return object;
+}
+
+export function dialArgs(
+  targets: DialTarget[],
+  options?: DialOptions,
+): Record<string, unknown> {
+  const args: Record<string, unknown> = { targets: targets.map(dialTargetToWire) };
+  if (!options) return args;
+  if (options.strategy !== undefined) args.strategy = options.strategy;
+  if (options.timeout !== undefined) args.timeout = options.timeout;
+  if (options.headers !== undefined) args.headers = options.headers;
+  return args;
+}
+
+export function recordStartArgs(options?: RecordOptions): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  if (!options) return args;
+  if (options.direction !== undefined) args.direction = options.direction;
+  if (options.channels !== undefined) args.channels = options.channels;
+  if (options.maxDurationMs !== undefined) args.max_duration_ms = options.maxDurationMs;
+  if (options.silenceMs !== undefined) args.silence_ms = options.silenceMs;
+  if (options.path !== undefined) args.path = options.path;
+  return args;
+}
+
+export function recordStopArgs(recordingId?: string): Record<string, unknown> {
+  // Absent, not null — which is what makes the server stop every recording on
+  // the call rather than one named `null`.
+  return recordingId === undefined ? {} : { recording_id: recordingId };
+}
+
 export type PlaySource =
   | { file: string }
   | { dbId: number }
@@ -602,6 +759,61 @@ export class Call {
   }
 
   /**
+   * Ring `targets` as B-legs while the caller stays **unanswered** and this
+   * application keeps the channel.
+   *
+   * The difference from {@link Call.route} is who holds the call afterwards.
+   * `route` hands it back to siphon, so the app gets `StasisEnd{reason: routed}`
+   * and loses it; there is then no way to say "ring the extension, and if nobody
+   * answers, voicemail" without answering the caller first — which starts
+   * billing before anyone picks up, records an unanswered call as answered, and
+   * denies the caller the callee's own ringback.
+   *
+   * The first 2xx answers the caller with the winner's SDP and the pair becomes
+   * an ordinary two-leg call, still owned by this app. A failure or timeout
+   * arrives as a `DialFailed` event with the caller still ringing and still
+   * parked, so the app decides what happens next.
+   *
+   * Each target is a URI (dialed as written) or an `{aor}` (forked to every
+   * registered contact over its own flow) — see {@link DialTarget}, and note
+   * that a target naming both, or neither, throws before anything is sent.
+   *
+   * ```ts
+   * const dialing = await call.dial(
+   *   [{ aor: "sip:204@pbx.example" }],
+   *   { strategy: "sequential", timeout: 20 },
+   * );
+   * ```
+   *
+   * Rejects with `code === "not_found"` (the call is gone, or no target yielded
+   * a branch — an AoR nobody has registered), `"invalid_state"` (already
+   * answered, which is what this verb exists to avoid), `"bad_request"` (an
+   * empty or malformed target list) or `"unsupported_verb"` (a strategy siphon
+   * does not implement).
+   */
+  async dial(targets: DialTarget[], options?: DialOptions): Promise<Dialing> {
+    const result = (await this.sip(SipVerb.Dial, dialArgs(targets, options))) as
+      | Record<string, unknown>
+      | null;
+    const text = (name: string): string | undefined => {
+      const value = result?.[name];
+      return typeof value === "string" ? value : undefined;
+    };
+    const count = (name: string): number | undefined => {
+      const value = result?.[name];
+      return typeof value === "number" ? value : undefined;
+    };
+    return {
+      // The server echoes the channel back; fall back to the one addressed
+      // rather than returning an empty id.
+      channel: text("channel") ?? this.channelId,
+      targets: count("targets"),
+      strategy: text("strategy"),
+      timeout: count("timeout"),
+    };
+  }
+
+  /**
    * Accept a *pending inbound* REFER (surfaced as a `TransferRequested` event)
    * and run the transfer. `target` overrides the Refer-To URI, `nextHop` steers
    * egress, and `mode` (`"terminate"` / `"transparent"`) overrides
@@ -836,6 +1048,49 @@ export class Call {
   /** Detach the WebSocket audio tee (idempotent on siphon-rtp). */
   async streamStop(): Promise<void> {
     await this.sip(SipVerb.StreamStop, {});
+  }
+
+  /**
+   * Record this call's decoded audio to a wav file.
+   *
+   * The reply names the `recordingId` a later {@link Call.recordStop}
+   * addresses. It is **not** the file: `RecordingFinished` fires when the file
+   * is *closed* and names its path, which is what an app that mails the audio
+   * has to wait for — acting on this reply races a half-written file.
+   *
+   * `maxDurationMs` and `silenceMs` are the two stop conditions a voicemail
+   * greeting announces, and the engine evaluates both where the decoded audio
+   * already is. Not SIPREC: this writes a file and works on a single-leg,
+   * engine-terminated call, which is what a voicemail box is. siphon-rtp
+   * backend only — rtpengine / rtpproxy reject with
+   * `code === "unsupported_verb"`; a call with no anchored media session
+   * rejects with `"not_found"`.
+   */
+  async recordStart(options?: RecordOptions): Promise<Recording> {
+    const result = (await this.sip(
+      SipVerb.RecordStart,
+      recordStartArgs(options),
+    )) as Record<string, unknown> | null;
+    const text = (name: string): string | undefined => {
+      const value = result?.[name];
+      return typeof value === "string" ? value : undefined;
+    };
+    return {
+      channel: text("channel") ?? this.channelId,
+      recordingId: text("recording_id"),
+    };
+  }
+
+  /**
+   * Stop the recording named by `recordingId`, or **every** recording on this
+   * call when it is left out.
+   *
+   * Resolves once the engine has accepted the stop; the file is not closed yet.
+   * `RecordingFinished` says that, and carries the path and the reason
+   * (`stopped`, `max_duration`, `silence`, `call_ended`, `error`).
+   */
+  async recordStop(recordingId?: string): Promise<void> {
+    await this.sip(SipVerb.RecordStop, recordStopArgs(recordingId));
   }
 
   // --- escape hatch + events --------------------------------------------

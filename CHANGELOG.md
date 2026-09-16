@@ -6,6 +6,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **`dial`, `record_start` and `record_stop` are typed verbs in all three
+  control SDKs.** All three shipped server-side but were missing from the
+  `SipVerb` enum the SDKs are built against, so none of them wrapped the verbs
+  and an application had to reach for the raw `command()` escape hatch and hand
+  it the wire field names itself. A `dial` target is a tagged type rather than a
+  loose string (`DialTarget::uri` / `DialTarget::aor` in Rust, a `{uri}` or
+  `{aor}` object in TypeScript and Python), because the two do different things:
+  an AoR forks to every registered contact over that contact's own captured
+  flow, which is the only way to reach a phone registered on TCP, TLS or WSS
+  behind NAT, while the same text sent as a URI is resolved by DNS and reaches
+  none of them. A target naming both, or neither, is refused before a frame goes
+  out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
+  channel layout or strategy the server would reject.
+
 ### Fixed
 
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
