@@ -438,7 +438,7 @@ impl ConnectionPool {
     /// Send data to a destination, binding the local socket to a
     /// specific source address — used for ESP-over-TCP IPsec where
     /// the kernel egress XFRM selector for SA #3 (TS 33.203 §6.3 /
-    /// §7.2) requires src=`pcscf_port_c`, dst=`ue_port_us`, and an
+    /// §7.1) requires src=`pcscf_port_c`, dst=`ue_port_us`, and an
     /// ephemerally-bound socket would never match.
     ///
     /// Same pooling semantics as `send_tcp` — and the requested `source`
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tcp_from_binds_to_specified_source() {
-        // ESP-over-TCP IPsec (TS 33.203 §7.2): the outbound TCP
+        // ESP-over-TCP IPsec (TS 33.203 §7.1): the outbound TCP
         // socket for SA #3 must bind to (pcscf_addr, pcscf_port_c).
         // Verify that send_tcp_from honours the requested source —
         // an ephemerally-bound socket would have a random source

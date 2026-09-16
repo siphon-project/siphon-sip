@@ -253,7 +253,7 @@ pub(super) fn relay_request(
     // matching P-CSCF port (e.g. `pcscf_port_c` for an MT INVITE landing
     // on the UE's `port_us`) rather than the default per-transport
     // via_host / listener (3GPP TS 33.203 §6.3 / §7.4).  The SA's
-    // pinned protocol (UDP/TCP, TS 33.203 §7.2) also overrides whatever
+    // pinned protocol (UDP/TCP, TS 33.203 §7.1) also overrides whatever
     // transport the URI / inbound suggested: in-dialog BYE/UPDATE often
     // routes via a cached Contact that lacks `;transport=`, and the
     // kernel XFRM selector silently drops every protected frame whose
