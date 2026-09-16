@@ -50,6 +50,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a log naming the listener, instead of being counted as binary garbage and
   credited to the auto-ban store — siphon banning its own front.
 
+  The abuse controls follow the client rather than the front. At accept there is
+  only one address to judge — the front's — and behind a front that address is
+  shared by every caller, so a ban never matches it and the per-source connection
+  ceiling never trips. Once the header has been read, `security.failed_auth_ban`,
+  `security.apiban` and `security.connection_limits` are all re-applied to the
+  client it names, and the connection is counted against that client instead of
+  against the front. Without this the store would still record an abuser behind a
+  front and then never drop them, which is half of what this option exists to
+  fix.
+
 - **A re-encrypting front can tell siphon the client spoke TLS, via the v2
   `PP2_TYPE_SSL` TLV.** A front that terminates the UE's TLS and opens a
   plaintext connection to siphon leaves every consumer seeing `tcp`, so a script
