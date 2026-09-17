@@ -791,7 +791,6 @@ pub(super) fn init_registrant(
     );
 
     // Spawn background registration loop
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let loop_manager = Arc::clone(manager);
     let loop_outbound = Arc::clone(outbound_senders);
     let loop_listen_addrs = listen_addrs.clone();
@@ -809,15 +808,9 @@ pub(super) fn init_registrant(
             loop_advertised_address,
             loop_hep_sender,
             loop_stream_connections,
-            shutdown_rx,
         )
         .await;
     });
-
-    // Keep shutdown_tx alive — dropping it would cause the registration
-    // loop's shutdown.changed() to resolve immediately on every select tick,
-    // starving the sleep branch and preventing REGISTERs from being sent.
-    std::mem::forget(shutdown_tx);
 
     // The `registration` Python namespace was already installed early in
     // `serve()` (before ScriptEngine::new) using this same manager.

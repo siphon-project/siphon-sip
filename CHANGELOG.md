@@ -8,6 +8,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A removed outbound registration now de-registers upstream, and so does
+  shutting down.** `registration.remove()` dropped siphon's own state and left
+  the binding on the registrar until the granted `Expires` ran out, so a trunk
+  that had been deleted kept being offered calls for up to an hour. Removing a
+  registered entry now queues an `Expires: 0` REGISTER (RFC 3261 §10.2.2)
+  carrying that registration's own Call-ID and next CSeq, sent on the next
+  refresh tick. Shutdown clears every remaining binding the same way: that path
+  was written but could never run, because the sender of its signal channel was
+  leaked at start-up to work around a closed-channel wakeup, leaving nothing
+  able to fire it. It is now driven from the shutdown sequence itself, before
+  draining begins.
+
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
   accepted whichever tag described the release commit, so a `control-sdk-v*`
   tag on that same commit set the SDK version: 1.9.0 built and published to
