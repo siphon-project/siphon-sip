@@ -131,6 +131,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   only egress address a media record carries, and not a duplicate of the call
   record's signalling `destination_ip`. Present on a relay-only leg, where the
   quality fields are not.
+- **Outbound messages go out in a fixed header order, with `Content-Length`
+  last.** Header order used to be whatever order the code happened to touch the
+  headers in. `set`/`set_all` hold a header's slot, but `remove` shifts the
+  survivors up, so a remove-then-re-add moved a header to the end of the
+  message — and anything injected after the body had been accounted for landed
+  past `Content-Length`. From 1.9.0 the B-leg INVITE and every relayed response
+  settle `Supported` and `Allow` that way (they are the B2BUA's own claims, not
+  a relay of the far party's), so both went out after `Content-Length`, next to
+  the per-carrier and charging headers that already did. Serialization now
+  orders the block itself: the headers RFC 3261 §7.3.1 recommends "appear
+  towards the top of the message to facilitate rapid parsing" (`Via`,
+  `Max-Forwards`, `Record-Route`, `Route`, `Proxy-Require`,
+  `Proxy-Authorization`) first, then `From`, `To`, `Call-ID`, `CSeq`,
+  `Contact`, then everything else in the order it was added, then the
+  `Content-*` group with `Content-Length` last. Rows sharing a field name keep
+  their relative order, which is the part §7.3.1 does make significant, so
+  `Via` and `Record-Route` stacking is untouched; a compact form ranks as its
+  long name (`l` is `Content-Length`) and still goes out compact. Ordering at
+  the serializer rather than at each construction site means no call site can
+  move a header on the wire again.
+
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
   accepted whichever tag described the release commit, so a `control-sdk-v*`
   tag on that same commit set the SDK version: 1.9.0 built and published to
