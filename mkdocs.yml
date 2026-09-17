@@ -73,6 +73,7 @@ nav:
       - Auth & security: reference/security.md
       - Media: reference/media.md
       - Gateway: reference/gateway.md
+      - Least-Cost Routing: reference/lcr-api.md
       - Diameter: reference/diameter.md
       - IMS control: reference/ims.md
       - Observability: reference/observability.md
