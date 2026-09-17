@@ -13,6 +13,7 @@
 
 pub mod aka;
 pub mod messages;
+pub mod source;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,7 +27,7 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::auth::{self, DigestChallenge, DigestCredentials, NonceCounter};
+use crate::auth::{self, DigestChallenge, NonceCounter};
 use std::net::IpAddr;
 
 use crate::hep::HepSender;
@@ -96,12 +97,29 @@ impl fmt::Display for RegistrantState {
 // ---------------------------------------------------------------------------
 
 /// Authentication credentials for a registration entry.
+///
+/// The secret is a password or a pre-computed H(A1), so a source that must not
+/// hold a reversible secret can still register a trunk. An H(A1) is bound to
+/// the hash it was computed with (RFC 7616 §3.4.3), so it only answers a
+/// registrar that challenges with that hash.
 #[derive(Debug, Clone)]
 pub struct RegistrantCredentials {
     pub username: String,
-    pub password: String,
+    pub secret: crate::auth::StoredSecret,
     /// Optional realm hint — if `None`, derived from the 401 challenge.
     pub realm: Option<String>,
+}
+
+impl RegistrantCredentials {
+    /// Credentials from a plaintext password — what YAML and
+    /// `registration.add()` supply.
+    pub fn password(username: String, password: String, realm: Option<String>) -> Self {
+        Self {
+            username,
+            secret: crate::auth::StoredSecret::Password(password),
+            realm,
+        }
+    }
 }
 
 /// How an entry authenticates to its upstream registrar.
@@ -311,6 +329,21 @@ impl UeIpsec {
 // Entry
 // ---------------------------------------------------------------------------
 
+/// Who created a [`RegistrantEntry`].
+///
+/// Reconciling a `registrant.backend` source against the live set is only safe
+/// if the source owns a subset of it: a YAML entry and a script-added one are
+/// not its to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryOrigin {
+    /// The `registrant.entries` list in `siphon.yaml`.
+    Yaml,
+    /// `registration.add()` from a script.
+    Script,
+    /// A `registrant.backend: database` / `http` source.
+    Source,
+}
+
 /// A single outbound registration binding.
 #[derive(Debug)]
 pub struct RegistrantEntry {
@@ -349,6 +382,16 @@ pub struct RegistrantEntry {
     pub failure_count: u32,
     /// When the last REGISTER was sent (for transaction timeout detection).
     pub last_sent_at: Option<Instant>,
+    /// Who created this entry.
+    ///
+    /// A source reconcile only ever adds, updates or removes entries it created
+    /// itself. Without that, its first pass would delete every YAML entry and
+    /// every one a script added with `registration.add` — including the IMS
+    /// soft-UE, which no database knows about.
+    pub origin: EntryOrigin,
+    /// Fingerprint of the source row this was built from, for
+    /// [`source::reconcile`]. `None` for anything not created by a source.
+    pub source_fingerprint: Option<u64>,
 
     // --- IMS AKA (Phase 1) ---
     /// Authentication mode. `Digest` (default) keeps the carrier-trunk path
@@ -409,6 +452,8 @@ impl RegistrantEntry {
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
             failure_count: 0,
             last_sent_at: None,
+            origin: EntryOrigin::Script,
+            source_fingerprint: None,
             auth_mode: AuthMode::Digest,
             aka: None,
             sqn_ms: [0u8; 6],
@@ -418,6 +463,20 @@ impl RegistrantEntry {
             ue_ipsec: None,
             ims_contact: None,
         }
+    }
+
+    /// Record that this entry came from `siphon.yaml`.
+    pub fn from_yaml(mut self) -> Self {
+        self.origin = EntryOrigin::Yaml;
+        self
+    }
+
+    /// Record that this entry came from a `registrant.backend` source, and the
+    /// fingerprint of the row it was built from.
+    pub fn from_source(mut self, fingerprint: u64) -> Self {
+        self.origin = EntryOrigin::Source;
+        self.source_fingerprint = Some(fingerprint);
+        self
     }
 
     /// Switch this entry to IMS AKAv1-MD5 authentication (3GPP TS 33.203).
@@ -600,6 +659,64 @@ impl RegistrantManager {
             });
         }
         removed
+    }
+
+    /// AoR to source-row fingerprint, for the entries a source created.
+    ///
+    /// The live half of [`source::reconcile`]. Deliberately excludes YAML and
+    /// script entries, so a reconcile can neither update nor remove one.
+    pub fn source_fingerprints(&self) -> HashMap<String, u64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.origin == EntryOrigin::Source)
+            .filter_map(|entry| {
+                entry
+                    .source_fingerprint
+                    .map(|fingerprint| (entry.aor.clone(), fingerprint))
+            })
+            .collect()
+    }
+
+    /// Whether an AoR is held by something other than a source, so a reconcile
+    /// must leave it alone and say so rather than overwrite it.
+    pub fn is_foreign_to_source(&self, aor: &str) -> bool {
+        self.entries
+            .get(aor)
+            .is_some_and(|entry| entry.origin != EntryOrigin::Source)
+    }
+
+    /// Replace a source-created entry in place, keeping its registration
+    /// identity.
+    ///
+    /// The upstream registrar should see a refresh of the binding it already
+    /// holds, not an unrelated new registration from the same trunk, so the
+    /// Call-ID carries over and the CSeq continues instead of restarting at 1
+    /// (RFC 3261 §10.2.4 / §8.1.1.5). The entry is marked due immediately, so a
+    /// rotated password takes effect on the next tick rather than at the next
+    /// refresh interval.
+    ///
+    /// Returns `false` when the AoR is gone or is not the source's to change.
+    pub fn update_from_source(&self, mut entry: RegistrantEntry) -> bool {
+        let carried = self.entries.get(&entry.aor).and_then(|existing| {
+            (existing.origin == EntryOrigin::Source).then(|| {
+                (
+                    existing.call_id.clone(),
+                    existing.cseq.load(Ordering::Relaxed),
+                )
+            })
+        });
+        let Some((call_id, cseq)) = carried else {
+            return false;
+        };
+
+        entry.call_id = call_id;
+        entry.cseq = AtomicU32::new(cseq);
+        entry.state = RegistrantState::Unregistered;
+        entry.next_attempt = Instant::now();
+
+        info!(aor = %entry.aor, "registrant updated from source");
+        self.entries.insert(entry.aor.clone(), entry);
+        true
     }
 
     /// Build the `Expires: 0` REGISTER that clears one entry's binding.
@@ -1307,11 +1424,7 @@ mod tests {
             "sip:registrar.carrier.com:5060".to_string(),
             "10.0.0.1:5060".parse().unwrap(),
             Transport::Udp,
-            RegistrantCredentials {
-                username: "alice".to_string(),
-                password: "secret123".to_string(),
-                realm: None,
-            },
+            RegistrantCredentials::password("alice".to_string(), "secret123".to_string(), None),
             3600,
             None,
         )
@@ -1698,6 +1811,112 @@ mod tests {
             manager.state("sip:alice@carrier.com"),
             Some(RegistrantState::Challenging)
         );
+    }
+
+    // --- Source-owned entries ---
+
+    fn source_entry(aor: &str, fingerprint: u64) -> RegistrantEntry {
+        make_entry(aor).from_source(fingerprint)
+    }
+
+    #[test]
+    fn only_source_entries_are_offered_to_a_reconcile() {
+        // The rule the whole design rests on: a reconcile must never see a
+        // YAML or script entry, or its first pass would delete the IMS soft-UE
+        // and every other trunk no database knows about.
+        let manager = make_manager();
+        manager.add(make_entry("sip:script@carrier.example"));
+        manager.add(make_entry("sip:yaml@carrier.example").from_yaml());
+        manager.add(source_entry("sip:source@carrier.example", 42));
+
+        let live = manager.source_fingerprints();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live.get("sip:source@carrier.example"), Some(&42));
+    }
+
+    #[test]
+    fn an_aor_held_by_a_script_is_foreign_to_a_source() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:script@carrier.example"));
+        manager.add(source_entry("sip:source@carrier.example", 1));
+
+        assert!(manager.is_foreign_to_source("sip:script@carrier.example"));
+        assert!(!manager.is_foreign_to_source("sip:source@carrier.example"));
+        // An AoR nobody holds is not foreign — it is simply new.
+        assert!(!manager.is_foreign_to_source("sip:nobody@carrier.example"));
+    }
+
+    #[test]
+    fn an_update_keeps_the_registration_identity() {
+        // RFC 3261 §10.2.4: a credential change refreshes the binding the
+        // registrar already holds. A fresh Call-ID with CSeq back at 1 would
+        // read as an unrelated registration and be rejected as out of order.
+        let manager = make_manager();
+        manager.add(source_entry("sip:a@carrier.example", 1));
+        manager.handle_success("sip:a@carrier.example", 3600);
+        let (call_id, cseq) = manager
+            .entries
+            .get("sip:a@carrier.example")
+            .map(|entry| {
+                (
+                    entry.call_id.clone(),
+                    entry.cseq.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .expect("entry present");
+
+        assert!(manager.update_from_source(source_entry("sip:a@carrier.example", 2)));
+
+        let updated = manager
+            .entries
+            .get("sip:a@carrier.example")
+            .expect("entry present");
+        assert_eq!(updated.call_id, call_id, "the Call-ID must carry over");
+        assert_eq!(
+            updated.cseq.load(std::sync::atomic::Ordering::Relaxed),
+            cseq,
+            "the CSeq must continue, not restart"
+        );
+        assert_eq!(updated.source_fingerprint, Some(2));
+        // Due at once, so a rotated password does not wait out the refresh.
+        assert_eq!(updated.state, RegistrantState::Unregistered);
+    }
+
+    #[test]
+    fn an_update_refuses_an_entry_a_source_does_not_own() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:script@carrier.example"));
+
+        assert!(!manager.update_from_source(source_entry("sip:script@carrier.example", 7)));
+
+        // Untouched: still the script's, still without a fingerprint.
+        let entry = manager
+            .entries
+            .get("sip:script@carrier.example")
+            .expect("entry present");
+        assert_eq!(entry.origin, EntryOrigin::Script);
+        assert_eq!(entry.source_fingerprint, None);
+    }
+
+    #[test]
+    fn repeated_add_and_remove_cycles_return_the_store_to_baseline() {
+        // The per-module steady-state check: a reconcile adds and removes
+        // entries for the life of the process, so anything it leaves behind
+        // grows without bound.
+        let manager = make_manager();
+        manager.add(make_entry("sip:permanent@carrier.example"));
+        let baseline = manager.len();
+
+        for cycle in 0..500 {
+            let aor = format!("sip:trunk{cycle}@carrier.example");
+            manager.add(source_entry(&aor, cycle as u64));
+            manager.handle_success(&aor, 3600);
+            manager.remove(&aor);
+        }
+
+        assert_eq!(manager.len(), baseline);
+        assert!(manager.source_fingerprints().is_empty());
     }
 
     #[test]
@@ -2186,11 +2405,11 @@ mod tests {
             format!("sip:pcscf.{AKA_REALM}:5060"),
             "10.0.0.1:5060".parse().unwrap(),
             Transport::Udp,
-            RegistrantCredentials {
-                username: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
-                password: String::new(), // unused for AKA
-                realm: Some(AKA_REALM.to_string()),
-            },
+            RegistrantCredentials::password(
+                "001010000000001@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+                String::new(), // unused for AKA
+                Some(AKA_REALM.to_string()),
+            ),
             600000,
             None,
         )
@@ -2434,11 +2653,11 @@ mod tests {
             "sip:192.0.2.143:5060".to_string(),
             "192.0.2.143:5060".parse().unwrap(),
             Transport::Udp,
-            RegistrantCredentials {
-                username: "001019999999999@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
-                password: String::new(),
-                realm: Some("ims.mnc01.mcc001.3gppnetwork.org".to_string()),
-            },
+            RegistrantCredentials::password(
+                "001019999999999@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+                String::new(),
+                Some("ims.mnc01.mcc001.3gppnetwork.org".to_string()),
+            ),
             3600,
             None,
         )

@@ -161,19 +161,31 @@ impl RegistrantManager {
         let cnonce = format!("{:08x}", rand_u32());
 
         let digest_uri = format!("sip:{request_uri_str}");
-        let credentials = DigestCredentials {
-            username: entry.credentials.username.clone(),
-            password: entry.credentials.password.clone(),
-        };
-
-        let auth_header_value = auth::format_authorization_header(
+        let auth_header_value = match auth::format_stored_authorization_header(
             challenge,
-            &credentials,
+            &entry.credentials.username,
+            &entry.credentials.secret,
             "REGISTER",
             &digest_uri,
             Some(nc),
             Some(&cnonce),
-        );
+        ) {
+            Ok(value) => value,
+            Err(mismatch) => {
+                // A stored ha1 for the wrong hash cannot answer this registrar.
+                // Reported rather than answered wrongly: the wrong ha1 makes a
+                // well-formed response the registrar reads as a bad password,
+                // which looks like a credential fault instead of a
+                // configuration one.
+                error!(
+                    aor = %entry.aor,
+                    realm = %challenge.realm,
+                    error = %mismatch,
+                    "cannot answer the registrar's challenge with the stored credential"
+                );
+                return None;
+            }
+        };
 
         let auth_header_name = if is_proxy_auth {
             "Proxy-Authorization"

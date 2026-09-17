@@ -25,6 +25,20 @@ use serde::Deserialize;
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantYamlConfig {
+    /// Where the registering trunks come from. Default: `static`, the
+    /// `entries` list below.
+    ///
+    /// `database` and `http` read them from a source the controller owns and
+    /// reconcile against it on an interval, so a trunk added, edited or deleted
+    /// there is followed without a restart. Entries added by a script
+    /// (`registration.add`) and the `entries` list are never touched by that
+    /// reconcile — it owns only what it created.
+    #[serde(default = "default_registrant_backend")]
+    pub backend: RegistrantBackendType,
+    /// SQL source for `backend: database`.
+    pub database: Option<RegistrantDatabaseConfig>,
+    /// HTTP source for `backend: http`.
+    pub http: Option<RegistrantHttpConfig>,
     /// Default registration interval in seconds. Default: 3600.
     #[serde(default = "default_registrant_interval")]
     pub default_interval: u32,
@@ -37,6 +51,86 @@ pub struct RegistrantYamlConfig {
     /// Static registration entries.
     #[serde(default)]
     pub entries: Vec<RegistrantEntryConfig>,
+}
+
+/// Where `registrant:` reads its registering trunks from.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrantBackendType {
+    /// The `entries` list in this file.
+    Static,
+    /// A PostgreSQL query the controller owns.
+    Database,
+    /// A JSON endpoint the controller serves.
+    Http,
+}
+
+/// SQL source for `registrant.backend: database`.
+///
+/// The query is the operator's, not siphon's: schemas differ and a fixed one
+/// would mean every deployment maintaining a view for us. Columns are read by
+/// name — `aor`, `registrar` and `username` are required; `password`, `ha1`,
+/// `ha1_algorithm`, `realm`, `interval`, `contact`, `transport`, `enabled` and
+/// `gateway` are optional. When the statement references `$1`, the instance id
+/// (`server.instance_id`) is bound to it, so a deployment can shard its trunks
+/// across nodes with `WHERE node = $1`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantDatabaseConfig {
+    /// libpq connection URI, e.g. `postgresql://siphon@db.internal/siphon`.
+    pub url: String,
+    /// Statement returning one row per registering trunk.
+    #[serde(default = "default_registrant_query")]
+    pub query: String,
+    /// How often to re-read the source and reconcile, in seconds. A change is
+    /// applied at once by `POST /admin/registrants/refresh`, so this is the
+    /// floor rather than the mechanism.
+    #[serde(default = "default_registrant_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Per-query deadline in milliseconds, connection included.
+    #[serde(default = "default_registrant_source_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// JSON source for `registrant.backend: http`.
+///
+/// The endpoint answers `GET {url}` with the contract in
+/// `docs/reference/registrant-api.md` (typed in `siphon_sdk.registrants`).
+///
+/// This is the form to use when trunk passwords are sealed at rest: the
+/// controller unseals in-process and serves the credential over a trusted local
+/// channel, so siphon never sees the sealed form and no sealing construction
+/// has to enter siphon.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantHttpConfig {
+    /// URL siphon `GET`s the trunk list from.
+    pub url: String,
+    /// How often to re-read the source and reconcile, in seconds.
+    #[serde(default = "default_registrant_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Per-request deadline in milliseconds.
+    #[serde(default = "default_registrant_source_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Full `Authorization` header value sent with each request (e.g.
+    /// `"Bearer …"`). Supports `${VAR}` expansion.
+    pub auth_header: Option<String>,
+}
+
+fn default_registrant_backend() -> RegistrantBackendType {
+    RegistrantBackendType::Static
+}
+
+fn default_registrant_query() -> String {
+    "SELECT aor, registrar, username, password, realm, expires AS interval, contact, \
+     transport, enabled FROM registrants"
+        .to_string()
+}
+
+fn default_registrant_refresh_secs() -> u64 {
+    30
+}
+
+fn default_registrant_source_timeout_ms() -> u64 {
+    2000
 }
 
 /// A single static registrant entry.

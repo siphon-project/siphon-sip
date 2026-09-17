@@ -97,6 +97,67 @@ pub(super) fn init_logging(
 ///
 /// `instance_epoch` is always a fresh UUID v4 generated at startup so two
 /// runs of the same logical replica are distinguishable.
+/// Start following a `registrant.backend` source, when one is configured.
+///
+/// Runs after the static `entries` are loaded, so the first reconcile sees them
+/// and leaves them alone — a source owns only the entries it created itself.
+fn init_registrant_source(
+    manager: &Arc<crate::registrant::RegistrantManager>,
+    config: &Config,
+    registrant_config: &crate::config::RegistrantYamlConfig,
+) {
+    use crate::config::RegistrantBackendType;
+    use crate::registrant::source::{DatabaseSource, HttpSource, RegistrantSource};
+
+    let source = match registrant_config.backend {
+        RegistrantBackendType::Static => return,
+        RegistrantBackendType::Database => {
+            // Config load refuses `database` without the block, so this is
+            // unreachable; log rather than panic if it ever is not.
+            let Some(database) = registrant_config.database.clone() else {
+                error!("registrant.backend: database without a `registrant.database` block");
+                return;
+            };
+            RegistrantSource::Database(DatabaseSource::new(database, instance_id(config)))
+        }
+        RegistrantBackendType::Http => {
+            let Some(http) = registrant_config.http.clone() else {
+                error!("registrant.backend: http without a `registrant.http` block");
+                return;
+            };
+            match HttpSource::new(http) {
+                Ok(source) => RegistrantSource::Http(source),
+                Err(error) => {
+                    error!(%error, "cannot build the registrant HTTP source");
+                    return;
+                }
+            }
+        }
+    };
+
+    let source = Arc::new(source);
+    crate::registrant::source::set_source(Arc::clone(&source));
+    let loop_manager = Arc::clone(manager);
+    tokio::spawn(async move {
+        crate::registrant::source::reconcile_loop(loop_manager, source).await;
+    });
+}
+
+/// This process's identity tag.
+///
+/// Resolution order: `server.instance_id` from siphon.yaml, then the `HOSTNAME`
+/// environment variable, then the literal `"siphon"`. Shared by the registrar's
+/// binding identity and the registrant source's `$1` binding, so a deployment
+/// that shards trunks by node uses the same name in both places.
+pub(super) fn instance_id(config: &Config) -> String {
+    config
+        .server
+        .as_ref()
+        .and_then(|server| server.instance_id.clone())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "siphon".to_string())
+}
+
 pub(super) fn init_registrar_identity(config: &Config) {
     use crate::registrar::InstanceIdentity;
     use crate::script::api::registrar_arc;
@@ -106,13 +167,7 @@ pub(super) fn init_registrar_identity(config: &Config) {
         None => return,
     };
 
-    let id = config
-        .server
-        .as_ref()
-        .and_then(|server| server.instance_id.clone())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "siphon".to_string());
-
+    let id = instance_id(config);
     let epoch = uuid::Uuid::new_v4().to_string();
 
     info!(instance_id = %id, instance_epoch = %epoch, "registrar instance identity");
@@ -700,11 +755,11 @@ pub(super) fn init_registrant(
             entry_config.registrar.clone(),
             destination,
             transport_type,
-            RegistrantCredentials {
-                username: entry_config.user.clone(),
-                password: entry_config.password.clone(),
-                realm: entry_config.realm.clone(),
-            },
+            RegistrantCredentials::password(
+                entry_config.user.clone(),
+                entry_config.password.clone(),
+                entry_config.realm.clone(),
+            ),
             entry_config
                 .interval
                 .unwrap_or(registrant_config.default_interval),
@@ -816,6 +871,8 @@ pub(super) fn init_registrant(
         count = registrant_config.entries.len(),
         "outbound registrations configured"
     );
+
+    init_registrant_source(manager, config, registrant_config);
 
     // Spawn background registration loop
     let loop_manager = Arc::clone(manager);
