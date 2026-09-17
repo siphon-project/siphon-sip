@@ -8,6 +8,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **Gateway groups can be read from a database or an HTTP endpoint and
+  reconciled at runtime** (`gateway.backend: database` / `http`), the twin of
+  the registrant source. A carrier added, edited or deleted by the controller is
+  followed without a restart. The reconcile is in place: a destination whose
+  definition has not changed is carried over with its health intact, so a
+  carrier that is down stays down rather than being marked healthy again on
+  every poll, and a group with nothing different is not touched at all, since
+  replacing one restarts its health prober. An unreadable source keeps the
+  current groups. The source owns only the groups it created — `gateway.groups`
+  and anything `gateway.add_group()` created are never reconciled away.
+  A row may also carry `registers`, naming an outbound registration: the
+  destination then answers challenges with that registration's credential, so
+  one trunk's secret is defined once, and `require_registration: true` keeps it
+  out of `gateway.select()` while that registration is down. The JSON is a
+  versioned contract typed in `siphon_sdk.gateways` and documented at
+  `docs/reference/gateway-api.md`, with `examples/provisioning_api_server.py`
+  serving it and the registrant contract off one table.
+
 - **Outbound registrations can be read from a database or an HTTP endpoint and
   reconciled at runtime** (`registrant.backend: database` / `http`), mirroring
   `auth.backend`. A controller that owns trunks as data no longer needs a

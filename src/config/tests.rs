@@ -4180,6 +4180,8 @@ fn gateway_dest(uri: &str, transport: Option<&str>) -> GatewayDestConfig {
         priority: 1,
         attrs: Default::default(),
         auth: None,
+        registers: None,
+        require_registration: false,
     }
 }
 

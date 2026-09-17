@@ -329,6 +329,46 @@ impl UeIpsec {
 // Entry
 // ---------------------------------------------------------------------------
 
+/// The process's registrant manager, for callers with no `Arc` in scope.
+///
+/// The gateway's selection gate is the one that needs it: a destination linked
+/// to a registration has to ask whether that registration is up, and the
+/// dispatcher group it lives on knows nothing about the registrant.
+static MANAGER: std::sync::OnceLock<Arc<RegistrantManager>> = std::sync::OnceLock::new();
+
+/// Record the process's registrant manager. Called once, at start-up.
+pub fn set_manager(manager: Arc<RegistrantManager>) {
+    let _ = MANAGER.set(manager);
+}
+
+/// Whether `aor` is an outbound registration that is currently registered.
+///
+/// `false` when outbound registration is not configured at all, which is the
+/// safe reading for a destination that asked to be gated on one: a link to a
+/// registration that does not exist is a misconfiguration, and withholding the
+/// destination makes it visible instead of silently dialling an unregistered
+/// trunk.
+pub fn registered(aor: &str) -> bool {
+    MANAGER
+        .get()
+        .and_then(|manager| manager.state(aor))
+        .is_some_and(|state| state == RegistrantState::Registered)
+}
+
+/// The credentials an outbound registration authenticates with.
+///
+/// Lets a gateway destination linked to a registration (`registers:`) inherit
+/// its secret, so one trunk's credential is defined once rather than repeated
+/// on both halves and left to drift.
+pub fn credentials_for(aor: &str) -> Option<Arc<crate::auth::StoredCredentials>> {
+    let manager = MANAGER.get()?;
+    let entry = manager.entries.get(aor)?;
+    Some(Arc::new(crate::auth::StoredCredentials {
+        username: entry.credentials.username.clone(),
+        secret: entry.credentials.secret.clone(),
+    }))
+}
+
 /// Who created a [`RegistrantEntry`].
 ///
 /// Reconciling a `registrant.backend` source against the live set is only safe

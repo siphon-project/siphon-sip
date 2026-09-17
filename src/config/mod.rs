@@ -52,7 +52,8 @@ pub use diameter::{
     DiameterTenant, DiameterTenantIdentity, EventSinkConfig, EventSinkFileConfig,
 };
 pub use gateway::{
-    GatewayConfig, GatewayDestConfig, GatewayGroupConfig, GatewayProbeConfig, LcrConfig,
+    GatewayAuthConfig, GatewayBackendType, GatewayConfig, GatewayDatabaseConfig, GatewayDestConfig,
+    GatewayGroupConfig, GatewayHttpConfig, GatewayProbeConfig, LcrConfig,
 };
 pub use ims::{IpsecBackend, IpsecConfig, IscConfig, SbiYamlConfig};
 pub use lawful_intercept::{
@@ -408,6 +409,7 @@ impl Config {
         config.validate_control_apps()?;
         config.validate_control_inbound()?;
         config.validate_registrant_source()?;
+        config.validate_gateway_source()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -719,6 +721,58 @@ impl Config {
                 Ok(())
             }
         }
+    }
+
+    /// Reject a `gateway:` source that cannot produce a group list.
+    ///
+    /// Same reasoning as the registrant source: a node that comes up healthy
+    /// and routes nowhere is worse than one that refuses to start.
+    fn validate_gateway_source(&self) -> Result<()> {
+        let Some(gateway) = &self.gateway else {
+            return Ok(());
+        };
+        let refresh_secs = match gateway.backend {
+            GatewayBackendType::Static => return Ok(()),
+            GatewayBackendType::Database => {
+                let Some(database) = &gateway.database else {
+                    return Err(SiphonError::Config(
+                        "gateway.backend: database needs a `gateway.database` block naming the \
+                         connection URL and the query that returns the destinations. Without one \
+                         there is no source, so no call would route."
+                            .to_string(),
+                    ));
+                };
+                if !cfg!(feature = "postgres-backend") {
+                    return Err(SiphonError::Config(
+                        "gateway.backend: database needs the `postgres-backend` cargo feature, \
+                         which this binary was built without. Rebuild with it (it is on by \
+                         default), or use \"http\" with a `gateway.http` endpoint."
+                            .to_string(),
+                    ));
+                }
+                database.refresh_secs
+            }
+            GatewayBackendType::Http => {
+                let Some(http) = &gateway.http else {
+                    return Err(SiphonError::Config(
+                        "gateway.backend: http needs a `gateway.http` block naming the endpoint \
+                         that returns the destinations. Without one there is no source, so no \
+                         call would route."
+                            .to_string(),
+                    ));
+                };
+                http.refresh_secs
+            }
+        };
+        if refresh_secs == 0 {
+            return Err(SiphonError::Config(
+                "gateway refresh_secs is 0, which would re-read the source in a tight loop. Set \
+                 the interval you want, and use POST /admin/gateways/refresh to apply a change \
+                 at once."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reject an app-level event class siphon does not publish.
