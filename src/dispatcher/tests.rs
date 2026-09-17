@@ -5894,7 +5894,7 @@ fn b_leg_invite_sample() -> SipMessage {
         )
         .via("SIP/2.0/UDP siphon.example.com:6060;branch=z9hG4bK-bleg-INVITE-BRANCH".to_string())
         .to("<sip:5111@ims.example.com>".to_string())
-        .from("<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
+        .from("<sip:+15550142@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
         .call_id("b2b-call-id-bleg".to_string())
         .cseq("1 INVITE".to_string())
         .max_forwards(70)
@@ -5940,7 +5940,7 @@ fn cancel_keeps_from_to_callid_verbatim() {
     let cancel = build_cancel_from_invite(&invite).unwrap();
     assert_eq!(
         cancel.headers.from().unwrap(),
-        "<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ",
+        "<sip:+15550142@siphon.example.com>;tag=b2bua-from-tag-XYZ",
     );
     assert_eq!(cancel.headers.to().unwrap(), "<sip:5111@ims.example.com>",);
     assert_eq!(cancel.headers.call_id().unwrap(), "b2b-call-id-bleg");
