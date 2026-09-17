@@ -13,14 +13,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
-    StreamContext,
+    PrefixedStream, StreamContext,
 };
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
@@ -47,6 +48,10 @@ pub async fn listen(
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these
+    // senders. `None` is the default and leaves the accept path untouched.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     // Bind before spawning, so that awaiting `listen` means the socket is
     // already accepting. With the bind inside the task, the caller returned
@@ -71,10 +76,25 @@ pub async fn listen(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut socket, remote_addr)) => {
+                Ok((socket, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TCP rejected {} by ACL", remote_addr);
                         continue;
+                    }
+                    // A listener behind a front talks to the front and nobody
+                    // else. Refused here, before the spawn, so a sender that
+                    // may not speak for anyone costs one accept() and nothing
+                    // more. Not an auto-ban signal: the likeliest cause by far
+                    // is a second front that was never added to the list, and
+                    // banning it would turn a misconfiguration into an outage.
+                    if let Some(allowlist) = &proxy_protocol {
+                        if !allowlist.allows(remote_addr.ip()) {
+                            warn!(
+                                "TCP refusing {remote_addr} on the proxy_protocol listener \
+                                 {bound}: not in proxy_protocol.from"
+                            );
+                            continue;
+                        }
                     }
                     // See the TLS listener for why this is taken here, before
                     // the spawn, and dropped silently rather than banned.
@@ -94,8 +114,62 @@ pub async fn listen(
 
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
+                    let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(bound);
+                        // Split before the PROXY read so the bytes read past
+                        // the header can be pushed back in front of the read
+                        // half — `into_split` is not available once the socket
+                        // is wrapped, and the framer needs them either way.
+                        let (mut reader, writer) = socket.into_split();
+                        // The PROXY header comes before anything else on the
+                        // wire, so it is read before the SIP sniff, and the
+                        // client address it carries replaces the front's for
+                        // every consumer downstream: the ban store, the
+                        // registrar's `received`, capture and the CDR.
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
+                            match accept_proxied(
+                                &mut reader,
+                                remote_addr,
+                                Transport::Tcp,
+                                &bound.to_string(),
+                            )
+                            .await
+                            {
+                                Some(accepted) => accepted,
+                                None => return,
+                            }
+                        } else {
+                            (remote_addr, None, bytes::BytesMut::new())
+                        };
+                        // The accept loop checked the ACL and the ceiling against
+                        // the front, where neither means anything: every
+                        // connection shares that address. Re-check the client the
+                        // header named, and hold its permit instead — dropping
+                        // the front's hands those slots back, so the connection
+                        // is counted once, against whoever is responsible.
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::Tcp,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
+                        // What the phone spoke to the front, when the front
+                        // re-encrypted and said so. Carried beside the hop, not
+                        // over it — this connection is still plain TCP.
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::Tcp,
+                        );
+                        // Push the over-read back in front of the read half so
+                        // the framer sees the first SIP message the front sent
+                        // in the same segment as the header.
+                        let mut reader = PrefixedStream::new(reader, replay);
                         // Decide from the first line that this really is SIP,
                         // before any byte reaches the framer — an HTTP probe
                         // frames as a complete "message" and would otherwise be
@@ -104,23 +178,25 @@ pub async fn listen(
                         // the connection id also keeps a probe out of the
                         // connection map and out of the accept log.
                         let Some(seed) =
-                            sniff_sip_or_drop(&mut socket, remote_addr, Transport::Tcp).await
+                            sniff_sip_or_drop(&mut reader, remote_addr, Transport::Tcp).await
                         else {
                             return;
                         };
                         // Confirmed SIP: the handshake slot goes back, the
-                        // connection slot stays with `permit` below.
+                        // connection slot stays with `permit` below. Still
+                        // after the PROXY read, so the header is covered by the
+                        // handshake ceiling rather than by nothing.
                         permit.handshake_done();
 
                         let connection_id = next_connection_id();
                         debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
-                        let (reader, writer) = socket.into_split();
                         serve_sip_stream(
                             reader,
                             writer,
                             StreamContext {
                                 transport: Transport::Tcp,
+                                client_transport,
                                 connection_id,
                                 local_addr,
                                 remote_addr,
@@ -809,11 +885,88 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("tcp listener must bind");
         assert_ne!(addr.port(), 0, "listen must return the port it bound");
         (addr, inbound_rx)
+    }
+
+    /// The accept loop checks the ACL against whoever opened the socket — the
+    /// front — so a listener behind one applies every abuse control to an
+    /// address every client shares. This proves the accept site re-applies it to
+    /// the client the header named.
+    ///
+    /// Deliberately driven through the per-listener `TransportAcl` rather than
+    /// the auto-ban store or the connection limiter: those are process-global
+    /// `OnceLock`s owned by tests in `security.rs`, so a test depending on them
+    /// here would be ordering-dependent. The ACL is passed in per listener, so
+    /// this is deterministic. It exercises the same `admit_proxied_client` call
+    /// either way — `is_allowed` is what consults the ban store in production.
+    #[tokio::test]
+    async fn a_denied_client_is_dropped_even_though_the_front_is_allowed() {
+        use tokio::io::AsyncWriteExt;
+
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        // Denies the client the header will claim; says nothing about loopback,
+        // so the front itself passes the accept-loop check.
+        let acl = Arc::new(TransportAcl::new(
+            vec!["203.0.113.66/32".to_string()],
+            vec![],
+        ));
+        let allowlist = Arc::new(crate::transport::proxy_protocol::ProxyProtocolAcl::new(&[
+            "127.0.0.0/8".to_string(),
+        ]));
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            acl,
+            None,
+            None,
+            None,
+            None,
+            Some(allowlist),
+        )
+        .await
+        .expect("tcp listener must bind");
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"PROXY TCP4 203.0.113.66 198.51.100.7 51234 5060\r\n")
+            .await
+            .unwrap();
+        client
+            .write_all(
+                concat!(
+                    "OPTIONS sip:probe@example.com SIP/2.0\r\n",
+                    "Via: SIP/2.0/TCP 203.0.113.66:51234;branch=z9hG4bKdenied\r\n",
+                    "From: <sip:probe@example.com>;tag=denied\r\n",
+                    "To: <sip:probe@example.com>\r\n",
+                    "Call-ID: denied-client@example.com\r\n",
+                    "CSeq: 1 OPTIONS\r\n",
+                    "Content-Length: 0\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Nothing must reach the dispatcher: delete the re-check at the accept
+        // site and this OPTIONS arrives under a denied address.
+        let delivered = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            inbound_rx.recv_async(),
+        )
+        .await;
+        assert!(
+            delivered.is_err(),
+            "a client the ACL denies must be dropped even when the front carrying it is allowed"
+        );
     }
 
     #[tokio::test]
@@ -925,5 +1078,131 @@ mod tests {
                 .unwrap();
         assert_eq!(&inbound.data[..], register.as_bytes());
         assert_eq!(inbound.transport, Transport::Tcp);
+    }
+
+    // --- end to end: the client's transport at the front ---------------------
+
+    /// Start a TCP SIP listener that sits behind a front and is given the
+    /// PROXY header by it.
+    async fn spawn_proxied_listener() -> (SocketAddr, flume::Receiver<InboundMessage>) {
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::new(ProxyProtocolAcl::new(
+                &["127.0.0.0/8".to_string()],
+            ))),
+        )
+        .await
+        .expect("tcp listener must bind");
+        (addr, inbound_rx)
+    }
+
+    /// A v2 `PROXY` header for TCP4, optionally carrying the `PP2_TYPE_SSL` TLV
+    /// that reports the client's TLS session with the front.
+    fn proxy_v2_tcp4(client_used_tls: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&std::net::Ipv4Addr::new(192, 0, 2, 10).octets());
+        body.extend_from_slice(&std::net::Ipv4Addr::new(198, 51, 100, 7).octets());
+        body.extend_from_slice(&51234u16.to_be_bytes());
+        body.extend_from_slice(&5061u16.to_be_bytes());
+        if client_used_tls {
+            // client=PP2_CLIENT_SSL, verify=0, then PP2_SUBTYPE_SSL_VERSION.
+            let mut ssl_value = vec![0x01u8, 0, 0, 0, 0];
+            ssl_value.push(0x21);
+            ssl_value.extend_from_slice(&7u16.to_be_bytes());
+            ssl_value.extend_from_slice(b"TLSv1.3");
+            body.push(0x20); // PP2_TYPE_SSL
+            body.extend_from_slice(&(ssl_value.len() as u16).to_be_bytes());
+            body.extend_from_slice(&ssl_value);
+        }
+        let mut header = Vec::from(
+            [
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ]
+            .as_slice(),
+        );
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x11); // TCP over IPv4
+        header.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        header.extend_from_slice(&body);
+        header
+    }
+
+    const PROXIED_REGISTER: &str = concat!(
+        "REGISTER sip:example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/TCP 192.0.2.10:51234;branch=z9hG4bK-edge\r\n",
+        "From: <sip:alice@example.com>;tag=abc123\r\n",
+        "To: <sip:alice@example.com>\r\n",
+        "Call-ID: edge-tls-test@example.com\r\n",
+        "CSeq: 1 REGISTER\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+
+    /// A re-encrypting front terminates the phone's TLS and opens its own
+    /// plaintext connection, so the hop is TCP while the client spoke TLS. The
+    /// `PP2_TYPE_SSL` TLV is the only record of that, and it has to reach the
+    /// dispatcher beside the hop rather than replacing it — the hop is what
+    /// decides the connection map, the Via token and the advertised address.
+    #[tokio::test]
+    async fn a_proxied_clients_edge_tls_reaches_the_dispatcher_beside_the_hop() {
+        use tokio::io::AsyncWriteExt;
+
+        let (addr, inbound_rx) = spawn_proxied_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&proxy_v2_tcp4(true)).await.unwrap();
+        client.write_all(PROXIED_REGISTER.as_bytes()).await.unwrap();
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("the proxied REGISTER must be dispatched")
+                .unwrap();
+
+        assert_eq!(
+            inbound.transport,
+            Transport::Tcp,
+            "the hop siphon accepted is still plaintext TCP"
+        );
+        assert_eq!(
+            inbound.client_transport,
+            Some(Transport::Tls),
+            "the SSL TLV says the phone reached the front over TLS"
+        );
+        assert_eq!(
+            inbound.remote_addr.ip().to_string(),
+            "192.0.2.10",
+            "the client address still comes from the header, not the front"
+        );
+    }
+
+    /// The same front without the TLV: nothing contradicts the hop, so no
+    /// client transport is invented for a connection that may well be plaintext
+    /// end to end.
+    #[tokio::test]
+    async fn a_proxied_client_without_the_tlv_reports_no_separate_transport() {
+        use tokio::io::AsyncWriteExt;
+
+        let (addr, inbound_rx) = spawn_proxied_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&proxy_v2_tcp4(false)).await.unwrap();
+        client.write_all(PROXIED_REGISTER.as_bytes()).await.unwrap();
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("the proxied REGISTER must be dispatched")
+                .unwrap();
+        assert_eq!(inbound.transport, Transport::Tcp);
+        assert_eq!(inbound.client_transport, None);
     }
 }

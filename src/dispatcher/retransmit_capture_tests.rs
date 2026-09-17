@@ -166,6 +166,7 @@ async fn every_retransmission_of_a_reliable_provisional_is_captured() {
     provisional.headers.add("Require", "100rel".to_string());
     provisional.headers.add("RSeq", "1".to_string());
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: address(SIPHON),
@@ -206,6 +207,7 @@ async fn a_request_relayed_over_a_captured_flow_is_captured() {
     );
     let message = parse(raw);
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: address(SIPHON),

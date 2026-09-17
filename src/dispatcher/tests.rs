@@ -2019,6 +2019,7 @@ fn save_stream_binding(
             None,
             vec![],
             crate::registrar::FlowCapture {
+                client_transport: None,
                 flow_token: Some(format!("tok-{user}").into_boxed_str()),
                 inbound_local_addr: None,
                 inbound_connection_id: Some(connection_id),
@@ -2183,6 +2184,7 @@ fn agreement_binding(
             None,
             vec![],
             crate::registrar::FlowCapture {
+                client_transport: None,
                 flow_token: Some("tok-agreement".into()),
                 inbound_local_addr: Some("192.0.2.10:5066".parse().expect("fixture")),
                 inbound_connection_id: (transport == Transport::Tcp).then_some(7),
@@ -7750,6 +7752,7 @@ fn sample_pending_refer(deadline: std::time::Instant) -> PendingInboundRefer {
     let local: SocketAddr = "192.0.2.100:5060".parse().unwrap();
     PendingInboundRefer {
         inbound: InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: local,

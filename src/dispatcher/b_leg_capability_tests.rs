@@ -377,6 +377,7 @@ async fn the_b_leg_allow_is_siphons_method_set() {
 fn b_leg_invite_from_script(script: &str) -> SipMessage {
     let dispatcher = test_dispatcher_with_script(script);
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: dispatcher.state.local_addr,

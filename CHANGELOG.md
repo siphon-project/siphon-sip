@@ -8,6 +8,70 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **`proxy_protocol` on a stream listener takes the client address from a
+  HAProxy PROXY header (v1 and v2), so a connection-terminating front stops
+  hiding the real client.** A front that terminates TLS opens its own
+  connection, so every consumer that keys on the source saw the front: auto-ban
+  banned the front rather than the abuser, `from_gateway()` and
+  `source_ip_in()` stopped discriminating, NAT return-routing advertised the
+  front in `received=`/`rport=`, `media.received_from` gated media ingress to it
+  so no RTP was accepted at all, and capture and the CDR recorded the front for
+  every call. The documented alternative, L4 source preservation, cannot work
+  for a front that terminates the connection, which is the point of using one to
+  terminate TLS.
+
+  Enabling it requires naming the senders allowed to assert an address:
+
+  ```yaml
+  listen:
+    tls:
+      - address: "198.51.100.10:5061"
+        proxy_protocol:
+          from: ["198.51.100.7/32"]
+  ```
+
+  `from` is mandatory and has no default. It deliberately does not fall back to
+  `security.trusted_cidrs`, which means "exempt from abuse controls" to all four
+  of its consumers and is where monitoring boxes and trunks are listed —
+  inheriting it would hand source-address forgery rights to hosts named there
+  for an unrelated reason. Stream listeners only (`tcp`, `tls`, `ws`, `wss`, and
+  a shared `tcp+ws` / `tls+wss` socket); a UDP listener is refused at config
+  load, as is an empty `from` or an entry that is not a CIDR. The header is read
+  before the TLS handshake, so a front may re-encrypt and no hop carries
+  cleartext SIP.
+
+  On an enabled listener, a connection from an address outside `from` and a
+  connection that opens without a header are both dropped rather than quietly
+  attributed to the front, and neither credits the auto-ban store — a second
+  front missing from the list is likelier than abuse, and banning your own
+  ingress is the worse outage. A v2 `LOCAL` or v1 `UNKNOWN` header (a front's own
+  health checks) is consumed and the socket's peer address stands. A PROXY header
+  arriving on a listener that has the option *off* is recognised and refused with
+  a log naming the listener, instead of being counted as binary garbage and
+  credited to the auto-ban store — siphon banning its own front.
+
+  The abuse controls follow the client rather than the front. At accept there is
+  only one address to judge — the front's — and behind a front that address is
+  shared by every caller, so a ban never matches it and the per-source connection
+  ceiling never trips. Once the header has been read, `security.failed_auth_ban`,
+  `security.apiban` and `security.connection_limits` are all re-applied to the
+  client it names, and the connection is counted against that client instead of
+  against the front. Without this the store would still record an abuser behind a
+  front and then never drop them, which is half of what this option exists to
+  fix.
+
+- **A re-encrypting front can tell siphon the client spoke TLS, via the v2
+  `PP2_TYPE_SSL` TLV.** A front that terminates the UE's TLS and opens a
+  plaintext connection to siphon leaves every consumer seeing `tcp`, so a script
+  gating on transport security would refuse a UE that did use TLS. The client's
+  transport is now carried *beside* the hop's, never over it: `request.transport`
+  still names the hop siphon accepted, and two new properties answer for the
+  client — `request.client_transport` (the front-declared transport, or `None`
+  when there is no front) and `request.client_is_secure`, which answers for the
+  client's effective hop so a UE connecting straight to a `tls` listener reports
+  `True` as well. `Contact.client_transport` persists it with the binding, and
+  the CDR records the client's transport rather than the front-facing one.
+  Mirrored in the SDK.
 - **`dial`, `record_start` and `record_stop` are typed verbs in all three
   control SDKs.** All three shipped server-side but were missing from the
   `SipVerb` enum the SDKs are built against, so none of them wrapped the verbs

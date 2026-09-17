@@ -149,8 +149,14 @@ pub(crate) fn validate_send_socket(send_socket: Option<&str>) -> PyResult<()> {
 #[pyclass(name = "Request")]
 pub struct PyRequest {
     message: Arc<Mutex<SipMessage>>,
-    /// Transport protocol this request arrived on.
+    /// Transport protocol this request arrived on — the hop siphon accepted.
     transport_name: String,
+    /// Transport the *client* used, when a front's PROXY header said it differs
+    /// from the hop (lowercase scheme token). `None` when nothing contradicts
+    /// the hop. Never merged into `transport_name`: that names the socket a
+    /// peer must come back to, and `registrar.save()` / `src/auth` both key on
+    /// it.
+    client_transport: Option<String>,
     /// Source IP address.
     source_ip: String,
     /// Source port.
@@ -229,6 +235,7 @@ impl PyRequest {
         Self {
             message,
             transport_name,
+            client_transport: None,
             source_ip,
             source_port,
             record_routed: false,
@@ -285,6 +292,7 @@ impl PyRequest {
         Self {
             message,
             transport_name,
+            client_transport: None,
             source_ip,
             source_port,
             record_routed: false,
@@ -319,6 +327,18 @@ impl PyRequest {
     pub fn set_inbound_flow(&mut self, local_addr: std::net::SocketAddr, connection_id: u64) {
         self.local_addr = Some(local_addr);
         self.inbound_connection_id = Some(connection_id);
+    }
+
+    /// Record what the client spoke, when a front's PROXY header reported a
+    /// transport different from the hop. Additive: the hop stays in
+    /// `transport_name`, which routing, registrar and auto-ban all read.
+    pub fn set_client_transport(&mut self, client_transport: Option<crate::transport::Transport>) {
+        self.client_transport = client_transport.map(|t| t.as_scheme().to_string());
+    }
+
+    /// The client's own transport, when a front declared one (Rust-side accessor).
+    pub fn client_transport_name(&self) -> Option<&str> {
+        self.client_transport.as_deref()
     }
 
     /// Full local SocketAddr the request arrived on (Rust-side accessor).
@@ -841,9 +861,44 @@ impl PyRequest {
     }
 
     /// Transport protocol ("udp", "tcp", "tls", "ws", "wss").
+    ///
+    /// Always the hop siphon accepted — the socket a peer must come back to.
+    /// Behind a connection-terminating front that is the *front's* transport,
+    /// not the phone's; read :attr:`client_transport` for that.
     #[getter]
     fn transport(&self) -> String {
         self.transport_name.clone()
+    }
+
+    /// Transport the client used to reach the front ("tls", "wss", …), or
+    /// ``None`` when no front declared one.
+    ///
+    /// Populated only on a ``proxy_protocol`` listener, from the v2
+    /// ``PP2_TYPE_SSL`` TLV: a re-encrypting front terminates the phone's TLS
+    /// and opens its own plaintext connection, so :attr:`transport` reads
+    /// ``"tcp"`` while this reads ``"tls"``.
+    ///
+    /// ``None`` does not mean insecure — it means nothing contradicts the hop.
+    /// Prefer :attr:`client_is_secure` over comparing this yourself.
+    #[getter]
+    pub(crate) fn client_transport(&self) -> Option<String> {
+        self.client_transport.clone()
+    }
+
+    /// Whether the client reached siphon over a secure transport.
+    ///
+    /// Answers for the client's own hop, whichever it was: the front-declared
+    /// transport when there is one, otherwise :attr:`transport`. So a UA that
+    /// connected straight to a TLS listener and one that reached a
+    /// TLS-terminating front both report ``True``.
+    #[getter]
+    pub(crate) fn client_is_secure(&self) -> bool {
+        let effective = self
+            .client_transport
+            .as_deref()
+            .unwrap_or(&self.transport_name);
+        crate::transport::Transport::from_scheme(effective)
+            .is_some_and(crate::transport::Transport::is_secure)
     }
 
     /// Source IP address.
@@ -2015,6 +2070,7 @@ mod tests {
     /// hands it to a script.
     fn contact_with_path(uri: &str, path: Vec<String>) -> super::super::registrar::PyContact {
         let contact = crate::registrar::Contact {
+            client_transport: None,
             uri: crate::sip::parser::parse_uri_standalone(uri).unwrap(),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2143,6 +2199,106 @@ mod tests {
         assert_eq!(request.transport(), "udp");
         assert_eq!(request.source_ip(), "10.0.0.1");
         assert_eq!(request.source_port(), 5060);
+    }
+
+    /// A v2 `PROXY` header for TCP4 whose `PP2_TYPE_SSL` TLV says the client
+    /// negotiated TLS with the front.
+    fn proxy_v2_with_client_tls() -> Vec<u8> {
+        // client=PP2_CLIENT_SSL, verify=0 (verified), then the version subtype.
+        let mut ssl_value = vec![0x01u8, 0, 0, 0, 0];
+        ssl_value.push(0x21);
+        ssl_value.extend_from_slice(&7u16.to_be_bytes());
+        ssl_value.extend_from_slice(b"TLSv1.3");
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&std::net::Ipv4Addr::new(192, 0, 2, 10).octets());
+        body.extend_from_slice(&std::net::Ipv4Addr::new(198, 51, 100, 7).octets());
+        body.extend_from_slice(&51234u16.to_be_bytes());
+        body.extend_from_slice(&5061u16.to_be_bytes());
+        body.push(0x20); // PP2_TYPE_SSL
+        body.extend_from_slice(&(ssl_value.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ssl_value);
+
+        let mut header = Vec::from(
+            [
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ]
+            .as_slice(),
+        );
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x11); // TCP over IPv4
+        header.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        header.extend_from_slice(&body);
+        header
+    }
+
+    /// A re-encrypting front terminates the phone's TLS and opens its own
+    /// plaintext connection, so the hop siphon accepted is TCP while the client
+    /// spoke TLS. The `PP2_TYPE_SSL` TLV is the only place that fact exists, and
+    /// it has to reach the script as `client_is_secure` — without ever being
+    /// mistaken for `transport`, which still names the hop.
+    #[tokio::test]
+    async fn a_proxied_client_that_spoke_tls_is_secure_to_the_script() {
+        use crate::transport::Transport;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut front, mut accepted) = tokio::io::duplex(4096);
+        front.write_all(&proxy_v2_with_client_tls()).await.unwrap();
+
+        let (client_addr, edge_tls, _replay) = crate::transport::proxy_protocol::accept_proxied(
+            &mut accepted,
+            "198.51.100.7:40000".parse().unwrap(),
+            Transport::Tcp,
+            "tcp",
+        )
+        .await
+        .expect("an allowed front's header must be accepted");
+
+        let client_transport =
+            crate::transport::proxy_protocol::client_transport(edge_tls.as_ref(), Transport::Tcp);
+        assert_eq!(
+            client_transport,
+            Some(Transport::Tls),
+            "PP2_CLIENT_SSL over a TCP hop means the client spoke TLS"
+        );
+
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(invite_request_message())),
+            Transport::Tcp.as_scheme().to_string(),
+            client_addr.ip().to_string(),
+            client_addr.port(),
+        );
+        request.set_client_transport(client_transport);
+
+        assert_eq!(
+            request.transport(),
+            "tcp",
+            "transport keeps naming the hop siphon accepted"
+        );
+        assert_eq!(request.client_transport().as_deref(), Some("tls"));
+        assert!(request.client_is_secure());
+    }
+
+    /// Without a header the client reached siphon directly, so its transport is
+    /// the hop: no `client_transport` to report, and `client_is_secure` answers
+    /// from the hop rather than defaulting to false.
+    #[test]
+    fn an_unproxied_request_reports_its_own_hop_as_the_clients_security() {
+        let plaintext = make_request();
+        assert_eq!(plaintext.client_transport(), None);
+        assert!(!plaintext.client_is_secure());
+
+        let direct_tls = PyRequest::new(
+            Arc::new(Mutex::new(invite_request_message())),
+            "tls".to_string(),
+            "192.0.2.10".to_string(),
+            51234,
+        );
+        assert_eq!(direct_tls.client_transport(), None);
+        assert!(
+            direct_tls.client_is_secure(),
+            "a client that reached siphon over TLS itself is secure too"
+        );
     }
 
     #[test]

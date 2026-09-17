@@ -1,0 +1,59 @@
+# siphon.proxy-protocol.yaml — PROXY protocol acceptance config.
+#
+# Used with: sipp/docker-compose.proxy-protocol.yaml
+# Script:    sipp/proxy-protocol/proxy_protocol_relay.py
+#
+# The listener under test is `listen.tls`, reached only through the HAProxy in
+# front of it (192.0.2.20), which connects with `send-proxy-v2`. The header is
+# cleartext and arrives ahead of the ClientHello, so this exercises the hardest
+# ordering the feature has: siphon reads the client's address before it has
+# even begun its own handshake.
+#
+# `from` names the front and nothing else. The UA (192.0.2.30) is deliberately
+# NOT listed — a PROXY header is a claim to be someone else, so only the front
+# may make it.
+#
+# The plain UDP listener exists purely for the container healthcheck (the script
+# answers OPTIONS). It carries no proxy_protocol: on UDP the reply destination
+# *is* the peer address, and config validation refuses the combination.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tls:
+    - address: "0.0.0.0:5061"
+      proxy_protocol:
+        from:
+          - "192.0.2.20/32"
+
+tls:
+  certificate: "/etc/siphon/pki/cert.pem"
+  private_key: "/etc/siphon/pki/key.pem"
+
+domain:
+  local:
+    - "pbx.example"
+    - "192.0.2.10"
+
+script:
+  path: "/etc/siphon/test_scripts/proxy_protocol_relay.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+# The CDR consumer. Which address lands on a row is decided inside the
+# dispatcher, in private code no Rust integration test can reach, so the row
+# this produces is the only end-to-end proof that a call behind a front is
+# billed against the caller and not against the front.
+cdr:
+  enabled: true
+  backend: file
+  file:
+    path: "/var/log/siphon/cdr.jsonl"
+
+log:
+  level: debug
+  format: pretty

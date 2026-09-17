@@ -697,6 +697,7 @@ mod tests {
         uri.port = Some(5060);
         let _ = uri_str;
         Contact {
+            client_transport: None,
             uri,
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -1132,6 +1133,7 @@ mod tests {
         // must still emit a terminated registration — the user is not
         // registered, only the iFC chain knows about them.
         let as_only = Contact {
+            client_transport: None,
             uri: crate::sip::uri::SipUri::new("ims.example.com".to_string())
                 .with_user("mmtel".into()),
             q: 1.0,

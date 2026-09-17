@@ -172,6 +172,60 @@ if not proxy.rate_limit(request, window_secs=1, max_requests=5):
     return    # silently drop — don't fingerprint the server
 ```
 
+### Letting a front speak for the client
+
+Everything above keys on the source IP, so everything above quietly stops working
+when a front **terminates** the connection — an L7 or TLS-terminating proxy,
+HAProxy in `tcp` mode with its own certificate, an Ingress controller. The front
+opens its own connection, so that is the only address SIPhon sees: the ban store
+bans the front or nobody, `trusted_cidrs` either exempts every client behind it
+or none of them, and `from_gateway()` stops telling you which side a call came
+from. `proxy_protocol` on the listener restores the client address by reading it
+out of the header the front sends:
+
+```yaml
+listen:
+  tls:
+    - address: "198.51.100.10:5061"
+      proxy_protocol:
+        from: ["198.51.100.7/32"]   # the front, and nothing else
+```
+
+**`from` is a security control, not a convenience.** A PROXY header lets its
+sender claim to be any address on the internet — including one of your
+`trusted_cidrs`, which is exactly how an unrestricted PROXY listener becomes a
+one-line bypass of every layer on this page. So `from` is mandatory, has no
+default, and a listener with an empty or unparseable list is refused at config
+load rather than started permissive. Keep it as narrow as the front really is: a
+`/32` per front, not the subnet it lives in.
+
+**It deliberately does not inherit `trusted_cidrs`.** That is the obvious
+shortcut and it is the wrong one. `trusted_cidrs` means "exempt from abuse
+controls" to all four of its consumers, and it is where this page has just told
+you to put monitoring boxes, health-check probes and trunks. Inheriting it would
+hand source-address forgery rights to every one of them, on the strength of a
+decision made for an entirely different reason. The two lists answer different
+questions and stay separate.
+
+Two failure directions are closed on purpose, because both would otherwise be
+silent:
+
+- A connection from outside `from`, and a connection on an enabled listener that
+  opens with anything other than a PROXY header, are **dropped** — never
+  attributed to the front. Neither credits the ban store: a second front nobody
+  added to the list is likelier than an attack, and banning your own ingress is a
+  worse outage than the misconfiguration.
+- A PROXY header arriving on a listener with the option **off** is recognised and
+  refused with a log naming the listener. It used to score as non-SIP bytes, i.e.
+  `strong_signal_weight` — SIPhon banning its own load balancer within a few
+  connections.
+
+The header is cleartext and arrives ahead of the TLS ClientHello, so it is read
+before the handshake. That is what lets the front terminate the subscriber's TLS
+and open its own to SIPhon with no hop carrying cleartext SIP. Stream listeners
+only; the full reference is in
+[Transports](../transports.md#behind-a-connection-terminating-front).
+
 ## 2. Drop malformed traffic (script)
 
 `proxy.sanity_check()` runs the RFC 4475 semantic checks (mandatory headers, CSeq,
@@ -357,6 +411,8 @@ of the B-leg's own.
 ## Checklist
 
 - [ ] `security.failed_auth_ban` + `scanner_block` on, infra in `trusted_cidrs`
+- [ ] Behind a terminating front: `proxy_protocol.from` names that front and only
+      that front (it does **not** inherit `trusted_cidrs`)
 - [ ] `proxy.sanity_check()` on out-of-dialog requests, silent-drop failures
 - [ ] TLS (and mTLS for trunks); subscriber-facing access over TLS/WSS
 - [ ] Digest auth on REGISTER (+ `enforce_auth_aor_match`)

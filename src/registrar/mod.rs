@@ -166,6 +166,14 @@ pub struct Contact {
     /// every consumer wanted a `Transport` anyway — the routing path used to
     /// re-parse this string back into one on each send.
     pub source_transport: Option<Transport>,
+    /// Transport the *client* used to reach the front, when a PROXY header
+    /// declared one that differs from `source_transport`.
+    ///
+    /// Descriptive only. `source_transport` is what routing, `received` URI
+    /// construction and RFC 5626 flow handling all read — this records that the
+    /// UE behind a TLS-terminating front spoke TLS even though the binding was
+    /// accepted over plain TCP. `None` means nothing contradicted the hop.
+    pub client_transport: Option<Transport>,
     /// RFC 5627 GRUU: `+sip.instance` (URN, e.g. "urn:uuid:f81d4fae-...").
     pub sip_instance: Option<Box<str>>,
     /// RFC 5626 Outbound: `reg-id` parameter.
@@ -398,6 +406,11 @@ pub struct FlowCapture {
     pub flow_token: Option<Box<str>>,
     pub inbound_local_addr: Option<SocketAddr>,
     pub inbound_connection_id: Option<u64>,
+    /// Transport the client used to reach the front, when a PROXY header
+    /// declared one. Travels with the rest of the captured flow rather than as
+    /// another positional argument on the `save_*` family, which already carry
+    /// the full RFC 3261 + IMS parameter set.
+    pub client_transport: Option<Transport>,
 }
 
 /// Identity of the siphon process that accepts new REGISTERs.
@@ -1306,6 +1319,7 @@ impl Registrar {
         }
 
         let contact = Contact {
+            client_transport: None,
             uri,
             q,
             registered_at: Instant::now(),
@@ -1821,6 +1835,7 @@ impl Registrar {
         let aor = primary.as_str();
         let instance = self.current_instance();
         let contact = Contact {
+            client_transport: None,
             uri: uri.clone(),
             q,
             registered_at: Instant::now(),
@@ -2053,6 +2068,7 @@ mod tests {
                 None,
                 vec![],
                 FlowCapture {
+                    client_transport: None,
                     flow_token: None,
                     inbound_local_addr: None,
                     inbound_connection_id: connection_id,
@@ -2154,6 +2170,7 @@ mod tests {
                 None,
                 vec![],
                 FlowCapture {
+                    client_transport: None,
                     flow_token: Some("tok-1".into()),
                     inbound_local_addr: None,
                     inbound_connection_id: Some(77),
@@ -2208,6 +2225,7 @@ mod tests {
                 None,
                 vec![],
                 FlowCapture {
+                    client_transport: None,
                     flow_token: Some(Box::from(flow_token)),
                     inbound_local_addr: None,
                     inbound_connection_id: Some(connection_id),
@@ -2365,6 +2383,7 @@ mod tests {
                 None,
                 vec![],
                 FlowCapture {
+                    client_transport: None,
                     flow_token: None,
                     inbound_local_addr: None,
                     inbound_connection_id: Some(7),
@@ -3134,6 +3153,7 @@ mod tests {
         });
 
         let foreign = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
@@ -3187,6 +3207,7 @@ mod tests {
     #[test]
     fn contact_remaining_seconds() {
         let contact = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
@@ -3218,6 +3239,7 @@ mod tests {
         // Manually insert an already-expired contact
         {
             let contact = Contact {
+                client_transport: None,
                 uri: contact_uri("alice", "10.0.0.1"),
                 q: 1.0,
                 registered_at: Instant::now() - Duration::from_secs(7200),
@@ -3276,6 +3298,7 @@ mod tests {
         );
 
         let contact = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -3405,6 +3428,7 @@ mod tests {
 
         registrar.set_associated_uris(doomed, vec!["sip:+15551234567@ims.example.com".to_string()]);
         let expired = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -3498,6 +3522,7 @@ mod tests {
                     None,
                     vec![],
                     FlowCapture {
+                        client_transport: None,
                         flow_token: Some(format!("token-{index}").into_boxed_str()),
                         inbound_local_addr: None,
                         inbound_connection_id: Some(index as u64),
@@ -4662,6 +4687,7 @@ mod tests {
 
     fn flow_capture(token: &str, local_port: u16, remote_port: u16) -> FlowCapture {
         FlowCapture {
+            client_transport: None,
             flow_token: Some(token.into()),
             inbound_local_addr: Some(format!("127.0.0.1:{local_port}").parse().unwrap()),
             inbound_connection_id: Some(0xfeed_face_dead_beef ^ remote_port as u64),
@@ -4867,6 +4893,7 @@ mod tests {
         // unwires it.
         let aor = "sip:alice@ims.example.com".to_string();
         let stale = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -4906,6 +4933,7 @@ mod tests {
         let registrar = Registrar::default();
         let aor = "sip:alice@ims.example.com".to_string();
         let live = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now(),
@@ -4947,6 +4975,7 @@ mod tests {
         let registrar = Registrar::default();
         let aor = "sip:alice@ims.example.com".to_string();
         let stale = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -5041,6 +5070,7 @@ mod tests {
         let registrar = Registrar::default();
         let aor = "sip:alice@ims.example.com".to_string();
         let stale = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -5103,6 +5133,7 @@ mod tests {
                         None,
                         vec![],
                         FlowCapture {
+                            client_transport: None,
                             flow_token: Some(token.into_boxed_str()),
                             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
                             inbound_connection_id: Some(thread_id * 1000 + i),
@@ -5498,6 +5529,7 @@ mod tests {
         // Inject an already-expired UE contact + a live AS record so
         // we can verify the cascade.
         let stale_ue = Contact {
+            client_transport: None,
             uri: contact_uri("alice", "10.0.0.1"),
             q: 1.0,
             registered_at: Instant::now() - Duration::from_secs(7200),
@@ -5519,6 +5551,7 @@ mod tests {
             kind: ContactKind::Ue,
         };
         let live_as = Contact {
+            client_transport: None,
             uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
             q: 1.0,
             registered_at: Instant::now(),
@@ -5557,6 +5590,7 @@ mod tests {
         let registrar = Registrar::default();
         let aor = "sip:alice@ims.example.com".to_string();
         let as_only = Contact {
+            client_transport: None,
             uri: SipUri::new("ims.example.com".to_string()).with_user("mmtel".into()),
             q: 1.0,
             registered_at: Instant::now(),
