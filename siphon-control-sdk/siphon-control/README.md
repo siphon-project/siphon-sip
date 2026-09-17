@@ -124,6 +124,17 @@ reported as a failure. That is damage control, not a substitute for closing.
   `hangup(reason=None)`, `refer(to)` / `transfer(to)`, `set_header(name, value)`,
   `get_header(name)`, `set_var(key, value)`, `get_var(key)`, `command(verb, args=None)`,
   `next_event()`.
+- `await call.dial(targets, strategy=None, timeout=None, headers=None)` rings B-legs
+  while the caller stays **unanswered** and this app keeps the channel. Each target
+  is a dict: `{"uri": ...}` is dialed as written, `{"aor": ...}` is forked to every
+  registered contact over that contact's own captured flow, which is the only way to
+  reach a phone registered on TCP, TLS or WSS behind NAT. A bare string is refused,
+  because it does not say which of the two was meant.
+- `await call.record_start(direction=None, channels=None, max_duration_ms=None,
+  silence_ms=None, path=None)` records the call's decoded audio to a wav file and
+  returns the `recording_id` that `await call.record_stop(recording_id=None)`
+  addresses (no id stops every recording on the call). The reply is the accept;
+  the `RecordingFinished` event says the file is closed. siphon-rtp backend only.
 - Media verbs `play_file(file)` / `dtmf(digits)` raise `ControlError` with
   `code == "unsupported_verb"` until the server implements media.
 

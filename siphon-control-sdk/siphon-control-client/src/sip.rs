@@ -34,6 +34,11 @@ use crate::originate::originate_on;
 pub use crate::originate::{
     OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, SessionRefresher, SessionTimer,
 };
+// `dial` and the recording pair hang their verbs off `Call` from their own
+// modules; their argument types are re-exported here so every SIP type is
+// reachable under one path.
+pub use crate::dial::{DialOptions, DialStrategy, DialTarget, Dialing};
+pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 
@@ -572,7 +577,7 @@ impl Call {
         json!({ "channel": self.inner.channel_id })
     }
 
-    async fn sip(
+    pub(crate) async fn sip(
         &self,
         verb: SipVerb,
         args: serde_json::Value,
@@ -2380,5 +2385,182 @@ mod tests {
         // Wrong-kind accessors stay None.
         assert!(failed.dtmf().is_none());
         assert!(failed.transfer_requested().is_none());
+    }
+
+    fn dial_result() -> serde_json::Value {
+        json!({
+            "channel": "ch1",
+            "state": "dialing",
+            "targets": 3,
+            "strategy": "parallel",
+            "timeout": 30,
+        })
+    }
+
+    #[tokio::test]
+    async fn dial_addresses_the_channel_and_names_the_verb_the_server_claims() {
+        // `dial` rings B-legs of a call this app already holds, so unlike the
+        // module-level `originate` it must carry the channel target.
+        let recorder = recorder(dial_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        let dialing = call
+            .dial(
+                vec![DialTarget::uri("sip:1001@pbx.example")],
+                DialOptions::default(),
+            )
+            .await
+            .expect("dial");
+
+        let recorded = lock(&recorder.calls)[0].clone();
+        assert_eq!(recorded.module.as_deref(), Some("sip"));
+        assert_eq!(recorded.verb, "dial");
+        assert_eq!(recorded.target, json!({ "channel": "ch1" }));
+        // A bare URI target with no overrides is a plain string on the wire.
+        assert_eq!(
+            recorded.args,
+            json!({ "targets": ["sip:1001@pbx.example"] })
+        );
+        assert_eq!(dialing.channel, "ch1");
+    }
+
+    #[tokio::test]
+    async fn an_aor_target_is_an_object_and_never_a_uri_string() {
+        // The distinction the type exists for: `{aor}` forks to every registered
+        // contact over that contact's own captured flow, which is the only way to
+        // reach a phone registered on TCP, TLS or WSS behind NAT. The same text
+        // sent as a URI is DNS-resolved and reaches none of them.
+        let recorder = recorder(dial_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        let dialing = call
+            .dial(
+                vec![
+                    DialTarget::aor("sip:204@pbx.example"),
+                    DialTarget::uri_via("sip:+15550177@trunk.example", "sip:192.0.2.9:5060")
+                        .header("X-Carrier", "a"),
+                ],
+                DialOptions::default(),
+            )
+            .await
+            .expect("dial");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(
+            args["targets"],
+            json!([
+                { "aor": "sip:204@pbx.example" },
+                {
+                    "uri": "sip:+15550177@trunk.example",
+                    "next_hop": "sip:192.0.2.9:5060",
+                    "headers": { "X-Carrier": "a" },
+                },
+            ])
+        );
+        // The reply counts the branches the server resolved, so an AoR that
+        // expanded to three contacts reports three, not the one target asked for.
+        assert_eq!(dialing.targets, Some(3));
+    }
+
+    #[tokio::test]
+    async fn dial_options_use_the_names_the_server_parses_and_omit_the_rest() {
+        let recorder = recorder(dial_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.dial(
+            vec![DialTarget::aor("sip:204@pbx.example")],
+            DialOptions::default()
+                .strategy(DialStrategy::Sequential)
+                .timeout(20)
+                .header("X-Trace", "abc"),
+        )
+        .await
+        .expect("dial");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["strategy"], "sequential");
+        assert_eq!(args["timeout"], 20);
+        assert_eq!(args["headers"], json!({ "X-Trace": "abc" }));
+
+        // Nothing asked for, nothing sent: the server's own parallel / 30 s
+        // defaults apply rather than a copy of them pinned here.
+        call.dial(
+            vec![DialTarget::aor("sip:204@pbx.example")],
+            DialOptions::default(),
+        )
+        .await
+        .expect("dial");
+        let args = lock(&recorder.calls)[1].args.clone();
+        assert_eq!(
+            args,
+            json!({ "targets": [{ "aor": "sip:204@pbx.example" }] })
+        );
+    }
+
+    fn recording_result() -> serde_json::Value {
+        json!({ "channel": "ch1", "state": "recording", "recording_id": "rec-1" })
+    }
+
+    #[tokio::test]
+    async fn record_start_sends_the_selectors_the_server_parses() {
+        let recorder = recorder(recording_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        let recording = call
+            .record_start(
+                RecordOptions::default()
+                    .direction(RecordDirection::Both)
+                    .channels(RecordChannels::Stereo)
+                    .max_duration_ms(60_000)
+                    .silence_ms(4_000)
+                    .path("/var/spool/siphon/greeting.wav"),
+            )
+            .await
+            .expect("record_start");
+
+        let recorded = lock(&recorder.calls)[0].clone();
+        assert_eq!(recorded.verb, "record_start");
+        assert_eq!(recorded.target, json!({ "channel": "ch1" }));
+        assert_eq!(
+            recorded.args,
+            json!({
+                "direction": "both",
+                "channels": "stereo",
+                "max_duration_ms": 60_000,
+                "silence_ms": 4_000,
+                "path": "/var/spool/siphon/greeting.wav",
+            })
+        );
+        assert_eq!(recording.recording_id.as_deref(), Some("rec-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unshaped_record_start_leaves_every_default_to_the_server() {
+        // `ingress` + `mono` are the server's defaults. Sending them anyway would
+        // pin this SDK's copy of them onto every recording, so a caller that
+        // asked for nothing would stop tracking the server it is talking to.
+        let recorder = recorder(recording_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.record_start(RecordOptions::default())
+            .await
+            .expect("record_start");
+        assert_eq!(lock(&recorder.calls)[0].args, json!({}));
+    }
+
+    #[tokio::test]
+    async fn record_stop_names_one_recording_or_stops_every_one() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "stopping" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.record_stop(Some("rec-1")).await.expect("record_stop");
+        call.record_stop(None).await.expect("record_stop");
+
+        let calls = lock(&recorder.calls).clone();
+        assert_eq!(calls[0].verb, "record_stop");
+        assert_eq!(calls[0].args, json!({ "recording_id": "rec-1" }));
+        // Absent, not null — which is what makes the server stop every
+        // recording on the call rather than one named `null`.
+        assert_eq!(calls[1].args, json!({}));
     }
 }
