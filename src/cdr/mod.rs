@@ -310,6 +310,11 @@ pub struct CdrSession {
     ruri: String,
     source_ip: String,
     transport: String,
+    /// IP of the next hop this call was sent to, once one is known — see
+    /// [`set_destination_ip`](Self::set_destination_ip). `None` until the
+    /// request is actually on its way to somewhere, which is after the script
+    /// handler has decided where that is.
+    destination_ip: Option<String>,
     user_agent: Option<String>,
     auth_user: Option<String>,
     /// Wall-clock INVITE time (serialized as `timestamp_start`).
@@ -353,6 +358,7 @@ impl CdrSession {
             ruri,
             source_ip,
             transport,
+            destination_ip: None,
             user_agent,
             auth_user,
             start_wall: SystemTime::now(),
@@ -383,6 +389,18 @@ impl CdrSession {
     /// `cdr.write(request, extra=…)` against this call.
     pub fn has_extra_fields(&self) -> bool {
         !self.extra.is_empty()
+    }
+
+    /// Record where this call was actually sent — the next hop's IP.
+    ///
+    /// Stamped when the request goes out, not at INVITE time: the destination
+    /// is the script's decision (`relay()` / `fork()` / `call.dial()`) and is
+    /// not known when the record is opened. A later send replaces an earlier
+    /// one, so a sequential fork or an LCR failover records the carrier the
+    /// call ended up on rather than the first one tried — that one is in
+    /// `lcr_attempts`.
+    pub fn set_destination_ip(&mut self, destination_ip: String) {
+        self.destination_ip = Some(destination_ip);
     }
 
     /// Record the authenticated username after the fact.
@@ -455,6 +473,7 @@ impl CdrSession {
             self.transport,
         );
         cdr.response_code = response_code.unwrap_or(self.response_code);
+        cdr.destination_ip = self.destination_ip.unwrap_or_default();
         cdr.timestamp_start = Some(format_timestamp(self.start_wall));
         if let Some(answer_wall) = self.answer_wall {
             cdr.timestamp_answer = Some(format_timestamp(answer_wall));

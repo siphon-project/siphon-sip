@@ -73,8 +73,15 @@ def media_record() -> dict:
         "near_packets_out": "8198",
         "near_bytes_out": "1639600",
         "near_packets_dropped": "2",
+        "near_remote_address": "192.0.2.100:40000",
+        "near_local_address": "192.0.2.10:30000",
+        "near_payload_type": "0",
         "far_tag": "77c0be",
         "far_codec": "AMR-WB",
+        "far_remote_address": "203.0.113.30:40002",
+        "far_local_address": "192.0.2.10:30002",
+        "far_payload_type": "9",
+        "far_egress_ssrc": "84281096",
         "far_packets_in": "8199",
         "far_bytes_in": "1230000",
         "far_packets_out": "8200",
@@ -205,6 +212,23 @@ def test_media_legs_parse_into_numbers():
     assert far.rtt_ms == pytest.approx(22.75)
     assert far.mos_average == pytest.approx(4.12)
     assert far.mos_basis == "full"
+
+
+def test_media_leg_carries_the_media_plane_addresses():
+    # The egress address a call record's destination_ip does not stand in for:
+    # that is the signalling next hop, this is where the RTP went. Present on a
+    # relay-only leg, where MOS is not.
+    near, far = CallDetailRecord.from_dict(media_record()).media_legs
+
+    assert near.remote_address == "192.0.2.100:40000"
+    assert near.local_address == "192.0.2.10:30000"
+    assert near.payload_type == 0
+    assert near.egress_ssrc is None
+    assert near.mos_average is None  # counters-only leg, addresses regardless
+
+    assert far.remote_address == "203.0.113.30:40002"
+    assert far.payload_type == 9
+    assert far.egress_ssrc == 84281096
 
 
 def test_unmeasured_leg_fields_stay_none():

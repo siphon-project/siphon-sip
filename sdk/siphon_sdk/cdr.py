@@ -193,6 +193,27 @@ class MediaLeg:
     codec: Optional[str] = None
     """Negotiated audio codec name, when known."""
 
+    remote_address: Optional[str] = None
+    """Where this party's media actually came from (``"host:port"``) — the
+    source the datapath latched, else its signalled address.
+
+    The media-plane peer, and the only egress address a media record carries.
+    It is not a duplicate of the call record's `destination_ip`: that is the
+    signalling next hop, and an anchored call need not send its media to the
+    same host. Present on a relay-only leg too, where the quality fields are
+    not."""
+
+    local_address: Optional[str] = None
+    """The engine's own media address toward this party (``"host:port"``)."""
+
+    payload_type: Optional[int] = None
+    """RTP payload type of the negotiated codec — the number on the wire, where
+    :attr:`codec` is the name it was negotiated under."""
+
+    egress_ssrc: Optional[int] = None
+    """SSRC of the stream the engine *sent* this party (RFC 3550), when a
+    userspace actor originated it. :attr:`ssrc` is the inbound counterpart."""
+
     packets_in: int = 0
     bytes_in: int = 0
     packets_out: int = 0
@@ -256,6 +277,10 @@ class MediaLeg:
             role=role,
             tag=str(get("tag") or ""),
             codec=get("codec"),
+            remote_address=get("remote_address"),
+            local_address=get("local_address"),
+            payload_type=_as_int(get("payload_type")),
+            egress_ssrc=_as_int(get("egress_ssrc")),
             packets_in=_as_int(get("packets_in")) or 0,
             bytes_in=_as_int(get("bytes_in")) or 0,
             packets_out=_as_int(get("packets_out")) or 0,
@@ -326,11 +351,22 @@ class CallDetailRecord:
     """Source IP of the request."""
 
     destination_ip: str = ""
-    """Destination IP (next hop).
+    """IP of the next hop the call was sent to — the signalling egress.
 
-    Reads empty on every record siphon emits today — the field is declared and
-    serialized, but no emit path fills it in. Don't build a collector on it;
-    take the egress side from your own routing data until it is wired."""
+    Stamped when the request goes out, so it is the script's routing decision
+    (`relay()` / `fork()` / `call.dial()`), not the R-URI host. On a sequential
+    fork or an LCR failover it is the carrier the call ended up on; the ones
+    burned on the way are in `lcr_attempts`. On a parallel fork it is the branch
+    that answered.
+
+    Empty when nothing was ever sent — the script answered locally, or the
+    record came from a bare `cdr.write()` with `cdr.auto_emit` off, which is
+    written from inside the handler, before the request has been routed
+    anywhere.
+
+    Note this is the *signalling* peer: a media-anchored call's RTP egress is a
+    `MEDIA` record's `MediaLeg.remote_address`, which need not be the same
+    host."""
 
     transport: str = ""
     """``"udp"`` | ``"tcp"`` | ``"tls"`` | ``"ws"`` | ``"wss"``."""

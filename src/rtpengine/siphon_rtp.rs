@@ -1985,6 +1985,10 @@ fn convert_leg_summary(leg: ProtoLegSummary) -> CallLegSummary {
             missing_markers: stats.missing_markers,
             recovered_from_redundancy: stats.recovered_from_redundancy,
         }),
+        local_address: leg.local_address,
+        remote_address: leg.remote_address,
+        egress_ssrc: leg.egress_ssrc,
+        payload_type: leg.payload_type,
     }
 }
 
