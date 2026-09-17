@@ -121,9 +121,10 @@ pub struct ControlAppConfig {
     /// disconnects): `hangup` (the default) or `continue`.
     ///
     /// `fallback` — re-dispatch the call through the Python handlers — is
-    /// refused at config load rather than accepted: it silently behaved as
-    /// `hangup`, so an operator who chose it to keep calls alive got them torn
-    /// down and nothing said so.
+    /// refused rather than accepted: it silently behaved as `hangup`, so an
+    /// operator who chose it to keep calls alive got them torn down and nothing
+    /// said so. Refused everywhere the policy is set, not only here: see
+    /// [`unimplemented_on_lost`].
     #[serde(default)]
     pub on_lost: Option<String>,
     /// PEM bundle to verify the controller's certificate against when
@@ -148,6 +149,35 @@ pub struct ControlAppConfig {
     pub events: Vec<String>,
 }
 
+/// The control-loss policies siphon implements, and the refusal for one it does
+/// not.
+///
+/// `on_lost` is set in three places — `control.apps[].on_lost`,
+/// `call.handover(on_lost=…)` and the `originate` verb — and the control-loss
+/// path ends the call for every policy that is not `continue`. While only
+/// config load knew which policies exist, the other two accepted `fallback` and
+/// then hung the call up anyway, so the vocabulary lives here and all three ask
+/// it rather than each keeping its own list to drift.
+///
+/// `None` when `policy` is implemented; otherwise the tail of a refusal, which
+/// the caller prefixes with the setting the value came from.
+pub fn unimplemented_on_lost(policy: &str) -> Option<String> {
+    if policy == "hangup" || policy == "continue" {
+        return None;
+    }
+    let mut refusal = format!(
+        "is {policy:?}, which siphon does not implement — it is \"hangup\" (end the call, the \
+         default) or \"continue\" (leave it running without an owner)."
+    );
+    if policy == "fallback" {
+        refusal.push_str(
+            " `fallback` would re-dispatch the call through the Python handlers, which does not \
+             exist; it behaved as `hangup`.",
+        );
+    }
+    Some(refusal)
+}
+
 /// Global control-plane resource caps + backpressure policy.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ControlLimits {
@@ -166,7 +196,7 @@ pub struct ControlLimits {
     pub reattach_grace_secs: u64,
     /// Default handoff deadline (milliseconds) applied when `call.handover()`
     /// does not pass an explicit `deadline_ms`. If no controller accepts and
-    /// acts within it, the call degrades (503 / fallback). Default 3000.
+    /// acts within it, the call degrades (503). Default 3000.
     #[serde(default = "ControlLimits::default_handoff_deadline_ms")]
     pub handoff_deadline_ms: u64,
 }

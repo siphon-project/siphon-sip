@@ -16,6 +16,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   with the version pinned, without re-running the crate, image, SBOM or
   GitHub Release steps.
 
+- **`on_lost: "fallback"` is refused where a call sets it, not only at config
+  load.** `call.handover(on_lost="fallback")` and an `originate` carrying
+  `on_lost: "fallback"` both accepted it and then hung the call up anyway when
+  the controlling connection was lost past the reattach grace — the re-dispatch
+  the name promises was never built. A script or control app that asked for it
+  to keep calls alive got exactly the opposite, on every call, with nothing
+  saying so. `call.handover()` now raises `ValueError` and `originate` answers
+  `bad_request`; `hangup` and `continue` are unchanged.
+
 ## [1.9.0] — 2026-09-16
 
 ### Added

@@ -56,7 +56,16 @@ class TestCallHandover:
         with pytest.raises(ValueError):
             call.handover("ivr-app", on_lost="explode")
 
-    @pytest.mark.parametrize("policy", ["hangup", "continue", "fallback"])
+    def test_handover_rejects_the_unimplemented_fallback_policy(self):
+        # `fallback` names a re-dispatch through the Python handlers that was
+        # never built: the server ends the call for every policy that is not
+        # `continue`, so accepting it here would have the mock promise what
+        # siphon refuses.
+        call = Call()
+        with pytest.raises(ValueError, match="fallback"):
+            call.handover("ivr-app", on_lost="fallback")
+
+    @pytest.mark.parametrize("policy", ["hangup", "continue"])
     def test_handover_accepts_valid_on_lost(self, policy):
         call = Call()
         call.handover("ivr-app", on_lost=policy)
