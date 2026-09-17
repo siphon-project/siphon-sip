@@ -85,9 +85,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   none of them. A target naming both, or neither, is refused before a frame goes
   out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
   channel layout or strategy the server would reject.
+- **The CDR wire contract is a typed import in the Python SDK:
+  `siphon_sdk.cdr.CallDetailRecord`.** A collector (FastAPI, a JSON-lines
+  tailer, a billing importer) parses records with `from_dict()` / `from_json()`
+  instead of hand-rolling dict access, and gets back the three record kinds
+  (`INVITE`/`BYE`, `REGISTER`, `MEDIA`) with the `MEDIA` per-leg figures parsed
+  out of their flat string form into `media_legs`, the `lcr_attempts` JSON
+  string decoded, and the Reason header's Q.850 cause. `from_dict()` routes
+  every unrecognised top-level key into `.extra`, which is what keeps a script's
+  `cdr.write(extra={...})` fields: those are flattened into the top level of the
+  JSON, so a body model that validates against the declared fields drops them.
+  `examples/cdr_collector.py` is a runnable collector, and the test harness's
+  `get_cdr().typed_records` returns the same type a collector receives.
 
 ### Fixed
 
+- **A CDR now records where the call was actually sent.** `destination_ip` was
+  declared, serialized and documented, but the only thing that ever set it was
+  a test — every record any deployment wrote carried an empty one. It is now
+  stamped from the send paths (proxy relay, each fork branch, and the B2BUA
+  B-leg INVITE), so it reflects the script's routing decision rather than the
+  R-URI host. A later send replaces an earlier one, so a sequential fork or an
+  LCR failover records the carrier the call completed on, with the burned ones
+  still in `lcr_attempts`; a parallel fork is corrected to the branch that
+  answered when its 2xx arrives. Still empty when nothing was sent (the script
+  answered locally, or a bare `cdr.write()` with `auto_emit` off, which is
+  written before the request is routed).
+- **A `MEDIA` record carries the media-plane addresses the engine reports.**
+  The native backend sends each leg's `remote_address`, `local_address`,
+  `payload_type` and `egress_ssrc`; siphon parsed the summary and dropped all
+  four. `{near,far,legN}_remote_address` is the RTP peer for that leg — the
+  only egress address a media record carries, and not a duplicate of the call
+  record's signalling `destination_ip`. Present on a relay-only leg, where the
+  quality fields are not.
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
   accepted whichever tag described the release commit, so a `control-sdk-v*`
   tag on that same commit set the SDK version: 1.9.0 built and published to

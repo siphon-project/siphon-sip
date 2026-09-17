@@ -17,8 +17,8 @@
 //! (Call-ID / dialog hygiene, per-carrier media, charging).
 //!
 //! The wire contract in this module is the single source of truth; the SDK
-//! pydantic models in `sdk/siphon_sdk/lcr.py` mirror it, and the reference
-//! server in `examples/lcr_api_server.py` implements it.
+//! dataclasses in `sdk/siphon_sdk/lcr.py` mirror it, and the reference server
+//! in `examples/lcr_api_server.py` implements it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
