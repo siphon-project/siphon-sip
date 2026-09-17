@@ -20,6 +20,57 @@ Call detail record writing from scripts.
 
 ::: siphon_sdk.mock_module.MockCdr
 
+### The record a collector receives
+
+Every sink writes the same shape: one JSON object per HTTP POST, per line of the
+JSON-lines file, per syslog message. `siphon_sdk.cdr.CallDetailRecord` is the
+typed mirror of it, so a collector imports the contract rather than guessing at
+a dict:
+
+```python
+from siphon_sdk.cdr import CallDetailRecord
+
+record = CallDetailRecord.from_json(line)
+record.call_id, record.duration_secs, record.reason_cause
+record.extra["billing_id"]        # cdr.write(extra={...}) lands here
+```
+
+Three record kinds share the one shape, told apart by `method`:
+
+| `method` | What it is | Notes |
+|----------|-----------|-------|
+| `INVITE` / `BYE` / … | the call record | the URIs, timing, teardown side |
+| `REGISTER` | a registrar state change | `cdr.include_register`; the change is in `reg_event` |
+| `MEDIA` | end-of-call media summary | no URIs — join it to the call on `call_id` |
+
+Custom fields are **flattened into the top level** of the JSON, not nested:
+`cdr.write(extra={...})`, an LCR route's `cdr_fields`, `lcr_attempts`, and a
+`MEDIA` record's per-leg figures all arrive as ordinary top-level keys.
+`CallDetailRecord.from_dict()` routes every unrecognised key into `.extra` — a
+body model that validates against the declared fields drops them instead, so
+take the body as `dict` and parse it:
+
+```python
+@app.post("/cdr")
+async def collect(payload: dict) -> dict:
+    record = CallDetailRecord.from_dict(payload)
+    if record.is_media:
+        for leg in record.media_legs:
+            print(leg.role, leg.codec, leg.packets_lost, leg.mos_average)
+    return {"ok": True}
+```
+
+`media_legs` parses the `near_` / `far_` / `leg2_` string extras back into
+numbers. A leg's quality figures (MOS, jitter, loss percent, RTT) read `None`
+when the media engine relayed that leg without a userspace actor — that is "not
+measured", not "measured as zero", and a kernelized relay reports counters only.
+
+`examples/cdr_collector.py` is a runnable FastAPI collector built on this.
+
+::: siphon_sdk.cdr.CallDetailRecord
+
+::: siphon_sdk.cdr.MediaLeg
+
 ### Writing to several sinks
 
 `cdr.backends` takes a list, and every record is written to every entry:

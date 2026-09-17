@@ -329,6 +329,37 @@ Each B-leg gets a fresh Call-ID and From-tag by default, fully decoupling the tw
 | `call.record(srs_uri)` | Start SIPREC recording |
 | `call.stop_recording()` | Stop SIPREC recording |
 
+## Consuming CDRs
+
+`siphon_sdk.cdr.CallDetailRecord` is the typed mirror of the record siphon
+writes to its CDR sinks — one JSON object per HTTP POST, per line of the
+JSON-lines file, per syslog message. Import it in your collector instead of
+hand-parsing dicts:
+
+```python
+from fastapi import FastAPI
+from siphon_sdk.cdr import CallDetailRecord
+
+app = FastAPI()
+
+@app.post("/cdr")
+async def collect(payload: dict) -> dict:
+    record = CallDetailRecord.from_dict(payload)
+    if record.is_media:                       # method == "MEDIA"
+        for leg in record.media_legs:         # join to the call on call_id
+            print(leg.role, leg.codec, leg.packets_lost)
+    else:
+        print(record.call_id, record.duration_secs, record.reason_cause)
+        print(record.extra["billing_id"])     # cdr.write(extra={...})
+    return {"ok": True}
+```
+
+Take the body as `dict` and call `from_dict`. Custom fields are flattened into
+the top level of the JSON, and a validating body model drops them before the
+handler runs; `from_dict` keeps them in `record.extra`.
+
+`examples/cdr_collector.py` in the SIPhon repo is a runnable version of this.
+
 ## License
 
 MIT

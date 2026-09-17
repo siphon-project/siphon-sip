@@ -85,6 +85,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   none of them. A target naming both, or neither, is refused before a frame goes
   out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
   channel layout or strategy the server would reject.
+- **The CDR wire contract is a typed import in the Python SDK:
+  `siphon_sdk.cdr.CallDetailRecord`.** A collector (FastAPI, a JSON-lines
+  tailer, a billing importer) parses records with `from_dict()` / `from_json()`
+  instead of hand-rolling dict access, and gets back the three record kinds
+  (`INVITE`/`BYE`, `REGISTER`, `MEDIA`) with the `MEDIA` per-leg figures parsed
+  out of their flat string form into `media_legs`, the `lcr_attempts` JSON
+  string decoded, and the Reason header's Q.850 cause. `from_dict()` routes
+  every unrecognised top-level key into `.extra`, which is what keeps a script's
+  `cdr.write(extra={...})` fields: those are flattened into the top level of the
+  JSON, so a body model that validates against the declared fields drops them.
+  `examples/cdr_collector.py` is a runnable collector, and the test harness's
+  `get_cdr().typed_records` returns the same type a collector receives.
 
 ### Fixed
 

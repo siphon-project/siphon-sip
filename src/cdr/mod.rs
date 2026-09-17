@@ -30,6 +30,11 @@
 //!   "sip_reason": null
 //! }
 //! ```
+//!
+//! The [`Cdr`] struct here is the single source of truth for that shape; the
+//! SDK dataclass in `sdk/siphon_sdk/cdr.py` mirrors it (a test there fails if
+//! the two drift), and the reference collector in `examples/cdr_collector.py`
+//! consumes it. A field added here needs the mirror updated in the same change.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};

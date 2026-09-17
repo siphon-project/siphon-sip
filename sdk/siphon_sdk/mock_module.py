@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Union
 
 from siphon_sdk.types import Contact, SipUri
 from siphon_sdk.request import _parse_uri
+from siphon_sdk.cdr import CallDetailRecord
 from siphon_sdk.lcr import Route
 from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
@@ -5072,6 +5073,19 @@ class MockCdr:
     def enabled(self) -> bool:
         """Whether the CDR system is enabled."""
         return self._enabled
+
+    @property
+    def typed_records(self) -> list[CallDetailRecord]:
+        """The written records as :class:`siphon_sdk.cdr.CallDetailRecord` — the
+        same type a collector receives from the HTTP/file sinks.
+
+        Assert against this rather than raw dicts when the test cares about the
+        shape the outside world sees::
+
+            record = get_cdr().typed_records[-1]
+            assert record.extra["billing_id"] == "B-12345"
+        """
+        return [CallDetailRecord.from_dict(record) for record in self.records]
 
     @staticmethod
     def session_key(source: "Any") -> str:
