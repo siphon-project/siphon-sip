@@ -1,0 +1,39 @@
+# siphon.registrant-test.yaml — removing an outbound registration must clear
+# the binding upstream (RFC 3261 §10.2.2), not just siphon's own state.
+#
+# Used with: sipp/docker-compose.yaml --profile registrant
+#            (scripts/registrant_test.sh)
+# Script:    scripts/registrant_dereg.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.219"
+
+advertised_address: "172.20.0.219"
+
+script:
+  path: "scripts/registrant_dereg.py"
+  reload: auto
+
+# One trunk, registering with the SIPp registrar on 172.20.0.220. The script
+# removes it as soon as it is registered, which is what the scenario is waiting
+# to see the de-REGISTER for.
+registrant:
+  default_interval: 3600
+  retry_interval: 5
+  max_retry_interval: 10
+  entries:
+    - aor: "sip:trunk1@registrar.test"
+      registrar: "sip:172.20.0.220:5060"
+      user: "trunk1"
+      password: "secret123"
+      transport: "udp"
+
+log:
+  level: debug
+  format: pretty
