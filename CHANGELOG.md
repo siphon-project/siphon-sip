@@ -8,6 +8,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A gateway group added at run time is now health-probed, and a removed one
+  stops being probed.** Probing was a single sweep over the groups present at
+  start-up, so a group created later with `gateway.add_group()` was never
+  probed and every destination in it stayed healthy for ever, while
+  `gateway.remove_group()` left its probe task running against a group the
+  dispatcher no longer held. Each group now owns its prober for its lifetime:
+  one added after start-up begins probing immediately, a removed or replaced
+  one has its prober aborted, and `probe.enabled: false` is honoured on a
+  runtime group as it already was on a configured one.
+
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
   accepted whichever tag described the release commit, so a `control-sdk-v*`
   tag on that same commit set the SDK version: 1.9.0 built and published to
