@@ -99,6 +99,8 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod originate_auth_tests;
+#[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
 mod prack_offer_answer_tests;

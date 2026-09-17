@@ -8,6 +8,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **A call placed with the control plane's `originate` verb now answers a
+  `401`/`407` from the trunk.** An originated call is a UAC on its own A-leg
+  and has no B-leg, so it never went through the B-leg's credentialed retry —
+  its response path had no challenge handling at all, and an `originate` to an
+  authenticating trunk died on the first challenge. It now ACKs the challenge
+  on its own branch (RFC 3261 §17.1.1.3) and re-sends as a new transaction with
+  `Authorization` / `Proxy-Authorization` (§8.1.3.5, §22.3), under the same
+  two-attempt cap the B-leg uses, so a wrong password fails the call instead of
+  looping. Credentials come from the gateway destination the call is aimed at;
+  `originate` itself takes none, because a controller should not be sending
+  trunk passwords over the control rail when the gateway already holds them.
+
 - **A gateway destination can carry the digest credentials it challenges
   with**, and any B-leg sent to that destination answers a `401`/`407` with
   them (RFC 3261 §22) through the existing single retry. Configure
