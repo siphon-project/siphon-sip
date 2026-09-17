@@ -44,7 +44,8 @@ pub use b2bua::{B2buaConfig, SessionRefresher, SessionTimerConfig};
 pub use cdr::{CdrFileConfig, CdrHttpConfig, CdrSinkConfig, CdrSyslogConfig, CdrYamlConfig};
 pub use charging::{RfConfig, RoConfig};
 pub use control::{
-    ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits, ControlTlsConfig,
+    unimplemented_on_lost, ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits,
+    ControlTlsConfig,
 };
 pub use diameter::{
     DiameterApplication, DiameterClientEntry, DiameterConfig, DiameterCxConfig,
@@ -754,18 +755,10 @@ impl Config {
             let Some(policy) = app.on_lost.as_deref() else {
                 continue;
             };
-            if policy != "hangup" && policy != "continue" {
+            if let Some(refusal) = unimplemented_on_lost(policy) {
                 return Err(SiphonError::Config(format!(
-                    "control.apps[{:?}].on_lost is {policy:?}, which siphon does not implement \
-                     — it is \"hangup\" (end the call, the default) or \"continue\" (leave it \
-                     running without an owner). {}",
-                    app.name,
-                    if policy == "fallback" {
-                        "`fallback` would re-dispatch through the Python handlers, which does \
-                         not exist; it behaved as `hangup`."
-                    } else {
-                        ""
-                    }
+                    "control.apps[{:?}].on_lost {refusal}",
+                    app.name
                 )));
             }
         }

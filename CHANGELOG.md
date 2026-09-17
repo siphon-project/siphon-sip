@@ -72,6 +72,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `True` as well. `Contact.client_transport` persists it with the binding, and
   the CDR records the client's transport rather than the front-facing one.
   Mirrored in the SDK.
+- **`dial`, `record_start` and `record_stop` are typed verbs in all three
+  control SDKs.** All three shipped server-side but were missing from the
+  `SipVerb` enum the SDKs are built against, so none of them wrapped the verbs
+  and an application had to reach for the raw `command()` escape hatch and hand
+  it the wire field names itself. A `dial` target is a tagged type rather than a
+  loose string (`DialTarget::uri` / `DialTarget::aor` in Rust, a `{uri}` or
+  `{aor}` object in TypeScript and Python), because the two do different things:
+  an AoR forks to every registered contact over that contact's own captured
+  flow, which is the only way to reach a phone registered on TCP, TLS or WSS
+  behind NAT, while the same text sent as a URI is resolved by DNS and reaches
+  none of them. A target naming both, or neither, is refused before a frame goes
+  out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
+  channel layout or strategy the server would reject.
 
 ### Fixed
 
@@ -82,6 +95,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   gained a `workflow_dispatch` that republishes the SDK for an existing tag
   with the version pinned, without re-running the crate, image, SBOM or
   GitHub Release steps.
+
+- **`on_lost: "fallback"` is refused where a call sets it, not only at config
+  load.** `call.handover(on_lost="fallback")` and an `originate` carrying
+  `on_lost: "fallback"` both accepted it and then hung the call up anyway when
+  the controlling connection was lost past the reattach grace — the re-dispatch
+  the name promises was never built. A script or control app that asked for it
+  to keep calls alive got exactly the opposite, on every call, with nothing
+  saying so. `call.handover()` now raises `ValueError` and `originate` answers
+  `bad_request`; `hangup` and `continue` are unchanged.
 
 ## [1.9.0] — 2026-09-16
 

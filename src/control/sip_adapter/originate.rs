@@ -126,6 +126,16 @@ pub(super) fn originate_on(
         .and_then(|value| value.as_str())
         .unwrap_or("hangup")
         .to_string();
+    // Refuse a policy siphon does not implement before anything is placed on
+    // the wire: the control-loss path ends the call for everything that is not
+    // `continue`, so accepting `fallback` here promised a re-dispatch and
+    // delivered a hangup, on every call this controller placed.
+    if let Some(refusal) = crate::config::unimplemented_on_lost(&on_lost) {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            format!("originate args.on_lost {refusal}"),
+        );
+    }
 
     if bus.channel_exists(channel_id) {
         return ControlResult::error(
