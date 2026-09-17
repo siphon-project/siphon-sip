@@ -2,6 +2,65 @@
 //! and classifying the responses that come back.
 use crate::dispatcher::*;
 
+/// Give a call the credentials of the gateway destination its B-leg is going
+/// to, when it has none of its own.
+///
+/// Matched on where the leg is actually being sent: by configured hostname
+/// first (a gateway FQDN, reached at whatever the health prober last resolved
+/// it to), then by resolved address, which is how a destination configured as
+/// a bare `IP:port` is found. Both directions matter because a destination
+/// carries an `address_str` only when it was configured as a hostname.
+///
+/// Silent when there is no gateway for this destination, when it has no
+/// credentials, or when the call already has some: each is the ordinary case
+/// for a call that is not going to an authenticating trunk.
+fn stamp_gateway_credentials(
+    call_id: &str,
+    routing_uri: &str,
+    destination: std::net::SocketAddr,
+    state: &DispatcherState,
+) {
+    let Some(manager) = crate::script::api::gateway_manager() else {
+        return;
+    };
+    let Some((group, credentials)) = gateway_credentials_for(manager, routing_uri, destination)
+    else {
+        return;
+    };
+
+    let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
+        return;
+    };
+    if call.outbound_credentials.is_some() {
+        return;
+    }
+
+    debug!(
+        call_id = %call_id,
+        group = %group,
+        username = %credentials.username,
+        "B2BUA: this gateway's configured credentials will answer its challenges"
+    );
+    call.outbound_credentials = Some(credentials);
+}
+
+/// The gateway group and credentials for the destination a leg is going to.
+///
+/// Split out from [`stamp_gateway_credentials`] so the matching is testable
+/// against a manager built in the test, rather than the process-global one.
+fn gateway_credentials_for(
+    manager: &crate::gateway::DispatcherManager,
+    routing_uri: &str,
+    destination: std::net::SocketAddr,
+) -> Option<(String, Arc<crate::auth::StoredCredentials>)> {
+    let host_port = crate::gateway::extract_address_from_uri(routing_uri);
+    let (group, gateway_destination) = manager
+        .hostname_destination_for(&host_port)
+        .or_else(|| manager.destination_for_address(destination))?;
+    let credentials = gateway_destination.credentials.clone()?;
+    Some((group, credentials))
+}
+
 /// Send a B-leg INVITE for a B2BUA call.
 ///
 /// `target_uri` drives the new INVITE's R-URI (so the called party's IMPU
@@ -114,6 +173,12 @@ pub fn b2bua_send_b_leg_invite(
             relay_target.transport.unwrap_or(Transport::Udp),
         )
     };
+
+    // A B-leg going to a configured gateway that challenges answers with that
+    // gateway's own credentials, so a trunk authenticates without a script
+    // doing it per call. A credential the script set with `set_credentials()`
+    // wins — it is the more specific instruction.
+    stamp_gateway_credentials(call_id, routing_uri, destination, state);
 
     // RFC 3261 §18.1.1 — bias an over-MTU UDP B-leg INVITE to TCP.  Skipped for a
     // flow-pinned B-leg.  The length is measured on the A-leg request as an
@@ -933,5 +998,123 @@ pub fn recv_b_leg_classification_event(
             Some(CallEvent::Terminated { .. }) => continue,
             other => return other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{StoredCredentials, StoredSecret};
+    use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+
+    fn credentials() -> StoredCredentials {
+        StoredCredentials {
+            username: "trunk1".to_string(),
+            secret: StoredSecret::Password("secret123".to_string()),
+        }
+    }
+
+    /// A destination configured as a hostname: it carries an `address_str` and
+    /// is reached at whatever the prober last resolved it to.
+    fn hostname_destination(with_auth: bool) -> Destination {
+        let destination = Destination::new(
+            "sip:gw1.carrier.example:5060".to_string(),
+            "203.0.113.10:5060".parse().expect("test address"),
+            Transport::Udp,
+            1,
+            1,
+        )
+        .with_address_str("gw1.carrier.example:5060".to_string());
+        if with_auth {
+            destination.with_credentials(credentials())
+        } else {
+            destination
+        }
+    }
+
+    /// A destination configured as a bare `IP:port`: no `address_str`, so it is
+    /// only findable by resolved address.
+    fn address_destination() -> Destination {
+        Destination::new(
+            "sip:203.0.113.20:5060".to_string(),
+            "203.0.113.20:5060".parse().expect("test address"),
+            Transport::Udp,
+            1,
+            1,
+        )
+        .with_credentials(credentials())
+    }
+
+    fn manager_with(destinations: Vec<Destination>) -> DispatcherManager {
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            destinations,
+        ));
+        manager
+    }
+
+    #[test]
+    fn a_gateway_matched_by_hostname_supplies_its_credentials() {
+        let manager = manager_with(vec![hostname_destination(true)]);
+
+        let (group, found) = gateway_credentials_for(
+            &manager,
+            "sip:gw1.carrier.example:5060",
+            "203.0.113.10:5060".parse().expect("test address"),
+        )
+        .expect("the gateway's credentials");
+
+        assert_eq!(group, "carriers");
+        assert_eq!(found.username, "trunk1");
+    }
+
+    #[test]
+    fn a_gateway_matched_by_resolved_address_supplies_its_credentials() {
+        // A bare IP:port destination carries no `address_str`, so the hostname
+        // match cannot find it — the address match is what covers it.
+        let manager = manager_with(vec![address_destination()]);
+
+        let (_, found) = gateway_credentials_for(
+            &manager,
+            "sip:203.0.113.20:5060",
+            "203.0.113.20:5060".parse().expect("test address"),
+        )
+        .expect("the gateway's credentials");
+
+        assert_eq!(found.username, "trunk1");
+    }
+
+    #[test]
+    fn a_gateway_without_credentials_supplies_none() {
+        let manager = manager_with(vec![hostname_destination(false)]);
+
+        assert!(gateway_credentials_for(
+            &manager,
+            "sip:gw1.carrier.example:5060",
+            "203.0.113.10:5060".parse().expect("test address"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_destination_in_no_group_supplies_none() {
+        let manager = manager_with(vec![hostname_destination(true)]);
+
+        assert!(gateway_credentials_for(
+            &manager,
+            "sip:elsewhere.example:5060",
+            "198.51.100.7:5060".parse().expect("test address"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn credentials_never_reach_a_debug_log() {
+        // `Destination` derives Debug and is logged; the secret must not be.
+        let rendered = format!("{:?}", hostname_destination(true));
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("trunk1"), "the username is not a secret");
     }
 }

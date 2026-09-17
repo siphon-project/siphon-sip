@@ -124,6 +124,39 @@ pub struct GatewayDestConfig {
     /// User-defined attributes (e.g. {"region": "us-east"}).
     #[serde(default)]
     pub attrs: std::collections::HashMap<String, String>,
+    /// Digest credentials this destination challenges with, used to answer a
+    /// 401/407 on any B-leg sent to it.
+    #[serde(default)]
+    pub auth: Option<GatewayAuthConfig>,
+}
+
+/// Digest credentials for one gateway destination.
+///
+/// Supply `password` or `ha1`, not both. An `ha1` is
+/// `H(username:realm:password)` for the realm the gateway challenges with, so
+/// a credential store need not hold a reversible secret — but it is still
+/// password-equivalent *for that realm*, and it is bound to one hash
+/// (RFC 7616 §3.4.3), so a gateway that challenges with SHA-256 cannot be
+/// answered from an MD5 one.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayAuthConfig {
+    /// Digest username.
+    pub username: String,
+    /// Plaintext password. Supports `${VAR}` expansion, so it need not sit in
+    /// the file.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Pre-computed `H(username:realm:password)` as a hex string.
+    #[serde(default)]
+    pub ha1: Option<String>,
+    /// Which hash `ha1` was computed with: `md5` (default), `sha-256`, or
+    /// `sha-512-256`.
+    #[serde(default = "default_gateway_ha1_algorithm")]
+    pub ha1_algorithm: String,
+}
+
+fn default_gateway_ha1_algorithm() -> String {
+    "md5".to_string()
 }
 
 impl GatewayDestConfig {

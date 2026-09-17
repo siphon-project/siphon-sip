@@ -6,6 +6,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **A gateway destination can carry the digest credentials it challenges
+  with**, and any B-leg sent to that destination answers a `401`/`407` with
+  them (RFC 3261 §22) through the existing single retry. Configure
+  `gateway.groups[].destinations[].auth` with a `username` and either a
+  `password` or a pre-computed `ha1`, so a credential store need not hold a
+  reversible secret. An `ha1` is bound to the hash it was computed with
+  (RFC 7616 §3.4.3), so `ha1_algorithm` must match what the gateway
+  challenges with; a mismatch is reported rather than answered wrongly, since
+  a wrong `ha1` produces a well-formed response the peer reads as a bad
+  password. The destination is matched by configured hostname and by resolved
+  address, so it applies to `call.dial()`, `call.fork()` and an LCR route
+  alike. A credential set in a script with `call.set_credentials()` still
+  wins. Secrets are never rendered by `Debug` and never reach Python.
+
 ### Fixed
 
 - **A removed outbound registration now de-registers upstream, and so does

@@ -41,7 +41,7 @@ pub struct BLegResponseSnapshot {
     pub b_leg_stored_from: Option<String>,
     pub b_leg_stored_to: Option<String>,
     pub call_state: CallState,
-    pub outbound_credentials: Option<(String, String)>,
+    pub outbound_credentials: Option<Arc<crate::auth::StoredCredentials>>,
     pub b_leg_handle_tx: Option<tokio::sync::mpsc::Sender<crate::b2bua::actor::LegMessage>>,
     pub b_leg_stored_invite: Option<Arc<Mutex<SipMessage>>>,
     pub b_leg_local_cseq: u32,

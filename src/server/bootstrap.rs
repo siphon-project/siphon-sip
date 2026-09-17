@@ -331,6 +331,33 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             if is_hostname {
                 dest = dest.with_address_str(address_str.clone());
             }
+            if let Some(ref auth) = dest_config.auth {
+                match crate::auth::StoredSecret::from_config(
+                    auth.password.as_deref(),
+                    auth.ha1.as_deref(),
+                    &auth.ha1_algorithm,
+                ) {
+                    Ok(secret) => {
+                        dest = dest.with_credentials(crate::auth::StoredCredentials {
+                            username: auth.username.clone(),
+                            secret,
+                        });
+                    }
+                    Err(error) => {
+                        // Skip the destination rather than the credential: a
+                        // gateway that challenges and is dialled without one
+                        // fails every call, which is harder to read than a
+                        // destination that is plainly absent.
+                        error!(
+                            uri = %dest_config.uri,
+                            group = %group_config.name,
+                            %error,
+                            "invalid gateway destination credentials, skipping destination"
+                        );
+                        continue;
+                    }
+                }
+            }
             destinations.push(dest);
         }
 

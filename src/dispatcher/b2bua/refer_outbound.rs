@@ -178,7 +178,7 @@ pub fn retry_originated_refer_with_credentials(
     status_code: u16,
     state: &DispatcherState,
 ) -> bool {
-    let Some((username, password)) = state
+    let Some(credentials) = state
         .call_actors
         .get_call(&pending.call_id)
         .and_then(|call| call.outbound_credentials.clone())
@@ -218,15 +218,27 @@ pub fn retry_originated_refer_with_credentials(
         .map(|call| call.digest_nc.next_for(&challenge.nonce))
         .unwrap_or(1);
 
-    let credentials = crate::auth::DigestCredentials { username, password };
-    let auth_value = crate::auth::format_authorization_header(
+    let auth_value = match crate::auth::format_stored_authorization_header(
         &challenge,
-        &credentials,
+        &credentials.username,
+        &credentials.secret,
         Method::Refer.as_str(),
         &pending.target_uri,
         Some(nc),
         None,
-    );
+    ) {
+        Ok(value) => value,
+        Err(mismatch) => {
+            error!(
+                call_id = %pending.call_id,
+                status = status_code,
+                realm = %challenge.realm,
+                error = %mismatch,
+                "B2BUA: cannot answer the REFER challenge with the stored credential"
+            );
+            return false;
+        }
+    };
     let auth_header_name = if status_code == 401 {
         "Authorization"
     } else {
