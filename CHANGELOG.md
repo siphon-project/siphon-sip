@@ -111,6 +111,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   including that both are per-route with no answer-level default, so a failover
   carrier never inherits the previous carrier's presentation.
 
+### Changed
+
+- **`SecurityServerParams.protocol` now names what the SA actually covers, so
+  the default multi-protocol pair reports `"any"` instead of `"udp"`.**
+  `ipsec.allocate()` without `protocol=` installs one SA pair whose selector
+  matches both UDP and TCP, as 3GPP TS 33.203 §6.3 and §7.1 require, but the
+  reported value still said `"udp"`. That was a leftover from when it was
+  written onto the wire as the `Security-Server` `protocol=` parameter, where
+  RFC 3329 reads an absent parameter as UDP. siphon stopped emitting that
+  parameter in 1.9.0 (no sec-agree spec defines one), so the only reader left is
+  the script — and a script gating on `p.protocol == "udp"` would refuse the TCP
+  half of its own SA. `SAHandle.protocol`, the view of an active SA from
+  `request.matched_sa`, has always reported `"any"`; the two now agree about the
+  same SA. An explicit `protocol="udp"` or `"tcp"` is unchanged. Nothing on the
+  wire changes. Mirrored in the SDK mock.
+
 ### Fixed
 
 - **A CDR now records where the call was actually sent.** `destination_ip` was
