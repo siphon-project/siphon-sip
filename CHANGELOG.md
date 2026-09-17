@@ -97,6 +97,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   JSON, so a body model that validates against the declared fields drops them.
   `examples/cdr_collector.py` is a runnable collector, and the test harness's
   `get_cdr().typed_records` returns the same type a collector receives.
+### Documentation
+
+- **The LCR reference is reachable from the API reference again, and now covers
+  the `lcr` namespace and the typed contract models.** `reference/lcr-api.md`
+  documented the full JSON contract but was in neither the site nav nor the
+  API-reference index, so the only way in was a deep link from the cookbook. It
+  is now an API-reference page carrying the `lcr` namespace, `LcrDecision`, and
+  `LcrRequest` / `LcrSource` / `LcrResponse` / `Route` / `LcrReject` rendered
+  from the SDK docstrings like every other namespace. The per-carrier presented
+  CLI and CLIR (`caller_id`, `caller_id_presentation`) were documented only in
+  that orphaned page; the cookbook and the feature matrix cover them too now,
+  including that both are per-route with no answer-level default, so a failover
+  carrier never inherits the previous carrier's presentation.
 
 ### Fixed
 
