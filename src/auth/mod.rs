@@ -78,6 +78,47 @@ impl DigestAlgorithm {
             DigestAlgorithm::Sha512_256Sess => 6,
         }
     }
+
+    /// Parse an algorithm name, as it appears in a challenge or in config.
+    ///
+    /// Matching is case-insensitive per RFC 7616 §3.3, and real deployments
+    /// vary on hyphen vs underscore vs no separator for the SHA-* names. An
+    /// empty name is MD5, which is what a challenge omitting `algorithm` means
+    /// (RFC 2617 §3.2.1).
+    pub fn parse(name: &str) -> Option<Self> {
+        let normalized = name.to_uppercase().replace('_', "-");
+        match normalized.as_str() {
+            "MD5" | "" => Some(DigestAlgorithm::Md5),
+            "MD5-SESS" => Some(DigestAlgorithm::Md5Sess),
+            "SHA-256" | "SHA256" => Some(DigestAlgorithm::Sha256),
+            "SHA-256-SESS" | "SHA256-SESS" => Some(DigestAlgorithm::Sha256Sess),
+            "SHA-512-256" | "SHA512-256" => Some(DigestAlgorithm::Sha512_256),
+            "SHA-512-256-SESS" | "SHA512-256-SESS" => Some(DigestAlgorithm::Sha512_256Sess),
+            "AKAV1-MD5" => Some(DigestAlgorithm::AkaV1Md5),
+            _ => None,
+        }
+    }
+
+    /// The hash a *stored* H(A1) is bound to, with the `-sess` variant folded
+    /// into its base.
+    ///
+    /// An H(A1) is algorithm-specific by construction (RFC 7616 §3.4.3), so one
+    /// computed for MD5 cannot answer a SHA-256 challenge. The `-sess` variants
+    /// are not a separate stored value though: they fold a per-request cnonce
+    /// into the stored H(A1) rather than replacing it (§3.4.2), so `MD5` and
+    /// `MD5-sess` answer from the same one. AKAv1-MD5's credential is a computed
+    /// RES rather than a stored secret, and ranks with its underlying hash.
+    pub fn stored_ha1_hash(self) -> Self {
+        match self {
+            DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess | DigestAlgorithm::AkaV1Md5 => {
+                DigestAlgorithm::Md5
+            }
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess => DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha512_256 | DigestAlgorithm::Sha512_256Sess => {
+                DigestAlgorithm::Sha512_256
+            }
+        }
+    }
 }
 
 impl fmt::Display for DigestAlgorithm {
@@ -100,6 +141,132 @@ pub struct DigestCredentials {
     pub username: String,
     pub password: String,
 }
+
+/// A secret siphon holds in order to answer a challenge as a *client*.
+///
+/// Two forms, because a credential store cannot always hold a reversible
+/// secret. A password answers any challenge, since H(A1) is computed per
+/// challenge from it. A stored H(A1) answers only a challenge whose realm and
+/// hash match the ones it was computed for (RFC 7616 §3.4.3) — but it is not
+/// reversible, so a store holding one cannot leak the password itself.
+///
+/// A stored H(A1) is still *password-equivalent for its realm*: anything
+/// holding it can authenticate as that user there. It narrows a disclosure, it
+/// does not prevent one.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StoredSecret {
+    /// A plaintext password. siphon computes `H(username:realm:password)`.
+    Password(String),
+    /// A pre-computed `H(username:realm:password)` hex string, and the hash it
+    /// was computed with.
+    Ha1 {
+        value: String,
+        algorithm: DigestAlgorithm,
+    },
+}
+
+/// A username and the secret siphon answers its challenges with.
+///
+/// What a gateway destination or an outbound registration holds. `Debug` is
+/// safe to log: the secret redacts itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCredentials {
+    pub username: String,
+    pub secret: StoredSecret,
+}
+
+impl StoredSecret {
+    /// Build from configuration: exactly one of `password` or `ha1`.
+    ///
+    /// Both, or neither, is rejected rather than resolved by precedence — two
+    /// secrets for one credential means one of them is not the one in use, and
+    /// silently picking would make the other look effective.
+    pub fn from_config(
+        password: Option<&str>,
+        ha1: Option<&str>,
+        ha1_algorithm: &str,
+    ) -> Result<Self, String> {
+        match (password, ha1) {
+            (Some(_), Some(_)) => Err(
+                "set `password` or `ha1`, not both — siphon will not guess which secret is live"
+                    .to_string(),
+            ),
+            (None, None) => {
+                Err("needs a `password` or an `ha1` to answer a challenge with".to_string())
+            }
+            (Some(password), None) => Ok(StoredSecret::Password(password.to_string())),
+            (None, Some(ha1)) => {
+                let algorithm = DigestAlgorithm::parse(ha1_algorithm).ok_or_else(|| {
+                    format!(
+                        "unknown `ha1_algorithm` {ha1_algorithm:?} — use md5, sha-256 or \
+                         sha-512-256"
+                    )
+                })?;
+                if ha1.trim().is_empty() {
+                    return Err("`ha1` is empty".to_string());
+                }
+                if !ha1.chars().all(|character| character.is_ascii_hexdigit()) {
+                    return Err(
+                        "`ha1` is not a hex string — it is H(username:realm:password), not the \
+                         password"
+                            .to_string(),
+                    );
+                }
+                Ok(StoredSecret::Ha1 {
+                    value: ha1.to_ascii_lowercase(),
+                    algorithm,
+                })
+            }
+        }
+    }
+
+    /// Whether this secret can answer `challenge`.
+    ///
+    /// Checked before use so a mismatch is reported rather than answered
+    /// wrongly: an H(A1) from the wrong hash still produces a well-formed
+    /// response, which the peer rejects as a bad password.
+    pub fn can_answer(&self, algorithm: DigestAlgorithm) -> bool {
+        match self {
+            StoredSecret::Password(_) => true,
+            StoredSecret::Ha1 {
+                algorithm: stored, ..
+            } => stored.stored_ha1_hash() == algorithm.stored_ha1_hash(),
+        }
+    }
+}
+
+/// Deliberately hand-written: these live on config, gateway destinations and
+/// call state, all of which get `Debug`-logged. A derive would print the secret.
+impl fmt::Debug for StoredSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoredSecret::Password(_) => formatter.write_str("Password(***)"),
+            StoredSecret::Ha1 { algorithm, .. } => write!(formatter, "Ha1({algorithm}, ***)"),
+        }
+    }
+}
+
+/// Why a [`StoredSecret`] could not answer a challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSecretMismatch {
+    /// The hash the stored H(A1) was computed with.
+    pub stored: DigestAlgorithm,
+    /// The hash the challenge asks for.
+    pub challenged: DigestAlgorithm,
+}
+
+impl fmt::Display for StoredSecretMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the stored ha1 was computed for {} but the challenge asks for {} — an ha1 is bound \
+             to its hash (RFC 7616 §3.4.3), so store a password or an ha1 for {}",
+            self.stored, self.challenged, self.challenged
+        )
+    }
+}
+
+impl std::error::Error for StoredSecretMismatch {}
 
 /// Tracks the nonce-count (`nc`) value for digest authentication.
 ///
@@ -177,23 +344,9 @@ pub fn parse_challenge(header_value: &str) -> Option<DigestChallenge> {
                 "nonce" => nonce = Some(value),
                 "opaque" => opaque = Some(value),
                 "qop" => qop = Some(value),
-                "algorithm" => {
-                    // Algorithm name matching is case-insensitive per
-                    // RFC 7616 §3.3; real-world deployments vary on
-                    // hyphen vs underscore vs no separator for the
-                    // SHA-* names.
-                    let normalized = value.to_uppercase().replace('_', "-");
-                    algorithm = match normalized.as_str() {
-                        "MD5" | "" => DigestAlgorithm::Md5,
-                        "MD5-SESS" => DigestAlgorithm::Md5Sess,
-                        "SHA-256" | "SHA256" => DigestAlgorithm::Sha256,
-                        "SHA-256-SESS" | "SHA256-SESS" => DigestAlgorithm::Sha256Sess,
-                        "SHA-512-256" | "SHA512-256" => DigestAlgorithm::Sha512_256,
-                        "SHA-512-256-SESS" | "SHA512-256-SESS" => DigestAlgorithm::Sha512_256Sess,
-                        "AKAV1-MD5" => DigestAlgorithm::AkaV1Md5,
-                        _ => return None, // unsupported algorithm
-                    };
-                }
+                // `?` on an unsupported algorithm: the whole challenge is
+                // unusable, which is what the old inline match returned too.
+                "algorithm" => algorithm = DigestAlgorithm::parse(&value)?,
                 "stale" => stale = value.eq_ignore_ascii_case("true"),
                 _ => {} // ignore unknown params
             }
@@ -389,6 +542,68 @@ pub fn format_authorization_header(
         cnonce_ref,
         None,
     )
+}
+
+/// Build an `Authorization` header from a [`StoredSecret`].
+///
+/// The third credential form alongside [`format_authorization_header`] (a
+/// password) and [`format_aka_authorization_header`] (a computed AKA RES),
+/// sharing the same digest tail. A password behaves exactly as the first does;
+/// a stored H(A1) skips the `H(username:realm:password)` step and feeds the
+/// stored value straight in.
+///
+/// Errors when a stored H(A1) is bound to a different hash than the challenge
+/// asks for. That is refused rather than attempted, because the wrong H(A1)
+/// yields a well-formed response the peer rejects as a bad password, which
+/// looks like a credential problem rather than a configuration one.
+pub fn format_stored_authorization_header(
+    challenge: &DigestChallenge,
+    username: &str,
+    secret: &StoredSecret,
+    method: &str,
+    digest_uri: &str,
+    nonce_count: Option<u32>,
+    cnonce: Option<&str>,
+) -> Result<String, StoredSecretMismatch> {
+    let base_ha1 = match secret {
+        StoredSecret::Password(password) => hash_hex(
+            challenge.algorithm,
+            format!("{}:{}:{}", username, challenge.realm, password).as_bytes(),
+        ),
+        StoredSecret::Ha1 { value, algorithm } => {
+            if !secret.can_answer(challenge.algorithm) {
+                return Err(StoredSecretMismatch {
+                    stored: *algorithm,
+                    challenged: challenge.algorithm,
+                });
+            }
+            value.clone()
+        }
+    };
+
+    let has_qop_auth = qop_has_auth(challenge);
+    let mut owned_cnonce: Option<String> = None;
+    let cnonce_ref = derive_cnonce(challenge, cnonce, has_qop_auth, &mut owned_cnonce);
+
+    let response = digest_response_from_ha1(
+        challenge,
+        base_ha1,
+        method,
+        digest_uri,
+        nonce_count,
+        cnonce_ref,
+    );
+
+    Ok(build_authorization_header(
+        username,
+        challenge,
+        digest_uri,
+        &response,
+        has_qop_auth,
+        nonce_count,
+        cnonce_ref,
+        None,
+    ))
 }
 
 /// Build a complete IMS AKAv1-MD5 `Authorization` header (RFC 3310).
@@ -925,6 +1140,257 @@ mod tests {
             None,
         );
         assert_eq!(response, expected);
+    }
+
+    // --- Stored secrets (password or pre-computed ha1) ---
+
+    /// The RFC 2617 §3.5 exchange, as published rather than recomputed: the
+    /// literal H(A1) for `Mufasa` / `testrealm@host.com` / `Circle Of Life`,
+    /// and the literal `response` the RFC prints for it.
+    const RFC2617_HA1: &str = "939e7578ed9e3c518a452acee763bce9";
+    const RFC2617_RESPONSE: &str = "6629fae49393a05397450978507c4ef1";
+
+    fn rfc2617_challenge() -> DigestChallenge {
+        DigestChallenge {
+            realm: "testrealm@host.com".to_string(),
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".to_string(),
+            opaque: Some("5ccc069c403ebaf9f0171e9517f40e41".to_string()),
+            qop: Some("auth".to_string()),
+            algorithm: DigestAlgorithm::Md5,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn a_stored_ha1_answers_the_rfc2617_vector() {
+        let secret = StoredSecret::Ha1 {
+            value: RFC2617_HA1.to_string(),
+            algorithm: DigestAlgorithm::Md5,
+        };
+
+        let header = format_stored_authorization_header(
+            &rfc2617_challenge(),
+            "Mufasa",
+            &secret,
+            "GET",
+            "/dir/index.html",
+            Some(1),
+            Some("0a4f113b"),
+        )
+        .expect("md5 ha1 answers an md5 challenge");
+
+        assert!(
+            header.contains(RFC2617_RESPONSE),
+            "response does not match the RFC 2617 vector: {header}"
+        );
+    }
+
+    #[test]
+    fn a_stored_password_and_its_ha1_answer_identically() {
+        let challenge = rfc2617_challenge();
+        let from_password = format_stored_authorization_header(
+            &challenge,
+            "Mufasa",
+            &StoredSecret::Password("Circle Of Life".to_string()),
+            "GET",
+            "/dir/index.html",
+            Some(1),
+            Some("0a4f113b"),
+        )
+        .expect("a password answers any challenge");
+
+        let from_ha1 = format_stored_authorization_header(
+            &challenge,
+            "Mufasa",
+            &StoredSecret::Ha1 {
+                value: RFC2617_HA1.to_string(),
+                algorithm: DigestAlgorithm::Md5,
+            },
+            "GET",
+            "/dir/index.html",
+            Some(1),
+            Some("0a4f113b"),
+        )
+        .expect("md5 ha1 answers an md5 challenge");
+
+        assert_eq!(from_password, from_ha1);
+        assert!(from_password.contains(RFC2617_RESPONSE));
+    }
+
+    #[test]
+    fn a_stored_ha1_refuses_a_challenge_for_another_hash() {
+        // An ha1 is bound to its hash (RFC 7616 §3.4.3). Answering anyway
+        // produces a well-formed response the peer rejects as a bad password,
+        // which reads as a credential fault rather than a configuration one.
+        let mut challenge = rfc2617_challenge();
+        challenge.algorithm = DigestAlgorithm::Sha256;
+
+        let error = format_stored_authorization_header(
+            &challenge,
+            "Mufasa",
+            &StoredSecret::Ha1 {
+                value: RFC2617_HA1.to_string(),
+                algorithm: DigestAlgorithm::Md5,
+            },
+            "GET",
+            "/dir/index.html",
+            Some(1),
+            Some("0a4f113b"),
+        )
+        .expect_err("an md5 ha1 must not answer a sha-256 challenge");
+
+        assert_eq!(error.stored, DigestAlgorithm::Md5);
+        assert_eq!(error.challenged, DigestAlgorithm::Sha256);
+        let rendered = error.to_string();
+        assert!(rendered.contains("MD5"), "{rendered}");
+        assert!(rendered.contains("SHA-256"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stored_ha1_serves_the_sess_variant_of_its_own_hash() {
+        // `-sess` folds a per-request cnonce into the stored ha1 rather than
+        // replacing it (RFC 7616 §3.4.2), so one stored value serves both.
+        let secret = StoredSecret::Ha1 {
+            value: RFC2617_HA1.to_string(),
+            algorithm: DigestAlgorithm::Md5,
+        };
+        assert!(secret.can_answer(DigestAlgorithm::Md5Sess));
+        assert!(secret.can_answer(DigestAlgorithm::Md5));
+        assert!(!secret.can_answer(DigestAlgorithm::Sha256));
+        assert!(!secret.can_answer(DigestAlgorithm::Sha512_256));
+    }
+
+    #[test]
+    fn a_stored_password_answers_every_hash() {
+        let secret = StoredSecret::Password("Circle Of Life".to_string());
+        for algorithm in [
+            DigestAlgorithm::Md5,
+            DigestAlgorithm::Md5Sess,
+            DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha256Sess,
+            DigestAlgorithm::Sha512_256,
+            DigestAlgorithm::Sha512_256Sess,
+        ] {
+            assert!(secret.can_answer(algorithm), "{algorithm}");
+        }
+    }
+
+    #[test]
+    fn a_stored_secret_never_debug_prints_itself() {
+        // These live on config and call state, both of which get Debug-logged.
+        let password = format!("{:?}", StoredSecret::Password("hunter2".to_string()));
+        assert!(!password.contains("hunter2"), "{password}");
+
+        let ha1 = format!(
+            "{:?}",
+            StoredSecret::Ha1 {
+                value: RFC2617_HA1.to_string(),
+                algorithm: DigestAlgorithm::Md5,
+            }
+        );
+        assert!(!ha1.contains(RFC2617_HA1), "{ha1}");
+        assert!(ha1.contains("MD5"), "{ha1}");
+    }
+
+    #[test]
+    fn stored_secret_from_config_reads_a_password() {
+        let secret = StoredSecret::from_config(Some("Circle Of Life"), None, "md5")
+            .expect("a password is enough");
+        assert_eq!(secret, StoredSecret::Password("Circle Of Life".to_string()));
+    }
+
+    #[test]
+    fn stored_secret_from_config_reads_an_ha1() {
+        let secret = StoredSecret::from_config(None, Some(RFC2617_HA1), "md5").expect("valid ha1");
+        assert_eq!(
+            secret,
+            StoredSecret::Ha1 {
+                value: RFC2617_HA1.to_string(),
+                algorithm: DigestAlgorithm::Md5,
+            }
+        );
+    }
+
+    #[test]
+    fn stored_secret_from_config_normalises_ha1_case() {
+        let secret = StoredSecret::from_config(None, Some(&RFC2617_HA1.to_uppercase()), "SHA-256")
+            .expect("valid ha1");
+        assert_eq!(
+            secret,
+            StoredSecret::Ha1 {
+                value: RFC2617_HA1.to_string(),
+                algorithm: DigestAlgorithm::Sha256,
+            }
+        );
+    }
+
+    #[test]
+    fn stored_secret_from_config_refuses_two_secrets() {
+        // Picking one silently would leave the other looking effective.
+        let error = StoredSecret::from_config(Some("pass"), Some(RFC2617_HA1), "md5")
+            .expect_err("both is ambiguous");
+        assert!(error.contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn stored_secret_from_config_refuses_no_secret() {
+        let error = StoredSecret::from_config(None, None, "md5").expect_err("needs a secret");
+        assert!(error.contains("password"), "{error}");
+    }
+
+    #[test]
+    fn stored_secret_from_config_refuses_a_password_in_the_ha1_field() {
+        // The common mistake: pasting the password where the hash goes. It
+        // would otherwise be used as an ha1 and fail every challenge.
+        let error =
+            StoredSecret::from_config(None, Some("Circle Of Life"), "md5").expect_err("not hex");
+        assert!(error.contains("hex"), "{error}");
+    }
+
+    #[test]
+    fn stored_secret_from_config_refuses_an_unknown_hash() {
+        let error =
+            StoredSecret::from_config(None, Some(RFC2617_HA1), "sha-3").expect_err("unknown hash");
+        assert!(error.contains("sha-3"), "{error}");
+    }
+
+    #[test]
+    fn digest_algorithm_parse_accepts_the_spelling_variants() {
+        // RFC 7616 §3.3 makes the name case-insensitive, and deployments vary
+        // on the separator.
+        assert_eq!(DigestAlgorithm::parse("MD5"), Some(DigestAlgorithm::Md5));
+        assert_eq!(DigestAlgorithm::parse("md5"), Some(DigestAlgorithm::Md5));
+        // A challenge omitting `algorithm` means MD5 (RFC 2617 §3.2.1).
+        assert_eq!(DigestAlgorithm::parse(""), Some(DigestAlgorithm::Md5));
+        assert_eq!(
+            DigestAlgorithm::parse("SHA_256"),
+            Some(DigestAlgorithm::Sha256)
+        );
+        assert_eq!(
+            DigestAlgorithm::parse("sha512-256"),
+            Some(DigestAlgorithm::Sha512_256)
+        );
+        assert_eq!(DigestAlgorithm::parse("sha-3"), None);
+    }
+
+    #[test]
+    fn stored_ha1_hash_folds_sess_variants_onto_their_base() {
+        assert_eq!(
+            DigestAlgorithm::Md5Sess.stored_ha1_hash(),
+            DigestAlgorithm::Md5
+        );
+        assert_eq!(
+            DigestAlgorithm::AkaV1Md5.stored_ha1_hash(),
+            DigestAlgorithm::Md5
+        );
+        assert_eq!(
+            DigestAlgorithm::Sha256Sess.stored_ha1_hash(),
+            DigestAlgorithm::Sha256
+        );
+        assert_eq!(
+            DigestAlgorithm::Sha512_256Sess.stored_ha1_hash(),
+            DigestAlgorithm::Sha512_256
+        );
     }
 
     /// RFC 2617 Section 3.5 test vector with qop=auth.
