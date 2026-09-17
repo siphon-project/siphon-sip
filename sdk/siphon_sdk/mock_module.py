@@ -8826,17 +8826,18 @@ class MockIpsec:
         # UDP" (§6.3) and "The transport protocol selector shall allow UDP
         # and TCP." (§7.1).
         # The ``protocol`` on the resulting :class:`SecurityServerParams`
-        # collapses to ``"udp"``.  It is informational: siphon's
-        # Security-Server carries no transport ``protocol=`` parameter for any
-        # SA, since no sec-agree spec defines one (RFC 3329 §2.2 and
-        # Appendix A, TS 33.203 Annex H) and TS 33.203 §6.3 / §7.1 have the SAs
-        # carry UDP and TCP alike.
+        # reports what the SA covers, so the multi-protocol default reports
+        # ``"any"`` — the same vocabulary :attr:`SAHandle.protocol` uses.
+        # It is informational either way: siphon's Security-Server carries no
+        # transport ``protocol=`` parameter for any SA, since no sec-agree spec
+        # defines one (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H) and
+        # TS 33.203 §6.3 / §7.1 have the SAs carry UDP and TCP alike.
         #
         # Explicit ``"udp"``/``"tcp"``/``"any"`` pin the selector to
         # that one inner protocol (single-transport deployments, tests).
         if protocol is None:
             sa_protocol = "any"
-            wire_protocol = "udp"
+            params_protocol = "any"
         else:
             proto_lower = protocol.lower()
             if proto_lower not in ("udp", "tcp", "any"):
@@ -8844,7 +8845,7 @@ class MockIpsec:
                     f"protocol must be 'udp', 'tcp', 'any', or None, got {protocol!r}"
                 )
             sa_protocol = proto_lower
-            wire_protocol = "udp" if proto_lower == "any" else proto_lower
+            params_protocol = proto_lower
         av._take()  # raises ValueError if already consumed
         # Family-matched P-CSCF address (mirrors the Rust binding, which
         # consumes ``av`` before this check): the SA's P-CSCF side must be the
@@ -8864,7 +8865,7 @@ class MockIpsec:
             raise self._allocate_should_fail(self._allocate_failure_message)
         pending = MockPendingSA(
             transform, offer, self.pcscf_port_c, self.pcscf_port_s,
-            expires_secs=expires_secs, protocol=wire_protocol,
+            expires_secs=expires_secs, protocol=params_protocol,
         )
         # Surface the *internal* SA selector mode for tests that want
         # to assert multi-protocol installation specifically.  Not on
