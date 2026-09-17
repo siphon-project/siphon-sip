@@ -495,7 +495,7 @@ pub fn retry_with_credentials(
                 "B2BUA: outbound auth retry limit reached — surfacing {status_code} upstream instead of re-authing"
             );
             // fall through to the failure path (on_failure + forward to A-leg)
-        } else if let Some((username, password)) = &snapshot.outbound_credentials {
+        } else if let Some(credentials) = &snapshot.outbound_credentials {
             let challenge_header = if status_code == 401 {
                 message.headers.get("WWW-Authenticate")
             } else {
@@ -592,25 +592,38 @@ pub fn retry_with_credentials(
                             "B2BUA: {status_code} received, retrying with credentials"
                         );
 
-                        let credentials = crate::auth::DigestCredentials {
-                            username: username.clone(),
-                            password: password.clone(),
-                        };
-
                         let auth_header_name = if status_code == 401 {
                             "Authorization"
                         } else {
                             "Proxy-Authorization"
                         };
 
-                        let auth_value = crate::auth::format_authorization_header(
+                        let auth_value = match crate::auth::format_stored_authorization_header(
                             &challenge,
-                            &credentials,
+                            &credentials.username,
+                            &credentials.secret,
                             "INVITE",
                             target_uri,
                             Some(nc),
                             None,
-                        );
+                        ) {
+                            Ok(value) => value,
+                            Err(mismatch) => {
+                                // A stored ha1 for the wrong hash cannot answer
+                                // this challenge. Surface it instead of sending
+                                // a response the trunk will read as a bad
+                                // password — that reads as a credential fault
+                                // and hides the configuration one.
+                                error!(
+                                    call_id = %call_id,
+                                    status = status_code,
+                                    realm = %challenge.realm,
+                                    error = %mismatch,
+                                    "B2BUA: cannot answer the trunk's challenge with the stored credential"
+                                );
+                                return false;
+                            }
+                        };
 
                         // RFC 5923 connection reuse: keep the authenticated
                         // retry on the SAME trunk member the CSeq-1 INVITE
