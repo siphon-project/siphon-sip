@@ -714,6 +714,21 @@ timeout in seconds (default 30). Dialling a call that is already answered is
 starts billing before anyone picks up and denies the caller the callee's own
 ringback.
 
+`profile` optionally selects a configured media profile and anchors both legs
+through the media engine. For example, plain RTP from a trunk to a phone that
+requires SDES-SRTP uses `"profile": "rtp_to_srtp"`; the reverse direction uses
+`srtp_to_rtp`. The profile's `offer` half shapes the SDP sent to the phone and
+its `answer` half shapes the SDP sent back to the caller. TLS signalling alone
+does not imply SRTP: select the profile from the endpoints' media policy.
+
+Profiled dials currently require a caller SDP offer and **exactly one resolved
+contact**, with no pre-existing media anchor. An unsupported fork, unknown
+profile, missing backend or failed media allocation returns `unavailable`
+without sending an INVITE or answering the caller. Invalid profile values
+return `bad_request`. Without `profile`, the existing unanchored behaviour is
+unchanged. A failed profiled dial releases its media session before
+`DialFailed`, preserving the original caller SDP for a later voicemail answer.
+
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.
 

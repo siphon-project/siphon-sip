@@ -72,6 +72,16 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
 /// billing before anyone picks up, records an unanswered call as answered, and
 /// denies the caller the callee's own ringback.
 pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let profile = match args.get("profile") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
+        Some(_) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "dial profile must be a non-empty profile name",
+            )
+        }
+    };
     let Some(targets_json) = args.get("targets").and_then(|v| v.as_array()) else {
         return ControlResult::error(
             ControlErrorCode::BadRequest,
@@ -119,6 +129,7 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         strategy,
         timeout_secs,
         &extra_headers,
+        profile,
     ) {
         Ok(true) => ControlResult::Ok(serde_json::json!({
             "channel": channel.channel_id,
@@ -139,6 +150,9 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         }
         Err(error @ crate::dispatcher::DialError::NoTargets) => {
             ControlResult::error(ControlErrorCode::BadRequest, error.to_string())
+        }
+        Err(error @ crate::dispatcher::DialError::Media(_)) => {
+            ControlResult::error(ControlErrorCode::Unavailable, error.to_string())
         }
     }
 }

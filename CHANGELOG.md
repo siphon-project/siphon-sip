@@ -81,6 +81,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   address, so it applies to `call.dial()`, `call.fork()` and an LCR route
   alike. A credential set in a script with `call.set_credentials()` still
   wins. Secrets are never rendered by `Debug` and never reach Python.
+
+- Control `dial` accepts a media `profile` for one resolved contact. The engine
+  anchors the offer before ringing and rewrites early/final answers in the
+  profile's reverse direction, allowing an RTP caller to reach an SRTP phone
+  without answering the caller first. Failed attempts release their allocation
+  before voicemail or another dial; unsupported media forks are refused.
+
 - **`proxy_protocol` on a stream listener takes the client address from a
   HAProxy PROXY header (v1 and v2), so a connection-terminating front stops
   hiding the real client.** A front that terminates TLS opens its own

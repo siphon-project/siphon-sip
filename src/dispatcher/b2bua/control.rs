@@ -757,6 +757,8 @@ pub enum DialError {
     AlreadyAnswered,
     /// An AoR with no registered contact.
     NoContacts(String),
+    /// The requested media path cannot be allocated safely.
+    Media(String),
 }
 
 impl std::fmt::Display for DialError {
@@ -773,6 +775,7 @@ impl std::fmt::Display for DialError {
             DialError::NoContacts(aor) => {
                 write!(formatter, "no registered contact for {aor}")
             }
+            DialError::Media(reason) => write!(formatter, "{reason}"),
         }
     }
 }
@@ -842,6 +845,7 @@ pub fn b2bua_dial_call(
     strategy: &str,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
+    profile: Option<&str>,
 ) -> Result<bool, DialError> {
     let parallel = if strategy.eq_ignore_ascii_case("parallel") {
         true
@@ -867,6 +871,7 @@ pub fn b2bua_dial_call(
         parallel,
         timeout_secs,
         extra_headers,
+        profile,
         &control.state,
     )
 }
@@ -879,6 +884,7 @@ pub(crate) fn b2bua_dial_call_with_state(
     parallel: bool,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
+    profile: Option<&str>,
     state: &DispatcherState,
 ) -> Result<bool, DialError> {
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
@@ -899,7 +905,7 @@ pub(crate) fn b2bua_dial_call_with_state(
         return Err(DialError::AlreadyAnswered);
     }
 
-    let template = {
+    let mut template = {
         let Some(invite_arc) = state
             .call_actors
             .get_call(&internal_call_id)
@@ -944,6 +950,29 @@ pub(crate) fn b2bua_dial_call_with_state(
         return Ok(true);
     }
 
+    if let Some(profile) = profile {
+        // A two-party allocation cannot safely represent competing fork
+        // answers. Explicitly refuse until each fork has its own media state.
+        if targets.len() != 1 {
+            return Err(DialError::Media(
+                "dial profile requires exactly one resolved contact".into(),
+            ));
+        }
+        let source_ip = state
+            .call_actors
+            .get_call(&internal_call_id)
+            .map(|call| call.a_leg.transport.remote_addr.ip())
+            .ok_or_else(|| DialError::Media("call is gone".into()))?;
+        template = control_dial_media_offer(&template, source_ip, profile, state)
+            .map_err(DialError::Media)?;
+        if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
+            call.control_dial_media = true;
+        } else {
+            release_failed_call_media(sip_call_id, state);
+            return Ok(false);
+        }
+    }
+
     // The controller has acted, so the handoff deadline no longer applies: what
     // bounds the call now is the dial's own timeout.
     state.call_actors.mark_controller_acted(&internal_call_id);
@@ -951,7 +980,7 @@ pub(crate) fn b2bua_dial_call_with_state(
     // from `route`.
     state.call_actors.set_control_dial(&internal_call_id, true);
 
-    let sent = if parallel {
+    let sent = if parallel || profile.is_some() {
         dial_parallel(&internal_call_id, &targets, extra_headers, &template, state)
     } else {
         dial_sequential(
@@ -965,6 +994,7 @@ pub(crate) fn b2bua_dial_call_with_state(
     };
 
     if sent == 0 {
+        release_control_dial_media(&internal_call_id, state);
         // Nothing reached the wire, so nothing will ever answer. Report it now
         // rather than leaving the caller in ringback for the full timeout.
         state.call_actors.set_control_dial(&internal_call_id, false);
@@ -1119,6 +1149,7 @@ pub fn report_control_dial_failure(
     }
 
     state.call_actors.set_control_dial(call_id, false);
+    release_control_dial_media(call_id, state);
     // The rung legs are done; the caller is not. Dropping them here is what
     // lets the controller dial again on the same channel.
     state.call_actors.clear_b_legs(call_id);
