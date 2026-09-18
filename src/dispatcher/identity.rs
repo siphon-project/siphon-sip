@@ -374,18 +374,27 @@ pub(super) fn a_leg_advertised_port(
 /// answer at all and times out.  Same invariant the proxy `relay(flow=…)` path
 /// enforces in [`relay_request`].
 ///
-/// The socket's own IP is used rather than the advertised host for the same
-/// reason: an advertised NAT address or FQDN does not identify the flow the
-/// response has to return over.  Unpinned legs (`None` — every non-flow B-leg)
-/// fall back to the per-transport advertised identity, byte-for-byte what
-/// siphon has always emitted.
+/// Datagram flows and configured IPsec protected ports retain that exact identity.
+/// Stream flows instead advertise the listener's public identity: delivery uses
+/// the held connection, but the peer's later BYE or re-INVITE targets our Contact
+/// and must not learn an internal bind address behind a NAT or TLS proxy.
+/// Unpinned legs fall back to the per-transport advertised identity.
 pub(super) fn b_leg_sent_by(
     b_leg_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
     transport: &Transport,
 ) -> (String, u16) {
     match b_leg_local_addr {
-        Some(local) => pinned_sent_by(local, || state.via_host(transport)),
+        Some(local)
+            if *transport == Transport::Udp
+                || crate::ipsec::runtime::is_protected_local_port(local.port()) =>
+        {
+            pinned_sent_by(local, || state.via_host(transport))
+        }
+        Some(local) => (
+            state.a_leg_advertised_host(Some(local), transport),
+            local.port(),
+        ),
         None => (state.via_host(transport), state.via_port(transport)),
     }
 }

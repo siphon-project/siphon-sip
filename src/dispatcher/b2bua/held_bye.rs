@@ -69,7 +69,14 @@ pub fn send_or_hold_bye(
     let route = ByeRoute {
         transport,
         destination,
-        connection_id: leg.transport.connection_id,
+        // A route to a different hop cannot use the endpoint's held socket.
+        connection_id: if destination == leg.transport.remote_addr
+            && transport == leg.transport.transport
+        {
+            leg.transport.connection_id
+        } else {
+            ConnectionId::default()
+        },
         local_addr: leg.transport.local_addr,
     };
     let dialog_call_id = leg.dialog.call_id.as_str();
@@ -243,19 +250,27 @@ fn stop_held_answer(dialog_call_id: &str, held: &HeldBye, state: &DispatcherStat
 }
 
 fn send_one(message: SipMessage, route: &ByeRoute, sender: ByeSender, state: &DispatcherState) {
+    // A stream dialog belongs to its captured connection, not any connection
+    // from the same IP. Several phones can sit behind one signaling proxy.
+    // Datagram B-legs still use the helper that arms their retransmissions.
     match sender {
-        ByeSender::Dialog => send_message_from(
+        ByeSender::BLeg
+            if route.transport == Transport::Udp
+                || route.connection_id == ConnectionId::default() =>
+        {
+            send_b2bua_to_bleg(
+                message,
+                route.transport,
+                route.destination,
+                route.local_addr,
+                state,
+            )
+        }
+        _ => send_message_from(
             message,
             route.transport,
             route.destination,
             route.connection_id,
-            route.local_addr,
-            state,
-        ),
-        ByeSender::BLeg => send_b2bua_to_bleg(
-            message,
-            route.transport,
-            route.destination,
             route.local_addr,
             state,
         ),
@@ -269,7 +284,19 @@ fn send_in_order(
     state: &DispatcherState,
 ) {
     match sender {
-        ByeSender::Dialog => send_messages_in_order_from(
+        ByeSender::BLeg
+            if route.transport == Transport::Udp
+                || route.connection_id == ConnectionId::default() =>
+        {
+            send_b2bua_sequence_to_bleg(
+                messages,
+                route.transport,
+                route.destination,
+                route.local_addr,
+                state,
+            )
+        }
+        _ => send_messages_in_order_from(
             messages,
             route.transport,
             route.destination,
@@ -277,12 +304,73 @@ fn send_in_order(
             route.local_addr,
             state,
         ),
-        ByeSender::BLeg => send_b2bua_sequence_to_bleg(
-            messages,
-            route.transport,
-            route.destination,
-            route.local_addr,
-            state,
-        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_b_leg_bye_and_its_held_ack_stay_on_the_original_stream_connection() {
+        for other_port in [42000, 42001] {
+            let mut fixture = crate::dispatcher::test_dispatcher::test_dispatcher();
+            let (sender, receiver) = flume::unbounded();
+            let router = &fixture.state.outbound;
+            fixture.state.outbound = Arc::new(OutboundRouter {
+                udp: router.udp.clone(),
+                udp_by_local: router.udp_by_local.clone(),
+                tcp: router.tcp.clone(),
+                tls: sender,
+                ws: router.ws.clone(),
+                wss: router.wss.clone(),
+                sctp: router.sctp.clone(),
+            });
+            // A proxy fronts several phones. Its registry may now describe a
+            // different connection on this socket or only a sibling socket.
+            fixture.state.stream_connections.register(
+                format!("198.51.100.20:{other_port}").parse().unwrap(),
+                Transport::Tls,
+                ConnectionId(43),
+            );
+            let route = ByeRoute {
+                transport: Transport::Tls,
+                destination: "198.51.100.20:42000".parse().unwrap(),
+                connection_id: ConnectionId(42),
+                local_addr: Some("192.0.2.10:5061".parse().unwrap()),
+            };
+            let request = |method: Method| {
+                SipMessageBuilder::new()
+                    .request(method, SipUri::new("example.com".to_string()))
+                    .call_id("dialog@example.com".to_string())
+                    .content_length(0)
+                    .build()
+                    .unwrap()
+            };
+            for sender in [ByeSender::BLeg, ByeSender::Dialog] {
+                send_one(request(Method::Bye), &route, sender, &fixture.state);
+                assert_eq!(receiver.try_recv().unwrap().connection_id, ConnectionId(42));
+                send_in_order(
+                    vec![request(Method::Ack), request(Method::Bye)],
+                    &route,
+                    sender,
+                    &fixture.state,
+                );
+                let mut methods = Vec::new();
+                while let Ok(sent) = receiver.try_recv() {
+                    assert_eq!(sent.connection_id, ConnectionId(42));
+                    for frame in sent.frames() {
+                        methods.push(
+                            parse_sip_message_bytes(frame)
+                                .unwrap()
+                                .method()
+                                .unwrap()
+                                .clone(),
+                        );
+                    }
+                }
+                assert_eq!(methods, vec![Method::Ack, Method::Bye]);
+            }
+        }
     }
 }
