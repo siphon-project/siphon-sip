@@ -216,6 +216,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   aborting while reporting otherwise successful calls. Rates are rounded for
   its integer summary.
 
+- **A bridged call's hangup stays on its captured stream connection.** B-leg
+  BYEs and any ACK held ahead of them no longer select another phone's TLS
+  connection behind the same signaling proxy. Datagram retransmissions and
+  requests routed to a different next hop retain their existing behavior.
+
+- **Registered stream phones receive the advertised Contact on dialled calls.**
+  Captured TCP, TLS and WebSocket flows retain their connection and listener
+  port while advertising the configured public host in Contact and Via. An
+  internal bind address previously prevented peers behind a NAT or TLS proxy
+  from routing their hangup back. Protected UDP flow identities are unchanged.
+
 - **A removed outbound registration now de-registers upstream, and so does
   shutting down.** `registration.remove()` dropped siphon's own state and left
   the binding on the registrar until the granted `Expires` ran out, so a trunk
