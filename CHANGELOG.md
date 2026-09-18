@@ -81,6 +81,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   address, so it applies to `call.dial()`, `call.fork()` and an LCR route
   alike. A credential set in a script with `call.set_credentials()` still
   wins. Secrets are never rendered by `Debug` and never reach Python.
+- `proxy.subscribe_state.accept(request, expires=...)` accepts notifier-side
+  SUBSCRIBE dialogs with a stable response/NOTIFY tag, refreshes existing state,
+  and returns 481 for an unknown dialog. NOTIFY reuses the subscriber's received
+  stream behind NAT while preserving its Contact URI. Expiry sends a final
+  `terminated;reason=timeout` notification and releases dialog state.
+
 - **`proxy_protocol` on a stream listener takes the client address from a
   HAProxy PROXY header (v1 and v2), so a connection-terminating front stops
   hiding the real client.** A front that terminates TLS opens its own

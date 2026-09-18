@@ -1024,6 +1024,9 @@ class _SubscribeStateStub:
     def create(self, request, expires=None):
         raise NotImplementedError(self._ERROR.format(name="create"))
 
+    def accept(self, request, expires=None):
+        raise NotImplementedError(self._ERROR.format(name="accept"))
+
     def get(self, id):
         raise NotImplementedError(self._ERROR.format(name="get"))
 
