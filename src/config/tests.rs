@@ -4297,6 +4297,7 @@ fn gateway_dest(uri: &str, transport: Option<&str>) -> GatewayDestConfig {
         weight: 1,
         priority: 1,
         attrs: Default::default(),
+        auth: None,
     }
 }
 

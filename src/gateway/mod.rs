@@ -83,6 +83,10 @@ pub struct Destination {
     pub priority: u32,
     /// User-defined attributes (e.g. {"region": "us-east", "type": "pstn"}).
     pub attrs: HashMap<String, String>,
+    /// Digest credentials this destination challenges with, used to answer a
+    /// 401/407 on any B-leg sent to it. `None` for a gateway that does not
+    /// authenticate. Never rendered by `Debug` — the secret redacts itself.
+    pub credentials: Option<Arc<crate::auth::StoredCredentials>>,
     /// Whether this destination is currently healthy.
     healthy: AtomicBool,
     /// Consecutive failure count.
@@ -111,10 +115,17 @@ impl Destination {
             weight,
             priority,
             attrs: HashMap::new(),
+            credentials: None,
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
             down_until: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach the digest credentials this destination challenges with.
+    pub fn with_credentials(mut self, credentials: crate::auth::StoredCredentials) -> Self {
+        self.credentials = Some(Arc::new(credentials));
+        self
     }
 
     /// Get the current resolved address.
@@ -647,12 +658,48 @@ impl DispatcherManager {
     /// case-insensitive. Returns the destination's current address and its
     /// configured transport, or `None` when no gateway hostname matches.
     pub fn cached_address_for(&self, host_port: &str) -> Option<(SocketAddr, Transport)> {
+        self.hostname_destination_for(host_port)
+            .map(|(_, destination)| (destination.address(), destination.transport))
+    }
+
+    /// The group and destination a next-hop `host:port` belongs to, matched on
+    /// the configured **hostname**.
+    ///
+    /// Backs [`Self::cached_address_for`] and the credential lookup on an
+    /// outbound leg: a B-leg sent to a gateway that challenges needs to find
+    /// its way back to the credentials configured for that destination, and the
+    /// only thing it carries is where it is going.
+    ///
+    /// Static-IP destinations carry no `address_str` and are skipped, so this
+    /// does not match them — see [`Self::destination_for_address`] for the
+    /// address-keyed half.
+    pub fn hostname_destination_for(&self, host_port: &str) -> Option<(String, Arc<Destination>)> {
         for group in self.groups.iter() {
             for destination in group.value().all_destinations() {
                 if let Some(ref address_str) = destination.address_str {
                     if address_str.eq_ignore_ascii_case(host_port) {
-                        return Some((destination.address(), destination.transport));
+                        return Some((group.key().clone(), Arc::clone(destination)));
                     }
+                }
+            }
+        }
+        None
+    }
+
+    /// The group and destination that resolve to `address`.
+    ///
+    /// The complement of [`Self::hostname_destination_for`]: a destination
+    /// configured as a bare `IP:port` never has an `address_str`, and one
+    /// configured as a hostname is reached at whatever the prober last resolved
+    /// it to. Keyed on the resolved address so both are found.
+    pub fn destination_for_address(
+        &self,
+        address: SocketAddr,
+    ) -> Option<(String, Arc<Destination>)> {
+        for group in self.groups.iter() {
+            for destination in group.value().all_destinations() {
+                if destination.address() == address {
+                    return Some((group.key().clone(), Arc::clone(destination)));
                 }
             }
         }

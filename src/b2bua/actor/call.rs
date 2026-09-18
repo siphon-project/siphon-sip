@@ -292,7 +292,7 @@ pub struct CallActor {
     /// one dialog are disambiguated by the `Event: refer;id` token.
     pub refer_subscriptions: Vec<ReferSubscription>,
     /// Outbound digest credentials for B-leg 401/407 retry.
-    pub outbound_credentials: Option<(String, String)>,
+    pub outbound_credentials: Option<Arc<crate::auth::StoredCredentials>>,
     /// Per-call digest nonce-count tracker (RFC 7616 §3.3). Resets to 1 when
     /// the trunk challenges with a fresh nonce; increments when the same
     /// nonce is reused (e.g. authenticated re-INVITE inside the dialog).

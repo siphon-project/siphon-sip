@@ -22,7 +22,7 @@ pub struct CallHandlerOutcome {
     pub action: CallAction,
     pub timer_override: Option<crate::script::api::call::SessionTimerOverride>,
     /// Outbound digest credentials for the B-leg 401/407 retry.
-    pub credentials: Option<(String, String)>,
+    pub credentials: Option<Arc<crate::auth::StoredCredentials>>,
     pub li_record: bool,
     pub preserve_call_id: bool,
     pub policy_input: Option<crate::script::api::call::HeaderPolicyInput>,
@@ -61,9 +61,14 @@ impl CallHandlerOutcome {
         Self {
             action: call.action().clone(),
             timer_override: call.session_timer_override().cloned(),
-            credentials: call
-                .outbound_credentials()
-                .map(|(user, password)| (user.to_string(), password.to_string())),
+            // A script hands over a password; the stored-ha1 form only ever
+            // comes from a gateway or registrant credential store.
+            credentials: call.outbound_credentials().map(|(user, password)| {
+                Arc::new(crate::auth::StoredCredentials {
+                    username: user.to_string(),
+                    secret: crate::auth::StoredSecret::Password(password.to_string()),
+                })
+            }),
             li_record: call.li_record(),
             preserve_call_id: call.preserve_call_id(),
             policy_input: call.header_policy_input().cloned(),
