@@ -3184,9 +3184,9 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.5.2"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d116c63e6e26d19dbc455d85c25b938ce33eb6a25301370fe524d2e38415986"
+checksum = "ef53f064a76d449dfe5fb8e8daab53e1987339413937cb240d3ce9d5d46f741d"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3222,8 +3222,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.8.6"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#c50a7f4473af51c30e448c7bc96e533923a942f3"
+version = "1.9.0"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#772c11d4acadc795ea0b5f4fdb725b2d3c78df1a"
 dependencies = [
  "aes",
  "arc-swap",
@@ -4069,9 +4069,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uppsala"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b83b4950a552cd9812b6afd150ea10729617d28208bba122912eb196c2261d4d"
+checksum = "a27f7d40a93824eefcf6b62fd2fa86bca9ea6a5825de56b4aa9a5ed7804b766c"
 
 [[package]]
 name = "url"
