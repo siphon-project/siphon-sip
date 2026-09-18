@@ -421,22 +421,26 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
 
     for group in &desired {
         let live = manager.destinations_of(&group.name);
-        let existed = !live.is_empty() || manager.get_group(&group.name).is_some();
+        let live_group = manager.get_group(&group.name);
+        let existed = live_group.is_some();
         let (destinations, changed, build_rejected) = reconcile_destinations(group, &live);
         report.rejected += build_rejected;
 
-        if existed && !changed {
+        let source_networks: Vec<_> = group
+            .source_networks
+            .iter()
+            .filter_map(|spec| super::parse_source_network(spec))
+            .collect();
+        let group_changed = live_group.as_ref().is_some_and(|existing| {
+            existing.algorithm != group.algorithm || existing.source_networks != source_networks
+        });
+
+        if existed && !changed && !group_changed {
             // Nothing to do — and importantly, no group replacement, so the
             // health prober keeps running rather than being aborted and
             // respawned every poll.
             continue;
         }
-
-        let source_networks = group
-            .source_networks
-            .iter()
-            .filter_map(|spec| super::parse_source_network(spec))
-            .collect();
 
         manager.add_group(
             DispatcherGroup::from_existing(group.name.clone(), group.algorithm, destinations)
@@ -879,6 +883,52 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "the group was replaced despite nothing changing"
         );
+    }
+
+    #[test]
+    fn changing_only_source_networks_updates_membership_without_resetting_health() {
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gateway.example.com:5060")];
+        rows[0].source_networks = vec!["192.0.2.0/24".to_string()];
+        apply_rows(&manager, &rows);
+        let first = manager.get_group("carriers").expect("group");
+        let destination = Arc::clone(&first.all_destinations()[0]);
+        destination.mark_down();
+
+        rows[0].source_networks = vec!["198.51.100.0/24".to_string()];
+        let report = apply_rows(&manager, &rows);
+        assert_eq!(report.updated, 1);
+        let second = manager.get_group("carriers").expect("group");
+        assert!(!second.contains_source("192.0.2.1".parse().unwrap()));
+        assert!(second.contains_source("198.51.100.1".parse().unwrap()));
+        assert!(Arc::ptr_eq(&destination, &second.all_destinations()[0]));
+        assert!(!destination.is_healthy());
+        assert_eq!(apply_rows(&manager, &rows), ReconcileReport::default());
+
+        rows[0].source_networks.clear();
+        assert_eq!(apply_rows(&manager, &rows).updated, 1);
+        assert!(!manager
+            .get_group("carriers")
+            .unwrap()
+            .contains_source("198.51.100.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn changing_only_algorithm_replaces_group_and_preserves_destinations() {
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gateway.example.com:5060")];
+        apply_rows(&manager, &rows);
+        let first = manager.get_group("carriers").expect("group");
+        rows[0].algorithm = Some("hash".to_string());
+
+        assert_eq!(apply_rows(&manager, &rows).updated, 1);
+        let second = manager.get_group("carriers").expect("group");
+        assert_eq!(second.algorithm, Algorithm::Hash);
+        assert!(Arc::ptr_eq(
+            &first.all_destinations()[0],
+            &second.all_destinations()[0]
+        ));
+        assert_eq!(apply_rows(&manager, &rows), ReconcileReport::default());
     }
 
     #[test]
