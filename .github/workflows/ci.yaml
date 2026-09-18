@@ -556,6 +556,45 @@ jobs:
       - name: MTU §18.1.1 fallback tests (IPv4)
         run: scripts/mtu_test.sh v4
 
+  # ── PROXY protocol: the client address behind a real front ─────────────────
+  # A REGISTER + INVITE flow through an actual HAProxy in `send-proxy-v2` mode
+  # into siphon's TLS listener.  Deterministic signal: siphon copies what each
+  # consumer holds (request.source_ip, source_ip_in(), the stored registration's
+  # captured flow, the contact fix_nated_register() rewrote) into headers on the
+  # 200, and the caller compares each against its OWN address.  A build that
+  # never threads the substitution through answers with HAProxy's address and
+  # the caller fails.  Needs no special capability.
+  sipp-proxy-protocol:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Client address survives a PROXY-protocol front (HAProxy → TLS)
+        run: scripts/proxy_protocol_test.sh
+
+  # ── failed_auth_ban auto-ban, including behind a PROXY-protocol front ──────
+  # Three existing phases (failed auth, non-SIP probe, rejected WS upgrade) plus
+  # one that asserts WHICH address a ban lands on when the traffic arrives
+  # behind a front: the abuser the header names, never the front itself.
+  # Banning the front turns one abuser into an outage for every client behind
+  # the load balancer, and nothing in the wire behaviour makes that visible —
+  # the harness reads GET /admin/bans instead.
+  sipp-banscan:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Auto-ban records the abuser, not the front
+        run: scripts/banscan_test.sh
+
   # ── RFC 3261 §16.4 Route self-identity ─────────────────────────────────────
   # A proxy must consume the Record-Route it inserted itself, or every in-dialog
   # request of a healthy dialog is refused.  The standard functional stack

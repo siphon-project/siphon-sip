@@ -104,6 +104,64 @@ listen:
   # logs a warning at startup for each TLS/WSS listener whose host is an IP
   # literal, unless tls.certificate carries that IP as an iPAddress
   # subjectAltName.
+  #
+  # PROXY protocol — take the client's address from the header a front sends,
+  # instead of seeing the front's own.  HAProxy PROXY v1 and v2.  STREAM
+  # LISTENERS ONLY (tcp, tls, ws, wss, and a shared tcp+ws / tls+wss socket).
+  # Off unless configured.
+  #
+  #   tls:
+  #     - address: "198.51.100.10:5061"
+  #       advertise: "sip.example.com"
+  #       proxy_protocol:
+  #         from:
+  #           - "198.51.100.7/32"     # the front, exactly
+  #
+  # A front that TERMINATES the connection (HAProxy in tcp mode, stunnel,
+  # anything that re-encrypts) opens its OWN connection to siphon, so the peer
+  # address is the front's — and every consumer keyed on the source inherits
+  # that.  failed_auth_ban bans the front rather than the abuser, from_gateway()
+  # and source_ip_in() stop discriminating, NAT return-routing writes the front
+  # into received=/rport=, media.received_from gates RTP ingress to the front so
+  # no media is accepted at all, and capture and the CDR record the front for
+  # every call.  Preserving the source at L4 (externalTrafficPolicy: Local, host
+  # networking, DSR) is the fix for a front that FORWARDS packets; it cannot
+  # work for one that terminates, which is the whole reason to put one there.
+  #
+  # `from` is MANDATORY and has no default.  A PROXY header lets its sender
+  # claim ANY source address, so the senders allowed to assert one must be
+  # named, and kept as narrow as the front really is (a /32 per front, not the
+  # subnet it happens to sit in).  It deliberately does NOT inherit
+  # security.trusted_cidrs: that list means "exempt from abuse controls" to all
+  # four of its consumers and is where monitoring boxes and trunks get listed,
+  # so inheriting it would hand source-address forgery rights to hosts named
+  # there for an unrelated reason.
+  #
+  # Refused at config load, not at runtime: proxy_protocol on a udp listener (a
+  # UDP reply goes to the peer address, so taking the client's from a header
+  # would send every answer past the front), an empty `from`, and an entry that
+  # is not a CIDR ("198.51.100.7" is refused; write "198.51.100.7/32").
+  #
+  # The header is cleartext and precedes the TLS ClientHello, so siphon reads it
+  # before the handshake.  That ordering is what lets a front terminate the UE's
+  # TLS and open its own to siphon with no cleartext SIP on any hop.
+  #
+  # On an ENABLED listener: a connection from an address outside `from` is
+  # refused at accept, and a connection that opens with anything but a PROXY
+  # header is dropped rather than quietly attributed to the front.  Neither
+  # counts toward failed_auth_ban — a second front nobody added to the list is
+  # far likelier than abuse, and banning it would turn a typo into an outage.
+  # v2 LOCAL and v1 UNKNOWN (a front's own health checks) are consumed and the
+  # socket's own peer address stands.
+  #
+  # On a listener WITHOUT the option, a PROXY header is recognised for what it
+  # is and the connection dropped with a log naming the listener — NOT counted
+  # as non-SIP garbage, which used to score a strong auto-ban signal, i.e.
+  # siphon banning its own load balancer.
+  #
+  # On a shared tcp+ws or tls+wss socket, set the same proxy_protocol on both
+  # halves: one socket takes one policy, and siphon warns and uses the tcp:/tls:
+  # side when the two disagree.
 
 # ---------------------------------------------------------------------------
 # Network identity

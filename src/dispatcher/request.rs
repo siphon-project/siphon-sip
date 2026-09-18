@@ -739,7 +739,9 @@ pub(super) fn handle_request(
             &state.cdr_sessions,
             &message,
             &inbound.remote_addr.ip().to_string(),
-            &format!("{}", inbound.transport).to_lowercase(),
+            // Descriptive field: record what the caller spoke, which behind a
+            // TLS-terminating front is not the hop siphon accepted.
+            inbound.client_or_hop_transport().as_scheme(),
         )
     } else {
         None
@@ -762,6 +764,9 @@ pub(super) fn handle_request(
     // Capture the full inbound flow for token-keyed MT routing
     // (`registrar.save(flow_token=...)` and `request.relay(flow=...)`).
     request.set_inbound_flow(inbound.local_addr, inbound.connection_id.0);
+    // What the client spoke, when a front declared it. Parallel to
+    // `transport_name` above, which stays the hop siphon accepted.
+    request.set_client_transport(inbound.client_transport);
 
     // Call Python handlers
     let (

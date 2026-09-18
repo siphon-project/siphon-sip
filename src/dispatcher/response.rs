@@ -1047,6 +1047,24 @@ pub(super) fn handle_response(
                 spawn_rf_proxy_start_if_invite(state, &server_key, &original_request, &session_arc);
                 // CDR: stamp the answer time on the tracked call (cdr.auto_emit).
                 cdr_mark_proxy_answer(state, &original_request, status_code);
+                // ...and correct the destination to the branch that answered.
+                // Every branch of a parallel fork stamped its own at send, so
+                // without this the record can name a branch that lost the race.
+                // The branch's recorded destination, not this response's source
+                // address: the record says where siphon sent the call, and a
+                // downstream element is free to answer from somewhere else.
+                if let Some(destination) = session_arc.read().ok().and_then(|session| {
+                    session
+                        .client_branches
+                        .get(client_key)
+                        .map(|b| b.destination)
+                }) {
+                    cdr_stamp_destination_for_invite(
+                        &state.cdr_sessions,
+                        &original_request,
+                        destination.ip(),
+                    );
+                }
             } else if (300..700).contains(&status_code)
                 && status_code != 401
                 && status_code != 407

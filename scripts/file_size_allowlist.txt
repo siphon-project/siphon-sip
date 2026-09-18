@@ -28,12 +28,14 @@ src/server/mod.rs            2627  # run_async is one 2,214-line fn; decomposed 
 src/script/api/diameter.rs   3350  # single #[pymethods] block; kwargs marshalling per interface
 src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
 src/script/api/call.rs       2600  # same; ~40% docstrings
-src/script/api/request.rs    1950  # same
+src/script/api/request.rs    2000  # same; +43 for the client-transport accessors and their docs
+src/script/api/registrar.rs  1520  # same; PyContact/PyFlow views + the save/save_proxy capture
 src/script/api/auth.rs       2150  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0; +49 for the database backend's validate/cache path
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 thin delegations
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
+src/registrar/backend.rs     1520  # StoredContact is one serde row plus its two conversions; split when touched
 src/rtpengine/siphon_rtp.rs  2350  # one backend; client/set/events/connection split when touched — +116 for the recording commands and their event
 src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched
 src/script/engine.rs         1580  # 80 lines over; ratchet down on next touch

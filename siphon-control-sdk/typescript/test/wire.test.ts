@@ -18,6 +18,9 @@ import {
   transferOutcome,
   MODULE_SIP,
   originateArgs,
+  dialArgs,
+  recordStartArgs,
+  recordStopArgs,
 } from "../src/index";
 import type {
   BridgeFailedPayload,
@@ -74,6 +77,9 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.Unhold).toBe("unhold");
     expect(SipVerb.StreamStart).toBe("stream_start");
     expect(SipVerb.StreamStop).toBe("stream_stop");
+    expect(SipVerb.Dial).toBe("dial");
+    expect(SipVerb.RecordStart).toBe("record_start");
+    expect(SipVerb.RecordStop).toBe("record_stop");
   });
 
   it("passes unknown + new event names through (forward-compatible)", () => {
@@ -474,6 +480,41 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("dial / recordStart / recordStop address the channel", async () => {
+    const transport = new RecordingTransport({
+      channel: "ch1",
+      state: "dialing",
+      targets: 3,
+      strategy: "parallel",
+      timeout: 30,
+    });
+    const call = makeCall(transport);
+    const dialing = await call.dial([{ aor: "sip:204@pbx.example" }]);
+    await call.recordStart({ direction: "both", maxDurationMs: 60000 });
+    await call.recordStop("rec-1");
+    expect(dialing).toMatchObject({ channel: "ch1", targets: 3 });
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "dial",
+        target: { channel: "ch1" },
+        args: { targets: [{ aor: "sip:204@pbx.example" }] },
+      },
+      {
+        module: MODULE_SIP,
+        verb: "record_start",
+        target: { channel: "ch1" },
+        args: { direction: "both", max_duration_ms: 60000 },
+      },
+      {
+        module: MODULE_SIP,
+        verb: "record_stop",
+        target: { channel: "ch1" },
+        args: { recording_id: "rec-1" },
+      },
+    ]);
+  });
+
   it("removeHeader emits the remove_header verb", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
@@ -580,5 +621,100 @@ describe("originate args map to the names the server parses", () => {
   it("omits untouched options rather than sending undefined", () => {
     const args = originateArgs("out-1", "sip:1001@pbx.example", { anchor: true }, {});
     expect(Object.keys(args).sort()).toEqual(["channel", "media", "to"]);
+  });
+});
+
+describe("dial args map to the target shapes the server parses", () => {
+  it("sends a bare URI target as a string and an AoR as an object", () => {
+    // The distinction the union exists for: `{aor}` forks to every registered
+    // contact over that contact's own captured flow, which is the only way to
+    // reach a phone registered on TCP, TLS or WSS behind NAT. The same text sent
+    // as a URI is DNS-resolved and reaches none of them.
+    expect(
+      dialArgs([{ uri: "sip:1001@pbx.example" }, { aor: "sip:204@pbx.example" }]),
+    ).toEqual({
+      targets: ["sip:1001@pbx.example", { aor: "sip:204@pbx.example" }],
+    });
+  });
+
+  it("keeps a URI target an object once it carries overrides", () => {
+    expect(
+      dialArgs([
+        {
+          uri: "sip:+15550177@trunk.example",
+          nextHop: "sip:192.0.2.9:5060",
+          headers: { "X-Carrier": "a" },
+        },
+      ]),
+    ).toEqual({
+      targets: [
+        {
+          uri: "sip:+15550177@trunk.example",
+          next_hop: "sip:192.0.2.9:5060",
+          headers: { "X-Carrier": "a" },
+        },
+      ],
+    });
+  });
+
+  it("refuses a target that names both a uri and an aor, and one that names neither", () => {
+    // The server reads `aor` first and ignores a `uri` beside it, so this would
+    // place a different call than the one written down — silently.
+    expect(() =>
+      dialArgs([
+        { uri: "sip:1001@pbx.example", aor: "sip:204@pbx.example" } as never,
+      ]),
+    ).toThrow(/uri/);
+    expect(() => dialArgs([{} as never])).toThrow(/uri/);
+  });
+
+  it("snake_cases the options and omits the ones left out", () => {
+    expect(
+      dialArgs([{ aor: "sip:204@pbx.example" }], {
+        strategy: "sequential",
+        timeout: 20,
+        headers: { "X-Trace": "abc" },
+      }),
+    ).toEqual({
+      targets: [{ aor: "sip:204@pbx.example" }],
+      strategy: "sequential",
+      timeout: 20,
+      headers: { "X-Trace": "abc" },
+    });
+    // Nothing asked for, nothing sent: the server's own parallel / 30 s
+    // defaults apply rather than a copy of them pinned here.
+    expect(Object.keys(dialArgs([{ aor: "sip:204@pbx.example" }], {}))).toEqual([
+      "targets",
+    ]);
+  });
+});
+
+describe("recording args map to the names the server parses", () => {
+  it("sends only the selectors that were set", () => {
+    expect(
+      recordStartArgs({
+        direction: "both",
+        channels: "stereo",
+        maxDurationMs: 60000,
+        silenceMs: 4000,
+        path: "/var/spool/siphon/greeting.wav",
+      }),
+    ).toEqual({
+      direction: "both",
+      channels: "stereo",
+      max_duration_ms: 60000,
+      silence_ms: 4000,
+      path: "/var/spool/siphon/greeting.wav",
+    });
+    // `ingress` + `mono` are the server's defaults; pinning them here would stop
+    // a caller that asked for nothing from tracking the server it talks to.
+    expect(recordStartArgs()).toEqual({});
+  });
+
+  it("stops one recording by id, or every recording when none is named", () => {
+    expect(recordStopArgs("rec-1")).toEqual({ recording_id: "rec-1" });
+    // Absent, not null — which is what makes the server stop every recording on
+    // the call rather than one named `null`.
+    expect(recordStopArgs()).toEqual({});
   });
 });

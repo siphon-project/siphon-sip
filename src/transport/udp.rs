@@ -264,6 +264,10 @@ async fn run_worker(
                         let message = InboundMessage {
                             connection_id,
                             transport: Transport::Udp,
+                            // The PROXY protocol is a stream-listener option
+                            // (config refuses it on UDP), so nothing can ever
+                            // declare a different client transport here.
+                            client_transport: None,
                             local_addr,
                             remote_addr,
                             data,

@@ -284,6 +284,7 @@ impl Registrar {
             flow_token,
             inbound_local_addr,
             inbound_connection_id,
+            client_transport,
         } = flow;
         let is_stream = is_stream_transport(source_transport);
         let contact = Contact {
@@ -295,6 +296,7 @@ impl Registrar {
             cseq,
             source_addr,
             source_transport,
+            client_transport,
             sip_instance: sip_instance.map(String::into_boxed_str),
             reg_id,
             path: path.into_iter().map(String::into_boxed_str).collect(),
@@ -495,6 +497,7 @@ mod tests {
             None,
             vec![],
             FlowCapture {
+                client_transport: None,
                 flow_token: Some(token.into()),
                 inbound_local_addr: None,
                 inbound_connection_id: Some(connection_id),

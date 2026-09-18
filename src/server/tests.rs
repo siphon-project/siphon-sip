@@ -309,6 +309,7 @@ fn default_udp_egress_addr_honours_extended_form() {
         address: "198.51.100.4:5062".to_string(),
         advertise: Some("sip.example.org".to_string()),
         dscp: None,
+        proxy_protocol: None,
     }];
     assert_eq!(
         default_udp_egress_addr(&entries),

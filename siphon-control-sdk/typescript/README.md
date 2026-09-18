@@ -110,6 +110,9 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `rejectRefer(code, reason?)` | `reject_refer` (`sip`) | ‡ |
 | `bridge(withChannel, options?)` | `bridge` (`sip`) | join two answered legs; the verdict arrives as `ChannelBridged` / `BridgeFailed` |
 | `unbridge(reason?)` | `unbridge` (`sip`) | break the bridge — both legs stay answered, owned and held |
+| `dial(targets, options?)` | `dial` (`sip`) | ring B-legs while the caller stays **unanswered** and this app keeps the channel. A target is `{uri}` (dialed as written) or `{aor}` (forked to every registered contact over its own flow); one naming both, or neither, throws |
+| `recordStart(options?)` | `record_start` (`sip`) | record the call's decoded audio to a wav file; the reply names the `recordingId`, `RecordingFinished` says the file is closed. siphon-rtp only |
+| `recordStop(recordingId?)` | `record_stop` (`sip`) | stop one recording, or every recording on the call when no id is given |
 | `playFile(file)` | `play` (`sip`) | ‡ media |
 | `dtmf(digits)` | `dtmf` (`sip`) | ‡ media |
 | `command(verb, args?)` | (`sip`) | arbitrary SIP-adapter verb |

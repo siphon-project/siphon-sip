@@ -1488,7 +1488,13 @@ impl SiphonServer {
         // fall back on for fire-and-forget sends that arrive with
         // `ConnectionId::default()` (e.g. in-dialog NOTIFY from the
         // subscribe_state module).
-        let mut tcp_entries: Vec<(std::net::SocketAddr, Option<u32>, Option<u8>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut tcp_entries: Vec<(
+            std::net::SocketAddr,
+            Option<u32>,
+            Option<u8>,
+            Option<Arc<transport::proxy_protocol::ProxyProtocolAcl>>,
+        )> = Vec::new();
         for entry in &config.listen.tcp {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
                 eprintln!("Invalid TCP listen address '{}': {error}", entry.address());
@@ -1511,7 +1517,15 @@ impl SiphonServer {
                 entry.advertise().map(str::to_string),
             ));
             let tos = resolve_tos(entry);
-            tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
+            // Built once here rather than per connection: the allowlist is
+            // consulted on every accept, and parsing CIDRs on the accept path
+            // would put string work in front of every handshake.
+            let proxy_protocol = entry.proxy_protocol().map(|proxy| {
+                Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                    &proxy.from,
+                ))
+            });
+            tcp_entries.push((addr, tos, entry.dscp().or(global_dscp), proxy_protocol));
         }
 
         // Stream-connection registry — created before the pool/listeners so all
@@ -1616,7 +1630,7 @@ impl SiphonServer {
         }
 
         // Spawn TCP listeners now that the pool exists.
-        for (addr, tos, dscp) in tcp_entries {
+        for (addr, tos, dscp, proxy_protocol) in tcp_entries {
             if tcp_ws_mux.contains(&addr) {
                 continue; // served by the TCP+WS mux listener below
             }
@@ -1634,6 +1648,7 @@ impl SiphonServer {
                 Some(Arc::clone(&connection_pool)),
                 crlf_pong_tracker.clone(),
                 connection_close_tx.clone(),
+                proxy_protocol,
             )
             .await
             {
@@ -1684,6 +1699,11 @@ impl SiphonServer {
                     Some(Arc::clone(&connection_pool)),
                     crlf_pong_tracker.clone(),
                     connection_close_tx.clone(),
+                    entry.proxy_protocol().map(|proxy| {
+                        Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                            &proxy.from,
+                        ))
+                    }),
                 )
                 .await
                 {
@@ -1732,6 +1752,11 @@ impl SiphonServer {
                 stream_connections.clone(),
                 tos,
                 connection_close_tx.clone(),
+                entry.proxy_protocol().map(|proxy| {
+                    Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                        &proxy.from,
+                    ))
+                }),
             )
             .await
             {
@@ -1781,6 +1806,11 @@ impl SiphonServer {
                     stream_connections.clone(),
                     tos,
                     connection_close_tx.clone(),
+                    entry.proxy_protocol().map(|proxy| {
+                        Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                            &proxy.from,
+                        ))
+                    }),
                 )
                 .await
                 {
@@ -1797,6 +1827,20 @@ impl SiphonServer {
         // on each transport — only the socket is shared.
         for addr in tcp_ws_mux {
             let tos = resolve_tos(tcp_listen[&addr]);
+            // One socket, one PROXY policy. Taking the listen.tcp side matches
+            // how DSCP is resolved below, and a disagreement is a config error
+            // worth naming rather than silently resolving.
+            let proxy_protocol = tcp_listen[&addr].proxy_protocol();
+            if ws_listen[&addr].proxy_protocol() != proxy_protocol {
+                warn!(addr = %addr,
+                    "listen.tcp and listen.ws set different proxy_protocol on the shared address; \
+                     using the listen.tcp value for the muxed socket");
+            }
+            let proxy_protocol = proxy_protocol.map(|proxy| {
+                Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                    &proxy.from,
+                ))
+            });
             if resolve_tos(ws_listen[&addr]) != tos {
                 warn!(addr = %addr,
                     "listen.tcp and listen.ws set different dscp on the shared address; \
@@ -1823,6 +1867,7 @@ impl SiphonServer {
                 Some(Arc::clone(&connection_pool)),
                 crlf_pong_tracker.clone(),
                 connection_close_tx.clone(),
+                proxy_protocol,
             )
             .await
             {
@@ -1833,6 +1878,18 @@ impl SiphonServer {
         if let Some(ref tls_config) = config.tls {
             for addr in tls_wss_mux {
                 let tos = resolve_tos(tls_listen[&addr]);
+                // One socket, one PROXY policy — see the tcp+ws mux above.
+                let proxy_protocol = tls_listen[&addr].proxy_protocol();
+                if wss_listen[&addr].proxy_protocol() != proxy_protocol {
+                    warn!(addr = %addr,
+                        "listen.tls and listen.wss set different proxy_protocol on the shared \
+                         address; using the listen.tls value for the muxed socket");
+                }
+                let proxy_protocol = proxy_protocol.map(|proxy| {
+                    Arc::new(transport::proxy_protocol::ProxyProtocolAcl::new(
+                        &proxy.from,
+                    ))
+                });
                 if resolve_tos(wss_listen[&addr]) != tos {
                     warn!(addr = %addr,
                         "listen.tls and listen.wss set different dscp on the shared address; \
@@ -1859,6 +1916,7 @@ impl SiphonServer {
                     Some(Arc::clone(&connection_pool)),
                     crlf_pong_tracker.clone(),
                     connection_close_tx.clone(),
+                    proxy_protocol,
                 )
                 .await
                 {

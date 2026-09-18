@@ -714,6 +714,18 @@ pub fn b2bua_send_b_leg_invite(
         );
     }
 
+    // CDR: the record opened at the A-leg INVITE learns where the call went.
+    // Stamped per B-leg INVITE, so an LCR failover that burns a carrier and
+    // completes on the next records the one it completed on — the burned ones
+    // are in `lcr_attempts`.
+    if crate::cdr::auto_emit_enabled() {
+        crate::dispatcher::cdr::cdr_stamp_destination(
+            &state.cdr_sessions,
+            call_id,
+            destination.ip(),
+        );
+    }
+
     // Persist the fully hygiene-processed B-leg INVITE on the leg.
     // The 401/407 auto-retry path rebuilds the retry from this — rebuilding
     // from the A-leg INVITE would leak A-leg headers (Record-Route, Route,

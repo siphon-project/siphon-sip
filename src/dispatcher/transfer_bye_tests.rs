@@ -269,6 +269,7 @@ fn new_party_call(call: &Call) -> (String, SipMessage, InboundMessage) {
     );
     let invite = parse_sip_message_bytes(raw.as_bytes()).expect("the new party's INVITE parses");
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
@@ -322,6 +323,7 @@ fn new_party_acks(call: &Call, answer: &SipMessage) {
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the new party's ACK parses");
     handle_request(
         InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: "192.0.2.1:5060".parse().expect("a literal address"),

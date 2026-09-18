@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Union
 
 from siphon_sdk.types import Contact, SipUri
 from siphon_sdk.request import _parse_uri
+from siphon_sdk.cdr import CallDetailRecord
 from siphon_sdk.lcr import Route
 from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
@@ -1745,6 +1746,9 @@ class MockRegistrar:
                 # Whoever authenticated this REGISTER, and nobody else: no
                 # carry-over from the binding it replaces, as in the engine.
                 auth_user=getattr(request, "auth_user", None),
+                # Descriptive: what the UE spoke to a front, when one said so.
+                # The binding still routes by its flow and Contact URI.
+                client_transport=getattr(request, "client_transport", None),
             )
             if flow_token is not None:
                 binding.flow_token = flow_token
@@ -5069,6 +5073,19 @@ class MockCdr:
     def enabled(self) -> bool:
         """Whether the CDR system is enabled."""
         return self._enabled
+
+    @property
+    def typed_records(self) -> list[CallDetailRecord]:
+        """The written records as :class:`siphon_sdk.cdr.CallDetailRecord` — the
+        same type a collector receives from the HTTP/file sinks.
+
+        Assert against this rather than raw dicts when the test cares about the
+        shape the outside world sees::
+
+            record = get_cdr().typed_records[-1]
+            assert record.extra["billing_id"] == "B-12345"
+        """
+        return [CallDetailRecord.from_dict(record) for record in self.records]
 
     @staticmethod
     def session_key(source: "Any") -> str:
@@ -8823,17 +8840,18 @@ class MockIpsec:
         # UDP" (§6.3) and "The transport protocol selector shall allow UDP
         # and TCP." (§7.1).
         # The ``protocol`` on the resulting :class:`SecurityServerParams`
-        # collapses to ``"udp"``.  It is informational: siphon's
-        # Security-Server carries no transport ``protocol=`` parameter for any
-        # SA, since no sec-agree spec defines one (RFC 3329 §2.2 and
-        # Appendix A, TS 33.203 Annex H) and TS 33.203 §6.3 / §7.1 have the SAs
-        # carry UDP and TCP alike.
+        # reports what the SA covers, so the multi-protocol default reports
+        # ``"any"`` — the same vocabulary :attr:`SAHandle.protocol` uses.
+        # It is informational either way: siphon's Security-Server carries no
+        # transport ``protocol=`` parameter for any SA, since no sec-agree spec
+        # defines one (RFC 3329 §2.2 and Appendix A, TS 33.203 Annex H) and
+        # TS 33.203 §6.3 / §7.1 have the SAs carry UDP and TCP alike.
         #
         # Explicit ``"udp"``/``"tcp"``/``"any"`` pin the selector to
         # that one inner protocol (single-transport deployments, tests).
         if protocol is None:
             sa_protocol = "any"
-            wire_protocol = "udp"
+            params_protocol = "any"
         else:
             proto_lower = protocol.lower()
             if proto_lower not in ("udp", "tcp", "any"):
@@ -8841,7 +8859,7 @@ class MockIpsec:
                     f"protocol must be 'udp', 'tcp', 'any', or None, got {protocol!r}"
                 )
             sa_protocol = proto_lower
-            wire_protocol = "udp" if proto_lower == "any" else proto_lower
+            params_protocol = proto_lower
         av._take()  # raises ValueError if already consumed
         # Family-matched P-CSCF address (mirrors the Rust binding, which
         # consumes ``av`` before this check): the SA's P-CSCF side must be the
@@ -8861,7 +8879,7 @@ class MockIpsec:
             raise self._allocate_should_fail(self._allocate_failure_message)
         pending = MockPendingSA(
             transform, offer, self.pcscf_port_c, self.pcscf_port_s,
-            expires_secs=expires_secs, protocol=wire_protocol,
+            expires_secs=expires_secs, protocol=params_protocol,
         )
         # Surface the *internal* SA selector mode for tests that want
         # to assert multi-protocol installation specifically.  Not on

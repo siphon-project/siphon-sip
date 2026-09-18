@@ -145,6 +145,9 @@ def test_module_surface():
         "bridge",
         "unbridge",
         "answer_anchored",
+        "dial",
+        "record_start",
+        "record_stop",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
@@ -987,5 +990,249 @@ def test_originate_verb_roundtrip():
             }
 
             client.close()
+
+    asyncio.run(scenario())
+
+
+def _verb_stub(verb_names, replies, frames):
+    """A stub that records every frame for `verb_names` and answers from `replies`.
+
+    `replies` is called with the recorded frame and returns the reply result.
+    """
+
+    async def stub(websocket):
+        auth = websocket.request.headers.get("Authorization", "")
+        if auth != f"Bearer {TOKEN}":
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        said_hello = False
+        async for message in websocket:
+            frame = json.loads(message)
+            frame_id = frame.get("id")
+            verb = frame.get("verb")
+            if not said_hello:
+                assert verb == "hello", "first frame must be hello"
+                await _reply_ok(
+                    websocket,
+                    frame_id,
+                    {"app": APP, "protocol": 1, "subprotocol": SUBPROTOCOL},
+                )
+                said_hello = True
+            elif verb == "test_push_stasis":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "event",
+                            "event": "StasisStart",
+                            "channel": "ch1",
+                            "app": APP,
+                            "call_id": "call-uuid",
+                            "sip_call_id": "sipcid@host",
+                            "payload": {},
+                        }
+                    )
+                )
+                await _reply_ok(websocket, frame_id, {})
+            elif verb in verb_names:
+                frames.append(frame)
+                await _reply_ok(websocket, frame_id, replies(frame))
+            else:
+                await _reply_ok(websocket, frame_id, {"state": "answered"})
+
+    return stub
+
+
+def test_dial_verb_roundtrip():
+    """`call.dial(...)` emits the `dial` command with the exact target shapes the
+    server parses, and refuses an ambiguous target before anything is sent."""
+
+    async def scenario():
+        frames = []
+        refused = []
+
+        def reply(_frame):
+            return {
+                "channel": "ch1",
+                "state": "dialing",
+                "targets": 3,
+                "strategy": "sequential",
+                "timeout": 20,
+            }
+
+        stub = _verb_stub({"dial"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                result = await call.dial(
+                    [
+                        {"aor": "sip:204@pbx.example"},
+                        {
+                            "uri": "sip:+15550177@trunk.example",
+                            "next_hop": "sip:192.0.2.9:5060",
+                            "headers": {"X-Carrier": "a"},
+                        },
+                    ],
+                    strategy="sequential",
+                    timeout=20,
+                    headers={"X-Trace": "abc"},
+                )
+                # Nothing else asked for: the server's own parallel / 30 s
+                # defaults apply rather than a copy of them pinned here.
+                await call.dial([{"uri": "sip:1001@pbx.example"}])
+                # Each of these would place a different call than the one that
+                # was written down, so each is refused before a frame goes out.
+                for bad in (
+                    # Ambiguous: the server reads a bare string as a URI, which
+                    # reaches none of an AoR's registered contacts.
+                    "sip:204@pbx.example",
+                    # The server reads `aor` first and ignores the `uri`.
+                    {"uri": "sip:1001@pbx.example", "aor": "sip:204@pbx.example"},
+                    {"next_hop": "sip:192.0.2.9:5060"},
+                    # An AoR branch routes over each contact's captured flow, so
+                    # a next_hop beside it is silently dropped server-side.
+                    {"aor": "sip:204@pbx.example", "next_hop": "sip:192.0.2.9:5060"},
+                ):
+                    try:
+                        call.dial([bad])
+                    except ValueError as error:
+                        refused.append(str(error))
+                try:
+                    call.dial([{"aor": "sip:204@pbx.example"}], strategy="hunt")
+                except ValueError as error:
+                    refused.append(str(error))
+                if not done.done():
+                    done.set_result(result)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            result = await asyncio.wait_for(done, timeout=5)
+            assert result == {
+                "channel": "ch1",
+                "targets": 3,
+                "strategy": "sequential",
+                "timeout": 20,
+            }
+
+            first = frames[0]
+            assert first["module"] == "sip"
+            assert first["verb"] == "dial"
+            assert first["target"]["channel"] == "ch1"
+            assert first["args"] == {
+                "targets": [
+                    {"aor": "sip:204@pbx.example"},
+                    {
+                        "uri": "sip:+15550177@trunk.example",
+                        "next_hop": "sip:192.0.2.9:5060",
+                        "headers": {"X-Carrier": "a"},
+                    },
+                ],
+                "strategy": "sequential",
+                "timeout": 20,
+                "headers": {"X-Trace": "abc"},
+            }
+            # A bare URI target with no overrides goes out as a plain string.
+            assert frames[1]["args"] == {"targets": ["sip:1001@pbx.example"]}
+            assert len(refused) == 5, refused
+            assert "aor" in refused[0] and "uri" in refused[0], refused[0]
+            assert "strategy" in refused[4], refused[4]
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_record_verbs_roundtrip():
+    """`call.record_start(...)` / `call.record_stop(...)` emit the exact args the
+    server parses, and the start's reply carries the id a stop addresses."""
+
+    async def scenario():
+        frames = []
+        refused = []
+
+        def reply(frame):
+            if frame["verb"] == "record_start":
+                return {
+                    "channel": "ch1",
+                    "state": "recording",
+                    "recording_id": "rec-1",
+                }
+            return {
+                "channel": "ch1",
+                "state": "stopping",
+                "recording_id": frame["args"].get("recording_id"),
+            }
+
+        stub = _verb_stub({"record_start", "record_stop"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                started = await call.record_start(
+                    direction="both",
+                    channels="stereo",
+                    max_duration_ms=60_000,
+                    silence_ms=4_000,
+                    path="/var/spool/siphon/greeting.wav",
+                )
+                await call.record_stop(recording_id=started["recording_id"])
+                await call.record_start()
+                await call.record_stop()
+                for kwargs in ({"direction": "inbound"}, {"channels": "quad"}):
+                    try:
+                        call.record_start(**kwargs)
+                    except ValueError as error:
+                        refused.append(str(error))
+                if not done.done():
+                    done.set_result(started)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            started = await asyncio.wait_for(done, timeout=5)
+            assert started == {"channel": "ch1", "recording_id": "rec-1"}
+
+            assert frames[0]["module"] == "sip"
+            assert frames[0]["verb"] == "record_start"
+            assert frames[0]["target"]["channel"] == "ch1"
+            assert frames[0]["args"] == {
+                "direction": "both",
+                "channels": "stereo",
+                "max_duration_ms": 60_000,
+                "silence_ms": 4_000,
+                "path": "/var/spool/siphon/greeting.wav",
+            }
+            assert frames[1]["verb"] == "record_stop"
+            assert frames[1]["args"] == {"recording_id": "rec-1"}
+            # ingress + mono are the server's defaults, so an unshaped start
+            # sends neither and keeps tracking the server it talks to.
+            assert frames[2]["args"] == {}
+            # Absent, not null — which is what makes the server stop every
+            # recording on the call rather than one named `null`.
+            assert frames[3]["args"] == {}
+            assert len(refused) == 2, refused
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
 
     asyncio.run(scenario())

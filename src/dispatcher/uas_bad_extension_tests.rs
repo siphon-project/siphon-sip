@@ -289,6 +289,7 @@ async fn a_replaces_takeover_refuses_an_extension_siphon_does_not_implement() {
         "Replaces: held-call@198.51.100.20;to-tag=held-to;from-tag=held-from\r\n",
     );
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: dispatcher.state.local_addr,

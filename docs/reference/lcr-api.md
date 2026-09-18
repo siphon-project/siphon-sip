@@ -1,9 +1,35 @@
-# LCR API contract (v1)
+# Least-Cost Routing (LCR)
 
-The JSON contract between siphon and the external Least-Cost-Routing API. siphon
-`POST`s an `LcrRequest` to `lcr.api_url` and expects an `LcrResponse`. LCR is
-B2BUA-only — see the [cookbook](../cookbook/least-cost-routing.md).
+An external HTTP JSON API owns the cost/order decision (siphon is not a rating
+engine); siphon caches it and executes the ordered route set as sequential
+failover, cheapest first, a fresh B-leg dialog per carrier. LCR is B2BUA-only —
+see the [cookbook](../cookbook/least-cost-routing.md) for why.
 
+The script side is two calls:
+
+```python
+from siphon import b2bua, lcr
+
+@b2bua.on_invite
+async def on_invite(call):
+    decision = await lcr.route(call, trunk_group="cust-trunks")
+    if decision is None:                       # API down and no fallback group
+        call.reject(503, "Service Unavailable")
+        return
+    if decision.reject:                        # API-side block
+        call.reject(decision.reject["code"], decision.reject["reason"])
+        return
+    call.route(decision.routes)                # sequential failover
+```
+
+The rest of this page is the wire contract between siphon and that API,
+followed by the [`lcr` namespace](#lcr-namespace) and the
+[typed models](#typed-contract-models) the SDK ships. `call.route()`,
+`call.active_route` and `call.route_attempts` are on the [Call](call.md) page.
+
+## The JSON contract (v1)
+
+siphon `POST`s an `LcrRequest` to `lcr.api_url` and expects an `LcrResponse`.
 Typed models operators build against ship in the `siphon-sip` SDK:
 
 ```python
@@ -224,3 +250,67 @@ Top-level:
 - **Forward-compatibility** — unknown response fields are ignored; new optional
   fields can be added without a version bump. Bump `version` only on a breaking
   change.
+
+## `lcr` namespace
+
+The B2BUA-only routing namespace. `await lcr.route(call, …)` queries the API
+(through the decision cache, falling back to `lcr.fallback_gateway_group`), and
+returns an [`LcrDecision`](#lcrdecision), or `None` when the API is unreachable
+and no fallback is configured.
+
+```python
+from siphon import lcr
+```
+
+::: siphon_sdk.mock_module.MockLcr
+
+## `LcrDecision`
+
+What `await lcr.route(call)` returns: the ordered carrier routes, or an
+API-side reject to answer the call with. `reject` and a non-empty `routes` are
+mutually exclusive; both empty means the API had no route and the script
+decides the response itself.
+
+::: siphon_sdk.mock_module.MockLcrDecision
+
+## Typed contract models
+
+`siphon_sdk.lcr` is the typed source for the wire contract above — the same
+shapes the Rust serde structs use, for operators implementing the API in
+Python. `to_dict()` omits `None` / empty fields to match the Rust
+`skip_serializing_if`, and aliases `from_uri` / `to_uri` onto the JSON `from` /
+`to` keys (Python reserved words).
+
+```python
+from siphon_sdk.lcr import LcrRequest, LcrSource, LcrResponse, Route, LcrReject
+```
+
+### `LcrRequest`
+
+::: siphon_sdk.lcr.LcrRequest
+    options:
+      heading_level: 4
+
+### `LcrSource`
+
+::: siphon_sdk.lcr.LcrSource
+    options:
+      heading_level: 4
+
+### `LcrResponse`
+
+::: siphon_sdk.lcr.LcrResponse
+    options:
+      heading_level: 4
+
+### `Route`
+
+::: siphon_sdk.lcr.Route
+    options:
+      heading_level: 4
+
+### `LcrReject`
+
+::: siphon_sdk.lcr.LcrReject
+    options:
+      heading_level: 4
