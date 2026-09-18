@@ -140,6 +140,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   leaked at start-up to work around a closed-channel wakeup, leaving nothing
   able to fire it. It is now driven from the shutdown sequence itself, before
   draining begins.
+- **A gateway group added at run time is now health-probed, and a removed one
+  stops being probed.** Probing was a single sweep over the groups present at
+  start-up, so a group created later with `gateway.add_group()` was never
+  probed and every destination in it stayed healthy for ever, while
+  `gateway.remove_group()` left its probe task running against a group the
+  dispatcher no longer held. Each group now owns its prober for its lifetime:
+  one added after start-up begins probing immediately, a removed or replaced
+  one has its prober aborted, and `probe.enabled: false` is honoured on a
+  runtime group as it already was on a configured one.
 - **A CDR now records where the call was actually sent.** `destination_ip` was
   declared, serialized and documented, but the only thing that ever set it was
   a test — every record any deployment wrote carried an empty one. It is now
