@@ -363,6 +363,34 @@ is bound to the hash it was computed with.
 Full contract, including the SQL column names the `database` source reads:
 <https://siphon-sip.org/reference/registrant-api/>.
 
+## Provisioning gateways
+
+`siphon_sdk.gateways` is the same idea for where calls egress *to*. One row is
+one destination; rows are gathered into groups by `group`, which is the name
+`gateway.select()` takes:
+
+```python
+from siphon_sdk.gateways import GatewayListResponse, GatewayRow
+
+@app.get("/gateways")
+def gateways() -> dict:
+    return GatewayListResponse(gateways=[
+        GatewayRow(group="carriers", uri="sip:gw1.carrier.example:5060",
+                   weight=3, registers="sip:trunk1@carrier.example"),
+    ]).to_dict()
+```
+
+`registers` links a destination to an outbound registration: it answers
+challenges with that registration's credential, so a trunk's secret is defined
+once, and `require_registration=True` additionally keeps it out of selection
+while that registration is down.
+
+A destination whose definition has not changed keeps its health across a
+refresh, so a carrier that is down stays down rather than being marked healthy
+again every poll.
+
+Full contract: <https://siphon-sip.org/reference/gateway-api/>.
+
 ## Consuming CDRs
 
 `siphon_sdk.cdr.CallDetailRecord` is the typed mirror of the record siphon

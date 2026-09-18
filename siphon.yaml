@@ -1408,6 +1408,33 @@ auth:
 # ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)
 # ---------------------------------------------------------------------------
+#
+# The groups can come from a source the controller owns instead of this file.
+# With `backend: database` / `http`, siphon re-reads it every `refresh_secs` and
+# reconciles: adding groups, rebuilding a destination whose definition changed,
+# and removing ones the source dropped.  A destination that has NOT changed is
+# carried over with its health intact, so a carrier that is down stays down
+# rather than being marked healthy again every poll, and an unchanged group is
+# not touched at all (replacing one restarts its health prober).  An unreadable
+# source changes nothing.  `POST /admin/gateways/refresh` applies a change at
+# once.  The source owns only the groups it created: `groups` below and anything
+# `gateway.add_group()` created are never reconciled away.
+# Contract: docs/reference/gateway-api.md.
+#
+# gateway:
+#   backend: database              # static (default) | database | http
+#   database:
+#     url: "postgresql://siphon@db.internal/siphon"
+#     query: 'SELECT "group", uri, address, transport, weight, priority,
+#              username, password, registers, enabled FROM gateways WHERE node = $1'
+#     refresh_secs: 30
+#     timeout_ms: 2000
+#   # ...or an endpoint the controller serves:
+#   http:
+#     url: "http://127.0.0.1:8080/gateways"
+#     refresh_secs: 30
+#     auth_header: "Bearer ${PROVISIONING_TOKEN}"
+#
 # gateway:
 #   groups:
 #     - name: "carriers"
@@ -1419,6 +1446,24 @@ auth:
 #         from_user: "siphon"     # user part in From URI of OPTIONS probes
 #         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
 #       destinations:
+#         # A destination may carry the digest credentials it challenges with,
+#         # so any B-leg sent to it answers a 401/407 (RFC 3261 §22).  Supply a
+#         # password OR a pre-computed ha1 (H(username:realm:password)) — an ha1
+#         # is not reversible to the password but is still password-equivalent
+#         # for its realm, and is bound to the hash it was computed with.
+#         #   auth:
+#         #     username: "trunk1"
+#         #     password: "${CARRIER_A_PASSWORD}"
+#         #     # ha1: "939e…"
+#         #     # ha1_algorithm: md5        # md5 (default) | sha-256 | sha-512-256
+#         #
+#         # `registers` links this destination to an outbound registration: with
+#         # no `auth` of its own it answers with that registration's credential,
+#         # so one trunk's secret is defined once.  `require_registration` also
+#         # keeps it out of gateway.select() while that registration is down —
+#         # opt-in, for a carrier that only accepts calls from a registered peer.
+#         #   registers: "sip:trunk1@carrier.example"
+#         #   require_registration: true
 #         - uri: "sip:gw1.carrier.com:5060"         # port + transport derived from URI
 #           weight: 3             # higher = more traffic (weighted algorithm)
 #           priority: 1           # lower = higher priority (failover tiers)

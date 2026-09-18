@@ -30,8 +30,98 @@ use serde::Deserialize;
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayConfig {
-    /// Named destination groups.
+    /// Where the groups come from. Default: `static`, the `groups` list below.
+    ///
+    /// `database` and `http` read them from a source the controller owns and
+    /// reconcile against it on an interval, so a gateway added, edited or
+    /// deleted there is followed without a restart. Groups declared in `groups`
+    /// and ones a script created with `gateway.add_group()` are never touched
+    /// by that reconcile — it owns only what it created.
+    #[serde(default = "default_gateway_backend")]
+    pub backend: GatewayBackendType,
+    /// SQL source for `backend: database`.
+    pub database: Option<GatewayDatabaseConfig>,
+    /// HTTP source for `backend: http`.
+    pub http: Option<GatewayHttpConfig>,
+    /// Named destination groups. May be empty when a source supplies them.
+    #[serde(default)]
     pub groups: Vec<GatewayGroupConfig>,
+}
+
+/// Where `gateway:` reads its destination groups from.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayBackendType {
+    /// The `groups` list in this file.
+    Static,
+    /// A PostgreSQL query the controller owns.
+    Database,
+    /// A JSON endpoint the controller serves.
+    Http,
+}
+
+/// SQL source for `gateway.backend: database`.
+///
+/// The query is the operator's. Columns are read by name: `group` (or
+/// `group_name`) and `uri` are required; `address`, `transport`, `weight`,
+/// `priority`, `username`, `password`, `ha1`, `ha1_algorithm`,
+/// `source_networks`, `enabled`, `registers` and `require_registration` are
+/// optional. When the statement references `$1`, the instance id
+/// (`server.instance_id`) is bound to it, so a deployment can shard its
+/// gateways across nodes.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayDatabaseConfig {
+    /// libpq connection URI.
+    pub url: String,
+    /// Statement returning one row per destination.
+    #[serde(default = "default_gateway_query")]
+    pub query: String,
+    /// How often to re-read the source and reconcile, in seconds. `POST
+    /// /admin/gateways/refresh` applies a change at once, so this is the floor
+    /// rather than the mechanism.
+    #[serde(default = "default_gateway_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Per-query deadline in milliseconds, connection included.
+    #[serde(default = "default_gateway_source_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// JSON source for `gateway.backend: http`.
+///
+/// The endpoint answers `GET {url}` with the contract in
+/// `docs/reference/gateway-api.md` (typed in `siphon_sdk.gateways`). Use this
+/// form when gateway credentials are sealed at rest: the controller unseals
+/// in-process and serves them over a trusted local channel.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayHttpConfig {
+    /// URL siphon `GET`s the gateway list from.
+    pub url: String,
+    /// How often to re-read the source and reconcile, in seconds.
+    #[serde(default = "default_gateway_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Per-request deadline in milliseconds.
+    #[serde(default = "default_gateway_source_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Full `Authorization` header value sent with each request.
+    pub auth_header: Option<String>,
+}
+
+fn default_gateway_backend() -> GatewayBackendType {
+    GatewayBackendType::Static
+}
+
+fn default_gateway_query() -> String {
+    "SELECT \"group\", uri, address, transport, weight, priority, username, password, \
+     enabled FROM gateways"
+        .to_string()
+}
+
+fn default_gateway_refresh_secs() -> u64 {
+    30
+}
+
+fn default_gateway_source_timeout_ms() -> u64 {
+    2000
 }
 
 /// A named group of destinations.
@@ -128,6 +218,21 @@ pub struct GatewayDestConfig {
     /// 401/407 on any B-leg sent to it.
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
+    /// AoR of an outbound registration this destination belongs to, linking one
+    /// trunk's registration and its egress. When set and this destination has
+    /// no `auth` of its own, it answers challenges with that registration's
+    /// credentials, so one trunk's secret is defined once.
+    #[serde(default)]
+    pub registers: Option<String>,
+    /// Keep this destination out of `gateway.select()` while the registration
+    /// named by `registers` is not registered.
+    ///
+    /// Off by default: a gateway that authenticates per call does not need its
+    /// registration to be up, and silently withholding a destination is worse
+    /// than trying it. Turn it on for a trunk that only accepts calls from a
+    /// registered peer, where dialling it unregistered just earns a 403.
+    #[serde(default)]
+    pub require_registration: bool,
 }
 
 /// Digest credentials for one gateway destination.

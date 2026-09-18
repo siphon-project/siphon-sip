@@ -23,6 +23,8 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 use tracing::{debug, info, warn};
 
+pub mod source;
+
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 use crate::uac::UacSender;
@@ -87,6 +89,12 @@ pub struct Destination {
     /// 401/407 on any B-leg sent to it. `None` for a gateway that does not
     /// authenticate. Never rendered by `Debug` — the secret redacts itself.
     pub credentials: Option<Arc<crate::auth::StoredCredentials>>,
+    /// AoR of an outbound registration this destination belongs to, linking one
+    /// trunk's registration and its egress.
+    pub registers: Option<String>,
+    /// Keep this destination out of [`DispatcherGroup::select`] while the
+    /// registration named by `registers` is not registered.
+    pub require_registration: bool,
     /// Whether this destination is currently healthy.
     healthy: AtomicBool,
     /// Consecutive failure count.
@@ -116,6 +124,8 @@ impl Destination {
             priority,
             attrs: HashMap::new(),
             credentials: None,
+            registers: None,
+            require_registration: false,
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
             down_until: std::sync::Mutex::new(None),
@@ -126,6 +136,33 @@ impl Destination {
     pub fn with_credentials(mut self, credentials: crate::auth::StoredCredentials) -> Self {
         self.credentials = Some(Arc::new(credentials));
         self
+    }
+
+    /// Link this destination to an outbound registration.
+    pub fn with_registration(mut self, aor: String, require: bool) -> Self {
+        self.registers = Some(aor);
+        self.require_registration = require;
+        self
+    }
+
+    /// Whether this destination may be selected right now.
+    ///
+    /// Health, plus the registration gate: a destination that only accepts
+    /// calls from a registered peer is worth skipping while its registration is
+    /// down, because dialling it would just earn a rejection. Only consulted
+    /// when `require_registration` is set, so the ordinary path does not look
+    /// anything up.
+    fn is_selectable(&self) -> bool {
+        if !self.is_healthy() {
+            return false;
+        }
+        if !self.require_registration {
+            return true;
+        }
+        let Some(ref aor) = self.registers else {
+            return true;
+        };
+        crate::registrant::registered(aor)
     }
 
     /// Get the current resolved address.
@@ -298,6 +335,22 @@ pub struct DispatcherGroup {
     /// to the next carrier (`gateway.groups[].reroute_causes`). Empty = the LCR
     /// path uses the global `lcr.reroute_causes` for this group's carriers.
     reroute_causes: Vec<u16>,
+    /// Who created this group, so a `gateway.backend` source reconcile only
+    /// ever replaces or removes groups it created itself. Without it, the first
+    /// pass would delete every group from `gateway.groups` and every one a
+    /// script added with `gateway.add_group()`.
+    pub origin: GroupOrigin,
+}
+
+/// Who created a [`DispatcherGroup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOrigin {
+    /// The `gateway.groups` list in `siphon.yaml`.
+    Yaml,
+    /// `gateway.add_group()` from a script.
+    Script,
+    /// A `gateway.backend: database` / `http` source.
+    Source,
 }
 
 impl DispatcherGroup {
@@ -312,10 +365,49 @@ impl DispatcherGroup {
             member_ips: ArcSwap::from_pointee(HashSet::new()),
             source_networks: Vec::new(),
             reroute_causes: Vec::new(),
+            origin: GroupOrigin::Script,
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
         group
+    }
+
+    /// Build from destinations that already exist, keeping their health.
+    ///
+    /// What a source reconcile uses: a destination whose identity has not
+    /// changed carries over as the same `Arc`, so its healthy/failure/cooldown
+    /// state survives the refresh. Rebuilding them instead would mark every
+    /// dead carrier healthy again on every poll.
+    pub fn from_existing(
+        name: String,
+        algorithm: Algorithm,
+        destinations: Vec<Arc<Destination>>,
+    ) -> Self {
+        let group = Self {
+            name,
+            algorithm,
+            probe_config: ProbeConfig::default(),
+            destinations,
+            counters: DashMap::new(),
+            member_ips: ArcSwap::from_pointee(HashSet::new()),
+            source_networks: Vec::new(),
+            reroute_causes: Vec::new(),
+            origin: GroupOrigin::Script,
+        };
+        group.refresh_member_ips();
+        group
+    }
+
+    /// Record that this group came from `siphon.yaml`.
+    pub fn from_yaml(mut self) -> Self {
+        self.origin = GroupOrigin::Yaml;
+        self
+    }
+
+    /// Record that this group came from a `gateway.backend` source.
+    pub fn from_source(mut self) -> Self {
+        self.origin = GroupOrigin::Source;
+        self
     }
 
     pub fn with_probe_config(mut self, config: ProbeConfig) -> Self {
@@ -361,7 +453,7 @@ impl DispatcherGroup {
                 .iter()
                 .filter(|d| {
                     d.priority == priority
-                        && d.is_healthy()
+                        && d.is_selectable()
                         && attr_filter.map_or(true, |f| d.matches_attrs(f))
                 })
                 .collect();
@@ -588,6 +680,34 @@ impl DispatcherManager {
     pub fn remove_group(&self, name: &str) -> bool {
         self.stop_prober(name);
         self.groups.remove(name).is_some()
+    }
+
+    /// Names of the groups a `gateway.backend` source created.
+    ///
+    /// The live half of its reconcile. Excludes YAML and script groups, so a
+    /// reconcile can neither replace nor remove one.
+    pub fn source_group_names(&self) -> Vec<String> {
+        self.groups
+            .iter()
+            .filter(|entry| entry.value().origin == GroupOrigin::Source)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Whether a group name is held by something other than a source.
+    pub fn is_foreign_to_source(&self, name: &str) -> bool {
+        self.groups
+            .get(name)
+            .is_some_and(|group| group.origin != GroupOrigin::Source)
+    }
+
+    /// The destinations of a named group, for a reconcile that wants to carry
+    /// the unchanged ones over rather than rebuild them.
+    pub fn destinations_of(&self, name: &str) -> Vec<Arc<Destination>> {
+        self.groups
+            .get(name)
+            .map(|group| group.all_destinations().to_vec())
+            .unwrap_or_default()
     }
 
     /// (Re)start the prober for one group.
@@ -1996,6 +2116,41 @@ mod tests {
             seen.insert(selected.uri.clone());
         }
         assert_eq!(seen.len(), 2, "should cycle through both backups");
+    }
+
+    // --- Registration-gated selection ---
+
+    #[test]
+    fn a_destination_gated_on_a_registration_is_withheld_while_it_is_down() {
+        // No registrant manager is installed here, which is the same answer as
+        // a registration that is not up: the destination only accepts calls
+        // from a registered peer, so dialling it would earn a rejection.
+        let gated = make_dest("sip:gw1.carrier.example", 5060, 1, 1)
+            .with_registration("sip:trunk1@carrier.example".to_string(), true);
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![gated],
+        ));
+
+        assert!(manager.select("carriers", None, None).is_none());
+    }
+
+    #[test]
+    fn a_linked_destination_is_selected_normally_unless_it_asks_to_be_gated() {
+        // The link alone only shares credentials; withholding a destination is
+        // opt-in, because silently routing nowhere is worse than trying.
+        let linked = make_dest("sip:gw1.carrier.example", 5060, 1, 1)
+            .with_registration("sip:trunk1@carrier.example".to_string(), false);
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![linked],
+        ));
+
+        assert!(manager.select("carriers", None, None).is_some());
     }
 
     // --- Edge cases ---

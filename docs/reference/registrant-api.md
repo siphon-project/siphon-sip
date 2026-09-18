@@ -6,7 +6,8 @@ owns trunks as data can hand siphon the list instead of having them written into
 
 The models are typed in [`siphon_sdk.registrants`](https://pypi.org/project/siphon-sip/)
 and mirrored by the Rust structs in `src/registrant/source.rs`. A runnable
-reference server is `examples/provisioning_api_server.py`.
+reference server — serving this and the [gateway contract](gateway-api.md)
+off one table — is `examples/provisioning_api_server.py`.
 
 ```python
 from siphon_sdk.registrants import RegistrantListResponse, RegistrantRow

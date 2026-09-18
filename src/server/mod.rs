@@ -978,6 +978,10 @@ impl SiphonServer {
                     std::time::Duration::from_secs(registrant_config.max_retry_interval),
                     registrant_user_agent,
                 ));
+                // Reachable from the gateway's selection gate, which has no
+                // `Arc` in scope but must ask whether a linked registration is
+                // up.
+                crate::registrant::set_manager(Arc::clone(&manager));
                 pyo3::Python::attach(|python| {
                     // PyRegistration ignores local_addr (flow() takes ue_ip
                     // explicitly); pass a placeholder.

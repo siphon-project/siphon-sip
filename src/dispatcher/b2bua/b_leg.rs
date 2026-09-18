@@ -57,7 +57,17 @@ pub(crate) fn gateway_credentials_for(
     let (group, gateway_destination) = manager
         .hostname_destination_for(&host_port)
         .or_else(|| manager.destination_for_address(destination))?;
-    let credentials = gateway_destination.credentials.clone()?;
+
+    // A destination linked to an outbound registration (`registers:`) and
+    // carrying no credentials of its own answers with that registration's, so
+    // one trunk's secret is defined once instead of on both halves.
+    let credentials = match gateway_destination.credentials.clone() {
+        Some(credentials) => credentials,
+        None => {
+            let aor = gateway_destination.registers.as_deref()?;
+            crate::registrant::credentials_for(aor)?
+        }
+    };
     Some((group, credentials))
 }
 
