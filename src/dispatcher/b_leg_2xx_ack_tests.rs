@@ -373,6 +373,7 @@ impl Call {
         let message = parse_sip_message_bytes(raw.as_bytes()).expect("the callee's BYE parses");
         handle_b2bua_bye(
             InboundMessage {
+                client_transport: None,
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
                 local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
@@ -435,6 +436,7 @@ fn caller_sends(state: &Arc<DispatcherState>, method: &str, cseq: &str, relayed_
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's request parses");
     handle_request(
         InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: "192.0.2.1:5060".parse().expect("a literal address"),

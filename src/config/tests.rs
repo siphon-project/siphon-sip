@@ -4164,6 +4164,124 @@ script:
 }
 
 #[test]
+fn listen_entry_parses_the_proxy_protocol_allowlist() {
+    let yaml = r#"
+listen:
+  tls:
+    - address: "0.0.0.0:5061"
+      proxy_protocol:
+        from:
+          - "198.51.100.7/32"
+          - "192.0.2.0/24"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    let proxy = config.listen.tls[0]
+        .proxy_protocol()
+        .expect("the allowlist must survive parsing");
+    assert_eq!(proxy.from, vec!["198.51.100.7/32", "192.0.2.0/24"]);
+}
+
+#[test]
+fn proxy_protocol_without_an_allowlist_is_refused() {
+    // A header lets its sender claim any source address, so "enabled" without
+    // "from whom" is refused rather than defaulted — there is deliberately no
+    // fallback to security.trusted_cidrs, which means something else.
+    let yaml = r#"
+listen:
+  tls:
+    - address: "0.0.0.0:5061"
+      proxy_protocol:
+        from: []
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let message = Config::from_str(yaml).expect_err("an empty allowlist must be refused");
+    let message = message.to_string();
+    assert!(
+        message.contains("proxy_protocol.from"),
+        "the error must name the key: {message}"
+    );
+}
+
+#[test]
+fn a_proxy_protocol_entry_that_is_not_a_cidr_is_refused() {
+    // The trusted_cidrs consumers each drop an unparseable entry silently, so
+    // an operator's typo quietly widens or narrows nothing. Not here.
+    let yaml = r#"
+listen:
+  tls:
+    - address: "0.0.0.0:5061"
+      proxy_protocol:
+        from:
+          - "198.51.100.7"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let message = Config::from_str(yaml).expect_err("a bare address must be refused");
+    let message = message.to_string();
+    assert!(
+        message.contains("198.51.100.7") && message.contains("/32"),
+        "the error must name the entry and show the fix: {message}"
+    );
+}
+
+#[test]
+fn proxy_protocol_on_a_udp_listener_is_refused() {
+    // A UDP reply goes to the peer address, so taking the client's from a
+    // header would send every answer past the front.
+    let yaml = r#"
+listen:
+  udp:
+    - address: "0.0.0.0:5060"
+      proxy_protocol:
+        from:
+          - "198.51.100.7/32"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let message = Config::from_str(yaml).expect_err("proxy_protocol on UDP must be refused");
+    let message = message.to_string();
+    assert!(
+        message.contains("listen.udp") && message.contains("stream"),
+        "the error must name the listener and say why: {message}"
+    );
+}
+
+#[test]
+fn a_listener_without_proxy_protocol_has_none() {
+    // Off unless configured: a bump must not start honouring a header that
+    // lets its sender claim any source address.
+    let yaml = r#"
+listen:
+  tcp:
+    - "0.0.0.0:5060"
+    - address: "0.0.0.0:5070"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    assert!(config.listen.tcp[0].proxy_protocol().is_none());
+    assert!(config.listen.tcp[1].proxy_protocol().is_none());
+}
+
+#[test]
 fn listen_entry_plain_has_no_dscp() {
     let entry = ListenEntry::Plain("0.0.0.0:5060".to_string());
     assert_eq!(entry.dscp(), None);

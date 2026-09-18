@@ -347,10 +347,21 @@ Manifests are in [`deploy/k8s/`](https://github.com/siphon-project/siphon-sip/tr
     periodSeconds: 5
   ```
 
-- **Networking:** SIP is sensitive to NAT rewriting of `Via`/`Contact`. Prefer
-  `hostNetwork: true` (or a properly configured `LoadBalancer`/`externalTrafficPolicy:
-  Local` so source IPs and ports survive) and set `advertised_address` to what peers
-  should see.
+- **Networking:** SIP is sensitive to NAT rewriting of `Via`/`Contact`, and to
+  losing the client's source address. Which fix applies depends on whether your
+  ingress *forwards* packets or *terminates* the connection:
+    - **Forwarding ingress** (a plain L4 `LoadBalancer`, DSR): preserve the
+      client source with `hostNetwork: true` or a properly configured
+      `externalTrafficPolicy: Local`. There is no header to read, so this is the
+      only thing that works — and it is enough.
+    - **Terminating ingress** (an L7 or TLS-terminating front, an Ingress
+      controller, anything that re-encrypts): it opens its own connection, so
+      source preservation is not available to it by definition. Have the front
+      send a PROXY header and set `proxy_protocol.from` on the matching stream
+      listener — see
+      [Transports](transports.md#behind-a-connection-terminating-front).
+
+  Either way, set `advertised_address` to what peers should see.
 - **Redis** as a normal dependency (a `Deployment` + `Service`, or a managed Redis).
   All siphon pods share it for registrar durability.
 - **Config** via a `ConfigMap` (siphon.yaml + the script), mounted read-only.

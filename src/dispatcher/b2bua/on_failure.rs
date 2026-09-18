@@ -341,6 +341,7 @@ fn reroute_failed_call(
             (
                 invite,
                 InboundMessage {
+                    client_transport: None,
                     connection_id: call.a_leg.transport.connection_id,
                     transport: call.a_leg.transport.transport,
                     local_addr: call.a_leg_local_addr.unwrap_or(state.local_addr),

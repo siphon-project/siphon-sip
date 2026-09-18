@@ -183,6 +183,11 @@ export const SipVerb = {
   Hangup: "hangup",
   Refer: "refer",
   Route: "route",
+  /**
+   * Ring targets as B-legs while the caller stays unanswered and the app keeps
+   * the channel. Channel-addressed, unlike `originate`, which creates one.
+   */
+  Dial: "dial",
   SetHeader: "set_header",
   GetHeader: "get_header",
   RemoveHeader: "remove_header",
@@ -198,6 +203,10 @@ export const SipVerb = {
   Unhold: "unhold",
   StreamStart: "stream_start",
   StreamStop: "stream_stop",
+  /** Record the call's decoded audio to a wav file (siphon-rtp backend only). */
+  RecordStart: "record_start",
+  /** Stop one recording by id, or every recording on the call. */
+  RecordStop: "record_stop",
 } as const;
 
 /** A value of {@link SipVerb}. */

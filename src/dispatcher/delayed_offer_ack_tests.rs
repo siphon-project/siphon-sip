@@ -360,6 +360,7 @@ impl OfferlessCall {
         }
         let message = parse_sip_message_bytes(raw.as_bytes()).expect("the caller's request parses");
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: address("192.0.2.1:5060"),

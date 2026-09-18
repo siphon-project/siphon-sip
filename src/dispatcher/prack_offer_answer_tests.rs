@@ -165,6 +165,7 @@ impl PrackCall {
         let state = Arc::new(state);
         let raw = caller_invite(offer);
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: state.local_addr,
@@ -317,6 +318,7 @@ impl PrackCall {
         }
         push_body(&mut raw, body);
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: self.state.local_addr,
@@ -354,6 +356,7 @@ impl PrackCall {
         );
         push_body(&mut raw, body);
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: self.state.local_addr,
@@ -1032,6 +1035,7 @@ fn place_with_split_egress(
     let state = Arc::new(state);
     let raw = caller_invite(offer);
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: state.local_addr,

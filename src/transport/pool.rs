@@ -750,6 +750,9 @@ impl ConnectionPool {
                             let message = InboundMessage {
                                 connection_id,
                                 transport: Transport::Tcp,
+                                // siphon opened this connection itself, so there
+                                // is no front and no client behind one.
+                                client_transport: None,
                                 local_addr,
                                 remote_addr: destination,
                                 data,
@@ -1065,6 +1068,8 @@ impl ConnectionPool {
                             let message = InboundMessage {
                                 connection_id,
                                 transport: Transport::Tls,
+                                // Outbound connection: no front in front of it.
+                                client_transport: None,
                                 local_addr,
                                 remote_addr: destination,
                                 data,

@@ -98,7 +98,13 @@ it would have been on a dedicated listener:
 | `REGISTER sip:… SIP/2.0`        | raw SIP    | `tls` / `tcp`     |
 | `SIP/2.0 200 OK`                | raw SIP    | `tls` / `tcp`     |
 | `GET / HTTP/1.1`                | WebSocket upgrade | `wss` / `ws` |
+| `PROXY TCP4 …` / the v2 signature | a [PROXY header](#behind-a-connection-terminating-front) — consumed, then the line *after* it is classified by the rows above | as above |
 | anything else                   | dropped (and counted as a malformed message) | — |
+
+The PROXY row only applies on a listener that sets `proxy_protocol`. Without it
+the header is still recognised, but the connection is dropped with a log naming
+the listener — not counted as a malformed message, because the sender is almost
+always your own front rather than a prober.
 
 The two grammars are disjoint — a SIP start line ends with ` SIP/2.0`
 (RFC 3261 §7.1) and an upgrade request ends with ` HTTP/1.1` (RFC 6455 §4.1),
@@ -133,6 +139,13 @@ check, with one difference: there is no WebSocket half to hand an HTTP request
 to, so an upgrade line is treated exactly like random bytes. Either way the
 connection is closed before a byte reaches the SIP framer, and the source is
 counted as a strong `security.failed_auth_ban` signal.
+
+One first line is exempt: a **PROXY header on a listener without
+`proxy_protocol`** is recognised for what it is and the connection dropped with
+a log naming the listener, crediting the source nothing. It used to score as
+non-SIP bytes, which meant a front pointed at the wrong listener banned itself
+in four connections — see
+[Behind a connection-terminating front](#behind-a-connection-terminating-front).
 
 This is what stops a vulnerability scanner walking `/phpinfo.php`, `/info.php`
 and friends against a TLS SIP port. Framing on length alone cannot: an HTTP
@@ -218,8 +231,8 @@ trust anchor is a different feature from a per-domain server certificate.
     domain in the request, or inbound mTLS, is what identifies a peer.
 
 A listener can be a **plain string** (`"10.0.0.1:5060"`) or the **extended form**
-with a per-socket advertised host and DSCP override (like OpenSIPS
-`socket … as …`):
+with a per-socket advertised host, a DSCP override (like OpenSIPS
+`socket … as …`), and — on stream transports — a PROXY-protocol allowlist:
 
 ```yaml
 listen:
@@ -227,7 +240,14 @@ listen:
     - address: "10.0.0.1:5061"
       advertise: "sip.example.com"   # what peers should see in Via/Record-Route
       dscp: EF                       # overrides the global listen.dscp
+      proxy_protocol:                # stream listeners only — see below
+        from: ["198.51.100.7/32"]    # the front(s) allowed to name the client
 ```
+
+`proxy_protocol` is covered in
+[Behind a connection-terminating front](#behind-a-connection-terminating-front);
+the other two fields are covered under
+[Behind NAT or a load balancer](#behind-nat-or-a-load-balancer).
 
 !!! note "SCTP is opt-in"
     SIP-over-SCTP links the `libsctp` system library and is Linux-only, so it's
@@ -443,9 +463,137 @@ A few properties worth knowing:
   transport's advertised address in its Via, and a Record-Route per side (see
   [Inter-transport routing](#inter-transport-routing)).
 - **Load balancers:** put the LB/health-check sources in `security.trusted_cidrs`
-  so probes aren't rate-limited, and prefer a topology that preserves the client
-  source IP:port (`externalTrafficPolicy: Local` / `hostNetwork` on Kubernetes —
-  see [Deployment](deployment.md#kubernetes-kept-deliberately-light)).
+  so probes aren't rate-limited. What to do about the *client's* source address
+  depends on what the balancer does with the packets. A **forwarding** L4
+  balancer can preserve it (`externalTrafficPolicy: Local` / `hostNetwork` on
+  Kubernetes — see
+  [Deployment](deployment.md#kubernetes-kept-deliberately-light)). A
+  **connection-terminating** front cannot, by definition; that one needs the
+  PROXY protocol, below.
+
+---
+
+## Behind a connection-terminating front
+
+`advertised_address` fixes the addresses siphon *writes*. It does nothing for the
+address siphon *reads*, and a front that terminates the connection breaks that
+one.
+
+A **forwarding** balancer (L4 pass-through, DSR, `externalTrafficPolicy: Local`)
+hands siphon the client's own packets, so the peer address is already right and
+none of this applies. A **terminating** front — HAProxy in `tcp` mode with its
+own TLS, stunnel, an Ingress controller, anything that re-encrypts — opens its
+**own** connection to siphon. The peer address is then the front's, and every
+consumer that keys on the source inherits that:
+
+- `security.failed_auth_ban` bans the front rather than the abuser — or, with
+  the front in `trusted_cidrs`, bans nobody at all.
+- `request.from_gateway()` and `request.source_ip_in()` stop discriminating:
+  every call now arrives from one address.
+- NAT return-routing writes the front into `received=` / `rport=`.
+- `media.received_from` gates RTP ingress to the front, so no media is accepted
+  at all.
+- Capture and the CDR record the front for every call.
+
+Source preservation is not something a terminating front can be configured into
+— it terminated the connection, which is the reason it is there. What it *can*
+do is send the client's endpoints ahead of the payload, in the
+[PROXY protocol](https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt).
+Enable that per listener:
+
+```yaml
+listen:
+  tls:
+    - address: "198.51.100.10:5061"
+      advertise: "sip.example.com"
+      proxy_protocol:
+        from:
+          - "198.51.100.7/32"     # the front, exactly
+```
+
+Version 1 (the text line) and version 2 (binary) are both accepted, and siphon
+needs no telling which — it decides from the signature. **Stream listeners
+only:** `listen.tcp`, `listen.tls`, `listen.ws`, `listen.wss`, and a shared
+`tcp+ws` / `tls+wss` socket. On `listen.udp` it is refused at config load,
+because a UDP reply goes to the peer address, so substituting the client's would
+send every answer past the front.
+
+### `from` is the security control
+
+A PROXY header lets its sender claim to be **any** address. `from` names the
+senders allowed to do that; it is mandatory and has no default. An empty list, or
+an entry that is not a CIDR (`"198.51.100.7"` where `"198.51.100.7/32"` was
+meant), is refused at config load rather than started in a permissive state.
+
+!!! danger "`from` does not inherit `security.trusted_cidrs`"
+    That would be the obvious convenience and it is the wrong one.
+    `trusted_cidrs` means "exempt from abuse controls" to all four of its
+    consumers, and it is where monitoring boxes, health-check probes and trunks
+    get listed. Inheriting it would let every one of them forge a source
+    address, on the strength of a decision made months earlier for an unrelated
+    reason. Keep `from` as narrow as the front really is: a `/32` per front, not
+    the subnet it happens to sit in. See
+    [Hardening & security](cookbook/security.md#letting-a-front-speak-for-the-client).
+
+### What happens on the wire
+
+The header is cleartext and arrives **ahead of the TLS ClientHello**, so siphon
+reads it before the handshake. That ordering is the whole point for a
+re-encrypting front: it terminates the subscriber's TLS and opens its own to
+siphon, and no hop carries cleartext SIP. Bytes read past the header — the
+ClientHello, the WebSocket `GET`, or the first SIP message — are replayed to
+whatever reads the connection next, so nothing is lost when a front packs the
+header and the INVITE into one segment.
+
+On a listener with `proxy_protocol` set:
+
+| What arrives | Result |
+|---|---|
+| A header from an address in `from` | The client's address replaces the front's for every consumer |
+| A header from an address **not** in `from` | Refused at accept, logged. Not an auto-ban signal. |
+| No header — plain SIP, a TLS record, silence | Connection dropped, logged. Never attributed to the front. Not an auto-ban signal. |
+| v2 `LOCAL` / v1 `UNKNOWN` | Consumed; the socket's own peer address stands. This is what a front's health checks send. |
+
+Neither refusal credits `failed_auth_ban`, deliberately: the overwhelmingly
+likely cause is a second front that nobody added to the list, and banning your
+own ingress is a worse outage than the misconfiguration behind it.
+
+The mirror case is a PROXY header arriving on a listener where the option is
+**off**. It is recognised and the connection dropped with a log naming the
+listener. Before that existed it was classified as non-SIP bytes, which scores
+`strong_signal_weight` — so a front aimed at the wrong listener banned itself
+within a few connections, with nothing in the log to say why.
+
+!!! warning "Spell the key exactly"
+    A listen entry is untagged, so a misspelled `proxy_protocol` key parses as a
+    perfectly valid listener with the option **off**. There is no config error to
+    see; the symptom is the header-on-a-disabled-listener log above. A
+    misspelling *inside* the block (anything other than `from`) is a hard config
+    error, as is omitting `from`.
+
+On a shared `tcp+ws` or `tls+wss` socket, set the same `proxy_protocol` on both
+halves — one socket takes one policy. siphon warns and uses the `tcp:` / `tls:`
+side when the two disagree.
+
+!!! note "What the client spoke, beside what this hop speaks"
+    A v2 header can carry `PP2_TYPE_SSL`, describing the TLS session the client
+    negotiated *with the front*. siphon carries that **beside** the hop, never
+    over it: `request.transport` keeps naming the transport siphon itself
+    accepted — `tcp` for a front that re-encrypts into a plaintext listener —
+    because that is what decides which connection map, pool and Via/Contact
+    token the message belongs to.
+
+    Two properties answer for the client instead:
+
+    - `request.client_transport` — the transport the front says the client used,
+      or `None` when no front declared one.
+    - `request.client_is_secure` — whether the client's *effective* hop was
+      secure. A UE that connects straight to a `tls` listener reports `True`
+      too, so `if not request.client_is_secure: reject` is safe to write; reading
+      `client_transport is None` as "insecure" would lock out every direct-TLS UE.
+
+    `Contact.client_transport` persists it with the registrar binding, and the
+    CDR records the client's transport rather than the front-facing one.
 
 ---
 

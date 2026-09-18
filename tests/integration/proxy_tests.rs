@@ -779,6 +779,7 @@ fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contac
         cseq: 1,
         source_addr: None,
         source_transport: Some(siphon::transport::Transport::Udp),
+        client_transport: None,
         sip_instance: None,
         reg_id: None,
         path: path.into_iter().map(String::into_boxed_str).collect(),

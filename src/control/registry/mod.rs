@@ -79,7 +79,7 @@ struct ChannelEntry {
     call_actor_id: String,
     /// The per-leg SIP Call-ID (CDR/HEP join key + `b2bua_*` routing).
     sip_call_id: String,
-    /// Control-loss policy for this call ("hangup"/"continue"/"fallback").
+    /// Control-loss policy for this call ("hangup" or "continue").
     on_lost: String,
     /// Per-call variables (drain with the channel — never on `CallActor`).
     vars: Mutex<HashMap<String, String>>,
@@ -390,10 +390,11 @@ impl ControlBus {
             "continue" => {
                 // Leave the call running autonomously; nothing to tear down.
             }
-            // Anything else ends the call. `fallback` is refused at config
-            // load and by the verbs that take it, so reaching here with one
-            // would be a bug rather than a policy — and ending the call is the
-            // safe reading of "the owner is gone".
+            // Anything else ends the call. `hangup` is the only other policy
+            // siphon implements, and ending the call is the safe reading of
+            // "the owner is gone". `fallback` is refused everywhere a call can
+            // set it — `Config::validate_control_apps`, `call.handover(on_lost=…)`
+            // and the `originate` verb — so it cannot reach here.
             _ => {
                 crate::dispatcher::b2bua_terminate_call(
                     &sip_call_id,

@@ -122,7 +122,26 @@ pub enum ListenEntry {
         /// Per-listener DSCP override (0–63 or name like "CS3", "EF").
         #[serde(default, deserialize_with = "deserialize_dscp")]
         dscp: Option<u8>,
+        /// Accept the HAProxy PROXY protocol on this listener, and take the
+        /// client address from it (stream transports only).
+        ///
+        /// Off unless configured. `from` is mandatory when it is set and has no
+        /// default: a header lets its sender claim any source address, and
+        /// `security.trusted_cidrs` means something else entirely ("exempt from
+        /// abuse controls"), so inheriting it would hand that power to every
+        /// monitoring box listed there.
+        #[serde(default)]
+        proxy_protocol: Option<ProxyProtocolConfig>,
     },
+}
+
+/// Per-listener PROXY protocol settings.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyProtocolConfig {
+    /// Senders allowed to assert a client address. Validated at config load;
+    /// an empty list is refused rather than silently accepting nobody.
+    pub from: Vec<String>,
 }
 
 impl ListenEntry {
@@ -147,6 +166,14 @@ impl ListenEntry {
         match self {
             ListenEntry::Plain(_) => None,
             ListenEntry::Extended { dscp, .. } => *dscp,
+        }
+    }
+
+    /// PROXY protocol settings for this listener, when it sits behind a front.
+    pub fn proxy_protocol(&self) -> Option<&ProxyProtocolConfig> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { proxy_protocol, .. } => proxy_protocol.as_ref(),
         }
     }
 }

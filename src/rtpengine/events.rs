@@ -186,6 +186,22 @@ pub struct CallLegSummary {
     /// only when the call negotiated a plaintext `m=text` stream *and* a text
     /// observability feature (recording, or `text_events`) promoted it.
     pub text: Option<TextStreamStats>,
+    /// The engine's media address toward this party — the advertised IP and the
+    /// RTP port it received on.
+    pub local_address: Option<SocketAddr>,
+    /// Where this party's media actually came from: the source the datapath
+    /// latched, else its signalled address.
+    ///
+    /// The media-plane peer for this leg, which is the only egress address a
+    /// record carries — the SIP-side `destination_ip` is the signalling next
+    /// hop and a call anchored through a media engine need not share it.
+    pub remote_address: Option<SocketAddr>,
+    /// The SSRC of the stream the engine *sent* this party (RFC 3550), when a
+    /// userspace actor originated it. `ssrc` is the inbound counterpart.
+    pub egress_ssrc: Option<u32>,
+    /// The RTP payload type of the leg's negotiated codec — the number on the
+    /// wire, where `codec` is the name it was negotiated under.
+    pub payload_type: Option<u8>,
 }
 
 /// One increment of RFC 4103 real-time text (T.140), carried by

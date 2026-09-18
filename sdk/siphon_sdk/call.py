@@ -658,13 +658,13 @@ class Call:
 
         A handoff deadline protects against an absent/slow controller: if no
         controller accepts and acts in time, a default action fires (``503`` by
-        default, or a fallback re-dispatch), so a dead controller degrades
-        instead of hanging calls.
+        default), so a dead controller degrades instead of hanging calls.
 
         Args:
             app: The control app name (must be configured under ``control.apps``).
             on_lost: What to do if the owning connection is lost mid-call —
-                ``"hangup"`` (default), ``"continue"``, or ``"fallback"``.
+                ``"hangup"`` (end the call, the default) or ``"continue"``
+                (leave it running without an owner).
             deadline_ms: Handoff deadline in milliseconds; ``None`` uses
                 ``control.limits.handoff_deadline_ms``.
             vars: Per-call variables seeded into the control channel, readable +
@@ -685,8 +685,8 @@ class Call:
 
         Raises:
             ValueError: if ``app`` is empty, ``on_lost`` is not one of
-                ``"hangup"`` / ``"continue"`` / ``"fallback"``, or ``profile`` /
-                ``ws_uri`` are passed without ``answer=True``.
+                ``"hangup"`` / ``"continue"``, or ``profile`` / ``ws_uri`` are
+                passed without ``answer=True``.
 
         Example::
 
@@ -703,10 +703,17 @@ class Call:
         """
         if not app:
             raise ValueError("call.handover() requires a non-empty app name")
-        if on_lost is not None and on_lost not in ("hangup", "continue", "fallback"):
+        if on_lost is not None and on_lost not in ("hangup", "continue"):
+            detail = (
+                " `fallback` would re-dispatch the call through the Python "
+                "handlers, which does not exist; it behaved as `hangup`."
+                if on_lost == "fallback"
+                else ""
+            )
             raise ValueError(
-                "call.handover(on_lost=…) must be 'hangup', 'continue', or "
-                f"'fallback' (got {on_lost!r})"
+                f"call.handover(on_lost=…) is {on_lost!r}, which siphon does not "
+                'implement — it is "hangup" (end the call, the default) or '
+                '"continue" (leave it running without an owner).' + detail
             )
         if not answer and (profile is not None or ws_uri is not None):
             raise ValueError(

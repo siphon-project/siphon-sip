@@ -63,6 +63,7 @@ fn place_call(script: &str, extra: &str) -> Vec<Sent> {
     let dispatcher = test_dispatcher_with_script(script);
     let raw = caller_invite(extra);
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: dispatcher.state.local_addr,

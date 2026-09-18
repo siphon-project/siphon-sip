@@ -45,6 +45,10 @@ pub struct StoredContact {
     /// Transport protocol the REGISTER arrived on (e.g. "udp", "tcp", "tls").
     #[serde(default)]
     pub source_transport: Option<String>,
+    /// Client's transport at the front (PROXY `PP2_TYPE_SSL`), when it differs
+    /// from `source_transport`. `None` for legacy rows and direct connections.
+    #[serde(default)]
+    pub client_transport: Option<String>,
     /// RFC 5627 sip.instance.
     pub sip_instance: Option<String>,
     /// RFC 5626 reg-id.
@@ -119,6 +123,7 @@ impl StoredContact {
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
             source_transport: contact.source_transport.map(|t| t.as_scheme().to_string()),
+            client_transport: contact.client_transport.map(|t| t.as_scheme().to_string()),
             sip_instance: contact.sip_instance.as_ref().map(|v| v.to_string()),
             reg_id: contact.reg_id,
             path: contact.path.iter().map(|v| v.to_string()).collect(),
@@ -207,6 +212,12 @@ impl StoredContact {
             // transport recorded" rather than failing the whole restore.
             source_transport: self
                 .source_transport
+                .as_deref()
+                .and_then(crate::transport::Transport::from_scheme),
+            // Degrades like `source_transport` above: an unrecognised scheme
+            // costs the detail, never the restore.
+            client_transport: self
+                .client_transport
                 .as_deref()
                 .and_then(crate::transport::Transport::from_scheme),
             sip_instance: self.sip_instance.as_deref().map(Box::from),
@@ -1539,6 +1550,7 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
         StoredContact {
+            client_transport: None,
             uri: "sip:alice@10.0.0.1".to_string(),
             q: 1.0,
             expires_secs: 3600,
@@ -1784,6 +1796,7 @@ mod tests {
             .as_secs();
 
         let stored = StoredContact {
+            client_transport: None,
             uri: "sip:alice@10.0.0.1".to_string(),
             q: 1.0,
             expires_secs: 3600,
@@ -1992,6 +2005,7 @@ mod tests {
             .save(
                 "sip:alice@example.com",
                 &[StoredContact {
+                    client_transport: None,
                     uri: "sip:alice@10.0.0.1".to_string(),
                     q: 1.0,
                     expires_secs: 3600,
@@ -2021,6 +2035,7 @@ mod tests {
                 "sip:bob@example.com",
                 &[
                     StoredContact {
+                        client_transport: None,
                         uri: "sip:bob@10.0.0.2".to_string(),
                         q: 1.0,
                         expires_secs: 3600,
@@ -2043,6 +2058,7 @@ mod tests {
                         auth_user: None,
                     },
                     StoredContact {
+                        client_transport: None,
                         uri: "sip:bob@10.0.0.3".to_string(),
                         q: 0.5,
                         expires_secs: 1800,
@@ -2120,6 +2136,51 @@ mod tests {
         stored.source_transport = Some("quic".to_string());
         let contact = stored.to_contact().expect("the binding still restores");
         assert_eq!(contact.source_transport, None);
+    }
+
+    /// The client's transport at the front persists *beside* the hop, never
+    /// instead of it: routing and `received` construction both read the hop, so
+    /// a binding that lost it would stop being reachable.
+    #[test]
+    fn the_clients_transport_persists_beside_the_hop() {
+        let mut contact = sample_stored_contact().to_contact().expect("non-expired");
+        contact.source_transport = Some(crate::transport::Transport::Tcp);
+        contact.client_transport = Some(crate::transport::Transport::Tls);
+
+        let stored = StoredContact::from_contact(&contact);
+        assert_eq!(stored.source_transport.as_deref(), Some("tcp"));
+        assert_eq!(stored.client_transport.as_deref(), Some("tls"));
+
+        let restored = stored.to_contact().expect("non-expired");
+        assert_eq!(
+            restored.source_transport,
+            Some(crate::transport::Transport::Tcp),
+            "the hop must survive the round trip"
+        );
+        assert_eq!(
+            restored.client_transport,
+            Some(crate::transport::Transport::Tls)
+        );
+    }
+
+    /// A row written before the field existed loads as "nothing contradicted
+    /// the hop", so no migration of a live Redis/Postgres store is needed.
+    #[test]
+    fn a_row_without_a_client_transport_loads_as_none() {
+        let mut row = serde_json::to_value(sample_stored_contact())
+            .expect("a stored contact serializes to JSON");
+        row.as_object_mut()
+            .expect("a stored contact is a JSON object")
+            .remove("client_transport")
+            .expect("this build writes the field");
+
+        let legacy: StoredContact =
+            serde_json::from_value(row).expect("a row predating the field must still load");
+        assert_eq!(legacy.client_transport, None);
+        assert_eq!(
+            legacy.to_contact().expect("non-expired").client_transport,
+            None
+        );
     }
 
     /// Restored bindings written by the same instance share one identity
@@ -2203,6 +2264,7 @@ mod tests {
             .save(
                 "sip:old@example.com",
                 &[StoredContact {
+                    client_transport: None,
                     uri: "sip:old@10.0.0.1".to_string(),
                     q: 1.0,
                     expires_secs: 0,
@@ -2249,6 +2311,7 @@ mod tests {
             .save(
                 "sip:alice@example.com",
                 &[StoredContact {
+                    client_transport: None,
                     uri: "sip:alice@10.0.0.1".to_string(),
                     q: 1.0,
                     expires_secs: 3600,

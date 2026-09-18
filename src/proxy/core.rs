@@ -814,6 +814,53 @@ mod tests {
         assert!(all_rr[1].contains("existing.example.com"));
     }
 
+    /// Prepending rebuilds the whole `Record-Route` entry (remove + re-add),
+    /// which moves it to the end of the header map — so the header a proxy adds
+    /// to stay in the path used to go out *below* `Content-Length`. RFC 3261
+    /// §7.3.1 names `Record-Route` among the headers that should "appear
+    /// towards the top of the message to facilitate rapid parsing", and that is
+    /// where it now goes, with the proxy's own value still topmost.
+    #[test]
+    fn record_route_goes_out_near_the_top() {
+        let mut headers = SipHeaders::new();
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+        headers.add("Max-Forwards", "70".to_string());
+        headers.add("Record-Route", "<sip:existing.example.com;lr>".to_string());
+        headers.add("Call-ID", "call-1@192.0.2.10".to_string());
+        headers.add("Content-Length", "0".to_string());
+
+        add_record_route(&mut headers, "sip:proxy.example.com");
+
+        let mut wire = Vec::new();
+        headers.write_wire(&mut wire);
+        let block = String::from_utf8(wire).expect("headers are UTF-8");
+        let names: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "Via",
+                "Max-Forwards",
+                "Record-Route",
+                "Record-Route",
+                "Call-ID",
+                "Content-Length",
+            ]
+        );
+        // Topmost is still this proxy — the prepend is untouched by ordering.
+        let first_rr = block
+            .lines()
+            .find(|line| line.starts_with("Record-Route:"))
+            .expect("a Record-Route row");
+        assert!(first_rr.contains("proxy.example.com"), "got {first_rr}");
+    }
+
     #[test]
     fn check_loose_route_with_lr() {
         let mut headers = SipHeaders::new();

@@ -1638,6 +1638,37 @@ mod tests {
         // Trusted sources are exempt there as everywhere else — the transport
         // tests that follow drive real loopback sockets through this path.
         assert!(!crate::security::is_source_banned(ip("127.0.0.1")));
+
+        // Behind a PROXY-protocol front the accept loop can only test the
+        // front, which is loopback here and trusted — so every abuser shares an
+        // exempt address and neither the ban nor the per-source ceiling can
+        // match. `admit_proxied_client` is the second pass that reads the
+        // client the header named. Without it the store still *records* the
+        // abuser (proved above) and never drops them, which is the functional
+        // half of the problem `proxy_protocol` exists to solve.
+        let front_acl = crate::transport::acl::TransportAcl::new(vec![], vec![]);
+        let banned_client = std::net::SocketAddr::new(prober, 51234);
+        assert!(
+            crate::transport::proxy_protocol::admit_proxied_client(
+                banned_client,
+                &front_acl,
+                crate::transport::Transport::Tcp,
+            )
+            .is_none(),
+            "a banned client must be dropped even when the front that carried it is trusted"
+        );
+        // And an address the store has never seen is still admitted, with its
+        // own permit — the check must not refuse everyone behind a front.
+        let clean_client = std::net::SocketAddr::new(never, 51235);
+        assert!(
+            crate::transport::proxy_protocol::admit_proxied_client(
+                clean_client,
+                &front_acl,
+                crate::transport::Transport::Tcp,
+            )
+            .is_some(),
+            "an unbanned client behind a front must still be let through"
+        );
     }
 
     // --- SecurityFilter (rate_limit + scanner_block) -----------------------
@@ -1919,6 +1950,50 @@ mod tests {
 
         drop(held);
         assert!(limiter.try_accept(flood).is_ok(), "slots come back");
+    }
+
+    /// Behind a front, the accept loop applies the ceiling to the *front's*
+    /// address, where it can never trip: every client shares it, so one abuser
+    /// can hold as many connections as it likes while the counters look healthy.
+    /// `admit_proxied_client` is what re-applies it to the client the header
+    /// named.
+    ///
+    /// This owns the process-global `CONNECTION_LIMITER` `OnceLock` — no other
+    /// test installs one (the ceiling tests around it build a `ConnectionLimiter`
+    /// directly), so the install is deterministic here. Loopback is trusted for
+    /// the same reason the auto-ban test above trusts it: every socket-driven
+    /// transport test in this binary passes through `try_accept_connection`, and
+    /// a metered loopback would start refusing them once a few were live.
+    #[test]
+    fn a_proxied_client_is_held_to_its_own_connection_ceiling() {
+        let loopback = ["127.0.0.0/8".to_string(), "::1/128".to_string()];
+        set_connection_limiter(Arc::new(ConnectionLimiter::new(
+            limits(0, 0, 2, 0),
+            &loopback,
+        )));
+        let acl = crate::transport::acl::TransportAcl::new(vec![], vec![]);
+        let client = std::net::SocketAddr::new(ip("203.0.113.77"), 51234);
+        let admit = || {
+            crate::transport::proxy_protocol::admit_proxied_client(
+                client,
+                &acl,
+                crate::transport::Transport::Tcp,
+            )
+        };
+
+        let held: Vec<_> = (0..2)
+            .map(|_| admit().expect("under the ceiling"))
+            .collect();
+        assert!(
+            admit().is_none(),
+            "a third simultaneous connection from one proxied client must be refused, \
+             even though the front carrying it is trusted and unmetered"
+        );
+        drop(held);
+        assert!(
+            admit().is_some(),
+            "slots come back when the client disconnects"
+        );
     }
 
     #[test]

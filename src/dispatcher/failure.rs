@@ -203,6 +203,7 @@ pub(super) fn execute_failure_retarget(
     state.session_store.remove_by_server_key(server_key);
 
     let inbound = InboundMessage {
+        client_transport: None,
         remote_addr: source_addr,
         local_addr: inbound_local_addr,
         connection_id,
@@ -419,6 +420,7 @@ pub(super) fn fail_branch_locally(
     );
 
     let inbound = InboundMessage {
+        client_transport: None,
         remote_addr: branch
             .as_ref()
             .map(|b| b.destination)

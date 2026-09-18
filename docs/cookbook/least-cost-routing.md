@@ -288,6 +288,61 @@ Carriers want the number in different shapes:
   "tech_prefix": "1010288", "headers": { "X-Account": "42" }, "rate": 0.0042 }
 ```
 
+## Presented CLI and CLIR (per carrier)
+
+Two more route fields decide what the **calling** party looks like to that
+carrier. `number_policy` above reshapes the *format* of whatever number is
+already there; these two substitute a different one, and withhold it.
+
+- **`caller_id`** — the number this carrier is presented, on `From` and on
+  `P-Asserted-Identity` / `P-Preferred-Identity` where present. It is a field
+  rather than something for `headers` because it goes through the
+  tag-preserving identity path: a `From` written by hand loses the dialog tag,
+  the INVITE still goes out, and the breakage only surfaces later on the ACK.
+- **`caller_id_presentation`** — `"allowed"` (the default) or `"restricted"`
+  for CLIR (RFC 3323 §4.1, 3GPP TS 24.607). `restricted` does four things
+  together:
+    - `From` becomes `"Anonymous" <sip:anonymous@anonymous.invalid>`, tag intact
+    - `Privacy: id` is asserted (RFC 3325 §7), appended to any existing value
+    - `P-Asserted-Identity` keeps the real identity for the trusted next hop, so
+      the network can still identify the caller for regulatory and emergency
+      purposes
+    - `P-Preferred-Identity` is removed, since it is the UA's *request* for what
+      to assert and forwarding it past a privacy boundary re-leaks the number
+
+    They move together on purpose. Asserting `Privacy: id` while leaving the
+    real number in `From` leaks it to every carrier that renders `From` rather
+    than PAI, which defeats CLIR while looking like it works.
+
+```json
+{
+  "routes": [
+    { "carrier_id": "carrier-a", "gateway_group": "carrier-a",
+      "caller_id": "+13105550100" },
+    { "carrier_id": "wholesale-b", "gateway_group": "wholesale-b",
+      "caller_id": "+13105550100", "caller_id_presentation": "restricted" }
+  ]
+}
+```
+
+Both are **per route, not per response** — unlike `destination`, there is no
+answer-level default for a carrier to inherit. A failover from carrier A to
+carrier B therefore never carries A's presentation across by accident; a route
+that wants CLIR has to say so. Set it on every route in the sequence when the
+call is withheld, or the call goes out anonymous on the cheapest carrier and
+with the real number on the failover.
+
+Ordering inside one route is fixed: `caller_id` substitutes first,
+`number_policy` reshapes formats second, and anonymisation runs last. So under
+`restricted` the substituted number still reaches PAI, and no policy tries to
+reformat `anonymous` as a number. An unrecognised `caller_id_presentation` is
+logged and treated as `restricted`, because a withheld call going out with the
+real number is the failure that matters.
+
+For deployments not using the LCR API the script-level twins are
+`call.set_caller_id(number)` and `call.restrict_caller_id()`, called before
+`call.dial()` / `call.route()`.
+
 ## Reroute causes (some carriers don't play nice)
 
 Failover only happens on a **reroute cause** — a SIP code that means "this

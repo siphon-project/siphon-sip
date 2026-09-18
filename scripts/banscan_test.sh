@@ -33,7 +33,7 @@ trap cleanup EXIT
 # listener on 127.0.0.1:<port> is MORE specific, so the kernel routes the
 # clients' loopback connections to *it* and this harness silently grades another
 # process — which looks exactly like a real regression. Refuse to start instead.
-for port in 5560 5562; do
+for port in 5560 5562 5564 5565; do
   if ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN; then
     echo "REFUSING TO RUN: something is already listening on port $port."
     echo "This harness would test that process instead of the siphon under test."
@@ -42,8 +42,16 @@ for port in 5560 5562; do
   fi
 done
 
-echo "=== build siphon image ==="
-docker build -t "$IMAGE" "$REPO_ROOT" >/dev/null
+# CI loads sipp-siphon from the build-image job; rebuilding here would redo a
+# ~10 minute image that is already present. Build only when it is absent, which
+# is the local case.
+if docker image inspect sipp-siphon:latest >/dev/null 2>&1; then
+  echo "=== reusing the existing sipp-siphon image ==="
+  IMAGE="sipp-siphon:latest"
+else
+  echo "=== build siphon image ==="
+  docker build -t "$IMAGE" "$REPO_ROOT" >/dev/null
+fi
 
 echo "=== start siphon (host net; failed_auth_ban threshold=3) ==="
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -77,6 +85,17 @@ if python3 "$DIR/httpprobe_client.py"; then
   echo "PASS: non-SIP probe closed unanswered and banned at accept"
 else
   fail "non-SIP probe not dropped/counted — a scanner can probe indefinitely" $?
+fi
+
+echo "=== restart siphon (empty ban store for the proxy-front phase) ==="
+docker restart "$CONTAINER" >/dev/null
+sleep 4
+
+echo "=== run proxy-front client (the ban must name the client, not the front) ==="
+if python3 "$DIR/proxyfront_client.py"; then
+  echo "PASS: the abuser behind the front was banned and the front was not"
+else
+  fail "auto-ban keyed on the wrong address behind a front" $?
 fi
 
 echo "=== restart siphon (empty ban store for the ws upgrade probe) ==="

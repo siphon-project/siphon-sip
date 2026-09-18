@@ -96,6 +96,7 @@ pub(super) fn udp_transport(remote: &str) -> LegTransport {
 
 pub(super) fn inbound_from(remote: &str) -> InboundMessage {
     InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: address("192.0.2.1:5060"),
