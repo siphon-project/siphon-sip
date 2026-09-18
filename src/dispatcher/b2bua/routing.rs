@@ -572,3 +572,81 @@ pub fn b2bua_dispatch_burned_routes(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::registrar::{Contact, ContactKind};
+    use crate::script::api::registrar::PyContact;
+    use crate::sip::uri::SipUri;
+    use crate::transport::{ConnectionId, InboundMessage, Transport};
+
+    /// RFC 5626 connection reuse is written `call.flow == contact.flow`, and a
+    /// `Flow`'s transport is part of its equality *and* its hash. So the
+    /// REGISTER-time derivation (`Contact::flow`) and the request-time one
+    /// ([`py_flow_from_inbound`](super::py_flow_from_inbound)) have to agree —
+    /// and both must keep naming the **hop**.
+    ///
+    /// Behind a TLS-terminating front the client's transport differs from the
+    /// hop, so letting either side pick the client's transport up instead would
+    /// silently stop the two matching, breaking connection reuse for exactly the
+    /// WebSocket UEs that have no other way back (RFC 7118 §5).
+    #[test]
+    fn a_proxied_binding_still_matches_a_request_on_the_same_connection() {
+        let local_addr: std::net::SocketAddr = "127.0.0.1:443".parse().expect("listener address");
+        let source_addr: std::net::SocketAddr = "192.0.2.10:51234".parse().expect("UE address");
+        let connection_id = 0xc0ffee_u64;
+
+        // The binding as the registrar stored it for a UE that reached a
+        // WSS-terminating front and arrived here as plain WS.
+        let contact = Contact {
+            uri: SipUri::new("192.0.2.10".to_string()).with_user("alice".to_string()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires_secs: 3600,
+            call_id: "edge-tls".into(),
+            cseq: 1,
+            source_addr: Some(source_addr),
+            source_transport: Some(Transport::WebSocket),
+            client_transport: Some(Transport::WebSocketSecure),
+            sip_instance: None,
+            reg_id: None,
+            path: Box::default(),
+            pending: false,
+            instance: None,
+            flow_token: None,
+            inbound_local_addr: Some(local_addr),
+            inbound_connection_id: Some(connection_id),
+            params: Vec::new(),
+            kind: ContactKind::Ue,
+            auth_user: None,
+        };
+        let binding_flow = PyContact::from_rust_contact(&contact)
+            .flow()
+            .expect("a stream binding with a captured flow has one");
+
+        // A later request over that same accepted connection, via the same front.
+        let inbound = InboundMessage {
+            connection_id: ConnectionId(connection_id),
+            transport: Transport::WebSocket,
+            client_transport: Some(Transport::WebSocketSecure),
+            local_addr,
+            remote_addr: source_addr,
+            data: bytes::Bytes::new(),
+        };
+        let request_flow =
+            super::py_flow_from_inbound(&inbound).expect("an inbound message always yields a flow");
+
+        assert_eq!(
+            binding_flow.transport, "ws",
+            "the binding's flow names the hop, not the client's transport at the front"
+        );
+        assert_eq!(
+            request_flow.transport, "ws",
+            "the request's flow names the hop too, or the two can never match"
+        );
+        assert_eq!(
+            binding_flow, request_flow,
+            "call.flow == contact.flow must still hold behind a front"
+        );
+    }
+}

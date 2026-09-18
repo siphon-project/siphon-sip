@@ -65,6 +65,78 @@ fn test_round_trip() {
     );
 }
 
+/// A parsed message goes back out in canonical header order, whatever order it
+/// arrived in: the proxy-processing headers first (RFC 3261 §7.3.1), then the
+/// dialog-identifying ones, then the `Content-*` group with `Content-Length`
+/// last. The input below is deliberately scrambled.
+#[test]
+fn serializes_headers_in_canonical_order() {
+    let raw = concat!(
+        "INVITE sip:user@example.com SIP/2.0\r\n",
+        "Content-Length: 0\r\n",
+        "Allow: INVITE, ACK, BYE\r\n",
+        "Content-Type: application/sdp\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "Call-ID: a84b4c76e66710@192.0.2.10\r\n",
+        "To: <sip:user@example.com>\r\n",
+        "From: <sip:caller@example.com>;tag=1928301774\r\n",
+        "Max-Forwards: 70\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK776asdhds\r\n",
+        "\r\n",
+    );
+
+    let message = siphon::sip::parse_sip_message(raw).unwrap().1;
+    let wire = String::from_utf8(message.to_bytes()).unwrap();
+    let names: Vec<&str> = wire
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+        .collect();
+
+    assert_eq!(
+        names,
+        vec![
+            "Via",
+            "Max-Forwards",
+            "From",
+            "To",
+            "Call-ID",
+            "CSeq",
+            "Allow",
+            "Content-Type",
+            "Content-Length",
+        ]
+    );
+}
+
+/// Re-parsing siphon's own output and serialising it again must produce the
+/// same bytes — the ordering has to be a fixed point, or a message relayed
+/// through two siphons would keep being rewritten.
+#[test]
+fn serialization_order_is_a_fixed_point() {
+    let raw = concat!(
+        "SIP/2.0 200 OK\r\n",
+        "Content-Length: 0\r\n",
+        "Supported: timer,replaces\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK776asdhds\r\n",
+        "From: <sip:caller@example.com>;tag=1928301774\r\n",
+        "To: <sip:user@example.com>;tag=sb-f7d98a826abb\r\n",
+        "Call-ID: a84b4c76e66710@192.0.2.10\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "\r\n",
+    );
+
+    let once = siphon::sip::parse_sip_message(raw).unwrap().1.to_bytes();
+    let once_str = String::from_utf8(once.clone()).unwrap();
+    let twice = siphon::sip::parse_sip_message(&once_str)
+        .unwrap()
+        .1
+        .to_bytes();
+
+    assert_eq!(once, twice);
+}
+
 /// Test body handling
 #[test]
 fn test_body_handling() {

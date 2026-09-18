@@ -114,6 +114,7 @@ class Request:
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
         transport: str = "udp",
+        client_transport: Optional[str] = None,
         source_ip: str = "127.0.0.1",
         source_port: int = 5060,
         user_agent: Optional[str] = None,
@@ -134,6 +135,7 @@ class Request:
         self._body = body
         self._content_type = content_type
         self._transport = transport
+        self._client_transport = client_transport
         self._source_ip = source_ip
         self._source_port = source_port
         self._user_agent = user_agent
@@ -217,8 +219,48 @@ class Request:
 
     @property
     def transport(self) -> str:
-        """Transport protocol: ``"udp"``, ``"tcp"``, ``"tls"``, ``"ws"``, ``"wss"``."""
+        """Transport protocol: ``"udp"``, ``"tcp"``, ``"tls"``, ``"ws"``, ``"wss"``.
+
+        Always the hop siphon accepted — the socket a peer must come back to.
+        Behind a connection-terminating front that is the *front's* transport,
+        not the phone's; read :attr:`client_transport` for that.
+        """
         return self._transport
+
+    @property
+    def client_transport(self) -> Optional[str]:
+        """Transport the client used to reach the front, or ``None``.
+
+        Populated only on a ``proxy_protocol`` listener, from the PROXY v2
+        ``PP2_TYPE_SSL`` TLV.  A re-encrypting front terminates the phone's TLS
+        and opens its own plaintext connection, so :attr:`transport` reads
+        ``"tcp"`` while this reads ``"tls"`` — that TLV is the only place the
+        phone's transport exists.
+
+        ``None`` does not mean insecure: it means nothing contradicts the hop,
+        so the client's transport *is* :attr:`transport`.  Prefer
+        :attr:`client_is_secure` over comparing this yourself.
+        """
+        return self._client_transport
+
+    @property
+    def client_is_secure(self) -> bool:
+        """Whether the client reached siphon over a secure transport.
+
+        Answers for the client's own hop, whichever it was: the front-declared
+        transport when there is one, otherwise :attr:`transport`.  So a UA that
+        connected straight to a TLS listener and one that reached a
+        TLS-terminating front both report ``True``::
+
+            @proxy.on_request("REGISTER")
+            def register(request):
+                if not request.client_is_secure:
+                    request.reply(403, "TLS Required")
+                    return
+                registrar.save(request)
+        """
+        effective = self._client_transport or self._transport
+        return effective in ("tls", "wss")
 
     @property
     def source_ip(self) -> str:

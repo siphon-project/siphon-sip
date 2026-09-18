@@ -44,7 +44,8 @@ pub use b2bua::{B2buaConfig, SessionRefresher, SessionTimerConfig};
 pub use cdr::{CdrFileConfig, CdrHttpConfig, CdrSinkConfig, CdrSyslogConfig, CdrYamlConfig};
 pub use charging::{RfConfig, RoConfig};
 pub use control::{
-    ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits, ControlTlsConfig,
+    unimplemented_on_lost, ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits,
+    ControlTlsConfig,
 };
 pub use diameter::{
     DiameterApplication, DiameterClientEntry, DiameterConfig, DiameterCxConfig,
@@ -413,7 +414,61 @@ impl Config {
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
         config.validate_control_connect_urls()?;
+        config.validate_listen()?;
         Ok(config)
+    }
+
+    /// Reject a `listen:` entry siphon cannot honour.
+    ///
+    /// At load, because `ListenEntry` is `#[serde(untagged)]` with no
+    /// `deny_unknown_fields`: a misspelled key parses as the extended form with
+    /// the field defaulted, so a listener that looks configured silently is not.
+    ///
+    /// `proxy_protocol` is the reason this exists. A PROXY header lets its
+    /// sender claim any source address, so an allowlist is mandatory, its
+    /// entries have to be CIDRs siphon actually parsed (the `trusted_cidrs`
+    /// consumers each drop an unparseable entry silently, which is the failure
+    /// this avoids repeating), and the option only means anything on a stream
+    /// transport — on UDP the reply destination *is* the peer address, so
+    /// rewriting it would send every answer past the front.
+    fn validate_listen(&self) -> Result<()> {
+        for (transport, entries) in [
+            ("udp", &self.listen.udp),
+            ("tcp", &self.listen.tcp),
+            ("tls", &self.listen.tls),
+            ("ws", &self.listen.ws),
+            ("wss", &self.listen.wss),
+        ] {
+            for entry in entries {
+                let Some(proxy) = entry.proxy_protocol() else {
+                    continue;
+                };
+                let address = entry.address();
+                if transport == "udp" {
+                    return Err(SiphonError::Config(format!(
+                        "listen.udp[{address}].proxy_protocol: the PROXY protocol is a stream \
+                         transport feature — a UDP reply goes to the peer address, so taking the \
+                         client's from a header would send every answer past the proxy"
+                    )));
+                }
+                if proxy.from.is_empty() {
+                    return Err(SiphonError::Config(format!(
+                        "listen.{transport}[{address}].proxy_protocol.from: name the proxies \
+                         allowed to assert a client address — a header from anywhere else is a \
+                         source-address forgery, and there is deliberately no default"
+                    )));
+                }
+                for cidr in &proxy.from {
+                    if cidr.parse::<ipnet::IpNet>().is_err() {
+                        return Err(SiphonError::Config(format!(
+                            "listen.{transport}[{address}].proxy_protocol.from: '{cidr}' is not a \
+                             CIDR (for a single host write '198.51.100.7/32')"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject a `control.tls` block siphon cannot serve.
@@ -700,18 +755,10 @@ impl Config {
             let Some(policy) = app.on_lost.as_deref() else {
                 continue;
             };
-            if policy != "hangup" && policy != "continue" {
+            if let Some(refusal) = unimplemented_on_lost(policy) {
                 return Err(SiphonError::Config(format!(
-                    "control.apps[{:?}].on_lost is {policy:?}, which siphon does not implement \
-                     — it is \"hangup\" (end the call, the default) or \"continue\" (leave it \
-                     running without an owner). {}",
-                    app.name,
-                    if policy == "fallback" {
-                        "`fallback` would re-dispatch through the Python handlers, which does \
-                         not exist; it behaved as `hangup`."
-                    } else {
-                        ""
-                    }
+                    "control.apps[{:?}].on_lost {refusal}",
+                    app.name
                 )));
             }
         }

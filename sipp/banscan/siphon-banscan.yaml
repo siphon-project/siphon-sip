@@ -4,8 +4,20 @@
 listen:
   tcp:
     - "0.0.0.0:5560"
+    # The same instance, seen through a connection-terminating front. The
+    # "front" is the test client on loopback; what it asserts in the header is
+    # the address the ban has to land on.
+    - address: "0.0.0.0:5564"
+      proxy_protocol:
+        from:
+          - "127.0.0.1/32"
   ws:
     - "0.0.0.0:5562"
+
+# Read-only view of the ban store, so the harness can assert WHICH address was
+# banned rather than inferring it from a dropped connection.
+admin:
+  listen: "127.0.0.1:5565"
 domain:
   local: ["127.0.0.1", "0.0.0.0"]
 script:

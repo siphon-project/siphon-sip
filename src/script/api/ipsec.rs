@@ -825,16 +825,25 @@ fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
 }
 
 /// Map an internal :data:`SaProtocol` to the value reported on
-/// :attr:`SecurityServerParams.protocol`, with `Any` collapsing to
-/// ``"udp"``.  The field is informational: siphon's ``Security-Server``
-/// carries no transport ``protocol=`` parameter for any SA, because no
-/// sec-agree spec defines one (RFC 3329 §2.2 and Appendix A, 3GPP
-/// TS 33.203 Annex H) and one pair carries UDP and TCP alike
-/// (TS 33.203 §6.3, §7.1).
+/// :attr:`SecurityServerParams.protocol`.
+///
+/// Reports what the SA actually covers, including ``"any"`` for the
+/// multi-protocol default — the same vocabulary :attr:`SAHandle.protocol`
+/// already uses, so the two views of one SA agree.
+///
+/// It used to collapse ``Any`` to ``"udp"`` because the value was written
+/// onto the wire as the ``Security-Server`` ``protocol=`` parameter, where
+/// RFC 3329 treats an absent parameter as UDP. siphon no longer emits that
+/// parameter for any SA — no sec-agree spec defines one (RFC 3329 §2.2 and
+/// Appendix A, 3GPP TS 33.203 Annex H, whose own ``prot=`` means ah/esp) —
+/// so the only reader left is the script, and telling it ``"udp"`` about a
+/// pair that carries UDP and TCP alike (TS 33.203 §6.3, §7.1) is simply
+/// wrong: a script gating on it would refuse the TCP half of its own SA.
 fn format_params_protocol(sa_protocol: SaProtocol) -> String {
     match sa_protocol {
-        SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
+        SaProtocol::Udp => "udp".to_string(),
         SaProtocol::Tcp => "tcp".to_string(),
+        SaProtocol::Any => "any".to_string(),
     }
 }
 
@@ -1893,17 +1902,41 @@ mod tests {
         assert!(error.contains("sctp"));
     }
 
-    /// `Any` collapses to ``"udp"`` on the informational
-    /// :attr:`SecurityServerParams.protocol`.  Nothing on the wire turns
-    /// on it: siphon emits no ``protocol=`` parameter on a
-    /// ``Security-Server``, for any SA, because no sec-agree spec
-    /// defines one (RFC 3329 §2.2 and Appendix A, 3GPP TS 33.203
-    /// Annex H).
+    /// :attr:`SecurityServerParams.protocol` names what the SA covers, so the
+    /// multi-protocol default says ``"any"`` rather than claiming UDP.
+    ///
+    /// It reported ``"udp"`` while the value was written onto the wire as the
+    /// ``Security-Server`` ``protocol=`` parameter, where RFC 3329 reads an
+    /// absent parameter as UDP. siphon emits no such parameter for any SA —
+    /// no sec-agree spec defines one (RFC 3329 §2.2 and Appendix A, 3GPP
+    /// TS 33.203 Annex H) — so the only reader is the script, and a pair that
+    /// carries UDP and TCP alike (TS 33.203 §6.3, §7.1) must not describe
+    /// itself as UDP-only.
     #[test]
-    fn format_params_protocol_collapses_any_to_udp_for_wire() {
-        assert_eq!(format_params_protocol(SaProtocol::Any), "udp");
+    fn params_protocol_names_what_the_sa_actually_covers() {
+        assert_eq!(
+            format_params_protocol(SaProtocol::Any),
+            "any",
+            "the default pair carries UDP and TCP; reporting 'udp' would have a \
+             script refuse the TCP half of its own SA"
+        );
         assert_eq!(format_params_protocol(SaProtocol::Udp), "udp");
         assert_eq!(format_params_protocol(SaProtocol::Tcp), "tcp");
+    }
+
+    /// The two views of one SA agree. `SAHandle.protocol` has always reported
+    /// the selector mode; `SecurityServerParams.protocol` used to disagree with
+    /// it for the default pair, calling the same SA "udp" that the handle
+    /// called "any".
+    #[test]
+    fn the_two_protocol_views_of_one_sa_agree() {
+        for mode in [SaProtocol::Any, SaProtocol::Udp, SaProtocol::Tcp] {
+            assert_eq!(
+                format_params_protocol(mode),
+                mode.as_str(),
+                "SecurityServerParams and SAHandle must name the same SA identically"
+            );
+        }
     }
 
     /// `activate(hard_lifetime_secs=…)` flips the metadata to Active and

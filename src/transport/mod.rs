@@ -4,6 +4,7 @@ pub mod crlf_keepalive;
 pub mod flow;
 pub mod mux;
 pub mod pool;
+pub mod proxy_protocol;
 pub mod rate_limit;
 #[cfg(feature = "sctp")]
 pub mod sctp;
@@ -280,10 +281,37 @@ pub struct ConnectionId(pub u64);
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub connection_id: ConnectionId,
+    /// The hop siphon accepted. Decides which connection map and pool the bytes
+    /// belong to, which token goes in Via / Contact / Record-Route, and which
+    /// key the advertised address is looked up under.
     pub transport: Transport,
+    /// What the *client* spoke, when a front said so and it differs from the hop.
+    ///
+    /// Set only from a verified v2 `PP2_TYPE_SSL` TLV on a `proxy_protocol`
+    /// listener. A re-encrypting front terminates the phone's TLS and opens its
+    /// own plaintext connection, so `transport` is TCP while the client used
+    /// TLS — this is the only place that fact exists.
+    ///
+    /// Deliberately parallel to `transport` rather than replacing it: the two
+    /// are different facts, and overwriting the hop would route a reply for a
+    /// plaintext socket over a TLS map. `None` means nothing contradicts the
+    /// hop, so the client's transport is the hop's.
+    pub client_transport: Option<Transport>,
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
     pub data: Bytes,
+}
+
+impl InboundMessage {
+    /// The transport to describe this message's *sender* by: what the client
+    /// spoke when a front declared it, else the hop it arrived on.
+    ///
+    /// For descriptive consumers only — records and displays. Anything that has
+    /// to reach the peer again must use [`transport`](Self::transport), which
+    /// names the socket the reply goes back over.
+    pub fn client_or_hop_transport(&self) -> Transport {
+        self.client_transport.unwrap_or(self.transport)
+    }
 }
 
 /// Transport protocol variant.
@@ -403,6 +431,30 @@ impl Transport {
             "sctp" => Some(Transport::Sctp),
             _ => None,
         }
+    }
+
+    /// The secure sibling of this transport.
+    ///
+    /// A v2 `PP2_TYPE_SSL` TLV reports that the client used TLS, not *which*
+    /// transport it used, so the client's transport is the secure form of the
+    /// hop the front then opened: a WebSocket hop means the client spoke WSS,
+    /// anything else means TLS. The already-secure forms map to themselves, so
+    /// a front that re-encrypts onto TLS and still sends the TLV agrees with
+    /// the hop instead of contradicting it.
+    ///
+    /// `Sctp` maps to itself: this enum has no SCTP-over-TLS variant, and the
+    /// PROXY protocol is only read on the TCP-based listeners anyway.
+    pub const fn secure_form(self) -> Transport {
+        match self {
+            Transport::WebSocket | Transport::WebSocketSecure => Transport::WebSocketSecure,
+            Transport::Udp | Transport::Tcp | Transport::Tls => Transport::Tls,
+            Transport::Sctp => Transport::Sctp,
+        }
+    }
+
+    /// Whether this transport protects the traffic it carries.
+    pub const fn is_secure(self) -> bool {
+        matches!(self, Transport::Tls | Transport::WebSocketSecure)
     }
 }
 
@@ -1133,6 +1185,7 @@ mod tests {
         let message = InboundMessage {
             connection_id: ConnectionId(1),
             transport: Transport::Udp,
+            client_transport: None,
             local_addr: "127.0.0.1:5060".parse().unwrap(),
             remote_addr: "192.168.1.1:50000".parse().unwrap(),
             data: Bytes::from_static(b"INVITE sip:bob@example.com SIP/2.0\r\n\r\n"),

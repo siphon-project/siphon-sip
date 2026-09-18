@@ -97,9 +97,17 @@ fn allow(message: &SipMessage) -> Option<Vec<String>> {
 }
 
 /// Dial `caller`'s call to [`CALLEE`] under `policy` and return the B-leg
-/// INVITE siphon sent. A `policy` of `None` leaves the call on the configured
-/// default (`transparent-b2bua@2026`).
+/// INVITE siphon sent, parsed. A `policy` of `None` leaves the call on the
+/// configured default (`transparent-b2bua@2026`).
 fn b_leg_invite(caller: &str, policy: Option<ResolvedPolicy>) -> SipMessage {
+    parse_sip_message_bytes(&b_leg_invite_bytes(caller, policy))
+        .expect("siphon sent a B-leg INVITE that parses")
+}
+
+/// The same B-leg INVITE as [`b_leg_invite`], as the bytes that went out.
+/// Parsing normalises a message into a header map, which is exactly where
+/// header *order* is lost, so anything asserting on order has to read this.
+fn b_leg_invite_bytes(caller: &str, policy: Option<ResolvedPolicy>) -> Vec<u8> {
     let dispatcher = test_dispatcher();
     let call_id = dispatcher.state.call_actors.create_call(Leg::new_a_leg(
         "b-leg-caps@192.0.2.10".to_string(),
@@ -137,7 +145,14 @@ fn b_leg_invite(caller: &str, policy: Option<ResolvedPolicy>) -> SipMessage {
         &dispatcher.state,
     );
     assert!(dialled, "the B-leg INVITE was not sent");
-    invite_to(wire(&dispatcher), CALLEE)
+
+    let mut invite = None;
+    while let Ok(outbound) = dispatcher.udp.try_recv() {
+        if outbound.destination.to_string() == CALLEE && outbound.data.starts_with(b"INVITE ") {
+            invite = Some(outbound.data.to_vec());
+        }
+    }
+    invite.unwrap_or_else(|| panic!("no INVITE to {CALLEE}"))
 }
 
 /// A built-in preset by name, with no per-call deltas.
@@ -377,6 +392,7 @@ async fn the_b_leg_allow_is_siphons_method_set() {
 fn b_leg_invite_from_script(script: &str) -> SipMessage {
     let dispatcher = test_dispatcher_with_script(script);
     let inbound = InboundMessage {
+        client_transport: None,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         local_addr: dispatcher.state.local_addr,
@@ -593,5 +609,56 @@ async fn relayed_responses_follow_the_per_call_deltas() {
             "resource-priority",
             "replaces"
         ])
+    );
+}
+
+/// The reported regression, on the path that produced it.
+///
+/// `Supported` and `Allow` are settled by a `remove` + re-add — that is what
+/// makes them siphon's claims rather than a relay of the caller's — and a
+/// `remove` moves the header to the end of the map. Before the wire order was
+/// owned by the serializer they went out *after* `Content-Length`, as did every
+/// header injected once the body had been accounted for. None of the capability
+/// logic changes here; the message just goes out in a fixed order.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_b_leg_invite_goes_out_in_canonical_header_order() {
+    let wire =
+        String::from_utf8(b_leg_invite_bytes(CALLER_INVITE, None)).expect("siphon sent UTF-8");
+    let names: Vec<&str> = wire
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+        .collect();
+
+    assert_eq!(
+        names.first(),
+        Some(&"Via"),
+        "Via leads the message (RFC 3261 §7.3.1), got {names:?}"
+    );
+    assert_eq!(
+        names.last(),
+        Some(&"Content-Length"),
+        "Content-Length is the last header, got {names:?}"
+    );
+
+    let position = |name: &str| {
+        names
+            .iter()
+            .position(|listed| listed.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("no {name} on the B-leg INVITE, got {names:?}"))
+    };
+    let content_length = position("Content-Length");
+    assert!(
+        position("Supported") < content_length,
+        "Supported must precede Content-Length, got {names:?}"
+    );
+    assert!(
+        position("Allow") < content_length,
+        "Allow must precede Content-Length, got {names:?}"
+    );
+    assert!(
+        position("Contact") < position("Supported"),
+        "the dialog headers lead the discretionary ones, got {names:?}"
     );
 }

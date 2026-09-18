@@ -1470,13 +1470,14 @@ impl PyCall {
     ///
     /// A handoff deadline protects against an absent/slow controller: if no
     /// controller accepts and acts in time, ``on_lost``'s sibling default action
-    /// fires (a ``503`` by default, or a fallback re-dispatch), so a dead
-    /// controller degrades instead of hanging calls.
+    /// fires (a ``503`` by default), so a dead controller degrades instead of
+    /// hanging calls.
     ///
     /// Args:
     ///     app: The control app name (must be configured in ``control.apps``).
     ///     on_lost: What to do if the owning connection is lost mid-call —
-    ///         ``"hangup"`` (default), ``"continue"``, or ``"fallback"``.
+    ///         ``"hangup"`` (end the call, the default) or ``"continue"``
+    ///         (leave it running without an owner).
     ///     deadline_ms: Handoff deadline in milliseconds; ``None`` uses
     ///         ``control.limits.handoff_deadline_ms``.
     ///     vars: Per-call variables seeded into the control channel, readable +
@@ -1524,9 +1525,9 @@ impl PyCall {
             ));
         }
         if let Some(policy) = on_lost {
-            if !matches!(policy, "hangup" | "continue" | "fallback") {
+            if let Some(refusal) = crate::config::unimplemented_on_lost(policy) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "call.handover(on_lost=…) must be 'hangup', 'continue', or 'fallback' (got '{policy}')"
+                    "call.handover(on_lost=…) {refusal}"
                 )));
             }
         }
@@ -2981,13 +2982,42 @@ mod tests {
         assert!(call
             .handover("app", Some("explode"), None, None, false, None, None)
             .is_err());
-        // Valid policies are accepted.
+        // The implemented policies are accepted.
         assert!(call
             .handover("app", Some("continue"), None, None, false, None, None)
             .is_ok());
         assert!(call
-            .handover("app", Some("fallback"), None, None, false, None, None)
+            .handover("app", Some("hangup"), None, None, false, None, None)
             .is_ok());
+    }
+
+    /// `fallback` was whitelisted here and implemented nowhere: the control-loss
+    /// path ends the call for every policy that is not `continue`, so a script
+    /// that asked to keep its calls alive when the controller dies got exactly
+    /// the opposite, on every call, with nothing saying so. Config load has
+    /// always refused it; the verb that sets it per call refuses it too.
+    #[test]
+    fn call_handover_refuses_the_unimplemented_fallback_policy() {
+        pyo3::Python::initialize();
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        let error = call
+            .handover("app", Some("fallback"), None, None, false, None, None)
+            .expect_err("an unimplemented on_lost must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("fallback") && text.contains("not implement"),
+            "the refusal must say fallback is not implemented: {text}"
+        );
+        assert!(
+            text.contains("hangup") && text.contains("continue"),
+            "and name the policies that do exist: {text}"
+        );
     }
 
     #[test]
@@ -3359,6 +3389,7 @@ mod tests {
     /// `registrar.lookup()` hands it to a script.
     fn binding_with_path(uri: &str, path: Vec<String>) -> super::super::registrar::PyContact {
         let contact = crate::registrar::Contact {
+            client_transport: None,
             uri: crate::sip::parser::parse_uri_standalone(uri).unwrap(),
             q: 1.0,
             registered_at: std::time::Instant::now(),

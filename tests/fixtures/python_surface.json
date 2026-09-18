@@ -455,6 +455,10 @@
         "doc": "Identity the REGISTER that stored this binding authenticated as: its",
         "kind": "getset_descriptor"
       },
+      "client_transport": {
+        "doc": "Transport the client used to reach the front when this binding was",
+        "kind": "getset_descriptor"
+      },
       "expires": {
         "doc": "Seconds remaining until this contact expires.",
         "kind": "getset_descriptor"
@@ -1731,6 +1735,14 @@
       },
       "call_id": {
         "doc": "Call-ID header value.",
+        "kind": "getset_descriptor"
+      },
+      "client_is_secure": {
+        "doc": "Whether the client reached siphon over a secure transport.",
+        "kind": "getset_descriptor"
+      },
+      "client_transport": {
+        "doc": "Transport the client used to reach the front (\"tls\", \"wss\", \u2026), or",
         "kind": "getset_descriptor"
       },
       "consumed_route": {

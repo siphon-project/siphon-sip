@@ -144,6 +144,10 @@ pub async fn listen(
                                         let message = InboundMessage {
                                             connection_id,
                                             transport: Transport::Sctp,
+                                            // No PROXY header is read on the
+                                            // SCTP listener, so the hop is all
+                                            // there is.
+                                            client_transport: None,
                                             local_addr: local,
                                             remote_addr,
                                             data,

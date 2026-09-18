@@ -87,6 +87,44 @@ pub(super) fn cdr_session_from_invite(
     Some((cdr_dialog_key(&call_id, &from_tag), session))
 }
 
+/// Stamp the next hop a call was sent to onto its tracked CDR session. No-op if
+/// untracked. See [`crate::cdr::CdrSession::set_destination_ip`].
+pub(super) fn cdr_stamp_destination(
+    sessions: &DashMap<String, crate::cdr::CdrSession>,
+    key: &str,
+    destination: std::net::IpAddr,
+) {
+    if let Some(mut session) = sessions.get_mut(key) {
+        session.set_destination_ip(destination.to_string());
+    }
+}
+
+/// Stamp the next hop onto the record tracked for `invite`'s dialog.
+///
+/// Called from the send paths, which have the resolved destination but not the
+/// CDR key, and run for every method — so both the auto-emit check and the
+/// INVITE check come before the key is built, and neither the key allocation
+/// nor the map lookup happens on the in-dialog path.
+pub(super) fn cdr_stamp_destination_for_invite(
+    sessions: &DashMap<String, crate::cdr::CdrSession>,
+    invite: &SipMessage,
+    destination: std::net::IpAddr,
+) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    if invite.method() != Some(&crate::sip::message::Method::Invite) {
+        return;
+    }
+    let (Some(call_id), Some(from_tag)) = (
+        invite.headers.get("Call-ID").map(|s| s.to_string()),
+        invite.typed_from().ok().flatten().and_then(|na| na.tag),
+    ) else {
+        return;
+    };
+    cdr_stamp_destination(sessions, &cdr_dialog_key(&call_id, &from_tag), destination);
+}
+
 /// Stamp the answer time on a tracked CDR session. No-op if untracked.
 pub(super) fn cdr_mark_answer(state: &DispatcherState, key: &str, response_code: u16) {
     if let Some(mut session) = state.cdr_sessions.get_mut(key) {
@@ -152,6 +190,8 @@ pub(super) fn cdr_emit_register(aor: &str, event_type: &str) {
 /// Each leg's figures are flattened into `extra`: index 0 → `near_`, index 1 →
 /// `far_`, any further leg → `leg{n}_`. Unmeasured optional fields (a plain
 /// in-kernel relay leg has no MOS/loss/jitter) are omitted, not emitted empty.
+/// `{prefix}_remote_address` is the media-plane peer — the egress address on
+/// the media side, which the SIP-side `destination_ip` does not stand in for.
 pub(super) fn media_summary_to_cdr(
     summary: &crate::rtpengine::events::CallSummary,
 ) -> crate::cdr::Cdr {
@@ -184,6 +224,22 @@ pub(super) fn media_summary_to_cdr(
         put("tag", leg.tag.clone());
         if let Some(codec) = &leg.codec {
             put("codec", codec.clone());
+        }
+        // The media-plane peer for this leg. The only egress address a record
+        // carries: a call anchored through a media engine need not send its
+        // media where it sent the signalling, so this is not a duplicate of the
+        // SIP-side `destination_ip`.
+        if let Some(remote) = leg.remote_address {
+            put("remote_address", remote.to_string());
+        }
+        if let Some(local) = leg.local_address {
+            put("local_address", local.to_string());
+        }
+        if let Some(payload_type) = leg.payload_type {
+            put("payload_type", payload_type.to_string());
+        }
+        if let Some(egress_ssrc) = leg.egress_ssrc {
+            put("egress_ssrc", egress_ssrc.to_string());
         }
         put("packets_in", leg.packets_in.to_string());
         put("bytes_in", leg.bytes_in.to_string());

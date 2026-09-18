@@ -233,10 +233,29 @@ fn bench_serialize(criterion: &mut Criterion) {
     let (_, message) = parse_sip_message(&invite_sdp).expect("setup parse invite+sdp");
     let wire_len = message.to_bytes().len() as u64;
 
+    // Same message with its headers out of canonical order, so serialization
+    // takes the sorting path instead of the already-ordered one. This is what a
+    // B2BUA leg looks like after the capability settling (a `remove` + re-add)
+    // and the post-body header injections: a handful of entries that belong
+    // before `Content-Length` sitting after it.
+    let mut unsorted = message.clone();
+    for name in ["Supported", "Allow", "P-Charging-Vector"] {
+        let value = unsorted
+            .headers
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "timer,replaces".to_string());
+        unsorted.headers.remove(name);
+        unsorted.headers.add(name, value);
+    }
+
     let mut group = criterion.benchmark_group("serialize");
     group.throughput(Throughput::Bytes(wire_len));
     group.bench_function("invite_sdp_to_bytes", |bencher| {
         bencher.iter(|| black_box(black_box(&message).to_bytes()));
+    });
+    group.bench_function("invite_unsorted_to_bytes", |bencher| {
+        bencher.iter(|| black_box(black_box(&unsorted).to_bytes()));
     });
     group.finish();
 }

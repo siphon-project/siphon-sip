@@ -205,6 +205,9 @@ pub struct PyContact {
     kind_value: crate::registrar::ContactKind,
     /// Identity the REGISTER that stored this binding authenticated as.
     auth_user_value: Option<String>,
+    /// Transport the client used to reach the front, when a PROXY header
+    /// declared one that differs from the hop the REGISTER arrived on.
+    client_transport_value: Option<String>,
 }
 
 #[pymethods]
@@ -327,6 +330,18 @@ impl PyContact {
         self.flow_value.clone()
     }
 
+    /// Transport the client used to reach the front when this binding was
+    /// registered ("tls", "wss", …), or ``None`` when no front declared one.
+    ///
+    /// Descriptive, like :attr:`received`: it records that a UE behind a
+    /// TLS-terminating front spoke TLS even though siphon accepted the REGISTER
+    /// over plain TCP. Routing still follows :attr:`flow` and the Contact URI,
+    /// which name the socket the UE is actually reachable on.
+    #[getter]
+    pub(crate) fn client_transport(&self) -> Option<&str> {
+        self.client_transport_value.as_deref()
+    }
+
     /// What kind of binding this is — ``"ue"`` (default) or ``"as"``.
     ///
     /// ``"as"`` contacts come from
@@ -446,6 +461,9 @@ impl PyContact {
             instance_epoch_value: contact.instance_epoch().map(str::to_string),
             is_local_value,
             flow_token_value: contact.flow_token.as_ref().map(|v| v.to_string()),
+            client_transport_value: contact
+                .client_transport
+                .map(|transport| transport.as_scheme().to_string()),
             flow_value,
             params_value: contact.params.clone(),
             kind_value: contact.kind,
@@ -617,6 +635,9 @@ impl PyRegistrar {
             flow_token: flow_token.as_deref().map(Box::from),
             inbound_local_addr: request.inbound_local_addr(),
             inbound_connection_id: request.inbound_connection_id_u64(),
+            client_transport: request
+                .client_transport_name()
+                .and_then(crate::transport::Transport::from_scheme),
         };
 
         // Extract expires from Expires header or default
@@ -857,6 +878,9 @@ impl PyRegistrar {
             flow_token: flow_token.as_deref().map(Box::from),
             inbound_local_addr: request.inbound_local_addr(),
             inbound_connection_id: request.inbound_connection_id_u64(),
+            client_transport: request
+                .client_transport_name()
+                .and_then(crate::transport::Transport::from_scheme),
         };
 
         let cseq_seq = request_msg
@@ -2207,6 +2231,7 @@ mod tests {
     #[test]
     fn py_contact_display() {
         let contact = PyContact {
+            client_transport_value: None,
             uri_string: "sip:alice@10.0.0.1".to_string(),
             q_value: 1.0,
             expires_remaining: 3600,
@@ -2709,6 +2734,7 @@ mod tests {
     #[test]
     fn pycontact_reconstitutes_flow_for_udp() {
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2768,6 +2794,7 @@ mod tests {
         // (is_local=false) falls back to URI routing — its connection_id is
         // meaningless on this process.
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("df7jal23ls0d.invalid".to_string()).with_user("bob".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2816,6 +2843,7 @@ mod tests {
         // captured connection_id is not.
         let path = vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()];
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("10.0.0.2".to_string()).with_user("bob".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2854,6 +2882,7 @@ mod tests {
         // (None) — for UDP, the connection_id is a deterministic hash
         // of (local, remote) so we can recover it on demand.
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2888,6 +2917,7 @@ mod tests {
         // can't reach the UE — surface flow=None so the script can
         // fall back instead of relay()ing into a void.
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),
@@ -2918,6 +2948,7 @@ mod tests {
     #[test]
     fn pycontact_omits_flow_when_no_local_addr() {
         let contact = Contact {
+            client_transport: None,
             uri: SipUri::new("10.0.0.1".to_string()).with_user("alice".into()),
             q: 1.0,
             registered_at: std::time::Instant::now(),

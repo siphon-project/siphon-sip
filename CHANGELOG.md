@@ -6,6 +6,127 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **`proxy_protocol` on a stream listener takes the client address from a
+  HAProxy PROXY header (v1 and v2), so a connection-terminating front stops
+  hiding the real client.** A front that terminates TLS opens its own
+  connection, so every consumer that keys on the source saw the front: auto-ban
+  banned the front rather than the abuser, `from_gateway()` and
+  `source_ip_in()` stopped discriminating, NAT return-routing advertised the
+  front in `received=`/`rport=`, `media.received_from` gated media ingress to it
+  so no RTP was accepted at all, and capture and the CDR recorded the front for
+  every call. The documented alternative, L4 source preservation, cannot work
+  for a front that terminates the connection, which is the point of using one to
+  terminate TLS.
+
+  Enabling it requires naming the senders allowed to assert an address:
+
+  ```yaml
+  listen:
+    tls:
+      - address: "198.51.100.10:5061"
+        proxy_protocol:
+          from: ["198.51.100.7/32"]
+  ```
+
+  `from` is mandatory and has no default. It deliberately does not fall back to
+  `security.trusted_cidrs`, which means "exempt from abuse controls" to all four
+  of its consumers and is where monitoring boxes and trunks are listed —
+  inheriting it would hand source-address forgery rights to hosts named there
+  for an unrelated reason. Stream listeners only (`tcp`, `tls`, `ws`, `wss`, and
+  a shared `tcp+ws` / `tls+wss` socket); a UDP listener is refused at config
+  load, as is an empty `from` or an entry that is not a CIDR. The header is read
+  before the TLS handshake, so a front may re-encrypt and no hop carries
+  cleartext SIP.
+
+  On an enabled listener, a connection from an address outside `from` and a
+  connection that opens without a header are both dropped rather than quietly
+  attributed to the front, and neither credits the auto-ban store — a second
+  front missing from the list is likelier than abuse, and banning your own
+  ingress is the worse outage. A v2 `LOCAL` or v1 `UNKNOWN` header (a front's own
+  health checks) is consumed and the socket's peer address stands. A PROXY header
+  arriving on a listener that has the option *off* is recognised and refused with
+  a log naming the listener, instead of being counted as binary garbage and
+  credited to the auto-ban store — siphon banning its own front.
+
+  The abuse controls follow the client rather than the front. At accept there is
+  only one address to judge — the front's — and behind a front that address is
+  shared by every caller, so a ban never matches it and the per-source connection
+  ceiling never trips. Once the header has been read, `security.failed_auth_ban`,
+  `security.apiban` and `security.connection_limits` are all re-applied to the
+  client it names, and the connection is counted against that client instead of
+  against the front. Without this the store would still record an abuser behind a
+  front and then never drop them, which is half of what this option exists to
+  fix.
+
+- **A re-encrypting front can tell siphon the client spoke TLS, via the v2
+  `PP2_TYPE_SSL` TLV.** A front that terminates the UE's TLS and opens a
+  plaintext connection to siphon leaves every consumer seeing `tcp`, so a script
+  gating on transport security would refuse a UE that did use TLS. The client's
+  transport is now carried *beside* the hop's, never over it: `request.transport`
+  still names the hop siphon accepted, and two new properties answer for the
+  client — `request.client_transport` (the front-declared transport, or `None`
+  when there is no front) and `request.client_is_secure`, which answers for the
+  client's effective hop so a UE connecting straight to a `tls` listener reports
+  `True` as well. `Contact.client_transport` persists it with the binding, and
+  the CDR records the client's transport rather than the front-facing one.
+  Mirrored in the SDK.
+- **`dial`, `record_start` and `record_stop` are typed verbs in all three
+  control SDKs.** All three shipped server-side but were missing from the
+  `SipVerb` enum the SDKs are built against, so none of them wrapped the verbs
+  and an application had to reach for the raw `command()` escape hatch and hand
+  it the wire field names itself. A `dial` target is a tagged type rather than a
+  loose string (`DialTarget::uri` / `DialTarget::aor` in Rust, a `{uri}` or
+  `{aor}` object in TypeScript and Python), because the two do different things:
+  an AoR forks to every registered contact over that contact's own captured
+  flow, which is the only way to reach a phone registered on TCP, TLS or WSS
+  behind NAT, while the same text sent as a URI is resolved by DNS and reaches
+  none of them. A target naming both, or neither, is refused before a frame goes
+  out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
+  channel layout or strategy the server would reject.
+- **The CDR wire contract is a typed import in the Python SDK:
+  `siphon_sdk.cdr.CallDetailRecord`.** A collector (FastAPI, a JSON-lines
+  tailer, a billing importer) parses records with `from_dict()` / `from_json()`
+  instead of hand-rolling dict access, and gets back the three record kinds
+  (`INVITE`/`BYE`, `REGISTER`, `MEDIA`) with the `MEDIA` per-leg figures parsed
+  out of their flat string form into `media_legs`, the `lcr_attempts` JSON
+  string decoded, and the Reason header's Q.850 cause. `from_dict()` routes
+  every unrecognised top-level key into `.extra`, which is what keeps a script's
+  `cdr.write(extra={...})` fields: those are flattened into the top level of the
+  JSON, so a body model that validates against the declared fields drops them.
+  `examples/cdr_collector.py` is a runnable collector, and the test harness's
+  `get_cdr().typed_records` returns the same type a collector receives.
+### Documentation
+
+- **The LCR reference is reachable from the API reference again, and now covers
+  the `lcr` namespace and the typed contract models.** `reference/lcr-api.md`
+  documented the full JSON contract but was in neither the site nav nor the
+  API-reference index, so the only way in was a deep link from the cookbook. It
+  is now an API-reference page carrying the `lcr` namespace, `LcrDecision`, and
+  `LcrRequest` / `LcrSource` / `LcrResponse` / `Route` / `LcrReject` rendered
+  from the SDK docstrings like every other namespace. The per-carrier presented
+  CLI and CLIR (`caller_id`, `caller_id_presentation`) were documented only in
+  that orphaned page; the cookbook and the feature matrix cover them too now,
+  including that both are per-route with no answer-level default, so a failover
+  carrier never inherits the previous carrier's presentation.
+
+### Changed
+
+- **`SecurityServerParams.protocol` now names what the SA actually covers, so
+  the default multi-protocol pair reports `"any"` instead of `"udp"`.**
+  `ipsec.allocate()` without `protocol=` installs one SA pair whose selector
+  matches both UDP and TCP, as 3GPP TS 33.203 §6.3 and §7.1 require, but the
+  reported value still said `"udp"`. That was a leftover from when it was
+  written onto the wire as the `Security-Server` `protocol=` parameter, where
+  RFC 3329 reads an absent parameter as UDP. siphon stopped emitting that
+  parameter in 1.9.0 (no sec-agree spec defines one), so the only reader left is
+  the script — and a script gating on `p.protocol == "udp"` would refuse the TCP
+  half of its own SA. `SAHandle.protocol`, the view of an active SA from
+  `request.matched_sa`, has always reported `"any"`; the two now agree about the
+  same SA. An explicit `protocol="udp"` or `"tcp"` is unchanged. Nothing on the
+  wire changes. Mirrored in the SDK mock.
+
 ### Fixed
 
 - **A removed outbound registration now de-registers upstream, and so does
@@ -19,6 +140,44 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   leaked at start-up to work around a closed-channel wakeup, leaving nothing
   able to fire it. It is now driven from the shutdown sequence itself, before
   draining begins.
+- **A CDR now records where the call was actually sent.** `destination_ip` was
+  declared, serialized and documented, but the only thing that ever set it was
+  a test — every record any deployment wrote carried an empty one. It is now
+  stamped from the send paths (proxy relay, each fork branch, and the B2BUA
+  B-leg INVITE), so it reflects the script's routing decision rather than the
+  R-URI host. A later send replaces an earlier one, so a sequential fork or an
+  LCR failover records the carrier the call completed on, with the burned ones
+  still in `lcr_attempts`; a parallel fork is corrected to the branch that
+  answered when its 2xx arrives. Still empty when nothing was sent (the script
+  answered locally, or a bare `cdr.write()` with `auto_emit` off, which is
+  written before the request is routed).
+- **A `MEDIA` record carries the media-plane addresses the engine reports.**
+  The native backend sends each leg's `remote_address`, `local_address`,
+  `payload_type` and `egress_ssrc`; siphon parsed the summary and dropped all
+  four. `{near,far,legN}_remote_address` is the RTP peer for that leg — the
+  only egress address a media record carries, and not a duplicate of the call
+  record's signalling `destination_ip`. Present on a relay-only leg, where the
+  quality fields are not.
+- **Outbound messages go out in a fixed header order, with `Content-Length`
+  last.** Header order used to be whatever order the code happened to touch the
+  headers in. `set`/`set_all` hold a header's slot, but `remove` shifts the
+  survivors up, so a remove-then-re-add moved a header to the end of the
+  message — and anything injected after the body had been accounted for landed
+  past `Content-Length`. From 1.9.0 the B-leg INVITE and every relayed response
+  settle `Supported` and `Allow` that way (they are the B2BUA's own claims, not
+  a relay of the far party's), so both went out after `Content-Length`, next to
+  the per-carrier and charging headers that already did. Serialization now
+  orders the block itself: the headers RFC 3261 §7.3.1 recommends "appear
+  towards the top of the message to facilitate rapid parsing" (`Via`,
+  `Max-Forwards`, `Record-Route`, `Route`, `Proxy-Require`,
+  `Proxy-Authorization`) first, then `From`, `To`, `Call-ID`, `CSeq`,
+  `Contact`, then everything else in the order it was added, then the
+  `Content-*` group with `Content-Length` last. Rows sharing a field name keep
+  their relative order, which is the part §7.3.1 does make significant, so
+  `Via` and `Record-Route` stacking is untouched; a compact form ranks as its
+  long name (`l` is `Content-Length`) and still goes out compact. Ordering at
+  the serializer rather than at each construction site means no call site can
+  move a header on the wire again.
 
 - **The Python SDK takes its version from the release tag only.** `hatch-vcs`
   accepted whichever tag described the release commit, so a `control-sdk-v*`
@@ -27,6 +186,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   gained a `workflow_dispatch` that republishes the SDK for an existing tag
   with the version pinned, without re-running the crate, image, SBOM or
   GitHub Release steps.
+
+- **`on_lost: "fallback"` is refused where a call sets it, not only at config
+  load.** `call.handover(on_lost="fallback")` and an `originate` carrying
+  `on_lost: "fallback"` both accepted it and then hung the call up anyway when
+  the controlling connection was lost past the reattach grace — the re-dispatch
+  the name promises was never built. A script or control app that asked for it
+  to keep calls alive got exactly the opposite, on every call, with nothing
+  saying so. `call.handover()` now raises `ValueError` and `originate` answers
+  `bad_request`; `hangup` and `continue` are unchanged.
 
 ## [1.9.0] — 2026-09-16
 
