@@ -55,6 +55,16 @@ pub struct SubscribeDialog {
     /// Remote target — the Contact URI from the SUBSCRIBE; NOTIFY
     /// Request-URI.
     pub remote_target: String,
+    /// Received peer for a directly connected notifier-side subscription.
+    /// Contact remains the request URI; this address selects the held transport.
+    #[serde(default)]
+    pub received_address: Option<std::net::SocketAddr>,
+    #[serde(default)]
+    pub received_transport: Option<String>,
+    /// Process-local flow generation; a replacement socket must not inherit
+    /// subscriptions belonging to the closed connection at the same address.
+    #[serde(default)]
+    pub received_connection_id: Option<u64>,
     /// Reversed Record-Route from the SUBSCRIBE (empty if none).
     pub route_set: Vec<String>,
     /// Event package name (from the `Event:` header — required per
@@ -259,6 +269,12 @@ impl SubscribeStore {
     /// expires via its own TTL, but L1 has no such reaper.  Call periodically
     /// (the dispatcher does so on its cleanup tick).
     pub fn sweep_stale(&self) -> usize {
+        self.take_stale().len()
+    }
+
+    /// Remove stale dialogs atomically, returning their final snapshots so the
+    /// notifier can send the mandatory terminating NOTIFY after releasing locks.
+    pub fn take_stale(&self) -> Vec<SubscribeDialog> {
         // Collect ids first, then remove: holding a DashMap iterator (shard
         // read lock) while removing (shard write lock) on the same map can
         // deadlock.
@@ -268,12 +284,17 @@ impl SubscribeStore {
             .filter(|entry| entry.terminated || entry.remaining_secs() == 0)
             .map(|entry| entry.key().clone())
             .collect();
+        let mut removed = Vec::with_capacity(stale.len());
         for id in &stale {
             // L1-only: an expired L2 entry ages out via its own TTL, and a
             // terminated dialog already had its L2 key deleted by `remove`.
-            self.dialogs.remove(id);
+            if let Some((_, dialog)) = self.dialogs.remove_if(id, |_, dialog| {
+                dialog.terminated || dialog.remaining_secs() == 0
+            }) {
+                removed.push(dialog);
+            }
         }
-        stale.len()
+        removed
     }
 
     /// Find a dialog by its three identity tags. Used to correlate an
@@ -327,6 +348,9 @@ mod tests {
             local_uri: "sip:mrf@ims.example".to_string(),
             remote_uri: "sip:alice@ims.example".to_string(),
             remote_target: "sip:alice@10.0.0.1:5060".to_string(),
+            received_address: None,
+            received_transport: None,
+            received_connection_id: None,
             route_set: vec!["<sip:edge.ims.example;lr>".to_string()],
             event: "conference".to_string(),
             expires_secs: 3600,
@@ -335,6 +359,26 @@ mod tests {
             event_version: 0,
             terminated: false,
             is_outbound: false,
+        }
+    }
+
+    #[test]
+    fn expired_dialog_snapshots_are_drained_once_for_final_notifications() {
+        let store = SubscribeStore::new();
+        for round in 0..100 {
+            for index in 0..20 {
+                let mut dialog = sample_dialog(&format!("{round}-{index}"));
+                dialog.expires_secs = 0;
+                dialog.cseq = 8;
+                store.put(dialog);
+            }
+            let expired = store.take_stale();
+            assert_eq!(expired.len(), 20);
+            assert!(expired
+                .iter()
+                .all(|dialog| dialog.cseq == 8 && !dialog.terminated));
+            assert!(store.take_stale().is_empty());
+            assert_eq!(store.local_count(), 0);
         }
     }
 

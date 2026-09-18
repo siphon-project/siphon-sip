@@ -37,7 +37,18 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // via its own TTL; L1 has no reaper, so a subscriber that vanishes without
     // an un-SUBSCRIBE would otherwise pin its dialog forever).
     let (expired_subs, subscribe_dialogs) = match crate::subscribe_state::global_store() {
-        Some(store) => (store.sweep_stale() as u64, store.local_count()),
+        Some(store) => {
+            let expired = store.take_stale();
+            let count = expired.len() as u64;
+            if !expired.is_empty() {
+                tokio::task::spawn_blocking(move || {
+                    for dialog in expired {
+                        crate::script::api::subscribe_state::notify_expired(dialog);
+                    }
+                });
+            }
+            (count, store.local_count())
+        }
         None => (0, 0),
     };
 

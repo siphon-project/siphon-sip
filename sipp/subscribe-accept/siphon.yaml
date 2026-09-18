@@ -1,0 +1,16 @@
+listen:
+  udp: ["0.0.0.0:5060"]
+  tls: ["0.0.0.0:5061"]
+tls:
+  certificate: /etc/siphon/pki/cert.pem
+  private_key: /etc/siphon/pki/key.pem
+domain:
+  local: ["example.com"]
+script:
+  path: /etc/siphon/test_scripts/notifier.py
+  reload: auto
+registrar:
+  backend: memory
+log:
+  level: debug
+  format: pretty

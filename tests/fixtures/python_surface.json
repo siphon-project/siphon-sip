@@ -2629,6 +2629,10 @@
         "doc": "The durable id \u2014 pass to ``proxy.subscribe_state.get()`` to",
         "kind": "getset_descriptor"
       },
+      "local_tag": {
+        "doc": "Notifier tag shared by the SUBSCRIBE response and every NOTIFY.",
+        "kind": "getset_descriptor"
+      },
       "mirror_reply": {
         "doc": "Send a final NOTIFY using an already-built",
         "kind": "method_descriptor",
@@ -2656,6 +2660,11 @@
       }
     },
     "SubscribeStateNamespace": {
+      "accept": {
+        "doc": "Accept an authenticated, authorized incoming SUBSCRIBE. Returns the",
+        "kind": "method_descriptor",
+        "sig": "($self, request, expires=None)"
+      },
       "create": {
         "doc": "Capture the dialog from an incoming SUBSCRIBE request and return a",
         "kind": "method_descriptor",
