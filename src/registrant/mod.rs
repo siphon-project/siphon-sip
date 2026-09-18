@@ -341,6 +341,11 @@ pub fn set_manager(manager: Arc<RegistrantManager>) {
     let _ = MANAGER.set(manager);
 }
 
+/// The process's registrant manager, if outbound registration is configured.
+pub fn manager() -> Option<&'static Arc<RegistrantManager>> {
+    MANAGER.get()
+}
+
 /// Whether `aor` is an outbound registration that is currently registered.
 ///
 /// `false` when outbound registration is not configured at all, which is the

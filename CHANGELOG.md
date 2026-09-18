@@ -8,6 +8,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **`POST /admin/registrants/refresh` and `POST /admin/gateways/refresh` apply a
+  provisioning change at once**, so `refresh_secs` is the floor rather than the
+  mechanism: a controller that has just saved a trunk or a carrier calls the
+  endpoint and the change is live, instead of landing up to an interval later.
+  Both sit behind the existing admin bearer gate with the other mutating routes,
+  and answer with what the pass did (`added` / `updated` / `removed` /
+  `rejected`). A node whose `backend` is `static` answers `501` rather than an
+  error — nothing failed, there is simply nothing to re-read — and a source that
+  cannot be read answers `502` while leaving the live set untouched, so a
+  controller can tell "I could not read it" from "I read it and everything is
+  gone".
+
 - **Gateway groups can be read from a database or an HTTP endpoint and
   reconciled at runtime** (`gateway.backend: database` / `http`), the twin of
   the registrant source. A carrier added, edited or deleted by the controller is
