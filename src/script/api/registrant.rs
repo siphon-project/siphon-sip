@@ -142,11 +142,7 @@ impl PyRegistration {
             registrar.to_string(),
             destination,
             transport_type,
-            RegistrantCredentials {
-                username: user.to_string(),
-                password: password.to_string(),
-                realm,
-            },
+            RegistrantCredentials::password(user.to_string(), password.to_string(), realm),
             interval.unwrap_or(self.inner.default_interval),
             contact,
         );

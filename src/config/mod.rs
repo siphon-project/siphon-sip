@@ -71,8 +71,8 @@ pub use observability::{
     TracingConfig,
 };
 pub use registrant::{
-    RegistrantAkaConfig, RegistrantEntryConfig, RegistrantImsConfig, RegistrantIpsecConfig,
-    RegistrantYamlConfig,
+    RegistrantAkaConfig, RegistrantBackendType, RegistrantDatabaseConfig, RegistrantEntryConfig,
+    RegistrantHttpConfig, RegistrantImsConfig, RegistrantIpsecConfig, RegistrantYamlConfig,
 };
 pub use registrar::{
     LivenessDeregMode, PostgresBackendConfig, RedisBackendConfig, RegistrarBackendType,
@@ -408,6 +408,7 @@ impl Config {
         config.validate_control_app_events()?;
         config.validate_control_apps()?;
         config.validate_control_inbound()?;
+        config.validate_registrant_source()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -713,6 +714,66 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// Reject a `registrant:` source that cannot produce a trunk list.
+    ///
+    /// Every failure here is silent at run time — an unreachable source means
+    /// no trunk registers, and a node that comes up healthy and registers
+    /// nothing is worse than one that refuses to start.
+    fn validate_registrant_source(&self) -> Result<()> {
+        let Some(registrant) = &self.registrant else {
+            return Ok(());
+        };
+        match registrant.backend {
+            RegistrantBackendType::Static => Ok(()),
+            RegistrantBackendType::Database => {
+                let Some(database) = &registrant.database else {
+                    return Err(SiphonError::Config(
+                        "registrant.backend: database needs a `registrant.database` block naming \
+                         the connection URL and the query that returns the registering trunks. \
+                         Without one there is no source, so nothing would register."
+                            .to_string(),
+                    ));
+                };
+                if !cfg!(feature = "postgres-backend") {
+                    return Err(SiphonError::Config(
+                        "registrant.backend: database needs the `postgres-backend` cargo \
+                         feature, which this binary was built without. Rebuild with it (it is \
+                         on by default), or use \"http\" with a `registrant.http` endpoint."
+                            .to_string(),
+                    ));
+                }
+                if database.refresh_secs == 0 {
+                    return Err(SiphonError::Config(
+                        "registrant.database.refresh_secs is 0, which would re-read the source \
+                         in a tight loop. Set the interval you want, and use \
+                         POST /admin/registrants/refresh to apply a change at once."
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            RegistrantBackendType::Http => {
+                let Some(http) = &registrant.http else {
+                    return Err(SiphonError::Config(
+                        "registrant.backend: http needs a `registrant.http` block naming the \
+                         endpoint that returns the registering trunks. Without one there is no \
+                         source, so nothing would register."
+                            .to_string(),
+                    ));
+                };
+                if http.refresh_secs == 0 {
+                    return Err(SiphonError::Config(
+                        "registrant.http.refresh_secs is 0, which would re-read the source in a \
+                         tight loop. Set the interval you want, and use \
+                         POST /admin/registrants/refresh to apply a change at once."
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Reject an app-level event class siphon does not publish.

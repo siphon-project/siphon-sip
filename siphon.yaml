@@ -353,7 +353,42 @@ registrar:
 #       password: "p33rsecret"
 #       transport: "tcp"
 #
-# Dynamic entries (loaded from database at runtime):
+# Database- or HTTP-backed entries (the controller owns the trunks):
+#
+# With `backend: database` / `http`, siphon re-reads the source every
+# `refresh_secs` and reconciles its registrations against it — adding trunks it
+# has not registered, re-registering ones whose credentials or target changed,
+# and de-registering (Expires: 0) ones the source no longer lists.  A row it has
+# already registered unchanged is left completely alone, so polling does not
+# churn the estate.  `POST /admin/registrants/refresh` applies a change at once.
+#
+# The source owns only the entries it created: `entries` above and anything a
+# script added with `registration.add()` are never touched by a reconcile.
+#
+# Supply `password` OR `ha1`, never both.  An `ha1` is
+# H(username:realm:password): it cannot be reversed to the password, but it is
+# still password-equivalent for its realm and is bound to one hash
+# (RFC 7616 §3.4.3).  Use the `http` form when trunk secrets are sealed at rest:
+# the controller unseals in-process and serves the credential locally, so siphon
+# never sees the sealed form.  Contract: docs/reference/registrant-api.md.
+#
+# registrant:
+#   backend: database              # static (default) | database | http
+#   database:
+#     url: "postgresql://siphon@db.internal/siphon"
+#     query: "SELECT aor, registrar, username, password, realm,
+#              expires AS interval, contact, transport, enabled
+#              FROM registrants WHERE node = $1"
+#     refresh_secs: 30
+#     timeout_ms: 2000
+#   # ...or an endpoint the controller serves:
+#   http:
+#     url: "http://127.0.0.1:8080/registrants"
+#     refresh_secs: 30
+#     timeout_ms: 2000
+#     auth_header: "Bearer ${PROVISIONING_TOKEN}"
+#
+# Script-managed entries (still supported, and unaffected by the above):
 # Use the `registration` Python API to add/remove entries from scripts.
 # This is useful when trunk credentials are stored in a database and may
 # change without redeploying config. Entries added via Python are identical
