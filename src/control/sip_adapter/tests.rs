@@ -2034,6 +2034,28 @@ fn dial_target_accepts_a_bare_uri() {
     assert!(parsed[0].flow.is_none());
 }
 
+#[test]
+fn dial_refuses_malformed_media_policy_instead_of_silently_sending_plain_media() {
+    for profile in [
+        serde_json::json!(true),
+        serde_json::json!(1),
+        serde_json::json!(""),
+        serde_json::json!(" "),
+    ] {
+        let result = sip_command(
+            "dial",
+            serde_json::json!({"targets": ["sip:201@example.com"], "profile": profile}),
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+}
+
 /// The object form carries the routing destination and per-target headers,
 /// while the R-URI keeps the shape the app asked for.
 #[test]

@@ -429,6 +429,8 @@ pub struct CallActor {
     /// Cleared the moment the outcome is decided: a 2xx makes it an ordinary
     /// two-leg call, and a reported failure hands the decision back.
     pub control_dial: bool,
+    /// The controller's dial owns an offer/answer media allocation.
+    pub control_dial_media: bool,
     /// Control-loss policy for a handed-over call ("hangup"/"continue"/
     /// "fallback"). Owned by the control plane on owner disconnect; stored here
     /// for observability.
@@ -552,6 +554,7 @@ impl CallActor {
             route_sequence: None,
             control_app: None,
             control_dial: false,
+            control_dial_media: false,
             on_control_loss: None,
             handoff_pending: false,
             originated: false,

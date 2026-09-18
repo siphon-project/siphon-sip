@@ -47,6 +47,13 @@ pub fn b_leg_answered(
                 .set_leg_last_sdp(call_id, false, &message.body);
         }
 
+        if let Err(error) = control_dial_media_answer(call_id, message, response_source.ip(), state)
+        {
+            error!(%call_id, %error, "control dial media failed before answering caller");
+            b2bua_fail_after_answer(call_id, &error, snapshot.b_leg_index, message, state);
+            return;
+        }
+
         // CDR: stamp the answer time (cdr.auto_emit).
         // A controller-issued `dial` is decided the moment somebody answers:
         // this is an ordinary two-leg call now, and a later failure on a losing
