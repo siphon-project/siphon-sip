@@ -81,6 +81,7 @@ nav:
       - LCR API contract: reference/lcr-api.md
       - Control plane (remote SDKs): reference/control-plane.md
       - Testing harness: reference/testing.md
+      - Registrant provisioning contract: reference/registrant-api.md
   - Running in production:
       - Transports & networking: transports.md
       - Media engines (rtpengine / siphon-rtp): media-engines.md

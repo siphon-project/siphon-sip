@@ -8,6 +8,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **Outbound registrations can be read from a database or an HTTP endpoint and
+  reconciled at runtime** (`registrant.backend: database` / `http`), mirroring
+  `auth.backend`. A controller that owns trunks as data no longer needs a
+  restart, or a script, for a trunk to be added, edited or deleted: siphon
+  re-reads the source every `refresh_secs` and applies the difference — adding
+  what it has not registered, re-registering what changed (keeping the binding's
+  Call-ID and continuing its CSeq, so the registrar sees a refresh rather than a
+  new registration), and sending `Expires: 0` for what the source no longer
+  lists or has disabled. A row that has not changed is left completely alone, so
+  polling does not churn the estate, and an unreadable source changes nothing
+  rather than de-registering everything. The source owns only the entries it
+  created: `registrant.entries` and anything a script added with
+  `registration.add()` are never touched. A row supplies `password` or a
+  pre-computed `ha1`, so a store need not hold a reversible secret, and the
+  `http` form suits a controller that seals its secrets at rest and unseals
+  in-process. The JSON is a versioned contract, typed in
+  `siphon_sdk.registrants` and documented at `docs/reference/registrant-api.md`.
+
 - **A call placed with the control plane's `originate` verb now answers a
   `401`/`407` from the trunk.** An originated call is a UAC on its own A-leg
   and has no B-leg, so it never went through the B-leg's credentialed retry —

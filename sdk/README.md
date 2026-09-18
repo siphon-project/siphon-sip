@@ -329,6 +329,40 @@ Each B-leg gets a fresh Call-ID and From-tag by default, fully decoupling the tw
 | `call.record(srs_uri)` | Start SIPREC recording |
 | `call.stop_recording()` | Stop SIPREC recording |
 
+## Provisioning outbound registrations
+
+`siphon_sdk.registrants` is the typed mirror of the contract a
+`registrant.backend: http` source answers with — the list of trunks siphon
+should keep registered. A controller that owns trunks as data serves it and
+siphon reconciles against it, so a trunk added, edited or deleted needs no
+restart and no script:
+
+```python
+from fastapi import FastAPI
+from siphon_sdk.registrants import RegistrantListResponse, RegistrantRow
+
+app = FastAPI()
+
+@app.get("/registrants")
+def registrants() -> dict:
+    return RegistrantListResponse(registrants=[
+        RegistrantRow(
+            aor="sip:trunk1@carrier.example",
+            registrar="sip:carrier.example:5060",
+            username="trunk1",
+            password="…",
+        ),
+    ]).to_dict()
+```
+
+The list is the complete desired state, not a delta: a trunk that is absent is
+de-registered. Supply `password` **or** `ha1`, never both — an `ha1` is not
+reversible to the password but is still password-equivalent for its realm, and
+is bound to the hash it was computed with.
+
+Full contract, including the SQL column names the `database` source reads:
+<https://siphon-sip.org/reference/registrant-api/>.
+
 ## Consuming CDRs
 
 `siphon_sdk.cdr.CallDetailRecord` is the typed mirror of the record siphon

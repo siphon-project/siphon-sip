@@ -55,6 +55,7 @@ from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc
 | [LCR API contract](lcr-api.md) | The JSON siphon exchanges with an external least-cost-routing API |
 | [Control plane (remote SDKs)](control-plane.md) | Driving handed-over calls from an out-of-process app (`pip install siphon-control`, `cargo add siphon-control-client`) |
 | [Testing harness](testing.md) | The pytest harness and its result objects |
+| [Registrant provisioning](registrant-api.md) | The `registrant.backend` sources, their JSON contract, and the typed row models |
 
 !!! note "Extension namespaces"
     The `smpp` and `http` namespaces come from the optional
