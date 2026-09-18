@@ -212,6 +212,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   selection algorithm even when its destinations are unchanged. Existing
   destination health is preserved, and unchanged polls leave the group alone.
 
+- The scale-test harness accepts fractional SIPp peak call rates instead of
+  aborting while reporting otherwise successful calls. Rates are rounded for
+  its integer summary.
+
 - **A removed outbound registration now de-registers upstream, and so does
   shutting down.** `registration.remove()` dropped siphon's own state and left
   the binding on the registrar until the granted `Expires` ran out, so a trunk
