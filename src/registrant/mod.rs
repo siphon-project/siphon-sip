@@ -12,6 +12,7 @@
 //! - Sends de-registration (Expires: 0) on shutdown.
 
 pub mod aka;
+pub mod messages;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{self, DigestChallenge, DigestCredentials, NonceCounter};
 use std::net::IpAddr;
@@ -483,6 +484,29 @@ pub struct RegistrantManager {
     /// REGISTER that offers IPsec consumes a pair. Seeded high so it never
     /// overlaps a co-resident P-CSCF's SPI range.
     ue_spi_counter: AtomicU32,
+    /// Where outbound REGISTERs egress from, installed by [`registration_loop`]
+    /// when it starts.
+    ///
+    /// The manager itself has no transport, so without this it cannot build a
+    /// message at all — and a de-registration has to be built at the moment the
+    /// entry is removed, while its Call-ID and CSeq are still there.
+    egress: std::sync::OnceLock<RegistrantEgress>,
+    /// De-registrations built by [`Self::remove`], waiting for the loop to send
+    /// them. Holds finished messages rather than live entries, so a removed
+    /// trunk is gone from `entries` immediately.
+    pending_deregistrations: std::sync::Mutex<Vec<(SipMessage, SocketAddr, Transport)>>,
+}
+
+/// Everything [`registration_loop`] needs to put a REGISTER on the wire.
+///
+/// Held on the manager so a de-registration can be built and sent from outside
+/// the loop — when an entry is removed, and at shutdown.
+struct RegistrantEgress {
+    local_addr: SocketAddr,
+    listen_addrs: HashMap<Transport, SocketAddr>,
+    advertised_addrs: HashMap<Transport, String>,
+    advertised_address: Option<String>,
+    hep_sender: Option<Arc<HepSender>>,
 }
 
 impl RegistrantManager {
@@ -501,6 +525,21 @@ impl RegistrantManager {
             user_agent_header,
             event_sender,
             ue_spi_counter: AtomicU32::new(Self::UE_SPI_BASE),
+            egress: std::sync::OnceLock::new(),
+            pending_deregistrations: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record how REGISTERs egress. Called once by [`registration_loop`].
+    fn set_egress(&self, egress: RegistrantEgress) {
+        let _ = self.egress.set(egress);
+    }
+
+    /// Take the de-registrations queued by [`Self::remove`], leaving none.
+    fn take_pending_deregistrations(&self) -> Vec<(SipMessage, SocketAddr, Transport)> {
+        match self.pending_deregistrations.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         }
     }
 
@@ -533,15 +572,48 @@ impl RegistrantManager {
         self.entries.insert(entry.aor.clone(), entry);
     }
 
-    /// Remove a registration entry by AoR.
+    /// Remove a registration entry by AoR, clearing its binding upstream.
+    ///
+    /// The binding lives on the registrar, not here, so dropping local state on
+    /// its own leaves the trunk registered until its `Expires` runs out — long
+    /// enough for a carrier to keep offering calls to a trunk that was deleted.
+    /// A `Registered` entry therefore gets an `Expires: 0` REGISTER queued for
+    /// [`registration_loop`] to send (RFC 3261 §10.2.2).
+    ///
+    /// The message is built here rather than by the loop because it needs the
+    /// entry's Call-ID and next CSeq, which go away with the entry. It is
+    /// fire-and-forget: the entry is gone either way, and a lost de-REGISTER
+    /// leaves exactly the expiry-based cleanup that was the only behaviour
+    /// before.
     pub fn remove(&self, aor: &str) -> Option<RegistrantEntry> {
+        let deregistration = self.build_deregistration(aor);
         let removed = self.entries.remove(aor).map(|(_, entry)| entry);
         if removed.is_some() {
+            if let Some(message) = deregistration {
+                match self.pending_deregistrations.lock() {
+                    Ok(mut pending) => pending.push(message),
+                    Err(poisoned) => poisoned.into_inner().push(message),
+                }
+            }
             self.emit_event(RegistrantEvent::Deregistered {
                 aor: aor.to_string(),
             });
         }
         removed
+    }
+
+    /// Build the `Expires: 0` REGISTER that clears one entry's binding.
+    ///
+    /// `None` when the entry is unknown, was never registered (nothing to
+    /// clear), or the loop has not started yet, so there is no egress to build
+    /// a Via and Contact from.
+    fn build_deregistration(&self, aor: &str) -> Option<(SipMessage, SocketAddr, Transport)> {
+        let egress = self.egress.get()?;
+        if self.entries.get(aor)?.state != RegistrantState::Registered {
+            return None;
+        }
+        self.build_register(aor, egress.local_addr, &egress.listen_addrs, 0)
+            .map(|(message, _branch, destination, transport)| (message, destination, transport))
     }
 
     /// Get number of entries.
@@ -588,370 +660,6 @@ impl RegistrantManager {
             true
         } else {
             false
-        }
-    }
-
-    /// Build a REGISTER request for an entry.
-    ///
-    /// `listen_addrs` maps each transport to its listen address. The entry's
-    /// transport is used to pick the correct local address (and port) for the
-    /// Contact and Via headers. Falls back to `local_addr` when no
-    /// transport-specific address is configured.
-    pub fn build_register(
-        &self,
-        aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
-        expires: u32,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
-        let mut entry = self.entries.get_mut(aor)?;
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
-        let cseq = entry.next_cseq();
-        let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
-
-        let request_uri = registrar_request_uri(&entry.registrar_uri);
-
-        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
-        });
-
-        let via = format!(
-            "SIP/2.0/{} {};branch={};rport",
-            entry.transport, effective_addr, branch
-        );
-
-        let mut builder = SipMessageBuilder::new()
-            .request(Method::Register, request_uri)
-            .via(via)
-            .to(format!("<{}>", entry.aor))
-            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
-            .call_id(entry.call_id.clone())
-            .cseq(format!("{cseq} REGISTER"))
-            .header(
-                "Contact",
-                build_contact_header(&contact, entry.ims_contact.as_ref()),
-            )
-            .header("Expires", expires.to_string())
-            .max_forwards(70)
-            .content_length(0);
-
-        if let Some(ref user_agent) = self.user_agent_header {
-            builder = builder.header("User-Agent", user_agent.clone());
-        }
-
-        // IMS AKA: the initial (unprotected) REGISTER carries an Authorization
-        // header with an empty response so the S-CSCF learns the IMPI and
-        // fetches an authentication vector — the 401 challenge then comes back
-        // through build_register_aka (RFC 3310 / TS 24.229 §5.1.1.2).
-        if entry.auth_mode == AuthMode::Aka {
-            let realm = entry
-                .credentials
-                .realm
-                .clone()
-                .unwrap_or_else(|| home_domain_from_aor(&entry.aor));
-            let registrar_host = entry
-                .registrar_uri
-                .strip_prefix("sip:")
-                .unwrap_or(&entry.registrar_uri);
-            let digest_uri = format!("sip:{registrar_host}");
-            builder = builder.header(
-                "Authorization",
-                initial_aka_authorization(&entry.credentials.username, &realm, &digest_uri),
-            );
-        }
-
-        // IMS IPsec sec-agree: the initial (unprotected) REGISTER offers the
-        // UE's transform, freshly allocated SPIs, and protected ports in
-        // Security-Client, and demands the extension via Require/Proxy-Require
-        // (RFC 3329 / TS 33.203 §7.2). The 401 answers with Security-Server.
-        // Deregistration (expires == 0) rides the existing SA and does not
-        // re-offer.
-        if expires > 0 && entry.ue_ipsec.is_some() {
-            let (spi_uc, spi_us) = self.allocate_ue_spi_pair();
-            if let Some(ipsec) = entry.ue_ipsec.as_mut() {
-                ipsec.spi_uc = spi_uc;
-                ipsec.spi_us = spi_us;
-                let security_client = build_security_client(&ipsec.offer());
-                builder = builder
-                    .header("Security-Client", security_client)
-                    .header("Require", "sec-agree".to_string())
-                    .header("Proxy-Require", "sec-agree".to_string())
-                    .header("Supported", "path, sec-agree".to_string())
-                    .header("Allow", IMS_ALLOW_METHODS.to_string());
-            }
-        }
-
-        let message = builder.build();
-
-        let destination = entry.destination;
-        let transport = entry.transport;
-
-        if expires > 0 {
-            entry.state = RegistrantState::Registering;
-            entry.last_sent_at = Some(Instant::now());
-        }
-
-        match message {
-            Ok(message) => Some((message, branch, destination, transport)),
-            Err(error) => {
-                warn!(aor = %entry.aor, %error, "failed to build REGISTER");
-                None
-            }
-        }
-    }
-
-    /// Build an authenticated REGISTER retry after receiving a 401/407 challenge.
-    pub fn build_register_with_auth(
-        &self,
-        aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
-        challenge: &DigestChallenge,
-        is_proxy_auth: bool,
-        expires: u32,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
-        let mut entry = self.entries.get_mut(aor)?;
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
-        let cseq = entry.next_cseq();
-        let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
-
-        let request_uri_str = entry
-            .registrar_uri
-            .strip_prefix("sip:")
-            .unwrap_or(&entry.registrar_uri)
-            .to_string();
-        let request_uri = registrar_request_uri(&entry.registrar_uri);
-
-        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
-        });
-
-        let via = format!(
-            "SIP/2.0/{} {};branch={};rport",
-            entry.transport, effective_addr, branch
-        );
-
-        let nc = entry.nonce_counter.next_for(&challenge.nonce);
-        let cnonce = format!("{:08x}", rand_u32());
-
-        let digest_uri = format!("sip:{request_uri_str}");
-        let credentials = DigestCredentials {
-            username: entry.credentials.username.clone(),
-            password: entry.credentials.password.clone(),
-        };
-
-        let auth_header_value = auth::format_authorization_header(
-            challenge,
-            &credentials,
-            "REGISTER",
-            &digest_uri,
-            Some(nc),
-            Some(&cnonce),
-        );
-
-        let auth_header_name = if is_proxy_auth {
-            "Proxy-Authorization"
-        } else {
-            "Authorization"
-        };
-
-        entry.state = RegistrantState::Challenging;
-        entry.last_sent_at = Some(Instant::now());
-
-        let mut builder = SipMessageBuilder::new()
-            .request(Method::Register, request_uri)
-            .via(via)
-            .to(format!("<{}>", entry.aor))
-            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
-            .call_id(entry.call_id.clone())
-            .cseq(format!("{cseq} REGISTER"))
-            .header(
-                "Contact",
-                build_contact_header(&contact, entry.ims_contact.as_ref()),
-            )
-            .header("Expires", expires.to_string())
-            .header(auth_header_name, auth_header_value)
-            .max_forwards(70)
-            .content_length(0);
-
-        if let Some(ref user_agent) = self.user_agent_header {
-            builder = builder.header("User-Agent", user_agent.clone());
-        }
-
-        let message = builder.build();
-
-        let destination = entry.destination;
-        let transport = entry.transport;
-
-        match message {
-            Ok(message) => Some((message, branch, destination, transport)),
-            Err(error) => {
-                warn!(aor = %entry.aor, %error, "failed to build authenticated REGISTER");
-                None
-            }
-        }
-    }
-
-    /// Build an authenticated REGISTER in response to an IMS AKAv1-MD5 challenge.
-    ///
-    /// Runs Milenage over the challenge's RAND/AUTN (carried base64 in the
-    /// nonce). On success, the Authorization response is computed from RES and
-    /// `SQN_MS` advances; on a sequence-number mismatch the REGISTER instead
-    /// carries an `auts=` re-synchronisation token (3GPP TS 33.102 §6.3.3); on
-    /// a MAC failure (untrusted network) it returns `None` so the caller fails
-    /// the registration.
-    ///
-    /// This is the Phase-1 (no-IPsec) shape — it does not yet emit
-    /// `Security-Verify` or install SAs (Phase 2), and CK/IK are discarded.
-    pub fn build_register_aka(
-        &self,
-        aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
-        challenge: &DigestChallenge,
-        expires: u32,
-        security_verify: Option<&str>,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
-        let mut entry = self.entries.get_mut(aor)?;
-
-        let credentials = entry.aka.clone()?;
-        let (rand, autn) = match aka::decode_aka_nonce(&challenge.nonce) {
-            Some(parts) => parts,
-            None => {
-                warn!(aor = %entry.aor, "AKA challenge nonce is not valid base64(RAND||AUTN)");
-                return None;
-            }
-        };
-
-        let (res, auts): (Vec<u8>, Option<String>) = match aka::aka_challenge(
-            &credentials,
-            &rand,
-            &autn,
-            &entry.sqn_ms,
-        ) {
-            aka::AkaOutcome::Success { res, ck, ik, sqn } => {
-                entry.sqn_ms = sqn;
-                // Stash CK/IK so the dispatcher can derive the IPsec SA
-                // keys before sending the protected REGISTER (Phase 2).
-                if let Some(ipsec) = entry.ue_ipsec.as_mut() {
-                    ipsec.ck = Some(ck);
-                    ipsec.ik = Some(ik);
-                }
-                (res, None)
-            }
-            aka::AkaOutcome::SyncFailure { auts } => {
-                warn!(aor = %entry.aor, "AKA SQN out of range — sending AUTS re-synchronisation");
-                // RFC 3310 §3.4: the resync REGISTER carries the auts token;
-                // the response is computed over an empty RES and the server
-                // re-bases SQN and re-challenges.
-                (Vec::new(), Some(aka::encode_auts(&auts)))
-            }
-            aka::AkaOutcome::MacFailure => {
-                warn!(aor = %entry.aor, "AKA AUTN MAC failed — untrusted network challenge, aborting");
-                return None;
-            }
-        };
-
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
-        let cseq = entry.next_cseq();
-        let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
-
-        let request_uri_str = entry
-            .registrar_uri
-            .strip_prefix("sip:")
-            .unwrap_or(&entry.registrar_uri)
-            .to_string();
-        let request_uri = registrar_request_uri(&entry.registrar_uri);
-
-        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
-        });
-        let via = format!(
-            "SIP/2.0/{} {};branch={};rport",
-            entry.transport, effective_addr, branch
-        );
-
-        let nc = entry.nonce_counter.next_for(&challenge.nonce);
-        let cnonce = format!("{:08x}", rand_u32());
-        let digest_uri = format!("sip:{request_uri_str}");
-
-        let auth_header_value = auth::format_aka_authorization_header(
-            challenge,
-            &entry.credentials.username,
-            &res,
-            &digest_uri,
-            Some(nc),
-            Some(&cnonce),
-            auts.as_deref(),
-        );
-
-        entry.state = RegistrantState::Challenging;
-        entry.last_sent_at = Some(Instant::now());
-
-        let mut builder = SipMessageBuilder::new()
-            .request(Method::Register, request_uri)
-            .via(via)
-            .to(format!("<{}>", entry.aor))
-            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
-            .call_id(entry.call_id.clone())
-            .cseq(format!("{cseq} REGISTER"))
-            .header(
-                "Contact",
-                build_contact_header(&contact, entry.ims_contact.as_ref()),
-            )
-            .header("Expires", expires.to_string())
-            .header("Authorization", auth_header_value)
-            .max_forwards(70)
-            .content_length(0);
-
-        if let Some(ref user_agent) = self.user_agent_header {
-            builder = builder.header("User-Agent", user_agent.clone());
-        }
-
-        // IPsec sec-agree: on the protected re-REGISTER, echo the P-CSCF's
-        // Security-Server verbatim in Security-Verify and repeat Security-Client
-        // (RFC 3329 §2.4 / TS 33.203 §7.4). This REGISTER egresses over the SA
-        // the dispatcher installs from the stashed CK/IK.
-        if let Some(verify) = security_verify {
-            builder = builder.header("Security-Verify", verify.to_string());
-            if let Some(ipsec) = entry.ue_ipsec.as_ref() {
-                builder = builder
-                    .header("Security-Client", build_security_client(&ipsec.offer()))
-                    .header("Require", "sec-agree".to_string())
-                    .header("Proxy-Require", "sec-agree".to_string())
-                    .header("Supported", "path, sec-agree".to_string())
-                    .header("Allow", IMS_ALLOW_METHODS.to_string());
-            }
-        }
-
-        let message = builder.build();
-        let transport = entry.transport;
-
-        // The protected REGISTER goes to the P-CSCF's protected server port
-        // (from Security-Server), not the default SIP port the initial REGISTER
-        // used. Without a recorded answer, fall back to the default destination.
-        let destination = match entry.ue_ipsec.as_ref() {
-            Some(ipsec) if security_verify.is_some() && ipsec.pcscf_port_s != 0 => {
-                SocketAddr::new(entry.destination.ip(), ipsec.pcscf_port_s)
-            }
-            _ => entry.destination,
-        };
-
-        match message {
-            Ok(message) => Some((message, branch, destination, transport)),
-            Err(error) => {
-                warn!(aor = %entry.aor, %error, "failed to build AKA REGISTER");
-                None
-            }
         }
     }
 
@@ -1265,8 +973,10 @@ impl fmt::Debug for RegistrantManager {
 
 /// Background registration refresh loop.
 ///
-/// Runs until the provided shutdown signal fires. On shutdown, sends
-/// de-registration (Expires: 0) for all active bindings.
+/// Runs for the life of the process. De-registration at shutdown is driven by
+/// `serve()` through [`deregister_all`] instead of from here: a loop signalled
+/// over a channel would be racing its own sleep against `std::process::exit`,
+/// which is why the sender used to be leaked rather than held.
 pub async fn registration_loop(
     manager: Arc<RegistrantManager>,
     outbound: Arc<OutboundRouter>,
@@ -1276,124 +986,198 @@ pub async fn registration_loop(
     advertised_address: Option<String>,
     hep_sender: Option<Arc<HepSender>>,
     stream_connections: Option<StreamConnections>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let tick_interval = Duration::from_secs(5);
 
+    // A de-registration is built at the moment an entry is removed, outside
+    // this loop, so the addressing a REGISTER needs is recorded on the manager.
+    manager.set_egress(RegistrantEgress {
+        local_addr,
+        listen_addrs: listen_addrs.clone(),
+        advertised_addrs: advertised_addrs.clone(),
+        advertised_address: advertised_address.clone(),
+        hep_sender: hep_sender.clone(),
+    });
+    let Some(egress) = manager.egress.get() else {
+        error!("registrant egress could not be installed — outbound registration is not running");
+        return;
+    };
+
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(tick_interval) => {
-                // Detect connection loss on connection-oriented transports
-                // (TLS/TCP/SCTP).  The pool removes dead connections from the
-                // stream registry; if the registrar destination is gone, force
-                // an immediate re-register instead of waiting for the
-                // refresh timer.  The lookup is transport-filtered so an
-                // unrelated WS/WSS UE sharing the trunk's IP can't mask a dead
-                // trunk connection (preserves the pre-unification TLS-only
-                // membership semantics exactly).
-                if let Some(ref stream_connections) = stream_connections {
-                    let stale: Vec<String> = manager.entries.iter()
-                        .filter(|entry| {
-                            entry.state == RegistrantState::Registered
-                                && matches!(entry.transport, Transport::Tls | Transport::Tcp | Transport::Sctp)
-                                && !stream_connections.has_ip_transport(entry.destination.ip(), entry.transport)
-                        })
-                        .map(|entry| entry.aor.clone())
-                        .collect();
-                    for aor in stale {
-                        warn!(aor = %aor, "connection lost — forcing immediate re-register");
-                        manager.refresh(&aor);
-                    }
-                }
+        tokio::time::sleep(tick_interval).await;
 
-                // Time out entries stuck in Registering/Challenging (RFC 3261
-                // Timer F — 32s).  Catches dead sockets where no response
-                // ever arrives.
-                let timed_out = manager.entries_timed_out();
-                for aor in &timed_out {
-                    warn!(aor = %aor, "REGISTER transaction timed out — no response received");
-                    manager.handle_failure(aor, 0, None);
-                }
+        // Clear bindings for entries removed since the last tick. Sent before
+        // anything else so a trunk that was deleted stops receiving calls as
+        // soon as possible.
+        for (message, destination, transport) in manager.take_pending_deregistrations() {
+            debug!(%destination, "sending de-REGISTER for a removed registrant");
+            send_registrant_message(&outbound, egress, message, destination, transport);
+        }
 
-                let due = manager.entries_due();
-                for aor in due {
-                    if let Some((message, branch, destination, transport)) =
-                        manager.build_register(&aor, local_addr, &listen_addrs, manager.default_interval)
-                    {
-                        let data = Bytes::from(message.to_bytes());
-
-                        // HEP capture — outbound REGISTER
-                        if let Some(ref hep) = hep_sender {
-                            let via_addr = resolve_via_addr(local_addr, &transport, &advertised_addrs, advertised_address.as_deref());
-                            hep.capture_outbound(via_addr, destination, transport, &data);
-                        }
-
-                        // UDP only: egress from the same local address advertised
-                        // in the Via (build_register uses the same listen_addrs
-                        // lookup), so the source port matches the Via and the
-                        // response / conntrack return path is consistent. With
-                        // multiple UDP listeners + IPsec, a `None` source picks a
-                        // non-deterministic udp_default — the initial REGISTER
-                        // could egress from a protected port (e.g. 6100) while the
-                        // Via said 5060, breaking the 401 return path. For TCP/TLS
-                        // the outbound connection is separate from the listener,
-                        // so leave the source unpinned.
-                        let source_local_addr = if transport == Transport::Udp {
-                            Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
-                        } else {
-                            None
-                        };
-                        let outbound_message = OutboundMessage {
-                            followups: None,
-                            connection_id: ConnectionId::default(),
-                            transport,
-                            destination,
-                            data,
-                            source_local_addr,
-                            server_name: None,
-                        };
-                        debug!(aor = %aor, branch = %branch, "sending REGISTER");
-                        if let Err(error) = outbound.send(outbound_message) {
-                            warn!(aor = %aor, %error, "failed to send REGISTER");
-                            manager.handle_failure(&aor, 0, None);
-                        }
-                    }
-                }
+        // Detect connection loss on connection-oriented transports
+        // (TLS/TCP/SCTP).  The pool removes dead connections from the
+        // stream registry; if the registrar destination is gone, force
+        // an immediate re-register instead of waiting for the
+        // refresh timer.  The lookup is transport-filtered so an
+        // unrelated WS/WSS UE sharing the trunk's IP can't mask a dead
+        // trunk connection (preserves the pre-unification TLS-only
+        // membership semantics exactly).
+        if let Some(ref stream_connections) = stream_connections {
+            let stale: Vec<String> = manager
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.state == RegistrantState::Registered
+                        && matches!(
+                            entry.transport,
+                            Transport::Tls | Transport::Tcp | Transport::Sctp
+                        )
+                        && !stream_connections
+                            .has_ip_transport(entry.destination.ip(), entry.transport)
+                })
+                .map(|entry| entry.aor.clone())
+                .collect();
+            for aor in stale {
+                warn!(aor = %aor, "connection lost — forcing immediate re-register");
+                manager.refresh(&aor);
             }
-            result = shutdown.changed() => {
-                if result.is_ok() && *shutdown.borrow() {
-                    info!("registrant shutting down — de-registering all bindings");
-                    let dereg_messages = manager.build_deregistrations(local_addr, &listen_addrs);
-                    for (message, destination, transport) in dereg_messages {
-                        let data = Bytes::from(message.to_bytes());
+        }
 
-                        // HEP capture — outbound de-registration
-                        if let Some(ref hep) = hep_sender {
-                            let via_addr = resolve_via_addr(local_addr, &transport, &advertised_addrs, advertised_address.as_deref());
-                            hep.capture_outbound(via_addr, destination, transport, &data);
-                        }
+        // Time out entries stuck in Registering/Challenging (RFC 3261
+        // Timer F — 32s).  Catches dead sockets where no response
+        // ever arrives.
+        let timed_out = manager.entries_timed_out();
+        for aor in &timed_out {
+            warn!(aor = %aor, "REGISTER transaction timed out — no response received");
+            manager.handle_failure(aor, 0, None);
+        }
 
-                        let source_local_addr = if transport == Transport::Udp {
-                            Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
-                        } else {
-                            None
-                        };
-                        let outbound_message = OutboundMessage {
-                            followups: None,
-                            connection_id: ConnectionId::default(),
-                            transport,
-                            destination,
-                            data,
-                            source_local_addr,
-                            server_name: None,
-                        };
-                        let _ = outbound.send(outbound_message);
-                    }
-                    break;
+        let due = manager.entries_due();
+        for aor in due {
+            if let Some((message, branch, destination, transport)) =
+                manager.build_register(&aor, local_addr, &listen_addrs, manager.default_interval)
+            {
+                let data = Bytes::from(message.to_bytes());
+
+                // HEP capture — outbound REGISTER
+                if let Some(ref hep) = hep_sender {
+                    let via_addr = resolve_via_addr(
+                        local_addr,
+                        &transport,
+                        &advertised_addrs,
+                        advertised_address.as_deref(),
+                    );
+                    hep.capture_outbound(via_addr, destination, transport, &data);
+                }
+
+                // UDP only: egress from the same local address advertised
+                // in the Via (build_register uses the same listen_addrs
+                // lookup), so the source port matches the Via and the
+                // response / conntrack return path is consistent. With
+                // multiple UDP listeners + IPsec, a `None` source picks a
+                // non-deterministic udp_default — the initial REGISTER
+                // could egress from a protected port (e.g. 6100) while the
+                // Via said 5060, breaking the 401 return path. For TCP/TLS
+                // the outbound connection is separate from the listener,
+                // so leave the source unpinned.
+                let source_local_addr = if transport == Transport::Udp {
+                    Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
+                } else {
+                    None
+                };
+                let outbound_message = OutboundMessage {
+                    followups: None,
+                    connection_id: ConnectionId::default(),
+                    transport,
+                    destination,
+                    data,
+                    source_local_addr,
+                    server_name: None,
+                };
+                debug!(aor = %aor, branch = %branch, "sending REGISTER");
+                if let Err(error) = outbound.send(outbound_message) {
+                    warn!(aor = %aor, %error, "failed to send REGISTER");
+                    manager.handle_failure(&aor, 0, None);
                 }
             }
         }
     }
+}
+
+/// Put one built registrant message on the wire, with HEP capture.
+///
+/// Shared by the two de-registration paths — an entry removed at run time, and
+/// shutdown. Both are fire-and-forget: the entry is already gone, so there is
+/// nothing left to record a failure against.
+fn send_registrant_message(
+    outbound: &OutboundRouter,
+    egress: &RegistrantEgress,
+    message: SipMessage,
+    destination: SocketAddr,
+    transport: Transport,
+) {
+    let data = Bytes::from(message.to_bytes());
+
+    if let Some(ref hep) = egress.hep_sender {
+        let via_addr = resolve_via_addr(
+            egress.local_addr,
+            &transport,
+            &egress.advertised_addrs,
+            egress.advertised_address.as_deref(),
+        );
+        hep.capture_outbound(via_addr, destination, transport, &data);
+    }
+
+    // UDP only: egress from the address advertised in the Via, as the REGISTER
+    // path does — see the note there on multiple UDP listeners with IPsec.
+    let source_local_addr = if transport == Transport::Udp {
+        Some(
+            egress
+                .listen_addrs
+                .get(&transport)
+                .copied()
+                .unwrap_or(egress.local_addr),
+        )
+    } else {
+        None
+    };
+
+    let _ = outbound.send(OutboundMessage {
+        followups: None,
+        connection_id: ConnectionId::default(),
+        transport,
+        destination,
+        data,
+        source_local_addr,
+        server_name: None,
+    });
+}
+
+/// Clear every outbound binding this node holds, for shutdown.
+///
+/// Driven by `serve()` when the signal arrives rather than by
+/// [`registration_loop`], so the caller knows the de-REGISTERs have reached the
+/// transport before the process exits. Signalling the loop instead would race
+/// its 5-second sleep against `std::process::exit`.
+///
+/// Returns how many de-registrations were sent.
+pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) -> usize {
+    let Some(egress) = manager.egress.get() else {
+        // The loop never started, so nothing ever registered.
+        return 0;
+    };
+
+    // Anything removed but not yet sent goes out too: this is the last chance
+    // to clear those bindings.
+    let pending = manager.take_pending_deregistrations();
+    let active = manager.build_deregistrations(egress.local_addr, &egress.listen_addrs);
+
+    let mut sent = 0;
+    for (message, destination, transport) in pending.into_iter().chain(active) {
+        send_registrant_message(outbound, egress, message, destination, transport);
+        sent += 1;
+    }
+    sent
 }
 
 /// Methods the soft-UE advertises in `Allow` on IMS REGISTERs (RFC 3261 §20.5)
@@ -1932,6 +1716,140 @@ mod tests {
         let bytes = dereg[0].0.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Expires: 0"));
+    }
+
+    // --- De-registration on removal ---
+
+    /// Stand in for what `registration_loop` installs when it starts.
+    fn install_test_egress(manager: &RegistrantManager) {
+        manager.set_egress(RegistrantEgress {
+            local_addr: "127.0.0.1:5060".parse().expect("test address"),
+            listen_addrs: HashMap::new(),
+            advertised_addrs: HashMap::new(),
+            advertised_address: None,
+            hep_sender: None,
+        });
+    }
+
+    fn test_outbound_router() -> (Arc<OutboundRouter>, flume::Receiver<OutboundMessage>) {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, _tcp_rx) = flume::unbounded();
+        let (tls_tx, _tls_rx) = flume::unbounded();
+        let (ws_tx, _ws_rx) = flume::unbounded();
+        let (wss_tx, _wss_rx) = flume::unbounded();
+        let (sctp_tx, _sctp_rx) = flume::unbounded();
+
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx.into(),
+            udp_by_local: HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
+        });
+        (router, udp_rx)
+    }
+
+    #[test]
+    fn removing_a_registered_entry_queues_a_deregistration() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        assert!(manager.remove("sip:alice@carrier.com").is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a removed trunk left its binding on the registrar"
+        );
+        let raw = String::from_utf8_lossy(&pending[0].0.to_bytes()).into_owned();
+        assert!(raw.starts_with("REGISTER "), "not a REGISTER: {raw}");
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains("sip:alice@carrier.com"), "wrong AoR: {raw}");
+    }
+
+    #[test]
+    fn a_queued_deregistration_reuses_the_entrys_call_id() {
+        // RFC 3261 §10.2.2: the de-registration belongs to the same
+        // registration as the binding it clears, so it carries that Call-ID
+        // with a higher CSeq — a fresh one reads as an unrelated request.
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+        let call_id = manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .map(|entry| entry.call_id.clone())
+            .expect("entry present");
+
+        manager.remove("sip:alice@carrier.com");
+
+        let pending = manager.take_pending_deregistrations();
+        let raw = String::from_utf8_lossy(&pending[0].0.to_bytes()).into_owned();
+        assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
+    }
+
+    #[test]
+    fn removing_an_entry_that_never_registered_queues_nothing() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        assert!(manager.remove("sip:alice@carrier.com").is_some());
+
+        // There is no binding upstream, so there is nothing to clear.
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn removing_an_unknown_entry_queues_nothing() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+
+        assert!(manager.remove("sip:nobody@carrier.com").is_none());
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn deregister_all_sends_queued_and_active_bindings() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        let (router, udp_rx) = test_outbound_router();
+
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.add(make_entry("sip:bob@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+        manager.handle_success("sip:bob@carrier.com", 3600);
+        // One removed just before shutdown, still queued and unsent.
+        manager.remove("sip:alice@carrier.com");
+
+        let sent = deregister_all(&manager, &router);
+
+        assert_eq!(sent, 2, "both the queued and the still-active binding");
+        for _ in 0..2 {
+            let message = udp_rx.try_recv().expect("de-REGISTER on the wire");
+            let raw = String::from_utf8_lossy(&message.data).into_owned();
+            assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        }
+        assert!(udp_rx.try_recv().is_err(), "sent more than it reported");
+    }
+
+    #[test]
+    fn deregister_all_is_a_no_op_before_the_loop_starts() {
+        // Nothing ever registered, so there is nothing to clear — and no
+        // egress to build a message from either.
+        let manager = make_manager();
+        let (router, udp_rx) = test_outbound_router();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        assert_eq!(deregister_all(&manager, &router), 0);
+        assert!(udp_rx.try_recv().is_err());
     }
 
     #[test]

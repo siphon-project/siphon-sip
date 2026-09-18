@@ -129,6 +129,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A removed outbound registration now de-registers upstream, and so does
+  shutting down.** `registration.remove()` dropped siphon's own state and left
+  the binding on the registrar until the granted `Expires` ran out, so a trunk
+  that had been deleted kept being offered calls for up to an hour. Removing a
+  registered entry now queues an `Expires: 0` REGISTER (RFC 3261 §10.2.2)
+  carrying that registration's own Call-ID and next CSeq, sent on the next
+  refresh tick. Shutdown clears every remaining binding the same way: that path
+  was written but could never run, because the sender of its signal channel was
+  leaked at start-up to work around a closed-channel wakeup, leaving nothing
+  able to fire it. It is now driven from the shutdown sequence itself, before
+  draining begins.
 - **A gateway group added at run time is now health-probed, and a removed one
   stops being probed.** Probing was a single sweep over the groups present at
   start-up, so a group created later with `gateway.add_group()` was never

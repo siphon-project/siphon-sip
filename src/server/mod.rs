@@ -2486,6 +2486,11 @@ impl SiphonServer {
             );
         }
 
+        // Kept back from the move into the dispatcher so shutdown can clear the
+        // outbound bindings (see `deregister_all` below).
+        let shutdown_registrant = registrant_manager.clone();
+        let shutdown_outbound = Arc::clone(&outbound_senders);
+
         let dispatcher_handle = tokio::spawn(dispatcher::run(
             inbound_rx,
             outbound_senders,
@@ -2532,6 +2537,18 @@ impl SiphonServer {
 
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown::wait_for_signal().await;
+
+        // Clear this node's outbound bindings before draining, so an upstream
+        // registrar stops offering calls to a node that is going away rather
+        // than waiting out the granted Expires (RFC 3261 §10.2.2). Done here
+        // rather than in the registration loop: the loop sleeps in 5-second
+        // ticks and would be racing `std::process::exit` below.
+        if let Some(ref manager) = shutdown_registrant {
+            let sent = crate::registrant::deregister_all(manager, &shutdown_outbound);
+            if sent > 0 {
+                info!(count = sent, "de-registered outbound bindings");
+            }
+        }
 
         let drain_secs = config.server.as_ref().map(|s| s.drain_secs).unwrap_or(30);
 

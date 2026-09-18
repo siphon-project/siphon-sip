@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The upstream registrar siphon registers a trunk with.
+
+     Proves the outbound half of RFC 3261 §10.2.2: when the trunk is removed,
+     siphon clears the binding it holds here with an `Expires: 0` REGISTER,
+     instead of dropping its own state and leaving this registrar offering
+     calls to a trunk that is gone until the granted Expires runs out.
+
+     Both REGISTERs arrive on one Call-ID, because a de-registration belongs to
+     the registration it clears (§10.2.4) — which is also what this asserts by
+     receiving them in a single SIPp call. -->
+<scenario name="Upstream registrar: a registration, then its de-registration">
+
+  <!-- The initial REGISTER for the configured trunk. -->
+  <recv request="REGISTER">
+    <action>
+      <!-- Not a de-registration: the binding has to exist before clearing it
+           can mean anything. No `^` anchor — the sipp in CI does not match one
+           against a header value. -->
+      <ereg regexp="Expires: [1-9]" search_in="msg" check_it="true"
+            assign_to="initial_expires" />
+      <!-- Referenced so sipp does not abort: it refuses a variable that is
+           assigned and never used. -->
+      <log message="initial REGISTER carried Expires [$initial_expires]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:trunk1@[local_ip]:[local_port]>;expires=3600
+      Expires: 3600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- The script removes the trunk once it is registered. That must put an
+       `Expires: 0` REGISTER on the wire, on the same Call-ID and a higher
+       CSeq. Before this was fixed, nothing arrived at all. -->
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="Expires: 0" search_in="msg" check_it="true"
+            assign_to="dereg_expires" />
+      <log message="de-REGISTER carried Expires [$dereg_expires]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="100, 500, 1000, 2000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 20000"/>
+
+</scenario>

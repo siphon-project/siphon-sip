@@ -617,6 +617,25 @@ jobs:
       - name: Route self-identity (in-dialog BYE must be relayed, not 404'd)
         run: scripts/route_selfid_test.sh
 
+  # ── Removing an outbound registration must clear it upstream ───────────────
+  # RFC 3261 §10.2.2.  Dropping siphon's own state leaves the binding on the
+  # registrar until the granted Expires runs out, so a trunk that was deleted
+  # keeps being offered calls.  siphon registers one trunk with a SIPp
+  # registrar, the script removes it once it is up, and the scenario fails
+  # unless the `Expires: 0` REGISTER arrives on the same Call-ID.
+  sipp-registrant:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Removing a trunk must de-register it upstream
+        run: scripts/registrant_test.sh
+
+
   # ── A forwarding transport error must become a response ────────────────────
   # RFC 3261 §16.9 makes a transport error on forwarding a 503 on that branch,
   # and §16.7 step 6 forwards it upstream as a 500.  Without it the branch goes
