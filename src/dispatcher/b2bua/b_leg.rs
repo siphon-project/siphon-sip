@@ -48,7 +48,7 @@ fn stamp_gateway_credentials(
 ///
 /// Split out from [`stamp_gateway_credentials`] so the matching is testable
 /// against a manager built in the test, rather than the process-global one.
-fn gateway_credentials_for(
+pub(crate) fn gateway_credentials_for(
     manager: &crate::gateway::DispatcherManager,
     routing_uri: &str,
     destination: std::net::SocketAddr,
