@@ -545,6 +545,14 @@ pub(super) fn relay_request(
     };
     let connection_id = outcome.connection_id;
 
+    // CDR: the record opened at INVITE learns where the call actually went.
+    // Here rather than at open time because the destination is the script's
+    // decision, and here rather than on the response because an unanswered call
+    // still has one (`cdr.auto_emit`).
+    if !outcome.delivery_failed {
+        cdr_stamp_destination_for_invite(&state.cdr_sessions, message, destination.ip());
+    }
+
     // RFC 3261 §16.9: a transport error on forwarding MUST be handled as if a
     // 503 had been received on that branch.  Without this the branch simply
     // goes quiet — the upstream UAC sits on the 100 Trying until its own
@@ -1059,6 +1067,14 @@ pub(super) fn relay_fork_branch(
         )
     };
     let connection_id = outcome.connection_id;
+
+    // CDR: as in `relay_request`. On a parallel fork every branch stamps, so
+    // the record carries the last branch dialed until the answered branch
+    // overwrites it (see the 2xx path in `response.rs`); on a sequential fork
+    // the last stamp is the branch the call ended on.
+    if !outcome.delivery_failed {
+        cdr_stamp_destination_for_invite(&state.cdr_sessions, message, destination.ip());
+    }
 
     // RFC 3261 §16.9 — a transport error on this branch is a 503 on this
     // branch.  Feeding it to the aggregator is what lets a parallel fork carry

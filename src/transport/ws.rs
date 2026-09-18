@@ -19,7 +19,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::acl::TransportAcl;
-use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor};
+use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
+use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor, PrefixedStream};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
     StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
@@ -35,6 +36,10 @@ use crate::transport::{
 pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     transport_variant: Transport,
+    // What the client spoke, when a front's PROXY header declared a transport
+    // different from this hop. Stamped on every message alongside
+    // `transport_variant`, never in place of it.
+    client_transport: Option<Transport>,
     connection_id: ConnectionId,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -128,6 +133,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                     let message = InboundMessage {
                         connection_id,
                         transport: transport_variant,
+                        client_transport,
                         local_addr,
                         remote_addr,
                         data,
@@ -141,6 +147,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
                     let message = InboundMessage {
                         connection_id,
                         transport: transport_variant,
+                        client_transport,
                         local_addr,
                         remote_addr,
                         data,
@@ -233,6 +240,9 @@ pub async fn listen(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these senders.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     // Bind before spawning, so that awaiting `listen` means the socket is
     // already accepting. With the bind inside the task, the caller returned
@@ -255,9 +265,21 @@ pub async fn listen(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((tcp_stream, remote_addr)) => {
+                Ok((mut tcp_stream, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
+                    }
+                    // A listener behind a front talks to the front and nobody
+                    // else. Refused before the spawn; not a ban signal, since
+                    // the likeliest cause is a second front never added.
+                    if let Some(allowlist) = &proxy_protocol {
+                        if !allowlist.allows(remote_addr.ip()) {
+                            warn!(
+                                "WS refusing {remote_addr} on the proxy_protocol listener \
+                                 {bound}: not in proxy_protocol.from"
+                            );
+                            continue;
+                        }
                     }
                     // See the TLS listener for why this is taken here, before
                     // the spawn, and dropped silently rather than banned.
@@ -274,15 +296,57 @@ pub async fn listen(
                     let connection_map = connection_map.clone();
                     let stream_connections = stream_connections.clone();
                     let close_tx = close_tx.clone();
+                    let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
 
                     configure_tcp_socket(&tcp_stream, tos);
-                    info!("WS accepted {} as {:?}", remote_addr, connection_id);
 
                     tokio::spawn(async move {
                         let local = tcp_stream.local_addr().unwrap_or(bound);
-                        handle_connection(
-                            tcp_stream,
+                        // Before the upgrade: the header precedes the GET, and
+                        // the client address it carries is what every consumer
+                        // downstream keys on.
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
+                            match accept_proxied(
+                                &mut tcp_stream,
+                                remote_addr,
+                                Transport::WebSocket,
+                                &bound.to_string(),
+                            )
+                            .await
+                            {
+                                Some(accepted) => accepted,
+                                None => return,
+                            }
+                        } else {
+                            (remote_addr, None, bytes::BytesMut::new())
+                        };
+                        // Re-check the client the header named, before an upgrade
+                        // is spent on it: the accept loop could only test the
+                        // front, where the ceiling never trips and a ban never
+                        // matches.
+                        let mut permit = permit;
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::WebSocket,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
+                        // A browser that reached the front over WSS arrives here
+                        // as plain WS; the TLV is the only record of that.
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
                             Transport::WebSocket,
+                        );
+                        info!("WS accepted {} as {:?}", remote_addr, connection_id);
+                        handle_connection(
+                            PrefixedStream::new(tcp_stream, replay),
+                            Transport::WebSocket,
+                            client_transport,
                             connection_id,
                             local,
                             remote_addr,
@@ -320,6 +384,9 @@ pub async fn listen_secure(
     stream_connections: StreamConnections,
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
+    // When set, this listener sits behind a connection-terminating front and
+    // every connection must open with a PROXY header from one of these senders.
+    proxy_protocol: Option<Arc<ProxyProtocolAcl>>,
 ) -> std::io::Result<SocketAddr> {
     let acceptor =
         crate::transport::tls::build_hot_reload_acceptor(tls_config).unwrap_or_else(|error| {
@@ -348,9 +415,21 @@ pub async fn listen_secure(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((tcp_stream, remote_addr)) => {
+                Ok((mut tcp_stream, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
+                    }
+                    // A listener behind a front talks to the front and nobody
+                    // else. Refused before the spawn; not a ban signal, since
+                    // the likeliest cause is a second front never added.
+                    if let Some(allowlist) = &proxy_protocol {
+                        if !allowlist.allows(remote_addr.ip()) {
+                            warn!(
+                                "WSS refusing {remote_addr} on the proxy_protocol listener \
+                                 {bound}: not in proxy_protocol.from"
+                            );
+                            continue;
+                        }
                     }
                     // See the TLS listener for why this is taken here, before
                     // the spawn, and dropped silently rather than banned.
@@ -368,10 +447,53 @@ pub async fn listen_secure(
                     let connection_map = connection_map.clone();
                     let stream_connections = stream_connections.clone();
                     let close_tx = close_tx.clone();
+                    let proxy_protocol = proxy_protocol.clone();
+                    let acl = Arc::clone(&acl);
 
                     configure_tcp_socket(&tcp_stream, tos);
 
                     tokio::spawn(async move {
+                        // Captured before wrapping: `get_ref().0` stops being
+                        // the `TcpStream` once a `PrefixedStream` is inside.
+                        let local = tcp_stream.local_addr().unwrap_or(bound);
+                        // Cleartext, ahead of the ClientHello — the ordering
+                        // that lets a front re-encrypt and still convey the
+                        // phone's address.
+                        let (remote_addr, edge_tls, replay) = if proxy_protocol.is_some() {
+                            match accept_proxied(
+                                &mut tcp_stream,
+                                remote_addr,
+                                Transport::WebSocketSecure,
+                                &bound.to_string(),
+                            )
+                            .await
+                            {
+                                Some(accepted) => accepted,
+                                None => return,
+                            }
+                        } else {
+                            (remote_addr, None, bytes::BytesMut::new())
+                        };
+                        // Re-check the client the header named, before the
+                        // handshake: the accept loop could only test the front,
+                        // where the per-source ceiling never trips and a ban
+                        // never matches, so a banned client costs no TLS here.
+                        let mut permit = permit;
+                        if proxy_protocol.is_some() {
+                            match crate::transport::proxy_protocol::admit_proxied_client(
+                                remote_addr,
+                                &acl,
+                                Transport::WebSocketSecure,
+                            ) {
+                                Some(client_permit) => permit = client_permit,
+                                None => return,
+                            }
+                        }
+                        let client_transport = crate::transport::proxy_protocol::client_transport(
+                            edge_tls.as_ref(),
+                            Transport::WebSocketSecure,
+                        );
+                        let tcp_stream = PrefixedStream::new(tcp_stream, replay);
                         // TLS handshake first, bounded the same way the TLS and
                         // mux listeners bound theirs — a peer that connects and
                         // then stalls mid-handshake (slowloris) must not be able
@@ -398,10 +520,10 @@ pub async fn listen_secure(
                         let connection_id = next_connection_id();
                         info!("WSS accepted {} as {:?}", remote_addr, connection_id);
 
-                        let local = tls_stream.get_ref().0.local_addr().unwrap_or(bound);
                         handle_connection(
                             tls_stream,
                             Transport::WebSocketSecure,
+                            client_transport,
                             connection_id,
                             local,
                             remote_addr,
@@ -463,6 +585,7 @@ mod tests {
             let served = tokio::spawn(handle_connection(
                 server,
                 Transport::WebSocket,
+                None,
                 connection_id,
                 local_addr,
                 remote_addr,
@@ -520,6 +643,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             StreamConnections::new(),
+            None,
             None,
             None,
         )
@@ -588,6 +712,7 @@ mod tests {
             registry.clone(),
             None,
             None,
+            None,
         )
         .await
         .expect("ws listener must bind");
@@ -651,6 +776,7 @@ mod tests {
             StreamConnections::new(),
             None,
             None,
+            None,
         )
         .await
         .expect("ws listener must bind");
@@ -688,6 +814,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             StreamConnections::new(),
+            None,
             None,
             None,
         )
@@ -740,6 +867,7 @@ mod tests {
             StreamConnections::new(),
             None,
             None,
+            None,
         )
         .await
         .expect("ws listener must bind");
@@ -786,6 +914,7 @@ mod tests {
             Arc::clone(&connection_map),
             test_acl(),
             StreamConnections::new(),
+            None,
             None,
             None,
         )

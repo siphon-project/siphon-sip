@@ -141,6 +141,7 @@ impl Call {
         let raw = caller_invite(capability);
         let invite = parse(&raw);
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: state.local_addr,
@@ -253,6 +254,7 @@ impl Call {
             cseq_number = cseq_number,
         );
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: self.state.local_addr,
@@ -303,6 +305,7 @@ impl Call {
             call_id = header("Call-ID"),
         );
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: self.state.local_addr,
@@ -326,6 +329,7 @@ impl Call {
             "\r\n",
         );
         let inbound = InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: self.state.local_addr,

@@ -200,16 +200,11 @@ impl SipMessage {
             }
         }
 
-        // Headers — one pass over the map, original-cased name + values
-        // together (no per-header re-lowercase + re-lookup).
-        for (name, values) in self.headers.iter_original() {
-            for value in values {
-                result.extend_from_slice(name.as_bytes());
-                result.extend_from_slice(b": ");
-                result.extend_from_slice(value.as_bytes());
-                result.extend_from_slice(b"\r\n");
-            }
-        }
+        // Headers — in canonical wire order, original-cased names. Ordering
+        // lives in the container (`SipHeaders::write_wire`) so that every
+        // outbound message gets it, whatever built the message and in whatever
+        // sequence it touched the headers.
+        self.headers.write_wire(&mut result);
 
         // Empty line
         result.extend_from_slice(b"\r\n");

@@ -362,6 +362,103 @@ fn an_unauthenticated_proxy_call_leaves_the_cdr_username_empty() {
     assert!(session.finalize("caller", None, None).auth_user.is_none());
 }
 
+// -----------------------------------------------------------------------
+// Where the call was sent has to reach the record (`destination_ip`)
+// -----------------------------------------------------------------------
+
+#[test]
+fn a_stamped_destination_reaches_the_finalized_cdr() {
+    // `destination_ip` was declared, serialized and documented while
+    // `with_destination_ip` was only ever called from tests, so every record
+    // any deployment ever wrote carried an empty one.
+    let sessions: DashMap<String, crate::cdr::CdrSession> = DashMap::new();
+    let (key, session) =
+        cdr_session_from_invite(&invite_for_cdr(), "192.0.2.100", "udp", None).expect("builds");
+    sessions.insert(key.clone(), session);
+
+    cdr_stamp_destination(&sessions, &key, "198.51.100.7".parse().expect("ip"));
+
+    let cdr = sessions
+        .remove(&key)
+        .expect("session tracked")
+        .1
+        .finalize("caller", None, None);
+    assert_eq!(cdr.destination_ip, "198.51.100.7");
+}
+
+#[test]
+fn the_last_destination_wins_so_a_failover_records_the_carrier_it_landed_on() {
+    // An LCR sequence dials carrier after carrier on the same record. The one
+    // the call completed on is the destination; the burned ones are in
+    // `lcr_attempts`, which is where a trend on a failing carrier belongs.
+    let sessions: DashMap<String, crate::cdr::CdrSession> = DashMap::new();
+    let (key, session) =
+        cdr_session_from_invite(&invite_for_cdr(), "192.0.2.100", "udp", None).expect("builds");
+    sessions.insert(key.clone(), session);
+
+    cdr_stamp_destination(&sessions, &key, "198.51.100.7".parse().expect("ip"));
+    cdr_stamp_destination(&sessions, &key, "203.0.113.9".parse().expect("ip"));
+
+    let cdr = sessions
+        .remove(&key)
+        .expect("session tracked")
+        .1
+        .finalize("caller", None, None);
+    assert_eq!(cdr.destination_ip, "203.0.113.9");
+}
+
+#[test]
+fn an_unstamped_call_leaves_the_destination_empty_rather_than_guessing() {
+    // Nothing was sent anywhere (the script answered locally), so there is no
+    // destination. Empty, never the source or the R-URI host.
+    let (_, session) =
+        cdr_session_from_invite(&invite_for_cdr(), "192.0.2.100", "udp", None).expect("builds");
+
+    assert_eq!(session.finalize("caller", None, None).destination_ip, "");
+}
+
+#[test]
+fn stamping_an_untracked_call_is_a_no_op() {
+    let sessions: DashMap<String, crate::cdr::CdrSession> = DashMap::new();
+    cdr_stamp_destination(
+        &sessions,
+        "no-such-call",
+        "198.51.100.7".parse().expect("ip"),
+    );
+    assert!(sessions.is_empty());
+}
+
+/// The send paths are not drivable in a unit test (a full `DispatcherState`,
+/// a resolver and a live socket), so guard the wiring at the source level —
+/// the same guard the authenticated-identity call site carries below, and for
+/// the same reason: this is a field whose plumbing, not whose storage, is what
+/// went missing.
+#[test]
+fn every_send_path_still_stamps_where_the_call_went() {
+    let relay = include_str!("relay.rs");
+    // Both the single relay and each fork branch, after the send succeeded.
+    assert_eq!(
+        relay.matches("cdr_stamp_destination_for_invite(").count(),
+        2,
+        "relay.rs must stamp the destination on both the single-relay and the \
+         fork-branch send — a missing one leaves those calls' records empty"
+    );
+
+    let b_leg = include_str!("b2bua/b_leg.rs");
+    assert!(
+        b_leg.contains("cdr_stamp_destination("),
+        "the B-leg INVITE send must stamp the destination, or every B2BUA \
+         record goes back to an empty destination_ip"
+    );
+
+    let response = include_str!("response.rs");
+    assert!(
+        response.contains("cdr_stamp_destination_for_invite("),
+        "the INVITE 2xx must correct the destination to the branch that \
+         answered, or a parallel fork records whichever branch was dialed last"
+    );
+}
+
 /// The dispatcher function that owns the proxy CDR start is not
 /// constructible in a unit test (it needs a full `DispatcherState` and a
 /// live Python handler), and no integration harness drives it — so the
@@ -795,6 +892,10 @@ fn media_summary_to_cdr_flattens_legs() {
             mos_max: Some(4.3),
             mos_basis: Some("full".to_string()),
             text: None,
+            local_address: Some("192.0.2.10:30000".parse().expect("local addr")),
+            remote_address: Some("198.51.100.20:40000".parse().expect("remote addr")),
+            egress_ssrc: Some(0x0506_0708),
+            payload_type: Some(9),
         }
     }
 
@@ -818,6 +919,12 @@ fn media_summary_to_cdr_flattens_legs() {
         mos_max: None,
         mos_basis: None,
         text: None,
+        // A counters-only leg still knows where its media went: the addresses
+        // come from the leg, not from the quality half the relay path lacks.
+        local_address: Some("192.0.2.10:30002".parse().expect("local addr")),
+        remote_address: Some("203.0.113.30:40002".parse().expect("remote addr")),
+        egress_ssrc: None,
+        payload_type: Some(8),
     };
 
     let summary = CallSummary {
@@ -894,6 +1001,36 @@ fn media_summary_to_cdr_flattens_legs() {
     assert!(!cdr.extra.contains_key("far_ssrc"));
     assert!(!cdr.extra.contains_key("far_mos_average"));
     assert!(!cdr.extra.contains_key("far_mos_basis"));
+
+    // ...but the media-plane addresses are there on both legs, measured or
+    // not. `far_remote_address` is the egress peer of a relay-only leg, which
+    // nothing else in the record carries.
+    assert_eq!(
+        cdr.extra.get("near_remote_address").map(String::as_str),
+        Some("198.51.100.20:40000")
+    );
+    assert_eq!(
+        cdr.extra.get("near_local_address").map(String::as_str),
+        Some("192.0.2.10:30000")
+    );
+    assert_eq!(
+        cdr.extra.get("near_payload_type").map(String::as_str),
+        Some("9")
+    );
+    assert_eq!(
+        cdr.extra.get("near_egress_ssrc").map(String::as_str),
+        Some("84281096")
+    );
+    assert_eq!(
+        cdr.extra.get("far_remote_address").map(String::as_str),
+        Some("203.0.113.30:40002")
+    );
+    assert_eq!(
+        cdr.extra.get("far_payload_type").map(String::as_str),
+        Some("8")
+    );
+    // Absent on a leg no userspace actor originated a stream for.
+    assert!(!cdr.extra.contains_key("far_egress_ssrc"));
 }
 
 #[test]
@@ -919,6 +1056,10 @@ fn media_summary_to_cdr_indexes_extra_legs() {
             mos_max: None,
             mos_basis: None,
             text: None,
+            local_address: None,
+            remote_address: None,
+            egress_ssrc: None,
+            payload_type: None,
         }
     }
 
@@ -967,6 +1108,10 @@ fn media_summary_to_cdr_handles_a_single_leg_call() {
         mos_max: None,
         mos_basis: Some("loss+jitter".to_string()),
         text: None,
+        local_address: None,
+        remote_address: None,
+        egress_ssrc: None,
+        payload_type: None,
     };
     let summary = CallSummary {
         call_id: "voice-ai-1".to_string(),
@@ -2019,6 +2164,7 @@ fn save_stream_binding(
             None,
             vec![],
             crate::registrar::FlowCapture {
+                client_transport: None,
                 flow_token: Some(format!("tok-{user}").into_boxed_str()),
                 inbound_local_addr: None,
                 inbound_connection_id: Some(connection_id),
@@ -2183,6 +2329,7 @@ fn agreement_binding(
             None,
             vec![],
             crate::registrar::FlowCapture {
+                client_transport: None,
                 flow_token: Some("tok-agreement".into()),
                 inbound_local_addr: Some("192.0.2.10:5066".parse().expect("fixture")),
                 inbound_connection_id: (transport == Transport::Tcp).then_some(7),
@@ -5894,7 +6041,7 @@ fn b_leg_invite_sample() -> SipMessage {
         )
         .via("SIP/2.0/UDP siphon.example.com:6060;branch=z9hG4bK-bleg-INVITE-BRANCH".to_string())
         .to("<sip:5111@ims.example.com>".to_string())
-        .from("<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
+        .from("<sip:+12025550123@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
         .call_id("b2b-call-id-bleg".to_string())
         .cseq("1 INVITE".to_string())
         .max_forwards(70)
@@ -5940,7 +6087,7 @@ fn cancel_keeps_from_to_callid_verbatim() {
     let cancel = build_cancel_from_invite(&invite).unwrap();
     assert_eq!(
         cancel.headers.from().unwrap(),
-        "<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ",
+        "<sip:+12025550123@siphon.example.com>;tag=b2bua-from-tag-XYZ",
     );
     assert_eq!(cancel.headers.to().unwrap(), "<sip:5111@ims.example.com>",);
     assert_eq!(cancel.headers.call_id().unwrap(), "b2b-call-id-bleg");
@@ -7750,6 +7897,7 @@ fn sample_pending_refer(deadline: std::time::Instant) -> PendingInboundRefer {
     let local: SocketAddr = "192.0.2.100:5060".parse().unwrap();
     PendingInboundRefer {
         inbound: InboundMessage {
+            client_transport: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: local,

@@ -103,6 +103,73 @@ pub fn same_header_name(first: &str, second: &str) -> bool {
     canonical_key(first) == canonical_key(second)
 }
 
+/// Rank shared by every header this module does not place explicitly. Sits
+/// between the head group and the `Content-*` tail, so unranked headers keep the
+/// relative order they were inserted in and only move as a block.
+const MIDDLE_RANK: u8 = 128;
+
+/// Canonical position on the wire for a header field name, keyed on the
+/// canonical form from [`canonical_key`] — so a message carrying the compact
+/// `l` ranks it as `Content-Length` and `v` as `Via`, while still going out
+/// under the short name it arrived with.
+///
+/// RFC 3261 §7.3.1: "The relative order of header fields with different field
+/// names is not significant. However, it is RECOMMENDED that header fields
+/// which are needed for proxy processing (Via, Route, Record-Route,
+/// Proxy-Require, Max-Forwards, and Proxy-Authorization, for example) appear
+/// towards the top of the message to facilitate rapid parsing." Ranks 0–5 are
+/// that set, ordered as the §24 call-flow examples lay them out (`Via` then
+/// `Max-Forwards`); 6–10 are the dialog-identifying headers, the order
+/// [`build_response_skeleton`](crate::sip::builder::build_response_skeleton)
+/// already emits.
+///
+/// The `Content-*` group goes last, `Content-Length` at the very end. No RFC
+/// requires that — §7.3.1 is explicit that it cannot matter — but it is what
+/// every mainstream stack emits, and a header block whose tail moves depending
+/// on which code path last touched the message is the thing this ordering
+/// exists to stop.
+fn wire_rank(canonical: &str) -> u8 {
+    match canonical {
+        // Needed for proxy processing (§7.3.1).
+        "via" => 0,
+        "max-forwards" => 1,
+        "record-route" => 2,
+        "route" => 3,
+        "proxy-require" => 4,
+        "proxy-authorization" => 5,
+        // Dialog identification.
+        "from" => 6,
+        "to" => 7,
+        "call-id" => 8,
+        "cseq" => 9,
+        "contact" => 10,
+        // Body description, last, with the length at the very end.
+        "content-disposition" => 250,
+        "content-encoding" => 251,
+        "content-language" => 252,
+        "content-type" => 253,
+        "content-length" => 254,
+        _ => MIDDLE_RANK,
+    }
+}
+
+/// Distinct field names whose ordering is worked out without touching the heap.
+/// Real messages carry 10–25; the inbound cap is on header *fields*
+/// (`MAX_HEADER_FIELDS` in [`validate`](crate::sip::validate), counting values,
+/// not names), so more than this is legal and just falls back to a `Vec` for the
+/// same ordering.
+const INLINE_HEADERS: usize = 64;
+
+/// Append one header's rows to `out`, one `Name: value\r\n` line per value.
+fn push_header_rows(out: &mut Vec<u8>, name: &str, values: &[String]) {
+    for value in values {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 impl SipHeaders {
     pub fn new() -> Self {
         Self {
@@ -197,6 +264,83 @@ impl SipHeaders {
             .headers
             .values()
             .map(|(name, values)| (name, values))
+    }
+
+    /// Append the header block to `out` in canonical wire order (see
+    /// [`wire_rank`]), one `Name: value\r\n` row per value. The caller writes
+    /// the blank line and the body.
+    ///
+    /// This is the one place header order is decided. Construction order is not
+    /// it: `set`/`set_all` hold a header's slot but `remove` shifts the
+    /// survivors up, so a remove-then-re-add moves a header to the tail, and
+    /// anything injected after the body was set lands past `Content-Length`.
+    /// Ordering here means no call site can move a header on the wire.
+    ///
+    /// **Rows sharing a field name keep their relative order** — the one
+    /// ordering rule §7.3.1 does make significant ("The relative order of
+    /// header field rows with the same field name is important"). They live in
+    /// a single entry's value vector, and this only ever reorders whole
+    /// entries, so `Via` and `Record-Route` stacking is untouched.
+    pub fn write_wire(&self, out: &mut Vec<u8>) {
+        // Fast path: almost every message is already canonical, because parse
+        // preserves the wire order it came in on and siphon's builders
+        // construct in this order. One scan proves it, and then the emit is the
+        // same straight walk it has always been.
+        let mut previous = 0u8;
+        let mut ordered = true;
+        for key in self.inner.headers.keys() {
+            let rank = wire_rank(key);
+            if rank < previous {
+                ordered = false;
+                break;
+            }
+            previous = rank;
+        }
+        if ordered {
+            for (name, values) in self.iter_original() {
+                push_header_rows(out, name, values);
+            }
+            return;
+        }
+
+        let count = self.inner.headers.len();
+        let mut inline_ranks = [0u8; INLINE_HEADERS];
+        let mut inline_order = [0usize; INLINE_HEADERS];
+        let mut heap_ranks;
+        let mut heap_order;
+        let (ranks, order) = if count <= INLINE_HEADERS {
+            (&mut inline_ranks[..count], &mut inline_order[..count])
+        } else {
+            heap_ranks = vec![0u8; count];
+            heap_order = vec![0usize; count];
+            (&mut heap_ranks[..], &mut heap_order[..])
+        };
+
+        for (index, key) in self.inner.headers.keys().enumerate() {
+            ranks[index] = wire_rank(key);
+            order[index] = index;
+        }
+
+        // Stable insertion sort over the index permutation. The list is short
+        // and nearly sorted — typically one header out of place, the one a
+        // remove-then-re-add or a post-body injection pushed to the tail — so
+        // this is effectively linear. Stability is what keeps every header
+        // sharing `MIDDLE_RANK` in its insertion order.
+        for position in 1..count {
+            let mut cursor = position;
+            while cursor > 0 && ranks[order[cursor - 1]] > ranks[order[cursor]] {
+                order.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+        }
+
+        for &index in order.iter() {
+            // In range by construction: every index came from enumerating this
+            // same map, which has not been touched since.
+            if let Some((_, (name, values))) = self.inner.headers.get_index(index) {
+                push_header_rows(out, name, values);
+            }
+        }
     }
 
     /// Convenience methods for common headers
@@ -372,5 +516,247 @@ mod tests {
         assert_eq!(headers.get("z").map(String::as_str), Some("opaque"));
         // `z` has no long-form alias, so it stays distinct from any header.
         assert!(!headers.has("Via"));
+    }
+
+    /// Serialize the header block alone and split it into `Name: value` rows.
+    fn wire_rows(headers: &SipHeaders) -> Vec<String> {
+        let mut out = Vec::new();
+        headers.write_wire(&mut out);
+        String::from_utf8(out)
+            .expect("header block is UTF-8")
+            .split_terminator("\r\n")
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Just the field names, in the order they go out.
+    fn wire_names(headers: &SipHeaders) -> Vec<String> {
+        wire_rows(headers)
+            .iter()
+            .map(|row| {
+                row.split_once(':')
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|| row.clone())
+            })
+            .collect()
+    }
+
+    /// `Content-Length` goes out last and `Content-Type` immediately before it,
+    /// however late the other headers were added. This is the reported bug:
+    /// headers injected after the body was set (per-carrier headers, charging
+    /// headers) used to land past `Content-Length`.
+    #[test]
+    fn content_length_is_last_however_late_headers_arrive() {
+        let mut headers = SipHeaders::new();
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+        headers.add("Content-Type", "application/sdp".to_string());
+        headers.add("Content-Length", "328".to_string());
+        // Everything below is injected after the body was accounted for.
+        headers.add("P-Charging-Vector", "icid-value=abc".to_string());
+        headers.add("Supported", "timer,replaces".to_string());
+        headers.add("Privacy", "id".to_string());
+
+        let names = wire_names(&headers);
+        assert_eq!(
+            names,
+            vec![
+                "Via",
+                "P-Charging-Vector",
+                "Supported",
+                "Privacy",
+                "Content-Type",
+                "Content-Length",
+            ]
+        );
+    }
+
+    /// The 1.9.0 regression in its own right: `remove` + re-add moves a header
+    /// to the end of the container, which used to put `Allow` and `Supported`
+    /// on the wire *after* `Content-Length`. Container order still moves — that
+    /// is what `remove` does — but the wire order no longer follows it.
+    #[test]
+    fn remove_and_re_add_does_not_move_a_header_past_content_length() {
+        let mut headers = SipHeaders::new();
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+        headers.add("Allow", "INVITE, ACK, BYE".to_string());
+        headers.add("Content-Length", "0".to_string());
+
+        // Exactly what `advertise_b_leg_capabilities` does.
+        headers.remove("Allow");
+        headers.add("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS".to_string());
+
+        // Container order did move — this is the behaviour behind the bug.
+        let container: Vec<&str> = headers.names().iter().map(|s| s.as_str()).collect();
+        assert_eq!(container, vec!["Via", "Content-Length", "Allow"]);
+
+        // The wire does not.
+        assert_eq!(wire_names(&headers), vec!["Via", "Allow", "Content-Length"]);
+    }
+
+    /// RFC 3261 §7.3.1: "The relative order of header field rows with the same
+    /// field name is important." Via stacking is topmost-first and load-bearing
+    /// for response routing, so canonicalising entries must never touch it.
+    #[test]
+    fn rows_sharing_a_field_name_keep_their_order() {
+        let mut headers = SipHeaders::new();
+        headers.add("Content-Length", "0".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK3".to_string(),
+        );
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bK2".to_string(),
+        );
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.30:5060;branch=z9hG4bK1".to_string(),
+        );
+        headers.add("Record-Route", "<sip:192.0.2.10;lr>".to_string());
+        headers.add("Record-Route", "<sip:192.0.2.20;lr>".to_string());
+
+        let rows = wire_rows(&headers);
+        assert_eq!(
+            rows,
+            vec![
+                "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK3",
+                "Via: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bK2",
+                "Via: SIP/2.0/UDP 192.0.2.30:5060;branch=z9hG4bK1",
+                "Record-Route: <sip:192.0.2.10;lr>",
+                "Record-Route: <sip:192.0.2.20;lr>",
+                "Content-Length: 0",
+            ]
+        );
+    }
+
+    /// Headers with no assigned rank share `MIDDLE_RANK` and keep the order
+    /// they were inserted in — the sort is stable, so this is a targeted
+    /// normalisation and not a reshuffle of the whole block.
+    #[test]
+    fn unranked_headers_keep_insertion_order() {
+        let mut headers = SipHeaders::new();
+        headers.add("Content-Length", "0".to_string());
+        headers.add("User-Agent", "siphon".to_string());
+        headers.add("P-Charging-Vector", "icid-value=abc".to_string());
+        headers.add("X-Zulu", "1".to_string());
+        headers.add("X-Alpha", "2".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+
+        assert_eq!(
+            wire_names(&headers),
+            vec![
+                "Via",
+                "User-Agent",
+                "P-Charging-Vector",
+                "X-Zulu",
+                "X-Alpha",
+                "Content-Length",
+            ]
+        );
+    }
+
+    /// A compact-form header ranks as its long name (RFC 3261 §7.3.3) but still
+    /// goes out under the short name it arrived with: `l` is `Content-Length`,
+    /// so it sorts last, and `v` is `Via`, so it sorts first.
+    #[test]
+    fn compact_forms_rank_as_their_long_name() {
+        let mut headers = SipHeaders::new();
+        headers.add("l", "0".to_string());
+        headers.add("Subject", "test".to_string());
+        headers.add(
+            "v",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+
+        assert_eq!(wire_names(&headers), vec!["v", "Subject", "l"]);
+    }
+
+    /// A block already in canonical order takes the fast path, and must come
+    /// out byte-identical to the slow path's answer for the same headers.
+    #[test]
+    fn ordered_and_unordered_inputs_agree() {
+        let rows = [
+            ("Via", "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1"),
+            ("Max-Forwards", "70"),
+            ("From", "<sip:15550100001@example.com>;tag=a"),
+            ("To", "<sip:15550100042@example.com>"),
+            ("Call-ID", "call-1@192.0.2.10"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:192.0.2.10:5060>"),
+            ("Supported", "timer,replaces"),
+            ("Content-Type", "application/sdp"),
+            ("Content-Length", "0"),
+        ];
+
+        let mut ordered = SipHeaders::new();
+        for (name, value) in rows {
+            ordered.add(name, value.to_string());
+        }
+        // Same headers, built back to front, so the fast path cannot trigger.
+        let mut scrambled = SipHeaders::new();
+        for (name, value) in rows.iter().rev() {
+            scrambled.add(name, value.to_string());
+        }
+
+        assert_eq!(wire_rows(&ordered), wire_rows(&scrambled));
+        assert_eq!(
+            wire_names(&ordered),
+            rows.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ordering is idempotent: canonical output re-parsed and re-serialised is
+    /// the same bytes. `tests/rfc4475` asserts this across the torture corpus;
+    /// this pins it at the container, where the ordering actually happens.
+    #[test]
+    fn ordering_is_idempotent() {
+        let mut headers = SipHeaders::new();
+        headers.add("Content-Length", "0".to_string());
+        headers.add("Allow", "INVITE, ACK, BYE".to_string());
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+        headers.add("Content-Type", "application/sdp".to_string());
+
+        let once = wire_rows(&headers);
+
+        // Feed the canonical order back in, as a re-parse would.
+        let mut reparsed = SipHeaders::new();
+        for row in &once {
+            let (name, value) = row.split_once(": ").expect("row is Name: value");
+            reparsed.add(name, value.to_string());
+        }
+
+        assert_eq!(wire_rows(&reparsed), once);
+    }
+
+    /// More distinct field names than the inline budget still get ordered —
+    /// the heap path is the same algorithm, not a bail-out to insertion order.
+    #[test]
+    fn heap_path_orders_too() {
+        let mut headers = SipHeaders::new();
+        headers.add("Content-Length", "0".to_string());
+        for index in 0..INLINE_HEADERS + 8 {
+            headers.add(&format!("X-Pad-{index}"), index.to_string());
+        }
+        headers.add(
+            "Via",
+            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK1".to_string(),
+        );
+
+        let names = wire_names(&headers);
+        assert!(names.len() > INLINE_HEADERS);
+        assert_eq!(names.first().map(String::as_str), Some("Via"));
+        assert_eq!(names.last().map(String::as_str), Some("Content-Length"));
     }
 }

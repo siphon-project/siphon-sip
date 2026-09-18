@@ -541,27 +541,99 @@ pub fn parse_source_network(spec: &str) -> Option<IpNet> {
 /// Manager for multiple dispatcher groups.
 pub struct DispatcherManager {
     groups: DashMap<String, Arc<DispatcherGroup>>,
+    /// One health-prober task per group, so a group added or removed at run time
+    /// starts and stops probing with it.
+    ///
+    /// Probing used to be a single sweep over the groups present at start-up,
+    /// which left two holes: a group added later (`gateway.add_group()`) was
+    /// never probed and so stayed healthy for ever, and a removed or replaced
+    /// one left its task looping against a group the dispatcher no longer held.
+    probers: DashMap<String, tokio::task::AbortHandle>,
+    /// Set once the transport layer is up. Groups configured before that start
+    /// probing when it arrives, and the stored runtime handle lets a prober be
+    /// spawned from a thread that is not itself on the runtime — the Python
+    /// executor calling `gateway.add_group()`, for one.
+    prober_runtime: std::sync::OnceLock<ProberRuntime>,
+}
+
+/// What [`spawn_health_probers`] installs so later groups can start probing.
+struct ProberRuntime {
+    uac_sender: Arc<UacSender>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl DispatcherManager {
     pub fn new() -> Self {
         Self {
             groups: DashMap::new(),
+            probers: DashMap::new(),
+            prober_runtime: std::sync::OnceLock::new(),
         }
     }
 
+    /// Add a group, or replace the one already registered under its name, and
+    /// (re)start its health prober.
     pub fn add_group(&self, group: DispatcherGroup) {
         let name = group.name.clone();
-        self.groups.insert(name, Arc::new(group));
+        let group = Arc::new(group);
+        self.groups.insert(name.clone(), Arc::clone(&group));
+        self.start_prober(name, &group);
     }
 
     pub fn get_group(&self, name: &str) -> Option<Arc<DispatcherGroup>> {
         self.groups.get(name).map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Remove a group by name.
+    /// Remove a group by name, stopping its health prober.
     pub fn remove_group(&self, name: &str) -> bool {
+        self.stop_prober(name);
         self.groups.remove(name).is_some()
+    }
+
+    /// (Re)start the prober for one group.
+    ///
+    /// Aborts whatever was registered under `name` first, so this is safe on a
+    /// replace: a prober task owns an `Arc` of the group it was spawned for, so
+    /// leaving the old one running would keep probing destinations that are no
+    /// longer in the dispatcher and writing health onto a group nothing reads.
+    fn start_prober(&self, name: String, group: &Arc<DispatcherGroup>) {
+        self.stop_prober(&name);
+        if !group.probe_config.enabled {
+            return;
+        }
+        let Some(prober_runtime) = self.prober_runtime.get() else {
+            // The transport layer is not up yet, so there is nothing to send
+            // OPTIONS with. `spawn_health_probers` starts this group's prober.
+            return;
+        };
+        let handle = spawn_prober(
+            Arc::clone(group),
+            Arc::clone(&prober_runtime.uac_sender),
+            &prober_runtime.runtime,
+        );
+        self.probers.insert(name, handle);
+    }
+
+    /// Abort the prober registered under `name`, if any.
+    fn stop_prober(&self, name: &str) {
+        if let Some((_, handle)) = self.probers.remove(name) {
+            handle.abort();
+            debug!(group = %name, "dispatcher health prober stopped");
+        }
+    }
+
+    /// Number of live prober tasks. Test-only: the lifecycle is the thing worth
+    /// asserting, and it is otherwise invisible from outside the module.
+    #[cfg(test)]
+    pub(crate) fn prober_count(&self) -> usize {
+        self.probers.len()
+    }
+
+    /// The abort handle of a named group's prober. Test-only, so a test can
+    /// prove the task was *aborted* rather than merely dropped from the map.
+    #[cfg(test)]
+    pub(crate) fn prober_handle(&self, name: &str) -> Option<tokio::task::AbortHandle> {
+        self.probers.get(name).map(|entry| entry.value().clone())
     }
 
     /// List all group names.
@@ -677,44 +749,63 @@ impl Default for DispatcherManager {
 // Health probing
 // ---------------------------------------------------------------------------
 
-/// Spawn background health probers for all groups that have probing enabled.
+/// Install the UAC that health probers send OPTIONS with, and start a prober for
+/// every group already configured.
 ///
-/// Each group gets its own probe task with its own interval and threshold.
+/// Called once, when the transport layer is up. Groups added after this point
+/// get their prober from [`DispatcherManager::add_group`] instead, so a group
+/// created at run time is probed like a configured one.
 pub fn spawn_health_probers(manager: Arc<DispatcherManager>, uac_sender: Arc<UacSender>) {
+    let prober_runtime = ProberRuntime {
+        uac_sender,
+        runtime: tokio::runtime::Handle::current(),
+    };
+    if manager.prober_runtime.set(prober_runtime).is_err() {
+        warn!("dispatcher health probers are already running; ignoring a second start");
+        return;
+    }
+
     for entry in manager.groups.iter() {
-        let group = Arc::clone(entry.value());
-        if !group.probe_config.enabled {
-            continue;
-        }
+        manager.start_prober(entry.key().clone(), entry.value());
+    }
+}
 
-        let uac = Arc::clone(&uac_sender);
-        let interval = group.probe_config.interval;
-        let threshold = group.probe_config.failure_threshold;
-        let from_user = group.probe_config.from_user.clone();
-        let from_domain = group.probe_config.from_domain.clone();
+/// Spawn one group's probe loop, returning the handle that stops it.
+///
+/// Each group gets its own task with its own interval and threshold.
+fn spawn_prober(
+    group: Arc<DispatcherGroup>,
+    uac_sender: Arc<UacSender>,
+    runtime: &tokio::runtime::Handle,
+) -> tokio::task::AbortHandle {
+    let interval = group.probe_config.interval;
+    let threshold = group.probe_config.failure_threshold;
+    let from_user = group.probe_config.from_user.clone();
+    let from_domain = group.probe_config.from_domain.clone();
 
-        info!(
-            group = %group.name,
-            interval_secs = interval.as_secs(),
-            threshold = threshold,
-            "dispatcher health prober started"
-        );
+    info!(
+        group = %group.name,
+        interval_secs = interval.as_secs(),
+        threshold = threshold,
+        "dispatcher health prober started"
+    );
 
-        tokio::spawn(async move {
+    runtime
+        .spawn(async move {
             let mut tick = tokio::time::interval(interval);
             loop {
                 tick.tick().await;
                 probe_group(
                     &group,
-                    &uac,
+                    &uac_sender,
                     threshold,
                     from_user.as_deref(),
                     from_domain.as_deref(),
                 )
                 .await;
             }
-        });
-    }
+        })
+        .abort_handle()
 }
 
 async fn probe_group(
@@ -1461,6 +1552,161 @@ mod tests {
 
         let status = group.status();
         assert!(!status[0].1);
+    }
+
+    // --- Health prober lifecycle ---
+
+    /// A `UacSender` over flume channels, holding every receiver open so a test
+    /// can observe what a prober actually puts on the wire.
+    struct TestUac {
+        sender: Arc<UacSender>,
+        udp: flume::Receiver<crate::transport::OutboundMessage>,
+        _other: Vec<flume::Receiver<crate::transport::OutboundMessage>>,
+    }
+
+    fn test_uac() -> TestUac {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, tcp_rx) = flume::unbounded();
+        let (tls_tx, tls_rx) = flume::unbounded();
+        let (ws_tx, ws_rx) = flume::unbounded();
+        let (wss_tx, wss_rx) = flume::unbounded();
+        let (sctp_tx, sctp_rx) = flume::unbounded();
+
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx.into(),
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
+        });
+
+        TestUac {
+            sender: Arc::new(UacSender::new(
+                router,
+                "127.0.0.1:5060".parse().unwrap(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+                None,
+            )),
+            udp: udp_rx,
+            _other: vec![tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx],
+        }
+    }
+
+    fn probed_group(name: &str) -> DispatcherGroup {
+        DispatcherGroup::new(
+            name.to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.test.com", 5060, 1, 1)],
+        )
+    }
+
+    /// Abort is not instant: the task is cancelled at its next await point.
+    async fn wait_finished(handle: &tokio::task::AbortHandle) -> bool {
+        for _ in 0..100 {
+            if handle.is_finished() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.is_finished()
+    }
+
+    #[tokio::test]
+    async fn a_group_added_after_startup_is_probed() {
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+        assert_eq!(manager.prober_count(), 0);
+
+        manager.add_group(probed_group("late"));
+
+        assert_eq!(manager.prober_count(), 1);
+        // The first interval tick fires immediately, so the OPTIONS must reach
+        // the wire without waiting out a whole probe interval. Before probing
+        // was per-group this group was never probed at all, and so stayed
+        // healthy for ever.
+        let sent = tokio::time::timeout(Duration::from_secs(5), uac.udp.recv_async())
+            .await
+            .expect("prober sent nothing for a group added after startup")
+            .expect("outbound channel closed");
+        let probe = String::from_utf8_lossy(&sent.data);
+        assert!(probe.starts_with("OPTIONS "), "unexpected probe: {probe}");
+    }
+
+    #[tokio::test]
+    async fn a_group_configured_before_the_transport_is_probed_once_it_is_up() {
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+
+        // Bootstrap order: `init_gateway` builds the groups, and the transport
+        // layer (and so the UAC) only comes up afterwards.
+        manager.add_group(probed_group("carriers"));
+        assert_eq!(manager.prober_count(), 0);
+
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+
+        assert_eq!(manager.prober_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_group_stops_its_prober() {
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+        manager.add_group(probed_group("carriers"));
+        let handle = manager
+            .prober_handle("carriers")
+            .expect("prober registered");
+
+        assert!(manager.remove_group("carriers"));
+
+        assert_eq!(manager.prober_count(), 0);
+        // The task owns an `Arc` of the group it was spawned for, so dropping
+        // the map entry alone would leave it probing a group the dispatcher no
+        // longer holds.
+        assert!(
+            wait_finished(&handle).await,
+            "prober outlived the group it was spawned for"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_group_leaves_exactly_one_prober() {
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+        manager.add_group(probed_group("carriers"));
+        let first = manager.prober_handle("carriers").expect("first prober");
+
+        manager.add_group(probed_group("carriers"));
+
+        assert_eq!(manager.prober_count(), 1);
+        assert!(
+            wait_finished(&first).await,
+            "the replaced group's prober kept running"
+        );
+        let second = manager.prober_handle("carriers").expect("second prober");
+        assert!(!second.is_finished(), "the replacement was not probed");
+    }
+
+    #[tokio::test]
+    async fn a_group_with_probing_disabled_gets_no_prober() {
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+
+        manager.add_group(probed_group("quiet").with_probe_config(ProbeConfig {
+            enabled: false,
+            ..ProbeConfig::default()
+        }));
+
+        assert_eq!(manager.prober_count(), 0);
+        assert!(manager.get_group("quiet").is_some());
     }
 
     // --- Algorithm parsing ---

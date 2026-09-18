@@ -1,0 +1,78 @@
+# docker-compose.proxy-protocol.yaml — a REAL HAProxy in front of siphon,
+# speaking the PROXY protocol v2 into a `tls` listener.
+#
+# Three services on one isolated network:
+#   siphon-proxyproto — listen.tls with proxy_protocol.from = the front only
+#   haproxy           — mode tcp, `send-proxy-v2 ssl verify none` to siphon:5061
+#   uac-proxyproto    — SIPp caller; talks ONLY to haproxy, never to siphon
+#
+# The caller's address exists nowhere on siphon's socket: HAProxy terminates
+# the caller's connection and opens its own. So every assertion the caller
+# makes about its own address (192.0.2.30) can only pass if the PROXY header
+# reached the consumer. The front is 192.0.2.20, which is what those consumers
+# read when the wiring is broken.
+#
+# The TLS material is generated per run by scripts/proxy_protocol_test.sh into
+# a temporary directory and mounted read-only — nothing is committed, and the
+# certificate is never a trust decision under test (HAProxy uses `verify none`).
+#
+# Driven by scripts/proxy_protocol_test.sh (and the CI `sipp-proxy-protocol` job).
+
+services:
+  siphon-proxyproto:
+    image: sipp-siphon
+    build:
+      context: ..
+    volumes:
+      - ./proxy-protocol/siphon.proxy-protocol.yaml:/etc/siphon/siphon.yaml:ro
+      - ./proxy-protocol:/etc/siphon/test_scripts:ro
+      - ${PROXY_PROTOCOL_TLS_DIR:?set by scripts/proxy_protocol_test.sh}:/etc/siphon/pki:ro
+      - ${PROXY_PROTOCOL_OUT_DIR:?set by scripts/proxy_protocol_test.sh}:/var/log/siphon
+    networks:
+      proxyproto:
+        ipv4_address: 192.0.2.10
+    healthcheck:
+      # UDP OPTIONS against the container's own plain listener; the relay
+      # script answers it 200. The TLS listener cannot be probed this way —
+      # it refuses anything that does not open with a PROXY header, which is
+      # the behaviour under test.
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import socket;
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2);
+          s.sendto(b'OPTIONS sip:pbx.example SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.10:15060;branch=z9hG4bK-hc\r\nFrom: <sip:hc@pbx.example>;tag=hc\r\nTo: <sip:pbx.example>\r\nCall-ID: hc@check\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 1\r\nContent-Length: 0\r\n\r\n',('192.0.2.10',5060));s.recv(1024);s.close()"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    depends_on:
+      siphon-proxyproto:
+        condition: service_healthy
+    volumes:
+      - ./proxy-protocol/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      proxyproto:
+        ipv4_address: 192.0.2.20
+
+  uac-proxyproto:
+    image: ctaloi/sipp:latest
+    depends_on:
+      haproxy:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      proxyproto:
+        ipv4_address: 192.0.2.30
+    entrypoint: [sipp, "192.0.2.20:5060", -sf, /sipp/scenarios/proxy_protocol_uac.xml, -t, t1, -i, "192.0.2.30", -m, "1", -l, "1", -timeout, "30", -trace_err]
+
+networks:
+  proxyproto:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24

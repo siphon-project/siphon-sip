@@ -20,6 +20,13 @@ Call detail record writing from scripts.
 
 ::: siphon_sdk.mock_module.MockCdr
 
+### The record a collector receives
+
+This namespace is the writing side. What comes out the other end — the JSON
+object every sink writes, its three record kinds, and the typed
+`siphon_sdk.cdr.CallDetailRecord` a collector parses it with — is
+[CDR records](cdr.md).
+
 ### Writing to several sinks
 
 `cdr.backends` takes a list, and every record is written to every entry:
