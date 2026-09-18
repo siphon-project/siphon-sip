@@ -44,12 +44,13 @@ pub(crate) enum CredentialLookup {
 /// in a per-request cnonce, so it is not a thing a table can hold.
 pub(crate) fn ha1_column_for(algorithm: crate::auth::DigestAlgorithm) -> &'static str {
     use crate::auth::DigestAlgorithm;
-    match algorithm {
-        DigestAlgorithm::Sha256 | DigestAlgorithm::Sha256Sess => "ha1_sha256",
-        DigestAlgorithm::Sha512_256 | DigestAlgorithm::Sha512_256Sess => "ha1_sha512_256",
-        // AKAv1-MD5's credential is a computed RES rather than a stored secret,
-        // so it never reaches a credential table; rank it with its hash.
-        DigestAlgorithm::Md5 | DigestAlgorithm::Md5Sess | DigestAlgorithm::AkaV1Md5 => "ha1_md5",
+    // `stored_ha1_hash` owns the "which hash is a stored H(A1) bound to"
+    // mapping, including folding the `-sess` variants into their base and
+    // ranking AKAv1-MD5 (a computed RES, never a stored secret) with MD5.
+    match algorithm.stored_ha1_hash() {
+        DigestAlgorithm::Sha256 => "ha1_sha256",
+        DigestAlgorithm::Sha512_256 => "ha1_sha512_256",
+        _ => "ha1_md5",
     }
 }
 
