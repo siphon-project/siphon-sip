@@ -322,8 +322,9 @@ for i in $(seq 1 "$NUM_UACS"); do
         f=$(echo "$last" | awk -F';' '{print $18+0}')
         rt=$(echo "$last" | awk -F';' '{print $70+0}')
         retrans=$(echo "$last" | awk -F';' '{print $58+0}')
+        # SIPp reports fractional rates; round the peak for the integer summary.
         # Peak periodic CallRate(P) = column 7
-        peak=$(awk -F';' 'NR>1 {if ($7+0 > p) p=$7+0} END {print p+0}' "$csv")
+        peak=$(awk -F';' 'NR>1 {if ($7+0 > p) p=$7+0} END {printf "%.0f", p+0}' "$csv")
         TOTAL_SUCCESS=$((TOTAL_SUCCESS + s))
         TOTAL_FAILED=$((TOTAL_FAILED + f))
         TOTAL_RETRANS=$((TOTAL_RETRANS + retrans))

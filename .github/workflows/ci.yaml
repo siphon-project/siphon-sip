@@ -414,6 +414,9 @@ jobs:
       - name: Run SDK tests
         run: pytest -v
 
+      - name: Check scale result parsing
+        run: python3 ../scripts/scale_stats_test.py
+
   # ── SBOM generation ────────────────────────────────────────────────────
   sbom:
     runs-on: ubuntu-latest
