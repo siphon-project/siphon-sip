@@ -18,7 +18,10 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Serialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+mod refresh;
+use refresh::{gateways_refresh_handler, registrants_refresh_handler};
 
 use crate::config::CorsConfig;
 
@@ -200,6 +203,11 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
         .route("/admin/drain", post(drain_handler))
         .route("/admin/drain", delete(drain_handler))
         .route("/admin/script/reload", post(script_reload_handler))
+        .route(
+            "/admin/registrants/refresh",
+            post(registrants_refresh_handler),
+        )
+        .route("/admin/gateways/refresh", post(gateways_refresh_handler))
         .route("/admin/capture/{call_id}", get(capture_handler))
         .route("/admin/search", get(search_handler))
         .route("/admin/logs", get(logs_handler))
@@ -2338,5 +2346,103 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Source refresh ---
+
+    /// Both refresh routes, so each assertion below covers the pair rather than
+    /// passing for one and silently not existing for the other.
+    const REFRESH_ROUTES: [&str; 2] = ["/admin/registrants/refresh", "/admin/gateways/refresh"];
+
+    #[tokio::test]
+    async fn a_refresh_on_a_node_with_no_source_is_not_an_error() {
+        // Nothing failed — this node reads no source, so there is nothing to
+        // re-read. Reporting it as a failure would have a controller retrying
+        // for ever against a node that is configured statically on purpose.
+        crate::metrics::init().ok();
+
+        for route in REFRESH_ROUTES {
+            let app = test_app();
+            let response = app
+                .oneshot(Request::post(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "{route} answered {} instead",
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_needs_the_token_when_one_is_configured() {
+        // It mutates the live trunk and carrier set, so it sits behind the
+        // bearer gate with the other mutating routes rather than with the
+        // reads.
+        crate::metrics::init().ok();
+
+        for route in REFRESH_ROUTES {
+            let app = router(authed_state("s3cret", false), None, false);
+            let response = app
+                .oneshot(Request::post(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{route} is reachable without the token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_with_the_token_reaches_the_handler() {
+        crate::metrics::init().ok();
+
+        for route in REFRESH_ROUTES {
+            let app = router(authed_state("s3cret", false), None, false);
+            let response = app
+                .oneshot(
+                    Request::post(route)
+                        .header("Authorization", "Bearer s3cret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Past the gate: the handler answers for itself (no source here).
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "{route} did not reach its handler"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_not_a_read_route() {
+        // A GET must not refresh anything: re-reading a source is a side
+        // effect, and a route that did it on GET would be triggered by any
+        // dashboard that polls.
+        crate::metrics::init().ok();
+
+        for route in REFRESH_ROUTES {
+            let app = test_app();
+            let response = app
+                .oneshot(Request::get(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{route} answers GET"
+            );
+        }
     }
 }

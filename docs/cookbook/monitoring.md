@@ -69,6 +69,8 @@ admin:
 | `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans |
 | `GET /admin/gateways` | per-group dispatcher status (destinations, health, weight, priority, missed health-checks) |
 | `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
+| `POST /admin/registrants/refresh` | re-read a `registrant.backend: database` / `http` source and reconcile now |
+| `POST /admin/gateways/refresh` | re-read a `gateway.backend: database` / `http` source and reconcile now |
 | `GET /admin/calls` | active B2BUA calls (Call-ID, state, caller, callee, B-legs) |
 | `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |
 
