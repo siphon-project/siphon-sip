@@ -386,6 +386,16 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             if is_hostname {
                 dest = dest.with_address_str(address_str.clone());
             }
+            if let Some(ref aor) = dest_config.registers {
+                dest = dest.with_registration(aor.clone(), dest_config.require_registration);
+            } else if dest_config.require_registration {
+                error!(
+                    uri = %dest_config.uri,
+                    group = %group_config.name,
+                    "require_registration needs a `registers` AoR to gate on, skipping destination"
+                );
+                continue;
+            }
             if let Some(ref auth) = dest_config.auth {
                 match crate::auth::StoredSecret::from_config(
                     auth.password.as_deref(),
@@ -446,7 +456,8 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             DispatcherGroup::new(group_config.name.clone(), algorithm, destinations)
                 .with_probe_config(probe)
                 .with_source_networks(source_networks)
-                .with_reroute_causes(group_config.reroute_causes.clone()),
+                .with_reroute_causes(group_config.reroute_causes.clone())
+                .from_yaml(),
         );
     }
 
@@ -464,8 +475,55 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     // `call.from_gateway` can test source membership without a Python
     // round-trip (points at the same manager as the Python singleton).
     crate::script::api::set_gateway_manager(Arc::clone(&manager));
+    init_gateway_source(&manager, config, gateway_config);
 
     Some(manager)
+}
+
+/// Start following a `gateway.backend` source, when one is configured.
+///
+/// Runs after the `gateway.groups` are built, so the first reconcile sees them
+/// and leaves them alone — a source owns only the groups it created itself.
+fn init_gateway_source(
+    manager: &Arc<crate::gateway::DispatcherManager>,
+    config: &Config,
+    gateway_config: &crate::config::GatewayConfig,
+) {
+    use crate::config::GatewayBackendType;
+    use crate::gateway::source::{DatabaseSource, GatewaySource, HttpSource};
+
+    let source = match gateway_config.backend {
+        GatewayBackendType::Static => return,
+        GatewayBackendType::Database => {
+            // Config load refuses `database` without the block, so this is
+            // unreachable; log rather than panic if it ever is not.
+            let Some(database) = gateway_config.database.clone() else {
+                error!("gateway.backend: database without a `gateway.database` block");
+                return;
+            };
+            GatewaySource::Database(DatabaseSource::new(database, instance_id(config)))
+        }
+        GatewayBackendType::Http => {
+            let Some(http) = gateway_config.http.clone() else {
+                error!("gateway.backend: http without a `gateway.http` block");
+                return;
+            };
+            match HttpSource::new(http) {
+                Ok(source) => GatewaySource::Http(source),
+                Err(error) => {
+                    error!(%error, "cannot build the gateway HTTP source");
+                    return;
+                }
+            }
+        }
+    };
+
+    let source = Arc::new(source);
+    crate::gateway::source::set_source(Arc::clone(&source));
+    let loop_manager = Arc::clone(manager);
+    tokio::spawn(async move {
+        crate::gateway::source::reconcile_loop(loop_manager, source).await;
+    });
 }
 
 /// Cloned LiManager handle that survives `init_li` so `spawn_li_tasks` can
