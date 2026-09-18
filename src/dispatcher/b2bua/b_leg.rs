@@ -249,16 +249,16 @@ pub fn b2bua_send_b_leg_invite(
     // The one identity this B-leg advertises — Via sent-by AND Contact.  Both
     // have to name the socket the INVITE actually leaves from, or the far end
     // answers somewhere we are not listening on this flow.
-    let (via_host, via_port) = egress_sent_by(
-        flow_local_addr,
-        send_socket.map(|pin| pin.via_sent_by()),
-        || {
+    let (via_host, via_port) = if flow_local_addr.is_some() {
+        b_leg_sent_by(flow_local_addr, state, &outbound_transport)
+    } else {
+        egress_sent_by(None, send_socket.map(|pin| pin.via_sent_by()), || {
             (
                 state.via_host(&outbound_transport),
                 state.via_port(&outbound_transport),
             )
-        },
-    );
+        })
+    };
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         outbound_transport, via_host, via_port, branch,
@@ -404,10 +404,10 @@ pub fn b2bua_send_b_leg_invite(
     //   set_contact_uri()  → replace the whole URI (edge/GRUU deployments that
     //     front siphon — the deployment owns routing the in-dialog target back).
     //
-    // On a flow-pinned B-leg the Contact names the flow's own socket, the same
-    // sent-by as the Via above: an in-dialog request from the far end has to
-    // arrive back on the socket the dialog is anchored on, which for an IPsec SA
-    // means a protected port (anything else is outside the SA).  A `send_socket=`
+    // A datagram flow's Contact names its protected socket. A stream flow keeps
+    // the same listener port but advertises its public identity so a peer can
+    // route later in-dialog requests through a NAT or TLS proxy. Both match the
+    // Via above; the held connection still owns stream delivery. A `send_socket=`
     // pin deliberately does NOT move the Contact — that feature pins egress and
     // the Via so the *response* returns to the chosen listener; the in-dialog
     // remote target stays the advertised address, as it was before flows.
