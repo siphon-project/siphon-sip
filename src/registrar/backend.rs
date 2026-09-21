@@ -158,25 +158,29 @@ impl StoredContact {
         self.remaining_secs() == 0
     }
 
-    /// Rebuild the monotonic `registered_at` for a restored binding so its age
-    /// survives the restart (see [`registered_at_epoch`](Self::registered_at_epoch)).
-    ///
-    /// Falls back to "now" when the stored epoch is missing (legacy entry) or
-    /// lies in the future (clock stepped backwards on a shared backend) —
-    /// treating an unknown age as zero only ever makes a binding look *newer*,
-    /// which is the safe direction: a fresh binding is never preferred less
-    /// than it should be, and expiry is governed by `expires_at`, not this.
-    fn restored_registered_at(&self) -> std::time::Instant {
-        let now = std::time::Instant::now();
+    /// Seconds since the binding was originally registered, as far as the
+    /// stored epoch can be trusted. Zero when there is no stored epoch (a row
+    /// written before the field existed) or it lies in the future (the clock
+    /// stepped backwards on a shared backend) — treating an unknown age as
+    /// zero only ever makes a binding look *newer*, which is the safe
+    /// direction.
+    fn restored_age_secs(&self) -> u64 {
         let Some(registered_at_epoch) = self.registered_at_epoch else {
-            return now;
+            return 0;
         };
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let age = Duration::from_secs(now_epoch.saturating_sub(registered_at_epoch));
-        now.checked_sub(age).unwrap_or(now)
+        now_epoch.saturating_sub(registered_at_epoch)
+    }
+
+    /// Rebuild the monotonic `registered_at` for a restored binding from its
+    /// age, so the age survives the restart.
+    fn restored_registered_at(&self, age_secs: u64) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        now.checked_sub(Duration::from_secs(age_secs))
+            .unwrap_or(now)
     }
 
     /// Convert to an in-memory Contact type.
@@ -188,6 +192,17 @@ impl StoredContact {
         if remaining == 0 {
             return None;
         }
+
+        // `registered_at` and `expires_secs` MUST share one time base:
+        // `Contact::is_expired` compares `registered_at.elapsed()` against
+        // `expires_secs`. `registered_at` is back-dated to the original
+        // registration, so pairing it with the *remaining* seconds asked
+        // whether `age >= remainder` — true for any binding past its half
+        // life, which reaped live bindings on the first sweep after a restart.
+        // Adding the age back rebuilds the grant that matches the back-dated
+        // instant, and collapses to `remaining` when the age is unknown.
+        let age_secs = self.restored_age_secs();
+        let expires_secs = remaining.saturating_add(age_secs).min(u64::from(u32::MAX)) as u32;
 
         let uri = parse_uri_standalone(&self.uri).ok()?;
         let source_addr = self
@@ -203,8 +218,8 @@ impl StoredContact {
         Some(super::Contact {
             uri,
             q: self.q,
-            registered_at: self.restored_registered_at(),
-            expires_secs: remaining as u32,
+            registered_at: self.restored_registered_at(age_secs),
+            expires_secs,
             call_id: self.call_id.as_str().into(),
             cseq: self.cseq,
             source_addr,
@@ -1555,7 +1570,12 @@ mod tests {
             q: 1.0,
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
-            registered_at_epoch: None,
+            // Non-None on purpose: with no stored epoch `restored_registered_at`
+            // falls back to now, so `elapsed()` is ~0 and no test driving this
+            // fixture can reach the expiry arithmetic at all. That is what hid
+            // the half-life reap — a fixture has to exercise the path the tests
+            // around it claim to cover.
+            registered_at_epoch: Some(now_epoch - 60),
             call_id: "call-1".into(),
             cseq: 1,
             source_addr: None,
@@ -1572,6 +1592,80 @@ mod tests {
             kind: "ue".to_string(),
             auth_user: None,
         }
+    }
+
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// A restored binding that is past its half-life but still well inside its
+    /// grant must survive the first sweep after a restart.
+    ///
+    /// `to_contact` back-dates `registered_at` to the ORIGINAL registration,
+    /// so pairing it with the *remaining* seconds made `Contact::is_expired`
+    /// evaluate `age_since_original >= seconds_still_remaining` — true for
+    /// anything past its half-life. A binding with 20 minutes left was reaped
+    /// milliseconds after boot, and the subscriber went unreachable for
+    /// terminating requests until it happened to re-register.
+    #[test]
+    fn restored_contact_past_half_life_is_not_expired() {
+        let now = now_epoch();
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = Some(now - 2400); // registered 40 min ago
+        stored.expires_at = Some(now + 1200); // 20 min still to run
+        stored.expires_secs = 3600; // original grant
+
+        let contact = stored.to_contact().expect("still inside its grant");
+
+        assert!(
+            !contact.is_expired(),
+            "a binding with 1200s left was reaped after restore"
+        );
+        let remaining = contact.remaining_seconds();
+        assert!(
+            (1150..=1200).contains(&remaining),
+            "remaining_seconds double-decremented: {remaining}"
+        );
+    }
+
+    /// A row written before `registered_at_epoch` existed has no age to
+    /// recover, so `registered_at` falls back to now and must be paired with
+    /// the REMAINING seconds — the one case where the relative pair is right.
+    #[test]
+    fn restored_legacy_contact_without_epoch_uses_remaining() {
+        let now = now_epoch();
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = None;
+        stored.expires_at = Some(now + 900);
+        stored.expires_secs = 3600;
+
+        let contact = stored.to_contact().expect("still inside its grant");
+
+        assert!(!contact.is_expired());
+        let remaining = contact.remaining_seconds();
+        assert!(
+            (850..=900).contains(&remaining),
+            "legacy row lost its remaining time: {remaining}"
+        );
+    }
+
+    /// The fix must not resurrect anything: a row whose absolute expiry has
+    /// passed is still dropped at restore.
+    #[test]
+    fn restored_contact_past_its_grant_is_dropped() {
+        let now = now_epoch();
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = Some(now - 4000);
+        stored.expires_at = Some(now - 400); // grant ended 400s ago
+        stored.expires_secs = 3600;
+
+        assert!(
+            stored.to_contact().is_none(),
+            "an expired binding was restored"
+        );
     }
 
     /// The identity that authenticated a binding has to survive a restart, or
@@ -1653,8 +1747,8 @@ mod tests {
         // Legacy entry written before age tracking: report a zero age rather
         // than a nonsense one.  Zero only ever makes a binding look newer,
         // which is the safe direction — expiry is governed by `expires_at`.
-        let stored = sample_stored_contact();
-        assert!(stored.registered_at_epoch.is_none());
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = None;
         let contact = stored.to_contact().unwrap();
         assert_eq!(contact.age_seconds(), 0);
     }

@@ -222,6 +222,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it had already ended (RFC 3261 §13.2.2.4, §15). A BYE for a dialog whose
   re-INVITE answer is still being handled now waits for that ACK and follows
   it, bounded at 64×T1 for an answer that never gets one.
+- **A binding restored from a backend is no longer reaped at half its remaining
+  life.** `StoredContact::to_contact` rebuilt the two fields that govern expiry
+  from different clocks: `registered_at` was back-dated to the original
+  registration, while `expires_secs` carried the seconds *still remaining*.
+  `Contact::is_expired` compares exactly those two, so after a restart the
+  predicate was effectively `age_since_registration >= seconds_still_remaining`
+  — true for any binding past its half-life. Such a binding was dropped by the
+  first stale-entry sweep, milliseconds after boot, while the backend still held
+  it with a future `expires_at`.
+
+  The effect was silent and one-sided: the subscriber stayed registered as far
+  as it knew and kept originating fine, but terminating requests found no
+  binding until it next re-registered — up to a full registration period. On a
+  node that restarts, roughly every subscriber past its half-life was affected
+  at once. `Contact::remaining_seconds` carried the same double-decrement and is
+  fixed with it.
+
+  The restored contact now derives `expires_secs` from the same age used to
+  back-date `registered_at`, so the pair shares one time base and
+  `elapsed >= expires_secs` holds exactly when the absolute `expires_at` has
+  passed. Entries written before age tracking, and any whose stored epoch is in
+  the future, report a zero age and keep the remaining-seconds behaviour they
+  had. A binding whose grant has genuinely ended is still dropped at restore.
 
 - Gateway source polling now applies changes to a group's source networks or
   selection algorithm even when its destinations are unchanged. Existing
