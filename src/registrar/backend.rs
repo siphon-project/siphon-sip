@@ -175,14 +175,6 @@ impl StoredContact {
         now_epoch.saturating_sub(registered_at_epoch)
     }
 
-    /// Rebuild the monotonic `registered_at` for a restored binding from its
-    /// age, so the age survives the restart.
-    fn restored_registered_at(&self, age_secs: u64) -> std::time::Instant {
-        let now = std::time::Instant::now();
-        now.checked_sub(Duration::from_secs(age_secs))
-            .unwrap_or(now)
-    }
-
     /// Convert to an in-memory Contact type.
     /// Returns `None` if the URI is unparseable or the contact has expired.
     pub fn to_contact(&self) -> Option<super::Contact> {
@@ -193,16 +185,17 @@ impl StoredContact {
             return None;
         }
 
-        // `registered_at` and `expires_secs` MUST share one time base:
-        // `Contact::is_expired` compares `registered_at.elapsed()` against
-        // `expires_secs`. `registered_at` is back-dated to the original
-        // registration, so pairing it with the *remaining* seconds asked
-        // whether `age >= remainder` — true for any binding past its half
+        // `registered_at` and `expires_secs` MUST share one time base, because
+        // `Contact::is_expired` compares one against the other. `registered_at`
+        // is back-dated to the original registration, so pairing it with the
+        // *remaining* seconds asks `age >= remainder` — true past the half
         // life, which reaped live bindings on the first sweep after a restart.
-        // Adding the age back rebuilds the grant that matches the back-dated
-        // instant, and collapses to `remaining` when the age is unknown.
         let age_secs = self.restored_age_secs();
         let expires_secs = remaining.saturating_add(age_secs).min(u64::from(u32::MAX)) as u32;
+        let now = std::time::Instant::now();
+        let registered_at = now
+            .checked_sub(Duration::from_secs(age_secs))
+            .unwrap_or(now);
 
         let uri = parse_uri_standalone(&self.uri).ok()?;
         let source_addr = self
@@ -218,7 +211,7 @@ impl StoredContact {
         Some(super::Contact {
             uri,
             q: self.q,
-            registered_at: self.restored_registered_at(age_secs),
+            registered_at,
             expires_secs,
             call_id: self.call_id.as_str().into(),
             cseq: self.cseq,
@@ -1570,8 +1563,8 @@ mod tests {
             q: 1.0,
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
-            // Non-None on purpose: with no stored epoch `restored_registered_at`
-            // falls back to now, so `elapsed()` is ~0 and no test driving this
+            // Non-None on purpose: with no stored epoch the restored
+            // `registered_at` is just now, so `elapsed()` is ~0 and no test driving this
             // fixture can reach the expiry arithmetic at all. That is what hid
             // the half-life reap — a fixture has to exercise the path the tests
             // around it claim to cover.
