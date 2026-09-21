@@ -496,6 +496,7 @@ pub async fn run(
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),
         held_byes: Arc::new(DashMap::new()),
+        pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         is_draining: drain.clone(),
         rf_charger,

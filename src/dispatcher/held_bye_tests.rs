@@ -289,3 +289,237 @@ async fn a_caller_bye_while_its_bye_is_held_is_answered_and_the_held_bye_is_drop
     );
     assert!(byes_to(&after, caller()).is_empty());
 }
+
+// ── RFC 3261 §13.2.2.4: the ACK siphon owes its own re-INVITE ────────────────
+//
+// siphon is the UAC of a re-INVITE it sends, so the final response has to be
+// ACKed, and §15 releases the dialog only once it is. A siphon-terminated
+// transfer is what puts the two in a race: the media re-anchor re-INVITEs the
+// surviving party while the transfer target can hang up in the same breath, so
+// the survivor's 200 is being rewritten on one task while its BYE is generated
+// on another. Emitted as they come, the BYE reaches the survivor first and the
+// ACK lands on a dialog the survivor has already ended.
+//
+// The window is the response handler's, so these drive its two ends directly:
+// `forward_reinvite_response` marks the dialog while it works and settles the
+// mark when the ACK is enqueued.
+
+/// The callee dialog's Call-ID, as the bridged harness builds the B-leg.
+const CALLEE_DIALOG: &str = "b2b-callee@192.0.2.1";
+
+/// siphon re-INVITEs the callee and returns the re-INVITE as sent.
+fn siphon_reinvites_the_callee(call: &Call) -> SipMessage {
+    let sdp = concat!(
+        "v=0\r\n",
+        "o=- 2 2 IN IP4 198.51.100.79\r\n",
+        "s=-\r\n",
+        "c=IN IP4 198.51.100.79\r\n",
+        "t=0 0\r\n",
+        "m=audio 40000 RTP/AVP 0\r\n",
+    );
+    assert!(
+        b2bua_send_reinvite_on_leg(
+            &call.call_id,
+            /*surviving_on_a_leg=*/ false,
+            sdp.as_bytes().to_vec(),
+            "reinvite:a2b",
+            &call.state,
+        ),
+        "siphon re-INVITEd the callee"
+    );
+    call.wire()
+        .into_iter()
+        .find(|sent| sent.destination == callee() && sent.message.method() == Some(&Method::Invite))
+        .expect("the re-INVITE reached the callee")
+        .message
+}
+
+/// The callee's final response to that re-INVITE, echoing its own Via, From,
+/// Call-ID and CSeq (RFC 3261 §8.2.6.2) so it matches the tracking leg.
+fn callee_answers_the_reinvite(call: &Call, reinvite: &SipMessage, status_line: &str) -> bool {
+    let header = |name: &str| {
+        reinvite
+            .headers
+            .get(name)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| panic!("the re-INVITE has no {name}"))
+    };
+    let raw = format!(
+        concat!(
+            "SIP/2.0 {status_line}\r\n",
+            "Via: {via}\r\n",
+            "From: {from}\r\n",
+            "To: {to};tag=callee-tag\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: {cseq}\r\n",
+            "Contact: <sip:15550100042@198.51.100.77:5060>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        status_line = status_line,
+        via = header("Via"),
+        from = header("From"),
+        to = header("To"),
+        call_id = header("Call-ID"),
+        cseq = header("CSeq"),
+    );
+    let mut message = parse_sip_message_bytes(raw.as_bytes()).expect("the response parses");
+    let status_code = message.status_code().expect("a response");
+    handle_b2bua_response(
+        &call.call_id,
+        top_via_branch(reinvite).expect("the re-INVITE has a Via branch"),
+        &mut message,
+        status_code,
+        callee(),
+        &call.state,
+    )
+}
+
+/// The handler marks the dialog while it is working and settles the mark once
+/// the ACK is on its way, for a 2xx and for a failed re-INVITE alike. Nothing is
+/// left behind for the sweep to find.
+#[tokio::test(start_paused = true)]
+async fn the_reinvite_response_handler_settles_the_ack_it_owes() {
+    for status_line in ["200 OK", "488 Not Acceptable Here"] {
+        let call = Call::bridged_with_script(B2BUA_SCRIPT);
+        call.callee_answers("");
+        let relayed = relayed_answer(&call);
+        call.caller_acks(&relayed);
+        call.wire();
+
+        let reinvite = siphon_reinvites_the_callee(&call);
+        assert!(
+            callee_answers_the_reinvite(&call, &reinvite, status_line),
+            "{status_line}: the response was handled"
+        );
+
+        let acks = call
+            .wire()
+            .iter()
+            .filter(|sent| {
+                sent.destination == callee() && sent.message.method() == Some(&Method::Ack)
+            })
+            .count();
+        assert_eq!(acks, 1, "{status_line}: exactly one ACK to the callee");
+        assert!(
+            call.state.pending_reinvite_acks.is_empty(),
+            "{status_line}: the owed ACK is settled, so the sweep has nothing to do"
+        );
+    }
+}
+
+/// A BYE for a dialog whose re-INVITE answer siphon has not ACKed yet waits, and
+/// goes out right after that ACK is enqueued.
+#[tokio::test(start_paused = true)]
+async fn a_bye_waits_for_the_reinvite_ack_siphon_owes_that_dialog() {
+    let call = Call::bridged_with_script(B2BUA_SCRIPT);
+    call.callee_answers("");
+    let relayed = relayed_answer(&call);
+    call.caller_acks(&relayed);
+    call.wire();
+
+    // The handler has the callee's re-INVITE answer in hand and has not ACKed it.
+    call.state.pending_reinvite_acks.insert(
+        CALLEE_DIALOG.to_string(),
+        tokio::time::Instant::now() + Duration::from_secs(32),
+    );
+
+    caller_hangs_up(&call.state, &relayed);
+    assert!(
+        byes_to(&call.wire(), callee()).is_empty(),
+        "no BYE to a callee whose re-INVITE answer is not ACKed (RFC 3261 §13.2.2.4)"
+    );
+    assert!(
+        !call.state.held_byes.is_empty(),
+        "the BYE is parked, not dropped"
+    );
+
+    assert!(release_bye_held_for_reinvite_ack(
+        CALLEE_DIALOG,
+        &call.state
+    ));
+    assert_eq!(
+        byes_to(&call.wire(), callee()).len(),
+        1,
+        "the ACK releases the BYE it held"
+    );
+    assert!(call.state.held_byes.is_empty() && call.state.pending_reinvite_acks.is_empty());
+}
+
+/// A re-INVITE answer that is never ACKed — the handler returned before building
+/// one — cannot park a BYE for the life of the process. The sweep sends it at
+/// 64×T1, once.
+#[tokio::test(start_paused = true)]
+async fn a_bye_held_for_an_ack_that_never_goes_out_is_swept_at_64_t1() {
+    let call = Call::bridged_with_script(B2BUA_SCRIPT);
+    call.callee_answers("");
+    let relayed = relayed_answer(&call);
+    call.caller_acks(&relayed);
+    call.wire();
+
+    call.state.pending_reinvite_acks.insert(
+        CALLEE_DIALOG.to_string(),
+        tokio::time::Instant::now() + Duration::from_millis(32_000),
+    );
+    caller_hangs_up(&call.state, &relayed);
+    call.wire();
+
+    tokio::time::sleep(Duration::from_millis(31_900)).await;
+    sweep_owed_reinvite_acks(&call.state);
+    assert!(
+        byes_to(&call.wire(), callee()).is_empty(),
+        "no BYE inside 64×T1"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sweep_owed_reinvite_acks(&call.state);
+    assert_eq!(
+        byes_to(&call.wire(), callee()).len(),
+        1,
+        "the held BYE, once"
+    );
+    assert!(call.state.held_byes.is_empty() && call.state.pending_reinvite_acks.is_empty());
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    sweep_owed_reinvite_acks(&call.state);
+    assert!(
+        byes_to(&call.wire(), callee()).is_empty(),
+        "and no second BYE"
+    );
+}
+
+/// The two waits are independent. A caller that has not ACKed siphon's own 2xx
+/// keeps its BYE parked even when a re-INVITE ACK on the same dialog settles
+/// first: releasing on the wrong reason would put the BYE on the wire before the
+/// caller has confirmed the dialog, which is what §15 forbids.
+#[tokio::test(start_paused = true)]
+async fn settling_a_reinvite_ack_does_not_release_a_bye_the_caller_still_owes() {
+    let call = Call::bridged_with_script(B2BUA_SCRIPT);
+    call.callee_answers("");
+    let relayed = relayed_answer(&call);
+    let caller_dialog = relayed
+        .headers
+        .call_id()
+        .expect("the relayed answer has a Call-ID")
+        .clone();
+    call.callee_hangs_up();
+    call.wire();
+
+    assert!(
+        !call.state.held_byes.is_empty(),
+        "the caller's BYE waits for its own ACK (RFC 3261 §15)"
+    );
+    assert!(
+        !release_bye_held_for_reinvite_ack(&caller_dialog, &call.state),
+        "a re-INVITE ACK settling does not release a BYE held for the caller's ACK"
+    );
+    assert!(byes_to(&call.wire(), caller()).is_empty());
+    assert!(!call.state.held_byes.is_empty(), "still parked");
+
+    call.caller_acks(&relayed);
+    assert_eq!(
+        byes_to(&call.wire(), caller()).len(),
+        1,
+        "the caller's own ACK is what releases it"
+    );
+}
