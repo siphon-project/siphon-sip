@@ -1,0 +1,32 @@
+services:
+  notifier:
+    image: ${SUBSCRIBE_ACCEPT_IMAGE:-sipp-siphon:latest}
+    volumes:
+      - ./subscribe-accept/siphon.yaml:/etc/siphon/siphon.yaml:ro
+      - ./subscribe-accept:/etc/siphon/test_scripts:ro
+      - ${SUBSCRIBE_ACCEPT_TLS_DIR:?set TLS directory}:/etc/siphon/pki:ro
+    networks:
+      subscriptions:
+        ipv4_address: 203.0.113.10
+  front:
+    image: haproxy:3.0-alpine
+    volumes:
+      - ./subscribe-accept/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ${SUBSCRIBE_ACCEPT_TLS_DIR:?set TLS directory}:/etc/siphon/pki:ro
+    networks:
+      subscriptions:
+        ipv4_address: 203.0.113.20
+  subscriber:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+      - ${SUBSCRIBE_ACCEPT_TLS_DIR:?set TLS directory}:/etc/siphon/pki:ro
+    networks:
+      subscriptions:
+        ipv4_address: 203.0.113.30
+    entrypoint: [sipp, "203.0.113.20:5061", -sf, "/sipp/scenarios/${SUBSCRIBE_ACCEPT_SCENARIO:-subscribe_accept_tls_uac.xml}", -t, l1, -tls_cert, /etc/siphon/pki/cert.pem, -tls_key, /etc/siphon/pki/key.pem, -i, "203.0.113.30", -m, "1", -l, "1", -timeout, "40", -trace_err]
+networks:
+  subscriptions:
+    ipam:
+      config:
+        - subnet: 203.0.113.0/24

@@ -343,6 +343,10 @@ class MockSubscribeHandle:
         return self._id
 
     @property
+    def local_tag(self) -> str:
+        return self._dialog.get("local_tag", "")
+
+    @property
     def event(self) -> str:
         return self._dialog.get("event", "")
 
@@ -454,6 +458,29 @@ class MockSubscribeState:
         }
         self._dialogs[handle_id] = dialog
         return MockSubscribeHandle(self, handle_id, dialog)
+
+    def accept(self, request: Any, expires: Optional[int] = None) -> Optional[MockSubscribeHandle]:
+        """Accept or refresh an authorized notifier subscription; body is script-owned."""
+        import uuid
+        to_value = request.get_header("To") or ""
+        to_tag = to_value.split(";tag=", 1)[1].split(";", 1)[0] if ";tag=" in to_value else None
+        event = request.get_header("Event") or ""
+        call_id = request.call_id
+        from_tag = request.from_tag
+        handle = self.find(call_id, to_tag, from_tag) if to_tag else None
+        if to_tag and (handle is None or handle.event != event):
+            request.reply(481, "Subscription Does Not Exist")
+            return None
+        if handle is None:
+            handle = self.create(request, expires)
+            handle._dialog["local_tag"] = uuid.uuid4().hex
+            handle._dialog["event"] = event
+        handle._dialog["expires_secs"] = expires if expires is not None else int(request.get_header("Expires") or 3600)
+        request.set_reply_header("To", to_value if to_tag else f"{to_value};tag={handle.local_tag}")
+        request.set_reply_header("Expires", str(handle.expires))
+        request.set_reply_header("Contact", f"<{request.to_uri}>")
+        request.reply(200, "OK")
+        return handle
 
     def get(self, id: str) -> Optional[MockSubscribeHandle]:
         dialog = self._dialogs.get(id)

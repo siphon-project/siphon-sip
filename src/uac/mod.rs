@@ -557,6 +557,18 @@ impl UacSender {
     /// Used for NOTIFY, MESSAGE, and other outbound requests where the caller
     /// does not need to correlate a response.
     pub fn send_request(&self, message: SipMessage, destination: SocketAddr, transport: Transport) {
+        self.send_request_on_connection(message, destination, transport, ConnectionId::default());
+    }
+
+    /// Send a request over a known live stream, keeping dialog requests on the
+    /// subscriber's connection even when its Contact is behind NAT.
+    pub fn send_request_on_connection(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+    ) {
         let data = Bytes::from(message.to_bytes());
 
         // HEP capture — outbound fire-and-forget
@@ -567,7 +579,7 @@ impl UacSender {
 
         let outbound_message = OutboundMessage {
             followups: None,
-            connection_id: ConnectionId::default(),
+            connection_id,
             transport,
             destination,
             data,
@@ -929,6 +941,35 @@ mod tests {
         let outbound = udp_rx.try_recv().unwrap();
         assert_eq!(outbound.destination, "10.0.0.5:5060".parse().unwrap());
         assert!(!outbound.data.is_empty());
+    }
+
+    #[test]
+    fn notify_on_a_known_stream_preserves_the_connection_id() {
+        let (sender, receivers) = make_uac_sender();
+        let message = SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Notify,
+                SipUri::new("192.0.2.20".into()),
+            )
+            .via("SIP/2.0/TLS 198.51.100.10:5061;branch=z9hG4bK-notify".into())
+            .to("<sip:201@example.com>;tag=watcher".into())
+            .from("<sip:201@example.com>;tag=notifier".into())
+            .call_id("notify-held-flow".into())
+            .cseq("2 NOTIFY".into())
+            .content_length(0)
+            .build()
+            .unwrap();
+        sender.send_request_on_connection(
+            message,
+            "198.51.100.20:43210".parse().unwrap(),
+            Transport::Tls,
+            ConnectionId(42),
+        );
+        let outbound = receivers[2].try_recv().unwrap();
+        assert_eq!(outbound.connection_id, ConnectionId(42));
+        assert_eq!(outbound.transport, Transport::Tls);
+        assert_eq!(outbound.destination, "198.51.100.20:43210".parse().unwrap());
+        assert_eq!(sender.pending_count(), 0);
     }
 
     #[test]

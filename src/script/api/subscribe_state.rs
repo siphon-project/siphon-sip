@@ -48,6 +48,103 @@ impl PySubscribeState {
 
 #[pymethods]
 impl PySubscribeState {
+    /// Accept an authenticated, authorized incoming SUBSCRIBE. Returns the
+    /// existing handle on refresh, or None after replying 481 to an unknown
+    /// in-dialog request. The script must immediately notify (or terminate for
+    /// Expires:0); package bodies and access policy remain script-owned.
+    #[pyo3(signature = (request, expires=None))]
+    fn accept(
+        &self,
+        request: &Bound<'_, PyRequest>,
+        expires: Option<u64>,
+    ) -> PyResult<Option<PySubscribeHandle>> {
+        let candidate = capture_incoming(request, expires)?;
+        let mut borrowed = request.borrow_mut();
+        let message_arc = borrowed.message();
+        let message = message_arc
+            .lock()
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
+        let to = message
+            .headers
+            .get("To")
+            .or_else(|| message.headers.get("t"))
+            .cloned()
+            .unwrap_or_default();
+        let tagged = extract_tag(&to).is_some();
+        let dialog = if tagged {
+            match self.store.find_by_tags(
+                &candidate.call_id,
+                &candidate.local_tag,
+                &candidate.remote_tag,
+            ) {
+                Some(existing)
+                    if !existing.is_outbound
+                        && existing.event == candidate.event
+                        && existing.remaining_secs() > 0
+                        && existing.local_uri == candidate.local_uri
+                        && existing.remote_uri == candidate.remote_uri =>
+                {
+                    existing
+                }
+                _ => {
+                    drop(message);
+                    borrowed.set_reply(481, "Subscription Does Not Exist".into());
+                    return Ok(None);
+                }
+            }
+        } else {
+            candidate.clone()
+        };
+        drop(message);
+        let mut dialog = dialog;
+        dialog.remote_target = candidate.remote_target;
+        // A notifier's route set is the request's order, unlike a UAC's reversed
+        // response route set (RFC 3261 section 12.1.1).
+        if !tagged {
+            dialog.route_set = candidate.route_set.into_iter().rev().collect();
+        }
+        dialog.received_address = borrowed.source_socket_addr();
+        dialog.received_transport = Some(borrowed.transport_name().to_ascii_lowercase());
+        dialog.received_connection_id = borrowed.inbound_connection_id_u64();
+        dialog.refresh(candidate.expires_secs);
+        borrowed.push_reply_header_replace("To", ensure_tag(&to, &dialog.local_tag));
+        borrowed.push_reply_header_replace("Expires", candidate.expires_secs.to_string());
+        let transport = received_transport(dialog.received_transport.as_deref().unwrap_or("udp"));
+        let contact = UAC_SENDER
+            .get()
+            .map(|sender| {
+                format_default_contact(
+                    &sender.via_host_for(&transport),
+                    sender.addr_for(&transport).port(),
+                    transport,
+                )
+            })
+            .unwrap_or_else(|| format!("<{}>", dialog.local_uri));
+        borrowed.push_reply_header_replace("Contact", contact);
+        borrowed.set_reply(200, "OK".into());
+        let id = dialog.id.clone();
+        if tagged {
+            // Preserve counters bumped concurrently by change notifications.
+            let refreshed = self.store.update(&id, |existing| {
+                existing.remote_target = dialog.remote_target;
+                existing.received_address = dialog.received_address;
+                existing.received_transport = dialog.received_transport;
+                existing.received_connection_id = dialog.received_connection_id;
+                existing.refresh(dialog.expires_secs);
+            });
+            if refreshed.is_none() {
+                borrowed.set_reply(481, "Subscription Does Not Exist".into());
+                return Ok(None);
+            }
+        } else {
+            self.store.put(dialog);
+        }
+        Ok(Some(PySubscribeHandle {
+            store: Arc::clone(&self.store),
+            id,
+        }))
+    }
+
     /// Capture the dialog from an incoming SUBSCRIBE request and return a
     /// handle for later NOTIFY/terminate operations.
     ///
@@ -61,97 +158,8 @@ impl PySubscribeState {
         request: &Bound<'_, PyRequest>,
         expires: Option<u64>,
     ) -> PyResult<PySubscribeHandle> {
-        let borrowed = request.borrow();
-        let message_arc = borrowed.message();
-        let message = message_arc.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-        })?;
-
-        let call_id = message
-            .headers
-            .get("Call-ID")
-            .or_else(|| message.headers.get("i"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Call-ID"))?;
-
-        let from_raw = message
-            .headers
-            .get("From")
-            .or_else(|| message.headers.get("f"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing From"))?;
-        let to_raw = message
-            .headers
-            .get("To")
-            .or_else(|| message.headers.get("t"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing To"))?;
-
-        let contact_raw = message
-            .headers
-            .get("Contact")
-            .or_else(|| message.headers.get("m"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Contact"))?;
-
-        let event = message
-            .headers
-            .get("Event")
-            .or_else(|| message.headers.get("o"))
-            .cloned()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Event header")
-            })?;
-
-        let remote_tag = extract_tag(&from_raw)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE From has no tag"))?;
-
-        // The SUBSCRIBE's To-tag is the notifier's (our) tag.  If the
-        // SUBSCRIBE had no To-tag (first-in-dialog), we mint one now so
-        // our NOTIFYs carry a stable tag.
-        let local_tag = extract_tag(&to_raw).unwrap_or_else(short_uuid);
-
-        let local_uri = strip_nameaddr(&to_raw);
-        let remote_uri = strip_nameaddr(&from_raw);
-        let remote_target = strip_nameaddr(&contact_raw);
-
-        // Record-Route values are copied left-to-right; NOTIFY Route
-        // headers are the reverse (RFC 3261 §12.1).
-        let route_set: Vec<String> = message
-            .headers
-            .get_all("Record-Route")
-            .map(|entries| entries.iter().rev().cloned().collect())
-            .unwrap_or_default();
-
-        let expires_secs = expires
-            .or_else(|| {
-                message
-                    .headers
-                    .get("Expires")
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-            })
-            .unwrap_or(3600);
-
-        let id = short_uuid();
-        let dialog = SubscribeDialog {
-            id: id.clone(),
-            call_id,
-            local_tag,
-            remote_tag,
-            local_uri,
-            remote_uri,
-            remote_target,
-            route_set,
-            event,
-            expires_secs,
-            created_at_unix: now_unix(),
-            cseq: 0,
-            event_version: 0,
-            terminated: false,
-            is_outbound: false,
-        };
-
-        drop(message);
+        let dialog = capture_incoming(request, expires)?;
+        let id = dialog.id.clone();
         self.store.put(dialog);
         debug!(id, "subscribe_state: dialog created");
 
@@ -407,6 +415,9 @@ impl PySubscribeState {
             local_uri,
             remote_uri,
             remote_target,
+            received_address: None,
+            received_transport: None,
+            received_connection_id: None,
             route_set,
             event: event.to_string(),
             expires_secs: expires,
@@ -458,6 +469,12 @@ impl PySubscribeHandle {
     #[getter]
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Notifier tag shared by the SUBSCRIBE response and every NOTIFY.
+    #[getter]
+    fn local_tag(&self) -> PyResult<String> {
+        Ok(self.load_sync()?.local_tag)
     }
 
     /// The SIP Event package (copied from the SUBSCRIBE).
@@ -691,9 +708,131 @@ impl PySubscribeHandle {
     }
 }
 
+fn capture_incoming(
+    request: &Bound<'_, PyRequest>,
+    expires: Option<u64>,
+) -> PyResult<SubscribeDialog> {
+    let borrowed = request.borrow();
+    let message_arc = borrowed.message();
+    let message = message_arc.lock().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+    })?;
+
+    let call_id = message
+        .headers
+        .get("Call-ID")
+        .or_else(|| message.headers.get("i"))
+        .cloned()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Call-ID"))?;
+
+    let from_raw = message
+        .headers
+        .get("From")
+        .or_else(|| message.headers.get("f"))
+        .cloned()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing From"))?;
+    let to_raw = message
+        .headers
+        .get("To")
+        .or_else(|| message.headers.get("t"))
+        .cloned()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing To"))?;
+
+    let contact_raw = message
+        .headers
+        .get("Contact")
+        .or_else(|| message.headers.get("m"))
+        .cloned()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Contact"))?;
+
+    let event = message
+        .headers
+        .get("Event")
+        .or_else(|| message.headers.get("o"))
+        .cloned()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Event header"))?;
+
+    let remote_tag = extract_tag(&from_raw)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE From has no tag"))?;
+
+    // The SUBSCRIBE's To-tag is the notifier's (our) tag.  If the
+    // SUBSCRIBE had no To-tag (first-in-dialog), we mint one now so
+    // our NOTIFYs carry a stable tag.
+    let local_tag = extract_tag(&to_raw).unwrap_or_else(short_uuid);
+
+    let local_uri = strip_nameaddr(&to_raw);
+    let remote_uri = strip_nameaddr(&from_raw);
+    let remote_target = strip_nameaddr(&contact_raw);
+
+    // Record-Route values are copied left-to-right; NOTIFY Route
+    // headers are the reverse (RFC 3261 §12.1).
+    let route_set: Vec<String> = message
+        .headers
+        .get_all("Record-Route")
+        .map(|entries| entries.iter().rev().cloned().collect())
+        .unwrap_or_default();
+
+    let expires_secs = expires
+        .or_else(|| {
+            message
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(3600);
+
+    let id = short_uuid();
+    let dialog = SubscribeDialog {
+        id: id.clone(),
+        call_id,
+        local_tag,
+        remote_tag,
+        local_uri,
+        remote_uri,
+        remote_target,
+        received_address: None,
+        received_transport: None,
+        received_connection_id: None,
+        route_set,
+        event,
+        expires_secs,
+        created_at_unix: now_unix(),
+        cseq: 0,
+        event_version: 0,
+        terminated: false,
+        is_outbound: false,
+    };
+
+    drop(message);
+    Ok(dialog)
+}
+
 // ---------------------------------------------------------------------------
 // Wire helpers — borrowed from proxy_utils / presence patterns
 // ---------------------------------------------------------------------------
+
+/// Finish expired notifier dialogs outside the dispatcher task: DNS resolution
+/// must not stall SIP dispatch. State has already been removed by the sweep.
+pub(crate) fn notify_expired(mut dialog: SubscribeDialog) {
+    if dialog.terminated || dialog.is_outbound {
+        return;
+    }
+    dialog.next_cseq();
+    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None) {
+        tracing::error!(id = %dialog.id, %error, "failed to notify subscription expiry");
+    }
+}
+
+fn received_transport(name: &str) -> Transport {
+    match name {
+        "tls" => Transport::Tls,
+        "tcp" => Transport::Tcp,
+        "ws" => Transport::WebSocket,
+        "wss" => Transport::WebSocketSecure,
+        "sctp" => Transport::Sctp,
+        _ => Transport::Udp,
+    }
+}
 
 fn send_notify(
     dialog: &SubscribeDialog,
@@ -713,71 +852,85 @@ fn send_notify(
     })?;
 
     // Determine transport destination: first Route URI or remote_target.
-    let resolve_target: String = dialog
-        .route_set
-        .first()
-        .map(|route| {
-            route
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_string()
-        })
-        .unwrap_or_else(|| dialog.remote_target.clone());
-
-    let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid route/target URI '{resolve_target}': {error}"
-        ))
-    })?;
     let ruri = parse_uri_standalone(&dialog.remote_target).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid remote_target URI '{}': {error}",
-            dialog.remote_target
-        ))
+        pyo3::exceptions::PyValueError::new_err(format!("invalid remote target: {error}"))
     })?;
+    let (destination, transport) = if let (true, Some(address), Some(transport)) = (
+        dialog.route_set.is_empty(),
+        dialog.received_address,
+        dialog.received_transport.as_deref(),
+    ) {
+        let transport = received_transport(transport);
+        (address, transport)
+    } else {
+        let resolve_target: String = dialog
+            .route_set
+            .first()
+            .map(|route| {
+                route
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            })
+            .unwrap_or_else(|| dialog.remote_target.clone());
 
-    let transport_hint = resolve_uri
-        .get_param("transport")
-        .map(|s: &str| s.to_string());
-    let resolver_clone = Arc::clone(resolver);
-    let host = resolve_uri.host.clone();
-    let port = resolve_uri.port;
-    let scheme = resolve_uri.scheme.clone();
+        let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid route/target URI '{resolve_target}': {error}"
+            ))
+        })?;
 
-    let destination = crate::script::detach_block_on(resolver_clone.resolve(
-        &host,
-        port,
-        scheme.as_str(),
-        transport_hint.as_deref(),
-    ));
+        let transport_hint = resolve_uri
+            .get_param("transport")
+            .map(|s: &str| s.to_string());
+        let resolver_clone = Arc::clone(resolver);
+        let host = resolve_uri.host.clone();
+        let port = resolve_uri.port;
+        let scheme = resolve_uri.scheme.clone();
 
-    let target = destination.into_iter().next().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "cannot resolve destination for '{resolve_target}'"
-        ))
-    })?;
+        let destination = crate::script::detach_block_on(resolver_clone.resolve(
+            &host,
+            port,
+            scheme.as_str(),
+            transport_hint.as_deref(),
+        ));
 
-    let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-        Some(hint) => match hint.to_lowercase().as_str() {
-            "tcp" => Transport::Tcp,
-            "tls" => Transport::Tls,
-            "ws" => Transport::WebSocket,
-            "wss" => Transport::WebSocketSecure,
-            "sctp" => Transport::Sctp,
-            _ => Transport::Udp,
-        },
-        None => {
-            if scheme == "sips" {
-                Transport::Tls
-            } else {
-                Transport::Udp
+        let target = destination.into_iter().next().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "cannot resolve destination for '{resolve_target}'"
+            ))
+        })?;
+
+        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
+            Some(hint) => match hint.to_lowercase().as_str() {
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                "sctp" => Transport::Sctp,
+                _ => Transport::Udp,
+            },
+            None => {
+                if scheme == "sips" {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                }
             }
-        }
+        };
+
+        (target.address, transport)
     };
 
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-    let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
+    let via = format!(
+        "SIP/2.0/{} {}:{};branch={}",
+        transport,
+        uac_sender.via_host_for(&transport),
+        uac_sender.addr_for(&transport).port(),
+        branch
+    );
     let cseq_str = format!("{} NOTIFY", dialog.cseq);
 
     // NOTIFY tag orientation (RFC 6665 §4.4.1): From = notifier (us),
@@ -793,6 +946,14 @@ fn send_notify(
         .max_forwards(70)
         .from(from_header)
         .to(to_header)
+        .header(
+            "Contact",
+            format_default_contact(
+                &uac_sender.via_host_for(&transport),
+                uac_sender.addr_for(&transport).port(),
+                transport,
+            ),
+        )
         .header("Event", dialog.event.clone())
         .header("Subscription-State", subscription_state.to_string());
 
@@ -816,8 +977,31 @@ fn send_notify(
 
     // If called from inside a request handler, the dispatcher may defer
     // until after the SUBSCRIBE reply is sent (RFC 6665 §4.1).
-    if !super::proxy_utils::try_defer_send(message.clone(), target.address, transport) {
-        uac_sender.send_request(message, target.address, transport);
+    if !super::proxy_utils::try_defer_send(message.clone(), destination, transport) {
+        if dialog.route_set.is_empty()
+            && dialog.received_address.is_some()
+            && transport != Transport::Udp
+        {
+            // Exact match only: IP-only reuse can select another subscriber's
+            // connection when several phones share one front proxy.
+            let connection_id = super::stream_connections()
+                .and_then(|registry| registry.get(&destination))
+                .filter(|(registered_transport, _)| *registered_transport == transport)
+                .filter(|(_, connection_id)| {
+                    dialog
+                        .received_connection_id
+                        .map_or(true, |expected| connection_id.0 == expected)
+                })
+                .map(|(_, connection_id)| connection_id)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "SUBSCRIBE transport flow is no longer connected",
+                    )
+                })?;
+            uac_sender.send_request_on_connection(message, destination, transport, connection_id);
+        } else {
+            uac_sender.send_request(message, destination, transport);
+        }
     }
     debug!(id = %dialog.id, "subscribe_state: NOTIFY sent");
     Ok(())
@@ -1206,6 +1390,101 @@ mod tests {
     use super::*;
     use pyo3::types::PyDict;
 
+    fn incoming<'py>(python: Python<'py>, tag: &str, expires: u64) -> Bound<'py, PyRequest> {
+        let message = SipMessageBuilder::new()
+            .request(
+                Method::Subscribe,
+                parse_uri_standalone("sip:201@example.com").unwrap(),
+            )
+            .via("SIP/2.0/TLS 192.0.2.20:5061;branch=z9hG4bK-test".into())
+            .from("<sip:201@example.com>;tag=watcher".into())
+            .to(format!("<sip:201@example.com>{tag}"))
+            .call_id("subscription-test".into())
+            .cseq("1 SUBSCRIBE".into())
+            .header("Contact", "<sip:201@192.0.2.20:5061;transport=tls>".into())
+            .header("Event", "message-summary".into())
+            .header("Expires", expires.to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(std::sync::Mutex::new(message)),
+            "tls".into(),
+            "198.51.100.20".into(),
+            43210,
+        );
+        request.set_inbound_flow("198.51.100.10:5061".parse().unwrap(), 42);
+        Bound::new(python, request).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_refresh_keeps_dialog_identity_and_received_tls_destination() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let request = incoming(python, "", 300);
+            let handle = namespace.accept(&request, Some(300)).unwrap().unwrap();
+            let initial = handle.load_sync().unwrap();
+            assert_eq!(
+                initial.received_address.unwrap().to_string(),
+                "198.51.100.20:43210"
+            );
+            assert_eq!(initial.received_transport.as_deref(), Some("tls"));
+            assert_eq!(initial.received_connection_id, Some(42));
+            assert!(initial.remote_target.contains("192.0.2.20"));
+            let headers = request.borrow_mut().take_reply_headers();
+            assert!(headers.iter().any(|(_, name, value)| name == "To"
+                && value.ends_with(&format!(";tag={}", initial.local_tag))));
+            store.update(&handle.id, |dialog| {
+                dialog.cseq = 7;
+                dialog.event_version = 4;
+            });
+            let refresh = incoming(python, &format!(";tag={}", initial.local_tag), 600);
+            let refreshed = namespace.accept(&refresh, Some(600)).unwrap().unwrap();
+            assert_eq!(refreshed.id, handle.id);
+            let updated = refreshed.load_sync().unwrap();
+            assert_eq!(
+                (updated.cseq, updated.event_version, updated.expires_secs),
+                (7, 4, 600)
+            );
+            assert_eq!(store.local_count(), 1);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_unknown_dialog_returns_481_without_allocating() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let request = incoming(python, ";tag=unknown", 300);
+            assert!(namespace.accept(&request, Some(300)).unwrap().is_none());
+            assert!(matches!(
+                request.borrow().action(),
+                super::super::request::RequestAction::Reply { code: 481, .. }
+            ));
+            assert_eq!(store.local_count(), 0);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_initial_zero_expiry_returns_handle_for_final_notify() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(store);
+            let request = incoming(python, "", 0);
+            let handle = namespace.accept(&request, Some(0)).unwrap().unwrap();
+            assert_eq!(handle.load_sync().unwrap().expires_secs, 0);
+            assert!(request
+                .borrow_mut()
+                .take_reply_headers()
+                .iter()
+                .any(|(_, name, value)| name == "Expires" && value == "0"));
+        });
+    }
+
     #[test]
     fn extract_tag_basic() {
         assert_eq!(
@@ -1249,7 +1528,7 @@ mod tests {
 import siphon
 ns = siphon.proxy.subscribe_state
 assert type(ns).__name__ != '_SubscribeStateStub', type(ns).__name__
-for m in ('create', 'get', 'send', 'find'):
+for m in ('accept', 'create', 'get', 'send', 'find'):
     assert hasattr(ns, m), m
 assert hasattr(ns, 'local_count'), 'local_count'
 "#;

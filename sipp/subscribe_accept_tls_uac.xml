@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- TLS terminates at a front and is re-encrypted to the notifier. The Contact
+     cannot be dialled: immediate and background NOTIFY must reuse the stream. -->
+<scenario name="SUBSCRIBE TLS acceptance refresh change and unsubscribe">
+  <send><![CDATA[
+SUBSCRIBE sip:201@example.com SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:201@example.com>;tag=watcher[call_number]
+To: <sip:201@example.com>
+Call-ID: [call_id]
+CSeq: 1 SUBSCRIBE
+Contact: <sip:201@192.0.2.200:5099;transport=tls>
+Event: message-summary
+Expires: 30
+Accept: application/simple-message-summary
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200" timeout="5000"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="To:" check_it="true" assign_to="tag_header,notifier_tag" />
+      <ereg regexp="transport=tls" search_in="hdr" header="Contact:" check_it="true" assign_to="contact_transport" />
+  </action></recv>
+  <recv request="NOTIFY" timeout="5000" next="mismatch" test="tag_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="From:" check_it="true" assign_to="tag_notify_header,notify_tag" />
+      <strcmp assign_to="tag_comparison" variable="notifier_tag" variable2="notify_tag" />
+      <test assign_to="tag_differs" variable="tag_comparison" compare="not_equal" value="0" />
+      <ereg regexp="active;expires=" search_in="hdr" header="Subscription-State:" check_it="true" assign_to="state_header" />
+      <ereg regexp="[[:space:]]*1 NOTIFY" search_in="hdr" header="CSeq:" check_it="true" assign_to="notify_cseq" />
+      <ereg regexp="Messages-Waiting: no" search_in="msg" check_it="true" assign_to="waiting" />
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+  <recv request="NOTIFY" timeout="5000" next="mismatch" test="tag_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="From:" check_it="true" assign_to="tag_notify_header,notify_tag" />
+      <strcmp assign_to="tag_comparison" variable="notifier_tag" variable2="notify_tag" />
+      <test assign_to="tag_differs" variable="tag_comparison" compare="not_equal" value="0" />
+      <ereg regexp="active;expires=" search_in="hdr" header="Subscription-State:" check_it="true" assign_to="state_header" />
+      <ereg regexp="[[:space:]]*2 NOTIFY" search_in="hdr" header="CSeq:" check_it="true" assign_to="notify_cseq" />
+      <ereg regexp="Messages-Waiting: yes" search_in="msg" check_it="true" assign_to="waiting" />
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+  <send><![CDATA[
+SUBSCRIBE sip:201@example.com SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:201@example.com>;tag=watcher[call_number]
+To: <sip:201@example.com>;tag=[$notifier_tag]
+Call-ID: [call_id]
+CSeq: 2 SUBSCRIBE
+Contact: <sip:201@192.0.2.200:5099;transport=tls>
+Event: message-summary
+Expires: 30
+Accept: application/simple-message-summary
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200" timeout="5000" next="mismatch" test="response_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="To:" check_it="true" assign_to="tag_header,response_tag" />
+      <ereg regexp="transport=tls" search_in="hdr" header="Contact:" check_it="true" assign_to="contact_transport" />
+      <strcmp assign_to="response_comparison" variable="notifier_tag" variable2="response_tag" />
+      <test assign_to="response_differs" variable="response_comparison" compare="not_equal" value="0" />
+  </action></recv>
+  <recv request="NOTIFY" timeout="5000" next="mismatch" test="tag_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="From:" check_it="true" assign_to="tag_notify_header,notify_tag" />
+      <strcmp assign_to="tag_comparison" variable="notifier_tag" variable2="notify_tag" />
+      <test assign_to="tag_differs" variable="tag_comparison" compare="not_equal" value="0" />
+      <ereg regexp="active;expires=" search_in="hdr" header="Subscription-State:" check_it="true" assign_to="state_header" />
+      <ereg regexp="[[:space:]]*3 NOTIFY" search_in="hdr" header="CSeq:" check_it="true" assign_to="notify_cseq" />
+      <ereg regexp="Messages-Waiting: no" search_in="msg" check_it="true" assign_to="waiting" />
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+  <send><![CDATA[
+SUBSCRIBE sip:201@example.com SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:201@example.com>;tag=watcher[call_number]
+To: <sip:201@example.com>;tag=[$notifier_tag]
+Call-ID: [call_id]
+CSeq: 3 SUBSCRIBE
+Contact: <sip:201@192.0.2.200:5099;transport=tls>
+Event: message-summary
+Expires: 0
+Accept: application/simple-message-summary
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200" timeout="5000" next="mismatch" test="response_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="To:" check_it="true" assign_to="tag_header,response_tag" />
+      <ereg regexp="transport=tls" search_in="hdr" header="Contact:" check_it="true" assign_to="contact_transport" />
+      <strcmp assign_to="response_comparison" variable="notifier_tag" variable2="response_tag" />
+      <test assign_to="response_differs" variable="response_comparison" compare="not_equal" value="0" />
+  </action></recv>
+  <recv request="NOTIFY" timeout="5000" next="mismatch" test="tag_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="From:" check_it="true" assign_to="tag_notify_header,notify_tag" />
+      <strcmp assign_to="tag_comparison" variable="notifier_tag" variable2="notify_tag" />
+      <test assign_to="tag_differs" variable="tag_comparison" compare="not_equal" value="0" />
+      <ereg regexp="terminated;reason=deactivated" search_in="hdr" header="Subscription-State:" check_it="true" assign_to="state_header" />
+      <ereg regexp="[[:space:]]*4 NOTIFY" search_in="hdr" header="CSeq:" check_it="true" assign_to="notify_cseq" />
+      <ereg regexp="Messages-Waiting: no" search_in="msg" check_it="true" assign_to="waiting" />
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+  <send><![CDATA[
+SUBSCRIBE sip:201@example.com SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:201@example.com>;tag=watcher[call_number]
+To: <sip:201@example.com>
+Call-ID: [call_id]
+CSeq: 4 SUBSCRIBE
+Contact: <sip:201@192.0.2.200:5099;transport=tls>
+Event: message-summary
+Expires: 0
+Accept: application/simple-message-summary
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200" timeout="5000"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="To:" check_it="true" assign_to="tag_header,notifier_tag" />
+      <ereg regexp="transport=tls" search_in="hdr" header="Contact:" check_it="true" assign_to="contact_transport" />
+  </action></recv>
+  <recv request="NOTIFY" timeout="5000" next="mismatch" test="tag_differs"><action>
+      <ereg regexp="tag=([^;&gt;[:space:]]+)" search_in="hdr" header="From:" check_it="true" assign_to="tag_notify_header,notify_tag" />
+      <strcmp assign_to="tag_comparison" variable="notifier_tag" variable2="notify_tag" />
+      <test assign_to="tag_differs" variable="tag_comparison" compare="not_equal" value="0" />
+      <ereg regexp="terminated;reason=deactivated" search_in="hdr" header="Subscription-State:" check_it="true" assign_to="state_header" />
+      <ereg regexp="[[:space:]]*1 NOTIFY" search_in="hdr" header="CSeq:" check_it="true" assign_to="notify_cseq" />
+      <ereg regexp="Messages-Waiting: no" search_in="msg" check_it="true" assign_to="waiting" />
+  </action></recv>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]></send>
+  <nop next="done" />
+  <label id="mismatch" />
+  <recv request="DIALOG_TAG_MISMATCH" timeout="100" />
+  <label id="done" />
+  <Reference variables="tag_header,state_header,notify_cseq,waiting,contact_transport,tag_notify_header" />
+</scenario>
