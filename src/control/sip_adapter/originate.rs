@@ -98,7 +98,7 @@ pub(super) fn originate_on(
         Ok(media) => media,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
-    let privacy = match parse_privacy(args.get("privacy")) {
+    let privacy = match parse_privacy("originate", args.get("privacy")) {
         Ok(privacy) => privacy,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
@@ -271,6 +271,7 @@ pub(super) fn parse_originate_media(
 /// unrecognised value is a typed error, never a silent "present the CLI" —
 /// guessing at a privacy setting is how identities leak.
 pub(super) fn parse_privacy(
+    verb: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<Option<crate::sip::privacy::CallerIdPresentation>, String> {
     match value {
@@ -280,9 +281,11 @@ pub(super) fn parse_privacy(
             Some(text) => crate::sip::privacy::CallerIdPresentation::parse(text)
                 .map(Some)
                 .ok_or_else(|| {
-                    format!("originate args.privacy must be \"allowed\" or \"restricted\", got '{text}'")
+                    format!(
+                        "{verb} args.privacy must be \"allowed\" or \"restricted\", got '{text}'"
+                    )
                 }),
-            None => Err("originate args.privacy must be a string".to_string()),
+            None => Err(format!("{verb} args.privacy must be a string")),
         },
     }
 }

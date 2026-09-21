@@ -71,6 +71,15 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
 /// answers, voicemail" without answering the caller first — which starts
 /// billing before anyone picks up, records an unanswered call as answered, and
 /// denies the caller the callee's own ringback.
+///
+/// `from` / `from_display` / `p_asserted_identity` / `privacy` are the same
+/// identity arguments `originate` takes. They matter here because a B-leg
+/// otherwise presents the caller's own `From`, which on a call out to a trunk
+/// is the internal extension: a carrier that looks its account up by the `From`
+/// user does not recognise it and challenges the INVITE however correct the
+/// digest is. `From` is framework-managed on a B-leg, so an injected
+/// `headers: {"From": …}` cannot do this — see
+/// [`crate::dispatcher::DialShaping`].
 pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let profile = match args.get("profile") {
         None | Some(serde_json::Value::Null) => None,
@@ -81,6 +90,17 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
                 "dial profile must be a non-empty profile name",
             )
         }
+    };
+    let privacy = match super::originate::parse_privacy("dial", args.get("privacy")) {
+        Ok(privacy) => privacy,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let shaping = crate::dispatcher::DialShaping {
+        profile: profile.map(str::to_string),
+        from: super::string_arg(args, "from"),
+        from_display: super::string_arg(args, "from_display"),
+        p_asserted_identity: super::string_arg(args, "p_asserted_identity"),
+        privacy,
     };
     let Some(targets_json) = args.get("targets").and_then(|v| v.as_array()) else {
         return ControlResult::error(
@@ -129,7 +149,7 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         strategy,
         timeout_secs,
         &extra_headers,
-        profile,
+        &shaping,
     ) {
         Ok(true) => ControlResult::Ok(serde_json::json!({
             "channel": channel.channel_id,
@@ -153,6 +173,9 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         }
         Err(error @ crate::dispatcher::DialError::Media(_)) => {
             ControlResult::error(ControlErrorCode::Unavailable, error.to_string())
+        }
+        Err(error @ crate::dispatcher::DialError::InvalidIdentity(_)) => {
+            ControlResult::error(ControlErrorCode::BadRequest, error.to_string())
         }
     }
 }

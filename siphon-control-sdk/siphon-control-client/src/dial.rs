@@ -22,6 +22,7 @@ use serde_json::json;
 use siphon_control_proto::sip::SipVerb;
 
 use crate::error::ControlError;
+use crate::originate::OriginatePrivacy;
 use crate::sip::{headers_to_json, Call};
 
 /// One target of a [`Call::dial`] — a URI to dial as written, or an AoR to fork
@@ -169,6 +170,35 @@ pub struct DialOptions {
     pub timeout_secs: Option<u32>,
     /// Headers injected on every branch's INVITE, under each target's own.
     pub headers: Vec<(String, String)>,
+    /// A configured media profile to anchor both legs through, so the caller
+    /// and the phones never exchange media directly.
+    ///
+    /// What a carrier-delivered call to a ring group needs: the carrier hands
+    /// over plain RTP at a routable address and every phone answers from an
+    /// address on its own LAN, so without the relay in the middle the two ends
+    /// cannot reach each other. `None` passes the caller's own SDP through.
+    pub profile: Option<String>,
+    /// The calling identity to present — the From URI (RFC 3261 §8.1.1.3).
+    ///
+    /// Without it a B-leg presents the caller's own From, which on a call out
+    /// to a trunk is the internal extension. A carrier that looks its account
+    /// up by the From user does not recognise that, so it challenges the INVITE
+    /// and keeps challenging however correct the digest is. A header injected
+    /// through [`DialOptions::header`] cannot do this: From is framework-managed
+    /// on a B-leg and is rewritten after the fact.
+    pub from: Option<String>,
+    /// The From display name. Naming a `from` without one drops the caller's
+    /// rather than presenting it beside a number that replaced it.
+    pub from_display: Option<String>,
+    /// `P-Asserted-Identity` for a trusted next hop (RFC 3325 §9.1). Reaches
+    /// the wire after the header policy, so a preset that strips `P-*` at a
+    /// trust boundary cannot silently drop it.
+    pub p_asserted_identity: Option<String>,
+    /// Whether the calling identity may be presented (RFC 3323 §4.1 /
+    /// TS 24.607) — the same presentation [`crate::sip::OriginateOptions`]
+    /// takes. `Restricted` anonymises From and asserts `Privacy: id`, keeping
+    /// the real identity in `p_asserted_identity` for the trusted next hop.
+    pub privacy: Option<OriginatePrivacy>,
 }
 
 impl DialOptions {
@@ -190,6 +220,36 @@ impl DialOptions {
         self
     }
 
+    /// Anchor both legs through this configured media profile.
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = Some(profile.into());
+        self
+    }
+
+    /// Present this URI as the calling identity instead of the caller's own.
+    pub fn from(mut self, from: impl Into<String>) -> Self {
+        self.from = Some(from.into());
+        self
+    }
+
+    /// Present this display name.
+    pub fn from_display(mut self, display: impl Into<String>) -> Self {
+        self.from_display = Some(display.into());
+        self
+    }
+
+    /// Assert this identity to a trusted next hop (RFC 3325 §9.1).
+    pub fn p_asserted_identity(mut self, identity: impl Into<String>) -> Self {
+        self.p_asserted_identity = Some(identity.into());
+        self
+    }
+
+    /// Present, or withhold, the calling identity.
+    pub fn privacy(mut self, privacy: OriginatePrivacy) -> Self {
+        self.privacy = Some(privacy);
+        self
+    }
+
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         if let Some(strategy) = self.strategy {
             args.insert("strategy".to_string(), json!(strategy.as_str()));
@@ -199,6 +259,19 @@ impl DialOptions {
         }
         if !self.headers.is_empty() {
             args.insert("headers".to_string(), headers_to_json(&self.headers));
+        }
+        for (name, value) in [
+            ("profile", &self.profile),
+            ("from", &self.from),
+            ("from_display", &self.from_display),
+            ("p_asserted_identity", &self.p_asserted_identity),
+        ] {
+            if let Some(value) = value {
+                args.insert(name.to_string(), json!(value));
+            }
+        }
+        if let Some(privacy) = self.privacy {
+            args.insert("privacy".to_string(), json!(privacy.as_str()));
         }
     }
 }
@@ -262,8 +335,10 @@ impl Call {
     /// Refusals are typed: `not_found` (the call is gone, or no target yielded a
     /// branch — an AoR nobody has registered), `invalid_state` (the call is
     /// already answered, which is what this verb exists to avoid),
-    /// `bad_request` (an empty or malformed target list), `unsupported_verb` (a
-    /// strategy siphon does not implement).
+    /// `bad_request` (an empty or malformed target list, an identity that is not
+    /// a SIP URI, a privacy siphon does not recognise), `unsupported_verb` (a
+    /// strategy siphon does not implement), `unavailable` (the media profile
+    /// could not be allocated — nothing was sent and the caller stays parked).
     pub async fn dial(
         &self,
         targets: Vec<DialTarget>,

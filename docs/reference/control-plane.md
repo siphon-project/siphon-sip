@@ -263,6 +263,7 @@ chunk, so logs join Homer and billing with no mapping table.
 | `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
+| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?}` | ring B-legs while the caller stays **unanswered** and the app keeps the channel — see [`dial`](#dial--ring-while-the-caller-waits) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -681,7 +682,8 @@ tell them apart without parsing prose:
 { "verb": "dial", "target": { "channel": "ch_caller" },
   "args": { "targets": [ {"aor": "sip:204@pbx.example"},
                          {"uri": "sip:+15550177@trunk.example", "next_hop": "sip:192.0.2.9:5060"} ],
-            "strategy": "parallel", "timeout": 20 } }
+            "strategy": "parallel", "timeout": 20,
+            "from": "sip:+15550100@trunk.example", "from_display": "Example Ltd" } }
 ```
 
 Rings the targets as B-legs of the caller's call while the caller stays
@@ -714,6 +716,41 @@ timeout in seconds (default 30). Dialling a call that is already answered is
 starts billing before anyone picks up and denies the caller the callee's own
 ringback.
 
+### Presenting an identity
+
+`from`, `from_display`, `p_asserted_identity` and `privacy` are the same
+identity arguments [`originate`](#phase-1-verb-set) takes, and they apply to the
+whole dial: every branch of a fork, every attempt of a sequential hunt.
+
+They matter because a B-leg's `From` is **framework-managed** — siphon swaps in
+a fresh dialog tag and, for topology hiding, rewrites the host to its own
+advertised address. Without these arguments the B-leg presents the caller's own
+`From`, which on a call out to a trunk is the internal extension. A carrier that
+looks its account up by the `From` user does not recognise it, so it challenges
+the INVITE and keeps challenging however correct the digest is, and
+`P-Asserted-Identity` alone does not fix it because that is not what such a
+carrier keys on. An injected `headers: {"From": …}` cannot fix it either: the
+host is overwritten after the fact, and a `From` written without its tag drops
+the mandatory dialog tag (RFC 3261 §8.1.1.3), which only shows up later, on the
+ACK.
+
+- `from` replaces the whole URI and **pins the host**, opting this leg out of
+  the `From` host rewrite.
+- `from_display` sets the display name; `""` removes it. Naming a `from` without
+  a `from_display` drops the caller's, rather than presenting `"203"` beside the
+  number that replaced it.
+- `p_asserted_identity` is injected **after** the header policy, so a preset that
+  strips `P-*` at a trust boundary cannot silently drop an identity the
+  controller named.
+- `privacy: "restricted"` anonymises `From` and asserts `Privacy: id` while
+  `p_asserted_identity` keeps the real identity for the trusted next hop
+  (RFC 3323 §4.1 / RFC 3325 §7 / TS 24.607). `"allowed"` presents it. Anything
+  else is `bad_request` — guessing at a privacy setting is how identities leak.
+
+A `from` that is not a SIP URI is `bad_request`, refused before any phone rings.
+
+### Anchoring the media
+
 `profile` optionally selects a configured media profile and anchors both legs
 through the media engine. For example, plain RTP from a trunk to a phone that
 requires SDES-SRTP uses `"profile": "rtp_to_srtp"`; the reverse direction uses
@@ -721,13 +758,29 @@ requires SDES-SRTP uses `"profile": "rtp_to_srtp"`; the reverse direction uses
 its `answer` half shapes the SDP sent back to the caller. TLS signalling alone
 does not imply SRTP: select the profile from the endpoints' media policy.
 
-Profiled dials currently require a caller SDP offer and **exactly one resolved
-contact**, with no pre-existing media anchor. An unsupported fork, unknown
-profile, missing backend or failed media allocation returns `unavailable`
-without sending an INVITE or answering the caller. Invalid profile values
-return `bad_request`. Without `profile`, the existing unanchored behaviour is
-unchanged. A failed profiled dial releases its media session before
-`DialFailed`, preserving the original caller SDP for a later voicemail answer.
+A profiled dial requires a caller SDP offer and no pre-existing media anchor. An
+unknown profile, missing backend or failed media allocation returns `unavailable`
+without sending an INVITE or answering the caller. Invalid profile values return
+`bad_request`. Without `profile`, the existing unanchored behaviour is unchanged.
+A failed profiled dial releases its media session before `DialFailed`, preserving
+the original caller SDP for a later voicemail answer.
+
+A profiled dial may fork. **One** allocation serves the whole dial: every branch
+is offered the same anchored SDP, exactly as a forking proxy offers one body to
+every branch, and whichever branch sends SDP is answered against it — the media
+engine re-points the far side of the relay on each answer, so the last SDP to
+arrive is what the caller hears and the `2xx` settles it on the branch that won
+(RFC 3261 §16.7). A sequential hunt re-uses that one allocation across its
+attempts rather than re-anchoring per attempt. What one allocation cannot do is
+give two *simultaneously* ringing branches separate early-media paths; that needs
+one allocation per branch. In practice phones ring with a `180` that carries no
+SDP, so this only shows up on a fork where two branches both open early media —
+the second takes the caller's ear from the first.
+
+A carrier-delivered call to a ring group is the case that needs a profile most:
+the carrier hands over plain RTP at a routable address and every phone answers
+from an address on its own LAN, so without the relay in the middle the two ends
+cannot reach each other.
 
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.

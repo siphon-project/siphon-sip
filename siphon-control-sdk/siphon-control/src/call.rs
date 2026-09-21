@@ -13,7 +13,8 @@ use siphon_control_client::sip::{
 
 use crate::args::{
     build_play_source, extract_dial_strategy, extract_dial_targets, extract_headers,
-    extract_record_channels, extract_record_direction, extract_route_target, parse_peer_hangup,
+    extract_privacy, extract_record_channels, extract_record_direction, extract_route_target,
+    parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
@@ -639,13 +640,41 @@ impl Call {
     /// ring timeout in seconds; each left out takes the server's own default
     /// (parallel, 30 s). ``headers`` is applied to every branch's INVITE.
     ///
+    /// ``profile`` names a configured media profile and anchors both legs
+    /// through it, so the caller and the phones never exchange media directly —
+    /// what a carrier-delivered call to a ring group needs, since the carrier
+    /// hands over plain RTP at a routable address and every phone answers from
+    /// an address on its own LAN.
+    ///
+    /// ``from`` / ``from_display`` / ``p_asserted_identity`` / ``privacy``
+    /// present a calling identity of the app's choosing. Without them a B-leg
+    /// presents the caller's own ``From``, which on a call out to a trunk is the
+    /// internal extension: a carrier that looks its account up by the ``From``
+    /// user does not recognise it, challenges the INVITE, and keeps challenging
+    /// however correct the digest is. A ``headers`` entry cannot do this —
+    /// ``From`` is framework-managed on a B-leg and is rewritten after the fact.
+    /// ``privacy="restricted"`` anonymises ``From`` and asserts ``Privacy: id``
+    /// while ``p_asserted_identity`` keeps the real identity for the trusted
+    /// next hop (RFC 3323 §4.1 / RFC 3325 §9.1 / TS 24.607).
+    ///
     /// Returns ``{"channel", "targets", "strategy", "timeout"}``, where
     /// ``targets`` counts the **branches** the server resolved — one AoR
     /// registered on three devices reports three. Raises ``ControlError`` with
     /// ``code == "not_found"`` (the call is gone, or no target yielded a
     /// branch), ``"invalid_state"`` (already answered), ``"bad_request"`` or
     /// ``"unsupported_verb"``.
-    #[pyo3(signature = (targets, strategy=None, timeout=None, headers=None))]
+    #[pyo3(signature = (
+        targets,
+        strategy=None,
+        timeout=None,
+        headers=None,
+        profile=None,
+        from_uri=None,
+        from_display=None,
+        p_asserted_identity=None,
+        privacy=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn dial<'py>(
         &self,
         py: Python<'py>,
@@ -653,6 +682,13 @@ impl Call {
         strategy: Option<String>,
         timeout: Option<u32>,
         headers: Option<Bound<'py, PyAny>>,
+        profile: Option<String>,
+        // `from` is a Python keyword, so the identity argument cannot be spelled
+        // the way the wire spells it. Named for what it is instead of mangled.
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = DialOptions {
             strategy: extract_dial_strategy(strategy)?,
@@ -661,6 +697,11 @@ impl Call {
                 .map(|headers| extract_headers(&headers))
                 .transpose()?
                 .unwrap_or_default(),
+            profile,
+            from: from_uri,
+            from_display,
+            p_asserted_identity,
+            privacy: extract_privacy("dial", privacy)?,
         };
         let dial_targets = extract_dial_targets(&targets)?;
         let call = self.inner.clone();

@@ -379,6 +379,43 @@ export interface DialOptions {
   timeout?: number;
   /** Headers injected on every branch's INVITE, under each target's own. */
   headers?: Record<string, string>;
+  /**
+   * A configured media profile to anchor both legs through, so the caller and
+   * the phones never exchange media directly.
+   *
+   * What a carrier-delivered call to a ring group needs: the carrier hands over
+   * plain RTP at a routable address and every phone answers from an address on
+   * its own LAN, so without the relay in the middle the two ends cannot reach
+   * each other. Left out, the caller's own SDP passes through.
+   */
+  profile?: string;
+  /**
+   * The calling identity to present — the From URI (RFC 3261 §8.1.1.3).
+   *
+   * Without it a B-leg presents the caller's own From, which on a call out to a
+   * trunk is the internal extension. A carrier that looks its account up by the
+   * From user does not recognise that, so it challenges the INVITE and keeps
+   * challenging however correct the digest is. A `headers` entry cannot do
+   * this: From is framework-managed on a B-leg and is rewritten after the fact.
+   */
+  from?: string;
+  /**
+   * The From display name. Naming a `from` without one drops the caller's
+   * rather than presenting it beside a number that replaced it.
+   */
+  fromDisplay?: string;
+  /**
+   * `P-Asserted-Identity` for a trusted next hop (RFC 3325 §9.1). Reaches the
+   * wire after the header policy, so a preset that strips `P-*` at a trust
+   * boundary cannot silently drop it.
+   */
+  pAssertedIdentity?: string;
+  /**
+   * Whether the calling identity may be presented (RFC 3323 §4.1 / TS 24.607).
+   * `"restricted"` anonymises From and asserts `Privacy: id`, keeping the real
+   * identity in `pAssertedIdentity` for the trusted next hop.
+   */
+  privacy?: "allowed" | "restricted";
 }
 
 /**
@@ -472,6 +509,13 @@ export function dialArgs(
   if (options.strategy !== undefined) args.strategy = options.strategy;
   if (options.timeout !== undefined) args.timeout = options.timeout;
   if (options.headers !== undefined) args.headers = options.headers;
+  if (options.profile !== undefined) args.profile = options.profile;
+  if (options.from !== undefined) args.from = options.from;
+  if (options.fromDisplay !== undefined) args.from_display = options.fromDisplay;
+  if (options.pAssertedIdentity !== undefined) {
+    args.p_asserted_identity = options.pAssertedIdentity;
+  }
+  if (options.privacy !== undefined) args.privacy = options.privacy;
   return args;
 }
 

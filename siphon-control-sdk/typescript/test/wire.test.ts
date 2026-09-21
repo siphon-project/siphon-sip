@@ -637,6 +637,25 @@ describe("dial args map to the target shapes the server parses", () => {
     });
   });
 
+  it("sends the identity and media options under the server's names", () => {
+    expect(
+      dialArgs([{ uri: "sip:+15550177@trunk.example" }], {
+        profile: "rtp_to_srtp",
+        from: "sip:+15550100@trunk.example",
+        fromDisplay: "Example Ltd",
+        pAssertedIdentity: "<sip:+15550100@trunk.example>",
+        privacy: "restricted",
+      }),
+    ).toEqual({
+      targets: ["sip:+15550177@trunk.example"],
+      profile: "rtp_to_srtp",
+      from: "sip:+15550100@trunk.example",
+      from_display: "Example Ltd",
+      p_asserted_identity: "<sip:+15550100@trunk.example>",
+      privacy: "restricted",
+    });
+  });
+
   it("keeps a URI target an object once it carries overrides", () => {
     expect(
       dialArgs([

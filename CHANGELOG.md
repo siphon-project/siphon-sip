@@ -6,6 +6,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **The control plane's `dial` verb presents a calling identity of the
+  controller's choosing** — `from`, `from_display`, `p_asserted_identity` and
+  `privacy`, the same arguments `originate` already took. Without them a B-leg
+  presents the caller's own `From`, which on a call out to a trunk is the
+  internal extension: a carrier that looks its account up by the `From` user
+  does not recognise it, challenges the INVITE, and keeps challenging however
+  correct the digest is. An injected `headers: {"From": …}` could not stand in,
+  because `From` is framework-managed on a B-leg — the host is rewritten after
+  the fact and a `From` written without its tag drops the mandatory dialog tag
+  (RFC 3261 §8.1.1.3). `privacy: "restricted"` anonymises `From` and asserts
+  `Privacy: id` while `p_asserted_identity` carries the real identity to the
+  trusted next hop (RFC 3323 §4.1 / RFC 3325 §7 / TS 24.607); an unrecognised
+  value is `bad_request` rather than a guess. The identity applies to the whole
+  dial, including the attempts a sequential hunt makes after the first, which
+  are built from the stored A-leg INVITE. Mirrored in all three control SDKs.
+
+### Fixed
+
+- **A `dial` that names a media profile can fork.** It previously refused any
+  dial that resolved to more than one branch, which made a profile and a ring
+  group mutually exclusive — and a carrier-delivered group call is exactly the
+  case that needs the relay, since the carrier hands over plain RTP at a
+  routable address and every phone answers from an address on its own LAN. One
+  allocation serves the whole dial: every branch is offered the same anchored
+  SDP, as a forking proxy offers one body to every branch, and the `2xx` settles
+  the relay on the branch that won (RFC 3261 §16.7). A profiled dial also
+  honours `strategy: "sequential"` now instead of being forced parallel, and
+  re-uses its one allocation across the attempts rather than handing the second
+  phone the caller's raw SDP around the relay.
+
+- **The control SDKs can ask for a media profile on `dial` at all.** `profile`
+  was accepted on the wire but absent from the Rust, Python and TypeScript
+  `DialOptions`, so no SDK could send it.
+
 ## [1.9.1] — 2026-09-21
 
 ### Added

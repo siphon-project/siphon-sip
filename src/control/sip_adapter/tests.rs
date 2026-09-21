@@ -681,18 +681,21 @@ fn originate_error_maps_an_invalid_body_to_bad_request() {
 #[test]
 fn parse_privacy_variants() {
     use crate::sip::privacy::CallerIdPresentation;
-    assert_eq!(parse_privacy(None), Ok(None));
-    assert_eq!(parse_privacy(Some(&serde_json::Value::Null)), Ok(None));
+    assert_eq!(parse_privacy("originate", None), Ok(None));
     assert_eq!(
-        parse_privacy(Some(&serde_json::json!("restricted"))),
+        parse_privacy("originate", Some(&serde_json::Value::Null)),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_privacy("originate", Some(&serde_json::json!("restricted"))),
         Ok(Some(CallerIdPresentation::Restricted))
     );
     assert_eq!(
-        parse_privacy(Some(&serde_json::json!("allowed"))),
+        parse_privacy("originate", Some(&serde_json::json!("allowed"))),
         Ok(Some(CallerIdPresentation::Allowed))
     );
-    assert!(parse_privacy(Some(&serde_json::json!("sideways"))).is_err());
-    assert!(parse_privacy(Some(&serde_json::json!(1))).is_err());
+    assert!(parse_privacy("originate", Some(&serde_json::json!("sideways"))).is_err());
+    assert!(parse_privacy("originate", Some(&serde_json::json!(1))).is_err());
 }
 
 #[test]
@@ -2054,6 +2057,22 @@ fn dial_refuses_malformed_media_policy_instead_of_silently_sending_plain_media()
             }
         ));
     }
+}
+
+/// Guessing at a privacy setting is how identities leak, so an unrecognised
+/// one is refused rather than defaulted — and the refusal names the verb it
+/// came from, not `originate`.
+#[test]
+fn dial_refuses_a_privacy_value_it_does_not_recognise() {
+    let result = sip_command(
+        "dial",
+        serde_json::json!({"targets": ["sip:201@example.com"], "privacy": "maybe"}),
+    );
+    let ControlResult::Error { code, message } = result else {
+        panic!("a privacy siphon cannot honour has to be refused");
+    };
+    assert_eq!(code, ControlErrorCode::BadRequest);
+    assert!(message.starts_with("dial args.privacy"), "{message}");
 }
 
 /// The object form carries the routing destination and per-target headers,

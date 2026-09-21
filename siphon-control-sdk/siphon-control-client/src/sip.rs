@@ -2497,6 +2497,35 @@ mod tests {
         );
     }
 
+    /// The identity and media arguments go out under the names the server
+    /// parses, which is the whole point of them: a `From` the controller names
+    /// is the difference between a carrier accepting an outbound call and
+    /// challenging it for ever, and it cannot be sent as a plain header.
+    #[tokio::test]
+    async fn dial_sends_the_identity_and_media_arguments_under_the_servers_names() {
+        let recorder = recorder(dial_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.dial(
+            vec![DialTarget::uri("sip:+15550177@trunk.example")],
+            DialOptions::default()
+                .profile("rtp_to_srtp")
+                .from("sip:+15550100@trunk.example")
+                .from_display("Example Ltd")
+                .p_asserted_identity("<sip:+15550100@trunk.example>")
+                .privacy(OriginatePrivacy::Restricted),
+        )
+        .await
+        .expect("dial");
+
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["profile"], "rtp_to_srtp");
+        assert_eq!(args["from"], "sip:+15550100@trunk.example");
+        assert_eq!(args["from_display"], "Example Ltd");
+        assert_eq!(args["p_asserted_identity"], "<sip:+15550100@trunk.example>");
+        assert_eq!(args["privacy"], "restricted");
+    }
+
     fn recording_result() -> serde_json::Value {
         json!({ "channel": "ch1", "state": "recording", "recording_id": "rec-1" })
     }
