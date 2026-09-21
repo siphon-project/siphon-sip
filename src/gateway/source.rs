@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::{Algorithm, Destination, DispatcherGroup, DispatcherManager, ProbeConfig};
 use crate::auth::{StoredCredentials, StoredSecret};
+use crate::source_health::{Backoff, SourceHealth};
 use crate::transport::Transport;
 
 /// Version of the JSON contract the `http` source speaks.
@@ -468,17 +469,98 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
     report
 }
 
+/// How long start-up keeps retrying an unreadable source before giving up and
+/// letting the node come up with no carriers.
+///
+/// Bounded on purpose. A node that cannot reach its controller has to come up:
+/// it still has to answer a health probe, serve `/metrics` (where the
+/// last-success gauge reads 0, which is exactly the alert), and accept the
+/// admin refresh that a controller coming back can push at it. Blocking boot
+/// indefinitely would turn a controller outage into an outage of every node
+/// that happened to restart during it.
+const STARTUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read the source once at start-up, retrying on a short backoff, **before**
+/// the listeners take traffic.
+///
+/// The loop below used to do its first fetch inside itself, so a node came up
+/// and started answering calls while its carriers were still being read — or,
+/// if the controller was down, with no carriers at all and one `warn` to say
+/// so. At start-up the "keep the current set" reasoning that governs a running
+/// node does not apply: there is no current set to keep.
+///
+/// Returns whether the source was read. A `false` is a node with no carriers
+/// from this source, which is worth the `error` it logs.
+pub async fn reconcile_at_startup(
+    manager: &Arc<DispatcherManager>,
+    source: &Arc<GatewaySource>,
+    health: &mut SourceHealth,
+) -> bool {
+    reconcile_at_startup_within(manager, source, health, STARTUP_BUDGET).await
+}
+
+/// [`reconcile_at_startup`] with an explicit budget, so a test can exercise the
+/// give-up path without waiting out the production one.
+async fn reconcile_at_startup_within(
+    manager: &Arc<DispatcherManager>,
+    source: &Arc<GatewaySource>,
+    health: &mut SourceHealth,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = Backoff::new(source.refresh_interval());
+
+    loop {
+        match reconcile_once(manager, source).await {
+            Ok(report) => {
+                health.record_success();
+                info!(
+                    added = report.added,
+                    rejected = report.rejected,
+                    "gateway source read at start-up"
+                );
+                return true;
+            }
+            Err(error) => {
+                health.record_failure(&error);
+                let delay = backoff.next_delay();
+                if tokio::time::Instant::now() + delay >= deadline {
+                    error!(
+                        %error,
+                        budget_secs = budget.as_secs(),
+                        "gateway source unreadable at start-up — coming up with NO carriers from \
+                         it; siphon keeps retrying, and POST /admin/gateways/refresh applies one \
+                         as soon as the source is back"
+                    );
+                    return false;
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Poll the source and reconcile, for the life of the process.
-pub async fn reconcile_loop(manager: Arc<DispatcherManager>, source: Arc<GatewaySource>) {
+///
+/// `health` carries the start-up attempt's streak in, so a node that came up
+/// against a dead controller does not restart its escalation from scratch.
+pub async fn reconcile_loop(
+    manager: Arc<DispatcherManager>,
+    source: Arc<GatewaySource>,
+    mut health: SourceHealth,
+) {
     let interval = source.refresh_interval();
     info!(
         refresh_secs = interval.as_secs(),
         "gateway groups follow a configured source"
     );
+    let mut backoff = Backoff::new(interval);
 
     loop {
-        match reconcile_once(&manager, &source).await {
+        let delay = match reconcile_once(&manager, &source).await {
             Ok(report) => {
+                health.record_success();
+                backoff.reset();
                 if report.added + report.updated + report.removed + report.rejected > 0 {
                     info!(
                         added = report.added,
@@ -488,14 +570,19 @@ pub async fn reconcile_loop(manager: Arc<DispatcherManager>, source: Arc<Gateway
                         "gateway source reconciled"
                     );
                 }
+                interval
             }
             Err(error) => {
                 // An unreadable source is not evidence that the carriers went
                 // away; tearing the estate down over it would fail every call.
-                warn!(%error, "gateway source unreadable — keeping the current groups");
+                // So the set is kept — but the node retries sooner than the
+                // next interval, so a controller that comes back is picked up
+                // in seconds rather than up to `refresh_secs` later.
+                health.record_failure(&error);
+                backoff.next_delay()
             }
-        }
-        tokio::time::sleep(interval).await;
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -1066,5 +1153,98 @@ mod tests {
         assert_eq!(back.gateways.len(), 1);
         assert_eq!(back.gateways[0].group, "carriers");
         assert!(!json.contains("null"), "{json}");
+    }
+
+    /// An HTTP source aimed at a port nothing is listening on: every fetch
+    /// fails immediately, which is what a node booting while its controller is
+    /// down actually sees.
+    fn unreadable_source(refresh_secs: u64) -> Arc<GatewaySource> {
+        let http = crate::config::GatewayHttpConfig {
+            // Reserved for documentation (RFC 5737), so this cannot reach a
+            // real host on a developer's network.
+            url: "http://192.0.2.1:1/gateways".to_string(),
+            refresh_secs,
+            timeout_ms: 50,
+            auth_header: None,
+        };
+        Arc::new(GatewaySource::Http(
+            HttpSource::new(http).expect("the HTTP client builds"),
+        ))
+    }
+
+    /// The boot path gives up inside its budget rather than blocking start-up.
+    ///
+    /// A node that cannot reach its controller still has to come up: it answers
+    /// the health probe, serves the last-success gauge that is the alert, and
+    /// accepts the admin refresh a recovering controller pushes at it. Blocking
+    /// boot would turn one controller outage into an outage of every node that
+    /// restarted during it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_source_at_startup_gives_up_inside_its_budget() {
+        let manager = manager();
+        let source = unreadable_source(1);
+        let mut health = SourceHealth::new(crate::source_health::SourceKind::Gateway);
+
+        let started = std::time::Instant::now();
+        let read = reconcile_at_startup_within(
+            &manager,
+            &source,
+            &mut health,
+            std::time::Duration::from_millis(900),
+        )
+        .await;
+
+        assert!(!read, "an unreachable controller cannot be read");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "start-up must not block: took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            health.consecutive_failures() >= 2,
+            "it retried rather than giving up on the first failure: {} attempt(s)",
+            health.consecutive_failures()
+        );
+    }
+
+    /// Retries are a backoff, not a hot loop: a controller that is down must
+    /// not be hammered by every node that rebooted into the outage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_retries_back_off_rather_than_spinning() {
+        let manager = manager();
+        let source = unreadable_source(1);
+        let mut health = SourceHealth::new(crate::source_health::SourceKind::Gateway);
+
+        reconcile_at_startup_within(
+            &manager,
+            &source,
+            &mut health,
+            std::time::Duration::from_millis(900),
+        )
+        .await;
+
+        // 250 ms, 500 ms, then the 1 s ceiling — a 900 ms budget admits a
+        // handful of attempts, not hundreds.
+        assert!(
+            health.consecutive_failures() <= 6,
+            "{} attempts in 900 ms is a spin, not a backoff",
+            health.consecutive_failures()
+        );
+    }
+
+    /// Every failed read is counted, so a dashboard can rate it; the success
+    /// timestamp is what ages out. Together they are "this node has been
+    /// serving a stale carrier set for six hours".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_failed_read_is_counted() {
+        let manager = manager();
+        let source = unreadable_source(1);
+        let mut health = SourceHealth::new(crate::source_health::SourceKind::Gateway);
+
+        for _ in 0..3 {
+            assert!(reconcile_once(&manager, &source).await.is_err());
+            health.record_failure("connection refused");
+        }
+        assert_eq!(health.consecutive_failures(), 3);
     }
 }

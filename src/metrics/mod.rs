@@ -380,6 +380,25 @@ pub struct SiphonMetrics {
     /// blocking HTTP on the executor pool.
     pub auth_ha1_cache_hits_total: IntCounter,
 
+    // --- Provisioning sources (gateway.backend / registrant.backend) ---
+    /// When the gateway source was last read, as Unix seconds. **Alert on its
+    /// age**, not on its value: a node whose controller went down keeps serving
+    /// the last set it read, correctly and indefinitely, so nothing else says
+    /// the carriers on this node are hours stale. 0 until the first successful
+    /// read, which is the state a node that booted against a dead controller is
+    /// in — it has no carriers at all.
+    pub gateway_source_last_success_timestamp_seconds: IntGauge,
+    /// Gateway-source reads that failed. Alert on a sustained `rate() > 0`; the
+    /// timestamp above says how long it has been going on.
+    pub gateway_source_failures_total: IntCounter,
+    /// When the registrant source was last read, as Unix seconds. Same contract
+    /// as the gateway pair, tracked separately because they fail separately: a
+    /// node can route over stale carriers with current trunk registrations, or
+    /// the reverse.
+    pub registrant_source_last_success_timestamp_seconds: IntGauge,
+    /// Registrant-source reads that failed.
+    pub registrant_source_failures_total: IntCounter,
+
     // --- Security / abuse (failed_auth_ban scanner protection) ---
     /// Source IPs currently auto-banned. Pruned periodically; trusted_cidrs are
     /// never counted. Alert on a sustained rise to spot a scanning campaign.
@@ -801,6 +820,23 @@ impl SiphonMetrics {
             "Total HTTP-auth credential lookups served from the in-process HA1 cache",
         )?;
 
+        let gateway_source_last_success_timestamp_seconds = IntGauge::new(
+            "siphon_gateway_source_last_success_timestamp_seconds",
+            "Unix time of the last successful read of the gateway.backend source (0 = never read; alert on its age)",
+        )?;
+        let gateway_source_failures_total = IntCounter::new(
+            "siphon_gateway_source_failures_total",
+            "Total failed reads of the gateway.backend source",
+        )?;
+        let registrant_source_last_success_timestamp_seconds = IntGauge::new(
+            "siphon_registrant_source_last_success_timestamp_seconds",
+            "Unix time of the last successful read of the registrant.backend source (0 = never read; alert on its age)",
+        )?;
+        let registrant_source_failures_total = IntCounter::new(
+            "siphon_registrant_source_failures_total",
+            "Total failed reads of the registrant.backend source",
+        )?;
+
         let banned_ips = IntGauge::new(
             "siphon_banned_ips",
             "Source IPs currently auto-banned by failed_auth_ban scanner protection",
@@ -1150,6 +1186,14 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
+        registry.register(Box::new(
+            gateway_source_last_success_timestamp_seconds.clone(),
+        ))?;
+        registry.register(Box::new(gateway_source_failures_total.clone()))?;
+        registry.register(Box::new(
+            registrant_source_last_success_timestamp_seconds.clone(),
+        ))?;
+        registry.register(Box::new(registrant_source_failures_total.clone()))?;
         registry.register(Box::new(banned_ips.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(handshake_failures_total.clone()))?;
@@ -1225,6 +1269,10 @@ impl SiphonMetrics {
             pyexec_jobs_completed_total,
             pyexec_jobs_shed_total,
             auth_ha1_cache_hits_total,
+            gateway_source_last_success_timestamp_seconds,
+            gateway_source_failures_total,
+            registrant_source_last_success_timestamp_seconds,
+            registrant_source_failures_total,
             banned_ips,
             auth_failures_total,
             handshake_failures_total,
