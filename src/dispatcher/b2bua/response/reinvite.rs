@@ -23,6 +23,12 @@ pub fn forward_reinvite_response(
     if let Some(direction) = reinvite_direction {
         let is_a2b = direction == "a2b";
 
+        // The responder's own dialog, read before the rewrites below put the
+        // originator's Call-ID on a bridged re-INVITE's response: the ACK below
+        // is its, and so is any BYE that has to follow that ACK.
+        let responder_dialog_call_id = message.headers.call_id().cloned();
+        owe_reinvite_ack(responder_dialog_call_id.as_deref(), status_code, state);
+
         // A siphon-originated re-INVITE (session-timer refresh / transfer media
         // re-anchor) has no originator leg — its tracking entry carries empty
         // stored Vias. Its response is absorbed (only used to ACK the responder),
@@ -361,6 +367,10 @@ pub fn forward_reinvite_response(
                 direction = direction,
                 "B2BUA: sent ACK to responder for re-INVITE 2xx"
             );
+            // The dialog is confirmed again, so a BYE parked behind this ACK can
+            // go (RFC 3261 §15). Enqueued after it, and on the same connection
+            // for a stream dialog, so the peer sees them in that order.
+            release_owed_reinvite_ack(responder_dialog_call_id.as_deref(), state);
 
             // Mark the re-INVITE B-leg entry as done (not removed!) so that
             // retransmitted 200 OKs can still be matched and re-ACKed.
@@ -390,6 +400,9 @@ pub fn forward_reinvite_response(
                 status = status_code,
                 "B2BUA: sent ACK to responder for re-INVITE non-2xx"
             );
+            // The re-INVITE failed, so the dialog keeps the session it had
+            // (RFC 3261 §14.1) and owes nothing further: release its BYE too.
+            release_owed_reinvite_ack(responder_dialog_call_id.as_deref(), state);
 
             // Remove the re-INVITE B-leg entry — no retransmission expected
             // since the IST will transition Completed→Confirmed on our ACK.
@@ -571,4 +584,38 @@ pub fn rewrite_reinvite_answer_sdp(
     if is_bridged_reinvite {
         strip_relayed_sdp_attributes(message, state);
     }
+}
+
+/// Mark this dialog as owing the ACK for the re-INVITE answer now being handled,
+/// so a BYE for it waits (`send_or_hold_bye`) instead of overtaking that ACK.
+///
+/// Everything between here and the ACK runs while a BYE for the same dialog can
+/// be generated on another task — a transfer's media re-anchor is answered by
+/// the surviving party exactly as the transfer target hangs up — and the
+/// rewriting and media work in between is long enough for the BYE to win.
+/// RFC 3261 §13.2.2.4 wants the 2xx ACKed and §15 releases the dialog only once
+/// it is. Bounded at 64×T1 by [`sweep_owed_reinvite_acks`], for the paths that
+/// return before an ACK is built.
+fn owe_reinvite_ack(dialog_call_id: Option<&str>, status_code: u16, state: &DispatcherState) {
+    // Only a final response is ACKed; a provisional owes nothing.
+    let (Some(dialog_call_id), 200..) = (dialog_call_id, status_code) else {
+        return;
+    };
+    state.pending_reinvite_acks.insert(
+        dialog_call_id.to_string(),
+        tokio::time::Instant::now() + crate::transaction::timer::TimerConfig::default().t1 * 64,
+    );
+}
+
+/// Settle the re-INVITE ACK this dialog was owed, now that it has been enqueued,
+/// and send the BYE that was parked behind it.
+///
+/// `dialog_call_id` is the responder's, captured before the response was
+/// rewritten: a bridged re-INVITE's response leaves here carrying the
+/// originator's Call-ID, which names the wrong dialog.
+fn release_owed_reinvite_ack(dialog_call_id: Option<&str>, state: &DispatcherState) {
+    let Some(dialog_call_id) = dialog_call_id else {
+        return;
+    };
+    release_bye_held_for_reinvite_ack(dialog_call_id, state);
 }

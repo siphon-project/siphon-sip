@@ -120,6 +120,7 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
                         fire_expired_timers(&state);
                         sweep_b2bua_retransmits(&state);
                         sweep_unacked_uas_2xx(&state);
+                        sweep_owed_reinvite_acks(&state);
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);

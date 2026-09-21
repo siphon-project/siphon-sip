@@ -12,6 +12,16 @@
 //! The party's ACK sends the BYE right after it ([`release_held_bye`]); at 64×T1
 //! `sweep_unacked_uas_2xx` sends it instead, once. A party that sends its own BYE
 //! first has ended the dialog itself ([`answer_caller_bye_for_held_dialog`]).
+//!
+//! The same wait runs the other way round. When siphon re-INVITEs a dialog it is
+//! that transaction's UAC and owes the ACK for its final response (§13.2.2.4), so
+//! a BYE for that dialog parks until the ACK is enqueued
+//! ([`release_bye_held_for_reinvite_ack`]) or until 64×T1
+//! ([`sweep_owed_reinvite_acks`]) for a re-INVITE that never gets one. A transfer
+//! is what makes this reachable: the media re-anchor re-INVITEs the surviving
+//! party while the transfer target can hang up, and the two run on different
+//! tasks, so without the wait the BYE reaches the survivor before the ACK and
+//! strands it on a dialog the survivor has already ended.
 
 use crate::dispatcher::*;
 
@@ -36,6 +46,8 @@ struct ByeRoute {
 ///
 /// - siphon is the dialog's UAS and the peer has not ACKed siphon's 2xx: the BYE
 ///   is held until that ACK, or until 64×T1 (§15, §13.3.1.4);
+/// - siphon re-INVITEd the dialog and its final response has not been ACKed yet:
+///   the BYE is held until that ACK is enqueued, or until 64×T1 (§13.2.2.4);
 /// - siphon is the dialog's UAC and still owes the ACK for a 2xx that carried an
 ///   offer: that ACK goes out first, every stream rejected, then the BYE
 ///   (§13.2.2.4);
@@ -92,7 +104,24 @@ pub fn send_or_hold_bye(
             bye,
             route,
             sender,
-            answer,
+            HeldByeWait::PeerAcksOurAnswer(answer),
+            state,
+        );
+        return;
+    }
+
+    // siphon re-INVITEd this dialog and has not ACKed the answer yet: the media
+    // re-anchor of a transfer is the one that races a BYE, since the far party
+    // can hang up while the survivor's 200 is still being rewritten. RFC 3261
+    // §13.2.2.4 wants that 2xx ACKed, and §15 only then released.
+    if state.pending_reinvite_acks.contains_key(dialog_call_id) {
+        hold_bye(
+            internal_call_id,
+            dialog_call_id,
+            bye,
+            route,
+            sender,
+            HeldByeWait::WeAckTheirAnswer,
             state,
         );
         return;
@@ -138,9 +167,38 @@ fn hold_bye(
     bye: SipMessage,
     route: ByeRoute,
     sender: ByeSender,
-    answer: Arc<UnackedAnswer>,
+    waits_for: HeldByeWait,
     state: &DispatcherState,
 ) {
+    // Re-read the same condition after the insert, so the ACK or the sweep that
+    // settles it between the lookup and the insert cannot leave this BYE parked
+    // with nobody left to release it.
+    let recheck: Box<dyn Fn() -> bool> = match &waits_for {
+        HeldByeWait::PeerAcksOurAnswer(answer) => {
+            let answer = Arc::clone(answer);
+            let retransmits = Arc::clone(&state.uas_2xx_retransmits);
+            let key = dialog_call_id.to_string();
+            Box::new(move || {
+                retransmits
+                    .get(&key)
+                    .is_some_and(|entry| Arc::ptr_eq(entry.value(), &answer))
+            })
+        }
+        HeldByeWait::WeAckTheirAnswer => {
+            let pending = Arc::clone(&state.pending_reinvite_acks);
+            let key = dialog_call_id.to_string();
+            Box::new(move || pending.contains_key(&key))
+        }
+    };
+    let reason = match &waits_for {
+        HeldByeWait::PeerAcksOurAnswer(_) => {
+            "RFC 3261 §15: the 2xx on this dialog is not ACKed yet, so its BYE waits for the ACK"
+        }
+        HeldByeWait::WeAckTheirAnswer => {
+            "RFC 3261 §13.2.2.4: siphon still owes this dialog a re-INVITE ACK, so its BYE waits"
+        }
+    };
+
     // A BYE already held for this dialog stays the one that is sent: a second
     // teardown racing the first adds none.
     state
@@ -154,23 +212,13 @@ fn hold_bye(
             local_addr: route.local_addr,
             sender,
             internal_call_id: internal_call_id.to_string(),
-            answer: Arc::clone(&answer),
+            waits_for,
         });
 
-    // The ACK or the 64×T1 sweep may have taken the answer between the lookup and
-    // the insert, and then neither of them finds this BYE. Each side sends the BYE
-    // only if it removes it from the store itself, so it goes out exactly once
-    // whichever way that race goes.
-    let still_waiting = state
-        .uas_2xx_retransmits
-        .get(dialog_call_id)
-        .is_some_and(|entry| Arc::ptr_eq(entry.value(), &answer));
-    if still_waiting {
-        debug!(
-            call_id = %internal_call_id,
-            %dialog_call_id,
-            "RFC 3261 §15: the 2xx on this dialog is not ACKed yet, so its BYE waits for the ACK"
-        );
+    // Each side sends the BYE only if it removes it from the store itself, so it
+    // goes out exactly once whichever way that race goes.
+    if recheck() {
+        debug!(call_id = %internal_call_id, %dialog_call_id, "{reason}");
         return;
     }
     release_held_bye(dialog_call_id, state);
@@ -182,7 +230,36 @@ fn hold_bye(
 /// Called for the ACK on that dialog, right after it is absorbed; by the 64×T1
 /// sweep; and by a hold that finds its answer already taken.
 pub fn release_held_bye(dialog_call_id: &str, state: &DispatcherState) -> bool {
-    let Some((_, held)) = state.held_byes.remove(dialog_call_id) else {
+    release_held_bye_inner(dialog_call_id, None, state)
+}
+
+/// [`release_held_bye`], but only for a BYE parked because siphon owed this
+/// dialog a re-INVITE ACK. A dialog can owe an ACK in both directions at once —
+/// siphon re-INVITEs a caller whose own ACK for siphon's 2xx never came — and
+/// then sending our ACK says nothing about what the peer still owes. Releasing
+/// on the wrong reason would put the BYE on the wire before the peer has
+/// confirmed the dialog, which is exactly what §15 forbids.
+pub fn release_bye_held_for_reinvite_ack(dialog_call_id: &str, state: &DispatcherState) -> bool {
+    state.pending_reinvite_acks.remove(dialog_call_id);
+    release_held_bye_inner(
+        dialog_call_id,
+        Some(|wait: &HeldByeWait| matches!(wait, HeldByeWait::WeAckTheirAnswer)),
+        state,
+    )
+}
+
+fn release_held_bye_inner(
+    dialog_call_id: &str,
+    only_if: Option<fn(&HeldByeWait) -> bool>,
+    state: &DispatcherState,
+) -> bool {
+    let removed = match only_if {
+        Some(predicate) => state
+            .held_byes
+            .remove_if(dialog_call_id, |_, held| predicate(&held.waits_for)),
+        None => state.held_byes.remove(dialog_call_id),
+    };
+    let Some((_, held)) = removed else {
         return false;
     };
     stop_held_answer(dialog_call_id, &held, state);
@@ -237,13 +314,14 @@ pub fn answer_caller_bye_for_held_dialog(
 
 /// Stop retransmitting the 2xx `held` waited on. Only the entry that is that very
 /// answer is removed, so an answer the ACK or the sweep already took is left
-/// alone.
+/// alone. A BYE that waited on an ACK of siphon's own has no answer to stop.
 fn stop_held_answer(dialog_call_id: &str, held: &HeldBye, state: &DispatcherState) {
+    let HeldByeWait::PeerAcksOurAnswer(waited_on) = &held.waits_for else {
+        return;
+    };
     if let Some((_, answer)) = state
         .uas_2xx_retransmits
-        .remove_if(dialog_call_id, |_, current| {
-            Arc::ptr_eq(current, &held.answer)
-        })
+        .remove_if(dialog_call_id, |_, current| Arc::ptr_eq(current, waited_on))
     {
         answer.cancel.notify_one();
     }
@@ -304,6 +382,49 @@ fn send_in_order(
             route.local_addr,
             state,
         ),
+    }
+}
+
+/// Send BYEs parked behind a re-INVITE ACK that is never going to be sent.
+///
+/// A re-INVITE whose final response never arrives leaves siphon owing an ACK it
+/// cannot build, so the mark it set would hold that dialog's BYE for the life of
+/// the process. The INVITE client transaction gives up at 64×T1 (RFC 3261 §17.1.1.2,
+/// Timer B), and so does this: past that deadline the dialog is released with the
+/// BYE it was owed, the same backstop `sweep_unacked_uas_2xx` gives the other
+/// direction. Runs on the dispatcher's timer tick.
+pub fn sweep_owed_reinvite_acks(state: &DispatcherState) {
+    if state.pending_reinvite_acks.is_empty() {
+        return;
+    }
+    let now = tokio::time::Instant::now();
+    // Snapshot first: nothing below runs while a store shard is locked.
+    let expired: Vec<String> = state
+        .pending_reinvite_acks
+        .iter()
+        .filter(|entry| now >= *entry.value())
+        .map(|entry| entry.key().clone())
+        .collect();
+    for dialog_call_id in expired {
+        // Only the entry that is still expired is claimed, so a final response
+        // landing between the snapshot and here keeps its own release.
+        if state
+            .pending_reinvite_acks
+            .remove_if(&dialog_call_id, |_, deadline| now >= *deadline)
+            .is_none()
+        {
+            continue;
+        }
+        if release_held_bye_inner(
+            &dialog_call_id,
+            Some(|wait: &HeldByeWait| matches!(wait, HeldByeWait::WeAckTheirAnswer)),
+            state,
+        ) {
+            debug!(
+                %dialog_call_id,
+                "the re-INVITE on this dialog never got a final response; sending the BYE it held"
+            );
+        }
     }
 }
 

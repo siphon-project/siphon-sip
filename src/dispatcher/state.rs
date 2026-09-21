@@ -221,6 +221,17 @@ pub struct DispatcherState {
     /// Keyed by the SIP Call-ID rather than the internal id: the call itself is
     /// gone by the time the ACK arrives.
     pub held_byes: Arc<DashMap<String, HeldBye>>,
+    /// Dialogs where siphon has sent a re-INVITE of its own and has not yet
+    /// ACKed its final response, keyed by that dialog's SIP Call-ID. The value
+    /// is the 64×T1 deadline past which a BYE held for it goes out regardless.
+    ///
+    /// RFC 3261 §13.2.2.4 has siphon, as that transaction's UAC, ACK the 2xx;
+    /// §15 releases the dialog with a BYE only once it is. The two run on
+    /// different tasks — the media re-anchor of a transfer answers on one while
+    /// the far party's BYE arrives on another — so without this the BYE can
+    /// reach the peer first and strand the ACK on a dialog it has already
+    /// ended.
+    pub pending_reinvite_acks: Arc<DashMap<String, tokio::time::Instant>>,
     /// INVITE server transactions whose CANCEL has already been accepted,
     /// keyed by the INVITE's transaction key.
     ///
@@ -368,8 +379,8 @@ pub struct UnackedAnswer {
     pub internal_call_id: String,
 }
 
-/// A BYE that waits for the ACK of the 2xx siphon sent on its dialog (RFC 3261
-/// §15), with everything needed to send it after the call is gone.
+/// A BYE that waits for an ACK still owed on its dialog, with everything needed
+/// to send it after the call is gone.
 pub struct HeldBye {
     pub bye: SipMessage,
     pub transport: Transport,
@@ -380,9 +391,22 @@ pub struct HeldBye {
     pub sender: ByeSender,
     /// The call this BYE ends, for the log line.
     pub internal_call_id: String,
-    /// The unACKed 2xx this BYE waits for. Only an entry that is this very `Arc`
-    /// is stopped along with it.
-    pub answer: Arc<UnackedAnswer>,
+    /// Which ACK this BYE waits for. Each release site only releases a BYE held
+    /// for its own reason, so an ACK that settles one does not send a BYE the
+    /// other is still owed.
+    pub waits_for: HeldByeWait,
+}
+
+/// Why a BYE is parked. Both are "the dialog owes an ACK", from opposite sides.
+pub enum HeldByeWait {
+    /// siphon is the dialog's UAS and the peer has not ACKed siphon's 2xx
+    /// (RFC 3261 §15). Only an entry that is this very `Arc` is stopped with it.
+    PeerAcksOurAnswer(Arc<UnackedAnswer>),
+    /// siphon is the dialog's UAC and owes the ACK for a re-INVITE answer it is
+    /// still processing (RFC 3261 §13.2.2.4). Released when that ACK is
+    /// enqueued, or by `sweep_owed_reinvite_acks` at the deadline the mark in
+    /// `pending_reinvite_acks` carries.
+    WeAckTheirAnswer,
 }
 
 /// How a siphon-originated BYE goes out.

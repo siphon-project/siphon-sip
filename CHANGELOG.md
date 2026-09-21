@@ -214,6 +214,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A transfer's BYE no longer overtakes the ACK siphon owes the surviving
+  leg.** A siphon-terminated transfer re-anchors media by re-INVITEing the
+  party that stays. A transfer target that hangs up in the same breath had its
+  BYE built on another task while that answer was still being rewritten, so the
+  BYE could reach the surviving party first and the ACK then landed on a dialog
+  it had already ended (RFC 3261 §13.2.2.4, §15). A BYE for a dialog whose
+  re-INVITE answer is still being handled now waits for that ACK and follows
+  it, bounded at 64×T1 for an answer that never gets one.
+
 - Gateway source polling now applies changes to a group's source networks or
   selection algorithm even when its destinations are unchanged. Existing
   destination health is preserved, and unchanged polls leave the group alone.
