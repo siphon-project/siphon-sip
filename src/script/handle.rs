@@ -195,6 +195,7 @@ mod tests {
                 sync_pool_size: None,
                 sync_pool_max: None,
                 handler_stall_abort_secs: 30,
+                handler_timeout_secs: None,
                 executor_queue_capacity: 1024,
                 include_paths: Vec::new(),
             })

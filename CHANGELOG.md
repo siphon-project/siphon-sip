@@ -245,6 +245,43 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   passed. Entries written before age tracking, and any whose stored epoch is in
   the future, report a zero age and keep the remaining-seconds behaviour they
   had. A binding whose grant has genuinely ended is still dropped at restore.
+- **One `async def` handler that never settles no longer aborts the whole
+  node.** Every inbound message becomes a job on the synchronous executor
+  pool, and an async handler parks its worker for as long as its coroutine
+  runs. That wait was unbounded, and its responder is a done-callback on a
+  `concurrent.futures.Future`, so a coroutine that never settles never fires
+  it and never drops the sender either — not even a channel error arrives, and
+  the worker is gone for the life of the process. The pool watchdog then saw
+  work in flight with nothing completing and aborted, taking down an NF, and
+  every subscriber on it, over a handful of wedged calls: in the incident this
+  came from, two wedged jobs out of six workers, with four idle and an empty
+  queue.
+
+  Three changes, because the abort had three separate causes.
+
+  The wait is now bounded by `script.handler_timeout_secs`, and the abandoned
+  coroutine is cancelled rather than left running on its driver. This is a leak
+  guard, not a deadline: the default is 300 s, far above a ring-before-answer
+  `asyncio.sleep`, an RFC 3261 Timer B wait (32 s) or an RFC 6733 Tx round trip
+  (30 s), so reaching it always means something is never going to arrive. The
+  handler's name is on the log line.
+
+  The watchdog no longer aborts a pool that can still serve. It now needs every
+  worker busy, the pool at its thread cap *and* work queued behind that — a
+  node that cannot answer the next message however long it waits. A pool with
+  idle workers and an empty queue is serving, and the stall belongs to the
+  wedged calls rather than to the node. A genuine deadlock still trips it: one
+  that wedges every worker leaves nothing idle, stops the pool growing, and
+  backs the queue up, so all three hold.
+
+  A pinned asyncio driver is now visible, via `siphon_async_drivers_stalled`
+  and a log line. A script API that blocks — Diameter, HTTP auth, DNS — runs on
+  the driver loop when it is called from inside an `async def`, and parks that
+  loop for every coroutine on it, including calls that never touched it.
+  Bounding the worker's wait does not release the loop, so without this the
+  failure would have gone from a loud crash to a node quietly failing async
+  dispatch. `submit` also steps over a stalled driver rather than queueing
+  behind it.
 
 - Gateway source polling now applies changes to a group's source networks or
   selection algorithm even when its destinations are unchanged. Existing

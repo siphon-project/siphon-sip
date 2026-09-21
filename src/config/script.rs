@@ -59,6 +59,25 @@ pub struct ScriptConfig {
     /// `script::py_executor`.
     #[serde(default = "default_handler_stall_abort_secs")]
     pub handler_stall_abort_secs: u64,
+    /// Seconds a synchronous worker waits for one `async def` handler's
+    /// coroutine before it gives the worker thread back and fails that call.
+    ///
+    /// Every inbound message becomes a job on the executor pool, and an async
+    /// handler parks its worker for as long as its coroutine runs. Without a
+    /// bound, a handler awaiting something that never completes costs that
+    /// worker for the life of the process.
+    ///
+    /// This is a leak guard, not a service-level deadline. Plenty of correct
+    /// handlers run for tens of seconds — a ring-before-answer `asyncio.sleep`,
+    /// a `proxy.send_request` waiting out RFC 3261 Timer B (32 s), a Diameter
+    /// round trip on RFC 6733 Tx (30 s) — so the default sits far above all of
+    /// them at 300 s. Reaching it means a handler is awaiting something that
+    /// will never arrive, which is a bug in the script or the thing it calls.
+    /// What keeps a wedged handler from taking the node down is the executor
+    /// watchdog declining to abort a pool that still has spare capacity, not
+    /// this value, so there is nothing to gain by tightening it.
+    #[serde(default)]
+    pub handler_timeout_secs: Option<u64>,
     /// Maximum number of handler jobs that may queue for the synchronous
     /// Python executor pool before new inbound work is shed (dropped — the SIP
     /// client retransmits).  Bounds memory under overload so a stuck pool can
@@ -85,6 +104,30 @@ fn default_handler_stall_abort_secs() -> u64 {
     30
 }
 
+/// Seconds a worker waits for one coroutine when the operator sets nothing.
+///
+/// A leak guard well clear of every legitimate long handler (a 30 s ring, a
+/// 32 s Timer B wait, a 30 s Diameter Tx), so reaching it always means
+/// something is never going to arrive.
+fn default_handler_timeout_secs() -> u64 {
+    300
+}
+
+/// The coroutine wait a worker uses, given the configured value.
+///
+/// Deliberately independent of `handler_stall_abort_secs`: deriving it from
+/// the stall window would cap every handler below 30 s, which is shorter than
+/// a normal ring and shorter than Timer B, so correct handlers would start
+/// failing. The watchdog's own guard — it does not abort a pool with idle
+/// capacity — is what stops a wedged handler taking the process with it.
+pub fn coroutine_timeout(handler_timeout_secs: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        handler_timeout_secs
+            .unwrap_or_else(default_handler_timeout_secs)
+            .max(1),
+    )
+}
+
 fn default_executor_queue_capacity() -> usize {
     1024
 }
@@ -98,6 +141,7 @@ impl Default for ScriptConfig {
             sync_pool_size: None,
             sync_pool_max: None,
             handler_stall_abort_secs: default_handler_stall_abort_secs(),
+            handler_timeout_secs: None,
             executor_queue_capacity: default_executor_queue_capacity(),
             include_paths: Vec::new(),
         }

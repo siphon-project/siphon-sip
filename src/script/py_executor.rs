@@ -309,8 +309,10 @@ fn parse_meminfo_total(content: &str) -> Option<u64> {
 struct PoolMetrics {
     /// Jobs currently executing on a worker thread.
     inflight: AtomicUsize,
-    /// Total jobs completed (monotonic). A flat value while the pool is at its
-    /// thread cap with every worker busy is the precise "pool wedged" signal.
+    /// Total jobs completed (monotonic). Flat while the pool is at its thread
+    /// cap, has no idle worker and has jobs queued behind that is the "pool
+    /// wedged" signal `run_watchdog` acts on — all of those, not the flat
+    /// counter alone, because a pool with spare capacity is still serving.
     completed: AtomicU64,
     /// Workers currently parked in `recv()` waiting for a job. `0` means every
     /// worker is busy, so a new submission should grow the pool (up to the cap).
@@ -717,6 +719,7 @@ fn run_watchdog(
 
         let inflight = metrics.inflight.load(Ordering::Relaxed);
         let total = metrics.total.load(Ordering::Relaxed);
+        let idle = metrics.idle.load(Ordering::Relaxed);
         let queue_depth = receiver.len();
         let completed = metrics.completed.load(Ordering::Relaxed);
 
@@ -743,27 +746,44 @@ fn run_watchdog(
             continue;
         };
 
-        // Wedged ⟺ there is work to do (a handler in-flight OR jobs queued) yet
-        // not one has completed since the last sample. Independent of pool fill,
-        // so it catches a low-concurrency deadlock (workers stuck on a
-        // lock/await that never returns) as well as full saturation. A healthy
-        // pool advances `completed` every tick; an idle pool has no pending work
-        // — neither trips.
+        // Wedged ⟺ nothing has completed since the last sample AND the pool has
+        // no way left to serve the next message. A healthy pool advances
+        // `completed` every tick; an idle pool has no pending work — neither
+        // trips.
+        //
+        // "No way left" is the part that has to be judged carefully, because
+        // the action here is to abort the process. A worker parked on a handler
+        // that never returns is a lost worker, but a pool with a parked worker
+        // and free capacity is still serving every message that arrives: the
+        // stall is the wedged call's, not the node's. Aborting there takes down
+        // an NF — and every subscriber on it — over a fault that was costing it
+        // some of its capacity. So the pool must also be out of room: no idle
+        // worker, nowhere left to grow, and work queued behind that.
+        //
+        // This is deliberately narrower than "work in-flight and nothing
+        // completing", which trips with most of the pool free. It still catches
+        // the genuine deadlock it exists for: one that wedges every worker
+        // leaves no idle ones, stops the pool growing, and backs the queue up
+        // behind it, so all three hold.
+        let saturated = idle == 0 && total >= params.max_threads;
         let has_work = inflight > 0 || queue_depth > 0;
-        if has_work && completed == last_completed {
+        if has_work && saturated && queue_depth > 0 && completed == last_completed {
             stalled_for += params.check_interval;
             if stalled_for >= threshold {
                 error!(
                     inflight,
                     total,
+                    idle,
                     queue_depth,
                     max_threads = params.max_threads,
                     stalled_secs = stalled_for.as_secs(),
-                    "Python executor pool wedged: work pending (in-flight/queued) \
-                     with zero completions for the stall window — aborting so a \
-                     supervisor restarts the process (a hung-but-alive SIP engine \
-                     never recovers on its own). Fires regardless of pool fill, so \
-                     it catches a low-concurrency deadlock, not just saturation."
+                    "Python executor pool wedged: every worker busy, none idle, the \
+                     pool at its thread cap, jobs queued behind them, and zero \
+                     completions for the stall window — aborting so a supervisor \
+                     restarts the process (a hung-but-alive SIP engine never \
+                     recovers on its own). A pool with idle capacity is still \
+                     serving and is left alone, however long an individual handler \
+                     has been parked."
                 );
                 on_stall();
                 // Reach here only in tests (production aborted above). Reset so
@@ -1473,24 +1493,31 @@ mod tests {
         }
     }
 
-    /// Watchdog positive: a pool with an in-flight handler and zero completions
-    /// for the stall window fires the abort action.
+    /// Watchdog positive: a pool at its thread cap, no idle worker, jobs queued
+    /// behind them and zero completions for the stall window fires the abort.
+    /// This is a node that cannot serve the next message however long it waits.
     #[test]
-    fn watchdog_fires_when_pool_wedged() {
+    fn watchdog_fires_when_the_pool_cannot_serve_anything() {
         let metrics = Arc::new(PoolMetrics::default());
-        // One worker, busy, never completes.
+        // The one worker the pool is allowed is busy and never completes...
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
-        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        metrics.idle.store(0, Ordering::Relaxed);
+        let (keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        // ...and work is stacking up behind it.
+        keep_alive_sender
+            .try_send(Box::new(|| {}) as Job)
+            .expect("queue a job nothing can pick up");
 
         let fired_at = watchdog_first_fired_at(metrics, receiver, 1, 4 * STALL_SAMPLES, |_| {});
 
         assert_eq!(
             fired_at,
             Some(STALL_SAMPLES),
-            "watchdog must fire when every worker is busy with zero completions, \
-             on the sample that completes the stall window"
+            "watchdog must fire when the pool is at its cap with nothing idle and \
+             work queued, on the sample that completes the stall window"
         );
+        drop(keep_alive_sender);
     }
 
     /// Watchdog negative: a pool that keeps completing jobs (even while fully
@@ -1510,9 +1537,16 @@ mod tests {
         const PROGRESSING_SAMPLES: usize = 4 * STALL_SAMPLES;
 
         let metrics = Arc::new(PoolMetrics::default());
+        // At the cap, nothing idle, and work queued behind the busy worker —
+        // the shape the watchdog is allowed to abort, so the quiet phase is a
+        // watchdog that would have fired, not one the guard is muting.
         metrics.total.store(1, Ordering::Relaxed);
         metrics.inflight.store(1, Ordering::Relaxed);
-        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        metrics.idle.store(0, Ordering::Relaxed);
+        let (keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        keep_alive_sender
+            .try_send(Box::new(|| {}) as Job)
+            .expect("queue a job behind the busy worker");
 
         let metrics_for_progress = Arc::clone(&metrics);
         let fired_at = watchdog_first_fired_at(
@@ -1542,28 +1576,56 @@ mod tests {
         );
     }
 
-    /// **Regression guard for the low-concurrency deadlock** — the watchdog must
-    /// fire even when the pool is far below its thread cap. A handler stuck on a
-    /// lock/await that never returns wedges the engine at low concurrency; the
-    /// pool never grows to max, so an "at the cap" trigger could never catch it
-    /// (the bug in the prior watchdog). Here one worker is busy with zero
-    /// completions while max_threads=8 — it MUST still abort.
+    /// **Regression guard for the incident this guard exists for.** A pool with
+    /// idle workers and an empty queue must NOT be aborted, however long some
+    /// of its workers have been parked.
+    ///
+    /// The shape is the one that took a node down: six worker threads, two
+    /// parked on handlers that never returned, four idle, nothing queued. That
+    /// pool was serving every message that arrived — the stall belonged to two
+    /// wedged calls, not to the node — and aborting it took out the NF and
+    /// every subscriber on it. The watchdog used to trip here because it asked
+    /// only "is anything in flight and has anything completed", which is true
+    /// of a pool that is 67% free.
     #[test]
-    fn watchdog_fires_below_cap_on_low_concurrency_deadlock() {
+    fn watchdog_does_not_fire_while_the_pool_can_still_serve() {
         let metrics = Arc::new(PoolMetrics::default());
-        // One of a possible 8 workers is wedged; the pool is nowhere near cap.
-        metrics.total.store(1, Ordering::Relaxed);
-        metrics.inflight.store(1, Ordering::Relaxed);
-        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        metrics.total.store(6, Ordering::Relaxed);
+        metrics.inflight.store(2, Ordering::Relaxed);
+        metrics.idle.store(4, Ordering::Relaxed);
+        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8); // empty queue
 
-        let fired_at = watchdog_first_fired_at(metrics, receiver, 8, 4 * STALL_SAMPLES, |_| {});
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 15, 4 * STALL_SAMPLES, |_| {});
+
+        assert_eq!(
+            fired_at, None,
+            "a pool with idle workers and an empty queue is serving, not wedged: \
+             aborting it turns two wedged calls into a dead node"
+        );
+    }
+
+    /// The same pool, once every worker is parked and work is queueing behind
+    /// them, is genuinely wedged and must still abort — the guard above narrows
+    /// the condition, it does not remove it.
+    #[test]
+    fn watchdog_still_fires_once_every_worker_is_parked() {
+        let metrics = Arc::new(PoolMetrics::default());
+        metrics.total.store(6, Ordering::Relaxed);
+        metrics.inflight.store(6, Ordering::Relaxed);
+        metrics.idle.store(0, Ordering::Relaxed);
+        let (keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        keep_alive_sender
+            .try_send(Box::new(|| {}) as Job)
+            .expect("queue a job nothing can pick up");
+
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 6, 4 * STALL_SAMPLES, |_| {});
 
         assert_eq!(
             fired_at,
             Some(STALL_SAMPLES),
-            "watchdog must fire on an in-flight handler that never completes, \
-             even far below the thread cap (low-concurrency deadlock)"
+            "every worker parked, at the cap, with work queued is a dead node"
         );
+        drop(keep_alive_sender);
     }
 
     /// Watchdog must fire on a stranded *queued* job too (work pending with zero
@@ -1571,16 +1633,18 @@ mod tests {
     #[test]
     fn watchdog_fires_on_stranded_queued_work() {
         let metrics = Arc::new(PoolMetrics::default());
-        // No worker is running it, but a job sits in the queue unconsumed.
+        // No worker is running it, but a job sits in the queue unconsumed and
+        // the pool is at its cap, so nothing can be grown to pick it up.
         metrics.total.store(2, Ordering::Relaxed);
         metrics.inflight.store(0, Ordering::Relaxed);
+        metrics.idle.store(0, Ordering::Relaxed);
 
         let (keep_alive_sender, receiver) = flume::bounded::<Job>(8);
         keep_alive_sender
             .try_send(Box::new(|| {}) as Job)
             .expect("queue a job that is never consumed");
 
-        let fired_at = watchdog_first_fired_at(metrics, receiver, 4, 4 * STALL_SAMPLES, |_| {});
+        let fired_at = watchdog_first_fired_at(metrics, receiver, 2, 4 * STALL_SAMPLES, |_| {});
 
         assert_eq!(
             fired_at,
