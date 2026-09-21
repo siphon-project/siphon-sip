@@ -135,6 +135,12 @@ pub struct DispatcherState {
     /// `config.b2bua.max_call_duration_secs`; `None` = uncapped, which is the
     /// default and was the only behaviour before this existed.
     pub default_max_call_duration_secs: Option<u32>,
+    /// Whether a B-leg with no `P-Asserted-Identity` gets one asserted from its
+    /// `From` (RFC 3325 §9.1). Resolved from `config.b2bua.assert_identity`;
+    /// **on** unless the operator turned it off, because a carrier that does
+    /// not want a PAI ignores it, while one that wants it and does not get it
+    /// rejects or mis-bills the call.
+    pub assert_identity: bool,
     /// Outbound registration manager (None when registrant is not configured).
     pub registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).

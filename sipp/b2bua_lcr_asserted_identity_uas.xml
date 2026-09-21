@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- LCR route in sipp-b2bua-lcr, the asserted-identity case (callee
+     +15550100005, routes.15550100005.json): one carrier, whose route names a
+     `caller_id` of +15550100777 and `caller_id_presentation: restricted`.
+
+     The carrier is the only party that can prove what actually left siphon, and
+     it asserts on all three headers of the trust-boundary contract:
+
+       - From is the RFC 3323 §4.1 anonymous name-addr, because the route
+         restricted the presentation. The presented number must NOT be in it.
+       - P-Asserted-Identity carries the route's caller_id. This is the header
+         the whole case exists for: the access leg's P-* was stripped by the
+         header policy (correctly), nothing used to put one back, and a carrier
+         that screens on the asserted identity saw nothing at all.
+       - Privacy: id is asserted, and now has something behind it — RFC 3325 §7
+         asks the trusted next hop to withhold the identity it was *given*, so
+         `Privacy: id` over an absent PAI is a privacy request nobody can
+         honour and a regulatory gap at the same time.
+
+     The regexes are deliberately un-anchored and match on a substring: the
+     sipp in CI does not match `^` against a header value, so an anchored
+     pattern would pass by never matching anything. -->
+
+<scenario name="B2BUA LCR carrier asserting the identity siphon presented">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <!-- The presented CLI reaches the carrier as an assertion. -->
+      <ereg regexp="sip:[+]15550100777@" search_in="hdr" header="P-Asserted-Identity:"
+            check_it="true" assign_to="asserted" />
+      <!-- And the caller's own number never does. -->
+      <ereg regexp="15550100001" search_in="hdr" header="P-Asserted-Identity:"
+            check_it_inverse="true" assign_to="asserted_is_not_the_caller" />
+      <!-- CLIR: the untrusted From is anonymised... -->
+      <ereg regexp="anonymous@anonymous.invalid" search_in="hdr" header="From:"
+            check_it="true" assign_to="anonymous_from" />
+      <ereg regexp="15550100777" search_in="hdr" header="From:"
+            check_it_inverse="true" assign_to="from_withholds_the_number" />
+      <!-- ...and the privacy request that goes with it is on the wire. -->
+      <ereg regexp="id" search_in="hdr" header="Privacy:"
+            check_it="true" assign_to="privacy_id" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagPAI[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:carrier@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=carrier 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" crlf="true" />
+
+  <recv request="BYE" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

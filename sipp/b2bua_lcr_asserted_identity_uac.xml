@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A-leg caller for the asserted-identity case in sipp-b2bua-lcr
+     (sipp/b2bua-lcr/, run by run_case.sh).
+
+     The callee +15550100005 is routed over routes.15550100005.json: one
+     carrier whose route names `caller_id: +15550100777` and
+     `caller_id_presentation: restricted`.
+
+     Nothing interesting happens on this leg — it places a call and hangs it up
+     — because the assertions that matter are on the carrier's side, where the
+     P-Asserted-Identity, the anonymised From and the Privacy header can be read
+     off what actually left siphon (b2bua_lcr_asserted_identity_uas.xml). This
+     caller exists to drive the call and to prove that a route asserting an
+     identity to the carrier still presents an ordinary answered call upstream.
+
+     The caller sends its own P-Asserted-Identity, which the header policy
+     strips at the trust boundary: siphon asserts its own, it does not relay
+     the access leg's. -->
+
+<scenario name="B2BUA LCR caller (carrier-side asserted identity)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:+15550100005@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+To: <sip:+15550100005@example.com>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:+15550100001@[local_ip]:[local_port];transport=[transport]>
+P-Asserted-Identity: <sip:+15550100001@example.com>
+Max-Forwards: 70
+User-Agent: SIPp/lcr-asserted-identity-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:+15550100005@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+To: <sip:+15550100005@example.com>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="300" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:+15550100005@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550100001@example.com>;tag=[pid]SIPpTag00[call_number]
+To: <sip:+15550100005@example.com>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" />
+
+</scenario>

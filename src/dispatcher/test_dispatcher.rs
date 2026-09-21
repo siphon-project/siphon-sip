@@ -95,6 +95,9 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         accept_replaces: false,
         log_dial: false,
         default_max_call_duration_secs: None,
+        // The production default, so a test that does not care about identity
+        // still exercises the shape a deployment runs.
+        assert_identity: true,
         registrant_manager: None,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new("siphon", "test")),
         li_siprec_srs_uri: None,

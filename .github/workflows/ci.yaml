@@ -1300,6 +1300,15 @@ jobs:
             exit 1
           fi
 
+      # A route naming caller_id and a restricted presentation reaches the
+      # carrier with a P-Asserted-Identity carrying the presented number, an
+      # anonymised From, and Privacy: id. The carrier asserts all three, because
+      # it is the only party that sees what actually left siphon — the caller's
+      # side of this call is an ordinary answered call and proves nothing about
+      # the identity headers.
+      - name: A carrier is told who the call is from, and CLIR still withholds it from the From
+        run: bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_asserted_identity_uac.xml sipp-b2bua-lcr-asserted-identity-uas
+
       - name: Collect logs
         if: always()
         run: |

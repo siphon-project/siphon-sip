@@ -81,6 +81,8 @@ mod a_leg_reliable_provisional_tests;
 #[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
+mod b_leg_asserted_identity_tests;
+#[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
 mod bad_extension_tests;
@@ -459,6 +461,7 @@ pub async fn run(
         accept_replaces: config.b2bua.replaces_takeover_enabled(),
         log_dial: config.b2bua.log_dial_enabled(),
         default_max_call_duration_secs: config.b2bua.resolved_max_call_duration_secs(),
+        assert_identity: config.b2bua.assert_identity_enabled(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(
             product_name,

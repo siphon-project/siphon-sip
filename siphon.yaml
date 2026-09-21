@@ -2104,6 +2104,27 @@ auth:
 # b2bua:
 #   max_call_duration_secs: 14400   # 4h
 
+# Assert an identity on a B-leg that has none: P-Asserted-Identity built from
+# the From after the header policy has run (RFC 3325 §9.1). DEFAULT: true.
+#
+# The header policy strips P-* off an untrusted access leg, which is right —
+# what a UE sent is not an assertion siphon can make. Nothing then put one back,
+# and the per-route caller_id only REWRITES a PAI that is already present, so a
+# route naming caller_id reached the carrier as a rewritten From and no asserted
+# identity at all. That is the one header most carriers ask for.
+#
+# CLIR had the same hole from the other side. `Privacy: id` asks the trusted
+# next hop to withhold the identity IT WAS GIVEN; asserted over an absent PAI
+# there is nothing to withhold and nothing to identify the caller by for
+# regulatory or emergency purposes. siphon now asserts the real identity before
+# anonymising the From, which is what makes the privacy request honourable.
+#
+# Set false for a next hop genuinely outside the trust domain. The default is to
+# assert, because a carrier that does not want a PAI ignores it, while one that
+# wants it and does not get it rejects or mis-bills the call.
+# b2bua:
+#   assert_identity: false
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

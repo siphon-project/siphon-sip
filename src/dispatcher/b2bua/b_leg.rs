@@ -531,6 +531,23 @@ pub fn b2bua_send_b_leg_invite(
         crate::sip::privacy::set_calling_number(&mut b_leg_invite, caller_id);
     }
 
+    // Assert an identity when this leg has none (RFC 3325 §9.1). The policy
+    // above stripped whatever the access leg sent, correctly — a UE's P-* is
+    // not an assertion siphon can make — and nothing put one back, so a route's
+    // `caller_id` reached the carrier as a rewritten From and nothing else.
+    //
+    // The position is load-bearing in three directions. After
+    // `set_calling_number`, so the PAI carries the route's presented CLI rather
+    // than the caller's own. Before the number policy, so the carrier's format
+    // is applied to the PAI too and the two headers do not disagree. Before the
+    // CLIR step below, which is what closes the other half: on a restricted
+    // call with no `caller_id` the From still holds the real caller here, so
+    // the identity asserted is the real one, and `Privacy: id` finally has
+    // something behind it for the trusted next hop to withhold.
+    if state.assert_identity {
+        crate::sip::privacy::assert_calling_identity(&mut b_leg_invite);
+    }
+
     // Per-leg number policy (an LCR route's, or a transfer's): reshape this
     // B-leg's identity headers (From / To / P-Asserted-Identity /
     // P-Preferred-Identity) to the carrier's format. The Request-URI is not

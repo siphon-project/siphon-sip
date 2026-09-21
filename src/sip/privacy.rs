@@ -107,6 +107,59 @@ pub fn set_calling_number(message: &mut SipMessage, number: &str) -> bool {
     rewritten > 0
 }
 
+/// Assert the calling party's identity in `P-Asserted-Identity`, built from
+/// `From`, when the message carries none (RFC 3325 §9.1).
+///
+/// The missing half of both operations above. [`set_calling_number`] only
+/// *rewrites* a PAI that is already present, and on a B-leg there usually is
+/// not one: the header policy strips `P-*` off an untrusted access leg, which
+/// is right — what the UE sent is not an assertion siphon can make — but
+/// nothing put one back. A route's `caller_id` therefore reached the carrier as
+/// a rewritten `From` and no asserted identity at all.
+///
+/// [`restrict_calling_identity`] has the same gap from the other side: it is
+/// built on the PAI carrying the real identity to the trusted next hop, and on
+/// a call with no PAI it asserts `Privacy: id` with nothing behind it.
+///
+/// Called *after* the number substitution and *before* the anonymisation, so
+/// the identity asserted is the one the call is presenting: a route's
+/// `caller_id` where one is set, and the real caller on a restricted call that
+/// has none.
+///
+/// Carries the `From`'s display name and URI; drops the dialog tag and every
+/// other header parameter, which belong to `From` and have no meaning on a PAI.
+/// Does nothing when a PAI is already present — the network has already
+/// decided — and nothing when the `From` is the anonymous URI, since asserting
+/// an anonymous identity asserts nothing.
+///
+/// Returns `true` if a header was added.
+pub fn assert_calling_identity(message: &mut SipMessage) -> bool {
+    if message.headers.has("P-Asserted-Identity") {
+        return false;
+    }
+    let Some(from) = message.headers.get("From").cloned() else {
+        return false;
+    };
+    let Ok(mut entry) = NameAddr::parse(&from) else {
+        return false;
+    };
+    if entry.uri.to_string() == ANONYMOUS_URI {
+        return false;
+    }
+
+    // A PAI is a name-addr, not a dialog header: no tag, no q, no expires, no
+    // header parameters (RFC 3325 §9.1).
+    entry.tag = None;
+    entry.q = None;
+    entry.expires = None;
+    entry.other_params.clear();
+
+    message
+        .headers
+        .add("P-Asserted-Identity", entry.to_string());
+    true
+}
+
 /// Withhold the calling party's identity (CLIR), per RFC 3323 §4.1 and
 /// TS 24.607.
 ///
@@ -116,7 +169,11 @@ pub fn set_calling_number(message: &mut SipMessage, number: &str) -> bool {
 ///   `Privacy` value rather than replacing it.
 /// - `P-Asserted-Identity` is left intact: it carries the real identity to the
 ///   trusted next hop, which is the entire mechanism by which the network can
-///   still identify the caller for regulatory and emergency purposes.
+///   still identify the caller for regulatory and emergency purposes. That only
+///   works if there *is* one — see [`assert_calling_identity`], which every
+///   caller of this function runs first, because `Privacy: id` over an absent
+///   PAI is a privacy request the next hop cannot honour and a regulatory gap
+///   at the same time.
 /// - `P-Preferred-Identity` is removed. It is the UA's *request* for what to
 ///   assert (RFC 3325 §9.1) and has no meaning once the network has decided;
 ///   forwarding it past a privacy boundary re-leaks the number.
@@ -260,6 +317,87 @@ mod tests {
         assert!(header(&message, "From")
             .expect("From")
             .contains("+12025550100"));
+    }
+
+    #[test]
+    fn assert_builds_a_pai_from_from_when_there_is_none() {
+        // The gap: the header policy strips P-* off the access leg and nothing
+        // put one back, so a carrier saw a From and no asserted identity.
+        let mut message = invite_with("");
+        assert!(assert_calling_identity(&mut message));
+
+        let pai = header(&message, "P-Asserted-Identity").expect("PAI asserted");
+        assert!(pai.contains("+12025550100"), "{pai}");
+        assert!(pai.contains("Alice"), "the display name carries: {pai}");
+        assert!(
+            !pai.contains("tag="),
+            "a PAI is not a dialog header and carries no tag: {pai}"
+        );
+    }
+
+    #[test]
+    fn assert_leaves_an_existing_pai_alone() {
+        // The network has already decided who this call is from.
+        let mut message =
+            invite_with("P-Asserted-Identity: <sip:+12025550177@ims.example.com>\r\n");
+        assert!(!assert_calling_identity(&mut message));
+        assert!(header(&message, "P-Asserted-Identity")
+            .expect("PAI")
+            .contains("+12025550177"));
+    }
+
+    #[test]
+    fn assert_refuses_to_assert_an_anonymous_identity() {
+        // Asserting `sip:anonymous@anonymous.invalid` asserts nothing, and
+        // would make `Privacy: id` look honoured while identifying no one.
+        let mut message = invite_with("");
+        restrict_calling_identity(&mut message);
+        assert!(!assert_calling_identity(&mut message));
+        assert!(!message.headers.has("P-Asserted-Identity"));
+    }
+
+    #[test]
+    fn assert_after_set_calling_number_carries_the_presented_cli() {
+        // The B-leg order: substitute first, then assert, so the PAI matches
+        // the From the carrier is being shown rather than the caller's own.
+        let mut message = invite_with("");
+        set_calling_number(&mut message, "+12025550111");
+        assert_calling_identity(&mut message);
+
+        let pai = header(&message, "P-Asserted-Identity").expect("PAI asserted");
+        assert!(pai.contains("+12025550111"), "{pai}");
+        assert!(!pai.contains("+12025550100"), "{pai}");
+    }
+
+    #[test]
+    fn assert_before_restrict_gives_privacy_id_something_to_withhold() {
+        // The CLIR half. `Privacy: id` asks the trusted next hop to withhold
+        // the identity it was given; with no PAI there is nothing to withhold
+        // and nothing to identify the caller by for regulatory or emergency
+        // purposes — a privacy header that cannot be honoured correctly.
+        let mut message = invite_with("");
+        assert_calling_identity(&mut message);
+        restrict_calling_identity(&mut message);
+
+        assert_eq!(header(&message, "Privacy").as_deref(), Some("id"));
+        let pai = header(&message, "P-Asserted-Identity").expect("PAI survives CLIR");
+        assert!(
+            pai.contains("+12025550100"),
+            "the real identity reaches the trusted next hop: {pai}"
+        );
+        let from = header(&message, "From").expect("From");
+        assert!(
+            !from.contains("+12025550100"),
+            "and never the untrusted one: {from}"
+        );
+    }
+
+    #[test]
+    fn assert_does_nothing_without_a_from() {
+        let mut message = invite_with("");
+        message.headers.remove("From");
+        assert!(!assert_calling_identity(&mut message));
+        assert!(!message.headers.has("P-Asserted-Identity"));
     }
 
     #[test]
