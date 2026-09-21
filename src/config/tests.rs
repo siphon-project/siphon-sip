@@ -26,6 +26,26 @@ fn control_tls_without_a_listener_is_refused() {
 }
 
 #[test]
+fn teardown_secs_defaults_to_five_and_can_be_switched_off() {
+    // The default matters: a node upgraded without touching its config starts
+    // ending the calls a drain deadline holds, which is the whole point. `0` is
+    // the documented way back to exiting on top of them.
+    let with_default = Config::from_str(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n\
+         server:\n  drain_secs: 10\n",
+    )
+    .expect("config loads");
+    assert_eq!(with_default.server.expect("server").teardown_secs, 5);
+
+    let switched_off = Config::from_str(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n\
+         server:\n  drain_secs: 10\n  teardown_secs: 0\n",
+    )
+    .expect("config loads");
+    assert_eq!(switched_off.server.expect("server").teardown_secs, 0);
+}
+
+#[test]
 fn admin_tls_with_an_unreadable_certificate_is_refused_at_load() {
     // Same reasoning as control.tls: a listener that binds, looks healthy and
     // fails every handshake reads to an operator as a broken client rather than

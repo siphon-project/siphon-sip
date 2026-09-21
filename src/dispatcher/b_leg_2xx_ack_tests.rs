@@ -284,7 +284,7 @@ impl Call {
 
     /// The callee's response to the INVITE: its Via, From, Call-ID and CSeq, a
     /// tagged To, its remote target, and whatever else `extra` adds.
-    fn callee_response(&self, status_line: &str, extra: &str, body: &str) -> String {
+    pub(super) fn callee_response(&self, status_line: &str, extra: &str, body: &str) -> String {
         let header = |name: &str| {
             self.invite
                 .headers

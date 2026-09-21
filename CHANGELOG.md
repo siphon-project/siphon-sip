@@ -8,6 +8,40 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **A drain deadline now ends the calls it is still holding
+  (`server.teardown_secs`, default 5).** The drain loop logged `"drain timeout —
+  exiting with in-flight work still active"` and exited. Nothing was torn down
+  on that path: no BYE on either leg, no Ro `CCR-TERMINATION`, no Rf stop, no
+  media release, no CDR. A call lasts minutes and `drain_secs` is seconds, so
+  **every** restart taken with traffic up ended there — the far side left
+  holding a channel until someone hung it up, anchors held to media timeout, and
+  charging sessions the OCS had authorised never closed.
+
+  At the deadline siphon now BYEs both legs of every answered call, carrying
+  `Reason: Q.850;cause=16` (normal clearing — an orderly hangup the network
+  chose, which is what an SBC taken out of service emits, not a fault for the
+  far side to alarm on), and runs the same teardown a `b2bua.terminate` does:
+  Ro `CCR-TERMINATION`, Rf ACR-STOP, media release, SIPREC stop, CDR. A call
+  still ringing has every pending B-leg CANCELled (RFC 3261 §9.1) and its caller
+  gets the 503 the drain already answers a new INVITE with, so a caller that
+  dialled during the drain and one whose ring the deadline cut short hear the
+  same story. It deliberately does not re-route: the `@b2bua.on_failure` path a
+  ring timeout runs would have an exiting node start dialling carriers.
+
+  The wait is what makes it real — the charging stops and the media delete are
+  spawned and awaited nowhere, so exiting straight after issuing the teardowns
+  would kill the Diameter round trips mid-flight. `teardown_secs: 0` restores
+  the previous behaviour exactly.
+
+  **Your container runtime's stop timeout must exceed `drain_secs +
+  teardown_secs`**, or its `SIGKILL` lands first and none of this happens;
+  Docker's default is 10 s. Two limits are worth stating rather than papering
+  over: a BYE for a dialog whose peer has not ACKed siphon's 2xx is held (RFC
+  3261 §15) and goes out only if that ACK arrives, and **proxy-mode calls cannot
+  be torn down at all** — a proxy keeps transaction state, not dialog state, so
+  there is nothing an in-dialog BYE could be built from, and a pure proxy node's
+  drain completes instantly while proxied calls are up.
+
 - **TLS on the admin listener (`admin.tls`).** The refresh endpoints are the
   right mechanism — they turn `refresh_secs` into a floor rather than the only
   lever — but the listener they sit on could not be shown to the controller that

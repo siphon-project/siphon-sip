@@ -41,6 +41,7 @@
 use std::time::Instant;
 
 use super::prack_bridge::{anchored_caller_offer, Anchoring};
+use super::terminate::q850_reason;
 use crate::b2bua::actor::{OfferVia, PendingPrackOffer, RequestSource};
 use crate::dispatcher::*;
 
@@ -343,7 +344,7 @@ pub fn end_call_on_unrelayable_update_answer(
     );
     b2bua_terminate_call_inner(
         call_id,
-        Some("Q.850;cause=47;text=\"Media anchor failed\""),
+        Some(q850_reason!(47, "Media anchor failed")),
         "b2bua",
         state,
     );

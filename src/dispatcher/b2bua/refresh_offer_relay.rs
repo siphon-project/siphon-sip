@@ -16,13 +16,14 @@
 //! teardown, and the held ACK goes out first with every stream rejected
 //! ([`take_held_refresh_ack_rejecting_offer`]).
 
+use super::terminate::q850_reason;
 use crate::b2bua::actor::RefreshOfferRelay;
 use crate::dispatcher::*;
 
 /// Q.850 cause 102 ("recovery on timer expiry"), as for a session refresh nobody
 /// answers: the refresh did not complete, and a timer is what ended the call.
 const REFRESH_OFFER_UNANSWERED_REASON: &str =
-    "Q.850;cause=102;text=\"Session refresh offer not answered\"";
+    q850_reason!(102, "Session refresh offer not answered");
 
 /// An ACK owed to a dialog's 2xx, and where it goes: what leaves ahead of that
 /// dialog's BYE when the call ends before the ACK could carry its answer.

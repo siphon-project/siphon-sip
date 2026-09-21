@@ -196,6 +196,32 @@ On `SIGTERM`/`SIGINT`, SIPhon **stops accepting new INVITEs** and waits up to
 `server.drain_secs` (default **30s**) for in-flight transactions and B2BUA calls to
 finish before exiting. Set `drain_secs: 0` to exit immediately.
 
+At the deadline it then **ends the calls that are still up**, within
+`server.teardown_secs` (default **5s**): a BYE on both legs carrying
+`Reason: Q.850;cause=16` (normal clearing), the Ro `CCR-TERMINATION`, the Rf
+stop, the media release and the CDR. A call lasts minutes and a drain is
+seconds, so this is the normal path on any restart taken with traffic up, not
+the exceptional one — before it existed, every such restart cut its calls with
+nothing on the wire and left the far side holding a channel until someone hung
+it up. `teardown_secs: 0` restores that behaviour if you want it.
+
+```yaml
+server:
+  drain_secs: 30
+  teardown_secs: 5
+```
+
+**Your container runtime's stop timeout must exceed `drain_secs +
+teardown_secs`**, or its `SIGKILL` lands first and none of this happens. Docker's
+default is 10 s (`docker stop -t`, `stop_grace_period:` in compose); Kubernetes'
+`terminationGracePeriodSeconds` defaults to 30 s.
+
+**B2BUA calls only.** A proxied call cannot be torn down and that is a property
+of proxying, not a gap here: a proxy keeps transaction state, not dialog state —
+no callee To-tag, no remote target, no route set, no CSeq — so there is nothing
+an in-dialog BYE could be built from. On a pure proxy node the drain reports no
+active calls at all and completes immediately while proxied calls are up.
+
 A rolling upgrade is therefore:
 
 1. Remove the node from the LB / DNS rotation (or let the LB's health probe do it).
@@ -205,8 +231,8 @@ A rolling upgrade is therefore:
 4. Re-add to rotation. Repeat per node.
 
 In Kubernetes, wire this to the pod lifecycle (below): a `preStop` hook plus a
-`terminationGracePeriodSeconds` **≥ `drain_secs`** lets the drain complete before the
-kubelet sends `SIGKILL`.
+`terminationGracePeriodSeconds` **≥ `drain_secs` + `teardown_secs`** lets the drain
+*and* the teardown complete before the kubelet sends `SIGKILL`.
 
 ### Health checks & probes
 

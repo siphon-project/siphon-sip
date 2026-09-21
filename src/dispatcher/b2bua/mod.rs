@@ -38,6 +38,7 @@ mod reliable;
 mod response;
 mod routing;
 mod session_timer;
+pub mod shutdown;
 mod terminate;
 mod timeouts;
 mod transfer;

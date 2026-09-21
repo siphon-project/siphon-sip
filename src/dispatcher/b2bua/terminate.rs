@@ -49,14 +49,36 @@ pub fn b2bua_stop_siprec(internal_call_id: &str, state: &DispatcherState) {
     }
 }
 
+/// Build an RFC 3326 `Reason:` header value from a Q.850 cause and free text.
+///
+/// The one place that knows the header's shape. Embedded quotes are stripped
+/// from `text` so a script-supplied string cannot produce a malformed header.
+/// For a cause and text both known at compile time, use [`q850_reason!`], which
+/// stays a `&'static str`.
+pub fn format_q850_reason(cause: u16, text: &str) -> String {
+    let text = text.replace('"', "");
+    format!("Q.850;cause={cause};text=\"{text}\"")
+}
+
 /// Build an RFC 3326 `Reason:` header value for a graceful, script-initiated
 /// call teardown. Q.850 cause 16 = normal call clearing; the script-supplied
-/// text rides along in `text=` (embedded quotes stripped so the header stays
-/// well-formed).
+/// text rides along in `text=`.
 pub fn format_normal_clearing_reason(reason: &str) -> String {
-    let text = reason.replace('"', "");
-    format!("Q.850;cause=16;text=\"{text}\"")
+    format_q850_reason(16, reason)
 }
+
+/// The compile-time twin of [`format_q850_reason`]: an RFC 3326 `Reason:` value
+/// from a literal cause and literal text, still a `&'static str`.
+///
+/// Every teardown reason siphon raises itself is known at build time, so they go
+/// through this rather than being hand-written seven different ways — which is
+/// how one of them ends up missing a quote.
+macro_rules! q850_reason {
+    ($cause:literal, $text:literal) => {
+        concat!("Q.850;cause=", $cause, ";text=\"", $text, "\"")
+    };
+}
+pub(crate) use q850_reason;
 
 /// Full B2BUA call teardown initiated by the framework — session-timer expiry or
 /// an imperative `b2bua.terminate` — NOT by an inbound BYE. Sends an in-dialog
@@ -299,7 +321,23 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    // Entered here, not in the inner form: the imperative API may be called
+    // from a thread with no tokio context (an event-callback driver, a timer),
+    // while the shutdown pass and the tests already run on one.
+    let _enter = control.runtime.enter();
+    b2bua_reject_call_in(&control.state, internal_call_id, code, reason)
+}
+
+/// [`b2bua_reject_call`] against an explicit dispatcher state, for a caller that
+/// already holds one — the shutdown teardown, and the tests that drive it
+/// without the process-global `B2BUA_CONTROL` a `OnceLock` only lets one state
+/// occupy.
+pub(crate) fn b2bua_reject_call_in(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+) -> bool {
     let (invite_arc, transport, remote_addr, connection_id, local_addr, local_tag, sip_call_id) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
@@ -316,7 +354,6 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
     let Some(invite_arc) = invite_arc else {
         return false;
     };
-    let _enter = control.runtime.enter();
     let Ok(invite) = invite_arc.lock() else {
         error!(call_id = %internal_call_id, "b2bua_reject_call: invite lock poisoned");
         return false;
@@ -390,7 +427,7 @@ pub fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     // Q.850 cause 102 = "recovery on timer expiry".
     b2bua_terminate_call_inner(
         call_id,
-        Some("Q.850;cause=102;text=\"Session timer expired\""),
+        Some(q850_reason!(102, "Session timer expired")),
         "timeout",
         state,
     );
@@ -411,7 +448,7 @@ pub fn b2bua_max_duration_terminate(call_id: &str, state: &DispatcherState) {
     // call rather than anything either peer did.
     b2bua_terminate_call_inner(
         call_id,
-        Some("Q.850;cause=102;text=\"Maximum call duration exceeded\""),
+        Some(q850_reason!(102, "Maximum call duration exceeded")),
         "timeout",
         state,
     );
@@ -435,7 +472,7 @@ pub fn b2bua_unacked_answer_terminate(call_id: &str, state: &DispatcherState) ->
     // the timer, so a CDR tells it apart from those two.
     b2bua_terminate_call_inner(
         call_id,
-        Some("Q.850;cause=102;text=\"No ACK received\""),
+        Some(q850_reason!(102, "No ACK received")),
         "timeout",
         state,
     )
