@@ -60,6 +60,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   resolve on an asyncio driver thread, where a parked loop stops every
   coroutine on it, including calls that never touched DNS. Measured against an
   unresponsive nameserver, one resolve took **18 s** before this change.
+- **A `@diameter.on_request` handler that raises now answers
+  `5012 DIAMETER_UNABLE_TO_COMPLY`, not `3002 DIAMETER_UNABLE_TO_DELIVER`.**
+  Every way the inbound dispatch could fail answered the no-route code, which on
+  Ro is read as a credit denial: a Python exception in a charging bridge
+  therefore tore down every live call at its first re-authorisation, and the
+  only visible symptom was `CCR-UPDATE denied … result_code=3002` with nothing
+  pointing at the script. A protocol error the peer can tell apart from a credit
+  decision is the reason both codes exist. The same applies to a handler that
+  returns something other than a `DiameterAnswer`, and to an answer that will
+  not serialize — those are siphon failing to comply, not an absent route. All
+  four now log at `error` with the handler's name (from its `__qualname__`) and
+  the exception, instead of a `warn` among thousands.
+
+  `3002` is unchanged for the two cases it describes: no handler matched the
+  request's application and command, or the handler that matched returned
+  `None`. Declining is a routing answer, and returning `None` is the documented
+  way to do it.
 
 ## [1.9.1] — 2026-09-21
 

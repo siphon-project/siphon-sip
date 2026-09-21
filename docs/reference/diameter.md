@@ -14,6 +14,27 @@ async def handle(request):
     return request.reject(3002)
 ```
 
+### What siphon answers when the handler does not
+
+A request the script does not answer itself gets one of three codes, and they
+are meant to be distinguishable at the peer:
+
+| Result-Code | When |
+|---|---|
+| `3002` DIAMETER_UNABLE_TO_DELIVER | Nothing serves the request: no `@diameter.on_request` matched its application and command, or the handler that matched returned `None`. |
+| `5012` DIAMETER_UNABLE_TO_COMPLY | siphon has a handler and could not carry it out: it raised, returned something that is not a `DiameterAnswer`, or produced an answer that would not serialize. Logged at `error` with the handler's name and the exception. |
+| `5014` DIAMETER_INVALID_AVP_LENGTH | The inbound message did not parse. |
+
+The 3002/5012 split matters most on Ro, where a `3002` to a CCR-UPDATE is read
+as a credit denial and the call is torn down. A handler that raises is a fault
+on siphon's side of the interface, not a decision about the subscriber's
+credit, so it answers `5012` — which lets an operator tell a script fault from
+an OCS denial instead of seeing every live call die at its first
+re-authorisation with nothing pointing at the script.
+
+Returning `None` stays `3002` on purpose: declining is a routing answer, and it
+is the documented way for a handler to say "not mine".
+
 ## Rx: QoS and bearer events
 
 `diameter.rx_aar` asks the PCRF to authorize the media of a call. With
