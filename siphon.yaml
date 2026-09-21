@@ -444,6 +444,27 @@ auth:
   # peer configuration directly. (The old `diameter_cx` value never parsed —
   # the variant is spelled `diametercx` — and is now rejected outright.)
 
+  # Which digest algorithms a 401/407 offers, most preferred first
+  # (RFC 7616 §3.7). One WWW-Authenticate / Proxy-Authenticate header per
+  # entry, in this order. Default: [MD5, SHA-256, SHA-512-256] — one challenge
+  # covering RFC 2617 and RFC 7616 clients, which is what siphon has always
+  # sent.
+  #
+  # Narrow it for a client population that cannot take a multi-challenge 401.
+  # Some SDKs abandon the registration outright when a 401 carries more than
+  # one WWW-Authenticate, whatever the algorithms and whatever the order, and
+  # the RFC's SHOULD gives them nothing to fall back to. You pay for it in the
+  # algorithms you drop, so narrow only as far as the clients require.
+  #
+  #   algorithms: ["MD5"]
+  #
+  # An unknown name fails the config load rather than being skipped: a silently
+  # dropped entry is a challenge set you did not choose. "AKAv1-MD5" is refused
+  # here too — IMS AKA is network-selected, and its challenge (with the AKA
+  # nonce and ck=/ik=) is built by auth.require_aka_digest() or
+  # auth.require_ims_digest(), not by this list.
+  # algorithms: ["MD5", "SHA-256", "SHA-512-256"]
+
   # Digest-nonce anti-replay (RFC 7616 §3.3). Nonces embed a timestamp and are
   # rejected once older than nonce_ttl_secs, so a captured Authorization can no
   # longer be replayed indefinitely.

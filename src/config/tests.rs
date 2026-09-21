@@ -2703,6 +2703,81 @@ fn rejects_undispatched_auth_backends() {
     );
 }
 
+// -----------------------------------------------------------------------
+// auth.algorithms — the digest challenge set
+// -----------------------------------------------------------------------
+
+#[test]
+fn auth_algorithms_defaults_to_the_set_siphon_has_always_sent() {
+    let config = Config::from_str(&backend_yaml("auth:\n  realm: \"example.com\"\n"))
+        .expect("a config without auth.algorithms must load");
+    assert_eq!(config.auth.algorithms, ["MD5", "SHA-256", "SHA-512-256"]);
+}
+
+#[test]
+fn auth_algorithms_takes_a_narrowed_set_in_the_configured_order() {
+    let config = Config::from_str(&backend_yaml(
+        "auth:\n  realm: \"example.com\"\n  algorithms: [\"SHA-256\", \"MD5\"]\n",
+    ))
+    .expect("a narrowed set must load");
+    assert_eq!(config.auth.algorithms, ["SHA-256", "MD5"]);
+}
+
+/// A name siphon cannot challenge with is refused, not skipped: a silently
+/// dropped entry is a challenge set the operator did not choose, and the
+/// difference is invisible until a client population stops registering.
+#[test]
+fn rejects_an_unknown_auth_algorithm_naming_it() {
+    let error = Config::from_str(&backend_yaml(
+        "auth:\n  realm: \"example.com\"\n  algorithms: [\"MD5\", \"SHA-3\"]\n",
+    ))
+    .expect_err("an unknown algorithm must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("SHA-3"),
+        "error should name the offending entry: {message}"
+    );
+    assert!(
+        message.contains("SHA-512-256"),
+        "error should list what is accepted: {message}"
+    );
+}
+
+/// AKA is network-selected and its challenge carries the AKA nonce plus
+/// ck=/ik=, so it cannot be one entry in an RFC 7616 negotiation. Accepting it
+/// here would emit a challenge with no auth vector behind it.
+#[test]
+fn rejects_aka_in_the_auth_algorithm_list_and_points_at_the_right_call() {
+    let error = Config::from_str(&backend_yaml(
+        "auth:\n  realm: \"example.com\"\n  algorithms: [\"AKAv1-MD5\"]\n",
+    ))
+    .expect_err("AKAv1-MD5 must be rejected here");
+    let message = error.to_string();
+    assert!(
+        message.contains("AKAv1-MD5"),
+        "error should name the offending entry: {message}"
+    );
+    assert!(
+        message.contains("require_aka_digest") && message.contains("require_ims_digest"),
+        "error should point at the calls that do build an AKA challenge: {message}"
+    );
+}
+
+/// An empty list would emit a 401 carrying no `WWW-Authenticate` at all, which
+/// a client reads as a malformed response rather than as "try again".
+#[test]
+fn rejects_an_empty_auth_algorithm_list() {
+    let error = Config::from_str(&backend_yaml(
+        "auth:\n  realm: \"example.com\"\n  algorithms: []\n",
+    ))
+    .expect_err("an empty challenge set must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("auth.algorithms is empty"),
+        "error should name the setting: {message}"
+    );
+}
+
 /// `backend: database` with no `auth.database` block has no credential
 /// source, so every digest check would come back `Unavailable` and nobody
 /// could register. A box that boots healthy and rejects every REGISTER is

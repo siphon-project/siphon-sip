@@ -602,6 +602,18 @@ pub fn inject_python_singletons(config: &Config) {
         );
     }
 
+    // Which algorithms a 401/407 offers (RFC 7616 §3.7). Every name here parsed
+    // and was accepted by `validate_auth_algorithms` at config load, so an
+    // unparseable one cannot reach this point and be silently dropped.
+    py_auth.set_challenge_algorithms(
+        config
+            .auth
+            .algorithms
+            .iter()
+            .filter_map(|name| crate::auth::DigestAlgorithm::parse(name))
+            .collect(),
+    );
+
     // Wire HTTP auth backend if configured
     if let Some(http_config) = &config.auth.http {
         if let Err(error) = py_auth.set_http_config(http_config.clone()) {

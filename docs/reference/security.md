@@ -86,6 +86,41 @@ path.
 
 ## `auth` namespace
 
+### Which algorithms a challenge offers
+
+`require_www_digest` / `require_proxy_digest` emit one `WWW-Authenticate` /
+`Proxy-Authenticate` header per algorithm in `auth.algorithms`, in that order,
+all sharing one nonce (RFC 7616 §3.7 — weakest first, so a legacy MD5-only
+client finds its entry and a modern one takes the strongest it supports).
+
+```yaml
+auth:
+  algorithms: ["MD5", "SHA-256", "SHA-512-256"]   # the default
+```
+
+Narrow it for a client population that cannot take a multi-challenge 401. The
+RFC's SHOULD assumes a client picks one from the list; some SDKs instead
+abandon the registration when a 401 carries more than one `WWW-Authenticate`,
+whatever the algorithms are and whatever the order, and there is nothing in the
+exchange to fall back to:
+
+```yaml
+auth:
+  algorithms: ["MD5"]
+```
+
+You pay for that in the algorithms you drop, so narrow only as far as the
+clients require. Verification is unaffected either way — siphon accepts any
+algorithm it can compute, including ones it did not offer.
+
+An unknown name fails the config load rather than being skipped: a silently
+dropped entry is a challenge set the operator did not choose, and the
+difference does not show up until clients stop registering. An empty list is
+refused for the same reason — a 401 carrying no challenge is unanswerable.
+`AKAv1-MD5` is refused here too: IMS AKA is network-selected, and its challenge
+(with the AKA nonce and `ck=`/`ik=`) comes from `auth.require_aka_digest()` or
+`auth.require_ims_digest()`.
+
 ### Issuing your own challenge
 
 `require_www_digest` / `require_proxy_digest` build the challenge for you. A

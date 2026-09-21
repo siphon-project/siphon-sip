@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use super::call::PyCall;
 use super::request::PyRequest;
 use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials};
+use crate::auth::DigestAlgorithm;
 use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 use vectors::{auth_vectors, ims_auth_store, store_auth_vector, take_auth_vector};
@@ -218,9 +219,25 @@ pub struct PyAuth {
     nonce_secret: Option<Arc<Vec<u8>>>,
     /// Max age (seconds) of a digest nonce before it is rejected as stale.
     nonce_ttl_secs: u64,
+    /// Algorithms offered on a 401/407, most preferred first — one challenge
+    /// header each, in this order (RFC 7616 §3.7). From `auth.algorithms`,
+    /// already parsed and validated at config load, so nothing here can fall
+    /// back or skip an entry silently.
+    challenge_algorithms: Arc<Vec<DigestAlgorithm>>,
     /// Registrar whose bindings record who authenticated them, consulted by
     /// `verify_integrity_protected`. `None` until the dispatcher wires one.
     registrar: Option<Arc<crate::registrar::Registrar>>,
+}
+
+/// The challenge set siphon has always sent, and the default when
+/// `auth.algorithms` is absent: weakest first, so a legacy MD5-only client
+/// finds its entry and a modern one takes the strongest it supports.
+fn default_challenge_algorithms() -> Arc<Vec<DigestAlgorithm>> {
+    Arc::new(vec![
+        DigestAlgorithm::Md5,
+        DigestAlgorithm::Sha256,
+        DigestAlgorithm::Sha512_256,
+    ])
 }
 
 impl PyAuth {
@@ -241,6 +258,7 @@ impl PyAuth {
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
+            challenge_algorithms: default_challenge_algorithms(),
             registrar: None,
         }
     }
@@ -259,6 +277,7 @@ impl PyAuth {
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
+            challenge_algorithms: default_challenge_algorithms(),
             registrar: None,
         }
     }
@@ -330,6 +349,18 @@ impl PyAuth {
         self.nonce_secret = secret.filter(|s| !s.is_empty()).map(Arc::new);
         if ttl_secs > 0 {
             self.nonce_ttl_secs = ttl_secs;
+        }
+    }
+
+    /// Set the algorithms a 401/407 offers, most preferred first.
+    ///
+    /// Takes the already-parsed names from `auth.algorithms`; an unknown or
+    /// AKA entry was refused at config load, so nothing is dropped here. An
+    /// empty list is ignored rather than producing a challenge-less 401 — the
+    /// config validator rejects that case, and this is the belt to its braces.
+    pub fn set_challenge_algorithms(&mut self, algorithms: Vec<DigestAlgorithm>) {
+        if !algorithms.is_empty() {
+            self.challenge_algorithms = Arc::new(algorithms);
         }
     }
 
@@ -1157,20 +1188,35 @@ impl PyAuth {
                 // RFC 7616 §3.7: a server that supports multiple algorithms
                 // SHOULD include one challenge per algorithm, weakest first.
                 // Modern clients pick the strongest they support; legacy
-                // MD5-only clients fall back to the first/last MD5 entry.
-                // We emit MD5 + SHA-256 + SHA-512-256 so a single challenge
-                // covers RFC 2617 and RFC 7616 implementations.
+                // MD5-only clients fall back to the MD5 entry.
+                //
+                // Which algorithms, and in what order, is `auth.algorithms` —
+                // defaulting to MD5 + SHA-256 + SHA-512-256, so one challenge
+                // covers RFC 2617 and RFC 7616 implementations. It is
+                // configurable because that SHOULD is not universally
+                // survivable: a client population that abandons a registration
+                // on any 401 carrying more than one challenge cannot be served
+                // by the recommended behaviour, and had no way to ask for less.
+                //
+                // One nonce across the whole set. The entries are alternatives
+                // for the same challenge, so a nonce minted per entry would
+                // leave the client's answer matching only one of them.
                 let nonce = self.generate_nonce();
                 let header_name = if challenge_code == 401 {
                     "WWW-Authenticate"
                 } else {
                     "Proxy-Authenticate"
                 };
-                let header_values = [
-                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=MD5, qop=\"auth\""),
-                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=SHA-256, qop=\"auth\""),
-                    format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=SHA-512-256, qop=\"auth\""),
-                ];
+                let header_values: Vec<String> = self
+                    .challenge_algorithms
+                    .iter()
+                    .map(|algorithm| {
+                        format!(
+                            "Digest realm=\"{realm}\", nonce=\"{nonce}\", \
+                             algorithm={algorithm}, qop=\"auth\""
+                        )
+                    })
+                    .collect();
 
                 let message = target.message();
                 let mut message_guard = message.lock().map_err(|error| {
@@ -2648,6 +2694,114 @@ mod tests {
             auth.validate_credentials(&build(&fresh), "example.com", "REGISTER"),
             CredentialCheck::Valid
         );
+    }
+
+    /// All values of `name` on a request's message.
+    fn request_header_values(request: &PyRequest, name: &str) -> Vec<String> {
+        let message = request.message();
+        let guard = message.lock().unwrap();
+        guard.headers.get_all(name).cloned().unwrap_or_default()
+    }
+
+    /// One `algorithm=` per 401 challenge, in the order emitted.
+    fn challenge_algorithms_of(request: &PyRequest) -> Vec<String> {
+        request_header_values(request, "WWW-Authenticate")
+            .iter()
+            .filter_map(|value| value.split("algorithm=").nth(1))
+            .map(|rest| rest.split(',').next().unwrap_or("").trim().to_string())
+            .collect()
+    }
+
+    /// One `nonce="…"` per 401 challenge.
+    fn challenge_nonces_of(request: &PyRequest) -> Vec<String> {
+        request_header_values(request, "WWW-Authenticate")
+            .iter()
+            .filter_map(|value| value.split("nonce=\"").nth(1))
+            .map(|rest| rest.split('"').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_default_challenge_set_is_the_three_algorithms_weakest_first() {
+        // What every deployment sends today, and what an operator still gets by
+        // leaving `auth.algorithms` out entirely.
+        let auth = make_auth();
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        assert_eq!(
+            challenge_algorithms_of(&request),
+            vec!["MD5", "SHA-256", "SHA-512-256"]
+        );
+    }
+
+    #[test]
+    fn a_single_configured_algorithm_emits_exactly_one_challenge() {
+        // The case the knob exists for: a client population that abandons the
+        // registration on any 401 carrying more than one challenge, whatever
+        // the algorithms are and whatever their order.
+        let mut auth = make_auth();
+        auth.set_challenge_algorithms(vec![DigestAlgorithm::Md5]);
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        let challenges = request_header_values(&request, "WWW-Authenticate");
+        assert_eq!(challenges.len(), 1, "got {challenges:?}");
+        assert!(challenges[0].contains("algorithm=MD5"));
+    }
+
+    #[test]
+    fn the_configured_order_is_the_order_on_the_wire() {
+        // Preference order is the operator's, not a sort: a client takes the
+        // strongest it recognises, so the order is how an operator steers it.
+        let mut auth = make_auth();
+        auth.set_challenge_algorithms(vec![DigestAlgorithm::Sha256, DigestAlgorithm::Md5]);
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        assert_eq!(challenge_algorithms_of(&request), vec!["SHA-256", "MD5"]);
+    }
+
+    #[test]
+    fn every_challenge_in_the_set_carries_the_same_nonce() {
+        // The entries are alternatives for one challenge. A nonce minted per
+        // entry would leave the client's answer matching only the one it picked.
+        let auth = make_auth();
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        let nonces = challenge_nonces_of(&request);
+        assert_eq!(nonces.len(), 3);
+        assert!(
+            nonces.iter().all(|nonce| *nonce == nonces[0]),
+            "challenges disagree on the nonce: {nonces:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_configured_set_keeps_the_default_rather_than_challenging_with_nothing() {
+        // Belt to the config validator's braces. A 401 carrying no
+        // WWW-Authenticate is unanswerable, so it must not be reachable by any
+        // route, including a caller that did not go through config validation.
+        let mut auth = make_auth();
+        auth.set_challenge_algorithms(Vec::new());
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        assert_eq!(request_header_values(&request, "WWW-Authenticate").len(), 3);
+    }
+
+    #[test]
+    fn a_second_challenge_replaces_the_set_rather_than_stacking_onto_it() {
+        // A handler that challenges twice (a retry loop, or 401-then-407) emits
+        // one set, not two concatenated ones.
+        let mut auth = make_auth();
+        auth.set_challenge_algorithms(vec![DigestAlgorithm::Md5]);
+        let mut request = make_register_request();
+
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        assert!(!auth.challenge_www(&mut request, None).unwrap());
+        assert_eq!(request_header_values(&request, "WWW-Authenticate").len(), 1);
     }
 
     #[test]
