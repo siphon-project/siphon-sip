@@ -783,3 +783,92 @@ async fn a_callee_bye_between_its_ack_and_the_callers_2xx_is_held_for_the_caller
         "the caller's ACK releases its BYE"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connection() {
+    for (scheme, transport) in [
+        ("tcp", Transport::Tcp),
+        ("tls", Transport::Tls),
+        ("ws", Transport::WebSocket),
+        ("wss", Transport::WebSocketSecure),
+    ] {
+        let mut dispatcher = test_dispatcher();
+        dispatcher
+            .state
+            .advertised_addrs
+            .insert(transport, "203.0.113.10".to_string());
+        let (sender, outbound) = flume::unbounded();
+        let router = &dispatcher.state.outbound;
+        dispatcher.state.outbound = Arc::new(OutboundRouter {
+            udp: router.udp.clone(),
+            udp_by_local: router.udp_by_local.clone(),
+            tcp: sender.clone(),
+            tls: sender.clone(),
+            ws: sender.clone(),
+            wss: sender.clone(),
+            sctp: sender,
+        });
+        let (state, _, call_id) = Call::caller_on(dispatcher);
+        let flow = crate::script::api::registrar::PyFlow {
+            transport: scheme.to_string(),
+            source_addr: "198.51.100.20:42000".parse().unwrap(),
+            local_addr: "192.0.2.10:5061".parse().unwrap(),
+            connection_id: 73,
+        };
+        assert!(b2bua_send_b_leg_invite(
+            &call_id,
+            "sip:phone@198.51.100.20:42000",
+            None,
+            Some(&flow),
+            &[],
+            None,
+            None,
+            &caller_invite(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &state,
+        ));
+        let sent = outbound.try_recv().unwrap();
+        assert_eq!(sent.connection_id, ConnectionId(73));
+        assert_eq!(sent.destination, flow.source_addr);
+        assert_eq!(sent.source_local_addr, Some(flow.local_addr));
+        let invite = parse_sip_message_bytes(&sent.data).unwrap();
+        assert_eq!(
+            invite.headers.get("Contact").unwrap(),
+            &format!("<sip:203.0.113.10:5061;transport={scheme}>")
+        );
+        assert!(invite
+            .headers
+            .get("Via")
+            .unwrap()
+            .contains(" 203.0.113.10:5061;"));
+        let call = state.call_actors.get_call(&call_id).unwrap();
+        let bye = build_b2bua_bye(&call.b_legs[0], &state).unwrap();
+        assert!(bye
+            .headers
+            .get("Via")
+            .unwrap()
+            .contains(" 203.0.113.10:5061;"));
+        assert_eq!(bye.headers.get("Contact"), invite.headers.get("Contact"));
+    }
+}
+
+#[test]
+fn a_datagram_flow_keeps_its_protected_socket_even_with_an_advertised_address() {
+    let mut dispatcher = test_dispatcher();
+    dispatcher
+        .state
+        .advertised_addrs
+        .insert(Transport::Udp, "203.0.113.10".to_string());
+    assert_eq!(
+        b_leg_sent_by(
+            Some("192.0.2.10:6100".parse().unwrap()),
+            &dispatcher.state,
+            &Transport::Udp
+        ),
+        ("192.0.2.10".to_string(), 6100)
+    );
+}
