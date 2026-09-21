@@ -13,6 +13,7 @@ sdk/dist/
 sdk/*.egg-info/
 .claude/
 CLAUDE.md
+AGENTS.md
 
 # Private deployment configs
 

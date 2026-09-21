@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-09-21
+
 ### Added
 
 - **`POST /admin/registrants/refresh` and `POST /admin/gateways/refresh` apply a
@@ -81,6 +83,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   address, so it applies to `call.dial()`, `call.fork()` and an LCR route
   alike. A credential set in a script with `call.set_credentials()` still
   wins. Secrets are never rendered by `Debug` and never reach Python.
+
 - `proxy.subscribe_state.accept(request, expires=...)` accepts notifier-side
   SUBSCRIBE dialogs with a stable response/NOTIFY tag, refreshes existing state,
   and returns 481 for an unknown dialog. NOTIFY reuses the subscriber's received
@@ -157,6 +160,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `True` as well. `Contact.client_transport` persists it with the binding, and
   the CDR records the client's transport rather than the front-facing one.
   Mirrored in the SDK.
+
 - **`dial`, `record_start` and `record_stop` are typed verbs in all three
   control SDKs.** All three shipped server-side but were missing from the
   `SipVerb` enum the SDKs are built against, so none of them wrapped the verbs
@@ -170,6 +174,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   none of them. A target naming both, or neither, is refused before a frame goes
   out, as is a `next_hop` beside an AoR (the server drops it) and a direction,
   channel layout or strategy the server would reject.
+
 - **The CDR wire contract is a typed import in the Python SDK:
   `siphon_sdk.cdr.CallDetailRecord`.** A collector (FastAPI, a JSON-lines
   tailer, a billing importer) parses records with `from_dict()` / `from_json()`
@@ -182,6 +187,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   JSON, so a body model that validates against the declared fields drops them.
   `examples/cdr_collector.py` is a runnable collector, and the test harness's
   `get_cdr().typed_records` returns the same type a collector receives.
+
 ### Documentation
 
 - **The LCR reference is reachable from the API reference again, and now covers
@@ -222,6 +228,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it had already ended (RFC 3261 §13.2.2.4, §15). A BYE for a dialog whose
   re-INVITE answer is still being handled now waits for that ACK and follows
   it, bounded at 64×T1 for an answer that never gets one.
+
 - **A binding restored from a backend is no longer reaped at half its remaining
   life.** `StoredContact::to_contact` rebuilt the two fields that govern expiry
   from different clocks: `registered_at` was back-dated to the original
@@ -245,6 +252,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   passed. Entries written before age tracking, and any whose stored epoch is in
   the future, report a zero age and keep the remaining-seconds behaviour they
   had. A binding whose grant has genuinely ended is still dropped at restore.
+
 - **One `async def` handler that never settles no longer aborts the whole
   node.** Every inbound message becomes a job on the synchronous executor
   pool, and an async handler parks its worker for as long as its coroutine
@@ -313,6 +321,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   leaked at start-up to work around a closed-channel wakeup, leaving nothing
   able to fire it. It is now driven from the shutdown sequence itself, before
   draining begins.
+
 - **A gateway group added at run time is now health-probed, and a removed one
   stops being probed.** Probing was a single sweep over the groups present at
   start-up, so a group created later with `gateway.add_group()` was never
@@ -322,6 +331,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   one added after start-up begins probing immediately, a removed or replaced
   one has its prober aborted, and `probe.enabled: false` is honoured on a
   runtime group as it already was on a configured one.
+
 - **A CDR now records where the call was actually sent.** `destination_ip` was
   declared, serialized and documented, but the only thing that ever set it was
   a test — every record any deployment wrote carried an empty one. It is now
@@ -333,6 +343,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   answered when its 2xx arrives. Still empty when nothing was sent (the script
   answered locally, or a bare `cdr.write()` with `auto_emit` off, which is
   written before the request is routed).
+
 - **A `MEDIA` record carries the media-plane addresses the engine reports.**
   The native backend sends each leg's `remote_address`, `local_address`,
   `payload_type` and `egress_ssrc`; siphon parsed the summary and dropped all
@@ -340,6 +351,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   only egress address a media record carries, and not a duplicate of the call
   record's signalling `destination_ip`. Present on a relay-only leg, where the
   quality fields are not.
+
 - **Outbound messages go out in a fixed header order, with `Content-Length`
   last.** Header order used to be whatever order the code happened to touch the
   headers in. `set`/`set_all` hold a header's slot, but `remove` shifts the
