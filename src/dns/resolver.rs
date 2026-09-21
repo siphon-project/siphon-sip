@@ -14,6 +14,34 @@ pub struct ResolvedTarget {
     pub transport: Option<String>,
 }
 
+/// How long one DNS query may take per attempt.
+///
+/// Set explicitly rather than inherited: hickory reads `options timeout` from
+/// `resolv.conf` and falls back to **5 s**, which is longer than a SIP
+/// transaction can afford to spend on one of the up-to-four lookups a single
+/// resolve makes.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many times one query is retried before it is given up on.
+///
+/// `resolv.conf`'s default is 2, and so is this — pinned so the budget below
+/// is a property of siphon rather than of whatever the host happens to say.
+const QUERY_ATTEMPTS: usize = 2;
+
+/// The ceiling on a whole [`SipResolver::resolve`], fan-out included.
+///
+/// Per-query bounds alone do not bound a resolve: with no port and no
+/// transport hint, RFC 3263 has us try SRV `_sip._udp`, SRV `_sip._tcp`, then
+/// A, then AAAA — four sequential queries, so the per-query budget multiplies.
+/// Against a black-holed resolver that is the difference between ~6 s and
+/// ~40 s, and nothing above this call bounds it: the relay path resolves on a
+/// pool worker inside `handle_inbound`, and the script path resolves on an
+/// asyncio driver thread, where it stops every coroutine on that loop.
+///
+/// Sized to stay well inside RFC 3261 Timer B (32 s) so a resolve can never
+/// outlive the transaction it is for.
+const TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// SIP DNS resolver (RFC 3263).
 ///
 /// Wraps a `hickory-resolver` async resolver. Constructed once at startup and
@@ -21,14 +49,61 @@ pub struct ResolvedTarget {
 #[derive(Clone)]
 pub struct SipResolver {
     resolver: TokioResolver,
+    /// Ceiling on one `resolve`, including its fan-out. See [`TOTAL_BUDGET`].
+    total_budget: std::time::Duration,
 }
 
 impl SipResolver {
-    /// Create a resolver using system DNS configuration.
+    /// Create a resolver using system DNS configuration, bounded by siphon's
+    /// own query timeout, attempt cap and total budget.
     pub fn from_system() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_system_bounded(QUERY_TIMEOUT, QUERY_ATTEMPTS, TOTAL_BUDGET)
+    }
+
+    /// [`SipResolver::from_system`] with the bounds supplied, so a test can
+    /// drive the timeout path without waiting out the real budget.
+    pub fn from_system_bounded(
+        query_timeout: std::time::Duration,
+        attempts: usize,
+        total_budget: std::time::Duration,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // hickory 0.26: `ResolverBuilder::build` is now fallible.
-        let resolver = TokioResolver::builder_tokio()?.build()?;
-        Ok(Self { resolver })
+        let mut builder = TokioResolver::builder_tokio()?;
+        // Overwrite whatever `resolv.conf` supplied: an unbounded resolve is a
+        // siphon problem whatever the host thinks.
+        builder.options_mut().timeout = query_timeout;
+        builder.options_mut().attempts = attempts;
+        let resolver = builder.build()?;
+        Ok(Self {
+            resolver,
+            total_budget,
+        })
+    }
+
+    /// A resolver aimed at a nameserver that never answers, for proving the
+    /// budget bites. RFC 5737 TEST-NET-1 is reserved and unroutable, so the
+    /// query black-holes rather than depending on the host's real DNS.
+    #[cfg(test)]
+    fn unreachable_nameserver(total_budget: std::time::Duration) -> Self {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+        // The default config ships real public nameservers, and appending to
+        // those let one of them answer: the resolve returned in microseconds
+        // without ever reaching the budget this test exists to prove. Replace
+        // the list outright so the black hole is the only server.
+        let mut config = ResolverConfig::default();
+        config.name_servers = vec![NameServerConfig::udp(
+            "192.0.2.1".parse().expect("a literal address"),
+        )];
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().timeout = std::time::Duration::from_secs(2);
+        builder.options_mut().attempts = QUERY_ATTEMPTS;
+        Self {
+            resolver: builder.build().expect("a resolver over a literal server"),
+            total_budget,
+        }
     }
 
     /// Resolve a SIP target to one or more socket addresses.
@@ -38,6 +113,37 @@ impl SipResolver {
     /// - Explicit port → A/AAAA lookup only (SRV records define their own port)
     /// - No port → SRV lookup first, fallback to A/AAAA on default port 5060/5061
     pub async fn resolve(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        scheme: &str,
+        transport_hint: Option<&str>,
+    ) -> Vec<ResolvedTarget> {
+        // The whole resolve, not each query: the SRV-then-A-then-AAAA fan-out
+        // below is sequential, so per-query bounds multiply. An expiry returns
+        // no targets, which every caller already handles as "unresolvable" —
+        // the caller a stalled resolve would otherwise hold is a pool worker
+        // or an asyncio driver, and holding either is worse than failing the
+        // one request.
+        match tokio::time::timeout(
+            self.total_budget,
+            self.resolve_inner(host, port, scheme, transport_hint),
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(_elapsed) => {
+                warn!(
+                    host = %host,
+                    budget_secs = self.total_budget.as_secs(),
+                    "DNS resolution exceeded its budget; treating the target as unresolvable"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    async fn resolve_inner(
         &self,
         host: &str,
         port: Option<u16>,
@@ -353,6 +459,42 @@ fn random_u32_inclusive(max: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// A nameserver that never answers must not hold the caller past the
+    /// budget.
+    ///
+    /// Unbounded, this resolve costs `attempts x timeout` per query across up
+    /// to four sequential queries — ~40 s on hickory's inherited defaults. The
+    /// caller it holds is a pool worker on the relay path, or an asyncio
+    /// driver on the script path, and neither can afford that. An expiry is
+    /// reported as "no targets", which every caller already treats as
+    /// unresolvable.
+    ///
+    /// Measured with the budget bypassed, this same resolve takes **18 s** —
+    /// and that is already with the per-query timeout tightened; on hickory's
+    /// inherited 5 s default it is worse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_black_holed_nameserver_gives_the_caller_back_at_the_budget() {
+        let budget = std::time::Duration::from_secs(1);
+        let resolver = SipResolver::unreachable_nameserver(budget);
+
+        let started = std::time::Instant::now();
+        // No port and no transport hint: the full SRV-then-A-then-AAAA
+        // fan-out, which is the shape the per-query bound does not cover.
+        let results = resolver
+            .resolve("sip.blackhole-probe.test", None, "sip", None)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            results.is_empty(),
+            "a resolve that never answered must not report targets"
+        );
+        assert!(
+            elapsed < budget * 4,
+            "the caller was held for {elapsed:?}, far past the {budget:?} budget"
+        );
+    }
 
     #[tokio::test]
     async fn resolve_numeric_ipv4() {

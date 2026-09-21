@@ -41,6 +41,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - **The control SDKs can ask for a media profile on `dial` at all.** `profile`
   was accepted on the wire but absent from the Rust, Python and TypeScript
   `DialOptions`, so no SDK could send it.
+### Fixed
+
+- **A DNS lookup can no longer hold a worker or an asyncio loop for tens of
+  seconds.** `SipResolver` set no `ResolverOpts`, so its bounds came from
+  `resolv.conf` and hickory's defaults — 5 s per attempt, 2 attempts. That is
+  per *query*, and one `resolve()` with no port and no transport hint makes up
+  to four sequential ones (SRV `_sip._udp`, SRV `_sip._tcp`, A, AAAA), so
+  nothing bounded the call as a whole.
+
+  siphon now sets the per-query timeout and attempt cap itself, and bounds the
+  whole resolve, fan-out included, at 6 s — inside RFC 3261 Timer B, so a
+  resolve can never outlive the transaction it is for. An expiry reports no
+  targets, which every caller already handles as unresolvable.
+
+  It matters because of who is waiting: the relay, fork and B2BUA-dial paths
+  resolve on an executor worker inside `handle_inbound`, and the script paths
+  resolve on an asyncio driver thread, where a parked loop stops every
+  coroutine on it, including calls that never touched DNS. Measured against an
+  unresponsive nameserver, one resolve took **18 s** before this change.
 
 ## [1.9.1] — 2026-09-21
 
