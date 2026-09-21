@@ -88,6 +88,42 @@ pub fn lcr_injectable_headers(route: &crate::lcr::Route, call_id: &str) -> Vec<(
         .collect()
 }
 
+/// Re-apply a controller-issued `dial`'s shaping to an attempt built from the
+/// stored A-leg INVITE.
+///
+/// That INVITE deliberately keeps the caller's own offer and own identity — a
+/// failed dial still has to be answerable into voicemail, and the caller's own
+/// 2xx has to echo its From — so an attempt built straight from it would
+/// present the caller's extension to the trunk and hand the next phone the very
+/// SDP the media profile exists to replace. `None` for every call that is not a
+/// shaped control dial, which is every LCR and `route` attempt.
+fn control_dial_shaping(
+    call_id: &str,
+    original_request: &SipMessage,
+    state: &DispatcherState,
+) -> Option<SipMessage> {
+    let (from_header, offer) = state.call_actors.get_call(call_id).map(|call| {
+        (
+            call.control_dial_from_header.clone(),
+            call.control_dial_offer.clone(),
+        )
+    })?;
+    if from_header.is_none() && offer.is_none() {
+        return None;
+    }
+    let mut shaped = original_request.clone();
+    if let Some(from_header) = from_header {
+        shaped.headers.set("From", from_header);
+    }
+    if let Some(offer) = offer {
+        shaped
+            .headers
+            .set("Content-Length", offer.len().to_string());
+        shaped.body = offer;
+    }
+    Some(shaped)
+}
+
 /// The inbound flow an INVITE arrived on, for `call.flow`.
 ///
 /// Built straight off the transport frame, so the connection id is the accepted
@@ -350,6 +386,12 @@ pub fn b2bua_advance_route_with_numbers(
     state: &DispatcherState,
     numbers: &crate::script::api::numbers::NumberRuntime,
 ) -> RouteAdvance {
+    // A controller-issued `dial` shaped its first attempt on a template of its
+    // own; the attempts after it arrive here built from the stored A-leg
+    // INVITE, so they have to be re-shaped or the hunt would change identity
+    // and media path halfway down its target list.
+    let shaped = control_dial_shaping(call_id, original_request, state);
+    let original_request = shaped.as_ref().unwrap_or(original_request);
     let send_socket_str = state.call_actors.route_send_socket(call_id);
     let send_socket = state.resolve_send_socket(send_socket_str.as_deref());
     let a_leg_ruri = match &original_request.start_line {

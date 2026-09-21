@@ -118,17 +118,19 @@ fn the_public_surface_is_pinned() {
             .count();
     }
 
-    // 46: the 39 the 1.9.0 split preserved, plus `b2bua_progress_call_anchored`
+    // 47: the 39 the 1.9.0 split preserved, plus `b2bua_progress_call_anchored`
     // and `b2bua_early_media_sdp` for anchored early media, plus the 4
     // crate-internal control-adapter entry points the dial verb needs, plus the
     // crate-internal `b2bua_set_session_timer` `call.answer()` needs to negotiate
-    // a session timer set in the same handler. All additive, so a
-    // minor-compatible change — recorded here because that is the tripwire.
+    // a session timer set in the same handler, plus the crate-internal
+    // `DialShaping` carrying the dial verb's identity and media arguments. All
+    // additive, so a minor-compatible change — recorded here because that is the
+    // tripwire.
     assert_eq!(
         declared + re_exported,
-        46,
+        47,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 46. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 47. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

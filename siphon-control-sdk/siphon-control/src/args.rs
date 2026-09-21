@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 
 use siphon_control_client::proto::sip::PeerHangupPolicy;
 use siphon_control_client::sip::{
-    DialStrategy, DialTarget, OriginateMedia, PlaySource, RecordChannels, RecordDirection,
-    RouteTarget, SessionRefresher, SessionTimer,
+    DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource, RecordChannels,
+    RecordDirection, RouteTarget, SessionRefresher, SessionTimer,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -134,6 +134,23 @@ fn optional_string(dict: &Bound<'_, pyo3::types::PyDict>, key: &str) -> PyResult
     match dict.get_item(key)? {
         Some(value) if !value.is_none() => Ok(Some(value.extract()?)),
         _ => Ok(None),
+    }
+}
+
+/// Parse a `privacy=` argument. Refused here rather than defaulted: guessing at
+/// a privacy setting is how identities leak, and "I asked for restricted and got
+/// presented" is not something the wire tells you afterwards.
+pub(crate) fn extract_privacy(
+    verb: &str,
+    privacy: Option<String>,
+) -> PyResult<Option<OriginatePrivacy>> {
+    match privacy.as_deref() {
+        None => Ok(None),
+        Some("allowed") => Ok(Some(OriginatePrivacy::Allowed)),
+        Some("restricted") => Ok(Some(OriginatePrivacy::Restricted)),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "{verb} privacy must be \"allowed\" or \"restricted\", not {other:?}"
+        ))),
     }
 }
 

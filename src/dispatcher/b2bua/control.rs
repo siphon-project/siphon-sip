@@ -746,6 +746,122 @@ pub struct DialTarget {
     pub headers: std::collections::HashMap<String, String>,
 }
 
+/// How a controller-issued `dial` presents itself and anchors its media.
+///
+/// Every field applies to the whole dial: each branch of a fork and each
+/// attempt of a sequential hunt, not just the first one out.
+#[derive(Debug, Clone, Default)]
+pub struct DialShaping {
+    /// Media profile to anchor both legs through. `None` passes the caller's
+    /// own SDP to the phones and lets them negotiate with the caller directly.
+    pub profile: Option<String>,
+    /// Calling identity — the From URI (RFC 3261 §8.1.1.3).
+    ///
+    /// Without it a B-leg presents the caller's own From, which on a call out
+    /// to a trunk is the internal extension. A carrier that looks its account
+    /// up by the From user does not recognise that, so it challenges the INVITE
+    /// and keeps challenging however correct the digest is.
+    pub from: Option<String>,
+    /// From display name. An empty string removes the caller's rather than
+    /// presenting an empty one.
+    pub from_display: Option<String>,
+    /// `P-Asserted-Identity` for a trusted next hop (RFC 3325 §9.1). Injected
+    /// after the header policy, so a preset that strips `P-*` at a trust
+    /// boundary cannot silently drop an identity the controller named.
+    pub p_asserted_identity: Option<String>,
+    /// Calling-identity presentation (RFC 3323 §4.1 / TS 24.607). `Restricted`
+    /// anonymises From and asserts `Privacy: id`, keeping the real identity in
+    /// `P-Asserted-Identity` for the trusted next hop.
+    pub privacy: Option<crate::sip::privacy::CallerIdPresentation>,
+}
+
+/// The `From` a dial's identity arguments shaped.
+struct ShapedFrom {
+    /// The whole header value, dialog tag included.
+    header: String,
+    /// The host to pin, when `from` named one.
+    host: Option<String>,
+}
+
+/// Shape the dial template's `From` from `shaping`.
+///
+/// `From` is framework-managed on a B-leg — the builder swaps in a fresh dialog
+/// tag and, for topology hiding, rewrites the host to siphon's own advertised
+/// address — so it cannot be set with a plain header injection: one written
+/// without its tag drops the mandatory dialog tag (RFC 3261 §8.1.1.3), and the
+/// host would be overwritten after the fact anyway. This goes through
+/// [`NameAddr`], which round-trips the tag, and reports the host to pin the way
+/// `call.set_from_host()` pins it.
+fn apply_dial_identity(
+    template: &mut SipMessage,
+    shaping: &DialShaping,
+) -> Result<Option<ShapedFrom>, String> {
+    if shaping.from.is_none() && shaping.from_display.is_none() {
+        return Ok(None);
+    }
+    let raw = template
+        .headers
+        .get("From")
+        .or_else(|| template.headers.get("f"))
+        .cloned()
+        .ok_or("the call has no From header to present an identity on")?;
+    let mut nameaddr = crate::sip::headers::nameaddr::NameAddr::parse(&raw)
+        .map_err(|error| format!("cannot parse the call's From header: {error}"))?;
+    let mut host = None;
+    if let Some(from) = shaping.from.as_deref() {
+        let uri = parse_uri_standalone(from)
+            .map_err(|error| format!("dial from is not a SIP URI: {error}"))?;
+        host = Some(uri.host.clone());
+        nameaddr.uri = uri;
+    }
+    match shaping.from_display.as_deref() {
+        Some(display) => {
+            nameaddr.display_name = Some(display.to_string()).filter(|value| !value.is_empty());
+        }
+        // A display name is part of an identity. Keeping the caller's beside a
+        // number the controller replaced would present "203" next to the
+        // company's published number — the extension the `from` exists to hide.
+        None if shaping.from.is_some() => nameaddr.display_name = None,
+        None => {}
+    }
+    let header = nameaddr.to_string();
+    template.headers.set("From", header.clone());
+    Ok(Some(ShapedFrom { header, host }))
+}
+
+/// The command headers with `P-Asserted-Identity` on them.
+///
+/// It rides with the per-branch headers because those are injected *after* the
+/// header policy: an identity the controller named explicitly outranks a
+/// preset's `P-*` strip set, the same way a script's `set_header` does. Any
+/// asserted identity already in the command's own headers is replaced, so the
+/// two spellings cannot both reach the wire in an undefined order.
+fn dial_headers_with_asserted_identity(
+    extra_headers: &[(String, String)],
+    p_asserted_identity: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(identity) = p_asserted_identity else {
+        return extra_headers.to_vec();
+    };
+    let mut headers: Vec<(String, String)> = extra_headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("P-Asserted-Identity"))
+        .cloned()
+        .collect();
+    headers.push(("P-Asserted-Identity".to_string(), identity.to_string()));
+    headers
+}
+
+/// The config spelling of a presentation, for the failover engine's routes.
+const fn presentation_token(
+    presentation: crate::sip::privacy::CallerIdPresentation,
+) -> &'static str {
+    match presentation {
+        crate::sip::privacy::CallerIdPresentation::Allowed => "allowed",
+        crate::sip::privacy::CallerIdPresentation::Restricted => "restricted",
+    }
+}
+
 /// Why a `dial` could not be started.
 #[derive(Debug)]
 pub enum DialError {
@@ -759,6 +875,8 @@ pub enum DialError {
     NoContacts(String),
     /// The requested media path cannot be allocated safely.
     Media(String),
+    /// An identity argument siphon cannot put on the wire.
+    InvalidIdentity(String),
 }
 
 impl std::fmt::Display for DialError {
@@ -776,6 +894,7 @@ impl std::fmt::Display for DialError {
                 write!(formatter, "no registered contact for {aor}")
             }
             DialError::Media(reason) => write!(formatter, "{reason}"),
+            DialError::InvalidIdentity(reason) => write!(formatter, "{reason}"),
         }
     }
 }
@@ -845,7 +964,7 @@ pub fn b2bua_dial_call(
     strategy: &str,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
-    profile: Option<&str>,
+    shaping: &DialShaping,
 ) -> Result<bool, DialError> {
     let parallel = if strategy.eq_ignore_ascii_case("parallel") {
         true
@@ -871,7 +990,7 @@ pub fn b2bua_dial_call(
         parallel,
         timeout_secs,
         extra_headers,
-        profile,
+        shaping,
         &control.state,
     )
 }
@@ -884,7 +1003,7 @@ pub(crate) fn b2bua_dial_call_with_state(
     parallel: bool,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
-    profile: Option<&str>,
+    shaping: &DialShaping,
     state: &DispatcherState,
 ) -> Result<bool, DialError> {
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
@@ -950,14 +1069,22 @@ pub(crate) fn b2bua_dial_call_with_state(
         return Ok(true);
     }
 
-    if let Some(profile) = profile {
-        // A two-party allocation cannot safely represent competing fork
-        // answers. Explicitly refuse until each fork has its own media state.
-        if targets.len() != 1 {
-            return Err(DialError::Media(
-                "dial profile requires exactly one resolved contact".into(),
-            ));
+    // The identity this dial presents, applied to the template before anything
+    // is allocated or sent, and recorded on the call so the branches a
+    // sequential hunt dials later carry it too.
+    if let Some(shaped) =
+        apply_dial_identity(&mut template, shaping).map_err(DialError::InvalidIdentity)?
+    {
+        let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) else {
+            return Ok(false);
+        };
+        call.control_dial_from_header = Some(shaped.header);
+        if let Some(host) = shaped.host {
+            call.from_host_override = Some(host);
         }
+    }
+
+    if let Some(profile) = shaping.profile.as_deref() {
         let source_ip = state
             .call_actors
             .get_call(&internal_call_id)
@@ -965,13 +1092,20 @@ pub(crate) fn b2bua_dial_call_with_state(
             .ok_or_else(|| DialError::Media("call is gone".into()))?;
         template = control_dial_media_offer(&template, source_ip, profile, state)
             .map_err(DialError::Media)?;
-        if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
-            call.control_dial_media = true;
-        } else {
+        let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) else {
             release_failed_call_media(sip_call_id, state);
             return Ok(false);
-        }
+        };
+        call.control_dial_media = true;
+        // One allocation serves every branch: they are all offered this body,
+        // and the attempts a sequential hunt makes later are rebuilt from the
+        // stored A-leg INVITE, which keeps the caller's own offer so a failed
+        // dial is still answerable into voicemail.
+        call.control_dial_offer = Some(template.body.clone());
     }
+
+    let extra_headers =
+        dial_headers_with_asserted_identity(extra_headers, shaping.p_asserted_identity.as_deref());
 
     // The controller has acted, so the handoff deadline no longer applies: what
     // bounds the call now is the dial's own timeout.
@@ -980,15 +1114,23 @@ pub(crate) fn b2bua_dial_call_with_state(
     // from `route`.
     state.call_actors.set_control_dial(&internal_call_id, true);
 
-    let sent = if parallel || profile.is_some() {
-        dial_parallel(&internal_call_id, &targets, extra_headers, &template, state)
+    let sent = if parallel {
+        dial_parallel(
+            &internal_call_id,
+            &targets,
+            &extra_headers,
+            &template,
+            shaping.privacy,
+            state,
+        )
     } else {
         dial_sequential(
             &internal_call_id,
             targets,
             timeout_secs,
-            extra_headers,
+            &extra_headers,
             &template,
+            shaping.privacy,
             state,
         )
     };
@@ -1028,6 +1170,7 @@ fn dial_parallel(
     targets: &[DialTarget],
     extra_headers: &[(String, String)],
     template: &SipMessage,
+    privacy: Option<crate::sip::privacy::CallerIdPresentation>,
     state: &DispatcherState,
 ) -> usize {
     let mut sent = 0usize;
@@ -1045,7 +1188,7 @@ fn dial_parallel(
             None,
             None,
             None,
-            None,
+            privacy,
             &headers,
             state,
         ) {
@@ -1065,6 +1208,7 @@ fn sequential_dial_routes(
     targets: Vec<DialTarget>,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
+    privacy: Option<crate::sip::privacy::CallerIdPresentation>,
 ) -> Vec<crate::lcr::Route> {
     targets
         .into_iter()
@@ -1076,6 +1220,11 @@ fn sequential_dial_routes(
                 .into_iter()
                 .collect(),
             reroute_after_progress: true,
+            // The failover engine applies this per attempt, after the number
+            // policy, which is where CLIR belongs: the dial's presentation has
+            // to survive every hop of the hunt, not just the first.
+            caller_id_presentation: privacy
+                .map(|presentation| presentation_token(presentation).to_string()),
             ..Default::default()
         })
         .collect()
@@ -1090,9 +1239,10 @@ fn dial_sequential(
     timeout_secs: u32,
     extra_headers: &[(String, String)],
     template: &SipMessage,
+    privacy: Option<crate::sip::privacy::CallerIdPresentation>,
     state: &DispatcherState,
 ) -> usize {
-    let routes = sequential_dial_routes(targets, timeout_secs, extra_headers);
+    let routes = sequential_dial_routes(targets, timeout_secs, extra_headers, privacy);
     state.call_actors.start_route_sequence(
         call_id,
         crate::b2bua::actor::RouteSequenceState {
@@ -1227,14 +1377,211 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let routes =
-            sequential_dial_routes(targets, 20, &[("X-Hunt".to_string(), "desk".to_string())]);
+        let routes = sequential_dial_routes(
+            targets,
+            20,
+            &[("X-Hunt".to_string(), "desk".to_string())],
+            None,
+        );
         assert_eq!(routes.len(), 2);
         assert!(routes.iter().all(|route| route.reroute_after_progress));
         assert!(routes.iter().all(|route| route.timeout_secs == Some(20)));
         assert_eq!(
             routes[0].headers.get("X-Hunt").map(String::as_str),
             Some("desk")
+        );
+    }
+
+    /// CLIR has to survive the whole hunt, not just its first attempt, so the
+    /// presentation rides on every route the failover engine takes.
+    #[test]
+    fn a_sequential_dial_carries_its_presentation_on_every_route() {
+        let targets = ["sip:1001@pbx.example.com", "sip:1002@pbx.example.com"]
+            .into_iter()
+            .map(|uri| DialTarget {
+                uri: uri.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let routes = sequential_dial_routes(
+            targets,
+            20,
+            &[],
+            Some(crate::sip::privacy::CallerIdPresentation::Restricted),
+        );
+        assert!(routes
+            .iter()
+            .all(|route| route.caller_id_presentation.as_deref() == Some("restricted")));
+
+        let unspecified = sequential_dial_routes(
+            vec![DialTarget {
+                uri: "sip:1001@pbx.example.com".to_string(),
+                ..Default::default()
+            }],
+            20,
+            &[],
+            None,
+        );
+        assert!(unspecified[0].caller_id_presentation.is_none());
+    }
+
+    fn from_template(from: &str) -> SipMessage {
+        parse_sip_message_bytes(
+            format!(
+                concat!(
+                    "INVITE sip:1001@pbx.example.com SIP/2.0\r\n",
+                    "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-identity\r\n",
+                    "From: {from}\r\n",
+                    "To: <sip:1001@pbx.example.com>\r\n",
+                    "Call-ID: identity@192.0.2.10\r\n",
+                    "CSeq: 1 INVITE\r\n",
+                    "Content-Length: 0\r\n",
+                    "\r\n",
+                ),
+                from = from
+            )
+            .as_bytes(),
+        )
+        .expect("the template parses")
+    }
+
+    /// The dialog tag is the thing a `From` rewrite must never drop (RFC 3261
+    /// §8.1.1.3) — a `From` written without it breaks every in-dialog request
+    /// that follows, and only on the ACK, long after the rewrite looked fine.
+    #[test]
+    fn a_presented_identity_keeps_the_dialog_tag_and_reports_the_host_to_pin() {
+        let mut template = from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag");
+        let shaped = apply_dial_identity(
+            &mut template,
+            &DialShaping {
+                from: Some("sip:15550100042@trunk.example.com".to_string()),
+                from_display: Some("Example Ltd".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("a well-formed URI")
+        .expect("something was shaped");
+        assert_eq!(
+            shaped.header,
+            "\"Example Ltd\" <sip:15550100042@trunk.example.com>;tag=caller-tag"
+        );
+        assert_eq!(shaped.host.as_deref(), Some("trunk.example.com"));
+        assert_eq!(
+            template.headers.get("From").map(String::as_str),
+            Some(shaped.header.as_str())
+        );
+    }
+
+    /// Replacing the number while keeping "203" beside it would present the
+    /// extension the `from` exists to hide.
+    #[test]
+    fn a_presented_identity_without_a_display_name_drops_the_callers() {
+        let mut template = from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag");
+        let shaped = apply_dial_identity(
+            &mut template,
+            &DialShaping {
+                from: Some("sip:15550100042@trunk.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("a well-formed URI")
+        .expect("something was shaped");
+        assert_eq!(
+            shaped.header,
+            "<sip:15550100042@trunk.example.com>;tag=caller-tag"
+        );
+    }
+
+    /// An empty display name removes the caller's rather than presenting an
+    /// empty one, and leaves the URI alone.
+    #[test]
+    fn an_empty_display_name_removes_the_callers_and_keeps_the_uri() {
+        let mut template = from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag");
+        let shaped = apply_dial_identity(
+            &mut template,
+            &DialShaping {
+                from_display: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .expect("no URI to parse")
+        .expect("something was shaped");
+        assert_eq!(shaped.header, "<sip:203@pbx.example.com>;tag=caller-tag");
+        assert!(
+            shaped.host.is_none(),
+            "no host was named, so none is pinned"
+        );
+    }
+
+    /// A dial that names no identity leaves the template exactly as it found
+    /// it — every unshaped dial still presents the caller.
+    #[test]
+    fn a_dial_that_names_no_identity_shapes_nothing() {
+        let mut template = from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag");
+        let before = template.headers.get("From").cloned();
+        assert!(apply_dial_identity(&mut template, &DialShaping::default())
+            .expect("nothing to parse")
+            .is_none());
+        assert_eq!(template.headers.get("From").cloned(), before);
+    }
+
+    /// A URI siphon cannot put on the wire is an error, and the template is
+    /// left alone: the caller is still parked and the controller still owns the
+    /// decision, which beats ringing a phone under a broken identity.
+    #[test]
+    fn an_unparseable_presented_identity_is_an_error_that_changes_nothing() {
+        let mut template = from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag");
+        let before = template.headers.get("From").cloned();
+        assert!(apply_dial_identity(
+            &mut template,
+            &DialShaping {
+                from: Some("not a uri".to_string()),
+                from_display: Some("Example Ltd".to_string()),
+                ..Default::default()
+            },
+        )
+        .is_err());
+        assert_eq!(template.headers.get("From").cloned(), before);
+    }
+
+    /// The asserted identity the controller named replaces one the command's
+    /// own headers carried, whatever case that one was spelled in — two
+    /// spellings of a single-value header reaching the wire in an order a
+    /// HashMap decides is not a thing to leave to chance (RFC 3325 §9.1).
+    #[test]
+    fn a_named_asserted_identity_replaces_one_in_the_command_headers() {
+        let headers = dial_headers_with_asserted_identity(
+            &[
+                ("X-Account".to_string(), "42".to_string()),
+                (
+                    "p-asserted-identity".to_string(),
+                    "<sip:203@pbx.example.com>".to_string(),
+                ),
+            ],
+            Some("<sip:15550100042@trunk.example.com>"),
+        );
+        assert_eq!(
+            headers,
+            vec![
+                ("X-Account".to_string(), "42".to_string()),
+                (
+                    "P-Asserted-Identity".to_string(),
+                    "<sip:15550100042@trunk.example.com>".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Naming none leaves the command's headers exactly as they were.
+    #[test]
+    fn no_named_asserted_identity_leaves_the_command_headers_alone() {
+        let given = [(
+            "p-asserted-identity".to_string(),
+            "<sip:203@pbx.example.com>".to_string(),
+        )];
+        assert_eq!(
+            dial_headers_with_asserted_identity(&given, None),
+            given.to_vec()
         );
     }
 }

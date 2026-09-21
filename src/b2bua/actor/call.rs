@@ -431,6 +431,25 @@ pub struct CallActor {
     pub control_dial: bool,
     /// The controller's dial owns an offer/answer media allocation.
     pub control_dial_media: bool,
+    /// The anchored offer that allocation rewrote, kept for the attempts a
+    /// sequential dial makes after the first.
+    ///
+    /// The stored A-leg INVITE deliberately keeps the caller's *own* offer so a
+    /// failed dial can still be answered into voicemail, so it is not the body
+    /// a later attempt may be built from: handing the next phone the caller's
+    /// raw SDP would route its audio around the relay the profile asked for.
+    pub control_dial_offer: Option<Vec<u8>>,
+    /// The `From` a controller-issued `dial` asked this call to present, kept
+    /// for the same reason as [`Self::control_dial_offer`]: the stored A-leg
+    /// INVITE holds the caller's own identity (the caller's 2xx has to echo
+    /// it), so without this only the first attempt of a sequential hunt would
+    /// carry what the controller asked for.
+    ///
+    /// It outlives the dial on purpose. "Present this call as +15550100" is a
+    /// statement about the call, so a second `dial` on the same channel — the
+    /// voicemail box, a retry on another trunk — presents it too unless that
+    /// dial names a different one.
+    pub control_dial_from_header: Option<String>,
     /// Control-loss policy for a handed-over call ("hangup"/"continue"/
     /// "fallback"). Owned by the control plane on owner disconnect; stored here
     /// for observability.
@@ -555,6 +574,8 @@ impl CallActor {
             control_app: None,
             control_dial: false,
             control_dial_media: false,
+            control_dial_offer: None,
+            control_dial_from_header: None,
             on_control_loss: None,
             handoff_pending: false,
             originated: false,

@@ -78,15 +78,15 @@ use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
 use siphon_control_client::proto::ControlErrorCode;
-use siphon_control_client::sip::{
-    Call as RustCall, OriginateOptions, OriginatePrivacy, SipClient, SipServer,
-};
+use siphon_control_client::sip::{Call as RustCall, OriginateOptions, SipClient, SipServer};
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
 
 mod args;
 mod call;
 
-use args::{extract_headers, extract_session_timer, extract_string_pairs, originate_media};
+use args::{
+    extract_headers, extract_privacy, extract_session_timer, extract_string_pairs, originate_media,
+};
 use call::Call;
 
 // ---------------------------------------------------------------------------
@@ -375,16 +375,7 @@ impl ControlClient {
         session_timer: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let plan = originate_media(media, profile, ws_uri, sdp, body, content_type)?;
-        let privacy = match privacy.as_deref() {
-            None => None,
-            Some("allowed") => Some(OriginatePrivacy::Allowed),
-            Some("restricted") => Some(OriginatePrivacy::Restricted),
-            Some(other) => {
-                return Err(PyValueError::new_err(format!(
-                    "originate privacy must be \"allowed\" or \"restricted\", not {other:?}"
-                )))
-            }
-        };
+        let privacy = extract_privacy("originate", privacy)?;
         let options = OriginateOptions {
             from: from_uri,
             from_display,
