@@ -8,6 +8,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **TLS on the admin listener (`admin.tls`).** The refresh endpoints are the
+  right mechanism — they turn `refresh_secs` into a floor rather than the only
+  lever — but the listener they sit on could not be shown to the controller that
+  wants to call them: the bearer token crossed the wire in the clear on every
+  call, and so did everything the API returns, the registration list (number,
+  contact address, expiry) and the live call list among it. The answer was an
+  ssh tunnel, and the controller did not get to push at all.
+
+  `admin.tls` takes the same block the SIP listeners do, hot reload included, so
+  a certificate renewed under a running process is served by the next handshake
+  and cert-manager or certbot needs no restart. `verify_client` + `client_ca`
+  make it mutual, which is the stronger answer for a machine-to-machine caller
+  than a bearer token on its own. An unreadable certificate or key fails the
+  **config load** naming `admin.tls`, rather than binding a listener that looks
+  healthy and fails every handshake. Unset leaves the listener plaintext,
+  exactly as before.
+
 - **The kernel firewall now keeps a gateway allow set, so a carrier provisioned
   at run time is let *in* as well as dialed out.** Where carriers authenticate
   by source address there is no registration and no outbound digest, so the
@@ -53,6 +70,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   Turn the whole thing off with `security.firewall.gateway_set: false`.
 
 ### Changed
+
+- **`admin.auth.protect_reads: true` no longer costs you the dashboard.** The
+  UI shell is now served unauthenticated and every byte of data stays behind the
+  token. The SPA fallback is registered below the auth layer, so with reads
+  protected the dashboard's own assets answered `401` and it could never
+  bootstrap far enough to ask for a token — which forced `protect_reads: false`
+  on any node that wanted a UI, and left the registration list and the live call
+  list readable to whatever the admin ACL admitted, with no token at all.
+
+  The exemption is a `GET`/`HEAD` whose path is under neither `/admin` nor
+  `/metrics`, which is exactly the set that falls through to the SPA handler, so
+  it cannot reach a data route: every one of those is `/metrics` or `/admin/*`.
+  `/admin/logs`, `/admin/capture` and `/admin/search` stay always-gated and are
+  still refused outright when no token is configured. The dashboard already held
+  its token in `sessionStorage` and rendered "locked" rather than "failed" on a
+  `401`, so it loads, prompts, and works.
 
 - **A gateway group with `probe.enabled: false` is re-resolved every 60 seconds
   instead of only at start-up.** Its destinations were resolved once at

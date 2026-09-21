@@ -21,7 +21,9 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 
 mod refresh;
+mod serve;
 use refresh::{gateways_refresh_handler, registrants_refresh_handler};
+pub use serve::serve;
 
 use crate::config::CorsConfig;
 
@@ -55,6 +57,11 @@ pub struct AdminState {
     /// a recompile and report the error. `None` in tests and on a node with no
     /// script.
     pub script_engine: Option<Arc<crate::script::engine::ScriptEngine>>,
+    /// Whether the embedded dashboard is served from this listener. Set by
+    /// [`router`] from its own argument rather than by each caller, so the
+    /// auth layer and the route table can never disagree about it. Read only to
+    /// decide whether the UI shell is exempt from the bearer gate.
+    pub ui_enabled: bool,
 }
 
 /// Which optional subsystems are configured on this node.
@@ -110,64 +117,6 @@ impl AdminFeatures {
         }
     }
 }
-
-/// Start the HTTP admin API server.
-///
-/// `cors` optionally attaches an `Access-Control-Allow-Origin` policy so a
-/// browser dashboard served from another origin can `fetch()` the admin API
-/// (and the `/metrics` it also serves). `None` = no CORS headers.
-///
-/// `ui_enabled` serves the embedded web dashboard at `/` (and its assets),
-/// same-origin with the API. It only has an effect on a binary built with the
-/// `ui` cargo feature; without that feature a `true` here is a loud warning and
-/// nothing is served.
-pub async fn serve(
-    listen_addr: SocketAddr,
-    state: AdminState,
-    cors: Option<CorsConfig>,
-    ui_enabled: bool,
-) {
-    #[cfg(not(feature = "ui"))]
-    if ui_enabled {
-        tracing::warn!(
-            "admin.ui.enabled is set but this binary was built without the `ui` \
-             feature; no dashboard will be served (rebuild with --features ui)"
-        );
-    }
-
-    #[cfg(feature = "ui")]
-    if ui_enabled {
-        tracing::warn!(
-            "admin web UI enabled — this is an EXPERIMENTAL feature and may change \
-             or be removed in a future release"
-        );
-    }
-
-    let app = router(state, cors.as_ref(), ui_enabled);
-
-    info!("Admin API listening on {}", listen_addr);
-
-    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("Failed to bind admin API on {}: {}", listen_addr, error);
-            return;
-        }
-    };
-
-    // `into_make_service_with_connect_info` so the auth layer can attribute a
-    // failed token to a source address and feed the auto-ban, the way the
-    // control listener does.
-    if let Err(error) = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    {
-        error!("Admin API server error: {}", error);
-    }
-}
-
 /// Build the router (also used by tests without binding a port).
 ///
 /// Layer order (outermost first): CORS → bearer auth → routes. CORS is
@@ -175,7 +124,8 @@ pub async fn serve(
 /// `Access-Control-Allow-Origin` echo (else the browser hides the body from the
 /// dashboard). The auth layer gates mutating routes (and reads when
 /// `protect_reads`) on the configured bearer token.
-fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Router {
+pub(super) fn router(mut state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Router {
+    state.ui_enabled = ui_enabled;
     let base = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/metrics.json", get(metrics_json_handler))
@@ -269,7 +219,27 @@ async fn require_admin_auth(
 ) -> Response {
     let method = request.method();
     let is_read = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
-    let sensitive = is_sensitive_path(request.uri().path());
+    let path = request.uri().path().to_string();
+    let sensitive = is_sensitive_path(&path);
+
+    // The dashboard *shell* is not data, and serving it behind the token is
+    // what forced `protect_reads: false` on every node that wanted a UI: the
+    // SPA fallback is registered below this layer, so its own assets 401 and it
+    // can never bootstrap far enough to ask for a token. The cost was that
+    // whatever the admin ACL admits could read the registration list (number,
+    // contact address, expiry) and the live call list with no token at all.
+    //
+    // A `GET`/`HEAD` whose path is under neither `/admin` nor `/metrics` is
+    // exactly the set that falls through to the SPA handler, so this exemption
+    // cannot reach a data route — every one of those is `/metrics` or
+    // `/admin/*`, `is_sensitive_path` included. The dashboard holds its token
+    // in `sessionStorage`, attaches it to every fetch and already renders
+    // "locked" rather than "failed" on a 401, so the shell loads, prompts, and
+    // works with reads protected.
+    let is_ui_shell = state.ui_enabled
+        && (method == Method::GET || method == Method::HEAD)
+        && !path.starts_with("/admin")
+        && !path.starts_with("/metrics");
 
     // A sensitive route on a node with no token has nothing to authenticate
     // against. Serving it would publish call-ids and signalling to anyone who
@@ -288,6 +258,7 @@ async fn require_admin_auth(
 
     let needs_auth = state.auth_token.is_some()
         && method != Method::OPTIONS
+        && !is_ui_shell
         && (state.protect_reads || !is_read || sensitive);
 
     if needs_auth {
@@ -308,11 +279,23 @@ async fn require_admin_auth(
             // credential-guessing target like any other, and it had no such
             // signal at all. `ConnectInfo` is absent when the router is driven
             // directly (tests), which is not a reachable client.
-            if let Some(peer) = request
+            // Two shapes because the TLS listener cannot produce a bare
+            // `SocketAddr` connect-info (orphan rule — see
+            // `transport::tls_listener::TlsPeer`), and a failed token over TLS
+            // is exactly as much of a guessing signal as one in the clear.
+            let peer_ip = request
                 .extensions()
                 .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            {
-                crate::security::record_handshake_failure(peer.0.ip(), "admin");
+                .map(|peer| peer.0.ip())
+                .or_else(|| {
+                    request
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<crate::transport::tls_listener::TlsPeer>>(
+                        )
+                        .map(|peer| peer.0 .0.ip())
+                });
+            if let Some(peer_ip) = peer_ip {
+                crate::security::record_handshake_failure(peer_ip, "admin");
             }
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1458,6 +1441,7 @@ mod tests {
             instance_id: None,
             features: AdminFeatures::default(),
             script_engine: None,
+            ui_enabled: false,
         }
     }
 
@@ -1471,6 +1455,144 @@ mod tests {
 
     fn test_app() -> Router {
         router(test_state(), None, false)
+    }
+
+    /// `GET path` against a router, with an optional bearer token.
+    async fn get_status(app: Router, path: &str, token: Option<&str>) -> StatusCode {
+        let mut request = Request::get(path);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn protect_reads_gates_the_data_but_not_the_dashboard_shell() {
+        // The whole point of the split: `protect_reads: true` used to make the
+        // dashboard unusable, so every node that wanted a UI ran with the
+        // registration list and the call list readable to anyone the admin ACL
+        // admitted, with no token at all.
+        for path in ["/", "/app.js", "/assets/style.css"] {
+            let app = router(authed_state("secret", true), None, true);
+            assert_ne!(
+                get_status(app, path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path} is the shell, not data — it must not 401"
+            );
+        }
+        for path in ["/admin/registrations", "/admin/metrics.json", "/metrics"] {
+            let app = router(authed_state("secret", true), None, true);
+            assert_eq!(
+                get_status(app, path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path} is data and must stay behind the token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_token_still_opens_every_data_route() {
+        for path in ["/admin/registrations", "/admin/metrics.json", "/metrics"] {
+            let app = router(authed_state("secret", true), None, true);
+            assert_eq!(
+                get_status(app, path, Some("secret")).await,
+                StatusCode::OK,
+                "{path} with the token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shell_exemption_is_off_when_the_ui_is() {
+        // A node with no dashboard has no shell to serve, so the exemption must
+        // not become a hole on a path nothing answers.
+        let app = router(authed_state("secret", true), None, false);
+        assert_eq!(
+            get_status(app, "/app.js", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_routes_are_unaffected_by_the_shell_exemption() {
+        // `/admin/logs` is under `/admin`, so it cannot reach the exemption —
+        // and with no token configured it is refused outright, as before.
+        let app = router(test_state(), None, true);
+        assert_eq!(
+            get_status(app, "/admin/logs", None).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_api_answers_over_tls() {
+        // The binary installs the process-level provider at start-up
+        // (`server::run`); a test binary has to do it itself, and rustls panics
+        // rather than picking one.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let directory = crate::transport::testutil::temp_dir("admin");
+        let paths = crate::transport::testutil::write_test_chain(&directory);
+        let tls = crate::config::TlsServerConfig {
+            certificate: paths["server_cert"].to_string_lossy().into_owned(),
+            private_key: paths["server_key"].to_string_lossy().into_owned(),
+            certificates: Vec::new(),
+            method: crate::config::TlsMethod::default(),
+            verify_client: false,
+            client_ca: None,
+            client_certificate: None,
+            client_private_key: None,
+        };
+        let acceptor =
+            crate::transport::tls::build_hot_reload_acceptor(&tls).expect("hot reload acceptor");
+        let listener = crate::transport::tls_listener::TlsListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            acceptor,
+            "admin API test",
+        )
+        .await
+        .expect("bind");
+        let addr = axum::serve::Listener::local_addr(&listener).expect("local addr");
+        let app = router(test_state(), None, false);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<crate::transport::tls_listener::TlsPeer>(
+                ),
+            )
+            .await;
+        });
+
+        let client_config = crate::transport::testutil::tls_client_config(&paths["ca"], None);
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let server_name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(
+            std::net::Ipv4Addr::new(127, 0, 0, 1).into(),
+        );
+        let mut stream = connector
+            .connect(server_name, stream)
+            .await
+            .expect("TLS handshake");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(
+                b"GET /admin/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "admin API did not answer over TLS: {response}"
+        );
     }
 
     #[test]
@@ -1618,6 +1740,7 @@ mod tests {
             instance_id: None,
             features: AdminFeatures::default(),
             script_engine: None,
+            ui_enabled: false,
         };
         let app = router(state, None, false);
 

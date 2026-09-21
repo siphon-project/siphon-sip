@@ -26,6 +26,7 @@ fn test_state() -> AdminState {
         // No optional subsystem configured — every gated block reports `null`.
         features: siphon::admin::AdminFeatures::default(),
         script_engine: None,
+        ui_enabled: false,
     }
 }
 

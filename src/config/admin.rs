@@ -72,6 +72,21 @@ pub struct AdminConfig {
     /// ladder and search. Unset = off.
     #[serde(default)]
     pub capture: Option<AdminCaptureConfig>,
+    /// Optional TLS on the admin listener. Unset = plaintext (unchanged).
+    ///
+    /// Without it the bearer token crosses the wire in the clear on every call,
+    /// and so does everything the API returns — the registration list (number,
+    /// contact address, expiry) and the live call list among it. That is why a
+    /// controller driving `POST /admin/gateways/refresh` over anything but a
+    /// tunnel needs this block.
+    ///
+    /// Same type and same hot reload as the SIP listeners: a certificate
+    /// replaced under a running process is picked up on the next handshake, so
+    /// cert-manager and certbot need no restart. `verify_client` makes it
+    /// mutual, which is the stronger answer for a machine-to-machine caller
+    /// than a bearer token on its own.
+    #[serde(default)]
+    pub tls: Option<crate::config::TlsServerConfig>,
 }
 
 /// Bounded SIP message capture exposed over the admin API.
