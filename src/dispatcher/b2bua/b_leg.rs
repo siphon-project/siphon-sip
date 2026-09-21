@@ -1029,15 +1029,66 @@ pub fn classify_b_leg_response(status_code: u16) -> Option<ResponseClass> {
     }
 }
 
+/// How long the caller waits for a leg actor's classification event.
+///
+/// The actor is in-process and handling a message it was just handed, so this
+/// normally settles in microseconds. The bound is for when it never settles:
+/// `LegActor::run` leaves its loop on `Cancel`/`Shutdown`, sends `Terminated`,
+/// then drops its mailbox receiver, and a `try_send` landing in that window
+/// succeeds but is never read. The only event that then arrives is that
+/// `Terminated`, which the filter below skips — turning the one signal that
+/// would have released this wait into a reason to keep waiting.
+///
+/// Unbounded, the caller is released only by the next B-leg response on the
+/// call or by teardown dropping the last sender, so a pool worker can sit here
+/// for the length of a call. Generous against a microsecond-scale normal case,
+/// and short enough that losing it costs one response's classification.
+const CLASSIFICATION_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Take the next classification event for a B-leg response, skipping a stale
+/// `Terminated` from a superseded leg (a 401/407/422 retry replaces the leg,
+/// and consuming its `Terminated` here would misclassify the real 200 OK as
+/// provisional).
+///
+/// Returns `None` if no classification arrives within [`CLASSIFICATION_WAIT`];
+/// the caller treats that the same as an absent actor and classifies from the
+/// status code instead. Draining still matters — the actors emit events with
+/// an awaiting `send` on a 64-deep channel, so a channel nobody drains parks
+/// the actor — but draining is not worth a worker held for a whole call.
 pub fn recv_b_leg_classification_event(
     rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
 ) -> Option<CallEvent> {
-    loop {
-        match rx.blocking_recv() {
-            Some(CallEvent::Terminated { .. }) => continue,
-            other => return other,
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // No runtime to time against (a unit test driving this directly):
+        // keep the original unbounded behaviour rather than silently
+        // changing what such a test exercises.
+        loop {
+            match rx.blocking_recv() {
+                Some(CallEvent::Terminated { .. }) => continue,
+                other => return other,
+            }
         }
-    }
+    };
+
+    let deadline = tokio::time::Instant::now() + CLASSIFICATION_WAIT;
+    handle.block_on(async {
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(CallEvent::Terminated { .. })) => continue,
+                Ok(other) => return other,
+                Err(_elapsed) => {
+                    warn!(
+                        wait = ?CLASSIFICATION_WAIT,
+                        "B2BUA: no classification event from the B-leg actor within its \
+                         window — classifying from the status code instead. The actor \
+                         most likely exited between accepting the response and reading \
+                         it; holding the worker any longer costs a whole call."
+                    );
+                    return None;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

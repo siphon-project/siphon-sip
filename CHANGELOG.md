@@ -6,6 +6,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A B-leg response no longer holds a worker for the length of the call when
+  its leg actor has already exited.** The dispatcher hands the response to the
+  actor and then blocks for the classification event it emits, skipping a
+  stale `Terminated` from a leg a 401/407/422 retry superseded — consuming
+  that one would misclassify the live leg's 200 OK as provisional.
+
+  `LegActor::run` leaves its loop on `Cancel`/`Shutdown`, emits `Terminated`
+  and drops its mailbox receiver. A send landing in that window is accepted and
+  never read, so the only event to arrive is that `Terminated` — and skipping
+  it turns the one signal that would have released the wait into a reason to
+  keep waiting. The wait then ended only on the next B-leg response for that
+  call or on teardown dropping the last sender, with an executor worker gone
+  until it did.
+
+  The wait is now bounded at 250 ms, after which the response is classified
+  from its status code, which is what an absent actor already does. Draining
+  still matters — the actors emit with an awaiting send on a 64-deep channel,
+  so a channel nobody drains parks the actor — but draining is not worth a
+  worker held for a whole call. The normal path is unchanged: it still wakes
+  the moment the event lands, so nothing is added to the per-response path.
+
 ### Added
 
 - **A drain deadline now ends the calls it is still holding

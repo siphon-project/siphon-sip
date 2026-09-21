@@ -5233,6 +5233,66 @@ async fn b_leg_200_classifies_as_answered_after_auth_retry_supersede() {
     let _ = actor2_task.await;
 }
 
+/// A classification event that never comes must not cost a whole call's worth
+/// of worker time.
+///
+/// `LegActor::run` leaves its loop on `Cancel`/`Shutdown`, emits `Terminated`
+/// and then drops its mailbox receiver. A `try_send` landing in that window is
+/// accepted and never read, so the only event to arrive is that `Terminated` —
+/// which the classifier skips by design, turning the one signal that would
+/// have released it into a reason to keep waiting. Unbounded, the caller is
+/// then released only by the next B-leg response on the call or by teardown
+/// dropping the last sender, and until then a pool worker is gone.
+///
+/// Here the channel holds exactly one stale `Terminated` and a sender is kept
+/// alive so the receive cannot end on its own — the pathological shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_classification_event_that_never_arrives_gives_the_worker_back() {
+    use crate::b2bua::actor::{Leg, LegActor, TransportInfo as LegTransport};
+    use crate::transport::{ConnectionId, Transport};
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
+
+    // A superseded leg's actor, run to completion so its `Terminated` is the
+    // only thing on the channel — exactly what the classifier skips.
+    let stale = Leg::new_b_leg(
+        "b2b-no-classification@test".to_string(),
+        "from-tag-stale".to_string(),
+        "sip:bob@10.0.0.2:5060".to_string(),
+        "z9hG4bK-stale".to_string(),
+        LegTransport {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    let (actor, handle) = LegActor::new(stale, event_tx.clone());
+    let actor_task = tokio::spawn(actor.run());
+    drop(handle);
+    actor_task.await.unwrap();
+
+    // Held for the duration: with a live sender the receive never ends by
+    // itself, so only the bound can end it.
+    let _keep_sender_alive = event_tx;
+
+    let started = std::time::Instant::now();
+    let event = tokio::task::spawn_blocking(move || recv_b_leg_classification_event(&mut event_rx))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        event.is_none(),
+        "nothing but a stale Terminated was ever sent, so there is no \
+         classification to return; got {event:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the worker was held {elapsed:?} — unbounded, this waits out the call"
+    );
+}
+
 fn test_resolver() -> SipResolver {
     SipResolver::from_system().unwrap()
 }
