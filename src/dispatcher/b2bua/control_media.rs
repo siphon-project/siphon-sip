@@ -89,7 +89,14 @@ pub fn control_dial_media_offer(
 }
 
 /// Rewrite a dialled phone's early/final answer for the caller using the
-/// opposite half of the selected profile. A missing session fails closed.
+/// opposite half of the selected profile. Once a call is known to own an
+/// allocation, a missing session fails closed.
+///
+/// Every B-leg answer and every provisional carrying SDP comes through here, so
+/// the two "this is not a profiled dial" exits have to be plain no-ops: a call
+/// that never asked for a profile, and one whose actor a concurrent teardown has
+/// already removed. Reporting the second as a media failure would abandon a 2xx
+/// or cancel the ringing branches of a call the control plane never touched.
 pub fn control_dial_media_answer(
     call_id: &str,
     response: &mut SipMessage,
@@ -97,7 +104,7 @@ pub fn control_dial_media_answer(
     state: &DispatcherState,
 ) -> Result<(), String> {
     let Some(call) = state.call_actors.get_call(call_id) else {
-        return Err("call is gone".into());
+        return Ok(());
     };
     if !call.control_dial_media {
         return Ok(());
@@ -263,6 +270,40 @@ mod tests {
         )
         .is_err());
         assert!(dispatcher.udp.try_recv().is_err());
+    }
+
+    /// An answer for a call this module has no allocation for is not a media
+    /// failure. Both callers abandon the call on `Err`, so a plain B2BUA call
+    /// racing its own teardown must come back through here untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_for_a_call_without_a_profiled_dial_is_left_alone() {
+        let dispatcher = test_dispatcher();
+        let original = response(&invite(), 200);
+
+        let mut gone = original.clone();
+        assert_eq!(
+            control_dial_media_answer(
+                "a-call-that-has-been-torn-down",
+                &mut gone,
+                "192.0.2.10".parse().unwrap(),
+                &dispatcher.state,
+            ),
+            Ok(())
+        );
+        assert_eq!(gone.body, original.body);
+
+        let call_id = park(&dispatcher.state);
+        let mut unprofiled = original.clone();
+        assert_eq!(
+            control_dial_media_answer(
+                &call_id,
+                &mut unprofiled,
+                "192.0.2.10".parse().unwrap(),
+                &dispatcher.state,
+            ),
+            Ok(())
+        );
+        assert_eq!(unprofiled.body, original.body);
     }
 
     fn park(state: &DispatcherState) -> String {
