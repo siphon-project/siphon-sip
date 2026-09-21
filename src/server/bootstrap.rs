@@ -1351,3 +1351,53 @@ pub(super) fn unpin_python_thread_state() {
         pyo3::ffi::PyGILState_Release(gstate);
     }
 }
+
+/// Publish the kernel gateway allow set, then keep it current.
+///
+/// Called after the firewall handle exists and **before the listeners bind**, so
+/// the node never takes traffic while the kernel is still dropping a carrier
+/// siphon is willing to dial. The gateway source loop is spawned earlier than
+/// this, which is why the bootstrap publish exists at all rather than leaving
+/// the first one to the reconcile's poke.
+///
+/// A failure is warned, never fatal: the operator's ruleset keeps whatever it
+/// was deployed with, which is what a node did before the set existed.
+pub(super) async fn init_gateway_allow_set(
+    config: &Config,
+    gateway_manager: Option<&Arc<crate::gateway::DispatcherManager>>,
+    kernel_firewall_up: bool,
+) {
+    if !kernel_firewall_up {
+        return;
+    }
+    let (Some(manager), Some(firewall_config)) = (
+        gateway_manager,
+        config
+            .security
+            .as_ref()
+            .and_then(|security| security.firewall.as_ref()),
+    ) else {
+        return;
+    };
+    if !firewall_config.gateway_set {
+        return;
+    }
+    let trusted_cidrs = config
+        .security
+        .as_ref()
+        .map(|security| security.trusted_cidrs.clone())
+        .unwrap_or_default();
+    let allow_set = Arc::new(crate::firewall::gateways::GatewayAllowSet::new(
+        firewall_config,
+        &trusted_cidrs,
+        Arc::clone(manager),
+    ));
+    if let Err(error) = allow_set.publish().await {
+        warn!(
+            %error,
+            "kernel firewall: gateway allow set not published — a carrier provisioned at run time may be dialable while the kernel drops its answers"
+        );
+    }
+    crate::firewall::gateways::install(Arc::clone(&allow_set));
+    tokio::spawn(allow_set.run());
+}

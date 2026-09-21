@@ -609,6 +609,34 @@ impl DispatcherGroup {
                 .iter()
                 .any(|network| network.contains(&ip))
     }
+
+    /// Every source this group admits, as CIDR ranges: each currently resolved
+    /// destination address as a host prefix, plus the static `source_networks`.
+    ///
+    /// The two inputs [`Self::contains_source`] answers from, so the kernel
+    /// allow set admits exactly what `request.from_gateway` calls a member and
+    /// the two can never disagree. Reading `member_ips` rather than
+    /// [`Destination::address`] is what makes a carrier behind several A
+    /// records work: the probe cycle keeps every resolved address in there,
+    /// not only the one currently selected.
+    pub fn admitted_sources(&self) -> Vec<IpNet> {
+        let members = self.member_ips.load();
+        let mut sources = Vec::with_capacity(members.len() + self.source_networks.len());
+        for ip in members.iter() {
+            let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
+            if let Ok(network) = IpNet::new(*ip, host_prefix) {
+                sources.push(network);
+            }
+        }
+        sources.extend_from_slice(&self.source_networks);
+        sources
+    }
+
+    /// True when this group's health probing is disabled, so nothing re-resolves
+    /// its destinations after start-up.
+    pub fn probing_disabled(&self) -> bool {
+        !self.probe_config.enabled
+    }
 }
 
 /// Parse a `source_networks` entry into an [`IpNet`].
@@ -759,6 +787,35 @@ impl DispatcherManager {
     /// List all group names.
     pub fn group_names(&self) -> Vec<String> {
         self.groups.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Every source any group admits — the input to the kernel gateway allow
+    /// set (see [`crate::firewall::gateways`]). Ranges may overlap or repeat
+    /// across groups; the publisher normalises.
+    pub fn admitted_sources(&self) -> Vec<IpNet> {
+        self.groups
+            .iter()
+            .flat_map(|entry| entry.value().admitted_sources())
+            .collect()
+    }
+
+    /// Re-resolve the member addresses of groups whose probing is disabled.
+    ///
+    /// A probed group is re-resolved every probe cycle; one with
+    /// `probe.enabled: false` was only ever resolved at start-up, so a change
+    /// of A record on it was invisible until a restart — to routing, to
+    /// `request.from_gateway`, and to the kernel allow set alike. The allow-set
+    /// publisher calls this on its floor tick, which is the only periodic pass
+    /// those groups get.
+    ///
+    /// Blocking (`to_socket_addrs`), exactly like [`DispatcherGroup::refresh_member_ips`]:
+    /// never call it from the request hot path.
+    pub fn refresh_member_ips_for_unprobed(&self) {
+        for entry in self.groups.iter() {
+            if entry.value().probing_disabled() {
+                entry.value().refresh_member_ips();
+            }
+        }
     }
 
     /// The probe-maintained resolved address for a next-hop `host:port`, if it

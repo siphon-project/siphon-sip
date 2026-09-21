@@ -1126,6 +1126,9 @@ impl SiphonServer {
             None => None,
         };
 
+        // --- Gateway allow set ---
+        init_gateway_allow_set(&config, gateway_manager.as_ref(), kernel_firewall.is_some()).await;
+
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config, kernel_firewall.clone());
 

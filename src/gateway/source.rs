@@ -391,9 +391,17 @@ pub async fn reconcile_once(
 
     // Resolving addresses blocks, so the whole build runs off the runtime.
     let manager_for_build = Arc::clone(manager);
-    tokio::task::spawn_blocking(move || apply_rows(&manager_for_build, &rows))
+    let report = tokio::task::spawn_blocking(move || apply_rows(&manager_for_build, &rows))
         .await
-        .map_err(|error| format!("the gateway reconcile panicked: {error}"))
+        .map_err(|error| format!("the gateway reconcile panicked: {error}"))?;
+
+    // Admit a newly provisioned carrier in the same tick it became dialable.
+    // A no-op unless the kernel gateway allow set is running, and it collapses
+    // with any other poke in the same window, so an unchanged pass costs
+    // nothing beyond the comparison the publisher does anyway.
+    crate::firewall::gateways::request_publish();
+
+    Ok(report)
 }
 
 /// The synchronous half of a reconcile: everything that resolves DNS.

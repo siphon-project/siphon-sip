@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+pub mod gateways;
 #[cfg(target_os = "linux")]
 pub mod nftables;
 
@@ -90,6 +91,10 @@ pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<Ke
         &config.set_v4,
         &config.set_v6,
         config.manage_rule,
+        config.gateway_set.then_some((
+            config.set_gateways_v4.as_str(),
+            config.set_gateways_v6.as_str(),
+        )),
     )
     .await?;
 

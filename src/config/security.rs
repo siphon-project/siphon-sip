@@ -124,6 +124,24 @@ pub struct FirewallConfig {
     /// have siphon manage only the sets and reference them from your own ruleset.
     #[serde(default = "bool_true")]
     pub manage_rule: bool,
+    /// When true (the default), siphon also declares and maintains an allow set
+    /// holding every source its gateways admit, plus `security.trusted_cidrs`.
+    /// A carrier provisioned at run time through `gateway.backend` is otherwise
+    /// dialable while the kernel still drops its answers.
+    ///
+    /// siphon declares the sets and never writes a rule for them: reference
+    /// them from your own ruleset (`ip saddr @gateways4 udp dport 5060
+    /// accept`). An `accept` inside siphon's own chain would also make a
+    /// gateway immune to the ban drops, which is a policy decision that belongs
+    /// to the operator.
+    #[serde(default = "bool_true")]
+    pub gateway_set: bool,
+    /// Interval set holding the admitted IPv4 sources. Default: `gateways4`.
+    #[serde(default = "default_firewall_set_gateways_v4")]
+    pub set_gateways_v4: String,
+    /// Interval set holding the admitted IPv6 sources. Default: `gateways6`.
+    #[serde(default = "default_firewall_set_gateways_v6")]
+    pub set_gateways_v6: String,
 }
 
 fn default_firewall_table() -> String {
@@ -137,6 +155,12 @@ fn default_firewall_set_v4() -> String {
 }
 fn default_firewall_set_v6() -> String {
     "banned6".to_string()
+}
+fn default_firewall_set_gateways_v4() -> String {
+    "gateways4".to_string()
+}
+fn default_firewall_set_gateways_v6() -> String {
+    "gateways6".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
