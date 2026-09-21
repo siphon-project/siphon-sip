@@ -232,10 +232,26 @@ advertised_address: "127.0.0.1"
 script:
   path: "scripts/proxy_default.py"
   reload: auto    # auto = inotify (change without restart) | sighup = signal only
+  #
+  # SIGHUP reloads the script in BOTH modes; `sighup` means only that the
+  # inotify watcher is off, so a deploy decides when the reload happens.
+  # (`POST /admin/script/reload` also reloads in either mode.)
+  #
+  # A reload re-executes the script in a fresh namespace and drops every helper
+  # module it imported from sys.modules, so MODULE-LEVEL STATE STARTS EMPTY.
+  # That is why `auto` reloads only for the script's own file and for helper
+  # modules the running script actually imported — a sibling .py in the same
+  # directory belongs to another process, and reloading for it would wipe this
+  # one's state for someone else's deploy. Events arriving within 250 ms are one
+  # reload, so a deploy writing several helpers recompiles once.
+  #
   # The script's own directory is on sys.path, so a script can `import helpers`
   # for a sibling `helpers.py`. include_paths adds extra directories for helper
   # libraries shared across scripts. Absolute imports only (the script is not a
   # package); helper modules hot-reload on change like the main script.
+  # Watching is non-recursive, so a helper laid out as a package
+  # (lib/mypkg/__init__.py) does not trigger a reload — put helper modules
+  # directly in a watched directory.
   # include_paths:
   #   - "/etc/siphon/lib"
   # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.

@@ -28,7 +28,8 @@ use tracing::{debug, error, info, warn};
 use crate::config::{self, Config};
 use crate::gateway::DispatcherManager;
 use crate::hep::HepSender;
-use crate::script::engine::{spawn_file_watcher, ScriptEngine};
+use crate::script::engine::ScriptEngine;
+use crate::script::watcher::{spawn_file_watcher, spawn_sighup_reloader};
 use crate::script::ScriptHandle;
 use crate::transport;
 use crate::uac::UacSender;
@@ -1078,8 +1079,13 @@ impl SiphonServer {
             }))
         };
 
-        // Start file watcher for hot-reload (no-op for embedded scripts)
+        // Start file watcher for hot-reload (no-op for embedded scripts, and
+        // under `reload: sighup`, where the signal below is the only trigger).
         spawn_file_watcher(Arc::clone(&engine));
+        // SIGHUP reloads the script in either mode. Installed here rather than
+        // beside the SIGUSR2 diagnostic above because the engine does not exist
+        // yet at that point.
+        spawn_sighup_reloader(Arc::clone(&engine));
 
         // Start any @timer.every() handlers registered in the script.
         engine.restart_timers();

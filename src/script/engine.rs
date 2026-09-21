@@ -643,11 +643,55 @@ impl ScriptEngine {
         &self.script_path
     }
 
+    /// Whether a change to `changed` is a reason for *this* engine to reload:
+    /// the script's own file, or a module the running script has imported from
+    /// one of the watched directories.
+    ///
+    /// This is the scope rule. The watcher used to reload on any `.py` file in
+    /// a watched directory, so two siphon processes whose scripts share a
+    /// directory reloaded each other — and a reload re-executes the script in a
+    /// fresh namespace, so the one that did not change lost its module-level
+    /// state. A charging bridge losing its per-session map mid-call is the case
+    /// that found this: every call answered after an unrelated routing-script
+    /// deploy had no answer instant to bill from.
+    ///
+    /// The set is read from `sys.modules` at *event* time rather than
+    /// snapshotted at compile time, which is what makes it correct in both
+    /// directions. A helper imported lazily inside a handler is not in
+    /// `sys.modules` when the script is compiled, so a snapshot would stop
+    /// reloading it for good; and a module that has never been imported has no
+    /// stale copy to purge, so not reloading for it is the right answer rather
+    /// than a gap.
+    ///
+    /// Errors attaching to Python or reading `sys.modules` resolve to `true`.
+    /// Reloading when unsure costs a recompile; not reloading loses the deploy.
+    pub fn reloads_for(&self, changed: &Path) -> bool {
+        if changed.file_name().is_some() && changed.file_name() == self.script_path.file_name() {
+            return true;
+        }
+        let changed = canonical(changed);
+        if changed == canonical(&self.script_path) {
+            return true;
+        }
+        let dirs = user_script_dirs(&self.script_path, &self.include_paths);
+        if dirs.is_empty() {
+            return false; // embedded script: nothing on disk to import from
+        }
+        Python::attach(|python| match imported_user_modules(python, &dirs) {
+            Ok(modules) => modules.iter().any(|(_, path)| *path == changed),
+            Err(error) => {
+                warn!(%error, "could not read sys.modules; reloading rather than skipping");
+                true
+            }
+        })
+    }
+
     /// Directories the file watcher should observe for hot-reload: the script's
-    /// own directory plus every configured `include_paths` directory. A change
-    /// to any `*.py` file under one of these triggers a reload (helper modules
-    /// hot-reload alongside the main script). De-duplicated; missing dirs are
-    /// dropped by the watcher when it fails to watch them.
+    /// own directory plus every configured `include_paths` directory. Whether a
+    /// change inside one of them is a reason to reload is
+    /// [`reloads_for`](Self::reloads_for), not the mere fact of the directory
+    /// being watched. De-duplicated; missing dirs are dropped by the watcher
+    /// when it fails to watch them.
     pub fn watch_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(parent) = self.script_path.parent() {
@@ -1000,6 +1044,68 @@ fn ensure_sys_path(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Canonicalise a path for comparison against a module's `__file__`, falling
+/// back to the path as given when it does not resolve.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Every module currently in `sys.modules` whose `__file__` lives under one of
+/// the script directories, as `(module name, canonical file path)`.
+///
+/// This is the engine's answer to "which helper modules is the running script
+/// using". There is no import graph and none is needed: `sys.modules` is
+/// per-process and this process runs one script, so a module imported from a
+/// script directory was imported *by that script*.
+///
+/// Two callers, for the two halves of a reload. [`purge_user_modules`] drops
+/// each one so a reload re-imports the current source, and
+/// [`ScriptEngine::imports_file`] tests a changed path against the set so a
+/// sibling `.py` nothing imported is not a reason to reload.
+///
+/// Modules with no `__file__` — builtins, namespace packages, C extensions —
+/// are skipped: they have no source on disk to have gone stale.
+fn imported_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<Vec<(String, PathBuf)>> {
+    let sys = python
+        .import("sys")
+        .map_err(|error| SiphonError::Script(format!("import sys: {error}")))?;
+    let modules = sys
+        .getattr("modules")
+        .map_err(|error| SiphonError::Script(format!("sys.modules: {error}")))?
+        .cast_into::<PyDict>()
+        .map_err(|error| SiphonError::Script(format!("sys.modules not a dict: {error}")))?;
+
+    // Iterate a *snapshot*, not the live dict. `sys.modules` is process-global,
+    // so another thread — a handler lazily importing a module under free-threaded
+    // Python (3.14t), or a parallel test compiling a script — can change its size
+    // mid-iteration, which CPython rejects with "dictionary changed size during
+    // iteration" (a panic here, e.g. on hot-reload). `dict.copy()` is atomic under
+    // the free-threaded build's per-object lock and the copy is thread-local, so
+    // iterating it is race-free.
+    let snapshot = modules
+        .copy()
+        .map_err(|error| SiphonError::Script(format!("snapshot sys.modules: {error}")))?;
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for (name, module) in snapshot.iter() {
+        let Ok(file_attr) = module.getattr("__file__") else {
+            continue; // builtins / namespace packages have no __file__
+        };
+        if file_attr.is_none() {
+            continue;
+        }
+        let Ok(file_str) = file_attr.extract::<String>() else {
+            continue;
+        };
+        let module_path = canonical(Path::new(&file_str));
+        if dirs.iter().any(|dir| module_path.starts_with(dir)) {
+            if let Ok(module_name) = name.extract::<String>() {
+                found.push((module_name, module_path));
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Drop from `sys.modules` every module whose `__file__` lives under one of the
 /// script directories, so a reload re-imports the current source rather than
 /// returning the stale cached module.
@@ -1023,38 +1129,9 @@ fn purge_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
         .cast_into::<PyDict>()
         .map_err(|error| SiphonError::Script(format!("sys.modules not a dict: {error}")))?;
 
-    // Iterate a *snapshot*, not the live dict. `sys.modules` is process-global,
-    // so another thread — a handler lazily importing a module under free-threaded
-    // Python (3.14t), or a parallel test compiling a script — can change its size
-    // mid-iteration, which CPython rejects with "dictionary changed size during
-    // iteration" (a panic here, e.g. on hot-reload). `dict.copy()` is atomic under
-    // the free-threaded build's per-object lock and the copy is thread-local, so
-    // iterating it is race-free. Deletions below still target the live `modules`;
-    // a key already removed by a concurrent purge just makes `del_item` warn.
-    let snapshot = modules
-        .copy()
-        .map_err(|error| SiphonError::Script(format!("snapshot sys.modules: {error}")))?;
-    let mut to_remove: Vec<String> = Vec::new();
-    for (name, module) in snapshot.iter() {
-        let Ok(file_attr) = module.getattr("__file__") else {
-            continue; // builtins / namespace packages have no __file__
-        };
-        if file_attr.is_none() {
-            continue;
-        }
-        let Ok(file_str) = file_attr.extract::<String>() else {
-            continue;
-        };
-        let module_path =
-            std::fs::canonicalize(&file_str).unwrap_or_else(|_| PathBuf::from(&file_str));
-        if dirs.iter().any(|dir| module_path.starts_with(dir)) {
-            if let Ok(module_name) = name.extract::<String>() {
-                to_remove.push(module_name);
-            }
-        }
-    }
-
-    for module_name in to_remove {
+    // Deletions target the live `modules`; a key already removed by a
+    // concurrent purge just makes `del_item` warn.
+    for (module_name, _) in imported_user_modules(python, dirs)? {
         if let Err(error) = modules.del_item(&module_name) {
             warn!(module = %module_name, %error, "failed to purge stale script module");
         } else {
@@ -1063,94 +1140,6 @@ fn purge_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// File watcher task
-// ---------------------------------------------------------------------------
-
-/// Spawn a background tokio task that watches the script file for changes
-/// and triggers hot-reload. Returns immediately.
-pub fn spawn_file_watcher(engine: Arc<ScriptEngine>) {
-    use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-    use std::sync::mpsc;
-
-    if !engine.auto_reload() {
-        info!("script auto-reload disabled (mode: sighup)");
-        return;
-    }
-
-    let path = engine.script_path().to_owned();
-    let watch_dirs = engine.watch_dirs();
-
-    // `notify` v8 uses std channels for sync, we bridge to tokio via spawn_blocking.
-    tokio::task::spawn_blocking(move || {
-        let (sender, receiver) = mpsc::channel::<notify::Result<Event>>();
-
-        let mut watcher = match RecommendedWatcher::new(sender, Config::default()) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                error!(%error, "failed to create file watcher");
-                return;
-            }
-        };
-
-        // Watch the script directory (and any include dirs) so we catch both the
-        // main script and sibling helper `.py` files, and renames/recreates
-        // (editors like vim write to a temp file then rename). NonRecursive: only
-        // direct children fire events.
-        let mut watched_any = false;
-        for watch_dir in &watch_dirs {
-            match watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    watched_any = true;
-                    info!(path = %watch_dir.display(), "watching script directory");
-                }
-                Err(error) => {
-                    // A missing include dir is not fatal — keep watching the rest.
-                    warn!(%error, path = %watch_dir.display(), "failed to watch directory");
-                }
-            }
-        }
-        if !watched_any {
-            error!("no script directories could be watched; hot-reload disabled");
-            return;
-        }
-
-        info!(path = %path.display(), "file watcher started");
-
-        let file_name = path.file_name();
-
-        for event in receiver {
-            match event {
-                Ok(Event {
-                    kind: EventKind::Modify(_) | EventKind::Create(_),
-                    paths,
-                    ..
-                }) => {
-                    // Reload on a change to the main script OR any `.py` file in a
-                    // watched dir (a sibling helper module the script imports).
-                    let is_relevant = paths.iter().any(|p| {
-                        p.file_name() == file_name || p.extension().is_some_and(|ext| ext == "py")
-                    });
-                    if !is_relevant {
-                        continue;
-                    }
-
-                    // Small debounce — editors sometimes generate multiple events.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-
-                    if let Err(error) = engine.reload() {
-                        warn!(%error, "hot-reload failed");
-                    }
-                }
-                Ok(_) => {} // Ignore other event kinds
-                Err(error) => {
-                    warn!(%error, "file watcher error");
-                }
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +1732,124 @@ mod tests {
             std::fs::read_to_string(&output).unwrap(),
             "v2",
             "reload re-imports the edited helper (sys.modules purge)"
+        );
+    }
+
+    /// A script, a helper it imports, and a sibling `.py` it does not — the
+    /// shape of two siphon processes sharing one script directory.
+    ///
+    /// The helper's module name is unique per call, because `sys.modules` is
+    /// process-global and keyed by name: two fixtures sharing one would have the
+    /// second import resolve to the first's cached module, whose `__file__`
+    /// points into a temp directory the second engine knows nothing about. An
+    /// artefact of many engines in one test process; a deployment runs one
+    /// script and cannot hit it.
+    fn reload_scope_fixture() -> (tempfile::TempDir, Arc<ScriptEngine>, PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+
+        Python::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let module = format!("sib_scope_imported_{unique}");
+        let imported = dir.path().join(format!("{module}.py"));
+        let stranger = dir.path().join("sib_scope_stranger.py");
+        let script = dir.path().join("scoped_main.py");
+
+        std::fs::write(&imported, "VALUE = 1\n").unwrap();
+        // A sibling that is a perfectly good script in its own right — the
+        // second process's — and that this one never imports.
+        std::fs::write(&stranger, "VALUE = 2\n").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                concat!(
+                    "from siphon import proxy\n",
+                    "import {}\n",
+                    "\n",
+                    "@proxy.on_request\n",
+                    "def handle(request):\n",
+                    "    pass\n",
+                ),
+                module
+            ),
+        )
+        .unwrap();
+
+        let config = ScriptConfig {
+            path: script.to_str().unwrap().to_owned(),
+            reload: ReloadMode::Auto,
+            async_pool_size: None,
+            sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            handler_timeout_secs: None,
+            executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
+        };
+        let engine = Arc::new(ScriptEngine::new(&config).expect("initial load"));
+        (dir, engine, imported, stranger)
+    }
+
+    #[test]
+    fn reloads_for_its_own_script_and_the_helpers_it_imported() {
+        let (_dir, engine, imported, _stranger) = reload_scope_fixture();
+
+        assert!(
+            engine.reloads_for(engine.script_path()),
+            "its own file is always a reason to reload"
+        );
+        assert!(
+            engine.reloads_for(&imported),
+            "a helper the running script imported is its own code"
+        );
+    }
+
+    /// The defect this closes. A sibling `.py` in the same directory belongs to
+    /// another process; reloading for it re-executes *this* script in a fresh
+    /// namespace and empties its module-level state — which is how a routing
+    /// deploy wiped a charging bridge's per-session map mid-call.
+    #[test]
+    fn does_not_reload_for_a_sibling_script_it_never_imported() {
+        let (_dir, engine, _imported, stranger) = reload_scope_fixture();
+
+        assert!(
+            !engine.reloads_for(&stranger),
+            "a .py this script never imported is not this script's deploy"
+        );
+    }
+
+    /// A module that has never been imported has no stale copy to purge, so not
+    /// reloading for it is the right answer rather than a gap: the first import
+    /// after it is written reads the new file anyway.
+    #[test]
+    fn a_helper_imported_later_becomes_a_reload_trigger_then() {
+        let (dir, engine, imported, _stranger) = reload_scope_fixture();
+        // Unique for the same reason the fixture's own helper is.
+        let module = format!("{}_late", imported.file_stem().unwrap().to_str().unwrap());
+        let late = dir.path().join(format!("{module}.py"));
+        std::fs::write(&late, "VALUE = 3\n").unwrap();
+
+        assert!(
+            !engine.reloads_for(&late),
+            "nothing has imported it yet, so there is nothing stale to replace"
+        );
+
+        // Import it the way a handler doing a lazy import would, and the answer
+        // changes — which is why the set is read at event time rather than
+        // snapshotted when the script was compiled.
+        let dirs = user_script_dirs(engine.script_path(), &[]);
+        let _guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::attach(|python| {
+            ensure_sys_path(python, &dirs).unwrap();
+            python.import(module.as_str()).unwrap();
+        });
+
+        assert!(
+            engine.reloads_for(&late),
+            "once the script has imported it, an edit is a reason to reload"
         );
     }
 

@@ -47,6 +47,7 @@ RUN_AUTO100=false
 RUN_HTTP_AUTH=false
 RUN_WEDGE=false
 RUN_NOHANDLER=false
+RUN_RELOAD=false
 RUN_BANSCAN=false
 RUN_SECURITY=false
 RUN_RFC4475=false
@@ -80,6 +81,7 @@ for arg in "$@"; do
     --http-auth)  RUN_HTTP_AUTH=true;  SELECTED_MODES+=("$arg") ;;
     --wedge)      RUN_WEDGE=true;      SELECTED_MODES+=("$arg") ;;
     --nohandler)  RUN_NOHANDLER=true;  SELECTED_MODES+=("$arg") ;;
+    --reload)     RUN_RELOAD=true;     SELECTED_MODES+=("$arg") ;;
     --banscan)    RUN_BANSCAN=true;    SELECTED_MODES+=("$arg") ;;
     --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
     --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
@@ -93,7 +95,7 @@ for arg in "$@"; do
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai --refer-single-leg --reoffer --control --bridge"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
-      echo "  --wedge --nohandler --banscan"
+      echo "  --wedge --nohandler --banscan --reload"
       echo "  --security --rfc4475 --webrtc"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
@@ -695,6 +697,17 @@ fi
 if [[ "$RUN_NOHANDLER" == true ]]; then
   echo "=== no-script-handler fallback regression (OPTIONS 200 / others 405) ==="
   bash scripts/options_fallback_test.sh || exit 1
+fi
+
+# ── script reload scope + SIGHUP (optional) ──────────────────────────────────
+# What reloads a script and what does not. Needs a running process and real
+# signal/inotify delivery, so no unit test reaches it: SIGHUP reloads (it used
+# to terminate siphon, since `reload: sighup` had no handler anywhere), a file
+# write under that mode does not, and under `reload: auto` a sibling .py the
+# script never imports does not reload it while an imported helper does.
+if [[ "$RUN_RELOAD" == true ]]; then
+  echo "=== script reload scope + SIGHUP regression ==="
+  bash scripts/script_reload_test.sh || exit 1
 fi
 
 # ── failed_auth_ban auto-ban regression (optional) ───────────────────────────
