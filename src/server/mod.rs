@@ -477,6 +477,7 @@ impl SiphonServer {
         crate::script::async_pool::AsyncPool::install(
             async_pool_size,
             tokio::runtime::Handle::current(),
+            crate::config::coroutine_timeout(config.script.handler_timeout_secs),
         );
 
         // Spin up the synchronous Python executor pool — a fixed set of

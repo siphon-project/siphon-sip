@@ -39,13 +39,14 @@
 //! pyo3-async-bridged tokio futures (the wake-up
 //! `loop.call_soon_threadsafe(set_result, ...)` always lands on a live loop).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
@@ -62,7 +63,39 @@ struct Driver {
     loop_obj: Py<PyAny>,
     /// OS thread running `loop.run_forever()`.  `None` after [`AsyncPool::drop`].
     thread: StdMutex<Option<JoinHandle<()>>>,
+    /// Pings the heartbeat monitor has scheduled on this loop.
+    pinged: Arc<AtomicU64>,
+    /// Pings the loop has actually run. Equal to `pinged` means the loop is
+    /// turning; falling behind means something is blocking on it.
+    landed: Arc<AtomicU64>,
 }
+
+/// A `#[pyclass]` callable the heartbeat schedules on a driver loop. Running
+/// at all is the whole signal — a pinned loop never gets to it.
+#[pyclass]
+struct DriverHeartbeat {
+    landed: Arc<AtomicU64>,
+}
+
+#[pymethods]
+impl DriverHeartbeat {
+    fn __call__(&self) {
+        self.landed.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// A coroutine handed to a driver: the oneshot its result arrives on, and the
+/// `concurrent.futures.Future` driving it, which the waiter cancels if it gives
+/// up first.
+type SubmittedCoroutine = (oneshot::Receiver<PyResult<Py<PyAny>>>, Py<PyAny>);
+
+/// How often the monitor pings each driver loop.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Pings a driver may owe before it counts as stalled. A loop running a
+/// handler that is merely slow still drains its callback queue, so this only
+/// trips on a loop that is not turning at all.
+const HEARTBEAT_MISSES_BEFORE_STALLED: u64 = 5;
 
 /// Fixed pool of asyncio event loops, each driven by a dedicated OS thread.
 pub struct AsyncPool {
@@ -70,6 +103,18 @@ pub struct AsyncPool {
     /// Round-robin selector. `Relaxed` is fine — we only care about
     /// even-ish distribution, not strict ordering.
     next: AtomicUsize,
+    /// How long [`run_coroutine_via_pool`] waits for a coroutine before it
+    /// gives the worker thread back.
+    ///
+    /// Every inbound message becomes a pyexec job, and an `async def` handler
+    /// parks its worker here for as long as the coroutine takes. Unbounded,
+    /// one handler that never settles costs that worker for the life of the
+    /// process, and the `py_executor` watchdog — which trips on "work
+    /// in-flight and nothing completed", independent of how full the pool is —
+    /// then aborts a process whose pool may be mostly idle. Sized under the
+    /// watchdog's stall window so a wedged handler is a failed call rather
+    /// than a failed node.
+    coroutine_timeout: Duration,
 }
 
 impl AsyncPool {
@@ -92,15 +137,33 @@ impl AsyncPool {
     /// once that runtime drops.  In production, pass the bootstrap
     /// runtime's `Handle::current()`.  In tests, use a long-lived
     /// static runtime.
-    pub fn install(size: usize, tokio_handle: TokioHandle) -> Arc<AsyncPool> {
+    pub fn install(
+        size: usize,
+        tokio_handle: TokioHandle,
+        coroutine_timeout: Duration,
+    ) -> Arc<AsyncPool> {
         if let Some(existing) = GLOBAL.get() {
             return Arc::clone(existing);
         }
         let size = size.max(1);
-        let pool = Arc::new(AsyncPool::spawn(size, tokio_handle));
+        let pool = Arc::new(AsyncPool::spawn(size, tokio_handle, coroutine_timeout));
         match GLOBAL.set(Arc::clone(&pool)) {
             Ok(()) => {
-                info!(size, "async script pool initialised");
+                info!(
+                    size,
+                    coroutine_timeout_secs = coroutine_timeout.as_secs(),
+                    "async script pool initialised"
+                );
+                let monitored = Arc::clone(&pool);
+                if let Err(error) = std::thread::Builder::new()
+                    .name("siphon-asyncio-heartbeat".to_string())
+                    .spawn(move || AsyncPool::run_heartbeat(monitored))
+                {
+                    // Not fatal: dispatch works without it, but a pinned
+                    // driver then shows up as handlers timing out with
+                    // nothing saying why.
+                    error!(%error, "could not start the asyncio driver heartbeat");
+                }
                 pool
             }
             Err(_) => {
@@ -122,7 +185,7 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
+    fn spawn(size: usize, tokio_handle: TokioHandle, coroutine_timeout: Duration) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
             drivers.push(spawn_driver(index, tokio_handle.clone()));
@@ -130,12 +193,100 @@ impl AsyncPool {
         Self {
             drivers,
             next: AtomicUsize::new(0),
+            coroutine_timeout,
+        }
+    }
+
+    /// How long a synchronous caller waits for a coroutine before giving its
+    /// worker thread back. See [`AsyncPool::coroutine_timeout`].
+    pub fn coroutine_timeout(&self) -> Duration {
+        self.coroutine_timeout
+    }
+
+    /// Whether this driver's loop has stopped running scheduled callbacks.
+    ///
+    /// True means something is blocking *on the loop thread* — a script API
+    /// that blocks (Diameter, HTTP auth, DNS) called from inside an
+    /// `async def` runs there, not on the worker. Every coroutine on that
+    /// driver is stopped for the duration, including ones belonging to calls
+    /// that never touched the blocking API.
+    fn driver_is_stalled(driver: &Driver) -> bool {
+        let pinged = driver.pinged.load(Ordering::Acquire);
+        let landed = driver.landed.load(Ordering::Acquire);
+        pinged.saturating_sub(landed) >= HEARTBEAT_MISSES_BEFORE_STALLED
+    }
+
+    /// Driver loops currently pinned by a blocking call.
+    pub fn stalled_drivers(&self) -> usize {
+        self.drivers
+            .iter()
+            .filter(|driver| Self::driver_is_stalled(driver))
+            .count()
+    }
+
+    /// Ping every driver once and report how many are stalled. Called on the
+    /// monitor's tick; also what the tests step by hand.
+    fn heartbeat_tick(&self) -> usize {
+        Python::attach(|python| {
+            for driver in &self.drivers {
+                let heartbeat = DriverHeartbeat {
+                    landed: Arc::clone(&driver.landed),
+                };
+                let Ok(callback) = Py::new(python, heartbeat) else {
+                    continue;
+                };
+                // `call_soon_threadsafe` only enqueues; the loop has to turn
+                // for the callback to run, which is exactly the property under
+                // test. A closed loop raises, and a driver whose loop is gone
+                // is not a stall worth reporting.
+                if driver
+                    .loop_obj
+                    .bind(python)
+                    .call_method1("call_soon_threadsafe", (callback,))
+                    .is_ok()
+                {
+                    driver.pinged.fetch_add(1, Ordering::Release);
+                }
+            }
+        });
+        self.stalled_drivers()
+    }
+
+    /// Run the heartbeat monitor until the process ends.
+    fn run_heartbeat(pool: Arc<AsyncPool>) {
+        let mut reported = 0usize;
+        loop {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            let stalled = pool.heartbeat_tick();
+            if let Some(registry) = crate::metrics::try_metrics() {
+                registry.async_drivers_stalled.set(stalled as i64);
+            }
+            if stalled != reported {
+                if stalled > reported {
+                    warn!(
+                        stalled,
+                        drivers = pool.drivers.len(),
+                        "asyncio driver loop pinned by a blocking call: every coroutine on it \
+                         is stopped until it returns. A script API that blocks (Diameter, HTTP \
+                         auth, DNS) called from inside an `async def` runs on the loop thread."
+                    );
+                } else {
+                    info!(stalled, "asyncio driver loops recovered");
+                }
+                reported = stalled;
+            }
         }
     }
 
     /// Submit a Python coroutine for execution on one of the pool's
     /// asyncio loops.  Returns a oneshot receiver that resolves with the
-    /// coroutine's result (or its exception, mapped to a `PyErr`).
+    /// coroutine's result (or its exception, mapped to a `PyErr`), and the
+    /// `concurrent.futures.Future` driving it.
+    ///
+    /// The caller keeps that future so it can `cancel()` a coroutine it has
+    /// stopped waiting for: dropping the receiver alone leaves the task
+    /// running on the driver loop for the life of the process, which is the
+    /// leak a timeout would otherwise trade the wedged thread for.
     ///
     /// Caller must already hold an attach scope on `python` — `coroutine`
     /// is a `Bound` reference into that scope.
@@ -143,11 +294,19 @@ impl AsyncPool {
         &self,
         python: Python<'py>,
         coroutine: &Bound<'py, PyAny>,
-    ) -> PyResult<oneshot::Receiver<PyResult<Py<PyAny>>>> {
+    ) -> PyResult<SubmittedCoroutine> {
         if self.drivers.is_empty() {
             return Err(PyRuntimeError::new_err("async pool has no drivers"));
         }
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.drivers.len();
+        // Round-robin, but step over a driver whose loop is pinned: handing a
+        // coroutine to a stalled loop buys it a timeout rather than a turn.
+        // Falls back to the round-robin pick when every driver is stalled —
+        // there is nowhere better, and the wait is bounded either way.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let index = (0..self.drivers.len())
+            .map(|offset| (start + offset) % self.drivers.len())
+            .find(|candidate| !Self::driver_is_stalled(&self.drivers[*candidate]))
+            .unwrap_or(start % self.drivers.len());
         let driver_loop = self.drivers[index].loop_obj.bind(python);
 
         // Sanity-check: pyo3-async-runtimes will drop responses into a closed
@@ -172,7 +331,7 @@ impl AsyncPool {
         };
         let py_bridge = Py::new(python, bridge)?;
         cf.call_method1("add_done_callback", (py_bridge,))?;
-        Ok(receiver)
+        Ok((receiver, cf.unbind()))
     }
 }
 
@@ -222,6 +381,8 @@ fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
         DriverHandshake::Ready(loop_obj) => Driver {
             loop_obj,
             thread: StdMutex::new(Some(thread)),
+            pinged: Arc::new(AtomicU64::new(0)),
+            landed: Arc::new(AtomicU64::new(0)),
         },
         DriverHandshake::Failed(message) => {
             // We can't recover from a missing asyncio loop; abort.
@@ -399,7 +560,10 @@ pub(crate) fn run_coroutine_via_pool(
         return Ok(None);
     };
 
-    let receiver = pool.submit(python, coroutine)?;
+    // The handler's name, read before the coroutine is handed over: after a
+    // timeout the only thing that says which handler wedged is this log line.
+    let handler = coroutine_name(coroutine);
+    let (receiver, future) = pool.submit(python, coroutine)?;
 
     // We need to await the oneshot synchronously.  `Handle::current()`
     // works inside `tokio::task::spawn_blocking`; if the caller isn't
@@ -426,15 +590,65 @@ pub(crate) fn run_coroutine_via_pool(
     // py_executor pool / `spawn_blocking` threads that already reach this path
     // it is the same passthrough those callers use elsewhere (blocking.rs,
     // engine.rs, diameter.rs).
-    let outcome = python.detach(|| tokio::task::block_in_place(|| runtime.block_on(receiver)));
+    //
+    // Bounded, because this is the one place every `async def` handler in the
+    // process funnels through. The responder is a done-callback on the
+    // `concurrent.futures.Future`; a coroutine that never settles never fires
+    // it and never drops the sender either, so not even `RecvError` arrives
+    // and the wait has no other way out. Unbounded, one such handler costs
+    // this worker for the life of the process, and the `py_executor` watchdog
+    // — which trips on "work in-flight, nothing completed" whatever the pool's
+    // fill — then aborts a node that still had idle workers and an empty
+    // queue.
+    let timeout = pool.coroutine_timeout();
+    let outcome = python.detach(|| {
+        tokio::task::block_in_place(|| runtime.block_on(tokio::time::timeout(timeout, receiver)))
+    });
 
     match outcome {
-        Ok(Ok(value)) => Ok(Some(value)),
-        Ok(Err(py_err)) => Err(py_err),
-        Err(_recv_err) => Err(PyValueError::new_err(
+        Ok(Ok(Ok(value))) => Ok(Some(value)),
+        Ok(Ok(Err(py_err))) => Err(py_err),
+        Ok(Err(_recv_err)) => Err(PyValueError::new_err(
             "async pool driver dropped the coroutine sender before completion",
         )),
+        Err(_elapsed) => {
+            // Cancel on the way out: the coroutine is still scheduled on its
+            // driver, and abandoning it only would trade a wedged worker for a
+            // task that lives for ever.
+            let cancelled = future
+                .bind(python)
+                .call_method0("cancel")
+                .and_then(|value| value.extract::<bool>())
+                .unwrap_or(false);
+            error!(
+                handler = %handler,
+                timeout_secs = timeout.as_secs(),
+                cancelled,
+                "async script handler did not settle within the coroutine timeout;                  giving the worker thread back and failing this call. The handler is                  awaiting something that never completes — an unbounded backend call,                  a DNS lookup, or a future nothing resolves."
+            );
+            Err(PyTimeoutError::new_err(format!(
+                "async handler '{handler}' did not settle within {}s",
+                timeout.as_secs()
+            )))
+        }
     }
+}
+
+/// The handler name behind a coroutine object, for the timeout log line.
+///
+/// `__qualname__` names the `async def` the script author wrote; the code
+/// object's name is the fallback for a coroutine built some other way.
+fn coroutine_name(coroutine: &Bound<'_, PyAny>) -> String {
+    coroutine
+        .getattr("__qualname__")
+        .and_then(|value| value.extract::<String>())
+        .or_else(|_| {
+            coroutine
+                .getattr("cr_code")
+                .and_then(|code| code.getattr("co_name"))
+                .and_then(|value| value.extract::<String>())
+        })
+        .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 #[cfg(test)]
@@ -442,7 +656,7 @@ mod tests {
     use super::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
     use std::ffi::CString;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -527,10 +741,14 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Short enough that a wedged-coroutine test finishes, long enough that a
+    /// normal coroutine in these tests never races it.
+    const TEST_COROUTINE_TIMEOUT: Duration = Duration::from_secs(3);
+
     fn ensure_pool() -> Arc<AsyncPool> {
         Python::initialize();
         Python::attach(install_test_module);
-        AsyncPool::install(2, test_runtime().handle().clone())
+        AsyncPool::install(2, test_runtime().handle().clone(), TEST_COROUTINE_TIMEOUT)
     }
 
     /// Build a coroutine factory from a Python source string.  Returns
@@ -1099,5 +1317,170 @@ mod tests {
                 "expected raised exception, got {error}"
             );
         });
+    }
+
+    /// The reproduction for the incident this bound exists for.
+    ///
+    /// An `async def` handler that never settles used to park its worker
+    /// thread for the life of the process: the responder is a done-callback on
+    /// the `concurrent.futures.Future`, so a coroutine that never resolves
+    /// never fires it and never drops the sender either — not even `RecvError`
+    /// arrives. On a node whose handlers are all async, a few of these take
+    /// every worker, `completed` goes flat, and the `py_executor` watchdog
+    /// aborts the process.
+    ///
+    /// The worker must come back, with an error naming the handler, and the
+    /// abandoned coroutine must be cancelled rather than left on the driver.
+    #[test]
+    fn a_coroutine_that_never_settles_gives_the_worker_back() {
+        let _serial = pool_test_guard();
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let before = count_pending_tasks_per_driver().await;
+
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    concat!(
+                        "import asyncio\n",
+                        "async def wedged_handler():\n",
+                        "    await asyncio.Event().wait()\n",
+                        "def factory():\n",
+                        "    return wedged_handler()\n",
+                    ),
+                ))
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = tokio::task::spawn_blocking(move || {
+                Python::attach(|python| {
+                    let coro = factory.bind(python).call0().unwrap();
+                    let result = run_coroutine_via_pool(python, &coro);
+                    result.map(|_| ()).map_err(|error| error.to_string())
+                })
+            })
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+
+            let message = outcome.expect_err("a coroutine that never settles must not succeed");
+            assert!(
+                message.contains("wedged_handler"),
+                "the error names the handler that wedged, got: {message}"
+            );
+            assert!(
+                message.contains("TimeoutError"),
+                "the error is a timeout, got: {message}"
+            );
+            assert!(
+                elapsed >= TEST_COROUTINE_TIMEOUT,
+                "returned before the timeout ({elapsed:?})"
+            );
+            assert!(
+                elapsed < TEST_COROUTINE_TIMEOUT * 4,
+                "the worker was parked well past the timeout ({elapsed:?})"
+            );
+
+            // The abandoned coroutine is cancelled, not left running: dropping
+            // the receiver alone would trade a wedged thread for a task that
+            // lives for ever on the driver loop.
+            flush_drivers().await;
+            force_python_gc();
+            flush_drivers().await;
+            let after = count_pending_tasks_per_driver().await;
+            assert_eq!(
+                after.iter().sum::<usize>(),
+                before.iter().sum::<usize>(),
+                "the timed-out coroutine is still scheduled on a driver loop"
+            );
+        });
+    }
+
+    /// A driver loop pinned by a blocking call is reported, and recovers.
+    ///
+    /// This is the failure the coroutine timeout alone cannot fix: the worker
+    /// gets its thread back, but the loop stays parked and every coroutine on
+    /// it — including calls that never touched the blocking API — is stopped.
+    /// Without a signal for it, bounding the wait turns a loud crash into a
+    /// node that quietly fails async dispatch.
+    #[test]
+    fn a_driver_pinned_by_a_blocking_call_is_reported_stalled() {
+        let _serial = pool_test_guard();
+        test_runtime().block_on(async move {
+            let pool = ensure_pool();
+            // Settle: a pool that has just run other tests may owe a ping.
+            for _ in 0..HEARTBEAT_MISSES_BEFORE_STALLED + 2 {
+                pool.heartbeat_tick();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(pool.heartbeat_tick(), 0, "a turning pool has no stalls");
+
+            // Pin every driver the way a blocking script API does: a callback
+            // that sleeps on the loop thread itself.
+            let release = Arc::new(AtomicBool::new(false));
+            let blocked = Arc::new(AtomicUsize::new(0));
+            Python::attach(|python| {
+                for driver in &pool.drivers {
+                    let callback = Py::new(
+                        python,
+                        BlockingCallback {
+                            release: Arc::clone(&release),
+                            entered: Arc::clone(&blocked),
+                        },
+                    )
+                    .unwrap();
+                    driver
+                        .loop_obj
+                        .bind(python)
+                        .call_method1("call_soon_threadsafe", (callback,))
+                        .unwrap();
+                }
+            });
+            while blocked.load(Ordering::Acquire) < pool.drivers.len() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            for _ in 0..HEARTBEAT_MISSES_BEFORE_STALLED + 1 {
+                pool.heartbeat_tick();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                pool.stalled_drivers(),
+                pool.drivers.len(),
+                "a loop blocked on its own thread must be reported stalled"
+            );
+
+            release.store(true, Ordering::Release);
+            let mut recovered = false;
+            for _ in 0..100 {
+                pool.heartbeat_tick();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if pool.stalled_drivers() == 0 {
+                    recovered = true;
+                    break;
+                }
+            }
+            assert!(recovered, "the drivers must clear once the block returns");
+        });
+    }
+
+    /// A callback that parks the driver loop it runs on until released — what
+    /// a blocking script API does when called from inside an `async def`.
+    #[pyclass]
+    struct BlockingCallback {
+        release: Arc<AtomicBool>,
+        entered: Arc<AtomicUsize>,
+    }
+
+    #[pymethods]
+    impl BlockingCallback {
+        fn __call__(&self, python: Python<'_>) {
+            self.entered.fetch_add(1, Ordering::Release);
+            python.detach(|| {
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
     }
 }

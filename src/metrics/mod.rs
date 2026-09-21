@@ -358,6 +358,12 @@ pub struct SiphonMetrics {
     /// handlers are not draining fast enough (blocking I/O, a wedged backend).
     /// Sampled by the pool watchdog.
     pub pyexec_queue_depth: IntGauge,
+    /// Asyncio driver loops pinned by a blocking call, so every coroutine on
+    /// them is stopped while the executor pool still looks healthy. A script
+    /// API that blocks (Diameter, HTTP auth, DNS) runs on the loop thread when
+    /// called from inside an `async def`. Equal to the driver count means no
+    /// coroutine in the process is progressing.
+    pub async_drivers_stalled: IntGauge,
     /// Handler jobs completed by the pool. With `pyexec_inflight` pinned at the
     /// pool size, a flat `completed` rate is the precise signal that the pool
     /// has wedged (zero forward progress) — what the watchdog aborts on.
@@ -773,6 +779,10 @@ impl SiphonMetrics {
             "siphon_pyexec_inflight",
             "Handler jobs currently executing on a Python executor pool worker",
         )?;
+        let async_drivers_stalled = IntGauge::new(
+            "siphon_async_drivers_stalled",
+            "Asyncio driver loops pinned by a blocking call (no scheduled callback ran within the heartbeat deadline)",
+        )?;
         let pyexec_queue_depth = IntGauge::new(
             "siphon_pyexec_queue_depth",
             "Handler jobs waiting in the Python executor pool's bounded queue",
@@ -1136,6 +1146,7 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_pool_max.clone()))?;
         registry.register(Box::new(pyexec_inflight.clone()))?;
         registry.register(Box::new(pyexec_queue_depth.clone()))?;
+        registry.register(Box::new(async_drivers_stalled.clone()))?;
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
@@ -1206,6 +1217,7 @@ impl SiphonMetrics {
             memory_metadata_bytes,
             python_allocated_blocks,
             script_errors_total,
+            async_drivers_stalled,
             pyexec_pool_size,
             pyexec_pool_max,
             pyexec_inflight,
