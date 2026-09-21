@@ -89,6 +89,17 @@ pub fn b_leg_provisional(
         // reach the caller as the script left them.
         let mut reply_shaped_headers: Vec<String> = Vec::new();
         if has_sdp_body {
+            if let Err(error) =
+                control_dial_media_answer(call_id, message, response_source.ip(), state)
+            {
+                error!(%call_id, %error, "control dial early media failed");
+                // Never forward an unanchored answer after promising a media
+                // profile. Cancel the outstanding legs and resolve the call.
+                let cancelled = state.call_actors.cancel_ringing_branches(call_id);
+                cancel_settled_branches(&cancelled, state);
+                report_control_dial_failure(call_id, 503, "Media negotiation failed", false, state);
+                return;
+            }
             let engine_state = state.engine.state();
             let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
             if !handlers.is_empty() {

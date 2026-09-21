@@ -215,6 +215,7 @@ async fn a_control_dial_refuses_when_the_policy_cannot_relay_a_required_extensio
         true,
         30,
         &[],
+        None,
         &dispatcher.state,
     );
     assert!(matches!(dialled, Ok(true)), "{dialled:?}");
@@ -234,6 +235,7 @@ async fn a_control_dial_goes_ahead_under_a_policy_that_relays_the_extension() {
         true,
         30,
         &[],
+        None,
         &dispatcher.state,
     );
     assert!(matches!(dialled, Ok(true)), "{dialled:?}");
