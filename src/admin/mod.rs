@@ -906,6 +906,8 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             // Not a pool figure, but read with them: a pinned asyncio driver
             // stops every coroutine on it while the pool itself looks healthy.
             "async_drivers_stalled": metrics.async_drivers_stalled.get(),
+            // Part of `inflight` that is never coming back.
+            "jobs_abandoned": metrics.pyexec_jobs_abandoned_total.get(),
         },
         // Every optional subsystem below is `null` when it is not configured on
         // this node, so the dashboard can render "not configured" rather than a
