@@ -1,0 +1,12 @@
+{
+  "routes": [
+    {
+      "carrier_id": "carrier-asserted-identity",
+      "next_hop": "sip:172.20.0.221:5060",
+      "caller_id": "+15550100777",
+      "caller_id_presentation": "restricted",
+      "timeout_secs": 5
+    }
+  ],
+  "cache_ttl_secs": 0
+}

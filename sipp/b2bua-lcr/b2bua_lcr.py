@@ -14,6 +14,13 @@ so does the ring bound below:
   100 and rings out at its 3 s ``timeout_secs``, inside a 6 s ring bound, and the
   call fails 503. The rejecting carrier's later 183 must not reach the caller,
   and the rejecting carrier must never be sent a CANCEL.
+- +15550100005 (routes.15550100005.json): one carrier, whose route names a
+  ``caller_id`` and a restricted presentation. The call is ordinary from the
+  caller's side; the carrier asserts what reached it — a P-Asserted-Identity
+  carrying the presented number, an anonymised From, and ``Privacy: id``. The
+  caller sends its own P-Asserted-Identity, which the header policy strips at
+  the trust boundary, so the one the carrier sees is siphon's assertion and not
+  a relayed copy of the access leg's.
 
 ``@b2bua.on_failure`` decides nothing. A failure the sequence ends on is
 therefore relayed to the caller as the carrier sent it, or as siphon's own 408

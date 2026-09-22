@@ -97,7 +97,7 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `destination` | string? | Retarget this carrier at a different destination number (RFC 3261 §16.5). Overrides the answer-level `destination`. Bare number or a URI (userpart only). |
 | `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`), after `number_policy` has shaped the number. |
 | `number_policy` | string? | Named `number_policies:` preset for this carrier's B-leg: shapes the dialled number in the R-URI and the From/To/PAI identity alike. Absent = `b2bua.default_number_policy`, as for `call.dial()`. A name that is not configured shapes nothing and is logged at warn. |
-| `caller_id` | string? | Calling number this carrier is presented (the CLI). Tag-preserving; also applied to PAI/PPI. |
+| `caller_id` | string? | Calling number this carrier is presented (the CLI). Tag-preserving; also applied to PAI/PPI, and a PAI is asserted when the leg has none (`b2bua.assert_identity`). |
 | `caller_id_presentation` | string? | `allowed` (default) or `restricted` — CLIR per RFC 3323 / TS 24.607. |
 | `rate` | number? | Per-minute rate (CDR/charging). |
 | `currency` | string? | ISO 4217. |
@@ -215,8 +215,8 @@ Top-level:
   `To`: it is a carrier routing artifact that belongs to the R-URI, not to the
   called-party identity. `number_policy` still owns `To`'s format on top.
 - **Presented CLI and CLIR** — `caller_id` substitutes the calling number this
-  carrier sees, on `From` and on `P-Asserted-Identity` / `P-Preferred-Identity`
-  where present. It goes through the tag-preserving identity path, which is why
+  carrier sees, on `From` and on `P-Asserted-Identity` / `P-Preferred-Identity`.
+  It goes through the tag-preserving identity path, which is why
   it is a field rather than something for `headers`: a `From` written without
   its dialog tag breaks every subsequent in-dialog request, and only surfaces
   later, on the ACK. `number_policy` reshapes the *format* of whatever number is
@@ -227,9 +227,12 @@ Top-level:
 
   - `From` becomes `"Anonymous" <sip:anonymous@anonymous.invalid>`, tag intact
   - `Privacy: id` is asserted (RFC 3325 §7), appended to any existing value
-  - `P-Asserted-Identity` keeps the real identity for the trusted next hop —
+  - `P-Asserted-Identity` carries the real identity to the trusted next hop —
     that is how the network stays able to identify the caller for regulatory and
-    emergency purposes
+    emergency purposes. It is *asserted* from the `From` when the leg has none,
+    which is the usual case on a B-leg: the header policy strips `P-*` at the
+    trust boundary, so `Privacy: id` would otherwise be a privacy request with
+    nothing behind it
   - `P-Preferred-Identity` is removed: it is the UA's *request* for what to
     assert, and forwarding it past a privacy boundary re-leaks the number
 
@@ -237,10 +240,14 @@ Top-level:
   number in `From` leaks it to every carrier that renders `From` rather than
   PAI, which defeats CLIR while looking like it works.
 
-  Ordering is fixed: `caller_id` is substituted **before** `number_policy`
-  reshapes formats, and anonymisation runs **after** — so under `restricted` the
-  substituted number still reaches PAI, and no policy tries to reformat
-  `anonymous` as a number. An unrecognised `caller_id_presentation` is logged
+  Ordering is fixed, and each step needs the one before it: `caller_id` is
+  substituted first, the identity is **asserted** second (so the PAI carries the
+  presented number, not the caller's own), `number_policy` reshapes formats
+  third (so the PAI and the `From` agree), and anonymisation runs last (so a
+  restricted route naming no `caller_id` still asserts the real identity, and no
+  policy tries to reformat `anonymous` as a number). The assertion is
+  `b2bua.assert_identity`, on by default; turn it off for a next hop genuinely
+  outside the trust domain. An unrecognised `caller_id_presentation` is logged
   and treated as `restricted`, because a withheld call going out with the real
   number is the failure that matters.
 

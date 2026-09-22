@@ -411,10 +411,23 @@ pub fn build_originate_invite(
     // with no audio, so it is refused here rather than placed.
     originate_check_body(&invite, &params.media)?;
 
-    // CLIR last of all — anonymisation is the final identity step, or a custom
-    // From / P-Asserted-Identity header set after it would undo it
-    // (RFC 3323 §4.1 / TS 24.607).
+    // A restricted originate needs something for `Privacy: id` to withhold
+    // (RFC 3325 §7): the trusted next hop identifies the caller by the PAI, so
+    // anonymising the From over an absent one leaves a privacy request nobody
+    // can honour correctly. Asserted from the From while it still holds the
+    // real identity, and only when the caller did not supply its own
+    // `p_asserted_identity` — an explicit one is the caller's decision and is
+    // already on the message, so this is a no-op there.
+    //
+    // Scoped to the restricted path on purpose. An unrestricted originate is a
+    // call the caller composed header by header; the B-leg builder's assertion
+    // exists because a *relayed* leg has had its P-* stripped by the header
+    // policy, which never happened here.
     if params.privacy == Some(crate::sip::privacy::CallerIdPresentation::Restricted) {
+        crate::sip::privacy::assert_calling_identity(&mut invite);
+        // CLIR last of all — anonymisation is the final identity step, or a
+        // custom From / P-Asserted-Identity header set after it would undo it
+        // (RFC 3323 §4.1 / TS 24.607).
         crate::sip::privacy::restrict_calling_identity(&mut invite);
     }
     Ok(invite)

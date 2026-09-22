@@ -6,6 +6,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+
+- **A B2BUA B-leg now carries a `P-Asserted-Identity` when it has none**, built
+  from its `From` after the header policy has run (RFC 3325 §9.1). This is a
+  behaviour change on upgrade: every B-leg gets one, not only routes that name a
+  `caller_id` or restrict the presentation. Turn it off per node with
+  `b2bua.assert_identity: false` for a next hop genuinely outside the trust
+  domain.
+
+  The gap it closes is that nothing ever *inserted* a PAI. `set_calling_number`
+  — what a route's `caller_id` goes through — only rewrites the header when it
+  is already present, and on a B-leg it usually is not: the header policy
+  strips `P-*` off an untrusted access leg, which is correct, because what a UE
+  sent is not an assertion siphon can make. So a route naming `caller_id`
+  reached the carrier with the presented number in `From` and no asserted
+  identity at all, which is the one header most carriers ask for.
+
+  CLIR had the same hole from the other side. `Privacy: id` asks the trusted
+  next hop to withhold the identity *it was given*; asserted over an absent PAI
+  there is nothing to withhold and nothing left to identify the caller by for
+  regulatory or emergency purposes — a privacy request the next hop cannot
+  honour correctly. siphon now asserts the real identity immediately before
+  anonymising the `From`, which is the only point at which the `From` still
+  holds it.
+
+  The ordering inside a B-leg is `caller_id` → assert → number policy → CLIR,
+  and each step needs the one before it: asserting after the substitution puts
+  the *presented* number in the PAI rather than the caller's own, asserting
+  before the number policy keeps the PAI and the `From` in one format, and
+  asserting before the anonymisation is what gives `Privacy: id` something real
+  to withhold. A PAI already on the message is left alone — the network has
+  already decided — and an anonymous `From` asserts nothing, because that would
+  make CLIR look honoured while identifying no one. The same assertion runs on
+  a restricted `b2bua.originate`, and yields to an explicit
+  `p_asserted_identity` parameter there.
+
 ### Added
 
 - **The control plane's `dial` verb presents a calling identity of the

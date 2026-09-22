@@ -8262,6 +8262,34 @@ services:
     profiles:
       - b2bua-lcr
 
+  # The asserted-identity case (b2bua_lcr_asserted_identity_uac.xml): the callee
+  # +15550100005 is routed over b2bua-lcr/routes.15550100005.json, one carrier
+  # whose route names caller_id +15550100777 and a restricted presentation. The
+  # carrier is the only party that can see what left siphon, so it is where the
+  # P-Asserted-Identity, the anonymised From and Privacy: id are asserted.
+  sipp-b2bua-lcr-asserted-identity-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-lcr-asserted-identity-uas
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.221
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_asserted_identity_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-lcr
+
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   # siphon's CDR file, shared with the assertion one-shot. Removed by

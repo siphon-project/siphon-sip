@@ -295,18 +295,27 @@ carrier. `number_policy` above reshapes the *format* of whatever number is
 already there; these two substitute a different one, and withhold it.
 
 - **`caller_id`** — the number this carrier is presented, on `From` and on
-  `P-Asserted-Identity` / `P-Preferred-Identity` where present. It is a field
-  rather than something for `headers` because it goes through the
-  tag-preserving identity path: a `From` written by hand loses the dialog tag,
-  the INVITE still goes out, and the breakage only surfaces later on the ACK.
+  `P-Asserted-Identity` / `P-Preferred-Identity`. It is a field rather than
+  something for `headers` because it goes through the tag-preserving identity
+  path: a `From` written by hand loses the dialog tag, the INVITE still goes
+  out, and the breakage only surfaces later on the ACK.
+
+    The PAI is *inserted* when the leg has none, which is the usual case: the
+    header policy strips `P-*` off an untrusted access leg, correctly, so there
+    is nothing left to rewrite by the time a route's `caller_id` is applied.
+    siphon asserts its own rather than relaying the UE's (`b2bua.assert_identity`,
+    on by default — set it to `false` for a next hop genuinely outside the trust
+    domain).
 - **`caller_id_presentation`** — `"allowed"` (the default) or `"restricted"`
   for CLIR (RFC 3323 §4.1, 3GPP TS 24.607). `restricted` does four things
   together:
     - `From` becomes `"Anonymous" <sip:anonymous@anonymous.invalid>`, tag intact
     - `Privacy: id` is asserted (RFC 3325 §7), appended to any existing value
-    - `P-Asserted-Identity` keeps the real identity for the trusted next hop, so
-      the network can still identify the caller for regulatory and emergency
-      purposes
+    - `P-Asserted-Identity` carries the real identity to the trusted next hop,
+      so the network can still identify the caller for regulatory and emergency
+      purposes — asserted from the `From` just before it is anonymised when the
+      leg has none, because `Privacy: id` over an absent PAI is a privacy
+      request the next hop cannot honour and a regulatory gap at once
     - `P-Preferred-Identity` is removed, since it is the UA's *request* for what
       to assert and forwarding it past a privacy boundary re-leaks the number
 
@@ -332,10 +341,14 @@ that wants CLIR has to say so. Set it on every route in the sequence when the
 call is withheld, or the call goes out anonymous on the cheapest carrier and
 with the real number on the failover.
 
-Ordering inside one route is fixed: `caller_id` substitutes first,
-`number_policy` reshapes formats second, and anonymisation runs last. So under
-`restricted` the substituted number still reaches PAI, and no policy tries to
-reformat `anonymous` as a number. An unrecognised `caller_id_presentation` is
+Ordering inside one route is fixed: `caller_id` substitutes first, the identity
+is asserted second, `number_policy` reshapes formats third, and anonymisation
+runs last. Each step depends on the one before it. Asserting after the
+substitution is what puts the *presented* number in the PAI rather than the
+caller's own; asserting before the number policy is what keeps the PAI and the
+`From` in the same format; and asserting before the anonymisation is what gives
+`Privacy: id` a real identity to withhold on a restricted route that names no
+`caller_id`. No policy ever tries to reformat `anonymous` as a number. An unrecognised `caller_id_presentation` is
 logged and treated as `restricted`, because a withheld call going out with the
 real number is the failure that matters.
 
