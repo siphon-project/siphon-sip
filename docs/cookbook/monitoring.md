@@ -29,6 +29,10 @@ SIPhon exports built-in gauges/counters; the ones worth alerting on:
 | `siphon_ro_denials_total` | `rate() > 0` | Calls being refused credit by the OCS |
 | `siphon_ro_credit_teardowns_total{reason="no_teardown_hook"}` | `increase() > 0` | Credit ran out with nothing wired to enforce it — the call is still up, and unpaid |
 | `siphon_diameter_inbound_answers_total{result_code="3002"}` | `rate() > 0` | Server role only: siphon is rejecting inbound requests because no `@diameter.on_request` handler matched — a script gap, not a peer problem |
+| `siphon_diameter_inbound_answers_total{result_code="5012"}` | `rate() > 0` | Server role only: an `@diameter.on_request` handler raised or returned the wrong type. Distinct from 3002 on purpose — on Ro a 3002 reads as a credit denial and tears the call down |
+| `siphon_gateway_source_last_success_timestamp_seconds` | `time() - <gauge> > 3 * refresh_secs`, or `== 0` | The carriers are stale: siphon kept the last set it read and the controller has been unreadable since. `0` = never read, so a node that booted into a controller outage has no carriers from the source |
+| `siphon_gateway_source_failures_total` | sustained `rate() > 0` | Reads are failing now; the timestamp above says for how long |
+| `siphon_registrant_source_last_success_timestamp_seconds` / `_failures_total` | same pair | Outbound trunk registrations, tracked separately — a node can route over stale carriers with current registrations, or the reverse |
 
 See [Handler execution model](../handler-execution-model.md) for the pool internals.
 

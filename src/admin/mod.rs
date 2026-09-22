@@ -845,6 +845,22 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         "jemalloc_active": crate::metrics::jemalloc_is_active(),
         "registrations_active": registrations,
         "gateways": gateways,
+        // Whether the provisioning sources are being read. A node whose
+        // controller went down keeps serving the last set it read, correctly
+        // and indefinitely, so nothing else on this page says the carriers or
+        // trunks are hours stale. `last_success` is 0 until the first
+        // successful read — the state of a node that booted against a dead
+        // controller, which has none at all.
+        "provisioning": {
+            "gateway": {
+                "last_success": metrics.gateway_source_last_success_timestamp_seconds.get(),
+                "failures": metrics.gateway_source_failures_total.get(),
+            },
+            "registrant": {
+                "last_success": metrics.registrant_source_last_success_timestamp_seconds.get(),
+                "failures": metrics.registrant_source_failures_total.get(),
+            },
+        },
         "sip": {
             "dialogs_active": metrics.dialogs_active.get(),
             // The two halves of `dialogs_active`. Which side carries the load is

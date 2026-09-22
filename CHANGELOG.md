@@ -8,6 +8,41 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A node no longer comes up with no carriers, quietly, when its controller is
+  down.** `gateway.backend`'s reconcile loop did its first fetch inside itself,
+  so the listeners bound and the node began answering calls while the carriers
+  were still being read — or, if the source was unreachable, with none at all
+  and a single `warn` to say so. The "an unreadable source is not evidence the
+  carriers went away, so keep the current set" rule is right for a running node
+  and has nothing to keep at start-up. siphon now reads the source **before the
+  listeners take traffic**, retrying on a short backoff within a bounded budget.
+  The budget is bounded on purpose: a node that cannot reach its controller
+  still has to come up to answer a health probe, export the gauge that is the
+  alert, and accept the `POST /admin/gateways/refresh` a recovering controller
+  pushes at it. When it gives up it says so at `error`, naming what it is
+  missing.
+
+  A failed poll no longer sleeps out the whole `refresh_secs` either — retries
+  back off from 250 ms and are capped at the refresh interval, so a controller
+  that comes back is followed in seconds rather than up to an interval later,
+  and one that stays down is never polled harder than a healthy one. The
+  registrant source gets the same backoff; its loop is spawned after the
+  listeners and nothing inbound depends on it, so it keeps that ordering.
+
+  **Four new metrics**, because none existed for either source and "this node
+  has been serving a stale carrier set for six hours" was invisible:
+  `siphon_gateway_source_last_success_timestamp_seconds`,
+  `siphon_gateway_source_failures_total`, and the same pair for
+  `registrant_source`. Alert on the age of the timestamp and the rate of the
+  counter; `0` on the timestamp means the source has never been read at all.
+  Both pairs also appear on `/admin/metrics.json` under `provisioning`.
+
+  Repeated failures now escalate: the first of a streak stays `warn` (a blip is
+  not an outage), the second is an `error`, and the rest are throttled to one
+  line a minute carrying the streak length and how many were suppressed. At the
+  default 30 s refresh a six-hour outage used to be 720 identical `warn` lines,
+  which is how an outage reads as normal.
+
 - **A script reload no longer re-executes every siphon process sharing a
   directory, and `reload: sighup` finally reloads on SIGHUP.** Three defects
   with one cost between them: a reload re-executes the script in a fresh

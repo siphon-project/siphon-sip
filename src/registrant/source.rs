@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::auth::StoredSecret;
+use crate::source_health::{Backoff, SourceHealth};
 
 /// Version of the JSON contract the `http` source speaks.
 pub const CONTRACT_VERSION: &str = "1";
@@ -681,10 +682,14 @@ pub async fn reconcile_loop(
         refresh_secs = interval.as_secs(),
         "outbound registrations follow a configured source"
     );
+    let mut health = SourceHealth::new(crate::source_health::SourceKind::Registrant);
+    let mut backoff = Backoff::new(interval);
 
     loop {
-        match reconcile_once(&manager, &source).await {
+        let delay = match reconcile_once(&manager, &source).await {
             Ok(report) => {
+                health.record_success();
+                backoff.reset();
                 if report.added + report.updated + report.removed + report.rejected > 0 {
                     info!(
                         added = report.added,
@@ -694,14 +699,26 @@ pub async fn reconcile_loop(
                         "registrant source reconciled"
                     );
                 }
+                interval
             }
             Err(error) => {
-                // Left alone on purpose: an unreadable source is not evidence
-                // that the trunks went away.
-                warn!(%error, "registrant source unreadable — keeping the current registrations");
+                // The current registrations are left alone on purpose: an
+                // unreadable source is not evidence that the trunks went away.
+                // But the retry comes sooner than the next interval, so a
+                // controller that comes back is followed in seconds — and the
+                // streak is counted and escalated, because a `warn` per poll at
+                // the default 30 s refresh makes a six-hour outage 720 lines
+                // that read as normal.
+                //
+                // Unlike the gateway source this loop is spawned *after* the
+                // listeners bind, so there is no start-up ordering to close:
+                // nothing inbound depends on a trunk registration, and the
+                // worst a slow first read costs is a late REGISTER.
+                health.record_failure(&error);
+                backoff.next_delay()
             }
-        }
-        tokio::time::sleep(interval).await;
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 

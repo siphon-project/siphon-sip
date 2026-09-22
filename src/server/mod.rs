@@ -560,7 +560,7 @@ impl SiphonServer {
         let pre_rtpengine = dispatcher::init_rtpengine(&config, rtpengine_events_tx.clone());
 
         // --- Gateway dispatcher ---
-        let gateway_manager = init_gateway(&config);
+        let gateway_manager = init_gateway(&config).await;
 
         // --- CDR singleton ---
         if config.cdr.is_some() {

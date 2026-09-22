@@ -40,6 +40,7 @@ pub mod server;
 pub mod shutdown;
 pub mod sip;
 pub mod siprec;
+pub mod source_health;
 pub mod srs;
 pub mod stir;
 pub mod subscribe_state;

@@ -328,7 +328,7 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
     info!("iFC Redis backend writer initialized");
 }
 
-pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
+pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     use crate::gateway::{
         extract_address_from_uri, resolve_address, Algorithm, Destination, DispatcherGroup,
         ProbeConfig,
@@ -475,7 +475,7 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     // `call.from_gateway` can test source membership without a Python
     // round-trip (points at the same manager as the Python singleton).
     crate::script::api::set_gateway_manager(Arc::clone(&manager));
-    init_gateway_source(&manager, config, gateway_config);
+    init_gateway_source(&manager, config, gateway_config).await;
 
     Some(manager)
 }
@@ -484,7 +484,20 @@ pub(super) fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
 ///
 /// Runs after the `gateway.groups` are built, so the first reconcile sees them
 /// and leaves them alone — a source owns only the groups it created itself.
-fn init_gateway_source(
+///
+/// **Awaits a first read before returning**, retrying on a short backoff within
+/// a bounded budget, and only then spawns the poll loop. The loop used to do
+/// its own first fetch, so a node bound its listeners and began answering calls
+/// while the carriers were still being read — or, when the controller was down,
+/// with no carriers at all and a single `warn` to say so. The "keep the current
+/// set" rule that makes a failed poll harmless on a running node has nothing to
+/// keep at start-up.
+///
+/// The budget is bounded rather than open-ended: a node that cannot reach its
+/// controller still has to come up to answer a health probe, serve the
+/// last-success gauge that is the alert, and accept the admin refresh a
+/// recovering controller pushes at it.
+async fn init_gateway_source(
     manager: &Arc<crate::gateway::DispatcherManager>,
     config: &Config,
     gateway_config: &crate::config::GatewayConfig,
@@ -520,9 +533,17 @@ fn init_gateway_source(
 
     let source = Arc::new(source);
     crate::gateway::source::set_source(Arc::clone(&source));
+
+    // Read it once before the listeners take traffic, carrying the attempt's
+    // failure streak into the loop so a node that came up against a dead
+    // controller does not restart its escalation from scratch.
+    let mut health =
+        crate::source_health::SourceHealth::new(crate::source_health::SourceKind::Gateway);
+    crate::gateway::source::reconcile_at_startup(manager, &source, &mut health).await;
+
     let loop_manager = Arc::clone(manager);
     tokio::spawn(async move {
-        crate::gateway::source::reconcile_loop(loop_manager, source).await;
+        crate::gateway::source::reconcile_loop(loop_manager, source, health).await;
     });
 }
 

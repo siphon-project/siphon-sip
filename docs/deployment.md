@@ -240,6 +240,9 @@ Scrape `/metrics`. The handful that matter operationally:
 | `siphon_pyexec_jobs_shed_total` | sustained `rate() > 0` | Handler pool saturated + queue full → SIP retransmits. Raise `sync_pool_max` or speed up handlers. |
 | `siphon_pyexec_pool_size` vs `_pool_max` | `pool_size == pool_max` **and** `inflight == pool_size` for minutes | Pool fully grown and saturated, approaching the liveness watchdog. |
 | `siphon_proxy_dialog_sessions` | grows unbounded under flat completed-call load | Dialog state not draining — a leak signature. |
+| `siphon_gateway_source_last_success_timestamp_seconds` | `time() - <gauge> > 3 * refresh_secs`, or the gauge is `0` | The carriers this node routes over are stale — it kept the last set it read, correctly, and nothing else says the controller has been unreachable for hours. `0` means it has *never* been read, so a node that booted against a dead controller has no carriers from the source at all. |
+| `siphon_gateway_source_failures_total` | sustained `rate() > 0` | Reads are failing now. Pair with the timestamp above, which says for how long. |
+| `siphon_registrant_source_*` | same pair, same thresholds | Outbound trunk registrations, tracked separately: a node can route over stale carriers with current registrations, or the reverse. |
 
 The allocator exposes its own numbers alongside those, and they answer different
 questions — reading only one is how a fragmentation problem gets misfiled as a
