@@ -174,12 +174,14 @@ pub struct MediaConfig {
     /// there only when the engine is this node's alone. This is the backend the
     /// reap is effective on today.
     ///
-    /// **The native `siphon-rtp` path is owner-scoped, and its owner identity
-    /// does not survive a reconnect**: the engine keys ownership on a
-    /// per-connection client id, so a restarted siphon is a new owner and its
-    /// own pre-restart calls are invisible to it. The reap is safe there —
-    /// it can never reach another node's call — but until the engine offers a
-    /// controller identity stable across reconnects, it finds nothing to reap.
+    /// **The native `siphon-rtp` path is owner-scoped**: the engine enumerates
+    /// only the calls this node's control identity created, so a reap there can
+    /// never reach another node's call whether or not the engine is shared.
+    /// siphon claims that identity from `server.instance_id` (host or pod name)
+    /// on every control connection, which is what lets a restarted process be
+    /// recognised as the same owner and find its own orphans. An engine older
+    /// than 0.8.0 ignores the claim and keys ownership on the connection; the
+    /// reap stays safe there and simply finds nothing.
     ///
     /// `rtpproxy` cannot enumerate at all; siphon warns at boot and skips.
     #[serde(default)]

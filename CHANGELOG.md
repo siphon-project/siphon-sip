@@ -31,6 +31,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **siphon now claims a stable control identity on every siphon-rtp connection,
+  so the calls it owns survive its own restart.** The engine keyed a call's
+  owner on the control connection, and a connection cannot outlive the process
+  that opened it — so a restarted siphon came back as a different owner and its
+  previous run's media sessions were stranded under an identity that could never
+  be presented again. Neither `query`, `delete` nor `list` would reach them; only
+  restarting the engine freed their ports.
+
+  The `Authenticate` frame now carries a `controller_id` taken from
+  `server.instance_id` (which resolves to the configured value, else `$HOSTNAME`,
+  else `siphon`), deliberately without the boot epoch the registrar's identity
+  carries — an identity that changes every boot is exactly the problem. Set
+  `server.instance_id` to something stable across restarts, such as a pod or host
+  name. The frame is now sent on a secretless connection too, since there is
+  otherwise no point at which the claim can be made; the engine accepts any token
+  when it has no secret configured. With no claim to make the frame is byte-
+  identical to before, so an older engine is unaffected, and an engine older than
+  0.8.0 ignores the claim entirely.
+
 - **An opt-in startup reap of media sessions the engine still holds for calls
   this node no longer has (`media.reap_orphans_at_startup`, default false).**
   A restart loses siphon's session state while the media engine keeps relaying.
@@ -52,11 +71,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   **rtpengine's `list` is unscoped** — it answers with every call on the engine,
   whoever created it, so on an rtpengine shared between nodes an enabled reap
   deletes calls that are live elsewhere; enable it there only when the engine is
-  this node's alone. That is the backend it is effective on today. The native
-  siphon-rtp engine is owner-scoped but keys ownership on a per-connection
-  client id, so a restarted siphon is a new owner and its own pre-restart calls
-  are invisible to it: the reap is safe there and finds nothing until the engine
-  offers a controller identity stable across reconnects. rtpproxy cannot
+  this node's alone. The native siphon-rtp engine is owner-scoped and siphon
+  claims a stable control identity on every connection (below), so a reap there
+  cannot reach another node's call even on a shared engine. rtpproxy cannot
   enumerate at all, and siphon warns at boot and skips rather than failing a
   reap every restart.
 
