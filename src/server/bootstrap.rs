@@ -147,9 +147,15 @@ fn init_registrant_source(
 ///
 /// Resolution order: `server.instance_id` from siphon.yaml, then the `HOSTNAME`
 /// environment variable, then the literal `"siphon"`. Shared by the registrar's
-/// binding identity and the registrant source's `$1` binding, so a deployment
-/// that shards trunks by node uses the same name in both places.
-pub(super) fn instance_id(config: &Config) -> String {
+/// binding identity, the registrant source's `$1` binding and the identity the
+/// siphon-rtp control connection claims, so a deployment that shards trunks by
+/// node uses the same name everywhere.
+///
+/// Deliberately free of the boot epoch. The registrar carries that separately
+/// (`instance_epoch`), and the media controller claim must not: an identity that
+/// changes every boot cannot be presented again, which is exactly what strands a
+/// previous run's media sessions.
+pub(crate) fn instance_id(config: &Config) -> String {
     config
         .server
         .as_ref()

@@ -559,6 +559,13 @@ impl SiphonServer {
         // listener feeds; the dispatcher consumes from `rtpengine_events_rx`.
         let (rtpengine_events_tx, rtpengine_events_rx) =
             tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(256);
+        // Before the backend is built, so the first control connection already
+        // carries it: the engine keys the calls a controller owns on this
+        // identity, and a connection that opened without one owns its calls
+        // under a connection id that dies with it.
+        let controller_id = instance_id(&config);
+        info!(%controller_id, "media control identity");
+        crate::rtpengine::set_controller_id(controller_id);
         let pre_rtpengine = dispatcher::init_rtpengine(&config, rtpengine_events_tx.clone());
         reap_orphaned_media(&config, &pre_rtpengine).await;
 

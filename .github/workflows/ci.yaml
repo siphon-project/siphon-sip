@@ -1957,6 +1957,23 @@ jobs:
           docker compose -f sipp/docker-compose.yaml logs siphon-voice-ai > siphon-voice-ai.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs mock-siphon-rtp > mock-siphon-rtp.log 2>&1 || true
 
+      # The engine keys call ownership on this, so a siphon that never presents
+      # it comes back from a restart as a different owner and cannot reach the
+      # sessions its previous run created. A unit test pins the frame's shape;
+      # only this proves it reaches an engine on a real connection — and this
+      # backend configures no control secret, which is exactly the case that
+      # used to send no frame at all.
+      - name: Assert siphon presented a control identity
+        run: |
+          if ! grep -q '"command": "authenticate"' mock-siphon-rtp.log; then
+            echo "siphon opened the control connection without an authenticate frame"
+            exit 1
+          fi
+          if ! grep '"command": "authenticate"' mock-siphon-rtp.log | grep -q '"controller_id"'; then
+            echo "the authenticate frame carried no controller_id"
+            exit 1
+          fi
+
       - name: Teardown
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile voice-ai down --remove-orphans
