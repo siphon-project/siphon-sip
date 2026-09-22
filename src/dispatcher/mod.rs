@@ -50,7 +50,7 @@ use crate::uac::UacSender;
 // add public paths. `init_rtpengine` and `spawn_rtpengine_health_check` are
 // re-exported because `server.rs` and the Python bindings reach them as
 // `siphon::dispatcher::…`.
-mod b2bua;
+pub(crate) mod b2bua;
 mod cancel_ack;
 mod cdr;
 mod charging;
@@ -136,6 +136,8 @@ mod session_timer_legs_tests;
 mod session_timer_min_se_tests;
 #[cfg(test)]
 mod session_timer_tests;
+#[cfg(test)]
+mod shutdown_teardown_tests;
 #[cfg(test)]
 mod teardown_race_tests;
 #[cfg(test)]

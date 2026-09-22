@@ -36,6 +36,27 @@ pub struct ServerIdentityConfig {
     /// immediately on signal).
     #[serde(default = "default_drain_secs")]
     pub drain_secs: u64,
+    /// After the drain deadline, end the calls still up rather than exiting on
+    /// top of them, and wait up to this many seconds for that to complete.
+    /// Default: 5. Set to 0 to restore the pre-1.9.2 behaviour exactly (exit at
+    /// the deadline, tearing nothing down).
+    ///
+    /// A call lasts minutes and `drain_secs` is seconds, so every restart taken
+    /// with traffic up reaches the deadline: without this, each surviving call
+    /// is cut with no BYE on either leg, no Ro `CCR-TERMINATION`, no Rf stop, no
+    /// media release and no CDR, leaving the far side holding a channel until
+    /// someone hangs it up.
+    ///
+    /// The wait is what makes it real: the charging stops and the media delete
+    /// are spawned and awaited nowhere, so exiting straight after issuing the
+    /// teardowns would kill them mid-flight.
+    ///
+    /// **Your container runtime's stop timeout must exceed
+    /// `drain_secs + teardown_secs`**, or its `SIGKILL` lands first and none of
+    /// this happens. Docker's default is 10 s; Kubernetes'
+    /// `terminationGracePeriodSeconds` is 30 s.
+    #[serde(default = "default_teardown_secs")]
+    pub teardown_secs: u64,
     /// Stable per-replica identity, stamped onto every accepted REGISTER
     /// binding so scripts can recognise their own bindings after restart.
     /// Recommended: ``"${POD_NAME:-${HOSTNAME}}"`` for K8s StatefulSet
@@ -66,6 +87,10 @@ pub struct ServerIdentityConfig {
 
 fn default_drain_secs() -> u64 {
     30
+}
+
+fn default_teardown_secs() -> u64 {
+    5
 }
 
 fn default_auto_options() -> bool {

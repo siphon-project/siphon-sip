@@ -48,6 +48,7 @@ RUN_HTTP_AUTH=false
 RUN_WEDGE=false
 RUN_NOHANDLER=false
 RUN_RELOAD=false
+RUN_SHUTDOWN=false
 RUN_BANSCAN=false
 RUN_SECURITY=false
 RUN_RFC4475=false
@@ -82,6 +83,7 @@ for arg in "$@"; do
     --wedge)      RUN_WEDGE=true;      SELECTED_MODES+=("$arg") ;;
     --nohandler)  RUN_NOHANDLER=true;  SELECTED_MODES+=("$arg") ;;
     --reload)     RUN_RELOAD=true;     SELECTED_MODES+=("$arg") ;;
+    --shutdown)   RUN_SHUTDOWN=true;   SELECTED_MODES+=("$arg") ;;
     --banscan)    RUN_BANSCAN=true;    SELECTED_MODES+=("$arg") ;;
     --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
     --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
@@ -95,7 +97,7 @@ for arg in "$@"; do
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai --refer-single-leg --reoffer --control --bridge"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
-      echo "  --wedge --nohandler --banscan --reload"
+      echo "  --wedge --nohandler --banscan --reload --shutdown"
       echo "  --security --rfc4475 --webrtc"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
@@ -708,6 +710,19 @@ fi
 if [[ "$RUN_RELOAD" == true ]]; then
   echo "=== script reload scope + SIGHUP regression ==="
   bash scripts/script_reload_test.sh || exit 1
+fi
+
+# ── shutdown teardown regression (optional) ─────────────────────────────────
+# A drain deadline must END the calls it is still holding, not exit on top of
+# them. A call lasts minutes and drain_secs is seconds, so the deadline is the
+# normal path on any restart taken with traffic up: before the teardown pass it
+# put nothing on the wire at all, and the far side kept its channel until
+# someone hung it up. Both legs must receive a BYE carrying Q.850;cause=16
+# before siphon exits — and with teardown_secs: 0, neither must, which is what
+# proves the knob is real and the old behaviour is still available.
+if [[ "$RUN_SHUTDOWN" == true ]]; then
+  echo "=== shutdown teardown regression (both legs BYEd at the drain deadline) ==="
+  bash scripts/shutdown_teardown_test.sh || exit 1
 fi
 
 # ── failed_auth_ban auto-ban regression (optional) ───────────────────────────

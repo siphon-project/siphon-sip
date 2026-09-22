@@ -1,0 +1,31 @@
+# siphon config for the shutdown-teardown SIPp test
+# (scripts/shutdown_teardown_test.sh). Both parties answer and then sit still;
+# nothing in this config can end the call, so the BYE the test waits for can
+# only come from the drain deadline's teardown pass.
+#
+# `session_timer:` and `b2bua.max_call_duration_secs` are deliberately absent —
+# either would end the call on its own and hide whether the teardown works.
+#
+# drain_secs is 1 so the deadline arrives promptly with the call still up, which
+# is the normal case in production too: a call lasts minutes and a drain is
+# seconds.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_shutdown.py"
+
+server:
+  drain_secs: ${DRAIN_SECS:-1}
+  teardown_secs: ${TEARDOWN_SECS:-5}
+
+log:
+  level: info

@@ -1360,6 +1360,28 @@ auth:
 #                                     # many seconds for in-flight transactions and
 #                                     # B2BUA calls to finish before exiting. Default
 #                                     # 30s. Set to 0 to exit immediately on signal.
+#   teardown_secs: 5                  # After the drain deadline, END the calls still
+#                                     # up rather than exiting on top of them, and
+#                                     # wait up to this many seconds for that to
+#                                     # complete. Default 5; 0 restores the pre-1.9.2
+#                                     # behaviour exactly.
+#                                     # A call lasts minutes and drain_secs is
+#                                     # seconds, so the deadline is the normal path
+#                                     # on any restart taken with traffic up. Without
+#                                     # this, each surviving call is cut with no BYE
+#                                     # on either leg, no Ro CCR-TERMINATION, no Rf
+#                                     # stop, no media release and no CDR, leaving
+#                                     # the far side holding a channel.
+#                                     # The wait is what makes it real: the charging
+#                                     # stops and the media delete are spawned and
+#                                     # awaited nowhere.
+#                                     # Your container runtime's stop timeout must
+#                                     # EXCEED drain_secs + teardown_secs, or its
+#                                     # SIGKILL lands first and none of this happens
+#                                     # (Docker defaults to 10s).
+#                                     # B2BUA calls only — a proxy keeps transaction
+#                                     # state, not dialog state, so there is nothing
+#                                     # an in-dialog BYE could be built from.
 #   auto_options: true                # Answer an OPTIONS that NO script handler
 #                                     # claims with 200 OK + Contact + Allow
 #                                     # (RFC 3261 §11.2). Default true.

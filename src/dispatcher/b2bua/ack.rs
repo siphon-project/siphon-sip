@@ -1,5 +1,6 @@
 //! ACKs and retransmit arming for the messages siphon owns: the 2xx it sent
 //! the A-leg (RFC 3261 §13.3.1.4) and the reliable provisionals (RFC 3262 §3).
+use super::terminate::q850_reason;
 use crate::dispatcher::*;
 
 /// Everything the ACK for a re-INVITE's final response is built from.
@@ -553,13 +554,13 @@ pub fn reject_unanchorable_offer(
 /// caller broke the offer/answer exchange (RFC 3264 §4 puts the answer to an
 /// offer in a 2xx into the ACK). Not 16: nothing about this ending was normal,
 /// and no party hung up. The text says which rule was broken.
-const NO_ANSWER_IN_ACK_REASON: &str = "Q.850;cause=111;text=\"No SDP answer in ACK\"";
+const NO_ANSWER_IN_ACK_REASON: &str = q850_reason!(111, "No SDP answer in ACK");
 
 /// What a call ended because the media engine refused the caller's answer to an
 /// anchored delayed offer carries on its BYEs. Q.850 cause 47, "resource
 /// unavailable, unspecified": the media resource the call is anchored on could
 /// not complete the session.
-const MEDIA_ANCHOR_FAILED_REASON: &str = "Q.850;cause=47;text=\"Media anchor failed\"";
+const MEDIA_ANCHOR_FAILED_REASON: &str = q850_reason!(47, "Media anchor failed");
 
 /// An SDP answer that declines every stream `offer` makes (RFC 3264 §6): one
 /// `m=` line for each offered one, in the same order, with port 0 and the first
