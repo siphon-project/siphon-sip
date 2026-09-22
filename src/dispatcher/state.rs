@@ -702,12 +702,23 @@ where
     .await
     .is_err()
     {
+        // The job is not cancelled — it cannot be. It keeps its worker until
+        // it returns, and a synchronous handler that never returns keeps it
+        // for the life of the process, which is why this is counted rather
+        // than only logged: `pyexec_inflight` cannot distinguish a busy worker
+        // from one that is gone for good, and this can.
+        if let Some(registry) = crate::metrics::try_metrics() {
+            registry.pyexec_jobs_abandoned_total.inc();
+        }
         warn!(
             handler = kind,
             timeout = ?EVENT_HANDLER_TIMEOUT,
             "script event handler did not return within the window — continuing to \
-             drain events rather than letting one handler stop the loop (the \
-             handler itself is still running; the executor watchdog covers it)"
+             drain events rather than letting one handler stop the loop. The handler \
+             is still running and still holds its worker: an async one ends at \
+             script.handler_timeout_secs, a synchronous one cannot be interrupted \
+             and holds that worker permanently. Counted in \
+             siphon_pyexec_jobs_abandoned_total."
         );
     }
 }

@@ -40,6 +40,52 @@ async fn a_stuck_event_handler_does_not_stop_the_drain_loop() {
     release.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Giving up on a handler is counted, because the worker does not come back.
+///
+/// The drain loop bounds its *wait*, never the job — a job cannot be
+/// cancelled, and a synchronous Python handler cannot be interrupted from Rust
+/// at all, so one that never returns keeps its worker for the life of the
+/// process. `pyexec_inflight` still counts that worker, correctly: it really
+/// is occupied. What no gauge could show is that it is occupied *for ever*,
+/// which is what this counter is for. Without it, a pool bleeding workers to
+/// stuck handlers looks exactly like a busy one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoning_a_stuck_event_handler_is_counted() {
+    // The suite does not initialise metrics, so without this the counter
+    // lookup returns None and the whole assertion below is skipped — a test
+    // that cannot reach its own subject. `init` is idempotent on the process
+    // -wide OnceLock, so sharing it with any other test that needs it is fine.
+    let _ = crate::metrics::init();
+    let registry = crate::metrics::try_metrics()
+        .expect("metrics must be initialised or this test asserts nothing");
+    let before = registry.pyexec_jobs_abandoned_total.get();
+
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_in_handler = std::sync::Arc::clone(&release);
+    super::run_event_handler("test.abandoned", move || {
+        while !release_in_handler.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })
+    .await;
+
+    // Released before the assertion, not after: the handler holds a blocking
+    // thread until this flips, and dropping the runtime waits for it. A failed
+    // assertion after this point would hang the suite instead of reporting.
+    let after = registry.pyexec_jobs_abandoned_total.get();
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Strictly greater, not `before + 1`: the counter is process-wide and the
+    // suite runs tests concurrently, so a sibling abandoning its own handler
+    // lands on the same counter.
+    assert!(
+        after > before,
+        "a handler the drain loop gave up on must be counted, or a pool losing \
+         workers to stuck handlers is indistinguishable from a busy one \
+         (before={before} after={after})"
+    );
+}
+
 /// The timer wheel stores a *pointer* to the entry, not the entry.
 ///
 /// Same shape as the transaction map: `hashbrown` sizes its bucket array

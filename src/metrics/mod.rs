@@ -364,6 +364,17 @@ pub struct SiphonMetrics {
     /// called from inside an `async def`. Equal to the driver count means no
     /// coroutine in the process is progressing.
     pub async_drivers_stalled: IntGauge,
+    /// Event-handler jobs whose caller stopped waiting but which are still
+    /// running on a worker, and always will be if they never return.
+    ///
+    /// A background drain loop bounds its *wait* on a handler, not the job.
+    /// An async handler ends at `script.handler_timeout_secs`; a synchronous
+    /// one cannot be interrupted from Rust at all, so it keeps its worker for
+    /// the life of the process. That worker is really gone, which is why
+    /// `pyexec_inflight` still counts it — this counter is how you tell the
+    /// difference between a busy pool and one that has permanently lost
+    /// workers to handlers that never came back.
+    pub pyexec_jobs_abandoned_total: IntCounter,
     /// Handler jobs completed by the pool. With `pyexec_inflight` pinned at the
     /// pool size, a flat `completed` rate is the precise signal that the pool
     /// has wedged (zero forward progress) — what the watchdog aborts on.
@@ -802,6 +813,10 @@ impl SiphonMetrics {
             "siphon_async_drivers_stalled",
             "Asyncio driver loops pinned by a blocking call (no scheduled callback ran within the heartbeat deadline)",
         )?;
+        let pyexec_jobs_abandoned_total = IntCounter::new(
+            "siphon_pyexec_jobs_abandoned_total",
+            "Event-handler jobs whose caller gave up waiting; the job still holds its worker",
+        )?;
         let pyexec_queue_depth = IntGauge::new(
             "siphon_pyexec_queue_depth",
             "Handler jobs waiting in the Python executor pool's bounded queue",
@@ -1183,6 +1198,7 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_inflight.clone()))?;
         registry.register(Box::new(pyexec_queue_depth.clone()))?;
         registry.register(Box::new(async_drivers_stalled.clone()))?;
+        registry.register(Box::new(pyexec_jobs_abandoned_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
@@ -1262,6 +1278,7 @@ impl SiphonMetrics {
             python_allocated_blocks,
             script_errors_total,
             async_drivers_stalled,
+            pyexec_jobs_abandoned_total,
             pyexec_pool_size,
             pyexec_pool_max,
             pyexec_inflight,

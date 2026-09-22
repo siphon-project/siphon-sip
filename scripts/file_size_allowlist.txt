@@ -14,7 +14,7 @@
 # ── Permanent ───────────────────────────────────────────────────────────────
 # Data, not logic. Splitting a table costs greppability and buys nothing.
 src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a table
-src/metrics/mod.rs          1910  # metric registry: one struct field + one registration per metric. +26 for the gateway/registrant provisioning-source pairs (last-success timestamp + failure counter each)
+src/metrics/mod.rs          1935  # metric registry: one struct field + one registration per metric. +26 for the gateway/registrant provisioning-source pairs (last-success timestamp + failure counter each), +17 for the abandoned-job counter (a pool losing workers to stuck handlers reads identically to a busy one without it)
 
 # ── Scheduled for the 1.9.0 module split ────────────────────────────────────
 src/server/mod.rs            2627  # run_async is one 2,214-line fn; decomposed next, into src/server/**

@@ -308,6 +308,11 @@ fn parse_meminfo_total(content: &str) -> Option<u64> {
 #[derive(Default)]
 struct PoolMetrics {
     /// Jobs currently executing on a worker thread.
+    ///
+    /// Includes a job whose caller gave up waiting: it is still on its worker,
+    /// and if it never returns that worker is gone for good, so counting it is
+    /// the truthful reading. `pyexec_jobs_abandoned_total` is what separates
+    /// the two cases.
     inflight: AtomicUsize,
     /// Total jobs completed (monotonic). Flat while the pool is at its thread
     /// cap, has no idle worker and has jobs queued behind that is the "pool

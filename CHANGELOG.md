@@ -397,6 +397,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   request's application and command, or the handler that matched returned
   `None`. Declining is a routing answer, and returning `None` is the documented
   way to do it.
+### Fixed
+
+- **A pool losing workers to stuck event handlers is no longer
+  indistinguishable from a busy one.** A background drain loop bounds its
+  *wait* on a script event handler, never the job: the job cannot be
+  cancelled, and a synchronous Python handler cannot be interrupted from Rust
+  at all, so one that never returns keeps its worker for the life of the
+  process. `siphon_pyexec_inflight` counts that worker, correctly — it really
+  is occupied — but no gauge could show that it is occupied *for ever*.
+
+  `siphon_pyexec_jobs_abandoned_total` now counts every handler a drain loop
+  gave up on, and the admin snapshot carries it as `pyexec.jobs_abandoned`.
+  A rising count is workers leaving the pool permanently; `inflight` minus
+  abandoned is the work actually in progress. An async handler still ends at
+  `script.handler_timeout_secs`, so this is specifically about synchronous
+  ones.
 
 ## [1.9.1] — 2026-09-21
 
