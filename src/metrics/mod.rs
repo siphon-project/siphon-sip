@@ -10,8 +10,8 @@ pub mod glibc;
 use std::sync::{Arc, OnceLock};
 
 use prometheus::{
-    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tracing::error;
 
@@ -278,6 +278,14 @@ pub struct SiphonMetrics {
     // --- Registrar ---
     pub registrations_active: IntGauge,
     pub registrar_refusals_total: IntCounterVec,
+    /// Commands queued for the registrar's L2 write-through backend.
+    pub registrar_backend_queue_depth: IntGauge,
+    /// Write-through commands discarded without reaching the backend.
+    pub registrar_backend_dropped_total: IntCounterVec,
+    /// Time `count_aors` spent queued behind the writes ahead of it.
+    pub registrar_count_aors_queue_wait_seconds: Histogram,
+    /// End-to-end time for `count_aors`, queue wait included.
+    pub registrar_count_aors_duration_seconds: Histogram,
 
     // --- Dialog gauges ---
     /// Active SIP dialogs, defined as `proxy_dialog_sessions + b2bua_calls_active`.
@@ -741,6 +749,41 @@ impl SiphonMetrics {
             Opts::new("siphon_registrar_refusals_total", "REGISTER refusals"),
             &["reason"],
         )?;
+        let registrar_backend_queue_depth = IntGauge::new(
+            "siphon_registrar_backend_queue_depth",
+            "Write-through commands queued for the registrar's persistence backend",
+        )?;
+        // A non-zero rate means L1 and L2 have diverged: the binding is live in
+        // memory and absent from the backend, so a restart loses it. Alert on
+        // any of it rather than on a threshold.
+        let registrar_backend_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_registrar_backend_dropped_total",
+                "Registrar write-through commands discarded before reaching the backend",
+            ),
+            &["command", "reason"],
+        )?;
+        // Two histograms rather than one, because the two causes of a slow
+        // count_aors have different fixes: a long queue is drained faster, a
+        // slow backend is not.
+        let registrar_count_aors_queue_wait_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "siphon_registrar_count_aors_queue_wait_seconds",
+                "Time a count_aors request waited behind queued registrar writes",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        )?;
+        let registrar_count_aors_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "siphon_registrar_count_aors_duration_seconds",
+                "End-to-end count_aors duration in seconds, including queue wait",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        )?;
 
         let dialogs_active = IntGauge::new(
             "siphon_dialogs_active",
@@ -1181,6 +1224,10 @@ impl SiphonMetrics {
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(registrar_refusals_total.clone()))?;
+        registry.register(Box::new(registrar_backend_queue_depth.clone()))?;
+        registry.register(Box::new(registrar_backend_dropped_total.clone()))?;
+        registry.register(Box::new(registrar_count_aors_queue_wait_seconds.clone()))?;
+        registry.register(Box::new(registrar_count_aors_duration_seconds.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
         registry.register(Box::new(b2bua_calls_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
@@ -1265,6 +1312,10 @@ impl SiphonMetrics {
             ipsec_sa_pairs,
             registrations_active,
             registrar_refusals_total,
+            registrar_backend_queue_depth,
+            registrar_backend_dropped_total,
+            registrar_count_aors_queue_wait_seconds,
+            registrar_count_aors_duration_seconds,
             dialogs_active,
             b2bua_calls_active,
             connections_active,
@@ -1677,23 +1728,44 @@ pub fn histogram_vec_summary_by_label(
                 .find(|pair| pair.name() == label)
                 .map(|pair| pair.value().to_owned())
                 .unwrap_or_default();
-            let histogram = metric.get_histogram();
-            let count = histogram.get_sample_count();
-            if count == 0 {
+            let Some(summary) = summarise_histogram(metric.get_histogram()) else {
                 continue;
-            }
-            let sum = histogram.get_sample_sum();
-            let mut summary = serde_json::Map::new();
-            summary.insert("count".into(), serde_json::Value::from(count));
-            summary.insert("sum".into(), serde_json::Value::from(sum));
-            summary.insert("mean".into(), serde_json::Value::from(sum / count as f64));
-            if let Some(p95) = interpolated_quantile(histogram, 0.95) {
-                summary.insert("p95".into(), serde_json::Value::from(p95));
-            }
-            out.insert(key, serde_json::Value::Object(summary));
+            };
+            out.insert(key, summary);
         }
     }
     out
+}
+
+/// `{count, sum, mean, p95}` for one histogram, or `None` when nothing has been
+/// observed — an untouched series renders as absent rather than as a row of
+/// zeroes the dashboard would draw as real.
+fn summarise_histogram(histogram: &prometheus::proto::Histogram) -> Option<serde_json::Value> {
+    let count = histogram.get_sample_count();
+    if count == 0 {
+        return None;
+    }
+    let sum = histogram.get_sample_sum();
+    let mut summary = serde_json::Map::new();
+    summary.insert("count".into(), serde_json::Value::from(count));
+    summary.insert("sum".into(), serde_json::Value::from(sum));
+    summary.insert("mean".into(), serde_json::Value::from(sum / count as f64));
+    if let Some(p95) = interpolated_quantile(histogram, 0.95) {
+        summary.insert("p95".into(), serde_json::Value::from(p95));
+    }
+    Some(serde_json::Value::Object(summary))
+}
+
+/// The same summary for a plain [`Histogram`], which has one series rather than
+/// one per label set.
+pub fn histogram_summary(histogram: &Histogram) -> serde_json::Value {
+    use prometheus::core::Collector;
+    histogram
+        .collect()
+        .first()
+        .and_then(|family| family.get_metric().first())
+        .and_then(|metric| summarise_histogram(metric.get_histogram()))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Linear interpolation of `quantile` within the cumulative bucket it falls in.

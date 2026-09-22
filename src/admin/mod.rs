@@ -884,6 +884,15 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "script_errors_total": metrics.script_errors_total.get(),
             "registrar_refusals": crate::metrics::int_counter_vec_by_label(&metrics.registrar_refusals_total, "reason"),
         },
+        // The registrar's L2 write-through path. `dropped` is the one to watch:
+        // any of it means a binding is live in memory and absent from the
+        // backend, so it will not survive a restart.
+        "registrar_backend": {
+            "queue_depth": metrics.registrar_backend_queue_depth.get(),
+            "dropped": crate::metrics::int_counter_vec_by_label(&metrics.registrar_backend_dropped_total, "command"),
+            "count_aors_queue_wait": crate::metrics::histogram_summary(&metrics.registrar_count_aors_queue_wait_seconds),
+            "count_aors_duration": crate::metrics::histogram_summary(&metrics.registrar_count_aors_duration_seconds),
+        },
         "memory": {
             "allocated": metrics.memory_allocated_bytes.get(),
             "resident": metrics.memory_resident_bytes.get(),

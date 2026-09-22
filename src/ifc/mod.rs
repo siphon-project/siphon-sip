@@ -35,7 +35,8 @@ impl BytesTextExt for quick_xml::events::BytesText<'_> {
     }
 }
 use tokio::sync::mpsc;
-#[cfg(feature = "redis-backend")]
+// Unconditional: the writer's drop path logs whether or not a Redis backend is
+// compiled in, since the queue and its bound exist either way.
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -810,18 +811,54 @@ enum IfcBackendCommand {
     Remove { aor: String },
 }
 
+/// How many iFC write-through commands may be queued before new ones are
+/// dropped.
+///
+/// Bounded for the same reason the registrar's queue is: during a Redis outage
+/// every operation burns its full response timeout, so the drain rate collapses
+/// while a registration storm keeps filling the queue. Smaller than the
+/// registrar's because iFC profiles are written once per registration rather
+/// than per binding refresh.
+const IFC_WRITER_QUEUE_CAPACITY: usize = 4_096;
+
 /// Handle for sending write-through commands to the iFC backend task.
 ///
 /// Sends are fire-and-forget; failures are logged by the background task.
 #[derive(Debug, Clone)]
 pub struct IfcBackendWriter {
-    sender: mpsc::UnboundedSender<IfcBackendCommand>,
+    sender: mpsc::Sender<IfcBackendCommand>,
 }
 
 impl IfcBackendWriter {
+    /// Enqueue a command, or drop it and say so.
+    ///
+    /// Never waits for space: the callers are on the registration path and are
+    /// not async, so the alternatives are blocking that path or growing without
+    /// limit. A dropped write leaves the in-memory profile without its backing
+    /// copy, so a restart re-fetches it from the HSS rather than restoring it —
+    /// survivable, but never silent.
+    fn enqueue(&self, command: IfcBackendCommand) {
+        let label = match &command {
+            IfcBackendCommand::Save { .. } => "save",
+            IfcBackendCommand::Remove { .. } => "remove",
+        };
+        if let Err(error) = self.sender.try_send(command) {
+            let reason = match error {
+                mpsc::error::TrySendError::Full(_) => "queue_full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            warn!(
+                command = label,
+                reason,
+                capacity = IFC_WRITER_QUEUE_CAPACITY,
+                "iFC backend write-through dropped; the profile will be re-fetched                  from the HSS after a restart rather than restored"
+            );
+        }
+    }
+
     /// Enqueue a save (raw XML for an AoR) to the backend.
     pub fn save(&self, aor: &str, xml: &str) {
-        let _ = self.sender.send(IfcBackendCommand::Save {
+        self.enqueue(IfcBackendCommand::Save {
             aor: aor.to_string(),
             xml: xml.to_string(),
         });
@@ -829,7 +866,7 @@ impl IfcBackendWriter {
 
     /// Enqueue a remove (iFC profile for an AoR) from the backend.
     pub fn remove(&self, aor: &str) {
-        let _ = self.sender.send(IfcBackendCommand::Remove {
+        self.enqueue(IfcBackendCommand::Remove {
             aor: aor.to_string(),
         });
     }
@@ -844,7 +881,7 @@ pub fn spawn_ifc_backend_writer(
     mut connection: redis::aio::MultiplexedConnection,
     key_prefix: String,
 ) -> IfcBackendWriter {
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(IFC_WRITER_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
         use redis::AsyncCommands;
