@@ -5,6 +5,10 @@ import asyncio
 from siphon_sdk import mock_module
 
 
+def run(coro):
+    return asyncio.run(coro)
+
+
 def _fresh_diameter():
     mock_module.install()
     diameter = mock_module.get_diameter()
@@ -108,16 +112,16 @@ def test_s6a_air_ulr_purge():
     _fresh_diameter()
     from siphon import diameter as d
 
-    air = d.s6a_air("001010000000001", b"\x00\xf1\x10", num_vectors=2)
+    air = run(d.s6a_air("001010000000001", b"\x00\xf1\x10", num_vectors=2))
     assert air["result_code"] == 2001
     assert len(air["vectors"]) == 2
     assert air["vectors"][0]["kasme"] == b"\x44" * 32
 
-    ula = d.s6a_ulr("001010000000001", b"\x00\xf1\x10", rat_type=1004)
+    ula = run(d.s6a_ulr("001010000000001", b"\x00\xf1\x10", rat_type=1004))
     assert ula["result_code"] == 2001
     assert ula["has_subscription_data"] is True
 
-    pua = d.s6a_purge_ue("001010000000001")
+    pua = run(d.s6a_purge_ue("001010000000001"))
     assert pua["result_code"] == 2001
 
 

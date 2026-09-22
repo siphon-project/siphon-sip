@@ -25,7 +25,7 @@ src/server/mod.rs            2627  # run_async is one 2,214-line fn; decomposed 
 # rejected. Splitting needs the thin-wrapper restructure, scheduled post-1.9.0.
 # A large share of each is `///` docstrings, which are the SDK's LLM context and
 # are load-bearing rather than padding.
-src/script/api/diameter.rs   3350  # single #[pymethods] block; kwargs marshalling per interface
+src/script/api/diameter.rs   3540  # single #[pymethods] block; kwargs marshalling per interface. +110 for making all 19 methods awaitable: each grows the owned-argument prep a future needs plus the Python::attach that rebuilds its dict on the way out, and the no-peer arm becomes a resolved coroutine; +76 for the per-method note saying so, which is the docstring a script author and the SDK both read
 src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    2000  # same; +43 for the client-transport accessors and their docs

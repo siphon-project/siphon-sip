@@ -1,6 +1,11 @@
 """Tests for the Rf (3GPP TS 32.299 IMS offline charging) mock surface."""
 
+import asyncio
 from siphon_sdk import mock_module
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 class TestRfMock:
@@ -12,14 +17,14 @@ class TestRfMock:
 
     def test_acr_start_returns_session_id(self):
         from siphon import diameter
-        result = diameter.rf_acr_start(
+        result = run(diameter.rf_acr_start(
             calling_party="sip:alice@ims.example.com",
             called_party="sip:bob@ims.example.com",
             sip_method="INVITE",
             role_of_node="originating",
             node_functionality="scscf",
             ims_charging_identifier="icid-1",
-        )
+        ))
         assert result is not None
         assert result["result_code"] == 2001
         assert result["session_id"]
@@ -27,21 +32,21 @@ class TestRfMock:
 
     def test_acr_interim_passes_session_id(self):
         from siphon import diameter
-        start = diameter.rf_acr_start(sip_method="INVITE")
+        start = run(diameter.rf_acr_start(sip_method="INVITE"))
         assert start is not None
         sid = start["session_id"]
 
-        interim = diameter.rf_acr_interim(sid, 1, sip_method="INVITE")
+        interim = run(diameter.rf_acr_interim(sid, 1, sip_method="INVITE"))
         assert interim is not None
         assert interim["session_id"] == sid
         assert interim["record_number"] == 1
 
     def test_acr_stop_with_termination_cause(self):
         from siphon import diameter
-        start = diameter.rf_acr_start(sip_method="INVITE")
+        start = run(diameter.rf_acr_start(sip_method="INVITE"))
         sid = start["session_id"]
-        stop = diameter.rf_acr_stop(sid, 2, termination_cause=8,
-                                     sip_method="BYE", cause_code=-200)
+        stop = run(diameter.rf_acr_stop(sid, 2, termination_cause=8,
+                                     sip_method="BYE", cause_code=-200))
         assert stop is not None
         assert stop["session_id"] == sid
 
@@ -55,13 +60,13 @@ class TestRfMock:
 
     def test_acr_event_one_shot(self):
         from siphon import diameter
-        result = diameter.rf_acr_event(
+        result = run(diameter.rf_acr_event(
             calling_party="sip:alice@ims.example.com",
             sip_method="REGISTER",
             role_of_node="originating",
             node_functionality="pcscf",
             cause_code=0,
-        )
+        ))
         assert result is not None
         captured = self.diameter.captured_acrs()
         assert len(captured) == 1
@@ -71,40 +76,40 @@ class TestRfMock:
     def test_set_rf_result_code_propagates(self):
         from siphon import diameter
         self.diameter.set_rf_result_code(4002)  # DIAMETER_OUT_OF_SPACE
-        result = diameter.rf_acr_start(sip_method="INVITE")
+        result = run(diameter.rf_acr_start(sip_method="INVITE"))
         assert result["result_code"] == 4002
 
     def test_set_rf_interim_interval_propagates(self):
         from siphon import diameter
         self.diameter.set_rf_interim_interval(600)
-        result = diameter.rf_acr_start(sip_method="INVITE")
+        result = run(diameter.rf_acr_start(sip_method="INVITE"))
         assert result["interim_interval"] == 600
 
     def test_clear_captured_acrs(self):
         from siphon import diameter
-        diameter.rf_acr_event(sip_method="REGISTER")
+        run(diameter.rf_acr_event(sip_method="REGISTER"))
         assert len(self.diameter.captured_acrs()) == 1
         self.diameter.clear_captured_acrs()
         assert self.diameter.captured_acrs() == []
 
     def test_session_ids_are_unique_per_start(self):
         from siphon import diameter
-        first = diameter.rf_acr_start(sip_method="INVITE")
-        second = diameter.rf_acr_start(sip_method="INVITE")
+        first = run(diameter.rf_acr_start(sip_method="INVITE"))
+        second = run(diameter.rf_acr_start(sip_method="INVITE"))
         assert first["session_id"] != second["session_id"]
 
     def test_acr_start_carries_trunk_group_kwargs(self):
         # BGCF emit shape — Outgoing-Trunk-Group-Id (TS 32.299 §7.2.71)
         # plus Application-Server (MMTel forward).
         from siphon import diameter
-        diameter.rf_acr_start(
+        run(diameter.rf_acr_start(
             sip_method="INVITE",
             node_functionality="bgcf",
             outgoing_trunk_group_id="carrier-A",
             incoming_trunk_group_id="trunk-in-001",
             application_server="sip:mmtel.ims.example.com",
             application_provided_called_party_address="sip:bob@example.com",
-        )
+        ))
         captured = self.diameter.captured_acrs()
         assert len(captured) == 1
         entry = captured[0]
@@ -121,12 +126,12 @@ class TestRfMock:
         the collector is left resolving the IMPU against an HSS after the
         fact, which only works for locally-provisioned users."""
         from siphon import diameter
-        diameter.rf_acr_start(
+        run(diameter.rf_acr_start(
             sip_method="INVITE",
             calling_party="sip:alice@ims.example.com",
             subscription_id=["sip:alice@ims.example.com", "001010000000001"],
             subscription_id_type=["sip", "imsi"],
-        )
+        ))
         captured = self.diameter.captured_acrs()
         assert captured[-1]["subscription_id"] == [
             "sip:alice@ims.example.com",
@@ -136,7 +141,7 @@ class TestRfMock:
 
     def test_acr_accepts_a_single_subscription_id(self):
         from siphon import diameter
-        diameter.rf_acr_event(sip_method="MESSAGE", subscription_id="+31612345678")
+        run(diameter.rf_acr_event(sip_method="MESSAGE", subscription_id="+31612345678"))
         assert self.diameter.captured_acrs()[-1]["subscription_id"] == "+31612345678"
 
     def test_acr_event_reports_a_failed_session_setup(self):
@@ -144,11 +149,11 @@ class TestRfMock:
         that carries a non-zero Cause-Code, and it must correlate by ICID with
         the rest of the attempt."""
         from siphon import diameter
-        diameter.rf_acr_event(
+        run(diameter.rf_acr_event(
             sip_method="INVITE",
             ims_charging_identifier="icid-failed-1",
             cause_code=-486,
-        )
+        ))
         captured = self.diameter.captured_acrs()[-1]
         assert captured["record_type"] == "EVENT"
         assert captured["cause_code"] == -486

@@ -10,5 +10,5 @@ pub mod handle;
 pub mod py_executor;
 pub mod watcher;
 
-pub(crate) use blocking::detach_block_on;
+pub(crate) use blocking::{awaitable, detach_block_on, ready};
 pub use handle::{HandlerHandle, ScriptHandle};
