@@ -239,6 +239,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   make CLIR look honoured while identifying no one. The same assertion runs on
   a restricted `b2bua.originate`, and yields to an explicit
   `p_asserted_identity` parameter there.
+- **A `dial` target can present its own calling identity**, through `from`,
+  `from_display`, `p_asserted_identity` and `privacy` on the target beside its
+  `headers`, overriding the dial's own field by field.
+
+  The dial-level identity applies to the whole dial, which cannot express the
+  case a hunt across carriers needs: the number a carrier will accept is a
+  property of that carrier, not of the call. Presenting another carrier's
+  number leaves it challenging the INVITE and going on challenging however
+  correct the digest is, because it looks its account up by the `From` user and
+  finds no such subscriber. A sequential hunt across two trunks could therefore
+  only ever present one of them correctly.
+
+  Resolved per field rather than all-or-nothing, so a target naming only a
+  `from` still inherits the dial's presentation — the precedence a target's
+  headers already use. A branch's number rides the same per-carrier
+  substitution an LCR route uses, so it keeps the dialog tag the framework owns
+  and reaches `P-Asserted-Identity` with it; its asserted identity rides the
+  per-branch headers, injected after the header policy so a preset's `P-*`
+  strip set cannot drop an identity the controller named. Mirrored in
+  `siphon-control-client` on `DialTarget`.
 
 ### Added
 

@@ -238,6 +238,20 @@ pub(super) fn parse_dial_target(
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        from: object
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        from_display: object
+            .get("from_display")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        p_asserted_identity: object
+            .get("p_asserted_identity")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
+            .map_err(|error| error.to_string())?,
     }])
 }
 

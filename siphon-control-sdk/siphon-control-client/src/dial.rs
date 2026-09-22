@@ -42,6 +42,8 @@ pub enum DialTarget {
         next_hop: Option<String>,
         /// Headers injected on this branch's INVITE, over the command's.
         headers: Vec<(String, String)>,
+        /// Calling identity for this branch alone, over the dial's.
+        identity: TargetIdentity,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -55,7 +57,29 @@ pub enum DialTarget {
         aor: String,
         /// Headers injected on every branch the AoR expands to.
         headers: Vec<(String, String)>,
+        /// Calling identity for every branch the AoR expands to, over the
+        /// dial's.
+        identity: TargetIdentity,
     },
+}
+
+/// The calling identity one dial target presents, overriding the dial's.
+///
+/// One dial can try two carriers that assigned different numbers, and the
+/// number a carrier will accept is a property of that carrier, not of the call.
+/// Each field falls back to the dial's own when this target does not name it,
+/// the same precedence a target's headers already use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetIdentity {
+    /// The From URI this branch presents (RFC 3261 §8.1.1.3).
+    pub from: Option<String>,
+    /// From display name. An empty string removes the caller's rather than
+    /// presenting an empty one.
+    pub from_display: Option<String>,
+    /// `P-Asserted-Identity` for a trusted next hop (RFC 3325 §9.1).
+    pub p_asserted_identity: Option<String>,
+    /// Whether this carrier may be shown the calling identity (RFC 3323 §4.1).
+    pub privacy: Option<OriginatePrivacy>,
 }
 
 impl DialTarget {
@@ -65,6 +89,7 @@ impl DialTarget {
             uri: uri.into(),
             next_hop: None,
             headers: Vec::new(),
+            identity: TargetIdentity::default(),
         }
     }
 
@@ -78,6 +103,7 @@ impl DialTarget {
             uri: uri.into(),
             next_hop: Some(next_hop.into()),
             headers: Vec::new(),
+            identity: TargetIdentity::default(),
         }
     }
 
@@ -87,6 +113,7 @@ impl DialTarget {
         Self::Aor {
             aor: aor.into(),
             headers: Vec::new(),
+            identity: TargetIdentity::default(),
         }
     }
 
@@ -101,32 +128,90 @@ impl DialTarget {
         self
     }
 
+    /// This target's own calling identity, mutable in place.
+    fn identity_mut(&mut self) -> &mut TargetIdentity {
+        match self {
+            Self::Uri { identity, .. } | Self::Aor { identity, .. } => identity,
+        }
+    }
+
+    /// Present this From on this branch alone, over the dial's own.
+    ///
+    /// For a hunt across carriers that assigned different numbers: the number
+    /// a carrier accepts belongs to that carrier, and presenting another
+    /// carrier's leaves it challenging the INVITE however correct the digest.
+    pub fn from(mut self, from: impl Into<String>) -> Self {
+        self.identity_mut().from = Some(from.into());
+        self
+    }
+
+    /// Present this From display name on this branch alone. An empty string
+    /// removes the caller's rather than presenting an empty one.
+    pub fn from_display(mut self, display: impl Into<String>) -> Self {
+        self.identity_mut().from_display = Some(display.into());
+        self
+    }
+
+    /// Assert this identity to this branch's next hop (RFC 3325 §9.1).
+    pub fn p_asserted_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity_mut().p_asserted_identity = Some(identity.into());
+        self
+    }
+
+    /// Whether this branch's carrier may be shown the calling identity.
+    pub fn privacy(mut self, privacy: OriginatePrivacy) -> Self {
+        self.identity_mut().privacy = Some(privacy);
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let headers = match self {
+        let (headers, identity) = match self {
             Self::Uri {
                 uri,
                 next_hop,
                 headers,
+                identity,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
-                // the shape the server's own examples use.
-                if next_hop.is_none() && headers.is_empty() {
+                // the shape the server's own examples use. An identity counts
+                // as an override, or the carrier's own number would be
+                // silently dropped on the way out.
+                if next_hop.is_none()
+                    && headers.is_empty()
+                    && identity == &TargetIdentity::default()
+                {
                     return json!(uri);
                 }
                 object.insert("uri".to_string(), json!(uri));
                 if let Some(next_hop) = next_hop {
                     object.insert("next_hop".to_string(), json!(next_hop));
                 }
-                headers
+                (headers, identity)
             }
-            Self::Aor { aor, headers } => {
+            Self::Aor {
+                aor,
+                headers,
+                identity,
+            } => {
                 object.insert("aor".to_string(), json!(aor));
-                headers
+                (headers, identity)
             }
         };
         if !headers.is_empty() {
             object.insert("headers".to_string(), headers_to_json(headers));
+        }
+        if let Some(from) = &identity.from {
+            object.insert("from".to_string(), json!(from));
+        }
+        if let Some(display) = &identity.from_display {
+            object.insert("from_display".to_string(), json!(display));
+        }
+        if let Some(asserted) = &identity.p_asserted_identity {
+            object.insert("p_asserted_identity".to_string(), json!(asserted));
+        }
+        if let Some(privacy) = identity.privacy {
+            object.insert("privacy".to_string(), json!(privacy.as_str()));
         }
         serde_json::Value::Object(object)
     }
@@ -372,5 +457,70 @@ impl Call {
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u32::try_from(value).ok()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target with no overrides stays a bare string, which is the shape the
+    /// server's own examples use.
+    #[test]
+    fn a_plain_uri_target_is_a_bare_string() {
+        assert_eq!(
+            DialTarget::uri("sip:204@pbx.example").to_json(),
+            json!("sip:204@pbx.example")
+        );
+    }
+
+    /// An identity has to defeat that shortcut, or a carrier's own number is
+    /// dropped on the way out and the branch presents the dial's instead —
+    /// which is the number that carrier does not recognise.
+    #[test]
+    fn a_target_identity_is_carried_on_the_wire() {
+        let target = DialTarget::uri("sip:+15550100@carrier-a.example")
+            .from("sip:2025550111@carrier-a.example")
+            .from_display("Support")
+            .p_asserted_identity("sip:2025550111@carrier-a.example")
+            .privacy(OriginatePrivacy::Restricted);
+
+        let json = target.to_json();
+        assert!(
+            json.is_object(),
+            "an identity must defeat the bare-string shortcut, got {json}"
+        );
+        assert_eq!(
+            json.get("from").and_then(|v| v.as_str()),
+            Some("sip:2025550111@carrier-a.example")
+        );
+        assert_eq!(
+            json.get("from_display").and_then(|v| v.as_str()),
+            Some("Support")
+        );
+        assert_eq!(
+            json.get("p_asserted_identity").and_then(|v| v.as_str()),
+            Some("sip:2025550111@carrier-a.example")
+        );
+        assert_eq!(
+            json.get("privacy").and_then(|v| v.as_str()),
+            Some(OriginatePrivacy::Restricted.as_str())
+        );
+    }
+
+    /// An AoR target carries its identity to every branch it expands to.
+    #[test]
+    fn an_aor_target_carries_its_identity() {
+        let json = DialTarget::aor("sip:204@pbx.example")
+            .from("sip:2025550100@pbx.example")
+            .to_json();
+        assert_eq!(
+            json.get("aor").and_then(|v| v.as_str()),
+            Some("sip:204@pbx.example")
+        );
+        assert_eq!(
+            json.get("from").and_then(|v| v.as_str()),
+            Some("sip:2025550100@pbx.example")
+        );
     }
 }
