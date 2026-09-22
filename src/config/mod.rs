@@ -405,6 +405,7 @@ impl Config {
         let config: Self = serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_backends()?;
+        config.validate_auth_algorithms()?;
         config.validate_cdr()?;
         config.validate_control_app_events()?;
         config.validate_control_apps()?;
@@ -1033,6 +1034,53 @@ impl Config {
                  under header_policies:, or pick one of: {}",
                 known.join(", ")
             )));
+        }
+
+        Ok(())
+    }
+
+    /// Reject an `auth.algorithms` list siphon cannot challenge with.
+    ///
+    /// At load, because every failure here is silent at runtime: an unknown name
+    /// skipped rather than refused leaves a challenge set the operator did not
+    /// choose, and an empty list leaves a 401 carrying no `WWW-Authenticate` at
+    /// all — which a client reads as a malformed response, not as "try again".
+    /// A client population is exactly the thing an operator narrows this list
+    /// for, so getting it wrong has to stop the node rather than half-apply.
+    fn validate_auth_algorithms(&self) -> Result<()> {
+        if self.auth.algorithms.is_empty() {
+            return Err(SiphonError::Config(
+                "auth.algorithms is empty — a 401/407 would carry no \
+                 WWW-Authenticate/Proxy-Authenticate header at all, which no client can \
+                 answer. Remove the key to get the default [MD5, SHA-256, SHA-512-256], \
+                 or name at least one algorithm."
+                    .to_string(),
+            ));
+        }
+
+        for name in &self.auth.algorithms {
+            match crate::auth::DigestAlgorithm::parse(name) {
+                // Network-selected, and its challenge carries the AKA nonce plus
+                // ck=/ik= rather than a plain one — it cannot be mixed into an
+                // RFC 7616 negotiation.
+                Some(crate::auth::DigestAlgorithm::AkaV1Md5) => {
+                    return Err(SiphonError::Config(format!(
+                        "auth.algorithms names {name:?}, which is not an algorithm to offer \
+                         here: IMS AKA is selected by the network, and its challenge is built \
+                         by `auth.require_aka_digest()` (local Milenage) or \
+                         `auth.require_ims_digest()` (Cx MAR to the HSS). Remove it from the \
+                         list and call one of those from the REGISTER handler."
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(SiphonError::Config(format!(
+                        "auth.algorithms names {name:?}, which is not a digest algorithm siphon \
+                         can challenge with. Use MD5, SHA-256 or SHA-512-256 (RFC 2617 / \
+                         RFC 7616), or one of their -sess variants."
+                    )));
+                }
+            }
         }
 
         Ok(())

@@ -34,6 +34,35 @@ pub struct AuthConfig {
     /// Digest-nonce lifetime in seconds (replay window). Default 3600.
     #[serde(default)]
     pub nonce_ttl_secs: Option<u64>,
+    /// Digest algorithms to offer on a 401/407, most preferred first
+    /// (RFC 7616 §3.7). One `WWW-Authenticate` / `Proxy-Authenticate` header is
+    /// emitted per entry, in this order.
+    ///
+    /// Defaults to `["MD5", "SHA-256", "SHA-512-256"]`, which is what siphon has
+    /// always sent: a single challenge set covering RFC 2617 and RFC 7616
+    /// clients. Narrow it for a client population that cannot take a
+    /// multi-challenge 401 — some do abandon the registration outright rather
+    /// than picking one, whatever the order — at the cost of the algorithms you
+    /// drop.
+    ///
+    /// Validated at config load: an unknown name is refused rather than skipped,
+    /// because a silently dropped entry is a challenge set the operator did not
+    /// choose. `AKAv1-MD5` is refused too — it is network-selected and reached
+    /// through `auth.require_aka_digest()` / `require_ims_digest()`, not this
+    /// list.
+    #[serde(default = "default_digest_algorithms")]
+    pub algorithms: Vec<String>,
+}
+
+/// Today's challenge set, unchanged: weakest first, so a legacy MD5-only client
+/// finds its entry and a modern one picks the strongest it supports
+/// (RFC 7616 §3.7).
+fn default_digest_algorithms() -> Vec<String> {
+    vec![
+        "MD5".to_string(),
+        "SHA-256".to_string(),
+        "SHA-512-256".to_string(),
+    ]
 }
 
 /// AKA credential for a single subscriber (3GPP TS 35.206 Milenage).
@@ -64,6 +93,7 @@ impl Default for AuthConfig {
             diameter: None,
             nonce_secret: None,
             nonce_ttl_secs: None,
+            algorithms: default_digest_algorithms(),
         }
     }
 }

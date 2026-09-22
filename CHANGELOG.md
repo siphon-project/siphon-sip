@@ -58,6 +58,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - **The control SDKs can ask for a media profile on `dial` at all.** `profile`
   was accepted on the wire but absent from the Rust, Python and TypeScript
   `DialOptions`, so no SDK could send it.
+- **`auth.algorithms` chooses which digest algorithms a challenge offers, and
+  in what order.** `auth.require_www_digest` / `require_proxy_digest` emitted a
+  fixed three — MD5, SHA-256, SHA-512-256 — with nothing in `auth:` able to
+  touch it, so an operator whose clients cannot take a multi-challenge 401 could
+  not use the engine's own primitive at all and had to run the whole digest
+  exchange in a routing script, re-deriving the nonce store, the auto-ban
+  integration and `enforce_auth_aor_match` in Python.
+
+  RFC 7616 §3.7's "one challenge per algorithm" is a SHOULD, and it is not
+  universally survivable: an SDK that abandons a registration on any 401
+  carrying more than one `WWW-Authenticate` — whatever the algorithms are and
+  whatever the order — leaves the exchange nothing to fall back to.
+
+  ```yaml
+  auth:
+    algorithms: ["MD5"]      # default: ["MD5", "SHA-256", "SHA-512-256"]
+  ```
+
+  One header per entry, in the configured order, all sharing one nonce.
+  Verification is unchanged and still accepts any algorithm siphon can compute,
+  including ones it did not offer. An unknown name fails the config load naming
+  it rather than being skipped, because a silently dropped entry is a challenge
+  set the operator did not choose; an empty list is refused too, since a 401
+  with no challenge is unanswerable; and `AKAv1-MD5` is refused with a pointer
+  to `require_aka_digest()` / `require_ims_digest()`, which are what build an
+  AKA challenge. Leaving the key out keeps today's behaviour exactly.
+
 ### Fixed
 
 - **A DNS lookup can no longer hold a worker or an asyncio loop for tens of
