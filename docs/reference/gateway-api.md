@@ -156,3 +156,11 @@ keyword-with-default and maps one-to-one onto the JSON fields above.
   rest of the estate with it; it is counted and logged with its group and URI.
 - **Push, when polling is too slow.** `POST /admin/gateways/refresh` applies a
   change the moment the controller saves a row.
+- **If your carriers authenticate by source address, turn on the kernel allow
+  set.** Provisioning a carrier here makes it dialable; it does not make the
+  kernel accept its answers. With `security.firewall.gateway_set` (the default
+  when `security.firewall` is set at all) siphon publishes every address these
+  groups resolve to into an nftables set you reference from your own ruleset, on
+  the same reconcile that made the carrier dialable. See
+  [kernel-firewall.md](../kernel-firewall.md#gateway-allow-set). Without it, a
+  newly provisioned carrier works outbound and is silently dead inbound.

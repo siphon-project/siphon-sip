@@ -6,6 +6,62 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+
+- **The kernel firewall now keeps a gateway allow set, so a carrier provisioned
+  at run time is let *in* as well as dialed out.** Where carriers authenticate
+  by source address there is no registration and no outbound digest, so the
+  address list is the authentication — and it is enforced by a ruleset written
+  at deploy time. A carrier added in a controller and picked up by
+  `gateway.backend`'s reconcile was therefore one siphon would dial and whose
+  answers the kernel dropped: the outbound half appears to work while the
+  inbound half is dead, which is the worst shape of failure to debug. It is what
+  stopped `gateway.backend` from being adoptable on an estate that authenticates
+  this way at all.
+
+  With `security.firewall` set, siphon now also declares `gateways4` /
+  `gateways6` — nftables **interval** sets — and keeps them holding every source
+  its gateways admit: every address every destination resolves to (all of them,
+  not only the one currently selected), every `gateway.groups[].source_networks`
+  entry, and every `security.trusted_cidrs` entry. That is the same view
+  `request.from_gateway()` answers from, so the kernel and a script cannot
+  disagree about who is a gateway.
+
+  **siphon declares the sets and writes no rule for them**, in either
+  `manage_rule` mode. Reference them from your own ruleset:
+
+  ```nft
+  ip  saddr @gateways4 udp dport 5060 accept
+  ip6 saddr @gateways6 udp dport 5060 accept
+  ```
+
+  An `accept` inside siphon's own chain would also make a gateway immune to the
+  ban drops, and whether a known carrier can be auto-banned is the operator's
+  policy call, not a side effect of keeping a set current.
+
+  Published once at start-up **before the listeners take traffic**, on every
+  reconcile and every `POST /admin/gateways/refresh` so a new carrier is
+  admitted in the same tick it becomes dialable, and on a 60 s floor tick. A
+  publish replaces the contents wholesale rather than diffing, so a carrier
+  removed from the source stops being admitted and the sets converge again after
+  someone runs `nft flush ruleset` underneath a running node; an unchanged view
+  issues no netlink transaction at all. CIDRs go in as written — expanding a
+  `/24` into 256 addresses, or dropping its prefix, is each a half-fix that
+  looks like it worked — which needs `NFTA_SET_ELEM_KEY_END` and so **Linux
+  5.7**. The floor applies to these sets only; the ban sets are unchanged, and
+  on an older kernel a publish fails with a `warn` and nothing else is affected.
+  Turn the whole thing off with `security.firewall.gateway_set: false`.
+
+### Changed
+
+- **A gateway group with `probe.enabled: false` is re-resolved every 60 seconds
+  instead of only at start-up.** Its destinations were resolved once at
+  construction and never again, so a change of A record on such a group was
+  invisible until a restart — to routing, to `request.from_gateway()` and to
+  `source_ip_in()` alike. The kernel allow set's floor tick is the pass that
+  does it; a probed group is unaffected, since its probe cycle already
+  re-resolves it.
+
 ### Fixed
 
 - **A node no longer comes up with no carriers, quietly, when its controller is

@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr};
 
+use ipnet::IpNet;
+
 /// Upper bound on waiting for a kernel ack (`SO_RCVTIMEO`). Netlink to the
 /// local kernel is reliable, so this never fires in practice — it exists so a
 /// lost ack can never park a `spawn_blocking` thread forever.
@@ -77,6 +79,11 @@ const NFTA_SET_ID: u16 = 10;
 
 // `enum nft_set_flags`
 const NFT_SET_TIMEOUT: u32 = 0x10;
+/// `NFT_SET_INTERVAL` — the set holds ranges, each element carrying a start
+/// key and an inclusive end key. Needed because the gateway allow set takes
+/// `security.trusted_cidrs` as written: expanding a `/24` into 256 bare
+/// addresses, or dropping its prefix, would each be a silent half-fix.
+const NFT_SET_INTERVAL: u32 = 0x4;
 
 // nft datatypes for `NFTA_SET_KEY_TYPE` (informational, but the kernel wants
 // it present): `ipv4_addr` = 7, `ipv6_addr` = 8.
@@ -91,6 +98,11 @@ const NFTA_SET_ELEM_LIST_ELEMENTS: u16 = 3;
 // `enum nft_set_elem_attributes`
 const NFTA_SET_ELEM_KEY: u16 = 1;
 const NFTA_SET_ELEM_TIMEOUT: u16 = 4;
+/// Inclusive upper bound of an interval element (`enum
+/// nft_set_elem_attributes`). Kernel floor: Linux 5.7, where the attribute was
+/// introduced — before it, a range had to be written as a pair of open
+/// elements.
+const NFTA_SET_ELEM_KEY_END: u16 = 9;
 
 // `enum nft_data_attributes`
 const NFTA_DATA_VALUE: u16 = 1;
@@ -285,6 +297,30 @@ fn build_new_set(table: &str, set: &str, set_id: u32, family: SetFamily, seq: u3
     nlmsg(nft_type(NFT_MSG_NEWSET), OBJECT_FLAGS, seq, &body)
 }
 
+/// Create an interval set (`flags interval`) keyed by an IPv4/IPv6 range. Holds
+/// the gateway allow set: the sources the operator's own ruleset accepts, as
+/// CIDRs rather than expanded addresses. Idempotent, like [`build_new_set`].
+///
+/// No `NFT_SET_TIMEOUT`: an allow-set element is replaced wholesale by the next
+/// publish, never expired by the kernel. A timeout here would drop a live
+/// carrier out of the set between publishes.
+fn build_new_interval_set(
+    table: &str,
+    set: &str,
+    set_id: u32,
+    family: SetFamily,
+    seq: u32,
+) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_SET_TABLE, table);
+    push_nla_str(&mut body, NFTA_SET_NAME, set);
+    push_nla_be32(&mut body, NFTA_SET_FLAGS, NFT_SET_INTERVAL);
+    push_nla_be32(&mut body, NFTA_SET_KEY_TYPE, family.key_type());
+    push_nla_be32(&mut body, NFTA_SET_KEY_LEN, family.key_len());
+    push_nla_be32(&mut body, NFTA_SET_ID, set_id);
+    nlmsg(nft_type(NFT_MSG_NEWSET), OBJECT_FLAGS, seq, &body)
+}
+
 /// Encode one set element: nested `NFTA_LIST_ELEM { KEY { DATA_VALUE=ip }[,
 /// TIMEOUT=ttl_ms] }`. `ttl_ms` is only meaningful on an add: `Some(0)` means
 /// never expire; a delete passes `None` (it matches on the key alone, so the
@@ -309,6 +345,41 @@ fn encode_element(address: &IpAddr, ttl_ms: Option<u64>) -> Vec<u8> {
     list_elem
 }
 
+/// Encode one interval element: nested `NFTA_LIST_ELEM { KEY { DATA_VALUE=first
+/// address }, KEY_END { DATA_VALUE=last address } }`.
+///
+/// The end key is **inclusive** — `192.0.2.0/24` is `192.0.2.0` through
+/// `192.0.2.255`, and a host prefix is a range of one, which is how a single
+/// resolved gateway address goes in. A delete matches on the start key alone,
+/// so it shares this encoding.
+fn encode_interval_element(network: &IpNet) -> Vec<u8> {
+    let mut key = Vec::new();
+    push_nla(&mut key, NFTA_DATA_VALUE, &ip_octets(network.network()));
+    let mut key_end = Vec::new();
+    push_nla(
+        &mut key_end,
+        NFTA_DATA_VALUE,
+        &ip_octets(network.broadcast()),
+    );
+
+    let mut elem = Vec::new();
+    push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY, &key);
+    push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY_END, &key_end);
+
+    let mut list_elem = Vec::new();
+    push_nla_nested(&mut list_elem, NFTA_LIST_ELEM, &elem);
+    list_elem
+}
+
+/// Network-order octets of an address, the form every nf_tables key data value
+/// takes.
+fn ip_octets(address: IpAddr) -> Vec<u8> {
+    match address {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    }
+}
+
 fn build_setelem(
     msg: u16,
     table: &str,
@@ -323,6 +394,30 @@ fn build_setelem(
     let elements = encode_element(address, ttl_ms);
     push_nla_nested(&mut body, NFTA_SET_ELEM_LIST_ELEMENTS, &elements);
     nlmsg(nft_type(msg), OBJECT_FLAGS, seq, &body)
+}
+
+/// One `NFT_MSG_NEWSETELEM` carrying every range of an allow set, so a publish
+/// is a single message rather than one per element.
+fn build_interval_setelems(table: &str, set: &str, networks: &[IpNet], seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_SET_ELEM_LIST_TABLE, table);
+    push_nla_str(&mut body, NFTA_SET_ELEM_LIST_SET, set);
+    let mut elements = Vec::new();
+    for network in networks {
+        elements.extend_from_slice(&encode_interval_element(network));
+    }
+    push_nla_nested(&mut body, NFTA_SET_ELEM_LIST_ELEMENTS, &elements);
+    nlmsg(nft_type(NFT_MSG_NEWSETELEM), OBJECT_FLAGS, seq, &body)
+}
+
+/// Empty a set: `NFT_MSG_DELSETELEM` with no element list, which is what
+/// `nft flush set` sends and what the kernel reads as "flush", not "delete
+/// nothing".
+fn build_flush_set(table: &str, set: &str, seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_SET_ELEM_LIST_TABLE, table);
+    push_nla_str(&mut body, NFTA_SET_ELEM_LIST_SET, set);
+    nlmsg(nft_type(NFT_MSG_DELSETELEM), OBJECT_FLAGS, seq, &body)
 }
 
 // --- self-contained chain + drop rule builders -----------------------------
@@ -598,6 +693,7 @@ pub async fn ensure_firewall(
     set_v4: &str,
     set_v6: &str,
     manage_rule: bool,
+    gateway_sets: Option<(&str, &str)>,
 ) -> io::Result<()> {
     // Object seqs run 1..=N within the batch (BATCH_END is N+1, set by
     // `wrap_batch`). The kernel resolves the rules' set/chain references against
@@ -608,12 +704,40 @@ pub async fn ensure_firewall(
         build_new_set(table, set_v4, 1, SetFamily::V4, 2),
         build_new_set(table, set_v6, 2, SetFamily::V6, 3),
     ];
+    let mut seq = 4;
+    // The allow sets are declared whenever the firewall is enabled, so an
+    // operator's own `nft -f` referencing them loads on a fresh node — before
+    // siphon has published anything into them. siphon writes no rule for them
+    // in either `manage_rule` mode: an `accept` inside siphon's chain would
+    // also make a gateway immune to the drop rules below, and that is the
+    // operator's policy call, not a side effect of declaring a set.
+    if let Some((gateways_v4, gateways_v6)) = gateway_sets {
+        messages.push(build_new_interval_set(
+            table,
+            gateways_v4,
+            3,
+            SetFamily::V4,
+            seq,
+        ));
+        seq += 1;
+        messages.push(build_new_interval_set(
+            table,
+            gateways_v6,
+            4,
+            SetFamily::V6,
+            seq,
+        ));
+        seq += 1;
+    }
     if manage_rule {
-        messages.push(build_new_chain(table, chain, 4));
+        messages.push(build_new_chain(table, chain, seq));
+        seq += 1;
         // Flush before re-appending so a restart never stacks a duplicate rule.
-        messages.push(build_flush_chain(table, chain, 5));
-        messages.push(build_drop_rule(table, chain, set_v4, SetFamily::V4, 6));
-        messages.push(build_drop_rule(table, chain, set_v6, SetFamily::V6, 7));
+        messages.push(build_flush_chain(table, chain, seq));
+        seq += 1;
+        messages.push(build_drop_rule(table, chain, set_v4, SetFamily::V4, seq));
+        seq += 1;
+        messages.push(build_drop_rule(table, chain, set_v6, SetFamily::V6, seq));
     }
     let object_count = messages.len();
     // No benign errno: every object is declared with `NLM_F_CREATE` (existing
@@ -655,6 +779,41 @@ pub async fn remove_banned(
     };
     let message = build_setelem(NFT_MSG_DELSETELEM, table, set, &address, None, 1);
     send(wrap_batch(&[message]), 1, Some(ENOENT)).await
+}
+
+/// Replace both gateway allow sets' contents in one atomic transaction: flush
+/// each, then add the ranges currently admitted.
+///
+/// A full replace, not an add/remove diff. A diff cannot converge after an
+/// `nft flush ruleset` has wiped the sets under a running siphon, and these
+/// sets hold tens of ranges rather than thousands, so re-sending all of them
+/// costs nothing. The flush and the adds share one batch, so a packet is never
+/// evaluated against a half-written set.
+///
+/// The ranges must not overlap: an interval set rejects an overlapping element
+/// with `EEXIST`, and no errno is treated as benign here. [`super::gateways`]
+/// merges before publishing.
+pub async fn replace_gateways(
+    table: &str,
+    set_v4: &str,
+    set_v6: &str,
+    v4: &[IpNet],
+    v6: &[IpNet],
+) -> io::Result<()> {
+    let mut messages = vec![
+        build_flush_set(table, set_v4, 1),
+        build_flush_set(table, set_v6, 2),
+    ];
+    let mut seq = 3;
+    if !v4.is_empty() {
+        messages.push(build_interval_setelems(table, set_v4, v4, seq));
+        seq += 1;
+    }
+    if !v6.is_empty() {
+        messages.push(build_interval_setelems(table, set_v6, v6, seq));
+    }
+    let object_count = messages.len();
+    send(wrap_batch(&messages), object_count, None).await
 }
 
 #[cfg(test)]
@@ -858,6 +1017,105 @@ mod tests {
     }
 
     #[test]
+    fn interval_set_carries_the_interval_flag_and_no_timeout() {
+        let message = build_new_interval_set("siphon", "gateways4", 3, SetFamily::V4, 4);
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_NAME, "name"), b"gateways4\0");
+        let flags = be32(attr(&attrs, NFTA_SET_FLAGS, "flags"));
+        assert_eq!(flags & NFT_SET_INTERVAL, NFT_SET_INTERVAL);
+        // An allow-set element is replaced by the next publish, never expired:
+        // a timeout here would drop a live carrier out of the set.
+        assert_eq!(flags & NFT_SET_TIMEOUT, 0);
+        assert_eq!(be32(attr(&attrs, NFTA_SET_KEY_LEN, "key len")), 4);
+        assert_eq!(be32(attr(&attrs, NFTA_SET_ID, "set id")), 3);
+    }
+
+    fn interval_bounds(network: &IpNet) -> (Vec<u8>, Vec<u8>) {
+        let element = encode_interval_element(network);
+        let elem = walk_attrs(attr(&walk_attrs(&element), NFTA_LIST_ELEM, "list elem"));
+        let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
+        let key_end = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY_END, "key end"));
+        (
+            attr(&key, NFTA_DATA_VALUE, "start").to_vec(),
+            attr(&key_end, NFTA_DATA_VALUE, "end").to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_host_prefix_is_a_range_of_one() {
+        let (start, end) = interval_bounds(&"203.0.113.5/32".parse().unwrap());
+        assert_eq!(start, vec![203, 0, 113, 5]);
+        assert_eq!(end, vec![203, 0, 113, 5]);
+    }
+
+    #[test]
+    fn a_v4_prefix_ends_on_its_last_address_inclusive() {
+        let (start, end) = interval_bounds(&"192.0.2.0/24".parse().unwrap());
+        assert_eq!(start, vec![192, 0, 2, 0]);
+        // Inclusive: NFTA_SET_ELEM_KEY_END is the last address in the range,
+        // not the first address after it.
+        assert_eq!(end, vec![192, 0, 2, 255]);
+    }
+
+    #[test]
+    fn a_v4_prefix_shorter_than_a_byte_boundary() {
+        let (start, end) = interval_bounds(&"198.51.100.64/28".parse().unwrap());
+        assert_eq!(start, vec![198, 51, 100, 64]);
+        assert_eq!(end, vec![198, 51, 100, 79]);
+    }
+
+    #[test]
+    fn a_v6_prefix_encodes_16_byte_bounds() {
+        let (start, end) = interval_bounds(&"2001:db8::/32".parse().unwrap());
+        assert_eq!(start, "2001:db8::".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(
+            end,
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
+    }
+
+    #[test]
+    fn interval_setelems_carries_every_range_in_one_message() {
+        let networks: Vec<IpNet> = vec![
+            "192.0.2.0/24".parse().unwrap(),
+            "203.0.113.5/32".parse().unwrap(),
+        ];
+        let message = build_interval_setelems("siphon", "gateways4", &networks, 3);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_NEWSETELEM));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_SET, "set"), b"gateways4\0");
+        let elements = walk_attrs(attr(&attrs, NFTA_SET_ELEM_LIST_ELEMENTS, "elements"));
+        assert_eq!(
+            elements
+                .iter()
+                .filter(|(ty, _)| *ty == NFTA_LIST_ELEM)
+                .count(),
+            2,
+            "both ranges ride one message, not one message each"
+        );
+    }
+
+    #[test]
+    fn flush_set_carries_no_elements() {
+        // `nft flush set` is a DELSETELEM with no element list; with one, the
+        // kernel would read it as "delete these" instead.
+        let message = build_flush_set("siphon", "gateways4", 1);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_DELSETELEM));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_SET, "set"), b"gateways4\0");
+        assert!(
+            !attrs
+                .iter()
+                .any(|(ty, _)| *ty == NFTA_SET_ELEM_LIST_ELEMENTS),
+            "a flush must not carry an element list"
+        );
+    }
+
+    #[test]
     fn new_chain_carries_hook_type_and_priority() {
         let message = build_new_chain("siphon", "input", 4);
         assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_NEWCHAIN));
@@ -1039,11 +1297,12 @@ mod tests {
     fn live_kernel_roundtrip() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            ensure_firewall("siphon", "input", "banned4", "banned6", true)
+            let gateway_sets = Some(("gateways4", "gateways6"));
+            ensure_firewall("siphon", "input", "banned4", "banned6", true, gateway_sets)
                 .await
                 .expect("ensure_firewall");
             // Restart: must be idempotent AND not stack duplicate rules.
-            ensure_firewall("siphon", "input", "banned4", "banned6", true)
+            ensure_firewall("siphon", "input", "banned4", "banned6", true, gateway_sets)
                 .await
                 .expect("ensure_firewall restart");
             add_banned(
@@ -1116,9 +1375,36 @@ mod tests {
             .await
             .expect_err("add into a missing set must error, not silently succeed");
             // manage_rule=false owns only table + sets — no chain, no rules.
-            ensure_firewall("siphon_sets", "input", "banned4", "banned6", false)
+            ensure_firewall("siphon_sets", "input", "banned4", "banned6", false, None)
                 .await
                 .expect("ensure_firewall sets-only");
+
+            // Gateway allow set: publish a mixed address/CIDR set, then replace
+            // it with a smaller one. The replace is what proves a carrier
+            // removed from the source stops being admitted, which an
+            // add-only publisher would never do.
+            replace_gateways(
+                "siphon",
+                "gateways4",
+                "gateways6",
+                &["198.51.100.128/25".parse().unwrap()],
+                &[],
+            )
+            .await
+            .expect("publish gateway allow set");
+            // Replace, not merge: the first publish must be gone afterwards.
+            replace_gateways(
+                "siphon",
+                "gateways4",
+                "gateways6",
+                &[
+                    "192.0.2.0/24".parse().unwrap(),
+                    "203.0.113.9/32".parse().unwrap(),
+                ],
+                &["2001:db8:1::/48".parse().unwrap()],
+            )
+            .await
+            .expect("republish gateway allow set");
         });
 
         let output = std::process::Command::new("nft")
@@ -1184,6 +1470,37 @@ mod tests {
         assert!(
             !sets_only.contains("chain"),
             "manage_rule=false must not create a chain:\n{sets_only}"
+        );
+        assert!(
+            !sets_only.contains("gateways4"),
+            "gateway_set=None must not declare an allow set:\n{sets_only}"
+        );
+
+        // The gateway allow set: declared as an interval set, holding what the
+        // second publish left, and nothing the first one held on its own.
+        assert!(
+            text.contains("gateways4") && text.contains("gateways6"),
+            "gateway allow sets missing:\n{text}"
+        );
+        assert!(
+            text.contains("flags interval"),
+            "allow set is not an interval set:\n{text}"
+        );
+        assert!(
+            text.contains("192.0.2.0/24"),
+            "published v4 range missing:\n{text}"
+        );
+        assert!(
+            text.contains("203.0.113.9"),
+            "published v4 host missing:\n{text}"
+        );
+        assert!(
+            text.contains("2001:db8:1::/48"),
+            "published v6 range missing:\n{text}"
+        );
+        assert!(
+            !text.contains("198.51.100.128/25"),
+            "a replaced range must be gone, not merged with the new one:\n{text}"
         );
     }
 }

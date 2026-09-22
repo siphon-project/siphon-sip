@@ -50,6 +50,9 @@ security:
     # set_v4: "banned4"       # IPv4 ban set
     # set_v6: "banned6"       # IPv6 ban set
     # manage_rule: true       # SIPhon owns the chain + drop rules too (see below)
+    # gateway_set: true       # also maintain the gateway allow set (see below)
+    # set_gateways_v4: "gateways4"   # IPv4 allow set (interval)
+    # set_gateways_v6: "gateways6"   # IPv6 allow set (interval)
 ```
 
 `firewall: {}` is enough. On startup SIPhon creates the `inet siphon` table, the
@@ -137,6 +140,95 @@ explicitly:
 ```bash
 nft delete table inet siphon
 ```
+
+## Gateway allow set
+
+The ban sets say who to keep out. The allow set says who to let in, and it
+exists because a carrier that authenticates by **source address** has no
+registration and no outbound digest — the address list *is* the authentication,
+and it is usually rendered into a ruleset at deploy time.
+
+That breaks the moment the carrier list stops being static. A carrier added in
+your controller and picked up by `gateway.backend`'s reconcile is one SIPhon
+will dial and whose answers the kernel drops: the outbound half appears to work
+while the inbound half is dead, which is the worst shape of failure to debug.
+
+So whenever the firewall is enabled, SIPhon also declares two **interval** sets
+and keeps them holding every source its gateways admit:
+
+```nft
+table inet siphon {
+    set gateways4 { type ipv4_addr; flags interval; }
+    set gateways6 { type ipv6_addr; flags interval; }
+}
+```
+
+**SIPhon declares the sets and writes no rule for them, in either `manage_rule`
+mode.** You reference them from your own ruleset:
+
+```nft
+ip  saddr @gateways4 udp dport 5060 accept
+ip6 saddr @gateways6 udp dport 5060 accept
+```
+
+That is deliberate. An `accept` inside SIPhon's own chain would also make a
+gateway immune to the ban drops above, and whether a known carrier can be
+auto-banned is your policy call, not a side effect of SIPhon keeping a set
+current. The sets are declared even before anything is published into them, so
+an `nft -f` referencing them loads on a fresh node.
+
+### What goes in
+
+- Every address every gateway group resolves to — all of them, not just the one
+  currently selected, so a carrier behind several A records works. This is the
+  same view `request.from_gateway()` answers from, so the kernel and the script
+  can never disagree about who is a gateway.
+- Every `gateway.groups[].source_networks` entry, as written.
+- Every `security.trusted_cidrs` entry, as written — it is already your "not an
+  abuser" list: own trunks, monitoring, management.
+
+Ranges are deduplicated and a range another already contains is dropped, so a
+gateway inside a `trusted_cidrs` block goes in once.
+
+### When it is republished
+
+- Once during start-up, **before the listeners take traffic**, so a node never
+  answers calls while the kernel is still dropping a carrier it will dial.
+- On every `gateway.backend` reconcile and every `POST /admin/gateways/refresh`,
+  so a carrier provisioned in your controller is admitted in the same tick it
+  becomes dialable.
+- On a 60-second floor tick, which also re-resolves groups with
+  `probe.enabled: false` — nothing else ever revisits their DNS.
+
+A publish that changes nothing issues no netlink transaction at all. A publish
+replaces the set contents wholesale rather than diffing, so a carrier removed
+from your source stops being admitted, and the sets converge again even after
+someone runs `nft flush ruleset` underneath a running node.
+
+### Kernel floor: Linux 5.7
+
+The allow set uses `NFTA_SET_ELEM_KEY_END` to carry a CIDR as one element with
+an inclusive upper bound. That attribute landed in Linux 5.7. On an older kernel
+the sets are declared but a publish fails, logged at `warn`, and everything else
+(the ban sets, the drop rules) is unaffected — the floor applies to the gateway
+sets only.
+
+Taking CIDRs as written is the point: expanding a `/24` into 256 bare addresses,
+or silently dropping its prefix and admitting one host out of it, are each a
+half-fix that looks like it worked.
+
+### Turning it off
+
+```yaml
+security:
+  firewall:
+    gateway_set: false
+```
+
+The sets are then neither declared nor published, and nothing else changes. Note
+the [renaming caveat](#renaming-or-disabling-clean-up-the-old-objects-yourself)
+applies here too: sets SIPhon already created stay in the kernel with their last
+contents until you remove them.
 
 ## Containers: use nftables, not XDP
 
