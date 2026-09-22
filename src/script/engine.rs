@@ -1567,14 +1567,48 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    /// Helper: write Python source to a temp file and compile it.
-    fn compile_temp_script(source: &str) -> Result<ScriptState> {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(source.as_bytes()).unwrap();
-        file.flush().unwrap();
+    /// A script file in a directory of its own.
+    ///
+    /// `NamedTempFile` puts the file directly in the system temp directory,
+    /// which makes that whole directory the engine's script directory — so
+    /// `purge_user_modules` drops every module in `sys.modules` whose file
+    /// lives anywhere beneath it, which is every *other* test's helper module.
+    /// That is correct behaviour on the engine's part (a module under the
+    /// script directory is the script's own helper) and unreachable in a
+    /// deployment, which runs one engine; a test binary runs dozens, and one
+    /// of them claiming the shared temp directory emptied the others'
+    /// `sys.modules` entries mid-test.
+    ///
+    /// Giving each script a directory nobody else writes to keeps every
+    /// engine's purge to its own helpers.
+    struct TempScript {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
 
+    impl TempScript {
+        fn new(source: &str) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("script.py");
+            std::fs::write(&path, source).unwrap();
+            Self { _dir: dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Replace the script's source in place, for the reload tests.
+        fn rewrite(&self, source: &str) {
+            std::fs::write(&self.path, source).unwrap();
+        }
+    }
+
+    /// Helper: write Python source to a temp script and compile it.
+    fn compile_temp_script(source: &str) -> Result<ScriptState> {
+        let script = TempScript::new(source);
         Python::initialize();
-        ScriptEngine::compile_script(file.path(), &[])
+        ScriptEngine::compile_script(script.path(), &[])
     }
 
     // --- Sibling `.py` imports (script.include_paths) --------------------------
@@ -2353,22 +2387,18 @@ async def route(request):
 
     #[test]
     fn reload_swaps_state_atomically() {
-        let mut file = NamedTempFile::new().unwrap();
-        write!(
-            file,
+        let script = TempScript::new(
             r#"
 from siphon import proxy
 
 @proxy.on_request
 def route(request):
     pass
-"#
-        )
-        .unwrap();
-        file.flush().unwrap();
+"#,
+        );
 
         let config = ScriptConfig {
-            path: file.path().to_str().unwrap().to_owned(),
+            path: script.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
@@ -2382,9 +2412,7 @@ def route(request):
         assert_eq!(engine.state().handlers.len(), 1);
 
         // Overwrite with a script that has 2 handlers
-        let mut file_handle = std::fs::File::create(file.path()).unwrap();
-        write!(
-            file_handle,
+        script.rewrite(
             r#"
 from siphon import proxy
 
@@ -2395,10 +2423,8 @@ def handle_register(request):
 @proxy.on_request("INVITE")
 def handle_invite(request):
     pass
-"#
-        )
-        .unwrap();
-        file_handle.flush().unwrap();
+"#,
+        );
 
         engine.reload().unwrap();
         assert_eq!(engine.state().handlers.len(), 2);
@@ -2406,22 +2432,18 @@ def handle_invite(request):
 
     #[test]
     fn failed_reload_keeps_previous_state() {
-        let mut file = NamedTempFile::new().unwrap();
-        write!(
-            file,
+        let script = TempScript::new(
             r#"
 from siphon import proxy
 
 @proxy.on_request
 def route(request):
     pass
-"#
-        )
-        .unwrap();
-        file.flush().unwrap();
+"#,
+        );
 
         let config = ScriptConfig {
-            path: file.path().to_str().unwrap().to_owned(),
+            path: script.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
@@ -2435,7 +2457,7 @@ def route(request):
         assert_eq!(engine.state().handlers.len(), 1);
 
         // Overwrite with broken syntax
-        std::fs::write(file.path(), "def broken(\n").unwrap();
+        script.rewrite("def broken(\n");
 
         let result = engine.reload();
         assert!(result.is_err());
@@ -3866,11 +3888,9 @@ from siphon import probe_ns
 
 assert probe_ns.answer() == 42
 "#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(source.as_bytes()).unwrap();
-        file.flush().unwrap();
+        let script = TempScript::new(source);
 
-        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        ScriptEngine::compile_script(script.path(), &[]).unwrap();
 
         crate::script::api::clear_user_namespaces();
     }
@@ -3977,11 +3997,9 @@ assert ext_alpha.answer() == 7
 assert ext_beta.answer() == 7
 assert ModuleExtensionProbe().answer() == 7
 "#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(source.as_bytes()).unwrap();
-        file.flush().unwrap();
+        let script = TempScript::new(source);
 
-        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        ScriptEngine::compile_script(script.path(), &[]).unwrap();
 
         crate::script::api::clear_module_extensions();
     }
@@ -4016,16 +4034,14 @@ from siphon import replay_probe
 
 assert replay_probe.answer() == 7
 "#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(source.as_bytes()).unwrap();
-        file.flush().unwrap();
+        let script = TempScript::new(source);
 
-        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        ScriptEngine::compile_script(script.path(), &[]).unwrap();
         let after_first = calls.load(Ordering::SeqCst);
         assert!(after_first >= 1, "hook never ran");
 
         // A reload re-installs the module; the hook must run again.
-        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        ScriptEngine::compile_script(script.path(), &[]).unwrap();
         assert!(
             calls.load(Ordering::SeqCst) > after_first,
             "hook did not replay on reload"
@@ -4085,11 +4101,9 @@ assert replay_probe.answer() == 7
         )
         .unwrap();
 
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"pass\n").unwrap();
-        file.flush().unwrap();
+        let script = TempScript::new("pass\n");
 
-        let result = ScriptEngine::compile_script(file.path(), &[]);
+        let result = ScriptEngine::compile_script(script.path(), &[]);
         crate::script::api::clear_module_extensions();
 
         let error = format!(
