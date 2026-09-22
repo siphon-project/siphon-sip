@@ -8,6 +8,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **The registrar's write-through queue is bounded, and `aor_count()` no longer
+  waits on it without a deadline.** `registrar.aor_count()` awaited a oneshot
+  with no timeout, queued behind a writer draining an **unbounded** channel. Each
+  Redis command was bounded only because 500ms happens to be the `redis` crate's
+  default response timeout, which siphon never asked for; the aggregate was not
+  bounded at all. During an outage every operation burns its full timeout, the
+  drain rate collapses to a couple of operations a second, and a REGISTER storm
+  grows the queue without limit — an unbounded memory sink and an ever-growing
+  wait for a caller who has no way to give up.
+
+  The queue now holds 16384 commands and refuses the rest, `aor_count()` gives up
+  after 5s with a new `BackendError::Timeout`, and the Redis response timeout is
+  pinned explicitly at the same 500ms so a dependency bump cannot remove the only
+  per-operation bound silently. A refused command is logged and counted rather
+  than discarded quietly: it means L1 and L2 have diverged, so that binding will
+  not survive a restart, which is worth an alert. The identical unbounded queue
+  in the iFC backend writer is bounded the same way.
+
+  Four new metrics make it diagnosable, where the path previously emitted
+  nothing: `siphon_registrar_backend_queue_depth`,
+  `siphon_registrar_backend_dropped_total{command,reason}`,
+  `siphon_registrar_count_aors_queue_wait_seconds` and
+  `siphon_registrar_count_aors_duration_seconds`. The two histograms are
+  separate because the two causes of a slow `count_aors` have different fixes —
+  a long queue is drained faster, a slow backend is not.
+
+
 - **A B-leg response no longer holds a worker for the length of the call when
   its leg actor has already exited.** The dispatcher hands the response to the
   actor and then blocks for the classification event it emits, skipping a

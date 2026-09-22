@@ -349,6 +349,11 @@ pub enum BackendError {
     Serialization(String),
     /// Query error.
     Query(String),
+    /// The backend did not answer inside the caller's deadline. Distinct from
+    /// `Connection` because the path is intact and the work is still running —
+    /// only this caller stopped waiting for it, so a retry is reasonable where
+    /// a connection error means there is nothing to retry against.
+    Timeout(String),
 }
 
 impl std::fmt::Display for BackendError {
@@ -359,6 +364,7 @@ impl std::fmt::Display for BackendError {
                 write!(f, "backend serialization error: {message}")
             }
             BackendError::Query(message) => write!(f, "backend query error: {message}"),
+            BackendError::Timeout(message) => write!(f, "backend timeout: {message}"),
         }
     }
 }
@@ -506,6 +512,15 @@ mod redis_real {
         connections: Vec<redis::aio::MultiplexedConnection>,
     }
 
+    /// How long a single Redis command may take before it fails.
+    ///
+    /// The same 500ms the `redis` crate happens to default to, pinned here so
+    /// it is siphon's choice rather than a dependency's. It is the only reason
+    /// an individual operation is bounded at all, and a bump that changed or
+    /// dropped that default would otherwise remove the bound silently, leaving
+    /// the write-through queue to back up behind commands that never return.
+    const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
     impl RedisBackend {
         /// Connect to Redis (single instance or sharded).
         pub async fn connect(config: RedisBackendConfig) -> Result<Self, BackendError> {
@@ -521,10 +536,11 @@ mod redis_real {
                 for url in &config.urls {
                     let client = redis::Client::open(url.as_str())
                         .map_err(|error| BackendError::Connection(error.to_string()))?;
-                    let connection = client
+                    let mut connection = client
                         .get_multiplexed_async_connection()
                         .await
                         .map_err(|error| BackendError::Connection(error.to_string()))?;
+                    connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
                     connections.push(connection);
                 }
                 tracing::info!(
@@ -535,10 +551,11 @@ mod redis_real {
             } else {
                 let client = redis::Client::open(config.url.as_str())
                     .map_err(|error| BackendError::Connection(error.to_string()))?;
-                let connection = client
+                let mut connection = client
                     .get_multiplexed_async_connection()
                     .await
                     .map_err(|error| BackendError::Connection(error.to_string()))?;
+                connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
                 tracing::info!("redis registrar backend connected");
                 vec![connection]
             };
@@ -1301,169 +1318,14 @@ impl RegistrarBackend for PostgresBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Backend writer — async write-through via channel
+// Backend writer — bounded write-through via channel
 // ---------------------------------------------------------------------------
 
-/// Commands sent to the backend writer task.
-enum BackendCommand {
-    Save {
-        aor: String,
-        contacts: Vec<StoredContact>,
-    },
-    Remove {
-        aor: String,
-    },
-    SaveAorState {
-        aor: String,
-        state: StoredAorState,
-    },
-    RemoveAorState {
-        aor: String,
-    },
-    CountAors {
-        reply: tokio::sync::oneshot::Sender<Result<usize, BackendError>>,
-    },
-}
-
-/// Handle for sending commands to a backend task.
-///
-/// Writes (Save / Remove) are fire-and-forget; failures are logged by the
-/// background task.  Reads (CountAors) round-trip through a oneshot reply
-/// channel and propagate backend errors to the caller.
-#[derive(Debug, Clone)]
-pub struct BackendWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<BackendCommand>,
-}
-
-impl BackendWriter {
-    /// Enqueue a save (full AoR replacement) to the backend.
-    pub fn save(&self, aor: &str, contacts: Vec<StoredContact>) {
-        let _ = self.tx.send(BackendCommand::Save {
-            aor: aor.to_string(),
-            contacts,
-        });
-    }
-
-    /// Enqueue a remove (all contacts for an AoR) to the backend.
-    pub fn remove(&self, aor: &str) {
-        let _ = self.tx.send(BackendCommand::Remove {
-            aor: aor.to_string(),
-        });
-    }
-
-    /// Enqueue an auxiliary-state write (Service-Route, P-Asserted-Identity,
-    /// P-Associated-URI) for an AoR.  An empty state removes the entry.
-    pub fn save_aor_state(&self, aor: &str, state: StoredAorState) {
-        let _ = self.tx.send(BackendCommand::SaveAorState {
-            aor: aor.to_string(),
-            state,
-        });
-    }
-
-    /// Enqueue a removal of the auxiliary state for an AoR.
-    pub fn remove_aor_state(&self, aor: &str) {
-        let _ = self.tx.send(BackendCommand::RemoveAorState {
-            aor: aor.to_string(),
-        });
-    }
-
-    /// Ask the backend for the current number of registered AoRs.
-    ///
-    /// Authoritative across all siphon instances sharing the backend
-    /// (Redis, Postgres).  Returns `BackendError::Connection` if the writer
-    /// task has shut down or the reply channel is dropped.
-    pub async fn count_aors(&self) -> Result<usize, BackendError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(BackendCommand::CountAors { reply: tx })
-            .map_err(|_| {
-                BackendError::Connection("registrar backend writer task is closed".to_string())
-            })?;
-        rx.await.map_err(|_| {
-            BackendError::Connection("registrar backend reply channel dropped".to_string())
-        })?
-    }
-}
-
-/// Spawn a background task that processes write-through commands.
-///
-/// Returns a [`BackendWriter`] handle that can be cloned into the Registrar.
-pub fn spawn_backend_writer<B: RegistrarBackend + 'static>(backend: B) -> BackendWriter {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(backend_writer_loop(backend, rx));
-    BackendWriter { tx }
-}
-
-/// A writer whose commands are recorded instead of applied, so a test can see
-/// exactly which write-throughs a registrar operation issued, and in what order.
-#[cfg(test)]
-pub(crate) fn recording_writer() -> (BackendWriter, RecordedWrites) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    (BackendWriter { tx }, RecordedWrites(rx))
-}
-
-/// The receiving end of [`recording_writer`].
-#[cfg(test)]
-pub(crate) struct RecordedWrites(tokio::sync::mpsc::UnboundedReceiver<BackendCommand>);
+mod writer;
 
 #[cfg(test)]
-impl RecordedWrites {
-    /// Every command issued since the last drain, one line each: the operation,
-    /// the AoR, and for a save the stored contact URIs in stored order.
-    pub(crate) fn drain(&mut self) -> Vec<String> {
-        let mut recorded = Vec::new();
-        while let Ok(command) = self.0.try_recv() {
-            recorded.push(match command {
-                BackendCommand::Save { aor, contacts } => {
-                    let uris: Vec<&str> = contacts
-                        .iter()
-                        .map(|contact| contact.uri.as_str())
-                        .collect();
-                    format!("save {aor} {uris:?}")
-                }
-                BackendCommand::Remove { aor } => format!("remove {aor}"),
-                BackendCommand::SaveAorState { aor, .. } => format!("save_state {aor}"),
-                BackendCommand::RemoveAorState { aor } => format!("remove_state {aor}"),
-                BackendCommand::CountAors { .. } => "count_aors".to_string(),
-            });
-        }
-        recorded
-    }
-}
-
-async fn backend_writer_loop<B: RegistrarBackend>(
-    backend: B,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<BackendCommand>,
-) {
-    while let Some(command) = rx.recv().await {
-        match command {
-            BackendCommand::Save { aor, contacts } => {
-                if let Err(error) = backend.save(&aor, &contacts).await {
-                    tracing::warn!(aor, %error, "registrar backend write-through failed");
-                }
-            }
-            BackendCommand::Remove { aor } => {
-                if let Err(error) = backend.remove(&aor).await {
-                    tracing::warn!(aor, %error, "registrar backend write-through failed");
-                }
-            }
-            BackendCommand::SaveAorState { aor, state } => {
-                if let Err(error) = backend.save_aor_state(&aor, &state).await {
-                    tracing::warn!(aor, %error, "registrar backend aor-state write-through failed");
-                }
-            }
-            BackendCommand::RemoveAorState { aor } => {
-                if let Err(error) = backend.remove_aor_state(&aor).await {
-                    tracing::warn!(aor, %error, "registrar backend aor-state remove failed");
-                }
-            }
-            BackendCommand::CountAors { reply } => {
-                let result = backend.all_aors().await.map(|aors| aors.len());
-                let _ = reply.send(result);
-            }
-        }
-    }
-}
+pub(crate) use writer::recording_writer;
+pub use writer::{spawn_backend_writer, BackendWriter};
 
 // ---------------------------------------------------------------------------
 // Restore — load contacts from backend into in-memory registrar
@@ -1552,7 +1414,7 @@ mod tests {
     use super::*;
     use crate::registrar::Registrar;
 
-    fn sample_stored_contact() -> StoredContact {
+    pub(super) fn sample_stored_contact() -> StoredContact {
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
