@@ -8,6 +8,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **BREAKING: the four `sbi` methods are now awaitable.**
+  `discover_pcf_binding`, `create_session`, `update_session` and
+  `delete_session` return a coroutine and must be `await`ed, for the reason the
+  `diameter` methods do below: they blocked the calling thread, which for an
+  `async def` handler is the asyncio driver every coroutine on that loop shares.
+  An N5 policy call at session setup is on the answer path of every VoNR call,
+  so it is one of the worst places to hold a loop.
+
+  Arguments are still read and validated at the call — `discover_pcf_binding`
+  still raises `ValueError` for a missing or doubled UE address where you called
+  it, and `create_session` / `update_session` still raise for a bad `events`
+  there too. Only the BSF's or PCF's own answer moves behind the `await`.
+
 - **BREAKING: every `diameter` request method is now awaitable.** `cx_uar`,
   `cx_sar`, `cx_lir`, `s6a_air`, `s6a_ulr`, `s6a_purge_ue`, `rx_aar`, `rx_str`,
   `sh_udr`, `sh_pur`, `sh_snr`, `s6c_srr`, `s6c_rsr`, `sgd_tfr`, `send_request`

@@ -69,13 +69,17 @@ impl PySbi {
     ///
     /// Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied. ``ue_ipv6``
     /// is treated as a prefix; a bare address gets ``/64`` appended.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (ue_ipv4=None, ue_ipv6=None))]
     fn discover_pcf_binding<'py>(
         &self,
         python: Python<'py>,
         ue_ipv4: Option<&str>,
         ue_ipv6: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let query = match (ue_ipv4, ue_ipv6) {
             (Some(ipv4), None) => BindingQuery::Ipv4(ipv4.to_string()),
             (None, Some(ipv6)) => {
@@ -111,16 +115,19 @@ impl PySbi {
             }
         };
 
-        let result =
-            crate::script::detach_block_on(async move { bsf.discover_binding(&query).await });
+        let scheme = self.pcf_scheme;
 
-        match result {
-            Ok(Some(binding)) => Ok(Some(binding_to_pydict(python, &binding, self.pcf_scheme)?)),
-            Ok(None) => Ok(None),
-            Err(error) => Err(BsfError::new_err(format!(
-                "sbi.discover_pcf_binding failed: {error}"
-            ))),
-        }
+        crate::script::awaitable(python, async move {
+            match bsf.discover_binding(&query).await {
+                Ok(Some(binding)) => Python::attach(|python| {
+                    binding_to_pydict(python, &binding, scheme).map(|dict| Some(dict.unbind()))
+                }),
+                Ok(None) => Ok(None),
+                Err(error) => Err(BsfError::new_err(format!(
+                    "sbi.discover_pcf_binding failed: {error}"
+                ))),
+            }
+        })
     }
 
     /// Create an N5 app session for QoS policy authorization.
@@ -155,6 +162,10 @@ impl PySbi {
     /// same PCF from any replica), or ``None`` on failure.
     ///
     /// Raises ``ValueError`` when ``events`` is empty or has no ``notif_uri``.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         af_app_id="IMS Services",
         sip_call_id=None,
@@ -180,7 +191,7 @@ impl PySbi {
         media_components: Option<&Bound<'py, PyAny>>,
         pcf_uri: Option<&str>,
         events: Option<Vec<String>>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
             None => Vec::new(),
@@ -203,25 +214,26 @@ impl PySbi {
 
         let client = Arc::clone(&self.client);
         let target = pcf_uri.map(String::from);
-        let result = crate::script::detach_block_on(async move {
-            client
-                .create_app_session(target.as_deref(), &request_data)
-                .await
-        });
 
-        match result {
-            Ok(created) => {
-                let dict = PyDict::new(python);
-                dict.set_item("app_session_id", &created.app_session_id)?;
-                dict.set_item("authorized", created.authorized)?;
-                dict.set_item("app_session_uri", created.location)?;
-                Ok(Some(dict))
+        crate::script::awaitable(python, async move {
+            let result = client
+                .create_app_session(target.as_deref(), &request_data)
+                .await;
+
+            match result {
+                Ok(created) => Python::attach(|python| {
+                    let dict = PyDict::new(python);
+                    dict.set_item("app_session_id", &created.app_session_id)?;
+                    dict.set_item("authorized", created.authorized)?;
+                    dict.set_item("app_session_uri", created.location)?;
+                    Ok(Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "sbi.create_session failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "sbi.create_session failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Delete an N5 app session.
@@ -235,18 +247,27 @@ impl PySbi {
     /// or it was already gone (404, the usual answer after a PCF termination).
     /// Either way siphon stops tracking it. Returns False when the delete
     /// failed (transport error or any other non-2xx); the session stays tracked.
-    fn delete_session(&self, session_id: &str) -> PyResult<bool> {
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
+    fn delete_session<'py>(
+        &self,
+        python: Python<'py>,
+        session_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = crate::script::detach_block_on(client.delete_app_session(&sid));
 
-        match result {
-            Ok(()) => Ok(true),
-            Err(error) => {
-                warn!(error = %error, "sbi.delete_session failed");
-                Ok(false)
+        crate::script::awaitable(python, async move {
+            match client.delete_app_session(&sid).await {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    warn!(error = %error, "sbi.delete_session failed");
+                    Ok(false)
+                }
             }
-        }
+        })
     }
 
     /// Update an N5 app session — media renegotiation (re-INVITE / UPDATE).
@@ -262,6 +283,10 @@ impl PySbi {
     /// changes where the PCF posts them and is only sent with ``events``.
     /// Raises ``ValueError`` when ``events`` is empty or ``notif_uri`` comes
     /// without ``events``.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         session_id,
         media_components=None,
@@ -275,7 +300,7 @@ impl PySbi {
         media_components: Option<&Bound<'py, PyAny>>,
         events: Option<Vec<String>>,
         notif_uri: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
             None => Vec::new(),
@@ -287,22 +312,24 @@ impl PySbi {
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = crate::script::detach_block_on(client.update_app_session(&sid, &update_data));
 
-        match result {
-            Ok(()) => {
-                // The modify response (the updated AppSessionContext) carries no
-                // flat id; echo the bare id from the ref the caller passed.
-                let dict = PyDict::new(python);
-                dict.set_item("app_session_id", app_session_id_from_location(session_id))?;
-                dict.set_item("authorized", true)?;
-                Ok(Some(dict))
+        crate::script::awaitable(python, async move {
+            match client.update_app_session(&sid, &update_data).await {
+                Ok(()) => Python::attach(|python| {
+                    // The modify response (the updated AppSessionContext)
+                    // carries no flat id; echo the bare id from the ref the
+                    // caller passed.
+                    let dict = PyDict::new(python);
+                    dict.set_item("app_session_id", app_session_id_from_location(&sid))?;
+                    dict.set_item("authorized", true)?;
+                    Ok(Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "sbi.update_session failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "sbi.update_session failed");
-                Ok(None)
-            }
-        }
+        })
     }
 }
 
