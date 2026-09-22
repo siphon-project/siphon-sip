@@ -121,10 +121,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   someone runs `nft flush ruleset` underneath a running node; an unchanged view
   issues no netlink transaction at all. CIDRs go in as written — expanding a
   `/24` into 256 addresses, or dropping its prefix, is each a half-fix that
-  looks like it worked — which needs `NFTA_SET_ELEM_KEY_END` and so **Linux
-  5.7**. The floor applies to these sets only; the ban sets are unchanged, and
-  on an older kernel a publish fails with a `warn` and nothing else is affected.
-  Turn the whole thing off with `security.firewall.gateway_set: false`.
+  looks like it worked — carried as the element pair `nft_set_rbtree` takes, the
+  same one `nft` emits. Turn the whole thing off with
+  `security.firewall.gateway_set: false`.
 
 ### Changed
 

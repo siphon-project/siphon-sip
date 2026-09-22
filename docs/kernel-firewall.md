@@ -205,17 +205,16 @@ replaces the set contents wholesale rather than diffing, so a carrier removed
 from your source stops being admitted, and the sets converge again even after
 someone runs `nft flush ruleset` underneath a running node.
 
-### Kernel floor: Linux 5.7
+### CIDRs go in as written
 
-The allow set uses `NFTA_SET_ELEM_KEY_END` to carry a CIDR as one element with
-an inclusive upper bound. That attribute landed in Linux 5.7. On an older kernel
-the sets are declared but a publish fails, logged at `warn`, and everything else
-(the ban sets, the drop rules) is unaffected — the floor applies to the gateway
-sets only.
-
-Taking CIDRs as written is the point: expanding a `/24` into 256 bare addresses,
-or silently dropping its prefix and admitting one host out of it, are each a
-half-fix that looks like it worked.
+Expanding a `/24` into 256 bare addresses, or silently dropping its prefix and
+admitting one host out of it, are each a half-fix that looks like it worked. So
+a CIDR rides as a range: `nft_set_rbtree` — the backend an
+`ipv4_addr`/`ipv6_addr` set with `flags interval` selects — takes a range as the
+element that opens it plus an `NFT_SET_ELEM_INTERVAL_END` element keyed one
+address past its last, which is exactly what `nft` itself sends. No kernel floor
+beyond nf_tables: this is the original interval encoding, not the newer
+`NFTA_SET_ELEM_KEY_END` attribute (which that backend rejects).
 
 ### Turning it off
 

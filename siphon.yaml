@@ -751,7 +751,6 @@ auth:
 #                               # answers. siphon declares the sets and writes
 #                               # NO rule for them; reference them yourself:
 #                               #   ip saddr @gateways4 udp dport 5060 accept
-#                               # Needs Linux >= 5.7 (NFTA_SET_ELEM_KEY_END).
 #     # set_gateways_v4: "gateways4"   # IPv4 allow set (flags interval)
 #     # set_gateways_v6: "gateways6"   # IPv6 allow set (flags interval)
 #     # manage_rule: true       # siphon owns chain + drop rules too; false =
