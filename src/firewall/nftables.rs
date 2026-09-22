@@ -98,11 +98,20 @@ const NFTA_SET_ELEM_LIST_ELEMENTS: u16 = 3;
 // `enum nft_set_elem_attributes`
 const NFTA_SET_ELEM_KEY: u16 = 1;
 const NFTA_SET_ELEM_TIMEOUT: u16 = 4;
-/// Inclusive upper bound of an interval element (`enum
-/// nft_set_elem_attributes`). Kernel floor: Linux 5.7, where the attribute was
-/// introduced — before it, a range had to be written as a pair of open
-/// elements.
-const NFTA_SET_ELEM_KEY_END: u16 = 9;
+/// `enum nft_set_elem_attributes`. An element carrying
+/// [`NFT_SET_ELEM_INTERVAL_END`] closes the range the previous one opened.
+const NFTA_SET_ELEM_FLAGS: u16 = 3;
+
+/// `enum nft_set_elem_flags`. This element is the **exclusive** upper bound of
+/// an interval: its key is the address one past the range's last.
+///
+/// Not `NFTA_SET_ELEM_KEY_END`, which reads like the obvious way to say the
+/// same thing and is what the first cut of this used. `nft_set_rbtree` — the
+/// backend an `ipv4_addr`/`ipv6_addr` set with `flags interval` selects —
+/// rejects it with `EINVAL`, and `nft --debug=netlink` shows `nft` itself
+/// emitting this two-element form instead. Matching what `nft` sends is the
+/// only encoding worth trusting here.
+const NFT_SET_ELEM_INTERVAL_END: u32 = 0x1;
 
 // `enum nft_data_attributes`
 const NFTA_DATA_VALUE: u16 = 1;
@@ -345,30 +354,50 @@ fn encode_element(address: &IpAddr, ttl_ms: Option<u64>) -> Vec<u8> {
     list_elem
 }
 
-/// Encode one interval element: nested `NFTA_LIST_ELEM { KEY { DATA_VALUE=first
-/// address }, KEY_END { DATA_VALUE=last address } }`.
-///
-/// The end key is **inclusive** — `192.0.2.0/24` is `192.0.2.0` through
-/// `192.0.2.255`, and a host prefix is a range of one, which is how a single
-/// resolved gateway address goes in. A delete matches on the start key alone,
-/// so it shares this encoding.
-fn encode_interval_element(network: &IpNet) -> Vec<u8> {
-    let mut key = Vec::new();
-    push_nla(&mut key, NFTA_DATA_VALUE, &ip_octets(network.network()));
-    let mut key_end = Vec::new();
-    push_nla(
-        &mut key_end,
-        NFTA_DATA_VALUE,
-        &ip_octets(network.broadcast()),
-    );
+/// Encode one set element: `NFTA_LIST_ELEM { KEY { DATA_VALUE=address }[,
+/// FLAGS=INTERVAL_END ] }`.
+fn encode_key_element(address: &[u8], interval_end: bool) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_nla(&mut data, NFTA_DATA_VALUE, address);
 
     let mut elem = Vec::new();
-    push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY, &key);
-    push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY_END, &key_end);
+    push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY, &data);
+    if interval_end {
+        push_nla_be32(&mut elem, NFTA_SET_ELEM_FLAGS, NFT_SET_ELEM_INTERVAL_END);
+    }
 
     let mut list_elem = Vec::new();
     push_nla_nested(&mut list_elem, NFTA_LIST_ELEM, &elem);
     list_elem
+}
+
+/// Encode one CIDR as the element **pair** `nft_set_rbtree` takes: the range's
+/// first address, then an [`NFT_SET_ELEM_INTERVAL_END`] element keyed one past
+/// its last.
+///
+/// A host prefix is a range of one, which is how a single resolved gateway
+/// address goes in: `203.0.113.9/32` is `203.0.113.9` followed by the end
+/// marker `203.0.113.10`. A range that runs to the top of the address space has
+/// nothing after it to key an end marker on, so it gets none and stays open —
+/// which is correct, since nothing follows it.
+fn encode_interval_element(network: &IpNet) -> Vec<u8> {
+    let mut elements = encode_key_element(&ip_octets(network.network()), false);
+    if let Some(after_last) = address_after(network.broadcast()) {
+        elements.extend_from_slice(&encode_key_element(&ip_octets(after_last), true));
+    }
+    elements
+}
+
+/// The address one past `address`, or `None` at the top of the address space.
+fn address_after(address: IpAddr) -> Option<IpAddr> {
+    match address {
+        IpAddr::V4(v4) => u32::from(v4)
+            .checked_add(1)
+            .map(|next| IpAddr::V4(next.into())),
+        IpAddr::V6(v6) => u128::from(v6)
+            .checked_add(1)
+            .map(|next| IpAddr::V6(next.into())),
+    }
 }
 
 /// Network-order octets of an address, the form every nf_tables key data value
@@ -403,6 +432,16 @@ fn build_interval_setelems(table: &str, set: &str, networks: &[IpNet], seq: u32)
     push_nla_str(&mut body, NFTA_SET_ELEM_LIST_TABLE, table);
     push_nla_str(&mut body, NFTA_SET_ELEM_LIST_SET, set);
     let mut elements = Vec::new();
+    // Mark everything below the first range as outside the set. `nft` emits
+    // this too: without a lower bound to close against, the rbtree has no way
+    // to read the first range's start element as an opening one.
+    if let Some(first) = networks.first() {
+        let floor = match first {
+            IpNet::V4(_) => vec![0u8; 4],
+            IpNet::V6(_) => vec![0u8; 16],
+        };
+        elements.extend_from_slice(&encode_key_element(&floor, true));
+    }
     for network in networks {
         elements.extend_from_slice(&encode_interval_element(network));
     }
@@ -1030,38 +1069,60 @@ mod tests {
         assert_eq!(be32(attr(&attrs, NFTA_SET_ID, "set id")), 3);
     }
 
-    fn interval_bounds(network: &IpNet) -> (Vec<u8>, Vec<u8>) {
-        let element = encode_interval_element(network);
-        let elem = walk_attrs(attr(&walk_attrs(&element), NFTA_LIST_ELEM, "list elem"));
-        let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
-        let key_end = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY_END, "key end"));
-        (
-            attr(&key, NFTA_DATA_VALUE, "start").to_vec(),
-            attr(&key_end, NFTA_DATA_VALUE, "end").to_vec(),
-        )
+    /// The start key of an encoded range, and the exclusive end key when the
+    /// range has one. Asserts the shape `nft_set_rbtree` requires along the
+    /// way: the first element carries no flags, the second is flagged as the
+    /// interval's end.
+    fn interval_bounds(network: &IpNet) -> (Vec<u8>, Option<Vec<u8>>) {
+        let encoded = encode_interval_element(network);
+        let elements: Vec<Vec<(u16, &[u8])>> = walk_attrs(&encoded)
+            .into_iter()
+            .filter(|(attr_type, _)| *attr_type == NFTA_LIST_ELEM)
+            .map(|(_, payload)| walk_attrs(payload))
+            .collect();
+
+        let opener = &elements[0];
+        assert!(
+            !opener
+                .iter()
+                .any(|(attr_type, _)| *attr_type == NFTA_SET_ELEM_FLAGS),
+            "the element that opens a range must not be flagged as its end"
+        );
+        let key = walk_attrs(attr(opener, NFTA_SET_ELEM_KEY, "key"));
+        let start = attr(&key, NFTA_DATA_VALUE, "start").to_vec();
+
+        let end = elements.get(1).map(|closer| {
+            assert_eq!(
+                be32(attr(closer, NFTA_SET_ELEM_FLAGS, "flags")),
+                NFT_SET_ELEM_INTERVAL_END,
+                "the second element must close the interval"
+            );
+            let key = walk_attrs(attr(closer, NFTA_SET_ELEM_KEY, "key"));
+            attr(&key, NFTA_DATA_VALUE, "end").to_vec()
+        });
+        (start, end)
     }
 
     #[test]
     fn a_host_prefix_is_a_range_of_one() {
         let (start, end) = interval_bounds(&"203.0.113.5/32".parse().unwrap());
         assert_eq!(start, vec![203, 0, 113, 5]);
-        assert_eq!(end, vec![203, 0, 113, 5]);
+        // Exclusive: the end marker is the address *after* the range.
+        assert_eq!(end, Some(vec![203, 0, 113, 6]));
     }
 
     #[test]
-    fn a_v4_prefix_ends_on_its_last_address_inclusive() {
+    fn a_v4_prefix_ends_one_past_its_last_address() {
         let (start, end) = interval_bounds(&"192.0.2.0/24".parse().unwrap());
         assert_eq!(start, vec![192, 0, 2, 0]);
-        // Inclusive: NFTA_SET_ELEM_KEY_END is the last address in the range,
-        // not the first address after it.
-        assert_eq!(end, vec![192, 0, 2, 255]);
+        assert_eq!(end, Some(vec![192, 0, 3, 0]));
     }
 
     #[test]
     fn a_v4_prefix_shorter_than_a_byte_boundary() {
         let (start, end) = interval_bounds(&"198.51.100.64/28".parse().unwrap());
         assert_eq!(start, vec![198, 51, 100, 64]);
-        assert_eq!(end, vec![198, 51, 100, 79]);
+        assert_eq!(end, Some(vec![198, 51, 100, 80]));
     }
 
     #[test]
@@ -1070,11 +1131,17 @@ mod tests {
         assert_eq!(start, "2001:db8::".parse::<Ipv6Addr>().unwrap().octets());
         assert_eq!(
             end,
-            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"
-                .parse::<Ipv6Addr>()
-                .unwrap()
-                .octets()
+            Some("2001:db9::".parse::<Ipv6Addr>().unwrap().octets().to_vec())
         );
+    }
+
+    #[test]
+    fn a_range_running_to_the_top_of_the_space_stays_open() {
+        // There is no address after the last one to key an end marker on, and
+        // none is needed: nothing follows it.
+        let (start, end) = interval_bounds(&"0.0.0.0/0".parse().unwrap());
+        assert_eq!(start, vec![0, 0, 0, 0]);
+        assert_eq!(end, None);
     }
 
     #[test]
@@ -1088,13 +1155,24 @@ mod tests {
         let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
         assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_SET, "set"), b"gateways4\0");
         let elements = walk_attrs(attr(&attrs, NFTA_SET_ELEM_LIST_ELEMENTS, "elements"));
+        let elements: Vec<Vec<(u16, &[u8])>> = elements
+            .into_iter()
+            .filter(|(attr_type, _)| *attr_type == NFTA_LIST_ELEM)
+            .map(|(_, payload)| walk_attrs(payload))
+            .collect();
+        // The opening floor marker, then a start + end pair per range — all in
+        // one message, not one message each.
+        assert_eq!(elements.len(), 5);
+
+        let floor = walk_attrs(attr(&elements[0], NFTA_SET_ELEM_KEY, "key"));
         assert_eq!(
-            elements
-                .iter()
-                .filter(|(ty, _)| *ty == NFTA_LIST_ELEM)
-                .count(),
-            2,
-            "both ranges ride one message, not one message each"
+            attr(&floor, NFTA_DATA_VALUE, "floor"),
+            &[0, 0, 0, 0],
+            "everything below the first range is marked as outside the set"
+        );
+        assert_eq!(
+            be32(attr(&elements[0], NFTA_SET_ELEM_FLAGS, "flags")),
+            NFT_SET_ELEM_INTERVAL_END
         );
     }
 
