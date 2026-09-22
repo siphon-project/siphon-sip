@@ -12,6 +12,7 @@ configurable backends for registrar, auth, cache, etc.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import re
 import sys
@@ -1398,6 +1399,52 @@ def _auth_param(value: str, name: str) -> Optional[str]:
     return None
 
 
+# Digest algorithm name -> hashlib name.  The ``-sess`` variants fold a cnonce
+# into H(A1) rather than changing the hash, so they share their base entry
+# (RFC 7616 §3.4.2).  An absent ``algorithm=`` means MD5 (RFC 2617 §3.2.1).
+_DIGEST_HASHES = {
+    "": "md5",
+    "MD5": "md5",
+    "MD5-SESS": "md5",
+    "SHA-256": "sha256",
+    "SHA256": "sha256",
+    "SHA-256-SESS": "sha256",
+    "SHA256-SESS": "sha256",
+    "SHA-512-256": "sha512_256",
+    "SHA512-256": "sha512_256",
+    "SHA-512-256-SESS": "sha512_256",
+    "SHA512-256-SESS": "sha512_256",
+}
+
+
+def _digest_hash(algorithm: Optional[str], data: str) -> str:
+    """Lowercase hex of ``data`` under the digest ``algorithm``.
+
+    Matching is case-insensitive and tolerates ``_`` for ``-``, as the engine's
+    parser does.  An algorithm this Python's ``hashlib`` cannot provide raises
+    rather than returning a mismatch: ``sha512_256`` is in
+    ``hashlib.algorithms_available`` but not ``algorithms_guaranteed``, and a
+    silent ``False`` there would be the same "the test proves nothing" trap this
+    verifier exists to close.
+    """
+    name = (algorithm or "").upper().replace("_", "-")
+    hash_name = _DIGEST_HASHES.get(name)
+    if hash_name is None:
+        raise ValueError(
+            f"unknown digest algorithm {algorithm!r} — "
+            f"expected one of MD5, SHA-256, SHA-512-256 (or a -sess variant)"
+        )
+    try:
+        digest = hashlib.new(hash_name)
+    except ValueError as error:  # pragma: no cover - platform-dependent
+        raise ValueError(
+            f"digest algorithm {algorithm!r} needs hashlib {hash_name!r}, "
+            f"which this Python does not provide: {error}"
+        ) from error
+    digest.update(data.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _with_integrity_protected(value: str, protected: str) -> str:
     """``value`` carrying exactly one ``integrity-protected="<protected>"``."""
     scheme, params = _auth_scheme_and_params(value)
@@ -2605,6 +2652,10 @@ class MockAuth:
             ``True`` if authenticated, ``False`` if challenge was sent.
         """
         self._resolve_supplied(password, ha1)
+        if password is not None or ha1 is not None:
+            return self._challenge_with_supplied(
+                target, "Authorization", 401, "Unauthorized", realm, password, ha1
+            )
         if self._allow:
             # Derive auth_user from From URI when auto-allowing.
             user = getattr(target.from_uri, "user", None) if target.from_uri else None
@@ -2616,6 +2667,27 @@ class MockAuth:
             target.auth_user = self._extract_username(auth_header)
             return True
         self._challenge(target, 401, "Unauthorized")
+        return False
+
+    def _challenge_with_supplied(self, target: Any, header_name: str,
+                                 code: int, reason: str,
+                                 realm: Optional[str],
+                                 password: Optional[str],
+                                 ha1: Optional[str]) -> bool:
+        """Verify against a script-supplied credential, else arm the challenge.
+
+        The shared tail of ``require_www_digest`` / ``require_proxy_digest``
+        when the script passed ``password=`` / ``ha1=``.  Unlike the backend
+        path it never consults ``_allow``: the script handed over a credential
+        to check, so a wrong one has to be refused or the test proves nothing.
+        """
+        auth_header = target.get_header(header_name)
+        if auth_header is not None and self._verify_supplied(
+            target, auth_header, realm, password, ha1
+        ):
+            target.auth_user = self._extract_username(auth_header)
+            return True
+        self._challenge(target, code, reason)
         return False
 
     def require_proxy_digest(self, target: Any,
@@ -2643,6 +2715,11 @@ class MockAuth:
                 configured backend.  Mutually exclusive with ``password``.
         """
         self._resolve_supplied(password, ha1)
+        if password is not None or ha1 is not None:
+            return self._challenge_with_supplied(
+                target, "Proxy-Authorization", 407,
+                "Proxy Authentication Required", realm, password, ha1,
+            )
         if self._allow:
             user = getattr(target.from_uri, "user", None) if target.from_uri else None
             target.auth_user = user or "mock_user"
@@ -2853,13 +2930,26 @@ class MockAuth:
         MD5, SHA-256 and SHA-512-256 from one secret, because H(A1) is derived
         with whatever algorithm the client actually used (RFC 7616 §3.4.3).
 
-        The anti-replay nonce check runs either way: a supplied credential
-        changes where the secret comes from, never whether a captured
+        The anti-replay nonce check runs either way in the engine: a supplied
+        credential changes where the secret comes from, never whether a captured
         ``Authorization`` may be replayed.
+
+        **What the mock does and does not do.**  With ``password=`` or ``ha1=``
+        it performs the real RFC 7616 arithmetic — H(A1), H(A2) and the response
+        under the algorithm the ``Authorization`` header names — so a wrong
+        password returns ``False`` and a right one returns ``True``, and a test
+        that delegates verification to the engine keeps its accept/reject
+        assertions.  With neither kwarg it still answers from the preset
+        ``_allow`` flag, because there is no credential source in the mock to
+        look one up from.
+
+        It deliberately does **not** replay-check the nonce, which the engine
+        does first: a fixture's hand-written nonce would otherwise fail every
+        test for the wrong reason.  ``validate_nonce`` covers that separately.
 
         Args:
             target: The SIP ``Request`` or B2BUA ``Call``.
-            realm: Auth realm.
+            realm: Auth realm.  When ``None``, the realm in the header is used.
             password: Plaintext secret to verify against.  Mutually exclusive
                 with ``ha1``.
             ha1: Already-computed H(A1) to verify against.  Mutually exclusive
@@ -2869,16 +2959,73 @@ class MockAuth:
             ``True`` if valid credentials are present.
 
         Raises:
-            ValueError: if both ``password`` and ``ha1`` are given.
+            ValueError: if both ``password`` and ``ha1`` are given, or if the
+                header names a digest algorithm this Python cannot compute.
         """
         self._resolve_supplied(password, ha1)
-        if self._allow:
-            return True
         auth_header = (
             target.get_header("Authorization")
             or target.get_header("Proxy-Authorization")
         )
+
+        # A supplied credential is something the mock can actually check, so it
+        # checks it rather than falling through to the preset flag.
+        if password is not None or ha1 is not None:
+            if auth_header is None:
+                return False
+            return self._verify_supplied(target, auth_header, realm, password, ha1)
+
+        if self._allow:
+            return True
         return auth_header is not None and self._check_auth(auth_header, realm)
+
+    def _verify_supplied(self, target: Any, auth_header: str,
+                         realm: Optional[str],
+                         password: Optional[str],
+                         ha1: Optional[str]) -> bool:
+        """The RFC 7616 §3.4 response check, mirroring the engine's verifier.
+
+        H(A1) is the supplied hash verbatim, or ``H(username:realm:password)``.
+        ``realm`` is the caller's argument when given — the engine uses the realm
+        the script passed, not the one the client echoed back, so a client cannot
+        pick the realm its credential is checked against.
+        """
+        algorithm = _auth_param(auth_header, "algorithm")
+        username = _auth_param(auth_header, "username") or ""
+        nonce = _auth_param(auth_header, "nonce") or ""
+        digest_uri = _auth_param(auth_header, "uri") or ""
+        response = _auth_param(auth_header, "response") or ""
+        qop = _auth_param(auth_header, "qop")
+        effective_realm = realm if realm is not None else (
+            _auth_param(auth_header, "realm") or ""
+        )
+
+        if ha1 is not None:
+            # Algorithm-specific by construction (RFC 7616 §3.4.3): a hash
+            # computed for MD5 cannot answer a SHA-256 challenge, and that
+            # mismatch has to show up as a failed verification, not a pass.
+            secret_hash = ha1
+        else:
+            secret_hash = _digest_hash(
+                algorithm, f"{username}:{effective_realm}:{password}"
+            )
+
+        # The engine takes the method from the request start line and defaults
+        # to REGISTER for anything that is not one (a B2BUA Call).
+        method = getattr(target, "method", None) or "REGISTER"
+        ha2 = _digest_hash(algorithm, f"{method}:{digest_uri}")
+
+        if qop == "auth":
+            nonce_count = _auth_param(auth_header, "nc") or "00000001"
+            cnonce = _auth_param(auth_header, "cnonce") or ""
+            expected = _digest_hash(
+                algorithm,
+                f"{secret_hash}:{nonce}:{nonce_count}:{cnonce}:auth:{ha2}",
+            )
+        else:
+            expected = _digest_hash(algorithm, f"{secret_hash}:{nonce}:{ha2}")
+
+        return expected.lower() == response.strip().lower()
 
     @staticmethod
     def _resolve_supplied(password: Optional[str], ha1: Optional[str]) -> None:

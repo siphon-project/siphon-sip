@@ -60,6 +60,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   resolve on an asyncio driver thread, where a parked loop stops every
   coroutine on it, including calls that never touched DNS. Measured against an
   unresponsive nameserver, one resolve took **18 s** before this change.
+- **The SDK mock's digest checks now verify a supplied credential instead of
+  waving it through.** `auth.verify_digest(request, realm, password=…)` — and
+  the `require_www_digest` / `require_proxy_digest` / `require_digest` forms of
+  it — validated that `password=` and `ha1=` were not both given and then
+  answered from the mock's preset allow flag. A script that delegates
+  verification to the engine, which is what those keywords exist for, therefore
+  lost every accept/reject assertion its tests could make: a wrong password
+  passed as readily as a right one, silently, while the engine verified
+  properly. The mock now does the RFC 7616 §3.4 arithmetic — H(A1), H(A2) and
+  the response under the algorithm the `Authorization` header names, MD5 /
+  SHA-256 / SHA-512-256, with and without `qop=auth` — so a wrong credential
+  returns `False` and the same test against a real node agrees. With neither
+  keyword given nothing changes; there is no credential source in a mock to look
+  one up from. An algorithm this Python's `hashlib` cannot provide raises
+  naming it rather than returning `False`, which would be the same trap again.
+
+  A stored `ha1` stays bound to the hash it was computed with (RFC 7616 §3.4.3),
+  so an MD5 hash now fails a SHA-256-signed request in the mock as it does on a
+  node. The mock deliberately does not replay-check the nonce, which the engine
+  does first — a fixture's hand-written nonce would otherwise fail every test
+  for the wrong reason.
+
 - **A `@diameter.on_request` handler that raises now answers
   `5012 DIAMETER_UNABLE_TO_COMPLY`, not `3002 DIAMETER_UNABLE_TO_DELIVER`.**
   Every way the inbound dispatch could fail answered the no-route code, which on
