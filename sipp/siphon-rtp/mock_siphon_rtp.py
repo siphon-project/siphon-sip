@@ -131,11 +131,26 @@ def primary_codec(sdp: str) -> str:
     return rtpmap.group(1).upper() if rtpmap else f"PT{payload}"
 
 
+# The controller identity the last `authenticate` presented, if any. The real
+# engine keys call ownership on it so a reconnecting controller reaches the
+# calls its previous connection created; the mock only records it, which is
+# enough for a scenario to assert that siphon presents one at all.
+CONTROLLER_ID = None
+
+
 def handle_command(command: dict, connection) -> dict:
     verb = command.get("command")
     call_id = command.get("call_id", "")
     if verb == "ping":
         return {"result": "pong"}
+    if verb == "authenticate":
+        # Mirrors the real engine with no secret configured: any token is
+        # accepted (there is none to check against), and a controller_id is an
+        # identity claim honoured on top of it. This mock configures no secret,
+        # so the token is not inspected.
+        global CONTROLLER_ID
+        CONTROLLER_ID = command.get("controller_id")
+        return {"result": "ok"}
     if verb == "offer":
         sdp = command.get("sdp", "")
         with CALLS_LOCK:
