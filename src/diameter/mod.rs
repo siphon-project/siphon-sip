@@ -22,6 +22,8 @@ pub mod rf;
 pub mod rf_service;
 pub mod ro;
 pub mod ro_service;
+#[cfg(test)]
+pub(crate) mod ro_test_support;
 pub mod rx;
 pub mod s6a;
 pub mod s6c;

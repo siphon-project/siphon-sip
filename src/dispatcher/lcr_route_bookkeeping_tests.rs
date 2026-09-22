@@ -81,7 +81,7 @@ fn attempts(sequence: &Sequence) -> Vec<String> {
 }
 
 /// The caller abandons the call it placed with [`Sequence::start`].
-fn caller_cancels(sequence: &Sequence) {
+pub(super) fn caller_cancels(sequence: &Sequence) {
     let raw = concat!(
         "CANCEL sip:15550100042@siphon.example.com SIP/2.0\r\n",
         "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-lcr-policy\r\n",

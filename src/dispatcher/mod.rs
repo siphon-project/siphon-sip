@@ -85,6 +85,8 @@ mod b_leg_capability_tests;
 #[cfg(test)]
 mod bad_extension_tests;
 #[cfg(test)]
+mod carrier_attribution_tests;
+#[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
 mod control_originate_tests;

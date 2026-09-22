@@ -630,6 +630,12 @@ pub fn include_register_enabled() -> bool {
 /// `siphon_cdr_dropped_total` counter — the point of several sinks is that a
 /// collector falling behind does not cost the durable file copy anything.
 pub fn write(cdr: Cdr) -> bool {
+    #[cfg(test)]
+    if let Some(captured) = CDR_TEST_RECORDS.get() {
+        if let Ok(mut guard) = captured.lock() {
+            guard.push(cdr.clone());
+        }
+    }
     let Some(sinks) = CDR_SENDER.get() else {
         return false;
     };
@@ -664,6 +670,31 @@ pub fn write(cdr: Cdr) -> bool {
 /// Check if CDR system is initialized and enabled.
 pub fn is_enabled() -> bool {
     CDR_SENDER.get().is_some()
+}
+
+/// Every record [`write`] has produced since the first call to
+/// [`capture_auto_emitted_cdrs`].
+#[cfg(test)]
+static CDR_TEST_RECORDS: OnceLock<std::sync::Mutex<Vec<Cdr>>> = OnceLock::new();
+
+/// Turn auto-emit on and start collecting the records it produces, so a test
+/// can drive a dispatcher path end-to-end and assert on the finished CDR.
+///
+/// **Process-wide, not per-test.** `CDR_AUTO_FLAGS` is the same `OnceLock`
+/// [`init`] writes, so the first caller wins and every later test in the same
+/// binary also runs with auto-emit on, and the collected records accumulate
+/// across all of them. That is safe because `CDR_SENDER` stays unset — no
+/// writer task runs, and [`write`] still reports the record as unaccepted. A
+/// caller must pick its own records out of the returned vector rather than
+/// assume it owns them: match on something that identifies the call, not on
+/// position or length.
+#[cfg(test)]
+pub(crate) fn capture_auto_emitted_cdrs() -> &'static std::sync::Mutex<Vec<Cdr>> {
+    let _ = CDR_AUTO_FLAGS.set(CdrAutoFlags {
+        auto_emit: true,
+        include_register: false,
+    });
+    CDR_TEST_RECORDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Background writer for one sink. Drains its channel and writes each record.

@@ -26,6 +26,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Fixed
 
+- **A call that never answered still names the carrier it was on.** Ro's
+  `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71) was stamped on the credit
+  session at the `2xx` alone, so an OCS was told a call was placed, told what it
+  consumed, and never told where it went unless somebody answered. A caller
+  hanging up during ringing — the largest class of unanswered call — a busy, a
+  ring timeout and a carrier's own 5xx after failover all produced an identical
+  CCR-TERMINATION naming nobody, which makes an answer-seizure ratio computed
+  per carrier from the charging feed 100 % for every carrier. The carrier is now
+  stamped at each attempt that reaches the wire, and again at the answer, so the
+  AVP means "the carrier that answered, or the last one dialled if none did" and
+  reaches a mid-call re-authorization as well as the final record. It stays
+  absent when no carrier was ever dialled. The CDR feed had the same hole on the
+  same calls: the caller-cancel path wrote its `487` record without the route's
+  `cdr_fields` or its `lcr_attempts`, so there was nothing to reconcile the
+  charging record against; both are stamped there now, as the answer and
+  exhausted-sequence paths already did.
+
 - **A `dial` that names a media profile can fork.** It previously refused any
   dial that resolved to more than one branch, which made a profile and a ring
   group mutually exclusive — and a carrier-delivered group call is exactly the

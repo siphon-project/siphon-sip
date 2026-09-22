@@ -223,6 +223,18 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         Some("Request Terminated"),
     );
 
+    // LCR: the carrier that was ringing when the caller gave up, and every
+    // carrier burned on the way to it, before the record is closed. The answer
+    // path and the exhausted-sequence path both stamp these; this one did not,
+    // and it is the only teardown where the carrier in flight is neither a
+    // winner nor a failed attempt — so a cancelled call named no carrier
+    // anywhere on the CDR feed, leaving nothing to reconcile the charging
+    // record against.
+    if let Some(route) = state.call_actors.active_route(&call_id) {
+        cdr_stamp_route_fields(state, &call_id, &route.cdr_fields);
+    }
+    cdr_stamp_route_attempts(state, &call_id);
+
     // CDR: the caller CANCELled before answer (cdr.auto_emit) → 487.
     cdr_finalize_b2bua_fail(state, &call_id, 487);
 

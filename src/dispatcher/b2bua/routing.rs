@@ -511,6 +511,18 @@ pub fn b2bua_advance_route_with_numbers(
             b2bua_record_undialed_carrier(call_id, &route, &mut burned, state);
             continue;
         }
+        // Charging: the call is on this carrier from here. Stamped at the dial
+        // rather than at the answer so every record after it names the carrier
+        // the call was actually on — a re-authorization firing while it rings,
+        // and the CCR-TERMINATION of a call that never answers at all, which is
+        // most of them (a caller cancelling during ringing is the single largest
+        // class). The answer path stamps again, last write wins, so an answered
+        // call still names the carrier that answered.
+        //
+        // After the `!sent` burn, not before: a carrier that never reached the
+        // wire is not one the call was on, which is also what keeps the AVP
+        // consistent with `dialed` on the CDR's `lcr_attempts`.
+        ro_stamp_dialed_carrier(state, call_id, &route.carrier_id);
         set_b2bua_answer_deadline(call_id, timeout, state);
         return RouteAdvance {
             dialed: true,
