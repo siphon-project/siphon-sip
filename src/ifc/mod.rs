@@ -35,7 +35,8 @@ impl BytesTextExt for quick_xml::events::BytesText<'_> {
     }
 }
 use tokio::sync::mpsc;
-#[cfg(feature = "redis-backend")]
+// Unconditional: the writer's drop path logs whether or not a Redis backend is
+// compiled in, since the queue and its bound exist either way.
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
