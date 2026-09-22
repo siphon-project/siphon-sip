@@ -328,6 +328,57 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
     info!("iFC Redis backend writer initialized");
 }
 
+/// Release media sessions the engine still holds for calls that died with a
+/// previous run of this node (`media.reap_orphans_at_startup`).
+///
+/// A restart drops siphon's session state, but the engine keeps relaying. Those
+/// calls are dead and nothing else removes them: the engine's own media timeout
+/// only fires for a stream that went quiet, and a call bridged between two
+/// endpoints that are both still sending never does. They hold their ports until
+/// the engine restarts.
+///
+/// Runs here, before any listener binds, so this node cannot yet have anchored a
+/// call of its own — otherwise a call whose offer had reached the engine but
+/// whose session-store entry had not yet landed would read as an orphan and be
+/// torn down.
+///
+/// A failure is logged, never fatal: not reclaiming ports is worse than a
+/// restart, but it is not worse than refusing to start.
+pub(super) async fn reap_orphaned_media(
+    config: &Config,
+    components: &crate::dispatcher::RtpEngineComponents,
+) {
+    let media_config = match &config.media {
+        Some(media_config) if media_config.reap_orphans_at_startup => media_config,
+        _ => return,
+    };
+    let (Some(backend), Some(sessions), _) = components else {
+        return;
+    };
+
+    // rtpproxy's control protocol has no enumeration verb, so there is nothing
+    // to reap from. Say so rather than fail a reap every restart: an operator
+    // who set the knob should learn it cannot be honoured here, once, at boot.
+    if matches!(backend.kind(), crate::config::MediaBackendKind::Rtpproxy) {
+        warn!(
+            "media.reap_orphans_at_startup is set, but the rtpproxy control protocol \
+             cannot enumerate live calls — no orphan reap will run on this backend"
+        );
+        return;
+    }
+
+    info!("media orphan reap: asking the engine what it still holds");
+    match crate::rtpengine::reap_orphaned_sessions(backend, sessions, media_config.reap_limit).await
+    {
+        Ok(_) => {}
+        Err(error) => warn!(
+            %error,
+            "media orphan reap failed; any sessions left from a previous run keep \
+             their ports until the engine releases them"
+        ),
+    }
+}
+
 pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     use crate::gateway::{
         extract_address_from_uri, resolve_address, Algorithm, Destination, DispatcherGroup,

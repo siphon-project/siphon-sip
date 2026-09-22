@@ -209,7 +209,7 @@ use timers::*;
 /// (rtpengine NG or native siphon-rtp), the media session store, and the
 /// profile registry. Each component is present only when `media` is configured
 /// (otherwise all three are `None`).
-type RtpEngineComponents = (
+pub type RtpEngineComponents = (
     Option<Arc<crate::rtpengine::MediaBackend>>,
     Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
     Option<Arc<crate::rtpengine::ProfileRegistry>>,

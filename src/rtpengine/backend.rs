@@ -21,7 +21,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
@@ -168,6 +168,42 @@ impl MediaBackend {
             Self::RtpEngine(set) => set.delete(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.delete(call_id, from_tag).await,
             Self::RtpProxy(client) => client.delete(call_id, from_tag).await,
+        }
+    }
+
+    /// Tear down a whole call by id, for one recovered from [`Self::list`]
+    /// whose tags are no longer known.
+    pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        match self {
+            Self::RtpEngine(set) => set.delete_call(call_id).await,
+            Self::SiphonRtp(client) => client.delete_call(call_id).await,
+            Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "the rtpproxy control protocol cannot delete a call without its tags".to_string(),
+            )),
+        }
+    }
+
+    /// Every live call-id the backend reports, for the startup orphan reap.
+    ///
+    /// **Scoping differs by backend, and it decides how dangerous the answer
+    /// is.** The native siphon-rtp path is owner-scoped: the engine returns
+    /// only the calls this control identity created, so acting on the result
+    /// cannot touch another node's call. rtpengine's `list` has no such notion
+    /// and answers with every call on the engine, another node's included —
+    /// which is why anything that deletes from this result is opt-in
+    /// (`media.reap_orphans_at_startup`) and documented at that knob.
+    ///
+    /// rtpproxy has no enumeration command at all, so it reports that rather
+    /// than an empty list: "nothing is live" and "I cannot tell you" are
+    /// different answers, and a reap must not read the second as the first and
+    /// conclude there is nothing to keep.
+    pub async fn list(&self, limit: Option<usize>) -> Result<Vec<String>, RtpEngineError> {
+        match self {
+            Self::RtpEngine(set) => set.list(limit).await,
+            Self::SiphonRtp(client) => client.list().await,
+            Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "the rtpproxy control protocol has no way to enumerate live calls".to_string(),
+            )),
         }
     }
 
@@ -886,6 +922,64 @@ impl MediaBackend {
     }
 }
 
+/// Delete the media sessions an engine still holds for calls this node no
+/// longer has. Returns how many were reaped.
+///
+/// A restart loses siphon's session state while the engine keeps relaying, so
+/// those calls are dead but still hold their ports. Nothing else removes them:
+/// the engine's own media timeout only fires for a call that stopped receiving,
+/// and a call bridged between two still-talking endpoints never does.
+///
+/// Anything the store still knows about is kept, so this is safe to run with
+/// sessions already restored — it deletes what siphon cannot account for, not
+/// what it has not got round to yet. Comparison is on the *engine's* call-id,
+/// which is not always the SIP one: a media re-anchor gives a call an engine id
+/// of its own, and comparing the SIP id would read every re-anchored call as an
+/// orphan and delete a live call.
+///
+/// Bounded by `limit`, and one failed delete does not stop the rest: a call the
+/// engine refuses is logged and the reap moves on, since the remaining orphans
+/// are no less worth freeing.
+pub async fn reap_orphaned_sessions(
+    backend: &MediaBackend,
+    sessions: &crate::rtpengine::session::MediaSessionStore,
+    limit: usize,
+) -> Result<usize, RtpEngineError> {
+    let live = sessions.live_engine_call_ids();
+    let engine_calls = backend.list(Some(limit)).await?;
+
+    let orphans: Vec<&String> = engine_calls
+        .iter()
+        .filter(|call_id| !live.contains(*call_id))
+        .collect();
+    if orphans.is_empty() {
+        info!(
+            engine_calls = engine_calls.len(),
+            live = live.len(),
+            "media orphan reap: nothing the engine holds is unaccounted for"
+        );
+        return Ok(0);
+    }
+
+    let mut reaped = 0usize;
+    for call_id in &orphans {
+        match backend.delete_call(call_id).await {
+            Ok(()) => reaped += 1,
+            Err(error) => {
+                warn!(%call_id, %error, "media orphan reap: could not delete; leaving it")
+            }
+        }
+    }
+    info!(
+        reaped,
+        considered = orphans.len(),
+        engine_calls = engine_calls.len(),
+        live = live.len(),
+        "media orphan reap: released sessions this node no longer has calls for"
+    );
+    Ok(reaped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,5 +1403,240 @@ mod tests {
             rtpproxy_backend().await.unsupported_flags(&flags),
             vec!["received_from"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup orphan reap
+    // -----------------------------------------------------------------------
+
+    use crate::rtpengine::bencode::{self, BencodeValue};
+    use crate::rtpengine::session::{MediaSession, MediaSessionStore};
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    /// A mock rtpengine that answers `list` with `calls`, records the call-ids
+    /// it was asked to delete, and refuses to delete anything in `refuse`.
+    struct MockEngine {
+        address: SocketAddr,
+        deleted: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// The `limit` carried by each `list` it was sent, `None` when absent.
+        list_limits: Arc<tokio::sync::Mutex<Vec<Option<i64>>>>,
+    }
+
+    async fn spawn_mock_engine(calls: Vec<&'static str>, refuse: Vec<&'static str>) -> MockEngine {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let deleted: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let list_limits: Arc<tokio::sync::Mutex<Vec<Option<i64>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&deleted);
+        let limit_recorder = Arc::clone(&list_limits);
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65535];
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let Some(space) = data.iter().position(|&b| b == b' ') else {
+                    continue;
+                };
+                let cookie = String::from_utf8_lossy(&data[..space]).to_string();
+                let Ok(command) = bencode::decode_full_dict(&data[space + 1..]) else {
+                    continue;
+                };
+
+                let response = match command.dict_get_str("command") {
+                    Some("list") => {
+                        limit_recorder
+                            .lock()
+                            .await
+                            .push(command.dict_get("limit").and_then(|v| v.as_integer()));
+                        BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
+                            (
+                                "calls",
+                                BencodeValue::List(
+                                    calls
+                                        .iter()
+                                        .map(|call| BencodeValue::string(call))
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    }
+                    Some("delete") => {
+                        let call_id = command.dict_get_str("call-id").unwrap_or("").to_string();
+                        if refuse.contains(&call_id.as_str()) {
+                            BencodeValue::dict(vec![
+                                ("result", BencodeValue::string("error")),
+                                ("error-reason", BencodeValue::string("Unknown call-id")),
+                            ])
+                        } else {
+                            recorder.lock().await.push(call_id);
+                            BencodeValue::dict(vec![("result", BencodeValue::string("ok"))])
+                        }
+                    }
+                    _ => BencodeValue::dict(vec![("result", BencodeValue::string("ok"))]),
+                };
+
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                let _ = socket.send_to(&reply, source).await;
+            }
+        });
+
+        MockEngine {
+            address,
+            deleted,
+            list_limits,
+        }
+    }
+
+    async fn backend_for(engine: &MockEngine) -> MediaBackend {
+        let set = RtpEngineSet::new(vec![(engine.address, 2000, 1)])
+            .await
+            .unwrap();
+        MediaBackend::RtpEngine(Arc::new(set))
+    }
+
+    fn live_session(call_id: &str, engine_call_id: &str) -> MediaSession {
+        MediaSession {
+            call_id: call_id.to_string(),
+            rtpengine_call_id: engine_call_id.to_string(),
+            from_tag: "tag-a".to_string(),
+            to_tag: Some("tag-b".to_string()),
+            profile: "default".to_string(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    /// The whole point: a call the engine holds that this node has no session
+    /// for died with the previous run. Nothing else removes it — the engine's
+    /// media timeout only fires for a stream that went quiet, and a call
+    /// bridged between two still-sending endpoints never does.
+    #[tokio::test]
+    async fn a_call_the_store_does_not_know_is_reaped() {
+        let engine = spawn_mock_engine(vec!["orphan-1", "orphan-2"], vec![]).await;
+        let backend = backend_for(&engine).await;
+        let sessions = MediaSessionStore::new();
+
+        let reaped = reap_orphaned_sessions(&backend, &sessions, 1000)
+            .await
+            .unwrap();
+
+        assert_eq!(reaped, 2);
+        let mut deleted = engine.deleted.lock().await.clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec!["orphan-1".to_string(), "orphan-2".to_string()]
+        );
+    }
+
+    /// The reap runs before any listener binds, but it must still be keyed on
+    /// the store rather than on "everything the engine holds" — a live session
+    /// is a call siphon is relaying, and deleting it drops the audio.
+    #[tokio::test]
+    async fn a_call_the_store_still_holds_is_left_alone() {
+        let engine = spawn_mock_engine(vec!["orphan-1", "live-1"], vec![]).await;
+        let backend = backend_for(&engine).await;
+        let sessions = MediaSessionStore::new();
+        sessions.insert(live_session("live-1", "live-1"));
+
+        let reaped = reap_orphaned_sessions(&backend, &sessions, 1000)
+            .await
+            .unwrap();
+
+        assert_eq!(reaped, 1);
+        assert_eq!(*engine.deleted.lock().await, vec!["orphan-1".to_string()]);
+    }
+
+    /// A media re-anchor gives a live call an engine call-id of its own while
+    /// the store key stays the SIP Call-ID. Comparing the SIP id would read
+    /// that call as an orphan and tear down a call in progress — the one bug in
+    /// here that costs audio rather than ports.
+    #[tokio::test]
+    async fn a_re_anchored_call_is_matched_on_its_engine_id() {
+        let engine = spawn_mock_engine(vec!["reanchored-media-id"], vec![]).await;
+        let backend = backend_for(&engine).await;
+        let sessions = MediaSessionStore::new();
+        // Post-transfer shape: keyed by the surviving SIP Call-ID, anchored on
+        // a fresh engine call-id.
+        sessions.insert(live_session("sip-call-id", "reanchored-media-id"));
+
+        let reaped = reap_orphaned_sessions(&backend, &sessions, 1000)
+            .await
+            .unwrap();
+
+        assert_eq!(reaped, 0);
+        assert!(engine.deleted.lock().await.is_empty());
+    }
+
+    /// One call the engine refuses to delete must not strand the rest: the
+    /// remaining orphans are no less worth their ports.
+    #[tokio::test]
+    async fn a_refused_delete_does_not_stop_the_reap() {
+        let engine = spawn_mock_engine(vec!["stubborn", "orphan-2"], vec!["stubborn"]).await;
+        let backend = backend_for(&engine).await;
+        let sessions = MediaSessionStore::new();
+
+        let reaped = reap_orphaned_sessions(&backend, &sessions, 1000)
+            .await
+            .unwrap();
+
+        assert_eq!(reaped, 1, "the reap reports what it actually released");
+        assert_eq!(*engine.deleted.lock().await, vec!["orphan-2".to_string()]);
+    }
+
+    /// The bound is on the enumeration, not on the deletes: an engine holding
+    /// far more than `reap_limit` must not be asked to answer with all of it in
+    /// one datagram.
+    #[tokio::test]
+    async fn the_limit_reaches_the_engine() {
+        let engine = spawn_mock_engine(vec!["orphan-1"], vec![]).await;
+        let backend = backend_for(&engine).await;
+        let sessions = MediaSessionStore::new();
+
+        reap_orphaned_sessions(&backend, &sessions, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(*engine.list_limits.lock().await, vec![Some(7)]);
+    }
+
+    /// An engine that cannot be enumerated is an error, not an empty engine.
+    /// Swallowing it would make a failed reap indistinguishable from a clean
+    /// one in the log an operator reads after a restart.
+    #[tokio::test]
+    async fn an_unreachable_engine_is_an_error() {
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+            .await
+            .unwrap();
+        let backend = MediaBackend::RtpEngine(Arc::new(set));
+        let sessions = MediaSessionStore::new();
+
+        assert!(reap_orphaned_sessions(&backend, &sessions, 1000)
+            .await
+            .is_err());
+    }
+
+    /// rtpproxy's control protocol has no enumeration verb. Answering with an
+    /// empty list would read as "the engine holds nothing" and let a reap
+    /// report a clean sweep it never performed.
+    #[tokio::test]
+    async fn rtpproxy_cannot_enumerate_and_says_so() {
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+            .await
+            .unwrap();
+        let backend = MediaBackend::RtpProxy(set);
+
+        assert!(backend.list(Some(10)).await.is_err());
+        assert!(backend.delete_call("orphan-1").await.is_err());
     }
 }

@@ -46,6 +46,14 @@ impl BencodeValue {
         }
     }
 
+    /// Get as a list slice, if this is a List variant.
+    pub fn as_list(&self) -> Option<&[BencodeValue]> {
+        match self {
+            BencodeValue::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
     /// Get as a dict slice, if this is a Dict variant.
     pub fn as_dict(&self) -> Option<&[(Vec<u8>, BencodeValue)]> {
         match self {

@@ -25,7 +25,7 @@ use super::{
     init_rtpengine, inject_python_singletons, liveness_on_flow_close, publish_store_gauges,
     ro_authorize_b2bua, run, spawn_rtpengine_health_check, BridgeAccepted, BridgeParams,
     DrainState, OriginateError, OriginateMedia, OriginateParams, PreparedOriginate, ProxyRfState,
-    ReliableProvisional, RoAuthorizeOutcome, RouteError, RouteTarget,
+    ReliableProvisional, RoAuthorizeOutcome, RouteError, RouteTarget, RtpEngineComponents,
 };
 
 /// Coercing to a fn pointer pins arity and types, not merely the name — a

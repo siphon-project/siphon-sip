@@ -168,6 +168,55 @@ impl RtpEngineClient {
         Ok(())
     }
 
+    /// Tear down a whole call by id, omitting `from-tag`.
+    ///
+    /// rtpengine scopes a `delete` to one party when given a tag and to the
+    /// whole call when not, which is what a reap needs: the session that knew
+    /// the tags is exactly what was lost.
+    pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        let pairs: Vec<(&str, BencodeValue)> = vec![
+            ("command", BencodeValue::string("delete")),
+            ("call-id", BencodeValue::string(call_id)),
+        ];
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        Ok(())
+    }
+
+    /// Every live call-id this rtpengine is handling, via the NG `list` command.
+    ///
+    /// **Unscoped.** rtpengine has no notion of which controller created a
+    /// call, so this answers with every call on the engine, including another
+    /// node's. Anything acting on the result has to treat that as the hazard it
+    /// is — see `media.reap_orphans_at_startup`.
+    ///
+    /// `limit` is passed through so a large engine does not return an
+    /// unbounded answer in one datagram.
+    pub async fn list(&self, limit: Option<usize>) -> Result<Vec<String>, RtpEngineError> {
+        let mut pairs: Vec<(&str, BencodeValue)> = vec![("command", BencodeValue::string("list"))];
+        if let Some(limit) = limit {
+            pairs.push(("limit", BencodeValue::from_integer(limit as i64)));
+        }
+
+        let response = self.send_command(BencodeValue::dict(pairs)).await?;
+        self.check_result(&response)?;
+        let Some(calls) = response.dict_get("calls") else {
+            // An engine with nothing live omits the key rather than sending an
+            // empty list, so this is "no calls", not a protocol error.
+            return Ok(Vec::new());
+        };
+        let Some(items) = calls.as_list() else {
+            return Err(RtpEngineError::Protocol(
+                "'calls' in a list response is not a list".to_string(),
+            ));
+        };
+        Ok(items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Send a `query` command to get session statistics.
     pub async fn query(
         &self,
@@ -778,6 +827,52 @@ impl RtpEngineSet {
         let result = client.delete(call_id, from_tag).await;
         self.affinity.remove(call_id);
         result
+    }
+
+    /// Tear down a whole call by id on whichever instance holds it.
+    pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        let mut last: Option<RtpEngineError> = None;
+        for client in &self.clients {
+            match client.delete_call(call_id).await {
+                Ok(()) => {
+                    self.affinity.remove(call_id);
+                    return Ok(());
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| RtpEngineError::Protocol("no rtpengine to delete on".to_string())))
+    }
+
+    /// Every live call-id across the set, de-duplicated.
+    ///
+    /// **Unscoped, like the per-instance call it fans out to**: rtpengine
+    /// answers with every call it holds, whoever created it. An instance that
+    /// does not answer contributes nothing and is reported rather than failing
+    /// the enumeration, since the caller can only act on what it was told.
+    pub async fn list(&self, limit: Option<usize>) -> Result<Vec<String>, RtpEngineError> {
+        let mut call_ids: Vec<String> = Vec::new();
+        let mut reached = 0usize;
+        for client in &self.clients {
+            match client.list(limit).await {
+                Ok(ids) => {
+                    reached += 1;
+                    call_ids.extend(ids);
+                }
+                Err(error) => {
+                    warn!(%error, "rtpengine did not answer `list`; its calls are not enumerated")
+                }
+            }
+        }
+        if reached == 0 && !self.clients.is_empty() {
+            return Err(RtpEngineError::Protocol(
+                "no rtpengine answered `list`".to_string(),
+            ));
+        }
+        call_ids.sort();
+        call_ids.dedup();
+        Ok(call_ids)
     }
 
     /// Send a `query` command to the affinity-bound instance.
@@ -1856,5 +1951,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, None);
+    }
+
+    // -- `list` / `delete_call`: what the startup orphan reap is built on --
+
+    /// A mock that answers `list` with a fixed set of call-ids and captures
+    /// every command dict, so a test can assert on the wire form and not only
+    /// on the reply.
+    async fn spawn_mock_listing(
+        calls: Vec<&'static str>,
+    ) -> (SocketAddr, Arc<tokio::sync::Mutex<Vec<BencodeValue>>>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let captured: Arc<tokio::sync::Mutex<Vec<BencodeValue>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(65535);
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+                let command = bencode::decode_full_dict(&data[space + 1..]).unwrap();
+                let cmd_name = command.dict_get_str("command").unwrap_or("").to_string();
+                recorder.lock().await.push(command);
+
+                let response = if cmd_name == "list" {
+                    BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("ok")),
+                        (
+                            "calls",
+                            BencodeValue::List(
+                                calls
+                                    .iter()
+                                    .map(|call| BencodeValue::string(call))
+                                    .collect(),
+                            ),
+                        ),
+                    ])
+                } else {
+                    BencodeValue::dict(vec![("result", BencodeValue::string("ok"))])
+                };
+
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                let _ = socket.send_to(&reply, source).await;
+            }
+        });
+
+        (addr, captured)
+    }
+
+    #[tokio::test]
+    async fn list_reads_the_calls_key() {
+        let (addr, _captured) = spawn_mock_listing(vec!["call-a", "call-b"]).await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        let calls = client.list(None).await.unwrap();
+
+        assert_eq!(calls, vec!["call-a".to_string(), "call-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_passes_the_limit_through() {
+        let (addr, captured) = spawn_mock_listing(vec!["call-a"]).await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        client.list(Some(64)).await.unwrap();
+
+        let captured = captured.lock().await;
+        assert_eq!(
+            captured[0].dict_get("limit").and_then(|v| v.as_integer()),
+            Some(64),
+            "without the limit on the wire, a large engine answers with every \
+             call it holds in one datagram"
+        );
+    }
+
+    /// An engine with nothing live omits `calls` rather than sending an empty
+    /// list. Reading that as a protocol error would turn "no orphans to reap"
+    /// into a failed reap on exactly the healthy case.
+    #[tokio::test]
+    async fn list_with_no_calls_key_is_empty_not_an_error() {
+        // spawn_mock_rtpengine answers every non-ping command with a bare "ok".
+        let addr = spawn_mock_rtpengine().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        let calls = client.list(None).await.unwrap();
+
+        assert!(calls.is_empty());
+    }
+
+    /// The reap knows a call-id and nothing else — the session that held the
+    /// tags is precisely what the restart lost. rtpengine scopes a `delete` to
+    /// one party when given a `from-tag`, so sending one would leave the other
+    /// side relaying.
+    #[tokio::test]
+    async fn delete_call_omits_the_from_tag() {
+        let (addr, captured) = spawn_mock_listing(vec![]).await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+
+        client.delete_call("orphan-1").await.unwrap();
+
+        let captured = captured.lock().await;
+        assert_eq!(captured[0].dict_get_str("command"), Some("delete"));
+        assert_eq!(captured[0].dict_get_str("call-id"), Some("orphan-1"));
+        assert!(
+            captured[0].dict_get("from-tag").is_none(),
+            "a from-tag scopes the delete to one party, leaving the other relaying"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_list_deduplicates_across_instances() {
+        let (first, _) = spawn_mock_listing(vec!["shared", "only-first"]).await;
+        let (second, _) = spawn_mock_listing(vec!["shared", "only-second"]).await;
+        let set = RtpEngineSet::new(vec![(first, 2000, 1), (second, 2000, 1)])
+            .await
+            .unwrap();
+
+        let calls = set.list(None).await.unwrap();
+
+        assert_eq!(
+            calls,
+            vec![
+                "only-first".to_string(),
+                "only-second".to_string(),
+                "shared".to_string(),
+            ]
+        );
+    }
+
+    /// An instance that does not answer contributes nothing, but the answer is
+    /// still usable: the calls the reachable instance named are real. Failing
+    /// the whole enumeration would strand them.
+    #[tokio::test]
+    async fn set_list_survives_one_silent_instance() {
+        let (reachable, _) = spawn_mock_listing(vec!["live-one"]).await;
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let set = RtpEngineSet::new(vec![(reachable, 2000, 1), (silent_addr, 200, 1)])
+            .await
+            .unwrap();
+
+        let calls = set.list(None).await.unwrap();
+
+        assert_eq!(calls, vec!["live-one".to_string()]);
+    }
+
+    /// Every instance silent is not "the engine holds nothing", it is "we were
+    /// not told". Answering `Ok(vec![])` would let a reap conclude that every
+    /// call is gone.
+    #[tokio::test]
+    async fn set_list_errors_when_no_instance_answers() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let set = RtpEngineSet::new(vec![(silent_addr, 200, 1)])
+            .await
+            .unwrap();
+
+        assert!(
+            set.list(None).await.is_err(),
+            "an unanswered enumeration must not read as an empty engine"
+        );
     }
 }

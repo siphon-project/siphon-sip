@@ -560,6 +560,7 @@ impl SiphonServer {
         let (rtpengine_events_tx, rtpengine_events_rx) =
             tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(256);
         let pre_rtpengine = dispatcher::init_rtpengine(&config, rtpengine_events_tx.clone());
+        reap_orphaned_media(&config, &pre_rtpengine).await;
 
         // --- Gateway dispatcher ---
         let gateway_manager = init_gateway(&config).await;
