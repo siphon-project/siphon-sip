@@ -6,6 +6,46 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A script reload no longer re-executes every siphon process sharing a
+  directory, and `reload: sighup` finally reloads on SIGHUP.** Three defects
+  with one cost between them: a reload re-executes the script in a fresh
+  namespace and drops every helper it imported from `sys.modules`, so
+  module-level state starts empty. A reload nobody asked for is a process losing
+  whatever it was holding.
+
+  `reload: auto` reloaded on *any* `.py` file in the script's directory or an
+  `include_paths` entry. Two siphon processes whose scripts share a directory
+  therefore reloaded each other: deploying a routing script emptied the
+  per-session map of a Diameter charging bridge next to it, and every call
+  answered after the deploy lost the answer instant its records are built from.
+  siphon now reloads for the script's own file and for helper modules the
+  running script has actually imported — read from `sys.modules` at the moment
+  the file changes, not snapshotted at compile time, so a helper imported lazily
+  inside a handler still triggers one. A module nothing has imported is not a
+  trigger and does not need to be: with no stale copy cached, the first import
+  after it is written reads the new file.
+
+  The 50 ms sleep before each reload did not coalesce anything — it delayed each
+  event and then reloaded once per event, so an editor's several events per save
+  or a deploy writing three helpers each cost a full recompile. Events arriving
+  within 250 ms are now one reload.
+
+  `ReloadMode::Sighup` was documented as "only reload on SIGHUP" and no SIGHUP
+  handler existed anywhere in the tree, so choosing it meant never reloading —
+  silently — while `kill -HUP` terminated the process on the default
+  disposition. That is the worst of the three possible behaviours, because an
+  operator picks the mode precisely to control *when* module state is wiped.
+  SIGHUP now reloads the script, in **both** modes: `POST /admin/script/reload`
+  already worked regardless of mode, and a signal that worked in one and not the
+  other would be the same trap again. Under `sighup` the watcher stays off, so
+  the signal remains the only file-driven trigger.
+
+  Watching is still non-recursive, so a helper laid out as a package
+  (`lib/mypkg/__init__.py`) under an `include_paths` entry does not trigger a
+  reload. That is unchanged and now documented rather than implied.
+
 ### Changed
 
 - **A B2BUA B-leg now carries a `P-Asserted-Identity` when it has none**, built

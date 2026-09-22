@@ -62,9 +62,40 @@ import ims_common               # resolved from /etc/siphon/lib
 ## Hot-reload
 
 Helper modules hot-reload exactly like the main script. Editing and saving
-`helpers.py` (or anything under an `include_paths` directory) triggers a reload,
-and siphon re-imports the helper from its new source — you don't have to touch
-`main.py` to pick up a helper change.
+`helpers.py` (or anything under an `include_paths` directory that the script
+imports) triggers a reload, and siphon re-imports the helper from its new
+source — you don't have to touch `main.py` to pick up a helper change.
+
+**A reload resets module-level state.** The script is re-executed in a fresh
+namespace and every helper it imported is dropped from `sys.modules`, so any
+dict, list, counter or connection held at module level starts empty again. That
+is the cost of a reload, and it is why the rest of this section is careful about
+what counts as one. Anything that has to survive a reload belongs in the
+[`cache` namespace](../reference/index.md), not in a module global — see *No
+cross-request state in helpers* below.
+
+**Only your own code reloads you.** siphon reloads for the script's own file and
+for helper modules the running script has actually imported — not for every
+`.py` in a watched directory. Two siphon processes whose scripts live in one
+directory are therefore independent: deploying the routing script does not
+re-execute the charging bridge next to it and empty its session table. A helper
+nothing has imported yet is not a trigger either, and does not need to be: the
+first import after it is written reads the new file.
+
+**A burst of writes is one reload.** Events arriving within 250 ms are
+coalesced, so a deploy that writes three helpers recompiles the script once
+rather than three times.
+
+**SIGHUP reloads too**, in both `reload: auto` and `reload: sighup`. Under
+`sighup` the inotify watcher is off and the signal is the only trigger, which is
+how a deployment decides *when* module state is wiped:
+
+```bash
+kill -HUP "$(pidof siphon)"
+```
+
+`POST /admin/script/reload` does the same thing over the admin API, in either
+mode.
 
 ## Rules and limits
 
@@ -77,3 +108,8 @@ and siphon re-imports the helper from its new source — you don't have to touch
 - **A helper named after a stdlib module shadows it** — the same foot-gun as a
   normal `python script.py`. Give helpers distinct names (`sip_helpers.py`, not
   `email.py`).
+- **Watching is non-recursive.** A helper directly in the script's directory or
+  in an `include_paths` entry is watched; one a level deeper is not, so a helper
+  laid out as a package (`lib/mypkg/__init__.py`) will not hot-reload. Keep
+  helper modules flat in a watched directory, or reload with `SIGHUP` after
+  deploying a package.

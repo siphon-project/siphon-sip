@@ -8,6 +8,7 @@ pub mod diameter_dispatch;
 pub mod engine;
 pub mod handle;
 pub mod py_executor;
+pub mod watcher;
 
 pub(crate) use blocking::detach_block_on;
 pub use handle::{HandlerHandle, ScriptHandle};

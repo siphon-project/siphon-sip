@@ -622,7 +622,7 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
 /// Build a `SharedTlsAcceptor` and spawn a watcher that rebuilds it whenever
 /// the certificate or private-key file on disk changes (atomic rename, in-place
 /// rewrite, or directory swap — handled like the script hot-reload in
-/// [`crate::script::engine::spawn_file_watcher`]).
+/// [`crate::script::watcher::spawn_file_watcher`]).
 ///
 /// Existing connections continue using whatever acceptor accepted them — only
 /// new handshakes pick up the new cert. That matches the standard cert-renewal
