@@ -1622,6 +1622,53 @@ media:
     assert_eq!(instances[0].weight, 1); // default
 }
 
+/// The reap deletes live media sessions, so it has to be asked for. It is
+/// also unsafe on an rtpengine shared between nodes, where `list` is unscoped —
+/// defaulting it on would tear down another node's calls on every restart.
+#[test]
+fn media_orphan_reap_is_off_by_default() {
+    let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    let media = config.media.unwrap();
+    assert!(!media.reap_orphans_at_startup);
+    assert_eq!(media.reap_limit, 10_000);
+}
+
+#[test]
+fn parses_media_orphan_reap_knobs() {
+    let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  reap_orphans_at_startup: true
+  reap_limit: 250
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    let media = config.media.unwrap();
+    assert!(media.reap_orphans_at_startup);
+    assert_eq!(media.reap_limit, 250);
+}
+
 #[test]
 fn media_backend_defaults_to_rtpengine() {
     let yaml = r#"

@@ -929,6 +929,35 @@ auth:
 #   # config load rather than warning.
 #   # The `media.events:` listener is unused — rtpproxy pushes no async events.
 #
+# --- startup orphan reap (all backends; OFF by default) ---
+# A restart loses siphon's session state while the media engine keeps relaying.
+# Those calls are dead, but nothing removes them: the engine's own media timeout
+# only fires for a stream that went quiet, and a call bridged between two
+# endpoints that are both still sending never does. They hold their relay ports
+# until the engine itself restarts.
+#
+# With this set, siphon asks the engine what it holds once at startup — before
+# any listener binds, so it cannot yet have a call of its own — and deletes
+# every call it has no session for.
+#
+# media:
+#   reap_orphans_at_startup: true   # default false
+#   reap_limit: 10000                # most call-ids to enumerate in one reap
+#
+# Off by default because "the engine's calls" means different things per backend:
+#   rtpengine   — UNSCOPED. The NG `list` answers with every call on the engine,
+#                 whoever created it. On an rtpengine shared between siphon nodes
+#                 an enabled reap DELETES CALLS THAT ARE LIVE ON ANOTHER NODE.
+#                 Enable it only when the engine is this node's alone. This is
+#                 the backend the reap is effective on today.
+#   siphon-rtp  — owner-scoped, and the owner identity does not survive a
+#                 reconnect: the engine keys ownership on a per-connection client
+#                 id, so a restarted siphon is a new owner and cannot see its own
+#                 pre-restart calls. Safe (it can never reach another node's
+#                 call) but it finds nothing, until the engine offers a
+#                 controller identity that is stable across reconnects.
+#   rtpproxy    — cannot enumerate at all; siphon warns at boot and skips.
+#
 # Custom media profiles (extend or override built-ins):
 #
 # ---------------------------------------------------------------------------

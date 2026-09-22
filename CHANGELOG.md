@@ -31,6 +31,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Added
 
+- **An opt-in startup reap of media sessions the engine still holds for calls
+  this node no longer has (`media.reap_orphans_at_startup`, default false).**
+  A restart loses siphon's session state while the media engine keeps relaying.
+  Those calls are dead, and nothing removed them: the engine's own media timeout
+  only fires for a stream that went quiet, and a call bridged between two
+  endpoints that are both still sending never does — so the relay ports stayed
+  held until the engine itself restarted.
+
+  Once at startup, before any listener binds, siphon asks the engine what it
+  holds and deletes every call it has no session for. Binding later is what
+  makes it safe: this node cannot yet have anchored a call, so no call whose
+  offer had reached the engine but whose session entry had not yet landed can
+  read as an orphan. Sessions are matched on the engine-side call-id rather than
+  the SIP one, since a media re-anchor gives a call an engine id of its own.
+  Bounded by `media.reap_limit` (default 10000) and logged with a count; a call
+  the engine refuses to delete is logged and the rest still go.
+
+  Off by default because of what the enumeration covers per backend.
+  **rtpengine's `list` is unscoped** — it answers with every call on the engine,
+  whoever created it, so on an rtpengine shared between nodes an enabled reap
+  deletes calls that are live elsewhere; enable it there only when the engine is
+  this node's alone. That is the backend it is effective on today. The native
+  siphon-rtp engine is owner-scoped but keys ownership on a per-connection
+  client id, so a restarted siphon is a new owner and its own pre-restart calls
+  are invisible to it: the reap is safe there and finds nothing until the engine
+  offers a controller identity stable across reconnects. rtpproxy cannot
+  enumerate at all, and siphon warns at boot and skips rather than failing a
+  reap every restart.
+
 - **A drain deadline now ends the calls it is still holding
   (`server.teardown_secs`, default 5).** The drain loop logged `"drain timeout —
   exiting with in-flight work still active"` and exited. Nothing was torn down

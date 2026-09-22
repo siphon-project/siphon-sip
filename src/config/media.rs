@@ -159,6 +159,35 @@ pub struct MediaConfig {
     /// Classic `rtpproxy` relay connection. Required when `backend: rtpproxy`.
     #[serde(default)]
     pub rtpproxy: Option<RtpProxyConfig>,
+    /// Delete media sessions the engine still holds for calls this node no
+    /// longer has, once, at startup. **Off by default.**
+    ///
+    /// A restart loses siphon's own session state while the engine keeps
+    /// relaying: those calls are dead but their ports, and on some engines
+    /// their recordings, are held until something removes them.
+    ///
+    /// Off by default because of what "the engine's calls" means per backend.
+    ///
+    /// **rtpengine's `list` is unscoped**: it answers with every call on the
+    /// engine, whoever created it. On an rtpengine shared between nodes an
+    /// enabled reap deletes calls that are live on a different node. Enable it
+    /// there only when the engine is this node's alone. This is the backend the
+    /// reap is effective on today.
+    ///
+    /// **The native `siphon-rtp` path is owner-scoped, and its owner identity
+    /// does not survive a reconnect**: the engine keys ownership on a
+    /// per-connection client id, so a restarted siphon is a new owner and its
+    /// own pre-restart calls are invisible to it. The reap is safe there —
+    /// it can never reach another node's call — but until the engine offers a
+    /// controller identity stable across reconnects, it finds nothing to reap.
+    ///
+    /// `rtpproxy` cannot enumerate at all; siphon warns at boot and skips.
+    #[serde(default)]
+    pub reap_orphans_at_startup: bool,
+    /// Most call-ids to ask the engine for in one enumeration, and so the most
+    /// a single reap will consider. Keeps a large engine's answer bounded.
+    #[serde(default = "default_reap_limit")]
+    pub reap_limit: usize,
     /// Custom media profiles (name → offer/answer NG flags).
     /// Built-in profiles (srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough)
     /// are always available; custom entries here extend or override them.
@@ -216,6 +245,15 @@ impl MediaConfig {
             || !self.profiles.is_empty()
             || self.events.is_some()
     }
+}
+
+/// Most call-ids one startup reap will enumerate and consider.
+///
+/// Generous against any single node's real session count, and finite so a
+/// shared engine holding a very large number of calls cannot turn the reap
+/// into an unbounded answer at startup.
+fn default_reap_limit() -> usize {
+    10_000
 }
 
 fn default_rtpengine_health_check_interval_secs() -> u64 {

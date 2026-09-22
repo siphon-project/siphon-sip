@@ -526,6 +526,37 @@ impl SiphonRtpClient {
         expect_ok(result?)
     }
 
+    /// Tear down a whole call by id, for a call whose tags we no longer know.
+    ///
+    /// The engine matches `delete` on the call-id and the owning control
+    /// identity, not on the tags, so an orphan recovered from `list` is
+    /// deletable even though the session that knew its `from_tag` is gone —
+    /// which is the whole point of the reap.
+    pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        let result = self
+            .request(Command::Delete {
+                call_id: call_id.to_string(),
+                from_tag: String::new(),
+                to_tag: None,
+            })
+            .await;
+        self.sessions.remove(call_id);
+        expect_ok(result?)
+    }
+
+    /// The live call-ids this engine instance is handling for us.
+    ///
+    /// Owner-scoped engine side: the answer carries only the calls this control
+    /// identity created, so it is safe against an engine shared with another
+    /// node. That scoping is what makes a reap possible at all — see
+    /// [`SiphonRtpClientSet::list`].
+    pub async fn list(&self) -> Result<Vec<String>, RtpEngineError> {
+        match self.request(Command::List).await? {
+            CmdResult::List { call_ids } => Ok(call_ids),
+            other => Err(unexpected_result("list", other)),
+        }
+    }
+
     /// Inject an audio prompt; returns the engine-reported duration in ms.
     ///
     /// `overlay` mixes the prompt **under** the party's live egress instead of
@@ -1264,6 +1295,56 @@ impl SiphonRtpClientSet {
         self.select(call_id)
             .stop_recording(call_id, from_tag, recording_id)
             .await
+    }
+
+    /// Tear down a whole call by id on the instance that holds it.
+    ///
+    /// Affinity may not know this call — a reap runs before any of them were
+    /// offered here — so it is sent to each instance until one accepts.
+    pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        let mut last: Option<RtpEngineError> = None;
+        for client in &self.clients {
+            match client.delete_call(call_id).await {
+                Ok(()) => {
+                    self.affinity.remove(call_id);
+                    return Ok(());
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            RtpEngineError::Protocol("no media engine to delete on".to_string())
+        }))
+    }
+
+    /// Every live call-id across the set, de-duplicated.
+    ///
+    /// An instance that cannot be reached contributes nothing and is reported,
+    /// rather than failing the whole enumeration: a reap that gave up because
+    /// one of several engines was down would leave the others' orphans in
+    /// place, and the caller can only ever delete what it was told about.
+    pub async fn list(&self) -> Result<Vec<String>, RtpEngineError> {
+        let mut call_ids: Vec<String> = Vec::new();
+        let mut reached = 0usize;
+        for client in &self.clients {
+            match client.list().await {
+                Ok(ids) => {
+                    reached += 1;
+                    call_ids.extend(ids);
+                }
+                Err(error) => {
+                    warn!(%error, "media engine did not answer `list`; its calls are not enumerated")
+                }
+            }
+        }
+        if reached == 0 && !self.clients.is_empty() {
+            return Err(RtpEngineError::Protocol(
+                "no media engine answered `list`".to_string(),
+            ));
+        }
+        call_ids.sort();
+        call_ids.dedup();
+        Ok(call_ids)
     }
 
     /// Send a `delete` and drop affinity.

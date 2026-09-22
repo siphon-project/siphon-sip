@@ -218,6 +218,19 @@ impl MediaSessionStore {
             .retain(|_, session| session.created_at > cutoff);
     }
 
+    /// The engine-side call-ids of every session siphon currently holds.
+    ///
+    /// Engine-side, not SIP: the store is keyed by SIP Call-ID, but a media
+    /// engine enumerates by the id siphon offered it, and a media re-anchor
+    /// gives a call an engine id of its own. Comparing the wrong one would
+    /// read every live call as an orphan.
+    pub fn live_engine_call_ids(&self) -> std::collections::HashSet<String> {
+        self.sessions
+            .iter()
+            .map(|entry| entry.value().rtpengine_id().to_string())
+            .collect()
+    }
+
     /// Number of active sessions.
     pub fn len(&self) -> usize {
         self.sessions.len()

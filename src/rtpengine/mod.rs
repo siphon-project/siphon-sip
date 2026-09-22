@@ -21,7 +21,7 @@ pub mod siphon_rtp;
 #[cfg(test)]
 pub(crate) mod test_engine;
 
-pub use backend::MediaBackend;
+pub use backend::{reap_orphaned_sessions, MediaBackend};
 pub use client::{RtpEngineClient, RtpEngineSet};
 pub use error::RtpEngineError;
 pub use profile::{NgFlags, ProfileEntry, ProfileRegistry, WsTeeDirection};
