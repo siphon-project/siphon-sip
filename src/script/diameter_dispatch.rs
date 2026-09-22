@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::DiameterConfig;
 use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
@@ -703,9 +703,24 @@ struct AnswerOutcome {
     answer_py: Option<Py<PyDiameterAnswer>>,
 }
 
-/// Invoke `@diameter.on_request` and produce the answer wire bytes. Falls back
-/// to DIAMETER_UNABLE_TO_DELIVER (3002) when the handler returns `None`, and
-/// DIAMETER_INVALID_AVP_LENGTH (5014) when the inbound message is malformed.
+/// Invoke `@diameter.on_request` and produce the answer wire bytes.
+///
+/// Three failure answers, and the peer is meant to be able to tell them apart:
+///
+/// - **3002 DIAMETER_UNABLE_TO_DELIVER** — there is no route for this request.
+///   No handler matched its (application, command), or the handler that did
+///   deliberately returned `None`. Both are "nothing here serves this".
+/// - **5012 DIAMETER_UNABLE_TO_COMPLY** — siphon has a handler and could not
+///   carry it out: the handler raised, returned something that is not a
+///   `DiameterAnswer`, or produced an answer that would not serialize. This is
+///   a fault on siphon's side of the interface, not a decision about the
+///   request.
+/// - **5014 DIAMETER_INVALID_AVP_LENGTH** — the inbound message did not parse.
+///
+/// The 3002/5012 split is load-bearing on the Ro path, where a 3002 to a
+/// CCR-UPDATE is read as a credit denial and tears the call down: a Python
+/// exception in a charging bridge would otherwise drop every live call at its
+/// first re-authorisation, with nothing in the answer pointing at the script.
 fn build_answer_via_handler(
     python: Python<'_>,
     engine: &Arc<ScriptEngine>,
@@ -741,15 +756,26 @@ fn build_answer_via_handler(
     // vocabulary stays consistent with decoration-time validation.
     let selected =
         select_request_handler(&state, request_msg.application_id, request_msg.command_code);
-    let no_route_answer = || {
+    let answer_with = |result_code: u32, error_message: &str| {
         forward::build_answer(
             &request_msg,
             local_origin_host,
             local_origin_realm,
-            dictionary::DIAMETER_UNABLE_TO_DELIVER,
-            Some("no on_request handler"),
+            result_code,
+            Some(error_message),
         )
     };
+    // No route: nothing serves this request. Kept for the two cases that
+    // genuinely mean that, and not used for a handler that failed.
+    let no_route_answer = || {
+        answer_with(
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+            "no on_request handler",
+        )
+    };
+    // siphon has a handler and could not carry it out. `reason` names which of
+    // the ways, so the peer's log says more than "5012".
+    let cannot_comply = |reason: &str| answer_with(dictionary::DIAMETER_UNABLE_TO_COMPLY, reason);
 
     let Some(handler) = selected else {
         let answer = no_route_answer();
@@ -770,8 +796,10 @@ fn build_answer_via_handler(
     let request_py = match Py::new(python, request) {
         Ok(handle) => handle,
         Err(error) => {
-            warn!(%error, "Diameter server: failed to build request object");
-            let answer = no_route_answer();
+            // A handler was selected, so this is not "no route" — siphon could
+            // not build the object to hand it.
+            error!(%error, "Diameter server: failed to build request object");
+            let answer = cannot_comply("could not build the request object");
             return AnswerOutcome {
                 wire: answer.to_wire(),
                 request_py: None,
@@ -780,18 +808,20 @@ fn build_answer_via_handler(
         }
     };
 
-    let result = handler
-        .callable
-        .bind(python)
-        .call1((request_py.bind(python),));
+    let handler_callable = handler.callable.bind(python);
+    let result = handler_callable.call1((request_py.bind(python),));
     let resolved = match result {
         Ok(value) => {
             if handler.is_async {
                 match run_coroutine_value(python, &value) {
                     Ok(resolved) => resolved.into_bound(python),
                     Err(error) => {
-                        warn!(%error, "Diameter server: async on_request handler failed");
-                        let answer = no_route_answer();
+                        error!(
+                            handler = %handler_name(handler_callable),
+                            %error,
+                            "Diameter server: async on_request handler raised; answering 5012"
+                        );
+                        let answer = cannot_comply("on_request handler raised");
                         return AnswerOutcome {
                             wire: answer.to_wire(),
                             request_py: Some(request_py),
@@ -804,8 +834,12 @@ fn build_answer_via_handler(
             }
         }
         Err(error) => {
-            warn!(%error, "Diameter server: on_request handler raised");
-            let answer = no_route_answer();
+            error!(
+                handler = %handler_name(handler_callable),
+                %error,
+                "Diameter server: on_request handler raised; answering 5012"
+            );
+            let answer = cannot_comply("on_request handler raised");
             return AnswerOutcome {
                 wire: answer.to_wire(),
                 request_py: Some(request_py),
@@ -814,7 +848,8 @@ fn build_answer_via_handler(
         }
     };
 
-    // None → 3002; otherwise expect a DiameterAnswer.
+    // `None` is a decision — the handler declined the request — so it keeps the
+    // no-route answer. A return value of the wrong type is not a decision.
     let answer_py: Py<PyDiameterAnswer> = if resolved.is_none() {
         let answer = no_route_answer();
         match Py::new(python, PyDiameterAnswer::from_msg(answer)) {
@@ -831,12 +866,16 @@ fn build_answer_via_handler(
         match resolved.cast::<PyDiameterAnswer>() {
             Ok(answer_bound) => answer_bound.clone().unbind(),
             Err(_) => {
-                warn!("Diameter server: on_request must return a DiameterAnswer or None");
-                match Py::new(python, PyDiameterAnswer::from_msg(no_route_answer())) {
+                error!(
+                    handler = %handler_name(handler_callable),
+                    "Diameter server: on_request must return a DiameterAnswer or None; answering 5012"
+                );
+                let answer = cannot_comply("on_request returned a non-answer");
+                match Py::new(python, PyDiameterAnswer::from_msg(answer)) {
                     Ok(handle) => handle,
                     Err(_) => {
                         return AnswerOutcome {
-                            wire: no_route_answer().to_wire(),
+                            wire: cannot_comply("on_request returned a non-answer").to_wire(),
                             request_py: Some(request_py),
                             answer_py: None,
                         }
@@ -849,8 +888,12 @@ fn build_answer_via_handler(
     let wire = match answer_py.borrow(python).to_wire() {
         Ok(bytes) => bytes,
         Err(error) => {
-            warn!(%error, "Diameter server: failed to serialize answer");
-            no_route_answer().to_wire()
+            error!(
+                handler = %handler_name(handler_callable),
+                %error,
+                "Diameter server: failed to serialize the answer; answering 5012"
+            );
+            cannot_comply("answer could not be serialized").to_wire()
         }
     };
 
@@ -912,6 +955,28 @@ fn select_request_handler(
         }
     }
     best.map(|(_, handler)| handler)
+}
+
+/// The script author's name for a handler, for the log line when it fails.
+///
+/// `__qualname__` names the `def` as written; `__name__` covers a callable that
+/// has no qualname (a functools wrapper, a callable object). Read only on the
+/// failure paths — "which of my handlers raised" is unanswerable from
+/// `(application, command)` alone once a script registers several, and that was
+/// the whole difficulty in tracing a bridge exception back to its script.
+///
+/// The twin of [`crate::script::async_pool`]'s `coroutine_name`, which does the
+/// same for the coroutine-timeout line.
+fn handler_name(callable: &Bound<'_, PyAny>) -> String {
+    callable
+        .getattr("__qualname__")
+        .and_then(|value| value.extract::<String>())
+        .or_else(|_| {
+            callable
+                .getattr("__name__")
+                .and_then(|value| value.extract::<String>())
+        })
+        .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// Score a `@diameter.on_request` filter against an inbound request's
@@ -1091,5 +1156,185 @@ mod filter_tests {
             Some(2)
         );
         assert_eq!(request_filter_score(Some("S6a:purge-ue"), sh, sh_pur), None);
+    }
+}
+
+/// What a failing `@diameter.on_request` answers.
+///
+/// The peer has to be able to tell "nothing serves this" (3002) from "siphon
+/// has a handler and it broke" (5012). On Ro those two mean opposite things: a
+/// 3002 to a CCR-UPDATE is a credit denial and the call is torn down, so
+/// answering a Python exception with 3002 drops live calls and blames the OCS.
+#[cfg(test)]
+mod handler_failure_tests {
+    use super::*;
+
+    /// A minimal well-formed request (R-bit set) siphon will parse and route.
+    fn request_wire(command_code: u32, application_id: u32) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(20);
+        wire.push(1); // version
+        wire.extend_from_slice(&20u32.to_be_bytes()[1..]); // length
+        wire.push(0x80); // flags: request
+        wire.extend_from_slice(&command_code.to_be_bytes()[1..]);
+        wire.extend_from_slice(&application_id.to_be_bytes());
+        wire.extend_from_slice(&7u32.to_be_bytes()); // hop-by-hop
+        wire.extend_from_slice(&8u32.to_be_bytes()); // end-to-end
+        wire
+    }
+
+    fn incoming() -> crate::diameter::peer::IncomingRequest {
+        let command_code = dictionary::CMD_CREDIT_CONTROL;
+        let application_id = dictionary::RO_APP_ID;
+        crate::diameter::peer::IncomingRequest {
+            command_code,
+            application_id,
+            hop_by_hop: 7,
+            end_to_end: 8,
+            avps: serde_json::Value::Null,
+            raw: request_wire(command_code, application_id),
+        }
+    }
+
+    fn peer() -> PyInboundPeer {
+        PyInboundPeer {
+            name: "ocs".to_string(),
+            tenant: "default".to_string(),
+            addr: "192.0.2.10:3868".to_string(),
+            transport: "tcp".to_string(),
+        }
+    }
+
+    /// Compile `source` as the running script and return the Result-Code of the
+    /// answer siphon produces for one inbound CCR.
+    fn answer_result_code(source: &str) -> u32 {
+        let engine =
+            Arc::new(ScriptEngine::new_embedded(source).expect("the test script should compile"));
+        let request = incoming();
+        let peer_info = peer();
+        let wire = Python::attach(|python| {
+            build_answer_via_handler(
+                python,
+                &engine,
+                &request,
+                &peer_info,
+                "siphon.example.net",
+                "example.net",
+            )
+            .wire
+        });
+        let answer = DiameterMsg::from_wire(&wire).expect("siphon's own answer should parse");
+        let (base, _experimental) = answer.answer_result_codes();
+        base.expect("every failure answer carries a base Result-Code")
+    }
+
+    #[test]
+    fn a_handler_that_raises_answers_unable_to_comply() {
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import diameter\n",
+                "\n",
+                "@diameter.on_request\n",
+                "def handle(request):\n",
+                "    raise RuntimeError('the bridge is down')\n",
+            )),
+            dictionary::DIAMETER_UNABLE_TO_COMPLY,
+        );
+    }
+
+    #[test]
+    fn an_async_handler_that_raises_answers_unable_to_comply() {
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import diameter\n",
+                "\n",
+                "@diameter.on_request\n",
+                "async def handle(request):\n",
+                "    raise RuntimeError('the bridge is down')\n",
+            )),
+            dictionary::DIAMETER_UNABLE_TO_COMPLY,
+        );
+    }
+
+    #[test]
+    fn a_handler_returning_a_non_answer_answers_unable_to_comply() {
+        // Returning the wrong type is a script bug, not a decision about the
+        // request — so it is not the same answer as returning None.
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import diameter\n",
+                "\n",
+                "@diameter.on_request\n",
+                "def handle(request):\n",
+                "    return 2001\n",
+            )),
+            dictionary::DIAMETER_UNABLE_TO_COMPLY,
+        );
+    }
+
+    #[test]
+    fn a_handler_returning_none_still_answers_unable_to_deliver() {
+        // `None` is the documented way to decline, and declining is a routing
+        // answer. This is the case 3002 describes, and it must not move.
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import diameter\n",
+                "\n",
+                "@diameter.on_request\n",
+                "def handle(request):\n",
+                "    return None\n",
+            )),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+    }
+
+    #[test]
+    fn no_registered_handler_still_answers_unable_to_deliver() {
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import proxy\n",
+                "\n",
+                "@proxy.on_request\n",
+                "def handle(request):\n",
+                "    pass\n",
+            )),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+    }
+
+    #[test]
+    fn a_handler_that_answers_is_untouched() {
+        // The guard on the four failure paths: a working handler still gets its
+        // own Result-Code out, not 5012.
+        assert_eq!(
+            answer_result_code(concat!(
+                "from siphon import diameter\n",
+                "\n",
+                "@diameter.on_request\n",
+                "def handle(request):\n",
+                "    return request.answer(2001)\n",
+            )),
+            dictionary::DIAMETER_SUCCESS,
+        );
+    }
+
+    #[test]
+    fn handler_name_reads_the_script_authors_name() {
+        // The log line for a raise names the handler; `(application, command)`
+        // alone cannot say which of several registered handlers it was.
+        Python::attach(|python| {
+            let module = pyo3::types::PyModule::from_code(
+                python,
+                &std::ffi::CString::new("def on_ccr(request):\n    pass\n").unwrap(),
+                &std::ffi::CString::new("t.py").unwrap(),
+                &std::ffi::CString::new("t").unwrap(),
+            )
+            .expect("module compiles");
+            let callable = module.getattr("on_ccr").expect("handler is defined");
+            assert_eq!(handler_name(&callable), "on_ccr");
+
+            // Anything without either attribute degrades rather than panicking.
+            let not_a_function = python.None().into_bound(python);
+            assert_eq!(handler_name(&not_a_function), "<unknown>");
+        });
     }
 }
