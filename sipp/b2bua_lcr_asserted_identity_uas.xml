@@ -96,4 +96,10 @@ Content-Length: 0
 ]]>
   </send>
 
+  <!-- Every `assign_to` above exists only to carry `check_it`. SIPp refuses to
+       run a scenario holding a variable nothing references, and it refuses at
+       *load*, so the carrier exits before it has received anything and the case
+       fails as "200: never received" rather than as a missing reference. -->
+  <Reference variables="asserted,asserted_is_not_the_caller,anonymous_from,from_withholds_the_number,privacy_id" />
+
 </scenario>
