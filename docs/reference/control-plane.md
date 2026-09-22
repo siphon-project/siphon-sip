@@ -263,7 +263,7 @@ chunk, so logs join Homer and billing with no mapping table.
 | `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
-| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?}` | ring B-legs while the caller stays **unanswered** and the app keeps the channel — see [`dial`](#dial--ring-while-the-caller-waits) |
+| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?}` (identity fields also per target) | ring B-legs while the caller stays **unanswered** and the app keeps the channel — see [`dial`](#dial--ring-while-the-caller-waits) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -702,13 +702,22 @@ answer into voicemail, or reject with its own code. That is the difference from
 `StasisEnd{reason: routed}` and loses it, so "ring the extension, then
 voicemail" is not expressible with `route`.
 
-A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`. An `aor`
+A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
+object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and
+`privacy?` for that branch alone. An `aor`
 resolves against the registrar and forks to **every** registered contact, each
 over that contact's own captured flow and Path route set — which is the only way
 to reach a phone registered over TCP, TLS or WSS behind NAT, since such a
 contact is reachable only on the connection it registered over. An AoR nobody
 has registered contributes no branch; `dial` answers `not_found` when no target
 yields one.
+
+A target's identity overrides the dial's field by field, the same precedence
+its headers already use, so a target naming only a `from` still inherits the
+dial's `privacy`. This is what a hunt across two carriers needs: the number a
+carrier will accept is a property of that carrier, not of the call, and
+presenting another carrier's number leaves it challenging the INVITE however
+correct the digest is. A target naming nothing presents the dial's identity.
 
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is
