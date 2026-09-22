@@ -11,6 +11,7 @@ pub mod sctp;
 pub mod stream;
 pub mod tcp;
 pub mod tls;
+pub mod tls_listener;
 /// Transport layer — UDP, TCP, TLS, WebSocket, WSS, SCTP.
 /// Each transport sends inbound SIP messages to the core via a channel
 /// and receives outbound messages via a per-connection sender.
@@ -21,6 +22,133 @@ pub mod ws;
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::net::SocketAddr;
+
+    /// Generate a CA, a server leaf for 127.0.0.1 and a client leaf, returning
+    /// their paths. Two leaves because mutual TLS needs both ends to present
+    /// one, and a client certificate needs `clientAuth` where the server's needs
+    /// `serverAuth` — webpki checks the EKU, so one cert cannot do both jobs.
+    pub(crate) fn write_test_chain(
+        directory: &std::path::Path,
+    ) -> std::collections::HashMap<&'static str, std::path::PathBuf> {
+        let path = |name: &str| directory.join(name);
+        let run = |arguments: Vec<std::ffi::OsString>| {
+            let status = std::process::Command::new("openssl")
+                .args(&arguments)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("openssl must be available to generate test certificates");
+            assert!(status.success(), "openssl failed: {arguments:?}");
+        };
+        let arg = |value: &str| std::ffi::OsString::from(value);
+
+        std::fs::write(
+            path("server.ext"),
+            "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n",
+        )
+        .expect("write server ext");
+        std::fs::write(
+            path("client.ext"),
+            "extendedKeyUsage=clientAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n",
+        )
+        .expect("write client ext");
+
+        run(vec![
+            arg("req"),
+            arg("-x509"),
+            arg("-newkey"),
+            arg("rsa:2048"),
+            arg("-nodes"),
+            arg("-days"),
+            arg("1"),
+            arg("-subj"),
+            arg("/CN=siphon-control-test-ca"),
+            arg("-keyout"),
+            path("ca.key").into_os_string(),
+            arg("-out"),
+            path("ca.crt").into_os_string(),
+        ]);
+        for (name, subject) in [("server", "/CN=siphon-control"), ("client", "/CN=ivr-app")] {
+            run(vec![
+                arg("req"),
+                arg("-newkey"),
+                arg("rsa:2048"),
+                arg("-nodes"),
+                arg("-subj"),
+                arg(subject),
+                arg("-keyout"),
+                path(&format!("{name}.key")).into_os_string(),
+                arg("-out"),
+                path(&format!("{name}.csr")).into_os_string(),
+            ]);
+            run(vec![
+                arg("x509"),
+                arg("-req"),
+                arg("-in"),
+                path(&format!("{name}.csr")).into_os_string(),
+                arg("-CA"),
+                path("ca.crt").into_os_string(),
+                arg("-CAkey"),
+                path("ca.key").into_os_string(),
+                arg("-CAcreateserial"),
+                arg("-days"),
+                arg("1"),
+                arg("-extfile"),
+                path(&format!("{name}.ext")).into_os_string(),
+                arg("-out"),
+                path(&format!("{name}.crt")).into_os_string(),
+            ]);
+        }
+
+        let mut paths = std::collections::HashMap::new();
+        paths.insert("ca", path("ca.crt"));
+        paths.insert("server_cert", path("server.crt"));
+        paths.insert("server_key", path("server.key"));
+        paths.insert("client_cert", path("client.crt"));
+        paths.insert("client_key", path("client.key"));
+        paths
+    }
+
+    /// A TLS client trusting `ca`, optionally presenting a client certificate.
+    pub(crate) fn tls_client_config(
+        ca: &std::path::Path,
+        client: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> tokio_rustls::rustls::ClientConfig {
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for certificate in CertificateDer::pem_file_iter(ca).expect("read ca") {
+            roots.add(certificate.expect("parse ca")).expect("add ca");
+        }
+        let builder = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+            crate::transport::tls::crypto_provider(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_root_certificates(roots);
+
+        match client {
+            Some((certificate_path, key_path)) => {
+                let certificates: Vec<_> = CertificateDer::pem_file_iter(certificate_path)
+                    .expect("read client cert")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("parse client cert");
+                let key = PrivateKeyDer::from_pem_file(key_path).expect("parse client key");
+                builder
+                    .with_client_auth_cert(certificates, key)
+                    .expect("client auth cert")
+            }
+            None => builder.with_no_client_auth(),
+        }
+    }
+
+    pub(crate) fn temp_dir(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("siphon-tls-fixture-{name}"));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        directory
+    }
 
     /// A loopback TCP port the kernel picked, kept bound by this process for
     /// the rest of its life so nothing else can take it.

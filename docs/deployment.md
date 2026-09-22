@@ -224,6 +224,41 @@ admin:
   while draining** (after `SIGTERM`) so a load balancer / Kubernetes pulls the node
   from rotation before it stops accepting new INVITEs.
 
+#### TLS and `protect_reads`
+
+The admin API can force-unregister AoRs and lift auto-bans, and what it *returns*
+is the registration list (number, contact address, expiry) and the live call
+list. Two settings make it safe to expose to a controller rather than only
+through a tunnel:
+
+```yaml
+admin:
+  listen: "0.0.0.0:9091"
+  auth:
+    token: "${ADMIN_TOKEN}"
+    protect_reads: true
+  tls:
+    certificate: "/etc/siphon/admin.pem"
+    private_key: "/etc/siphon/admin.key"
+    # verify_client: true
+    # client_ca: "/etc/siphon/controller-ca.pem"
+```
+
+- **`tls:`** is the same block the SIP listeners take, hot reload included — a
+  renewed certificate is served by the next handshake, so cert-manager and
+  certbot need no restart. Without it the bearer token crosses the wire in the
+  clear on every call. `verify_client: true` with a `client_ca` makes it mutual,
+  which is the stronger answer for a controller than a bearer token on its own.
+  An unreadable certificate or key fails the config load naming `admin.tls`,
+  rather than producing a listener that binds and fails every handshake.
+- **`protect_reads: true`** is now usable with the dashboard. The UI shell is
+  served unauthenticated and every byte of data stays behind the token, so the
+  dashboard loads, prompts for the token and works. Before this, a node that
+  wanted a UI had to run with reads unprotected, which left the registration and
+  call lists readable to anything the admin ACL admitted with no token at all.
+  `/admin/logs`, `/admin/capture` and `/admin/search` are always gated
+  regardless, and are refused outright when no token is configured.
+
 The admin port also serves `/admin/stats`, `/admin/registrations[/{aor}]` (inspect
 or force-unregister bindings), and `/metrics`. If you'd rather not enable it, a
 `GET /metrics` returning `200` is a serviceable liveness signal and a SIP `OPTIONS`

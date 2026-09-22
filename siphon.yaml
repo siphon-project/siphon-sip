@@ -1435,6 +1435,23 @@ auth:
 #   auth:
 #     token: "${ADMIN_TOKEN}"     # keep the literal out of YAML; expand from env
 #     protect_reads: false        # true = also gate GET routes + /metrics
+#                                 # (the dashboard stays usable with this on:
+#                                 #  its shell is served unauthenticated and
+#                                 #  every byte of data stays behind the token)
+#   # Optional TLS on the admin listener. Unset = plaintext, as before.
+#   # Without it the bearer token crosses the wire in the clear on every call,
+#   # and so does everything the API returns — the registration list (number,
+#   # contact address, expiry) and the live call list among it. Set this before
+#   # letting a controller drive POST /admin/{gateways,registrants}/refresh over
+#   # anything but a tunnel. Same shape and same hot reload as the SIP
+#   # listeners: a renewed certificate is served by the next handshake, no
+#   # restart. verify_client makes it mutual, which is the stronger answer for a
+#   # machine-to-machine caller than a bearer token alone.
+#   tls:
+#     certificate: "/etc/siphon/admin.pem"
+#     private_key: "/etc/siphon/admin.key"
+#     # verify_client: true
+#     # client_ca: "/etc/siphon/controller-ca.pem"
 #   # Optional embedded web dashboard (EXPERIMENTAL), served at the admin listener
 #   # root (/). Compiled into the release Docker image by default; a plain
 #   # `cargo build` needs `--features ui`, and a binary without it warns and serves

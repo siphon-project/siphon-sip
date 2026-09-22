@@ -26,6 +26,39 @@ fn control_tls_without_a_listener_is_refused() {
 }
 
 #[test]
+fn admin_tls_with_an_unreadable_certificate_is_refused_at_load() {
+    // Same reasoning as control.tls: a listener that binds, looks healthy and
+    // fails every handshake reads to an operator as a broken client rather than
+    // an unreadable key — and on this listener the fallback is a bearer token
+    // crossing the wire in the clear.
+    let error = Config::from_str(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n\
+         admin:\n  listen: \"127.0.0.1:9091\"\n  tls:\n    \
+         certificate: \"/nonexistent/siphon-admin.pem\"\n    \
+         private_key: \"/nonexistent/siphon-admin.key\"\n",
+    )
+    .expect_err("an unreadable admin certificate must be refused");
+    let message = error.to_string();
+    assert!(message.contains("admin.tls.certificate"), "{message}");
+    assert!(
+        message.contains("/nonexistent/siphon-admin.pem"),
+        "{message}"
+    );
+}
+
+#[test]
+fn admin_without_tls_still_loads() {
+    // The block is optional and plaintext stays the default, so a node that
+    // never had it keeps working on upgrade.
+    let config = Config::from_str(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n\
+         admin:\n  listen: \"127.0.0.1:9091\"\n",
+    )
+    .expect("admin without tls must load");
+    assert!(config.admin.expect("admin").tls.is_none());
+}
+
+#[test]
 fn control_tls_with_an_unreadable_certificate_is_refused_at_load() {
     // Otherwise the listener binds, looks healthy, and fails every
     // handshake — which reads as a broken client, not a missing file.

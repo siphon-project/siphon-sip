@@ -2469,12 +2469,16 @@ impl SiphonServer {
                             instance_id,
                             features: crate::admin::AdminFeatures::from_config(&config),
                             script_engine: Some(Arc::clone(&engine)),
+                            // Overwritten by `router` from its own argument;
+                            // set here only to satisfy the initializer.
+                            ui_enabled: false,
                         };
                         tokio::spawn(crate::admin::serve(
                             listen_addr,
                             admin_state,
                             admin_config.cors.clone(),
                             ui_enabled,
+                            admin_config.tls.clone(),
                         ));
                     } else {
                         error!("admin API enabled but registrar is not initialized; not starting");

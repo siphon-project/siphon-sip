@@ -33,6 +33,7 @@ use super::protocol::{
 };
 use super::registry::{ConnHandle, ControlBus, ControlCommand, OutboundFrame, OutboundQueue};
 use super::CONTROL_WRITE_TIMEOUT;
+use crate::transport::tls_listener::TlsListener;
 
 /// The connecting application's address, as connect-info.
 ///
@@ -59,98 +60,6 @@ impl
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         ControlPeer(*stream.remote_addr())
-    }
-}
-
-/// A TLS-terminating [`axum::serve::Listener`].
-///
-/// The handshake runs on a **spawned task per connection**, not inside
-/// `accept()`. `axum::serve` awaits `accept()` serially, so a handshake done
-/// inline would let one peer that connects and then stalls mid-handshake hold up
-/// every other application's connection — the whole control rail, blocked by one
-/// socket. Completed streams arrive here over a bounded channel instead, which
-/// also applies backpressure rather than spawning without limit.
-struct TlsListener {
-    local_addr: SocketAddr,
-    ready: tokio::sync::mpsc::Receiver<(
-        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        SocketAddr,
-    )>,
-}
-
-impl TlsListener {
-    /// Bind, and spawn the accept + handshake pump.
-    async fn bind(
-        listen_addr: SocketAddr,
-        acceptor: tokio_rustls::TlsAcceptor,
-    ) -> std::io::Result<Self> {
-        let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-        let local_addr = listener.local_addr()?;
-        // Small on purpose: this bounds how many completed-but-unserved
-        // connections queue up, and axum drains it as fast as it can spawn.
-        let (ready_tx, ready) = tokio::sync::mpsc::channel(32);
-
-        tokio::spawn(async move {
-            loop {
-                let (stream, peer_addr) = match listener.accept().await {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        // A per-connection error (EMFILE, a peer that reset
-                        // between SYN and accept) must not end the listener.
-                        warn!(%error, "control plane: accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                };
-                let acceptor = acceptor.clone();
-                let ready_tx = ready_tx.clone();
-                tokio::spawn(async move {
-                    let handshake = tokio::time::timeout(
-                        crate::transport::tls::TLS_HANDSHAKE_TIMEOUT,
-                        acceptor.accept(stream),
-                    )
-                    .await;
-                    match handshake {
-                        Ok(Ok(stream)) => {
-                            let _ = ready_tx.send((stream, peer_addr)).await;
-                        }
-                        Ok(Err(error)) => {
-                            debug!(%peer_addr, %error, "control plane: TLS handshake failed");
-                        }
-                        Err(_) => {
-                            debug!(
-                                %peer_addr,
-                                timeout = ?crate::transport::tls::TLS_HANDSHAKE_TIMEOUT,
-                                "control plane: TLS handshake timed out"
-                            );
-                        }
-                    }
-                });
-            }
-        });
-
-        Ok(Self { local_addr, ready })
-    }
-}
-
-impl axum::serve::Listener for TlsListener {
-    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.ready.recv().await {
-                Some(accepted) => return accepted,
-                // The pump task is gone, so nothing will ever arrive. The trait
-                // has no way to say so; parking here is the honest answer and
-                // leaves the process's other listeners running.
-                None => std::future::pending::<()>().await,
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(self.local_addr)
     }
 }
 
@@ -194,9 +103,14 @@ pub async fn serve(
             return;
         }
     };
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    // A single acceptor in the shared cell: the control rail rebuilds its
+    // server config at start-up, not on a file event, so behaviour is unchanged
+    // from before the listener moved.
+    let acceptor: crate::transport::tls::SharedTlsAcceptor = Arc::new(arc_swap::ArcSwap::from(
+        Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(server_config))),
+    ));
 
-    let listener = match TlsListener::bind(listen_addr, acceptor).await {
+    let listener = match TlsListener::bind(listen_addr, acceptor, "control plane").await {
         Ok(listener) => listener,
         Err(error) => {
             warn!(%listen_addr, %error, "failed to bind control plane listener");
@@ -523,6 +437,7 @@ mod tests {
     use super::*;
     use crate::config::ControlAppConfig;
     use crate::control::registry::SlowConsumerPolicy;
+    use crate::transport::testutil::{temp_dir, tls_client_config, write_test_chain};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -584,99 +499,6 @@ mod tests {
         request
     }
 
-    /// Generate a CA, a server leaf for 127.0.0.1 and a client leaf, returning
-    /// their paths. Two leaves because mutual TLS needs both ends to present
-    /// one, and a client certificate needs `clientAuth` where the server's needs
-    /// `serverAuth` — webpki checks the EKU, so one cert cannot do both jobs.
-    fn write_test_chain(
-        directory: &std::path::Path,
-    ) -> std::collections::HashMap<&'static str, std::path::PathBuf> {
-        let path = |name: &str| directory.join(name);
-        let run = |arguments: Vec<std::ffi::OsString>| {
-            let status = std::process::Command::new("openssl")
-                .args(&arguments)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("openssl must be available to generate test certificates");
-            assert!(status.success(), "openssl failed: {arguments:?}");
-        };
-        let arg = |value: &str| std::ffi::OsString::from(value);
-
-        std::fs::write(
-            path("server.ext"),
-            "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n",
-        )
-        .expect("write server ext");
-        std::fs::write(
-            path("client.ext"),
-            "extendedKeyUsage=clientAuth\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n",
-        )
-        .expect("write client ext");
-
-        run(vec![
-            arg("req"),
-            arg("-x509"),
-            arg("-newkey"),
-            arg("rsa:2048"),
-            arg("-nodes"),
-            arg("-days"),
-            arg("1"),
-            arg("-subj"),
-            arg("/CN=siphon-control-test-ca"),
-            arg("-keyout"),
-            path("ca.key").into_os_string(),
-            arg("-out"),
-            path("ca.crt").into_os_string(),
-        ]);
-        for (name, subject) in [("server", "/CN=siphon-control"), ("client", "/CN=ivr-app")] {
-            run(vec![
-                arg("req"),
-                arg("-newkey"),
-                arg("rsa:2048"),
-                arg("-nodes"),
-                arg("-subj"),
-                arg(subject),
-                arg("-keyout"),
-                path(&format!("{name}.key")).into_os_string(),
-                arg("-out"),
-                path(&format!("{name}.csr")).into_os_string(),
-            ]);
-            run(vec![
-                arg("x509"),
-                arg("-req"),
-                arg("-in"),
-                path(&format!("{name}.csr")).into_os_string(),
-                arg("-CA"),
-                path("ca.crt").into_os_string(),
-                arg("-CAkey"),
-                path("ca.key").into_os_string(),
-                arg("-CAcreateserial"),
-                arg("-days"),
-                arg("1"),
-                arg("-extfile"),
-                path(&format!("{name}.ext")).into_os_string(),
-                arg("-out"),
-                path(&format!("{name}.crt")).into_os_string(),
-            ]);
-        }
-
-        let mut paths = std::collections::HashMap::new();
-        paths.insert("ca", path("ca.crt"));
-        paths.insert("server_cert", path("server.crt"));
-        paths.insert("server_key", path("server.key"));
-        paths.insert("client_cert", path("client.crt"));
-        paths.insert("client_key", path("client.key"));
-        paths
-    }
-
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!("siphon-control-tls-{name}"));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("temp dir");
-        directory
-    }
-
     /// Start the control listener with TLS, returning its bound address.
     async fn start_tls_server(
         bus: Arc<ControlBus>,
@@ -689,50 +511,22 @@ mod tests {
             "control.tls",
         )
         .expect("server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let listener = TlsListener::bind("127.0.0.1:0".parse().unwrap(), acceptor)
-            .await
-            .expect("bind");
+        let acceptor: crate::transport::tls::SharedTlsAcceptor = Arc::new(arc_swap::ArcSwap::from(
+            Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(server_config))),
+        ));
+        let listener = TlsListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            acceptor,
+            "control plane test",
+        )
+        .await
+        .expect("bind");
         let addr = axum::serve::Listener::local_addr(&listener).expect("local addr");
         let make_service = router(bus).into_make_service_with_connect_info::<ControlPeer>();
         tokio::spawn(async move {
             let _ = axum::serve(listener, make_service).await;
         });
         addr
-    }
-
-    /// A TLS client trusting `ca`, optionally presenting a client certificate.
-    fn tls_client_config(
-        ca: &std::path::Path,
-        client: Option<(&std::path::Path, &std::path::Path)>,
-    ) -> tokio_rustls::rustls::ClientConfig {
-        use tokio_rustls::rustls::pki_types::pem::PemObject;
-        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-        for certificate in CertificateDer::pem_file_iter(ca).expect("read ca") {
-            roots.add(certificate.expect("parse ca")).expect("add ca");
-        }
-        let builder = tokio_rustls::rustls::ClientConfig::builder_with_provider(
-            crate::transport::tls::crypto_provider(),
-        )
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_root_certificates(roots);
-
-        match client {
-            Some((certificate_path, key_path)) => {
-                let certificates: Vec<_> = CertificateDer::pem_file_iter(certificate_path)
-                    .expect("read client cert")
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("parse client cert");
-                let key = PrivateKeyDer::from_pem_file(key_path).expect("parse client key");
-                builder
-                    .with_client_auth_cert(certificates, key)
-                    .expect("client auth cert")
-            }
-            None => builder.with_no_client_auth(),
-        }
     }
 
     /// Open a `wss://` control connection and return the socket.

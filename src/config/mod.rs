@@ -417,6 +417,7 @@ impl Config {
         config.validate_lawful_intercept()?;
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
+        config.validate_admin_tls()?;
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
         Ok(config)
@@ -501,6 +502,28 @@ impl Config {
             &tls.private_key,
             tls.client_ca.as_deref(),
             "control.tls",
+        )
+        .map_err(|error| SiphonError::Config(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reject an `admin.tls` block siphon cannot build a server config from.
+    ///
+    /// At load, for the same reason as `control.tls`: the alternative is a
+    /// listener that binds, looks healthy and fails every handshake, which
+    /// reads to an operator as a broken client rather than an unreadable key.
+    fn validate_admin_tls(&self) -> Result<()> {
+        let Some(admin) = &self.admin else {
+            return Ok(());
+        };
+        let Some(tls) = &admin.tls else {
+            return Ok(());
+        };
+        crate::transport::tls::server_config(
+            &tls.certificate,
+            &tls.private_key,
+            tls.client_ca.as_deref(),
+            "admin.tls",
         )
         .map_err(|error| SiphonError::Config(error.to_string()))?;
         Ok(())
