@@ -241,12 +241,23 @@ pub fn build_ro_subscriber(id: &str, id_type: Option<&str>) -> crate::diameter::
     }
 }
 
-/// Record the carrier that answered on the call's Ro session, so its
-/// CCR-UPDATEs and CCR-TERMINATION carry `Outgoing-Trunk-Group-Id`
-/// (TS 32.299 §7.2.71).
+/// Record the carrier the call is on now on its Ro session, so every record
+/// after this point carries `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71).
+///
+/// Written on each attempt that reaches the wire and again on the answer; last
+/// write wins. While the call rings it names the carrier in flight, and once
+/// one answers it names that one — so the value on any record is the carrier
+/// that answered, or the last one dialled if none did, and it is absent only
+/// when no carrier was ever dialled.
+///
+/// The stamp used to be made on the 2xx alone, which left every unanswered call
+/// unattributable: a caller who hung up during ringing, a busy, a ring timeout
+/// and a carrier's own 5xx all produced a CCR-TERMINATION naming nobody. A
+/// carrier then reached the charging feed only on the calls it answered, so its
+/// answer-seizure ratio computed from that feed was 100 % by construction.
 ///
 /// No-op when Ro is off or the call holds no reservation.
-pub fn ro_stamp_winning_carrier(state: &DispatcherState, internal_call_id: &str, carrier_id: &str) {
+pub fn ro_stamp_dialed_carrier(state: &DispatcherState, internal_call_id: &str, carrier_id: &str) {
     if carrier_id.is_empty() {
         return;
     }

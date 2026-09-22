@@ -72,11 +72,26 @@ handler is just the gate.
 
 Every request in the session carries Service-Information describing the call
 (calling and called party, ICID, `User-Session-Id`), not just the CCR-INITIAL,
-so an OCS can attribute mid-call usage and the final record. When the call was
-routed by LCR, the carrier that **answered** is stamped on the session at answer
-time as `Outgoing-Trunk-Group-Id` — under sequential failover that is not
-necessarily the carrier the CCR-INITIAL was built for, so it cannot be inferred
-from the initial request.
+so an OCS can attribute mid-call usage and the final record.
+
+When the call was routed by LCR, `Outgoing-Trunk-Group-Id` names **the carrier
+that answered, or the last one dialled if none did**. It is stamped on the
+session at each attempt that reaches the wire and again at the answer, last
+write wins, so it reaches every record after the first dial: a mid-call
+re-authorization, and the CCR-TERMINATION of a call that was cancelled during
+ringing, rang out, or was rejected by the carrier. Under sequential failover
+that is not necessarily the carrier the CCR-INITIAL was built for, so it cannot
+be inferred from the initial request — the CCR-INITIAL itself carries no carrier,
+since it is sent by the `ro_authorize()` gate before any B-leg INVITE leaves.
+
+The AVP is absent only when no carrier was ever dialled: no route was produced,
+or every route was unroutable and no INVITE left the box. A carrier that was
+considered but never reached is never named, which keeps the AVP consistent with
+`dialed` on the CDR's `lcr_attempts`.
+
+This matters for anything computed per carrier from the charging feed. An
+unanswered call used to name no carrier at all, so a carrier appeared only on
+the calls it answered and its answer-seizure ratio read 100 % by construction.
 
 ```python
 from siphon import b2bua, log

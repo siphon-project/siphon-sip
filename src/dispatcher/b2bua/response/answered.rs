@@ -66,10 +66,13 @@ pub fn b_leg_answered(
         // record it on the Ro session so every later CCR in that session names
         // the carrier that actually carried the call. Under sequential failover
         // that is not necessarily the one the CCR-INITIAL was built for, so it
-        // cannot be inferred from the initial request.
+        // cannot be inferred from the initial request. The dial already stamped
+        // this carrier on the session; this is the same write again, and it is
+        // the one that makes an answered call name its winner even if a future
+        // path answers without going through `b2bua_advance_route`.
         if let Some(route) = state.call_actors.active_route(call_id) {
             cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
-            ro_stamp_winning_carrier(state, call_id, &route.carrier_id);
+            ro_stamp_dialed_carrier(state, call_id, &route.carrier_id);
         }
         cdr_stamp_route_attempts(state, call_id);
 

@@ -145,9 +145,27 @@ impl Sequence {
         script: &str,
     ) -> Sequence {
         let mut sequence = Sequence::new_call(script);
-        let state = &sequence.dispatcher.state;
+        let advance = sequence.start_routes(routes, ring_bound_secs);
+        assert!(advance.dialed, "the first carrier was not dialled");
+        sequence
+    }
+
+    /// Queue `routes` with `ring_bound_secs` as the sequence's ring bound (what
+    /// `call.route(timeout=…)` sets) and dial the first routable one.
+    ///
+    /// Split out of [`Sequence::start_with_script`] so a test can set something
+    /// up on the call — a Ro reservation, say — between creating it and the
+    /// first dial, which is where `call.ro_authorize()` runs on a real call.
+    /// The [`RouteAdvance`] comes back rather than being asserted on, for the
+    /// tests whose carriers are all unroutable.
+    pub(super) fn start_routes(
+        &mut self,
+        routes: Vec<crate::lcr::Route>,
+        ring_bound_secs: u32,
+    ) -> RouteAdvance {
+        let state = &self.dispatcher.state;
         state.call_actors.start_route_sequence(
-            &sequence.call_id,
+            &self.call_id,
             crate::b2bua::actor::RouteSequenceState {
                 pending: routes.into(),
                 default_timeout: ring_bound_secs,
@@ -155,15 +173,14 @@ impl Sequence {
             },
         );
         let advance = {
-            let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
-            b2bua_advance_route(&sequence.call_id, &guard, state)
+            let guard = self.invite.lock().expect("the A-leg INVITE lock");
+            b2bua_advance_route(&self.call_id, &guard, state)
         };
         // As the INVITE path does once its guard is released: a carrier burned
         // on the way to the first dial is reported like any other.
-        b2bua_dispatch_burned_routes(&sequence.call_id, &advance.burned, state);
-        assert!(advance.dialed, "the first carrier was not dialled");
-        sequence.redialled();
-        sequence
+        b2bua_dispatch_burned_routes(&self.call_id, &advance.burned, state);
+        self.redialled();
+        advance
     }
 
     /// The caller's call forked in parallel to `addresses`, one branch each,
@@ -200,7 +217,7 @@ impl Sequence {
 
     /// A caller's call through a dispatcher running `script`, with nothing
     /// dialled yet.
-    fn new_call(script: &str) -> Sequence {
+    pub(super) fn new_call(script: &str) -> Sequence {
         let dispatcher = test_dispatcher_with_script(script);
         let call_id = dispatcher.state.call_actors.create_call(Leg::new_a_leg(
             "lcr-policy@192.0.2.10".to_string(),
