@@ -1,0 +1,49 @@
+# I-CSCF for the Cx end-to-end test.
+#
+# Runs the shipped examples/ims_icscf.py against the mock HSS, so the test
+# covers the example an operator actually starts from, not a stand-in.
+#
+# Network:
+#   172.20.0.74  mock HSS (Diameter TCP 3868)
+#   172.20.0.75  this I-CSCF
+#   172.20.0.76  the S-CSCF the HSS names (a SIPp UAS)
+
+listen:
+  udp:
+    - "0.0.0.0:6060"
+
+advertised_address: "172.20.0.75"
+
+domain:
+  local:
+    - "ims.example.com"
+    - "172.20.0.75"
+
+script:
+  path: "/etc/siphon/examples/ims_icscf.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+diameter:
+  origin_host: "icscf.ims.test"
+  origin_realm: "ims.test"
+  product_name: "SIPhon-ICSCF"
+  peers:
+    - name: "hss1"
+      host: "172.20.0.74"
+      port: 3868
+      destination_realm: "ims.test"
+  routes:
+    - application: cx
+      peers: ["hss1"]
+
+transaction:
+  timeout_secs: 5
+  invite_timeout_secs: 30
+
+log:
+  level: debug
+  format: pretty

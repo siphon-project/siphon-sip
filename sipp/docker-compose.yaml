@@ -4031,6 +4031,119 @@ services:
     profiles:
       - ims
 
+  # ── Cx end-to-end: I-CSCF asks a real HSS which S-CSCF to use ────────────
+  #
+  # Covers the Diameter request path against a peer on the wire, which no other
+  # job does: the I-CSCF's REGISTER handler awaits `diameter.cx_uar`, and the
+  # REGISTER only reaches the S-CSCF below if that answer resolved and its
+  # Server-Name was read. The script's SCSCF_FALLBACK names a host that does
+  # not exist here, so a lookup that quietly returned nothing cannot pass.
+  #
+  #   172.20.0.74  mock HSS (siphon in Diameter server mode)
+  #   172.20.0.75  I-CSCF (examples/ims_icscf.py)
+  #   172.20.0.76  the S-CSCF the HSS names (SIPp UAS)
+  #   172.20.0.77  the UE sending REGISTER
+
+  siphon-cx-hss:
+    image: sipp-siphon
+    build:
+      context: ..
+    container_name: siphon-cx-hss
+    volumes:
+      - ./ims:/etc/siphon/sipp-ims:ro
+    command: ["--config", "/etc/siphon/sipp-ims/hss-cx.yaml"]
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.74
+    healthcheck:
+      # A bare TCP connect: it proves the Diameter listener is bound, which is
+      # the readiness that matters here. It closes without a CER, so each probe
+      # leaves one "handshake rejected: early eof" in the HSS log — expected,
+      # and it stops as soon as the container is healthy.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',3868),2); s.close()\""]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    profiles:
+      - cx
+
+  siphon-cx-icscf:
+    image: sipp-siphon
+    build:
+      context: ..
+    container_name: siphon-cx-icscf
+    depends_on:
+      siphon-cx-hss:
+        condition: service_healthy
+    volumes:
+      - ./ims:/etc/siphon/sipp-ims:ro
+      - ../examples:/etc/siphon/examples:ro
+    command: ["--config", "/etc/siphon/sipp-ims/icscf-cx.yaml"]
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.75
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:ims.example.com SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@ims.example.com>;tag=hc\\r\\nTo: <sip:ims.example.com>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',6060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 8s
+    profiles:
+      - cx
+
+  # The S-CSCF the HSS names. Reaching it at all is the assertion.
+  sipp-cx-scscf:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-cx-icscf:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.76
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/ims/register_cx_scscf.xml
+      - -p
+      - "6060"
+      - -m
+      - "1"
+      - -timeout
+      - "25"
+    profiles:
+      - cx
+
+  sipp-cx-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-cx-icscf:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.77
+    entrypoint:
+      - sipp
+      - "172.20.0.75:6060"
+      - -sf
+      - /sipp/scenarios/ims/register_cx_uac.xml
+      - -s
+      - alice
+      - -key
+      - domain
+      - ims.example.com
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -trace_err
+    profiles:
+      - cx
+
   # Register bob with Contact pointing to 172.20.0.72:5060 (the UAS IP)
   sipp-ims-register-bob:
     image: ctaloi/sipp:latest

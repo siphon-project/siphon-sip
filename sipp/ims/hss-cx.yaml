@@ -1,0 +1,36 @@
+# Mock Cx HSS for the I-CSCF end-to-end test.
+#
+# siphon in Diameter server mode running sipp/ims/mock_hss.py, which answers
+# UAR/LIR with the S-CSCF address the I-CSCF must route to.
+#
+# Network:
+#   172.20.0.74  this HSS (Diameter TCP 3868)
+#   172.20.0.75  siphon-icscf (the Diameter client)
+#   172.20.0.76  the S-CSCF this HSS names
+
+# The schema wants a SIP listener even though this node only speaks Diameter.
+listen:
+  udp:
+    - "0.0.0.0:6060"
+
+domain:
+  local:
+    - "ims.test"
+
+script:
+  path: "/etc/siphon/sipp-ims/mock_hss.py"
+  reload: auto
+
+diameter:
+  listen:
+    tcp: "0.0.0.0:3868"
+  origin_host: "hss.ims.test"
+  origin_realm: "ims.test"
+  product_name: "SIPhon-MockHSS"
+  clients:
+    - name: "icscf"
+      allowed_ips: ["172.20.0.0/24"]
+
+log:
+  level: debug
+  format: pretty

@@ -2137,6 +2137,60 @@ jobs:
             mock-siphon-rtp-refer.log
 
 
+  # ── Cx end-to-end: a Diameter request against a peer on the wire ────────
+  # The only job that exercises the Diameter request path outside unit tests.
+  # The I-CSCF's REGISTER handler awaits `diameter.cx_uar`; the REGISTER can
+  # only reach the S-CSCF below if that coroutine resolved and its Server-Name
+  # was read, because the script's SCSCF_FALLBACK names a host that does not
+  # exist on this network.
+  sipp-cx-icscf:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start the mock HSS and the I-CSCF
+        run: docker compose -f sipp/docker-compose.yaml --profile cx up -d --wait siphon-cx-hss siphon-cx-icscf
+
+      - name: REGISTER routed via Cx UAR
+        run: docker compose -f sipp/docker-compose.yaml --profile cx up --abort-on-container-exit --exit-code-from sipp-cx-uac sipp-cx-scscf sipp-cx-uac
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-cx-icscf > siphon-cx-icscf.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-cx-hss > siphon-cx-hss.log 2>&1 || true
+
+      # Belt and braces on top of the SIPp result: name the two sides of the
+      # exchange in the logs, so a pass cannot come from the fallback path.
+      - name: Assert the answer came from the HSS and was used
+        run: |
+          if ! grep -q "HSS: UAR for" siphon-cx-hss.log; then
+            echo "the HSS never answered a UAR — the I-CSCF did not send one"
+            exit 1
+          fi
+          if ! grep -q "UAR -> S-CSCF: sip:172.20.0.76:6060" siphon-cx-icscf.log; then
+            echo "the I-CSCF did not read the Server-Name out of the Cx answer"
+            exit 1
+          fi
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile cx down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-cx-icscf-logs
+          path: |
+            siphon-cx-icscf.log
+            siphon-cx-hss.log
+
+
   # ── Real siphon-rtp: control-plane smoke (both front-ends) ─────────────
   # Runs the end-to-end test that was previously #[ignore]d behind
   # SIPHON_RTP_BIN with the note "CI does not build the engine". It still does

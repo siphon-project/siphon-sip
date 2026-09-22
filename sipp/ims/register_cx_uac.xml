@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  REGISTER through the I-CSCF, which must ask the HSS over Cx which S-CSCF to
+  use and relay there.
+
+  The I-CSCF does not authenticate (that is the S-CSCF's job), so there is no
+  401 leg here: one REGISTER, one 200 from whichever S-CSCF the I-CSCF chose.
+  The 200 only arrives if the awaited Cx UAR resolved and its Server-Name was
+  used — the script's SCSCF_FALLBACK names a host that does not exist on this
+  network, so a lookup that quietly returned nothing fails to relay and this
+  scenario times out.
+-->
+<scenario name="IMS REGISTER via Cx UAR">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[domain] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[domain]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[domain]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:[service]@[local_ip]:[local_port]>;expires=3600
+P-Visited-Network-ID: [domain]
+Max-Forwards: 70
+User-Agent: SIPp-Cx/[service]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" timeout="10000" />
+
+  <ResponseTimeRepartition value="100, 250, 500, 1000, 2000"/>
+</scenario>
