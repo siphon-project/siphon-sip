@@ -34,12 +34,12 @@ def on_reg_change(aor, event_type, contacts):
 
 
 @proxy.on_request
-def route(request):
+async def route(request):
     if request.method == "OPTIONS" and not request.ruri.user:
         request.reply(200, "OK")
         return
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=REALM):
+        if not await auth.require_digest(request, realm=REALM):
             return  # 401 challenge already sent
         registrar.save(request, force=True)  # fires on_change → blocking notify
         return
