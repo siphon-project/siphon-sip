@@ -160,7 +160,7 @@ async def on_diameter(req):
             # Report FINAL usage (Used-Service-Unit CC-Time, not Requested).
             # Fire-and-forget: acknowledge the CCR-T now and push usage on the loop.
             used = _unit_seconds(req, USED_SERVICE_UNIT, 0) or 0
-            asyncio.create_task(_report(account, str(session), used))
+            asyncio.create_task(await _report(account, str(session), used))
             return _cca(req, SUCCESS)
 
         if cc_type == EVENT:

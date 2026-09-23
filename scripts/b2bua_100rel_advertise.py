@@ -20,13 +20,13 @@ DOMAIN = "siphon.test"
 
 
 @proxy.on_request
-def route(request):
+async def route(request):
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
         return
 
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
         return

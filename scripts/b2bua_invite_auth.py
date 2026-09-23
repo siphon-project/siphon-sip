@@ -36,13 +36,13 @@ def route(request):
 
 
 @b2bua.on_invite
-def new_call(call):
+async def new_call(call):
     # Challenge the caller. On the first INVITE this arms a 407 carrying a fresh
     # nonce and returns False — siphon answers the A-leg itself and no B-leg is
     # dialled. On the authenticated re-INVITE it returns True and strips the
     # hop-by-hop Proxy-Authorization off the message the B-leg INVITE is built
     # from.
-    if not auth.require_proxy_digest(call, realm=REALM):
+    if not await auth.require_proxy_digest(call, realm=REALM):
         log.info(f"challenged {call.from_uri} with 407 (realm={REALM})")
         return
 

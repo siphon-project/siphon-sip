@@ -71,7 +71,7 @@ def on_reg_change(aor, event_type, contacts):
 # Main request routing
 # ---------------------------------------------------------------------------
 @proxy.on_request
-def route(request):
+async def route(request):
     # OPTIONS keepalive — reply 200 immediately (no auth)
     if request.method == "OPTIONS" and not request.ruri.user:
         request.reply(200, "OK")
@@ -127,7 +127,7 @@ def route(request):
     # REGISTER — digest auth, then save location
     # -------------------------------------------------------------------
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=SERVER_DOMAIN):
+        if not await auth.require_digest(request, realm=SERVER_DOMAIN):
             return  # 401 challenge sent
 
         user = request.from_uri.user or "?" if request.from_uri else "?"
@@ -151,7 +151,7 @@ def route(request):
     if request.transport == "tls" and request.ruri.is_local:
         # --- Subscriber side (TLS) → authenticate then relay to AS ---
 
-        if not auth.require_digest(request, realm=SERVER_DOMAIN):
+        if not await auth.require_digest(request, realm=SERVER_DOMAIN):
             return  # 407 challenge sent
 
         # Anti-spoofing: From user must match authenticated user

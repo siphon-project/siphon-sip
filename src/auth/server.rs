@@ -310,6 +310,20 @@ impl DatabaseCredentials {
         _realm: &str,
         _ha1_column: &str,
     ) -> CredentialLookup {
+        Self::unsupported()
+    }
+
+    /// The awaitable twin, so the script APIs compile without the feature too.
+    pub(crate) async fn lookup_async(
+        &self,
+        _username: &str,
+        _realm: &str,
+        _ha1_column: &str,
+    ) -> CredentialLookup {
+        Self::unsupported()
+    }
+
+    fn unsupported() -> CredentialLookup {
         tracing::warn!(
             "auth.backend: database needs the postgres-backend feature, which this binary \
              was built without"

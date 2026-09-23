@@ -10,12 +10,17 @@ Each identity check closes a hole the other leaves open, so both are tested.
 
 Uses the 3GPP test IMSI range (MCC 001 / MNC 01) only.
 """
+import asyncio
 from pathlib import Path
 
 from siphon_sdk import mock_module
 from siphon_sdk.mock_module import MockSAHandle
 from siphon_sdk.request import Request
 from siphon_sdk.testing import SipTestHarness
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 REALM = "ims.example.com"
 IMPI = "001010000000001@ims.example.com"

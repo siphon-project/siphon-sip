@@ -8,6 +8,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **BREAKING: the digest authentication methods are now awaitable.**
+  `auth.require_www_digest`, `auth.require_proxy_digest`, `auth.require_digest`,
+  `auth.verify_digest` and `auth.require_ims_digest` return a coroutine and must
+  be `await`ed, from an `async def` handler.
+
+  They blocked the calling thread while the credential backend answered — an
+  HTTP or SQL lookup for `auth.backend: http` / `database`, a Diameter MAR for
+  the IMS path. For an `async def` handler that thread is its asyncio driver,
+  shared by every coroutine on that loop, so one slow credential lookup stalled
+  unrelated calls.
+
+  **This reaches the default scripts.** `scripts/proxy_default.py` and
+  `scripts/b2bua_default.py` authenticate, so their handlers are now `async def`;
+  every shipped script and example that authenticates is converted the same way,
+  and any script of your own that calls these needs the same change.
+
+  `auth.require_aka_digest` is deliberately **not** awaitable: it derives its
+  vectors locally with Milenage and performs no I/O, so there is nothing to wait
+  for. Nor are `stamp_integrity_protected` / `verify_integrity_protected`.
+
+  Calling one of these from a synchronous handler now raises a `RuntimeError`
+  naming the cause and the fix, rather than asyncio's bare "no running event
+  loop". Worth knowing when migrating: a *forgotten* `await` does not raise —
+  the call returns a coroutine, which is truthy, so `if not auth.require_digest(…)`
+  silently authenticates everyone. Python emits "coroutine was never awaited"
+  for it, so treat that warning as an auth failure rather than noise.
+
 - **BREAKING: the four `sbi` methods are now awaitable.**
   `discover_pcf_binding`, `create_session`, `update_session` and
   `delete_session` return a coroutine and must be `await`ed, for the reason the

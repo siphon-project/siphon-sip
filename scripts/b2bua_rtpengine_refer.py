@@ -14,8 +14,8 @@ PROFILE = "codec_restricted"
 
 
 @proxy.on_request("REGISTER")
-def register(request):
-    if not auth.require_www_digest(request, realm=DOMAIN):
+async def register(request):
+    if not await auth.require_www_digest(request, realm=DOMAIN):
         return
     registrar.save(request)
 
