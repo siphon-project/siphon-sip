@@ -183,6 +183,34 @@ impl AuthTarget<'_> {
     }
 }
 
+/// Everything `validate_http` decides before the backend is asked, so the
+/// blocking and awaitable drivers share it.
+///
+/// Split out because the bridge into async must wrap **only** the network call.
+/// Wrapping the whole arm would make a decision that never touches the backend
+/// — a rejected username, a cache hit — depend on a tokio runtime and an
+/// attached interpreter it has no need for.
+struct HttpPrelude<'a> {
+    fields: DigestFields,
+    http_config: &'a HttpAuthConfig,
+    client: &'a reqwest::Client,
+    /// `Some` when the TTL cache already holds the credential.
+    cached: Option<String>,
+}
+
+/// The database twin of [`HttpPrelude`]: everything decided before the query.
+///
+/// Holds an owned `Arc` to the source rather than a borrow, so the awaitable
+/// driver's future does not borrow `self`.
+struct DatabasePrelude {
+    fields: DigestFields,
+    database: Arc<DatabaseCredentials>,
+    ha1_column: &'static str,
+    cache_key: String,
+    /// `Some` when the TTL cache already holds the credential.
+    cached: Option<String>,
+}
+
 /// Python-visible auth namespace.
 ///
 /// Scripts use: `from siphon import auth` then `auth.require_www_digest(request, realm)`.
@@ -1477,10 +1505,10 @@ impl PyAuth {
     }
 
     /// HTTP backend: fetch HA1 (or password) from REST endpoint, then verify digest.
-    fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
+    fn http_prelude(&self, auth_value: &str) -> Result<HttpPrelude<'_>, CredentialCheck> {
         let fields = match DigestFields::parse(auth_value) {
             Some(f) => f,
-            None => return CredentialCheck::Rejected,
+            None => return Err(CredentialCheck::Rejected),
         };
 
         // Bound the attacker-controlled username before it becomes a URL and an
@@ -1491,7 +1519,7 @@ impl PyAuth {
                 username_len = fields.username.len(),
                 "rejecting HTTP auth: username empty or exceeds length limit"
             );
-            return CredentialCheck::Rejected;
+            return Err(CredentialCheck::Rejected);
         }
 
         let (http_config, client) = match (&self.http_config, &self.http_client) {
@@ -1503,32 +1531,40 @@ impl PyAuth {
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.auth_backend_errors_total.inc();
                 }
-                return CredentialCheck::Unavailable;
+                return Err(CredentialCheck::Unavailable);
             }
         };
 
         // Serve from the TTL cache when possible — this is what keeps a
         // registration storm for the same subscribers from translating 1:1 into
         // blocking HTTP fetches that each pin a Python-executor worker.
-        let body = match self.cached_credential(&fields.username, http_config.cache_ttl_secs) {
-            Some(cached) => {
+        let cached = self
+            .cached_credential(&fields.username, http_config.cache_ttl_secs)
+            .inspect(|_| {
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.auth_ha1_cache_hits_total.inc();
                 }
                 debug!(username = %fields.username, "HTTP auth: HA1 cache hit");
-                cached
-            }
-            None => {
-                let fetched =
-                    match self.fetch_http_credential(http_config, client, &fields.username) {
-                        CredentialLookup::Found(body) => body,
-                        CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                        CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-                    };
-                self.store_credential(&fields.username, &fetched);
-                fetched
-            }
-        };
+            });
+
+        Ok(HttpPrelude {
+            fields,
+            http_config,
+            client,
+            cached,
+        })
+    }
+
+    /// Turn a fetched credential into a verdict — the half after the backend.
+    fn http_finish(
+        &self,
+        prelude: &HttpPrelude<'_>,
+        body: String,
+        realm: &str,
+        method: &str,
+    ) -> CredentialCheck {
+        let fields = &prelude.fields;
+        let http_config = prelude.http_config;
 
         let ha1 = if http_config.ha1 {
             // Response body is already the HA1 hex string. NOTE: this only
@@ -1551,15 +1587,77 @@ impl PyAuth {
         CredentialCheck::from_verified(valid)
     }
 
+    /// HTTP backend, blocking — siphon's own callers, which reach this from a
+    /// sync worker they may block.
+    fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
+        let prelude = match self.http_prelude(auth_value) {
+            Ok(prelude) => prelude,
+            Err(decided) => return decided,
+        };
+        let body = match &prelude.cached {
+            Some(cached) => cached.clone(),
+            None => match self.fetch_http_credential(
+                prelude.http_config,
+                prelude.client,
+                &prelude.fields.username,
+            ) {
+                CredentialLookup::Found(body) => {
+                    self.store_credential(&prelude.fields.username, &body);
+                    body
+                }
+                CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
+            },
+        };
+        self.http_finish(&prelude, body, realm, method)
+    }
+
+    /// HTTP backend, awaitable — the script APIs, which reach this from an
+    /// asyncio driver shared by every coroutine on that loop.
+    ///
+    /// Identical to [`Self::validate_http`] but for the one `await`: both are
+    /// thin drivers over [`Self::http_prelude`] and [`Self::http_finish`], so
+    /// the decision logic cannot drift between them.
+    async fn validate_http_async(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+    ) -> CredentialCheck {
+        let prelude = match self.http_prelude(auth_value) {
+            Ok(prelude) => prelude,
+            Err(decided) => return decided,
+        };
+        let body = match &prelude.cached {
+            Some(cached) => cached.clone(),
+            None => match self
+                .fetch_http_credential_async(
+                    prelude.http_config,
+                    prelude.client,
+                    &prelude.fields.username,
+                )
+                .await
+            {
+                CredentialLookup::Found(body) => {
+                    self.store_credential(&prelude.fields.username, &body);
+                    body
+                }
+                CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
+            },
+        };
+        self.http_finish(&prelude, body, realm, method)
+    }
+
     /// Database backend: look the credential up in SQL, then verify the digest.
     ///
     /// Same shape as [`Self::validate_http`] — the two differ only in where the
     /// credential comes from — so the username bound, the TTL cache and the
     /// `Unavailable`-is-not-evidence rule all behave identically.
-    fn validate_database(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
+    fn database_prelude(&self, auth_value: &str) -> Result<DatabasePrelude, CredentialCheck> {
         let fields = match DigestFields::parse(auth_value) {
             Some(f) => f,
-            None => return CredentialCheck::Rejected,
+            None => return Err(CredentialCheck::Rejected),
         };
 
         // Bound the attacker-controlled username before it becomes a cache key:
@@ -1570,7 +1668,7 @@ impl PyAuth {
                 username_len = fields.username.len(),
                 "rejecting database auth: username empty or exceeds length limit"
             );
-            return CredentialCheck::Rejected;
+            return Err(CredentialCheck::Rejected);
         }
 
         let Some(database) = &self.database else {
@@ -1581,7 +1679,7 @@ impl PyAuth {
             if let Some(metrics) = crate::metrics::try_metrics() {
                 metrics.auth_backend_errors_total.inc();
             }
-            return CredentialCheck::Unavailable;
+            return Err(CredentialCheck::Unavailable);
         };
 
         // With one H(A1) column per hash (RFC 8760) the row holds a different
@@ -1594,25 +1692,34 @@ impl PyAuth {
             fields.username.clone()
         };
 
-        let credential = match self.cached_credential(&cache_key, database.cache_ttl_secs()) {
-            Some(cached) => {
+        let cached = self
+            .cached_credential(&cache_key, database.cache_ttl_secs())
+            .inspect(|_| {
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.auth_ha1_cache_hits_total.inc();
                 }
                 debug!(username = %fields.username, "database auth: credential cache hit");
-                cached
-            }
-            None => match database.lookup(&fields.username, realm, ha1_column) {
-                CredentialLookup::Found(credential) => {
-                    self.store_credential(&cache_key, &credential);
-                    credential
-                }
-                CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-            },
-        };
+            });
 
-        let ha1 = if database.stores_ha1() {
+        Ok(DatabasePrelude {
+            fields,
+            database: Arc::clone(database),
+            ha1_column,
+            cache_key,
+            cached,
+        })
+    }
+
+    /// Turn a looked-up credential into a verdict — the half after the database.
+    fn database_finish(
+        &self,
+        prelude: &DatabasePrelude,
+        credential: String,
+        realm: &str,
+        method: &str,
+    ) -> CredentialCheck {
+        let fields = &prelude.fields;
+        let ha1 = if prelude.database.stores_ha1() {
             // Already H(A1). Algorithm-specific by construction (RFC 7616
             // §3.4.3), so it verifies only for clients answering with the
             // algorithm it was computed for.
@@ -1627,6 +1734,61 @@ impl PyAuth {
         let valid = fields.verify(&ha1, method);
         debug!(username = %fields.username, valid, "database auth digest verification");
         CredentialCheck::from_verified(valid)
+    }
+
+    /// Database backend, blocking — siphon's own sync callers.
+    fn validate_database(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
+        let prelude = match self.database_prelude(auth_value) {
+            Ok(prelude) => prelude,
+            Err(decided) => return decided,
+        };
+        let credential = match &prelude.cached {
+            Some(cached) => cached.clone(),
+            None => {
+                match prelude
+                    .database
+                    .lookup(&prelude.fields.username, realm, prelude.ha1_column)
+                {
+                    CredentialLookup::Found(credential) => {
+                        self.store_credential(&prelude.cache_key, &credential);
+                        credential
+                    }
+                    CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                    CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
+                }
+            }
+        };
+        self.database_finish(&prelude, credential, realm, method)
+    }
+
+    /// Database backend, awaitable — the script APIs. Identical but for the one
+    /// `await`, both being thin drivers over the shared prelude/finish pair.
+    async fn validate_database_async(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+    ) -> CredentialCheck {
+        let prelude = match self.database_prelude(auth_value) {
+            Ok(prelude) => prelude,
+            Err(decided) => return decided,
+        };
+        let credential = match &prelude.cached {
+            Some(cached) => cached.clone(),
+            None => match prelude
+                .database
+                .lookup_async(&prelude.fields.username, realm, prelude.ha1_column)
+                .await
+            {
+                CredentialLookup::Found(credential) => {
+                    self.store_credential(&prelude.cache_key, &credential);
+                    credential
+                }
+                CredentialLookup::NotFound => return CredentialCheck::Rejected,
+                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
+            },
+        };
+        self.database_finish(&prelude, credential, realm, method)
     }
 
     /// Return a cached credential body for `username` if caching is enabled and
@@ -1675,25 +1837,61 @@ impl PyAuth {
         // in the URL path. Substituting it raw lets a crafted `username` break
         // out of the `{username}` segment — `../../admin` (path traversal),
         // `x?role=admin` (query injection), `x#frag` — into the auth backend.
-        let encoded_username = encode_url_path_segment(username);
-        let url = http_config.url.replace("{username}", &encoded_username);
-        debug!(url = %url, username = %username, "HTTP auth lookup");
+        let url = self.credential_url(http_config, username);
 
         // Release the interpreter for the whole blocking HTTP exchange — see
         // `crate::script::detach_block_on` for why this is mandatory on
         // free-threaded CPython (blocking while attached stalls the GC
         // stop-the-world and wedges the engine).
-        let outcome: Result<Option<String>, reqwest::Error> =
-            crate::script::detach_block_on(async {
-                let response = client.get(&url).send().await?;
-                if !response.status().is_success() {
-                    // user not found / backend rejected — not an error
-                    return Ok(None);
-                }
-                let body = response.text().await?;
-                Ok(Some(body.trim().to_string()))
-            });
+        let outcome = crate::script::detach_block_on(Self::http_credential_request(client, &url));
+        self.interpret_http_outcome(outcome, &url, username)
+    }
 
+    /// [`Self::fetch_http_credential`] without blocking the caller's thread,
+    /// for the script APIs — they are called from an asyncio driver that every
+    /// coroutine on that loop shares.
+    async fn fetch_http_credential_async(
+        &self,
+        http_config: &HttpAuthConfig,
+        client: &reqwest::Client,
+        username: &str,
+    ) -> CredentialLookup {
+        let url = self.credential_url(http_config, username);
+        debug!(url = %url, username = %username, "HTTP auth lookup (awaitable)");
+        let outcome = Self::http_credential_request(client, &url).await;
+        self.interpret_http_outcome(outcome, &url, username)
+    }
+
+    /// Percent-encode the attacker-controlled digest username before it lands
+    /// in the URL path. Substituting it raw lets a crafted `username` break out
+    /// of the `{username}` segment — `../../admin` (path traversal),
+    /// `x?role=admin` (query injection), `x#frag` — into the auth backend.
+    fn credential_url(&self, http_config: &HttpAuthConfig, username: &str) -> String {
+        let encoded_username = encode_url_path_segment(username);
+        http_config.url.replace("{username}", &encoded_username)
+    }
+
+    /// The HTTP exchange itself, shared by both drivers so they cannot drift.
+    async fn http_credential_request(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<Option<String>, reqwest::Error> {
+        let response = client.get(url).send().await?;
+        if !response.status().is_success() {
+            // user not found / backend rejected — not an error
+            return Ok(None);
+        }
+        let body = response.text().await?;
+        Ok(Some(body.trim().to_string()))
+    }
+
+    /// Read the exchange's result the same way whichever driver ran it.
+    fn interpret_http_outcome(
+        &self,
+        outcome: Result<Option<String>, reqwest::Error>,
+        url: &str,
+        username: &str,
+    ) -> CredentialLookup {
         match outcome {
             Ok(Some(body)) => CredentialLookup::Found(body),
             Ok(None) => {

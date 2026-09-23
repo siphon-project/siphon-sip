@@ -119,8 +119,22 @@ mod postgres {
             realm: &str,
             ha1_column: &str,
         ) -> CredentialLookup {
+            crate::script::detach_block_on(self.lookup_async(username, realm, ha1_column))
+        }
+
+        /// The awaitable core of [`Self::lookup`].
+        ///
+        /// Two entry points because the callers differ in what they may block:
+        /// siphon's dispatcher reaches this from a sync worker, while a script
+        /// API reaches it from an asyncio driver many coroutines share.
+        pub(crate) async fn lookup_async(
+            &self,
+            username: &str,
+            realm: &str,
+            ha1_column: &str,
+        ) -> CredentialLookup {
             let timeout = Duration::from_millis(self.config.timeout_ms);
-            crate::script::detach_block_on(async {
+            {
                 match tokio::time::timeout(timeout, self.query(username, realm, ha1_column)).await {
                     Ok(outcome) => outcome,
                     Err(_) => {
@@ -133,7 +147,7 @@ mod postgres {
                         Self::backend_error()
                     }
                 }
-            })
+            }
         }
 
         async fn query(&self, username: &str, realm: &str, ha1_column: &str) -> CredentialLookup {
