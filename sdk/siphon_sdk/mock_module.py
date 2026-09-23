@@ -8372,6 +8372,9 @@ class MockSbi:
                 events=["FAILED_RESOURCES_ALLOCATION"],
             )
         """
+        # Validated at the call, as siphon does: the request body is built
+        # from the Python arguments before the future exists, so a bad
+        # `events` raises here rather than on ``await``.
         subscription = self._event_subscription(events, notif_uri, creating=True)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
@@ -8385,13 +8388,17 @@ class MockSbi:
         app_session_uri = (
             f"{base}/npcf-policyauthorization/v1/app-sessions/{session_id}"
         )
-        return {
-            "app_session_id": session_id,
-            "authorized": self._authorized,
-            "app_session_uri": app_session_uri,
-        }
 
-    def delete_session(self, session_id: str) -> bool:
+        async def _create() -> Optional[dict]:
+            return {
+                "app_session_id": session_id,
+                "authorized": self._authorized,
+                "app_session_uri": app_session_uri,
+            }
+
+        return _create()
+
+    async def delete_session(self, session_id: str) -> bool:
         """Delete an N5 app session.
 
         ``True`` means the session no longer exists on the PCF: siphon deleted
@@ -8456,16 +8463,22 @@ class MockSbi:
                 ``events``.
             TypeError: ``events`` is not a list of strings.
         """
+        # Same as create_session: the update body, and so its validation,
+        # is built before the future.
         subscription = self._event_subscription(events, notif_uri, creating=False)
         resolved = self._session_id(session_id)
-        if resolved not in self._sessions:
-            return None
-        if subscription is not None:
-            self._sessions[resolved]["ev_subsc"] = subscription
-        return {"app_session_id": resolved, "authorized": self._authorized}
+
+        async def _update() -> Optional[dict]:
+            if resolved not in self._sessions:
+                return None
+            if subscription is not None:
+                self._sessions[resolved]["ev_subsc"] = subscription
+            return {"app_session_id": resolved, "authorized": self._authorized}
+
+        return _update()
 
     def discover_pcf_binding(self, ue_ipv4: Optional[str] = None,
-                             ue_ipv6: Optional[str] = None) -> Optional[dict]:
+                             ue_ipv6: Optional[str] = None) -> Awaitable[Optional[dict]]:
         """Nbsf_Management discovery — look up the PCF binding for a UE IP.
 
         Returns a binding dict (5G; configure via ``set_binding``), ``None``
@@ -8481,13 +8494,20 @@ class MockSbi:
         Returns:
             The binding dict (incl. a ready-to-use ``pcf_uri``) or ``None``.
         """
+        # The argument check raises at the call, as it does in siphon: the
+        # arguments are read before the future is built. The BSF's own answer
+        # is the awaited part, so an unhealthy BSF surfaces on ``await``.
         if (ue_ipv4 is None) == (ue_ipv6 is None):
             raise ValueError(
                 "discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6"
             )
-        if self._bsf_error:
-            raise BsfError("mock BSF unhealthy")
-        return self._binding
+
+        async def _discover() -> Optional[dict]:
+            if self._bsf_error:
+                raise BsfError("mock BSF unhealthy")
+            return self._binding
+
+        return _discover()
 
     @staticmethod
     def on_event(fn: Any) -> Any:

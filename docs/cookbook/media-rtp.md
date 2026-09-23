@@ -388,9 +388,11 @@ teardown `@proxy.on_cancel` / `@b2bua.on_cancel` cover.
 from siphon import rtpengine, log
 
 @rtpengine.on_media_timeout
-def media_gone(call_id, from_tag):
+async def media_gone(call_id, from_tag):
     log.warn(f"media timeout on {call_id} — releasing call state")
-    # e.g. diameter.rx_str(session_id) / sbi.delete_session(...) / cdr.write(...)
+    # The release calls are awaitable, so the handler is `async def`:
+    # e.g. await diameter.rx_str(session_id) / await sbi.delete_session(...)
+    # / cdr.write(...)
 ```
 
 Filter to a specific call with `@rtpengine.on_media_timeout(call_id=..., from_tag=...)`,
