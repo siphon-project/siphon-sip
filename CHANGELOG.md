@@ -8,6 +8,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **BREAKING: `proxy.send_request` no longer sends without `await`.** It always
+  returned a coroutine, but the DNS resolve and the wire send happened *before*
+  that coroutine was handed back, so a script that never awaited it still got
+  the message out. Both now happen inside the coroutine: an un-awaited call
+  sends nothing.
+
+  The resolve is why. Doing it up front blocked the calling thread, which for an
+  `async def` handler is the asyncio driver every coroutine on that loop shares,
+  so one uncached lookup stalled unrelated calls for as long as it took.
+
+  Ordering is unaffected, and needs no queue: `await` is sequencing, so two
+  sends a script issues in order still leave in that order. Every shipped script
+  and example already awaited it.
+
 - **BREAKING: the `presence` and `subscribe_state` send paths are now
   awaitable.** `presence.notify`, `presence.terminate`,
   `subscribe_state.get`, `subscribe_state.send`, and a handle's `notify`,
