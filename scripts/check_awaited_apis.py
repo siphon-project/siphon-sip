@@ -188,12 +188,25 @@ def check(path):
 DOC_BLOCK = re.compile(r"```py(?:thon)?\n(.*?)```", re.DOTALL)
 ASSUMED_DOC_NAMESPACES = set(NAMESPACE_AWAITABLE) | {"registrar", "cache"}
 
+# A migration note has to show the broken form to name it, so a block can opt
+# out with an HTML comment on the line above its fence:
+#
+#     <!-- await-gate: shows the pre-1.10 form on purpose -->
+#
+# An HTML comment rather than a code comment, so the exemption does not appear
+# inside the sample a reader copies.  The reason after the colon is required, to
+# make an exemption something the author has to justify.
+DOC_EXEMPTION = re.compile(r"<!--\s*await-gate:\s*\S.*?-->")
+
 
 def check_doc(path):
     """Findings across every parseable python block in one markdown file."""
     text = path.read_text()
     findings = []
     for match in DOC_BLOCK.finditer(text):
+        preceding = text[: match.start()].rstrip().rsplit("\n", 1)[-1]
+        if DOC_EXEMPTION.search(preceding):
+            continue
         # Line of the block's first code line: newlines before the fence, plus
         # one to reach the fence itself and one more to step past it.
         offset = text[: match.start()].count("\n") + 1
@@ -235,6 +248,62 @@ async def handler(request, socket, process):
 """
 
 
+# The doc path adds two behaviours the script fixture cannot reach: namespaces
+# assumed bound rather than imported, and the exemption marker.  An exemption
+# mechanism is the obvious way to silence a real finding, so the fixture proves
+# a marker with no reason does not exempt.
+DOC_SELF_TEST_FIXTURE = """# Title
+
+```python
+diameter.cx_uar("sip:a@b")
+```
+
+<!-- await-gate: shows the old form on purpose -->
+```python
+diameter.cx_sar("sip:a@b")
+```
+
+<!-- await-gate: -->
+```python
+diameter.cx_lir("sip:a@b")
+```
+
+```python
+await diameter.rx_aar(framed_ip="192.0.2.1")
+```
+"""
+
+# Block bodies the doc fixture must flag, and must not.
+DOC_EXPECT_FLAGGED = {"cx_uar", "cx_lir"}
+DOC_EXPECT_CLEAN = {"cx_sar", "rx_aar"}
+
+
+def doc_self_test():
+    """Check the doc matcher and its exemption marker; return a process code."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = pathlib.Path(directory) / "fixture.md"
+        fixture.write_text(DOC_SELF_TEST_FIXTURE)
+        findings = check_doc(fixture)
+
+    flagged = {method for method in DOC_EXPECT_FLAGGED | DOC_EXPECT_CLEAN
+               if any(method in finding for finding in findings)}
+    missed = sorted(DOC_EXPECT_FLAGGED - flagged)
+    spurious = sorted(flagged & DOC_EXPECT_CLEAN)
+
+    if missed or spurious:
+        print("FAIL: the doc matcher no longer agrees with its fixture.")
+        for method in missed:
+            print(f"  missed a planted finding: {method}")
+        for method in spurious:
+            print(f"  flagged an exempted or awaited call: {method}")
+        return 1
+    print(f"OK: doc matcher flagged {sorted(DOC_EXPECT_FLAGGED)}, "
+          f"honoured the reasoned exemption, and rejected the empty one.")
+    return 0
+
+
 def self_test():
     """Check the matcher against the labelled fixture; return a process code."""
     import tempfile
@@ -262,7 +331,7 @@ def self_test():
             print(f"  flagged a legitimate call on fixture line {number}")
         return 1
     print(f"OK: matcher caught all {len(expected)} planted findings and nothing else.")
-    return 0
+    return doc_self_test()
 
 
 SCRIPT_ROOTS = ["scripts", "examples", "sipp"]
