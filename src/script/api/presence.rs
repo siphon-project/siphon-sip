@@ -333,8 +333,143 @@ impl PyPresence {
     ///     content_type: Content-Type of the body (e.g. ``"application/reginfo+xml"``).
     ///     subscription_state: Subscription-State header value (default ``"active"``).
     #[pyo3(signature = (subscription_id, body=None, content_type=None, subscription_state="active"))]
-    fn notify(
+    fn notify<'py>(
         &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        body: Option<&str>,
+        content_type: Option<&str>,
+        subscription_state: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let store = Arc::clone(&self.store);
+        let subscription_id = subscription_id.to_string();
+        let body = body.map(str::to_string);
+        let content_type = content_type.map(str::to_string);
+        let subscription_state = subscription_state.to_string();
+
+        crate::script::awaitable(python, async move {
+            Self::notify_inner(
+                store,
+                &subscription_id,
+                body.as_deref(),
+                content_type.as_deref(),
+                &subscription_state,
+            )
+            .await
+        })
+    }
+
+    /// Send a terminating NOTIFY for a subscription and remove it from the
+    /// store (RFC 6665 §4.4.1).
+    ///
+    /// Sends an in-dialog NOTIFY with ``Subscription-State:
+    /// terminated;reason=<reason>``, then removes the subscription's dialog
+    /// state.  Without this, scripts that respond to ``SUBSCRIBE Expires=0``
+    /// (or any other termination trigger) leak dialog state on every
+    /// short-lived subscription, and subsequent reg-event refreshes for the
+    /// resource fan out NOTIFYs to long-departed watchers.
+    ///
+    /// Args:
+    ///     subscription_id: ID returned by :meth:`subscribe_dialog`.
+    ///     reason: Termination reason per RFC 6665 §4.2.2 — one of
+    ///         ``"deactivated"``, ``"probation"``, ``"rejected"``,
+    ///         ``"timeout"``, ``"giveup"``, ``"noresource"``, ``"invariant"``.
+    ///         Defaults to ``"noresource"``.
+    ///     body: Optional final body (e.g. terminal reginfo XML).
+    ///     content_type: Content-Type of the body.
+    ///
+    /// Returns:
+    ///     ``True`` if the subscription existed and the NOTIFY was sent;
+    ///     ``False`` if the ``subscription_id`` was unknown (idempotent — safe
+    ///     to call repeatedly).
+    #[pyo3(signature = (subscription_id, reason=None, body=None, content_type=None))]
+    fn terminate<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        reason: Option<&str>,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // The unknown-subscription answer needs no NOTIFY, but it still has to
+        // be a coroutine: the caller writes one `await` for every path.
+        if self.store.get_subscription(subscription_id).is_none() {
+            return crate::script::ready(python, false);
+        }
+        let store = Arc::clone(&self.store);
+        let subscription_id = subscription_id.to_string();
+        let body = body.map(str::to_string);
+        let content_type = content_type.map(str::to_string);
+        let subscription_state = format!("terminated;reason={}", reason.unwrap_or("noresource"));
+
+        crate::script::awaitable(python, async move {
+            // notify() auto-removes the subscription when the state is
+            // terminated; we rely on that path so terminate() and
+            // notify(state="terminated;…") are observably equivalent.
+            Self::notify_inner(
+                store,
+                &subscription_id,
+                body.as_deref(),
+                content_type.as_deref(),
+                &subscription_state,
+            )
+            .await?;
+            Ok(true)
+        })
+    }
+}
+
+/// Convert a parsed [`crate::registrar::reginfo::ReginfoBody`] to a Python
+/// dict shaped for script consumption (snake-case keys, all-string enum
+/// values, optional fields surfaced as `None` when absent).
+fn reginfo_to_pydict<'py>(
+    python: Python<'py>,
+    body: &crate::registrar::reginfo::ReginfoBody,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item("version", body.version)?;
+    dict.set_item("state", body.state.to_string())?;
+
+    let registrations = pyo3::types::PyList::empty(python);
+    for reg in &body.registrations {
+        let reg_dict = PyDict::new(python);
+        reg_dict.set_item("aor", &reg.aor)?;
+        reg_dict.set_item("id", &reg.id)?;
+        reg_dict.set_item("state", reg.state.to_string())?;
+
+        let contacts = pyo3::types::PyList::empty(python);
+        for contact in &reg.contacts {
+            let contact_dict = PyDict::new(python);
+            contact_dict.set_item("uri", &contact.uri)?;
+            contact_dict.set_item("state", contact.state.to_string())?;
+            contact_dict.set_item("event", contact.event.to_string())?;
+            match contact.expires {
+                Some(secs) => contact_dict.set_item("expires", secs)?,
+                None => contact_dict.set_item("expires", python.None())?,
+            }
+            match contact.q {
+                Some(q) => contact_dict.set_item("q", q)?,
+                None => contact_dict.set_item("q", python.None())?,
+            }
+            contacts.append(contact_dict)?;
+        }
+        reg_dict.set_item("contacts", contacts)?;
+        registrations.append(reg_dict)?;
+    }
+    dict.set_item("registrations", registrations)?;
+    Ok(dict)
+}
+
+impl PyPresence {
+    /// The NOTIFY itself.
+    ///
+    /// Awaitable because the destination is resolved through DNS (RFC 3263),
+    /// which for an `async def` handler would otherwise block the asyncio
+    /// driver every coroutine on that loop shares. The deferral below still
+    /// works: the script awaits this before its handler returns, so the send is
+    /// registered in time for the dispatcher to order it after the 200 OK.
+    async fn notify_inner(
+        store: Arc<PresenceStore>,
         subscription_id: &str,
         body: Option<&str>,
         content_type: Option<&str>,
@@ -352,7 +487,7 @@ impl PyPresence {
         })?;
 
         // Look up subscription and extract + increment CSeq atomically
-        let dialog = self.store.prepare_notify(subscription_id).ok_or_else(|| {
+        let dialog = store.prepare_notify(subscription_id).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "subscription '{subscription_id}' not found or has no dialog state \
                  — use subscribe_dialog() to create subscriptions with dialog fields"
@@ -404,12 +539,9 @@ impl PyPresence {
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
 
-        let destination = crate::script::detach_block_on(resolver_clone.resolve(
-            &host,
-            port,
-            scheme.as_str(),
-            transport_hint.as_deref(),
-        ));
+        let destination = resolver_clone
+            .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
+            .await;
 
         let target = destination.into_iter().next().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -502,94 +634,10 @@ impl PyPresence {
         // this resource don't keep emitting NOTIFYs to a watcher that is no
         // longer subscribed.
         if is_terminated_subscription_state(subscription_state) {
-            self.store.remove_subscription(subscription_id);
+            store.remove_subscription(subscription_id);
         }
         Ok(())
     }
-
-    /// Send a terminating NOTIFY for a subscription and remove it from the
-    /// store (RFC 6665 §4.4.1).
-    ///
-    /// Sends an in-dialog NOTIFY with ``Subscription-State:
-    /// terminated;reason=<reason>``, then removes the subscription's dialog
-    /// state.  Without this, scripts that respond to ``SUBSCRIBE Expires=0``
-    /// (or any other termination trigger) leak dialog state on every
-    /// short-lived subscription, and subsequent reg-event refreshes for the
-    /// resource fan out NOTIFYs to long-departed watchers.
-    ///
-    /// Args:
-    ///     subscription_id: ID returned by :meth:`subscribe_dialog`.
-    ///     reason: Termination reason per RFC 6665 §4.2.2 — one of
-    ///         ``"deactivated"``, ``"probation"``, ``"rejected"``,
-    ///         ``"timeout"``, ``"giveup"``, ``"noresource"``, ``"invariant"``.
-    ///         Defaults to ``"noresource"``.
-    ///     body: Optional final body (e.g. terminal reginfo XML).
-    ///     content_type: Content-Type of the body.
-    ///
-    /// Returns:
-    ///     ``True`` if the subscription existed and the NOTIFY was sent;
-    ///     ``False`` if the ``subscription_id`` was unknown (idempotent — safe
-    ///     to call repeatedly).
-    #[pyo3(signature = (subscription_id, reason=None, body=None, content_type=None))]
-    fn terminate(
-        &self,
-        subscription_id: &str,
-        reason: Option<&str>,
-        body: Option<&str>,
-        content_type: Option<&str>,
-    ) -> PyResult<bool> {
-        if self.store.get_subscription(subscription_id).is_none() {
-            return Ok(false);
-        }
-        let reason_str = reason.unwrap_or("noresource");
-        let subscription_state = format!("terminated;reason={reason_str}");
-        // notify() auto-removes the subscription when the state is terminated;
-        // we rely on that path so terminate() and notify(state="terminated;…")
-        // are observably equivalent.
-        self.notify(subscription_id, body, content_type, &subscription_state)?;
-        Ok(true)
-    }
-}
-
-/// Convert a parsed [`crate::registrar::reginfo::ReginfoBody`] to a Python
-/// dict shaped for script consumption (snake-case keys, all-string enum
-/// values, optional fields surfaced as `None` when absent).
-fn reginfo_to_pydict<'py>(
-    python: Python<'py>,
-    body: &crate::registrar::reginfo::ReginfoBody,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(python);
-    dict.set_item("version", body.version)?;
-    dict.set_item("state", body.state.to_string())?;
-
-    let registrations = pyo3::types::PyList::empty(python);
-    for reg in &body.registrations {
-        let reg_dict = PyDict::new(python);
-        reg_dict.set_item("aor", &reg.aor)?;
-        reg_dict.set_item("id", &reg.id)?;
-        reg_dict.set_item("state", reg.state.to_string())?;
-
-        let contacts = pyo3::types::PyList::empty(python);
-        for contact in &reg.contacts {
-            let contact_dict = PyDict::new(python);
-            contact_dict.set_item("uri", &contact.uri)?;
-            contact_dict.set_item("state", contact.state.to_string())?;
-            contact_dict.set_item("event", contact.event.to_string())?;
-            match contact.expires {
-                Some(secs) => contact_dict.set_item("expires", secs)?,
-                None => contact_dict.set_item("expires", python.None())?,
-            }
-            match contact.q {
-                Some(q) => contact_dict.set_item("q", q)?,
-                None => contact_dict.set_item("q", python.None())?,
-            }
-            contacts.append(contact_dict)?;
-        }
-        reg_dict.set_item("contacts", contacts)?;
-        registrations.append(reg_dict)?;
-    }
-    dict.set_item("registrations", registrations)?;
-    Ok(dict)
 }
 
 #[cfg(test)]
@@ -819,15 +867,28 @@ mod tests {
         assert_eq!(subscription.expires, Duration::from_secs(1800));
     }
 
+    /// Unknown subscription: still an awaitable, still `False`. The caller
+    /// writes one `await` for every path, so this arm has to be a coroutine
+    /// too — a plain `False` here could not be awaited.
     #[test]
     fn terminate_nonexistent_returns_false() {
+        pyo3::Python::initialize();
         let store = make_store();
         let presence = PyPresence::new(store);
 
-        let result = presence
-            .terminate("sub-nonexistent", None, None, None)
-            .unwrap();
-        assert!(!result);
+        pyo3::Python::attach(|python| {
+            let coroutine = presence
+                .terminate(python, "sub-nonexistent", None, None, None)
+                .expect("terminate builds a coroutine");
+            let resolved: bool = python
+                .import("asyncio")
+                .expect("asyncio")
+                .call_method1("run", (coroutine,))
+                .expect("coroutine resolves")
+                .extract()
+                .expect("bool");
+            assert!(!resolved);
+        });
     }
 
     #[test]

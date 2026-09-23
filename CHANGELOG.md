@@ -8,6 +8,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ### Changed
 
+- **BREAKING: the `presence` and `subscribe_state` send paths are now
+  awaitable.** `presence.notify`, `presence.terminate`,
+  `subscribe_state.get`, `subscribe_state.send`, and a handle's `notify`,
+  `terminate` and `refresh` return a coroutine and must be `await`ed.
+
+  Each resolves its destination through DNS (RFC 3263) and, where it waits for
+  a response, waited for that too — on the calling thread, which for an
+  `async def` handler is the asyncio driver every coroutine on that loop
+  shares.
+
+  Ordering is preserved without any extra machinery, because `await` is
+  sequencing: two NOTIFYs a script sends in order still leave in that order.
+  `presence.notify`'s deferral is unaffected — RFC 3265 §3.1.6.2 requires the
+  200 OK to a SUBSCRIBE before the first NOTIFY, and the script awaits the
+  NOTIFY before its handler returns, so the send is still registered in time
+  for the dispatcher to order it.
+
+  **One path is deliberately left blocking**: `SubscribeHandle`'s properties
+  (`event`, `expires`, `local_tag`, …) read through a loader that hits Redis on
+  an L1 miss. A Python property cannot be awaited, so making it non-blocking
+  would mean turning the properties into methods — a larger API change than
+  this one. An L1 hit, which is the common case and always the case for a
+  dialog this instance created, touches no network.
+
 - **BREAKING: the digest authentication methods are now awaitable.**
   `auth.require_www_digest`, `auth.require_proxy_digest`, `auth.require_digest`,
   `auth.verify_digest` and `auth.require_ims_digest` return a coroutine and must

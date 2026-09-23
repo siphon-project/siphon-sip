@@ -41,9 +41,12 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
             let expired = store.take_stale();
             let count = expired.len() as u64;
             if !expired.is_empty() {
-                tokio::task::spawn_blocking(move || {
+                // `spawn`, not `spawn_blocking`: the terminating NOTIFY no
+                // longer blocks a thread for its DNS lookup, so it needs no
+                // blocking-pool slot — only to stay off the dispatch task.
+                tokio::spawn(async move {
                     for dialog in expired {
-                        crate::script::api::subscribe_state::notify_expired(dialog);
+                        crate::script::api::subscribe_state::notify_expired(dialog).await;
                     }
                 });
             }
