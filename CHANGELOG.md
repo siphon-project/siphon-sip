@@ -123,6 +123,21 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The IMS P-CSCF example reserved and released no QoS bearer.** Both Rx calls
+  in `examples/ims_pcscf.py` were written without `await` against APIs that are
+  now awaitable, so each returned a coroutine that never ran: the AAR reserved
+  nothing on the dedicated bearer, and the STR on teardown released nothing,
+  leaving the PCRF session to age out on its own. Neither raised — the AAR's
+  coroutine is truthy, so the success branch was taken and logged, and the STR's
+  was simply formatted into the log line as if it were a result code.
+
+  A `scripts/check_awaited_apis.py` gate now walks the AST of every shipped
+  script and fails on an awaitable siphon call that is not awaited, which is the
+  only way to catch this class: nothing but a live node executes these scripts,
+  and a missed `await` reads as working code at every other layer. The gate
+  self-tests against a labelled fixture in CI, so it cannot quietly stop
+  matching.
+
 - **The registrar's write-through queue is bounded, and `aor_count()` no longer
   waits on it without a deadline.** `registrar.aor_count()` awaited a oneshot
   with no timeout, queued behind a writer draining an **unbounded** channel. Each
