@@ -13,7 +13,7 @@ DOMAIN = "example.com"
 
 
 @proxy.on_request
-def route(request):
+async def route(request):
     # Reject malformed / RFC 4475 torture traffic before doing any work.
     # The Rust side already drops unparseable messages and auto-483s
     # Max-Forwards==0; sanity_check adds the *semantic* checks on a message that
@@ -43,7 +43,7 @@ def route(request):
         return
 
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
         return

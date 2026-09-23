@@ -12,12 +12,17 @@ the same arithmetic. The vectors are the RFC 7616 §3.4 construction, the same o
 the engine's `DigestFields::verify` implements.
 """
 
+import asyncio
 import hashlib
 
 import pytest
 
 from siphon_sdk.mock_module import MockAuth
 from siphon_sdk.request import Request
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 REALM = "example.com"
 USERNAME = "carol"
@@ -75,9 +80,9 @@ def test_a_correctly_signed_request_verifies_with_the_password(algorithm):
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request(algorithm), realm=REALM, password=PASSWORD
-    ) is True
+    )) is True
 
 
 @pytest.mark.parametrize("algorithm", list(HASHES))
@@ -85,9 +90,9 @@ def test_a_correctly_signed_request_verifies_with_the_matching_ha1(algorithm):
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request(algorithm), realm=REALM, ha1=_ha1(algorithm)
-    ) is True
+    )) is True
 
 
 @pytest.mark.parametrize("algorithm", list(HASHES))
@@ -96,9 +101,9 @@ def test_the_wrong_password_is_refused(algorithm):
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request(algorithm), realm=REALM, password="wrong"
-    ) is False
+    )) is False
 
 
 def test_an_ha1_computed_for_the_wrong_algorithm_is_refused():
@@ -111,21 +116,21 @@ def test_an_ha1_computed_for_the_wrong_algorithm_is_refused():
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request("SHA-256"), realm=REALM, ha1=_ha1("MD5")
-    ) is False
+    )) is False
 
 
 def test_qop_auth_is_verified_with_the_nonce_count_and_cnonce():
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request("MD5", qop=True), realm=REALM, password=PASSWORD
-    ) is True
-    assert auth.verify_digest(
+    )) is True
+    assert run(auth.verify_digest(
         _signed_request("MD5", qop=True), realm=REALM, password="wrong"
-    ) is False
+    )) is False
 
 
 def test_the_method_is_taken_from_the_request():
@@ -133,13 +138,13 @@ def test_the_method_is_taken_from_the_request():
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request(method="INVITE"), realm=REALM, password=PASSWORD
-    ) is True
+    )) is True
 
     # Signed as a REGISTER, presented on an INVITE.
     mismatched = _signed_request(method="INVITE", signed_method="REGISTER")
-    assert auth.verify_digest(mismatched, realm=REALM, password=PASSWORD) is False
+    assert run(auth.verify_digest(mismatched, realm=REALM, password=PASSWORD)) is False
 
 
 def test_a_missing_authorization_header_is_refused():
@@ -147,7 +152,7 @@ def test_a_missing_authorization_header_is_refused():
     auth._allow = True  # would have returned True before
 
     request = Request(method="REGISTER", to_uri=f"sip:{USERNAME}@{REALM}")
-    assert auth.verify_digest(request, realm=REALM, password=PASSWORD) is False
+    assert run(auth.verify_digest(request, realm=REALM, password=PASSWORD)) is False
 
 
 def test_the_allow_flag_still_governs_when_no_credential_is_supplied():
@@ -156,10 +161,10 @@ def test_the_allow_flag_still_governs_when_no_credential_is_supplied():
     request = _signed_request()
 
     auth._allow = True
-    assert auth.verify_digest(request, realm=REALM) is True
+    assert run(auth.verify_digest(request, realm=REALM)) is True
 
     auth._allow = False
-    assert auth.verify_digest(request, realm=REALM) is False
+    assert run(auth.verify_digest(request, realm=REALM)) is False
 
 
 def test_proxy_authorization_is_read_when_authorization_is_absent():
@@ -167,7 +172,7 @@ def test_proxy_authorization_is_read_when_authorization_is_absent():
     auth._allow = False
     request = _signed_request(header="Proxy-Authorization")
 
-    assert auth.verify_digest(request, realm=REALM, password=PASSWORD) is True
+    assert run(auth.verify_digest(request, realm=REALM, password=PASSWORD)) is True
 
 
 def test_the_realm_argument_wins_over_the_one_the_client_echoed():
@@ -179,9 +184,9 @@ def test_the_realm_argument_wins_over_the_one_the_client_echoed():
     auth = MockAuth()
     auth._allow = False
 
-    assert auth.verify_digest(
+    assert run(auth.verify_digest(
         _signed_request(), realm="other.example", password=PASSWORD
-    ) is False
+    )) is False
 
 
 def test_an_unknown_algorithm_raises_rather_than_returning_false():
@@ -195,7 +200,7 @@ def test_an_unknown_algorithm_raises_rather_than_returning_false():
     )
 
     with pytest.raises(ValueError, match="ROT13"):
-        auth.verify_digest(request, realm=REALM, password=PASSWORD)
+        run(auth.verify_digest(request, realm=REALM, password=PASSWORD))
 
 
 def test_supplying_both_still_raises_before_any_arithmetic():
@@ -203,9 +208,9 @@ def test_supplying_both_still_raises_before_any_arithmetic():
     auth._allow = False
 
     with pytest.raises(ValueError, match="not both"):
-        auth.verify_digest(
+        run(auth.verify_digest(
             _signed_request(), realm=REALM, password=PASSWORD, ha1=_ha1("MD5")
-        )
+        ))
 
 
 @pytest.mark.parametrize(
@@ -222,10 +227,10 @@ def test_the_challenge_helpers_verify_a_supplied_credential_too(method, header, 
     auth._allow = False
 
     good = _signed_request(header=header)
-    assert getattr(auth, method)(good, realm=REALM, password=PASSWORD) is True
+    assert run(getattr(auth, method)(good, realm=REALM, password=PASSWORD)) is True
     assert good.auth_user == USERNAME
 
     bad = _signed_request(header=header)
-    assert getattr(auth, method)(bad, realm=REALM, password="wrong") is False
+    assert run(getattr(auth, method)(bad, realm=REALM, password="wrong")) is False
     assert bad.last_action.kind == "reply"
     assert bad.last_action.status_code == code

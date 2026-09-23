@@ -35,11 +35,11 @@ SCSCF_URI = f"sip:scscf.{REALM}:6060"
 
 
 @proxy.on_request("REGISTER")
-def handle_register(request):
+async def handle_register(request):
     log.info(f"S-CSCF REGISTER from {request.from_uri}")
 
     # Standard SIP digest auth (lab mode — no AKA, no HSS).
-    if not auth.require_www_digest(request, realm=REALM):
+    if not await auth.require_www_digest(request, realm=REALM):
         log.info(f"sent 401 challenge to {request.from_uri}")
         return
 

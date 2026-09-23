@@ -63,7 +63,29 @@ where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
-    pyo3_async_runtimes::tokio::future_into_py(python, future)
+    pyo3_async_runtimes::tokio::future_into_py(python, future).map_err(explain_missing_loop)
+}
+
+/// Turn asyncio's `no running event loop` into an error that says what to do.
+///
+/// Building the coroutine needs a running loop, which a handler only has when
+/// it is `async def`. So this is precisely the error a script gets when it
+/// calls one of these from a synchronous handler — the single most likely
+/// mistake when migrating — and asyncio's own wording names neither the cause
+/// nor the fix.
+fn explain_missing_loop(error: PyErr) -> PyErr {
+    let is_missing_loop = Python::attach(|python| {
+        error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python)
+            && error.to_string().contains("no running event loop")
+    });
+    if !is_missing_loop {
+        return error;
+    }
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "this siphon API is awaitable and needs a running event loop: call it \
+         with `await` from an `async def` handler. A synchronous handler cannot \
+         await, so change `def handler(...)` to `async def handler(...)`.",
+    )
 }
 
 /// Drive `future` to completion, blocking the current handler thread, with the

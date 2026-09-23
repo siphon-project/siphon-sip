@@ -30,7 +30,7 @@ src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction schedul
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    2000  # same; +43 for the client-transport accessors and their docs
 src/script/api/registrar.rs  1520  # same; PyContact/PyFlow views + the save/save_proxy capture
-src/script/api/auth.rs       2150  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0; +49 for the database backend's validate/cache path
+src/script/api/auth.rs       2530  # UAS digest authenticator moves to src/auth/server.rs post-1.9.0; +49 for the database backend's validate/cache path. +159 for splitting each credential backend into a shared prelude/finish pair with a blocking and an awaitable driver, so the bridge into async wraps only the network call and a decision that never reaches the backend keeps needing no runtime; +157 for the awaitable digest driver and the test harness that calls it from a real event loop, which is the only way an awaitable method can be called at all; +27 for require_ims_digest's MAR flow, which becomes its own async fn because its request writes all happen after an await
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 thin delegations

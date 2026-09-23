@@ -50,7 +50,7 @@ async def route(request):
         return
 
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
         return

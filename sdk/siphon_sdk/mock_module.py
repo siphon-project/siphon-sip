@@ -2651,10 +2651,34 @@ class MockAuth:
         Returns:
             ``True`` if authenticated, ``False`` if challenge was sent.
         """
+
+        # Validated at the call, as siphon does: the kwargs are resolved before
+        # the future is built, so supplying both raises where you called it.
         self._resolve_supplied(password, ha1)
+
+        async def _run():
+            return self._digest_verdict(
+                target, "Authorization", 401, "Unauthorized", realm, password, ha1
+            )
+
+        return _run()
+
+    def _digest_verdict(self, target: Any, header_name: str, code: int, reason: str,
+                        realm: Optional[str], password: Optional[str],
+                        ha1: Optional[str]) -> bool:
+        """The digest decision itself, with no awaiting.
+
+        Shared so a method that is awaitable in siphon and one that is not can
+        both reach it. ``require_aka_digest`` is the second kind — local
+        Milenage, no I/O, so siphon never made it awaitable — and it used to
+        delegate to ``require_www_digest``. Once that returned a coroutine the
+        delegation silently authenticated everyone, because a coroutine is
+        truthy and ``if not auth.require_aka_digest(...)`` was therefore never
+        taken.
+        """
         if password is not None or ha1 is not None:
             return self._challenge_with_supplied(
-                target, "Authorization", 401, "Unauthorized", realm, password, ha1
+                target, header_name, code, reason, realm, password, ha1
             )
         if self._allow:
             # Derive auth_user from From URI when auto-allowing.
@@ -2662,11 +2686,11 @@ class MockAuth:
             target.auth_user = user or "mock_user"
             return True
         # Check if the message carries an Authorization header
-        auth_header = target.get_header("Authorization")
+        auth_header = target.get_header(header_name)
         if auth_header and self._check_auth(auth_header, realm):
             target.auth_user = self._extract_username(auth_header)
             return True
-        self._challenge(target, 401, "Unauthorized")
+        self._challenge(target, code, reason)
         return False
 
     def _challenge_with_supplied(self, target: Any, header_name: str,
@@ -2714,29 +2738,40 @@ class MockAuth:
             ha1: Verify against this already-computed H(A1) instead of the
                 configured backend.  Mutually exclusive with ``password``.
         """
+
+        # Validated at the call, as siphon does: the kwargs are resolved before
+        # the future is built, so supplying both raises where you called it.
         self._resolve_supplied(password, ha1)
-        if password is not None or ha1 is not None:
-            return self._challenge_with_supplied(
-                target, "Proxy-Authorization", 407,
-                "Proxy Authentication Required", realm, password, ha1,
-            )
-        if self._allow:
-            user = getattr(target.from_uri, "user", None) if target.from_uri else None
-            target.auth_user = user or "mock_user"
-            return True
-        auth_header = target.get_header("Proxy-Authorization")
-        if auth_header and self._check_auth(auth_header, realm):
-            target.auth_user = self._extract_username(auth_header)
-            return True
-        self._challenge(target, 407, "Proxy Authentication Required")
-        return False
+
+        async def _run():
+            if password is not None or ha1 is not None:
+                return self._challenge_with_supplied(
+                    target, "Proxy-Authorization", 407,
+                    "Proxy Authentication Required", realm, password, ha1,
+                )
+            if self._allow:
+                user = getattr(target.from_uri, "user", None) if target.from_uri else None
+                target.auth_user = user or "mock_user"
+                return True
+            auth_header = target.get_header("Proxy-Authorization")
+            if auth_header and self._check_auth(auth_header, realm):
+                target.auth_user = self._extract_username(auth_header)
+                return True
+            self._challenge(target, 407, "Proxy Authentication Required")
+            return False
+
+        return _run()
 
     def require_digest(self, target: Any,
                        realm: Optional[str] = None,
                        password: Optional[str] = None,
                        ha1: Optional[str] = None) -> bool:
         """Convenience alias for :meth:`require_www_digest`."""
-        return self.require_www_digest(target, realm=realm, password=password, ha1=ha1)
+
+        async def _run():
+            return await self.require_www_digest(target, realm=realm, password=password, ha1=ha1)
+
+        return _run()
 
     def require_ims_digest(self, request: Any,
                           realm: Optional[str] = None) -> bool:
@@ -2753,8 +2788,15 @@ class MockAuth:
         Returns:
             ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
         """
+
+        # Raised at the call, as siphon does: PyO3 refuses a Call when it
+        # extracts the argument, before any future exists.
         self._reject_call_target(request, "require_ims_digest")
-        return self.require_www_digest(request, realm=realm)
+
+        async def _run():
+            return await self.require_www_digest(request, realm=realm)
+
+        return _run()
 
     def require_aka_digest(self, request: Any,
                            realm: Optional[str] = None) -> bool:
@@ -2782,7 +2824,11 @@ class MockAuth:
             ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
         """
         self._reject_call_target(request, "require_aka_digest")
-        return self.require_www_digest(request, realm=realm)
+        # Not awaitable in siphon (local Milenage, no I/O), so it must not
+        # return a coroutine here either.
+        return self._digest_verdict(
+            request, "Authorization", 401, "Unauthorized", realm, None, None
+        )
 
     def stamp_integrity_protected(self, request: Any) -> Optional[str]:
         """P-CSCF: stamp ``integrity-protected`` into every ``Authorization`` header.
@@ -2962,22 +3008,26 @@ class MockAuth:
             ValueError: if both ``password`` and ``ha1`` are given, or if the
                 header names a digest algorithm this Python cannot compute.
         """
-        self._resolve_supplied(password, ha1)
-        auth_header = (
-            target.get_header("Authorization")
-            or target.get_header("Proxy-Authorization")
-        )
 
-        # A supplied credential is something the mock can actually check, so it
-        # checks it rather than falling through to the preset flag.
-        if password is not None or ha1 is not None:
-            if auth_header is None:
-                return False
-            return self._verify_supplied(target, auth_header, realm, password, ha1)
+        async def _run():
+            self._resolve_supplied(password, ha1)
+            auth_header = (
+                target.get_header("Authorization")
+                or target.get_header("Proxy-Authorization")
+            )
 
-        if self._allow:
-            return True
-        return auth_header is not None and self._check_auth(auth_header, realm)
+            # A supplied credential is something the mock can actually check, so it
+            # checks it rather than falling through to the preset flag.
+            if password is not None or ha1 is not None:
+                if auth_header is None:
+                    return False
+                return self._verify_supplied(target, auth_header, realm, password, ha1)
+
+            if self._allow:
+                return True
+            return auth_header is not None and self._check_auth(auth_header, realm)
+
+        return _run()
 
     def _verify_supplied(self, target: Any, auth_header: str,
                          realm: Optional[str],
