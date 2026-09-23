@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-09-24
+
 ### Changed
 
 - **BREAKING: `proxy.send_request` no longer sends without `await`.** It always
