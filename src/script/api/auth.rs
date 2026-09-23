@@ -1,7 +1,7 @@
 //! PyO3 `auth` namespace — SIP digest authentication.
 //!
-//! Exposes `auth.require_www_digest()`, `auth.require_proxy_digest()`,
-//! and `auth.verify_digest()` to Python scripts.
+//! Exposes `auth.require_www_digest(python, )`, `auth.require_proxy_digest(python, )`,
+//! and `auth.verify_digest(python, )` to Python scripts.
 //!
 //! Credentials come from `auth.users` (static), an HTTP lookup, or SQL —
 //! see [`crate::auth::server`] for the SQL source.
@@ -55,6 +55,33 @@ enum SuppliedSecret<'a> {
     /// hash rather than the plaintext, at the cost of being bound to the one
     /// algorithm it was computed for.
     Ha1(&'a str),
+}
+
+/// [`SuppliedSecret`] without the borrow, so it can cross into a future.
+#[derive(Clone)]
+enum OwnedSuppliedSecret {
+    Password(String),
+    Ha1(String),
+}
+
+impl OwnedSuppliedSecret {
+    fn borrowed(&self) -> SuppliedSecret<'_> {
+        match self {
+            OwnedSuppliedSecret::Password(secret) => SuppliedSecret::Password(secret),
+            OwnedSuppliedSecret::Ha1(secret) => SuppliedSecret::Ha1(secret),
+        }
+    }
+}
+
+impl SuppliedSecret<'_> {
+    fn to_owned_secret(&self) -> OwnedSuppliedSecret {
+        match self {
+            SuppliedSecret::Password(secret) => {
+                OwnedSuppliedSecret::Password((*secret).to_string())
+            }
+            SuppliedSecret::Ha1(secret) => OwnedSuppliedSecret::Ha1((*secret).to_string()),
+        }
+    }
 }
 
 impl<'a> SuppliedSecret<'a> {
@@ -211,10 +238,29 @@ struct DatabasePrelude {
     cached: Option<String>,
 }
 
+/// What a digest decision needs off the message, read before the credential
+/// backend is consulted.
+///
+/// Owned, so the awaitable driver can carry it across an `await` — the Python
+/// object it came from cannot cross one.
+struct DigestRead {
+    /// `Authorization`, or `Proxy-Authorization` when that is what arrived.
+    auth_header: Option<String>,
+    /// The SIP method, for the digest HA2. On a B2BUA `Call` this is the A-leg
+    /// INVITE, so the HA2 the caller computed over "INVITE:<uri>" is what is
+    /// verified against.
+    method: String,
+}
+
 /// Python-visible auth namespace.
 ///
-/// Scripts use: `from siphon import auth` then `auth.require_www_digest(request, realm)`.
-#[pyclass(name = "AuthNamespace")]
+/// Scripts use: `from siphon import auth` then `auth.require_www_digest(python, request, realm)`.
+// `skip_from_py_object` because `Clone` would otherwise opt this into a
+// `FromPyObject` derive it has no use for: the namespace is a singleton siphon
+// installs, never a value a script passes back in. `Clone` exists so the
+// awaitable digest path can move an owned handle into its future.
+#[pyclass(name = "AuthNamespace", skip_from_py_object)]
+#[derive(Clone)]
 pub struct PyAuth {
     /// Which backend to use for credential lookup.
     backend_type: AuthBackendType,
@@ -481,7 +527,7 @@ impl PyAuth {
     ///
     /// ```python
     /// if not auth.validate_nonce(nonce_from_the_header):
-    ///     auth.require_www_digest(request, realm)   # stale — re-challenge
+    ///     auth.require_www_digest(python, request, realm)   # stale — re-challenge
     ///     return
     /// ```
     ///
@@ -502,61 +548,50 @@ impl PyAuth {
     /// check, the auto-ban accounting and the failure metrics are identical
     /// either way; only the source of the secret differs.
     #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
-    fn require_www_digest(
+    fn require_www_digest<'py>(
         &self,
-        target: &Bound<'_, PyAny>,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
         realm: Option<&str>,
         password: Option<&str>,
         ha1: Option<&str>,
-    ) -> PyResult<bool> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
-        let mut guard = AuthTargetGuard::extract(target)?;
-        self.require_digest_inner(
-            &mut guard.as_target(),
-            realm,
-            401,
-            "WWW-Authenticate",
-            supplied.as_ref(),
-        )
+        self.require_digest_awaitable(python, target, realm, 401, supplied.as_ref())
     }
 
     /// Challenge with 407 Proxy-Authenticate if not yet authenticated.
     ///
     /// Same as `require_www_digest` but uses 407 status code. This is the
     /// challenge an INVITE normally gets, including from a B2BUA authenticating
-    /// its own A-leg (`auth.require_proxy_digest(call, realm)` inside
+    /// its own A-leg (`auth.require_proxy_digest(python, call, realm)` inside
     /// `@b2bua.on_invite`): the caller's re-INVITE carries
     /// `Proxy-Authorization`, which is stripped again before the B-leg is
     /// dialled because it is hop-by-hop (RFC 3261 §22.3).
     #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
-    fn require_proxy_digest(
+    fn require_proxy_digest<'py>(
         &self,
-        target: &Bound<'_, PyAny>,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
         realm: Option<&str>,
         password: Option<&str>,
         ha1: Option<&str>,
-    ) -> PyResult<bool> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
-        let mut guard = AuthTargetGuard::extract(target)?;
-        self.require_digest_inner(
-            &mut guard.as_target(),
-            realm,
-            407,
-            "Proxy-Authenticate",
-            supplied.as_ref(),
-        )
+        self.require_digest_awaitable(python, target, realm, 407, supplied.as_ref())
     }
 
     /// Convenience alias: same as `require_www_digest`.
     #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
-    fn require_digest(
+    fn require_digest<'py>(
         &self,
-        target: &Bound<'_, PyAny>,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
         realm: Option<&str>,
         password: Option<&str>,
         ha1: Option<&str>,
-    ) -> PyResult<bool> {
-        self.require_www_digest(target, realm, password, ha1)
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.require_www_digest(python, target, realm, password, ha1)
     }
 
     /// IMS digest authentication via Diameter Cx MAR/MAA.
@@ -885,8 +920,8 @@ impl PyAuth {
     ///
     /// ```python
     /// secret = await cache.fetch("secrets", request.auth_user)
-    /// if not auth.verify_digest(request, realm, password=secret):
-    ///     auth.require_www_digest(request, realm)
+    /// if not auth.verify_digest(python, request, realm, password=secret):
+    ///     auth.require_www_digest(python, request, realm)
     ///     return
     /// ```
     ///
@@ -901,38 +936,43 @@ impl PyAuth {
     /// changes where the secret comes from, never whether a captured
     /// `Authorization` may be replayed.
     #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
-    fn verify_digest(
+    fn verify_digest<'py>(
         &self,
-        target: &Bound<'_, PyAny>,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
         realm: Option<&str>,
         password: Option<&str>,
         ha1: Option<&str>,
-    ) -> PyResult<bool> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
-        let mut guard = AuthTargetGuard::extract(target)?;
-        let realm = realm.unwrap_or(&self.default_realm);
-        let message = guard.as_target().message();
-        let message = message.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-        })?;
+        let supplied = supplied.as_ref().map(SuppliedSecret::to_owned_secret);
+        let realm = realm.unwrap_or(&self.default_realm).to_string();
 
-        let method = match &message.start_line {
-            crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
-            _ => "REGISTER".to_string(),
+        // Read while attached; this method never writes to the target, so
+        // unlike the challenge path there is nothing to re-borrow afterwards.
+        let read = {
+            let mut guard = AuthTargetGuard::extract(target)?;
+            Self::digest_read(&mut guard.as_target())?
         };
 
-        // Look for Authorization or Proxy-Authorization header
-        let auth_header = message
-            .headers
-            .get("Authorization")
-            .or_else(|| message.headers.get("Proxy-Authorization"));
-
-        match auth_header {
-            Some(value) => Ok(self
-                .validate_credentials_with(value, realm, &method, supplied.as_ref())
-                .is_valid()),
-            None => Ok(false),
-        }
+        let auth = self.clone();
+        crate::script::awaitable(python, async move {
+            let Some(value) = read.auth_header.as_deref() else {
+                return Ok(false);
+            };
+            Ok(auth
+                .validate_credentials_with_async(
+                    value,
+                    &realm,
+                    &read.method,
+                    supplied
+                        .as_ref()
+                        .map(OwnedSuppliedSecret::borrowed)
+                        .as_ref(),
+                )
+                .await
+                .is_valid())
+        })
     }
 }
 
@@ -966,7 +1006,7 @@ impl PyAuth {
     /// Challenge a B2BUA A-leg with 407 Proxy-Authenticate (Rust API).
     ///
     /// The `Call` twin of [`challenge_proxy`](Self::challenge_proxy) — the same
-    /// path `auth.require_proxy_digest(call, realm)` takes from
+    /// path `auth.require_proxy_digest(python, call, realm)` takes from
     /// `@b2bua.on_invite`.
     pub fn challenge_proxy_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
         self.require_digest_inner(
@@ -1067,6 +1107,11 @@ impl CredentialCheck {
 /// are opposite signals, and collapsing them made an outage indistinguishable
 /// from an attack.
 impl PyAuth {
+    /// The blocking driver: read, validate, apply.
+    ///
+    /// siphon's own callers reach this from a sync worker they may block. The
+    /// script APIs use the same three pieces with an `await` in the middle, so
+    /// the decision logic is shared and cannot drift.
     fn require_digest_inner(
         &self,
         target: &mut AuthTarget<'_>,
@@ -1075,8 +1120,79 @@ impl PyAuth {
         _header_name: &str,
         supplied: Option<&SuppliedSecret<'_>>,
     ) -> PyResult<bool> {
-        let realm = realm.unwrap_or(&self.default_realm);
+        let realm = realm.unwrap_or(&self.default_realm).to_string();
+        let read = Self::digest_read(target)?;
+        let outcome = match &read.auth_header {
+            Some(value) => self.validate_credentials_with(value, &realm, &read.method, supplied),
+            None => CredentialCheck::Absent,
+        };
+        self.digest_apply(target, &read, outcome, &realm, challenge_code)
+    }
 
+    /// The awaitable driver: the same read / validate / apply as
+    /// [`Self::require_digest_inner`], with the credential lookup awaited
+    /// instead of blocking the caller's thread.
+    ///
+    /// The target is carried as a `Py<PyAny>` rather than a borrow, because a
+    /// `Bound` cannot cross an `await`. It is re-borrowed on the far side, which
+    /// is safe for the same reason the borrow was safe before: nothing else
+    /// holds it while a handler runs.
+    fn require_digest_awaitable<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        realm: Option<&str>,
+        challenge_code: u16,
+        supplied: Option<&SuppliedSecret<'_>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let realm = realm.unwrap_or(&self.default_realm).to_string();
+        let supplied = supplied.map(SuppliedSecret::to_owned_secret);
+
+        // Read while attached: the future cannot touch the Python object.
+        let read = {
+            let mut guard = AuthTargetGuard::extract(target)?;
+            Self::digest_read(&mut guard.as_target())?
+        };
+
+        let auth = self.clone();
+        let handle: Py<PyAny> = target.clone().unbind();
+
+        crate::script::awaitable(python, async move {
+            let outcome = match &read.auth_header {
+                Some(value) => {
+                    auth.validate_credentials_with_async(
+                        value,
+                        &realm,
+                        &read.method,
+                        supplied
+                            .as_ref()
+                            .map(OwnedSuppliedSecret::borrowed)
+                            .as_ref(),
+                    )
+                    .await
+                }
+                None => CredentialCheck::Absent,
+            };
+
+            Python::attach(|python| {
+                let bound = handle.bind(python);
+                let mut guard = AuthTargetGuard::extract(bound)?;
+                auth.digest_apply(
+                    &mut guard.as_target(),
+                    &read,
+                    outcome,
+                    &realm,
+                    challenge_code,
+                )
+            })
+        })
+    }
+
+    /// What the validation needs, read off the target before it runs.
+    ///
+    /// Separate because the awaitable driver must finish reading the Python
+    /// object before it builds its future — a `Bound` cannot cross into one.
+    fn digest_read(target: &mut AuthTarget<'_>) -> PyResult<DigestRead> {
         let message = target.message();
         let message_guard = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -1099,20 +1215,33 @@ impl PyAuth {
 
         drop(message_guard);
 
-        // Four-way, not two-way. A credential-less first leg (the legitimate
-        // opening of challenge-response, or a bare probe), a present-but-invalid
-        // attempt (wrong password or a forged/stale/replayed nonce — the
-        // high-confidence abuse signal) and a credential source that could not
-        // answer all arm the same challenge, but they are worth completely
-        // different things to the auto-ban. The failure arm below is where that
-        // is decided.
-        let outcome = match &auth_header {
-            Some(value) => self.validate_credentials_with(value, realm, &method, supplied),
-            None => CredentialCheck::Absent,
-        };
-        let credentials_present = auth_header.is_some();
+        Ok(DigestRead {
+            auth_header,
+            method,
+        })
+    }
 
-        match auth_header {
+    /// Act on the verdict: strip the hop-by-hop credentials and record the
+    /// identity, or arm the challenge and account for the failure.
+    ///
+    /// Four-way, not two-way. A credential-less first leg (the legitimate
+    /// opening of challenge-response, or a bare probe), a present-but-invalid
+    /// attempt (wrong password or a forged/stale/replayed nonce — the
+    /// high-confidence abuse signal) and a credential source that could not
+    /// answer all arm the same challenge, but they are worth completely
+    /// different things to the auto-ban. The failure arm below is where that
+    /// is decided.
+    fn digest_apply(
+        &self,
+        target: &mut AuthTarget<'_>,
+        read: &DigestRead,
+        outcome: CredentialCheck,
+        realm: &str,
+        challenge_code: u16,
+    ) -> PyResult<bool> {
+        let credentials_present = read.auth_header.is_some();
+
+        match read.auth_header.clone() {
             Some(value) if outcome.is_valid() => {
                 // Extract username from the Authorization header
                 if let Some(username) = extract_username(&value) {
@@ -1398,6 +1527,30 @@ impl PyAuth {
     /// The anti-replay nonce check runs either way: a supplied credential
     /// changes where the secret comes from, never whether the response is
     /// allowed to be a replay.
+    /// [`Self::validate_credentials_with`] with the backend lookup awaited.
+    ///
+    /// Only the two I/O backends differ; static is the same pure computation in
+    /// both, so it is reached through the shared sync path.
+    async fn validate_credentials_with_async(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+        supplied: Option<&SuppliedSecret<'_>>,
+    ) -> CredentialCheck {
+        match self.replay_or_supplied(auth_value, realm, method, supplied) {
+            Some(decided) => decided,
+            None => match self.backend_type {
+                AuthBackendType::Http => self.validate_http_async(auth_value, realm, method).await,
+                AuthBackendType::Database => {
+                    self.validate_database_async(auth_value, realm, method)
+                        .await
+                }
+                _ => self.validate_credentials_with(auth_value, realm, method, supplied),
+            },
+        }
+    }
+
     fn validate_credentials_with(
         &self,
         auth_value: &str,
@@ -1405,24 +1558,8 @@ impl PyAuth {
         method: &str,
         supplied: Option<&SuppliedSecret<'_>>,
     ) -> CredentialCheck {
-        // Anti-replay: reject a stale or forged nonce before any backend lookup
-        // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
-        // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
-        // single-use HSS vectors and never reach here.
-        match extract_nonce_field(auth_value) {
-            Some(nonce) if self.validate_nonce(&nonce) => {}
-            _ => {
-                debug!("auth: rejecting digest with missing/stale/invalid nonce");
-                return CredentialCheck::Rejected;
-            }
-        }
-        // A script-supplied secret short-circuits the backend entirely, so a
-        // deployment that can derive the credential in-process needs no
-        // credential source configured at all.
-        if let Some(secret) = supplied {
-            return CredentialCheck::from_verified(
-                self.validate_supplied(auth_value, realm, method, secret),
-            );
+        if let Some(decided) = self.replay_or_supplied(auth_value, realm, method, supplied) {
+            return decided;
         }
 
         match self.backend_type {
@@ -1442,6 +1579,37 @@ impl PyAuth {
                 CredentialCheck::Unavailable
             }
         }
+    }
+
+    /// The checks that run before any backend is consulted, shared by the
+    /// blocking and awaitable dispatchers. `Some` means the verdict was reached
+    /// without a lookup.
+    fn replay_or_supplied(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+        supplied: Option<&SuppliedSecret<'_>>,
+    ) -> Option<CredentialCheck> {
+        // Anti-replay: reject a stale or forged nonce before any backend lookup
+        // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
+        // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
+        // single-use HSS vectors and never reach here.
+        match extract_nonce_field(auth_value) {
+            Some(nonce) if self.validate_nonce(&nonce) => {}
+            _ => {
+                debug!("auth: rejecting digest with missing/stale/invalid nonce");
+                return Some(CredentialCheck::Rejected);
+            }
+        }
+        // A script-supplied secret short-circuits the backend entirely, so a
+        // deployment that can derive the credential in-process needs no
+        // credential source configured at all.
+        supplied.map(|secret| {
+            CredentialCheck::from_verified(
+                self.validate_supplied(auth_value, realm, method, secret),
+            )
+        })
     }
 
     /// Verify the digest response against a credential the script supplied.
@@ -2353,6 +2521,40 @@ mod tests {
         }
     }
 
+    /// The Python side of [`call_awaitable`]. A const so the source starts at
+    /// column zero — a Rust line continuation would carry the indentation into
+    /// Python and raise `IndentationError`.
+    const HELPER_SOURCE: &str = "import asyncio\ndef call(auth, method, target, realm, password, ha1):\n    async def run():\n        return await getattr(auth, method)(target, realm, password, ha1)\n    return asyncio.run(run())\n";
+
+    /// Call an awaitable auth method the way a handler does — from inside a
+    /// running loop — and return its result.
+    ///
+    /// The method cannot be called at all without one: building the coroutine
+    /// needs `asyncio.get_running_loop()`. So the call itself has to happen in
+    /// Python, inside `asyncio.run`, which is exactly the shape an `async def`
+    /// handler has.
+    fn call_awaitable(
+        python: Python<'_>,
+        auth: &PyAuth,
+        method: &str,
+        target: &Bound<'_, PyAny>,
+        realm: Option<&str>,
+        password: Option<&str>,
+        ha1: Option<&str>,
+    ) -> PyResult<bool> {
+        let helper = pyo3::types::PyModule::from_code(
+            python,
+            &std::ffi::CString::new(HELPER_SOURCE).expect("helper source"),
+            &std::ffi::CString::new("_auth_test_helper.py").expect("file"),
+            &std::ffi::CString::new("_auth_test_helper").expect("module"),
+        )?;
+        let auth_obj = Py::new(python, auth.clone())?;
+        helper
+            .getattr("call")?
+            .call1((auth_obj, method, target, realm, password, ha1))?
+            .extract()
+    }
+
     fn make_auth() -> PyAuth {
         let mut realm_users = HashMap::new();
         realm_users.insert("alice".to_string(), "pass123".to_string());
@@ -2503,14 +2705,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(auth
-                .verify_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    Some("s3cret"),
-                    None
-                )
-                .expect("verify runs"));
+            assert!(call_awaitable(
+                python,
+                &auth,
+                "verify_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                Some("s3cret"),
+                None
+            )
+            .expect("verify_digest runs"));
         });
     }
 
@@ -2522,14 +2726,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(!auth
-                .verify_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    Some("not-the-secret"),
-                    None
-                )
-                .expect("verify runs"));
+            assert!(!call_awaitable(
+                python,
+                &auth,
+                "verify_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                Some("not-the-secret"),
+                None
+            )
+            .expect("verify_digest runs"));
         });
     }
 
@@ -2542,14 +2748,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(auth
-                .verify_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    None,
-                    Some(&stored)
-                )
-                .expect("verify runs"));
+            assert!(call_awaitable(
+                python,
+                &auth,
+                "verify_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                None,
+                Some(&stored)
+            )
+            .expect("verify_digest runs"));
         });
     }
 
@@ -2570,13 +2778,16 @@ mod tests {
             Python::attach(|python| {
                 let object = Py::new(python, request).expect("request into Python");
                 assert!(
-                    auth.verify_digest(
+                    call_awaitable(
+                        python,
+                        &auth,
+                        "verify_digest",
                         object.bind(python).as_any(),
                         Some("example.com"),
                         Some("s3cret"),
                         None
                     )
-                    .expect("verify runs"),
+                    .expect("verify_digest runs"),
                     "password= must verify a {algorithm:?} response",
                 );
             });
@@ -2595,14 +2806,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(!auth
-                .verify_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    None,
-                    Some(&md5_ha1)
-                )
-                .expect("verify runs"));
+            assert!(!call_awaitable(
+                python,
+                &auth,
+                "verify_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                None,
+                Some(&md5_ha1)
+            )
+            .expect("verify_digest runs"));
         });
     }
 
@@ -2616,6 +2829,7 @@ mod tests {
             let object = Py::new(python, request).expect("request into Python");
             let error = auth
                 .verify_digest(
+                    python,
                     object.bind(python).as_any(),
                     Some("example.com"),
                     Some("s3cret"),
@@ -2670,14 +2884,16 @@ mod tests {
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
             assert!(
-                !auth
-                    .verify_digest(
-                        object.bind(python).as_any(),
-                        Some(realm),
-                        Some("s3cret"),
-                        None
-                    )
-                    .expect("verify runs"),
+                !call_awaitable(
+                    python,
+                    &auth,
+                    "verify_digest",
+                    object.bind(python).as_any(),
+                    Some(realm),
+                    Some("s3cret"),
+                    None
+                )
+                .expect("verify_digest runs"),
                 "a cryptographically valid response on a stale nonce is still a replay",
             );
         });
@@ -2691,14 +2907,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(auth
-                .require_www_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    Some("s3cret"),
-                    None
-                )
-                .expect("require runs"));
+            assert!(call_awaitable(
+                python,
+                &auth,
+                "require_www_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                Some("s3cret"),
+                None
+            )
+            .expect("require_www_digest runs"));
 
             let borrowed = object.borrow(python);
             assert_eq!(borrowed.get_auth_user(), Some("carol"));
@@ -2717,14 +2935,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(!auth
-                .require_www_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    Some("wrong-secret"),
-                    None
-                )
-                .expect("require runs"));
+            assert!(!call_awaitable(
+                python,
+                &auth,
+                "require_www_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                Some("wrong-secret"),
+                None
+            )
+            .expect("require_www_digest runs"));
 
             let borrowed = object.borrow(python);
             assert!(borrowed.get_auth_user().is_none());
@@ -2755,14 +2975,16 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let object = Py::new(python, request).expect("request into Python");
-            assert!(!auth
-                .require_www_digest(
-                    object.bind(python).as_any(),
-                    Some("example.com"),
-                    Some("wrong-secret"),
-                    None
-                )
-                .expect("require runs"));
+            assert!(!call_awaitable(
+                python,
+                &auth,
+                "require_www_digest",
+                object.bind(python).as_any(),
+                Some("example.com"),
+                Some("wrong-secret"),
+                None
+            )
+            .expect("require_www_digest runs"));
         });
 
         // `>` rather than `== before + 1`: the counter is process-global and
@@ -3292,37 +3514,61 @@ mod tests {
 
             // A proxy Request still works (unchanged behaviour).
             let request_obj = pyo3::Py::new(python, make_register_request()).unwrap();
-            let challenged = auth
-                .require_www_digest(request_obj.bind(python).as_any(), None, None, None)
-                .unwrap();
+            let challenged = call_awaitable(
+                python,
+                &auth,
+                "require_www_digest",
+                request_obj.bind(python).as_any(),
+                None,
+                None,
+                None,
+            )
+            .expect("require_www_digest runs");
             assert!(!challenged);
 
             // A B2BUA Call is accepted — this is the case that used to raise
             // "'Call' object cannot be converted to 'Request'".
             let call_obj = pyo3::Py::new(python, make_invite_call(None, "INVITE")).unwrap();
-            let challenged = auth
-                .require_proxy_digest(call_obj.bind(python).as_any(), None, None, None)
-                .unwrap();
+            let challenged = call_awaitable(
+                python,
+                &auth,
+                "require_proxy_digest",
+                call_obj.bind(python).as_any(),
+                None,
+                None,
+                None,
+            )
+            .expect("require_proxy_digest runs");
             assert!(!challenged);
-            assert!(auth
-                .verify_digest(call_obj.bind(python).as_any(), None, None, None)
-                .is_ok());
+            // Driven through a running loop, because that is the only way the
+            // awaitable form can be called at all — and it proves the Call was
+            // accepted more strongly than the old `is_ok()` did.
+            call_awaitable(
+                python,
+                &auth,
+                "verify_digest",
+                call_obj.bind(python).as_any(),
+                None,
+                None,
+                None,
+            )
+            .expect("verify_digest accepts a Call");
 
             // Anything else is a clear TypeError naming both accepted types,
             // not a silent pass.
             let bogus = pyo3::types::PyString::new(python, "not a request or call");
             let error = auth
-                .require_proxy_digest(bogus.as_any(), None, None, None)
+                .require_proxy_digest(python, bogus.as_any(), None, None, None)
                 .unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
             assert!(auth
-                .require_www_digest(bogus.as_any(), None, None, None)
+                .require_www_digest(python, bogus.as_any(), None, None, None)
                 .is_err());
             assert!(auth
-                .require_digest(bogus.as_any(), None, None, None)
+                .require_digest(python, bogus.as_any(), None, None, None)
                 .is_err());
             assert!(auth
-                .verify_digest(bogus.as_any(), None, None, None)
+                .verify_digest(python, bogus.as_any(), None, None, None)
                 .is_err());
         });
     }
