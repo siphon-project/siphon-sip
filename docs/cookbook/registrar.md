@@ -43,7 +43,7 @@ from siphon import proxy, registrar, auth, log
 DOMAIN = "example.com"
 
 @proxy.on_request
-def route(request):
+async def route(request):
     # In-dialog requests follow the established route set.
     if request.in_dialog:
         if request.loose_route():
@@ -55,7 +55,7 @@ def route(request):
     # REGISTER: challenge, then store the contact. registrar.save() also sends
     # the 200 OK with the granted Expires.
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return                      # 401 challenge already sent
         request.fix_nated_register()    # rewrite Contact with the observed source
         registrar.save(request)

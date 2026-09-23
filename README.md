@@ -353,7 +353,7 @@ from siphon import proxy, registrar, auth, log
 DOMAIN = "example.com"
 
 @proxy.on_request
-def route(request):
+async def route(request):
     # OPTIONS keepalive
     if request.method == "OPTIONS" and request.ruri.is_local:
         request.reply(200, "OK")
@@ -369,7 +369,7 @@ def route(request):
 
     # REGISTER with digest authentication
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)   # save() sends the 200 OK itself
         return
@@ -428,9 +428,9 @@ registrar.lookup(uri)       # -> list[Contact]
 registrar.is_registered(uri)
 
 # Auth — takes a Request (proxy) or a Call (B2BUA)
-auth.require_www_digest(request, realm)    # 401 challenge (REGISTER)
-auth.require_proxy_digest(request, realm)  # 407 challenge (INVITE)
-auth.require_proxy_digest(call, realm)     # 407 challenge from @b2bua.on_invite
+await auth.require_www_digest(request, realm)    # 401 challenge (REGISTER)
+await auth.require_proxy_digest(request, realm)  # 407 challenge (INVITE)
+await auth.require_proxy_digest(call, realm)     # 407 challenge from @b2bua.on_invite
 
 # Gateway routing
 gateway.select("carriers")                  # weighted round-robin
@@ -481,13 +481,13 @@ A single script can use both `@proxy.on_request` and `@b2bua.on_invite` decorato
 from siphon import proxy, b2bua, registrar, auth, rtpengine, log
 
 @proxy.on_request
-def route(request):
+async def route(request):
     if request.method == "OPTIONS" and request.ruri.is_local:
         request.reply(200, "OK")
         return
 
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm="example.com"):
+        if not await auth.require_digest(request, realm="example.com"):
             return
         registrar.save(request)   # save() sends the 200 OK itself
         return

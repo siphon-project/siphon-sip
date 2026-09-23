@@ -131,12 +131,19 @@ entry, but a working config keeps working.
   coroutine is truthy, so the success branch was taken and logged, and the STR's
   was simply formatted into the log line as if it were a result code.
 
+- **The docs showed twenty calls without the `await` they now need**, across the
+  README, four cookbook pages and three reference pages — including
+  `if not auth.require_www_digest(...)`, which is the shape that silently
+  authenticates. Copied as written, those snippets would have skipped the
+  challenge and relayed the request. The enclosing handlers are now `async def`
+  where the example defines one.
+
   A `scripts/check_awaited_apis.py` gate now walks the AST of every shipped
-  script and fails on an awaitable siphon call that is not awaited, which is the
-  only way to catch this class: nothing but a live node executes these scripts,
-  and a missed `await` reads as working code at every other layer. The gate
-  self-tests against a labelled fixture in CI, so it cannot quietly stop
-  matching.
+  script, and of every python block in the docs, and fails on an awaitable
+  siphon call that is not awaited. That is the only way to catch this class:
+  neither the scripts nor the snippets are executed by any test, and a missed
+  `await` reads as working code at every other layer. The gate self-tests
+  against a labelled fixture in CI, so it cannot quietly stop matching.
 
 - **The registrar's write-through queue is bounded, and `aor_count()` no longer
   waits on it without a deadline.** `registrar.aor_count()` awaited a oneshot

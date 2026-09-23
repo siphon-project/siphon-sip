@@ -269,7 +269,7 @@ startup if `client_ca` is missing). It applies to `listen.tls` **and** `listen.w
 ## 4. Authenticate subscribers (script + config)
 
 ```python
-if not auth.require_digest(request, realm="example.com"):
+if not await auth.require_digest(request, realm="example.com"):
     return                      # 401/407 challenge already sent
 user = request.auth_user        # the authenticated username afterwards
 ```

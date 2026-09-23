@@ -47,7 +47,7 @@ like any value it does not define.
 ```python
 from siphon import diameter, qos
 
-result = diameter.rx_aar(
+result = await diameter.rx_aar(
     framed_ip=request.source_ip,
     media_components=qos.media_flows_from_sdp(
         offer=request.body, answer=reply.body, direction="orig",

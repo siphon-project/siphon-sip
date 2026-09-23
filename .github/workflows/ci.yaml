@@ -90,8 +90,9 @@ jobs:
   # ── Missing-`await` gate ────────────────────────────────────────────────
   # A forgotten `await` on an awaitable script API does not raise: the call
   # returns a truthy coroutine that never runs, so the handler reads as
-  # working. Nothing but a live node executes these scripts, so this is the
-  # only place that catches it. Toolchain-free, same as the size gate.
+  # working. Neither the scripts nor the doc snippets are executed by any
+  # test, so this is the only place that catches it. Toolchain-free, same as
+  # the size gate.
   script-await:
     name: script await
     runs-on: ubuntu-latest
@@ -101,6 +102,7 @@ jobs:
       # gate that silently stops matching is how a check like this fails.
       - run: scripts/check_awaited_apis.py --self-test
       - run: scripts/check_awaited_apis.py
+      - run: scripts/check_awaited_apis.py --docs
 
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev

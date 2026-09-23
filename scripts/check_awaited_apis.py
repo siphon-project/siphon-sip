@@ -17,16 +17,22 @@ them with: grep for `script::awaitable(` / `script::ready(` and map each hit to
 its enclosing `fn` — an awaitable pymethod is exactly one that reaches those,
 plus the few that call `pyo3_async_runtimes::tokio::future_into_py` directly.
 
-Scope is the shipped handler scripts, which is where a missed `await` is
-invisible: nothing executes them but a live node.  `sdk/` is deliberately out of
-scope — the SDK's own tests drive coroutines through `asyncio.run`, so a missed
-`await` there fails in the SDK suite instead of in production.  Note that an
-awaitable mock is a plain `def` returning an inner coroutine, the same shape a
-pymethod has, so `iscoroutinefunction` is the wrong thing to assert on either.
+Two scopes, both unexecuted by any test:
+
+* default — the shipped handler scripts, which only a live node runs.
+* `--docs` — ```python blocks under `docs/` and in the README, which is the
+  bigger source, because an author copies a snippet rather than deriving it.
+
+`sdk/` is deliberately out of scope: the SDK's own tests drive coroutines through
+`asyncio.run`, so a missed `await` there fails in the SDK suite instead of in
+production.  Note that an awaitable mock is a plain `def` returning an inner
+coroutine, the same shape a pymethod has, so `iscoroutinefunction` is the wrong
+thing to assert on in either place.
 """
 
 import ast
 import pathlib
+import re
 import sys
 
 # Awaitable methods reached through a namespace imported from `siphon`.
@@ -133,9 +139,8 @@ def _handle_variables(tree, siphon):
     return handles
 
 
-def check(path):
-    tree = ast.parse(path.read_text(), str(path))
-    siphon = _siphon_names(tree)
+def _scan(tree, siphon, label, line_offset=0):
+    """Findings in one parsed tree, attributed to `label` at `line_offset`."""
     excused = _excused(tree)
     handles = _handle_variables(tree, siphon)
     findings = []
@@ -165,7 +170,38 @@ def check(path):
             what = f"{method}()"
 
         if what:
-            findings.append(f"{path}:{node.lineno}: {what} is awaitable but not awaited")
+            line = node.lineno + line_offset
+            findings.append(f"{label}:{line}: {what} is awaitable but not awaited")
+    return findings
+
+
+def check(path):
+    """Findings in a shipped script, whose siphon names are resolved by import."""
+    tree = ast.parse(path.read_text(), str(path))
+    return _scan(tree, _siphon_names(tree), str(path))
+
+
+# ```python blocks in the docs are the other place this bug spreads from, and the
+# bigger one: an author copies the snippet rather than deriving it.  Blocks are
+# fragments, so the namespaces are assumed bound instead of resolved by import,
+# and a fragment that will not parse standalone is skipped rather than failed.
+DOC_BLOCK = re.compile(r"```py(?:thon)?\n(.*?)```", re.DOTALL)
+ASSUMED_DOC_NAMESPACES = set(NAMESPACE_AWAITABLE) | {"registrar", "cache"}
+
+
+def check_doc(path):
+    """Findings across every parseable python block in one markdown file."""
+    text = path.read_text()
+    findings = []
+    for match in DOC_BLOCK.finditer(text):
+        # Line of the block's first code line: newlines before the fence, plus
+        # one to reach the fence itself and one more to step past it.
+        offset = text[: match.start()].count("\n") + 1
+        try:
+            tree = ast.parse(match.group(1))
+        except SyntaxError:
+            continue
+        findings.extend(_scan(tree, ASSUMED_DOC_NAMESPACES, str(path), offset))
     return findings
 
 
@@ -229,18 +265,28 @@ def self_test():
     return 0
 
 
+SCRIPT_ROOTS = ["scripts", "examples", "sipp"]
+DOC_ROOTS = ["docs", "README.md"]
+
+
 def main(argv):
     if "--self-test" in argv:
         return self_test()
-    roots = [pathlib.Path(p) for p in argv[1:]] or [
-        pathlib.Path("scripts"), pathlib.Path("examples"), pathlib.Path("sipp"),
-    ]
+
+    docs = "--docs" in argv
+    given = [argument for argument in argv[1:] if not argument.startswith("--")]
+    roots = [pathlib.Path(p) for p in given or (DOC_ROOTS if docs else SCRIPT_ROOTS)]
+
     findings, checked = [], 0
     for root in roots:
-        for path in sorted(root.rglob("*.py")):
+        if docs:
+            paths = sorted(root.rglob("*.md")) if root.is_dir() else [root]
+        else:
+            paths = sorted(root.rglob("*.py"))
+        for path in paths:
             checked += 1
             try:
-                findings.extend(check(path))
+                findings.extend(check_doc(path) if docs else check(path))
             except SyntaxError as error:
                 findings.append(f"{path}: could not parse: {error}")
 
