@@ -4,9 +4,30 @@ All notable changes to SIPhon are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Versioning is lockstep across
 the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
+**Versioning policy.** The Python scripting API may break on a **minor**
+release, never on a patch. A release that breaks it says so with a
+`BREAKING` entry here and ships a migration note under `docs/`. The Rust
+library API follows the same rule. Config (`siphon.yaml`) keys are additive
+within a major: a key may gain values or a default may change with a `Changed`
+entry, but a working config keeps working.
+
 ## [Unreleased]
 
 ### Changed
+
+- **BREAKING: `proxy.send_request` no longer sends without `await`.** It always
+  returned a coroutine, but the DNS resolve and the wire send happened *before*
+  that coroutine was handed back, so a script that never awaited it still got
+  the message out. Both now happen inside the coroutine: an un-awaited call
+  sends nothing.
+
+  The resolve is why. Doing it up front blocked the calling thread, which for an
+  `async def` handler is the asyncio driver every coroutine on that loop shares,
+  so one uncached lookup stalled unrelated calls for as long as it took.
+
+  Ordering is unaffected, and needs no queue: `await` is sequencing, so two
+  sends a script issues in order still leave in that order. Every shipped script
+  and example already awaited it.
 
 - **BREAKING: the `presence` and `subscribe_state` send paths are now
   awaitable.** `presence.notify`, `presence.terminate`,

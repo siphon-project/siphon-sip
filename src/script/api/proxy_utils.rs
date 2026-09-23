@@ -3,13 +3,12 @@
 //! These are injected onto the Python `proxy` namespace alongside the
 //! decorator methods defined in `siphon_package.py`.
 
-use std::ffi::CString;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::PyDict;
 
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
@@ -368,88 +367,92 @@ impl PyProxyUtils {
             .get_param("transport")
             .map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
+        let uac = Arc::clone(uac_sender);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
+        let resolve_target = resolve_uri.to_string();
 
-        // Resolver is async, but cheap for numeric IPs (short-circuits).
-        // Doing this synchronously up-front lets the wire send happen before
-        // we hand a coroutine back to Python — scripts that don't `await`
-        // still get the message out.  The only awaitable work is the
-        // optional response wait.
-        let destination = crate::script::detach_block_on(resolver_clone.resolve(
-            &host,
-            port,
-            scheme.as_str(),
-            transport_hint.as_deref(),
-        ));
-
-        let target = destination.into_iter().next().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{resolve_uri}'"
-            ))
-        })?;
-
-        // Determine transport
-        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-            Some(hint) => match hint.to_lowercase().as_str() {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                "ws" => Transport::WebSocket,
-                "wss" => Transport::WebSocketSecure,
-                "sctp" => Transport::Sctp,
-                _ => Transport::Udp,
-            },
-            None => {
-                if scheme == "sips" {
-                    Transport::Tls
-                } else {
-                    Transport::Udp
-                }
-            }
-        };
-
-        // Via sent-by = our advertised host (FQDN-aware) + listen port, so the
-        // peer's response comes back to us rather than the resolved destination.
-        let local_sent_by = format!(
-            "{}:{}",
-            uac_sender.via_host_for(&transport),
-            uac_sender.addr_for(&transport).port(),
-        );
-        let (message, branch) =
-            build_send_request_message(method, uri, transport, &local_sent_by, headers, body)?;
-
-        // Always register a pending entry. For fire-and-forget the entry
-        // exists only so the dispatcher's `UacSender::match_response` silently
-        // consumes the matching response — without it, every legitimate
-        // response logs "response for unknown branch (not ours)".
-        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
-
-        if !wait_for_response {
-            // Fire-and-forget: clean up the pending entry after RFC 3261
-            // §17.1.2.2 Timer F (32 s = 64 × T1) — no peer can sensibly
-            // respond after that, and the slot must self-evict.  On a
-            // matched response, the receiver fires before the timeout and
-            // the entry has already been removed by `match_response`.
-            let uac_for_cleanup = Arc::clone(uac_sender);
-            let branch_for_cleanup = branch;
-            tokio::spawn(async move {
-                if tokio::time::timeout(std::time::Duration::from_secs(32), receiver)
-                    .await
-                    .is_err()
-                {
-                    uac_for_cleanup.expire_branch(&branch_for_cleanup);
-                }
-            });
-            return immediate_none_coroutine(python);
-        }
-
-        // wait_for_response: hand a coroutine back that resolves to the
-        // Reply (or None on timeout).  The caller is necessarily inside an
-        // async context — `await proxy.send_request(..., wait_for_response=True)`
-        // — so `future_into_py` finds a running event loop.
+        // Everything the message needs from Python, read here because a
+        // `Bound` cannot cross into a future. The build itself waits until
+        // after the resolve: the Via sent-by depends on the transport the
+        // resolve picks.
+        let inputs = SendRequestInputs::extract(method, headers, body)?;
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+
+        // The resolve used to run before the coroutine was handed back, so a
+        // script that never awaited still got the message out. That cost a
+        // blocked calling thread, which for an `async def` handler is the
+        // asyncio driver every coroutine on that loop shares.
+        //
+        // It lives in the coroutine now, and the no-`await` affordance goes
+        // with it: this API is awaited, full stop. Ordering comes for free from
+        // that — `await` *is* sequencing, so two sends a script issues in order
+        // still leave in order, with no queue and no special case.
+        crate::script::awaitable(python, async move {
+            let destination = resolver_clone
+                .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
+                .await;
+            let Some(target) = destination.into_iter().next() else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "cannot resolve destination for '{resolve_target}'"
+                )));
+            };
+
+            let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
+                Some(hint) => match hint.to_lowercase().as_str() {
+                    "tcp" => Transport::Tcp,
+                    "tls" => Transport::Tls,
+                    "ws" => Transport::WebSocket,
+                    "wss" => Transport::WebSocketSecure,
+                    "sctp" => Transport::Sctp,
+                    _ => Transport::Udp,
+                },
+                None => {
+                    if scheme == "sips" {
+                        Transport::Tls
+                    } else {
+                        Transport::Udp
+                    }
+                }
+            };
+
+            // Via sent-by = our advertised host (FQDN-aware) + listen port, so
+            // the peer's response comes back to us rather than the resolved
+            // destination.
+            let local_sent_by = format!(
+                "{}:{}",
+                uac.via_host_for(&transport),
+                uac.addr_for(&transport).port(),
+            );
+            let (message, branch) = inputs
+                .build(uri, transport, &local_sent_by)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+            // Always register a pending entry. For fire-and-forget the entry
+            // exists only so the dispatcher's `UacSender::match_response`
+            // silently consumes the matching response — without it, every
+            // legitimate response logs "response for unknown branch (not ours)".
+            let receiver = uac.send_request_with_response(message, target.address, transport);
+
+            if !wait_for_response {
+                // Clean up the pending entry after RFC 3261 §17.1.2.2 Timer F
+                // (32 s = 64 × T1) — no peer can sensibly respond after that,
+                // and the slot must self-evict. On a matched response the
+                // receiver fires first and `match_response` has already removed
+                // it.
+                let uac_for_cleanup = Arc::clone(&uac);
+                tokio::spawn(async move {
+                    if tokio::time::timeout(std::time::Duration::from_secs(32), receiver)
+                        .await
+                        .is_err()
+                    {
+                        uac_for_cleanup.expire_branch(&branch);
+                    }
+                });
+                return Ok(None);
+            }
+
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(Ok(crate::uac::UacResult::Response(message))) => Python::attach(|py| {
                     let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
@@ -600,6 +603,202 @@ fn ensure_from_tag(raw: &str) -> String {
 /// Pulled out as a free function so it can be unit-tested without a UAC
 /// sender / DNS resolver — the bug that motivated the extraction was the
 /// body argument silently dropping on REGISTER 3PR (TS 24.229 §5.4.1.7).
+/// Everything `send_request` needs from Python, as owned Rust values.
+///
+/// Split from the build because a `Bound<PyDict>` cannot cross into a future
+/// and the build has to happen after the DNS resolve — the Via sent-by depends
+/// on the transport the resolve chooses. Extracted on the calling thread,
+/// built on tokio.
+struct SendRequestInputs {
+    sip_method: Method,
+    user_call_id: Option<String>,
+    user_cseq: Option<String>,
+    user_max_forwards: Option<String>,
+    user_via: Option<String>,
+    user_from: Option<String>,
+    other_headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+}
+
+impl SendRequestInputs {
+    fn extract(
+        method: &str,
+        headers: Option<&Bound<'_, PyDict>>,
+        body: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let sip_method = Method::from_str(method);
+
+        // Pre-extract user headers so that single-value auto-set headers
+        // (Call-ID, CSeq, Max-Forwards, Via — RFC 3261 §7.3.1) get *replaced*
+        // when the script supplies them, not duplicated.  Without this split,
+        // builder.header() appends every user value on top of our auto-set
+        // one and the resulting message has two Call-IDs / CSeqs / etc.;
+        // strict UAS implementations pick the first (auto-generated) header
+        // and discard the script-intended value.  Same root cause as the
+        // set_reply_header dual-To bug fixed in b1b2d55.
+        let mut user_call_id: Option<String> = None;
+        let mut user_cseq: Option<String> = None;
+        let mut user_max_forwards: Option<String> = None;
+        let mut user_via: Option<String> = None;
+        let mut user_from: Option<String> = None;
+        let mut other_headers: Vec<(String, String)> = Vec::new();
+
+        if let Some(header_dict) = headers {
+            for (key, value) in header_dict.iter() {
+                let name: String = key.extract().map_err(|error| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "header name must be str: {error}"
+                    ))
+                })?;
+                let val: String = value.extract().map_err(|error| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "header value must be str: {error}"
+                    ))
+                })?;
+                // Case-insensitive match — RFC 3261 §7.3 makes header names
+                // case-insensitive, and Call-ID has the compact form "i".
+                if name.eq_ignore_ascii_case("Call-ID") || name.eq_ignore_ascii_case("i") {
+                    user_call_id = Some(val);
+                } else if name.eq_ignore_ascii_case("CSeq") {
+                    user_cseq = Some(val);
+                } else if name.eq_ignore_ascii_case("Max-Forwards") {
+                    user_max_forwards = Some(val);
+                } else if name.eq_ignore_ascii_case("Via") || name.eq_ignore_ascii_case("v") {
+                    user_via = Some(val);
+                } else if name.eq_ignore_ascii_case("From") || name.eq_ignore_ascii_case("f") {
+                    // From is single-value (RFC 3261 §7.3.1) and its `tag` is
+                    // mandatory on every request (§8.1.1.3).  Pull it out here
+                    // so we can guarantee the tag below — leaving it in
+                    // other_headers would both risk a duplicate From and skip
+                    // the tag fixup entirely.
+                    user_from = Some(val);
+                } else {
+                    other_headers.push((name, val));
+                }
+            }
+        }
+
+        let body = match body {
+            Some(body_obj) => Some(super::request::extract_body_bytes(body_obj)?),
+            None => None,
+        };
+
+        Ok(Self {
+            sip_method,
+            user_call_id,
+            user_cseq,
+            user_max_forwards,
+            user_via,
+            user_from,
+            other_headers,
+            body,
+        })
+    }
+
+    /// Build the message once the resolve has chosen a transport.
+    fn build(
+        self,
+        uri: SipUri,
+        transport: Transport,
+        local_sent_by: &str,
+    ) -> Result<(SipMessage, String), String> {
+        let Self {
+            sip_method,
+            user_call_id,
+            user_cseq,
+            user_max_forwards,
+            user_via,
+            user_from,
+            other_headers,
+            body,
+        } = self;
+
+        // Branch returned to the caller so it can register / expire the
+        // pending UAC entry.  When the script supplies its own Via, prefer
+        // the branch parsed from that value so response correlation still
+        // works — falling back to a fresh UAC-shaped branch if the parse
+        // fails or the supplied Via has no branch param.
+        let auto_branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
+        let via_value = match user_via {
+            Some(via_str) => via_str,
+            // Auto Via sent-by is *our* advertised host:port (FQDN-aware, RFC 3261
+            // §20.42) so the peer routes the response back to us — not the
+            // destination address, which was a latent bug.
+            None => format!(
+                "SIP/2.0/{} {};branch={}",
+                transport, local_sent_by, auto_branch
+            ),
+        };
+        let branch = crate::sip::headers::via::Via::parse(&via_value)
+            .ok()
+            .and_then(|v| v.branch)
+            .unwrap_or_else(|| auto_branch.clone());
+
+        let call_id = user_call_id.unwrap_or_else(|| format!("py-{}", uuid::Uuid::new_v4()));
+        let cseq_str = user_cseq.unwrap_or_else(|| format!("1 {}", sip_method.as_str()));
+
+        // From tag is mandatory on *every* request (RFC 3261 §8.1.1.3) — it is
+        // half of the transaction/dialog identity, not a dialog-only nicety, and
+        // even a dialog-less MESSAGE (RFC 3428) must carry it.  A strict UAS is
+        // entitled to answer 400 Bad Request on a tagless From, and real VoLTE
+        // handsets do.  Guarantee one here the same way Call-ID/CSeq/Via are
+        // auto-provided: keep a script-pinned tag untouched, append a generated
+        // one when it is missing, and synthesize a whole From (from our advertised
+        // identity) when the script supplied none at all.
+        let from_value = match user_from {
+            Some(raw) => ensure_from_tag(&raw),
+            None => format!("<sip:{local_sent_by}>;tag={}", uuid::Uuid::new_v4()),
+        };
+
+        let mut builder = SipMessageBuilder::new()
+            .request(sip_method, uri)
+            .via(via_value)
+            .from(from_value)
+            .call_id(call_id)
+            .cseq(cseq_str);
+
+        // Max-Forwards is u8 in the builder; if the script supplied a
+        // non-numeric value, fall through to the default rather than
+        // erroring — header() preserves the raw string for parsers that
+        // accept extension forms.
+        builder = match user_max_forwards
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<u8>().ok())
+        {
+            Some(max) => builder.max_forwards(max),
+            None => match user_max_forwards {
+                Some(raw) => builder.set_header("Max-Forwards", raw),
+                None => builder.max_forwards(70),
+            },
+        };
+
+        for (name, val) in other_headers {
+            builder = builder.header(&name, val);
+        }
+
+        // Set body if provided — accept str or bytes.  body_str() / body() each
+        // refresh Content-Length so any caller-provided value is corrected.
+        if let Some(bytes) = body {
+            builder = builder.body(bytes);
+        } else {
+            builder = builder.content_length(0);
+        }
+
+        let message = builder
+            .build()
+            .map_err(|error| format!("failed to build SIP message: {error}"))?;
+        Ok((message, branch))
+    }
+}
+
+/// The pre-split call shape, kept for the tests below.
+///
+/// They assert on the built message, not on where the extraction stops, so they
+/// read better calling one function. Production goes through
+/// [`SendRequestInputs::extract`] and [`SendRequestInputs::build`] separately
+/// because the two halves run on different threads.
+#[cfg(test)]
 fn build_send_request_message(
     method: &str,
     uri: SipUri,
@@ -608,160 +807,9 @@ fn build_send_request_message(
     headers: Option<&Bound<'_, PyDict>>,
     body: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<(SipMessage, String)> {
-    let sip_method = Method::from_str(method);
-
-    // Pre-extract user headers so that single-value auto-set headers
-    // (Call-ID, CSeq, Max-Forwards, Via — RFC 3261 §7.3.1) get *replaced*
-    // when the script supplies them, not duplicated.  Without this split,
-    // builder.header() appends every user value on top of our auto-set
-    // one and the resulting message has two Call-IDs / CSeqs / etc.;
-    // strict UAS implementations pick the first (auto-generated) header
-    // and discard the script-intended value.  Same root cause as the
-    // set_reply_header dual-To bug fixed in b1b2d55.
-    let mut user_call_id: Option<String> = None;
-    let mut user_cseq: Option<String> = None;
-    let mut user_max_forwards: Option<String> = None;
-    let mut user_via: Option<String> = None;
-    let mut user_from: Option<String> = None;
-    let mut other_headers: Vec<(String, String)> = Vec::new();
-
-    if let Some(header_dict) = headers {
-        for (key, value) in header_dict.iter() {
-            let name: String = key.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!("header name must be str: {error}"))
-            })?;
-            let val: String = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!("header value must be str: {error}"))
-            })?;
-            // Case-insensitive match — RFC 3261 §7.3 makes header names
-            // case-insensitive, and Call-ID has the compact form "i".
-            if name.eq_ignore_ascii_case("Call-ID") || name.eq_ignore_ascii_case("i") {
-                user_call_id = Some(val);
-            } else if name.eq_ignore_ascii_case("CSeq") {
-                user_cseq = Some(val);
-            } else if name.eq_ignore_ascii_case("Max-Forwards") {
-                user_max_forwards = Some(val);
-            } else if name.eq_ignore_ascii_case("Via") || name.eq_ignore_ascii_case("v") {
-                user_via = Some(val);
-            } else if name.eq_ignore_ascii_case("From") || name.eq_ignore_ascii_case("f") {
-                // From is single-value (RFC 3261 §7.3.1) and its `tag` is
-                // mandatory on every request (§8.1.1.3).  Pull it out here
-                // so we can guarantee the tag below — leaving it in
-                // other_headers would both risk a duplicate From and skip
-                // the tag fixup entirely.
-                user_from = Some(val);
-            } else {
-                other_headers.push((name, val));
-            }
-        }
-    }
-
-    // Branch returned to the caller so it can register / expire the
-    // pending UAC entry.  When the script supplies its own Via, prefer
-    // the branch parsed from that value so response correlation still
-    // works — falling back to a fresh UAC-shaped branch if the parse
-    // fails or the supplied Via has no branch param.
-    let auto_branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
-    let via_value = match user_via {
-        Some(via_str) => via_str,
-        // Auto Via sent-by is *our* advertised host:port (FQDN-aware, RFC 3261
-        // §20.42) so the peer routes the response back to us — not the
-        // destination address, which was a latent bug.
-        None => format!(
-            "SIP/2.0/{} {};branch={}",
-            transport, local_sent_by, auto_branch
-        ),
-    };
-    let branch = crate::sip::headers::via::Via::parse(&via_value)
-        .ok()
-        .and_then(|v| v.branch)
-        .unwrap_or_else(|| auto_branch.clone());
-
-    let call_id = user_call_id.unwrap_or_else(|| format!("py-{}", uuid::Uuid::new_v4()));
-    let cseq_str = user_cseq.unwrap_or_else(|| format!("1 {}", sip_method.as_str()));
-
-    // From tag is mandatory on *every* request (RFC 3261 §8.1.1.3) — it is
-    // half of the transaction/dialog identity, not a dialog-only nicety, and
-    // even a dialog-less MESSAGE (RFC 3428) must carry it.  A strict UAS is
-    // entitled to answer 400 Bad Request on a tagless From, and real VoLTE
-    // handsets do.  Guarantee one here the same way Call-ID/CSeq/Via are
-    // auto-provided: keep a script-pinned tag untouched, append a generated
-    // one when it is missing, and synthesize a whole From (from our advertised
-    // identity) when the script supplied none at all.
-    let from_value = match user_from {
-        Some(raw) => ensure_from_tag(&raw),
-        None => format!("<sip:{local_sent_by}>;tag={}", uuid::Uuid::new_v4()),
-    };
-
-    let mut builder = SipMessageBuilder::new()
-        .request(sip_method, uri)
-        .via(via_value)
-        .from(from_value)
-        .call_id(call_id)
-        .cseq(cseq_str);
-
-    // Max-Forwards is u8 in the builder; if the script supplied a
-    // non-numeric value, fall through to the default rather than
-    // erroring — header() preserves the raw string for parsers that
-    // accept extension forms.
-    builder = match user_max_forwards
-        .as_deref()
-        .map(str::trim)
-        .and_then(|s| s.parse::<u8>().ok())
-    {
-        Some(max) => builder.max_forwards(max),
-        None => match user_max_forwards {
-            Some(raw) => builder.set_header("Max-Forwards", raw),
-            None => builder.max_forwards(70),
-        },
-    };
-
-    for (name, val) in other_headers {
-        builder = builder.header(&name, val);
-    }
-
-    // Set body if provided — accept str or bytes.  body_str() / body() each
-    // refresh Content-Length so any caller-provided value is corrected.
-    if let Some(body_obj) = body {
-        let bytes = super::request::extract_body_bytes(body_obj)?;
-        builder = builder.body(bytes);
-    } else {
-        builder = builder.content_length(0);
-    }
-
-    let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SIP message: {error}"))
-    })?;
-    Ok((message, branch))
-}
-
-/// Return a Python coroutine that resolves to ``None`` immediately.
-///
-/// Used by ``proxy.send_request(wait_for_response=False)`` so the function
-/// always hands back an awaitable, even when no event loop is "running"
-/// at the call site (e.g. when invoked from a sync handler context).
-/// `future_into_py` requires a running asyncio loop at construction time;
-/// a plain Python ``async def`` coroutine does not, so this works in any
-/// caller context — including unit tests with no asyncio loop.
-fn immediate_none_coroutine<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-    static HELPER: OnceLock<Py<PyAny>> = OnceLock::new();
-    if let Some(handle) = HELPER.get() {
-        return handle.bind(py).call0();
-    }
-
-    let source = CString::new("async def _none():\n    return None\n").map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("helper source CString: {error}"))
-    })?;
-    let file_name = CString::new("_proxy_send_request_helper.py").map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("helper file CString: {error}"))
-    })?;
-    let module_name = CString::new("_proxy_send_request_helper").map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("helper module CString: {error}"))
-    })?;
-    let module = PyModule::from_code(py, &source, &file_name, &module_name)?;
-    let func = module.getattr("_none")?;
-    let _ = HELPER.set(func.clone().unbind());
-    func.call0()
+    SendRequestInputs::extract(method, headers, body)?
+        .build(uri, transport, local_sent_by)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 /// Perform ENUM NAPTR lookup for a phone number.
@@ -1560,6 +1608,30 @@ mod tests {
         });
     }
 
+    /// Call `proxy.send_request` from inside a running loop, the way a
+    /// handler does, and drive it to completion.
+    fn run_send_request<'py>(
+        python: Python<'py>,
+        proxy: &Bound<'py, PyAny>,
+        method: &str,
+        ruri: &str,
+        kwargs: &Bound<'py, PyDict>,
+    ) -> PyResult<()> {
+        let helper = pyo3::types::PyModule::from_code(
+            python,
+            &std::ffi::CString::new(SEND_HELPER).expect("helper source"),
+            &std::ffi::CString::new("_send_request_test_helper.py").expect("file"),
+            &std::ffi::CString::new("_send_request_test_helper").expect("module"),
+        )?;
+        helper
+            .getattr("call")?
+            .call1((proxy, method, ruri, kwargs))
+            .map(|_| ())
+    }
+
+    /// Column-zero source: a Rust line continuation would indent the Python.
+    const SEND_HELPER: &str = "import asyncio\ndef call(proxy, method, ruri, kwargs):\n    async def run():\n        return await proxy.send_request(method, ruri, **kwargs)\n    return asyncio.run(run())\n";
+
     /// End-to-end PyO3 dispatch test: call `proxy_utils.send_request(...)`
     /// from Python with `body=` and `headers=` kwargs, then read the wire
     /// bytes off a flume channel.  This is what `build_send_request_message`
@@ -1576,11 +1648,11 @@ mod tests {
     /// 4. Fire-and-forget registers a pending UAC entry (so dispatcher
     ///    silently consumes the response — no "unknown branch" log) and
     ///    `match_response` removes it on the matching reply.
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_request_python_kwargs_preserve_body_and_content_type() {
         use crate::transport::OutboundRouter;
         use crate::uac::UacSender;
-        use pyo3::types::PyTuple;
         use std::collections::HashMap;
 
         pyo3::Python::initialize();
@@ -1694,14 +1766,8 @@ mod tests {
             kwargs.set_item("body", body_1).unwrap();
 
             // Numeric IP — the resolver short-circuits without DNS.
-            let args = PyTuple::new(py, ["REGISTER", "sip:127.0.0.1:5060"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "REGISTER", "sip:127.0.0.1:5060", &kwargs)
                 .expect("scenario 1: kwarg dispatch");
-            // send_request returns an awaitable; the wire send already
-            // happened synchronously.  Close the coroutine to suppress
-            // Python's "coroutine was never awaited" warning.
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1739,11 +1805,8 @@ mod tests {
                 .set_item("body", pyo3::types::PyBytes::new(py, body_2))
                 .unwrap();
 
-            let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "MESSAGE", "sip:127.0.0.1:5060", &kwargs)
                 .expect("scenario 2: bytes-body dispatch");
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1776,11 +1839,8 @@ mod tests {
             kwargs.set_item("headers", headers).unwrap();
             kwargs.set_item("body", body_3).unwrap();
 
-            let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "MESSAGE", "sip:127.0.0.1:5060", &kwargs)
                 .expect("scenario 3: stale-CL dispatch");
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1814,11 +1874,8 @@ mod tests {
         Python::attach(|py| {
             let bound = utils_py.bind(py);
             let kwargs = PyDict::new(py);
-            let args = PyTuple::new(py, ["OPTIONS", "sip:127.0.0.1:5060"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "OPTIONS", "sip:127.0.0.1:5060", &kwargs)
                 .expect("scenario 4: fire-and-forget dispatch");
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1892,11 +1949,8 @@ mod tests {
             kwargs.set_item("headers", headers).unwrap();
 
             // R-URI is host-B; Route is host-A.
-            let args = PyTuple::new(py, ["SUBSCRIBE", "sip:127.0.0.9:5099"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "SUBSCRIBE", "sip:127.0.0.9:5099", &kwargs)
                 .expect("scenario 5: route-driven dispatch");
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1935,11 +1989,8 @@ mod tests {
             kwargs.set_item("headers", headers).unwrap();
             kwargs.set_item("next_hop", "sip:127.0.0.7:5077").unwrap();
 
-            let args = PyTuple::new(py, ["SUBSCRIBE", "sip:127.0.0.9:5099"]).unwrap();
-            let coroutine = bound
-                .call_method("send_request", args, Some(&kwargs))
+            run_send_request(py, bound, "SUBSCRIBE", "sip:127.0.0.9:5099", &kwargs)
                 .expect("scenario 6: next_hop-override dispatch");
-            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
