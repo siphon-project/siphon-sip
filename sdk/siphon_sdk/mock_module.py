@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 from types import ModuleType
-from typing import Any, Callable, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
 from siphon_sdk.types import Contact, SipUri
 from siphon_sdk.request import _parse_uri
@@ -6125,7 +6125,7 @@ class MockDiameter:
 
     # -- Cx: HSS integration (I-CSCF / S-CSCF) --
 
-    def cx_uar(self, public_identity: str,
+    async def cx_uar(self, public_identity: str,
                visited_network_id: Optional[str] = None,
                user_auth_type: Optional[int] = None) -> Optional[dict]:
         """Send a User-Authorization-Request to discover S-CSCF assignment.
@@ -6146,7 +6146,7 @@ class MockDiameter:
             return {"result_code": 2001, "server_name": self._default_server_name}
         return None
 
-    def cx_sar(self, public_identity: str,
+    async def cx_sar(self, public_identity: str,
                server_name: Optional[str] = None,
                assignment_type: int = 1) -> Optional[dict]:
         """Send a Server-Assignment-Request after REGISTER auth.
@@ -6163,7 +6163,7 @@ class MockDiameter:
             return dict(self._sar_responses[public_identity])
         return {"result_code": 2001, "user_data": None}
 
-    def cx_lir(self, public_identity: str) -> Optional[dict]:
+    async def cx_lir(self, public_identity: str) -> Optional[dict]:
         """Send a Location-Info-Request to find the serving S-CSCF.
 
         Args:
@@ -6229,7 +6229,7 @@ class MockDiameter:
                media_components: Optional[list] = None,
                af_application_id: str = "IMS Services",
                subscription_id: Optional[tuple] = None,
-               specific_actions: Optional[list[int]] = None) -> Optional[dict]:
+               specific_actions: Optional[list[int]] = None) -> Awaitable[Optional[dict]]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Without ``session_id`` the AAR is sent as Rx-Request-Type
@@ -6300,14 +6300,24 @@ class MockDiameter:
                 specific_actions=[2, 4, 9],
             )
         """
+        # Validated here rather than inside the coroutine, because siphon
+        # validates here too: the media components and specific actions are
+        # Python objects, which cannot cross into the future it returns, so a
+        # bad value raises at the call and not on ``await``. A plain
+        # ``async def`` would defer it and let a test pass against a shape
+        # production rejects earlier.
         if specific_actions is not None:
             self._check_specific_actions(specific_actions)
         sid = session_id or f"mock-rx-{len(self._aar_responses) + 1}"
-        if sid in self._aar_responses:
-            return dict(self._aar_responses[sid])
-        return {"result_code": self._default_rx_result_code, "session_id": sid}
 
-    def rx_str(self, session_id: str) -> Optional[int]:
+        async def _send() -> Optional[dict]:
+            if sid in self._aar_responses:
+                return dict(self._aar_responses[sid])
+            return {"result_code": self._default_rx_result_code, "session_id": sid}
+
+        return _send()
+
+    async def rx_str(self, session_id: str) -> Optional[int]:
         """Send an Rx Session-Termination-Request.
 
         Args:
@@ -6320,7 +6330,7 @@ class MockDiameter:
 
     # -- Sh: HSS integration (Application Server role) --
 
-    def sh_udr(self, public_identity: str,
+    async def sh_udr(self, public_identity: str,
                data_reference: Union[int, list[int]],
                service_indication: Optional[str] = None) -> Optional[dict]:
         """Send a Sh User-Data-Request to fetch user profile data from the HSS.
@@ -6337,7 +6347,7 @@ class MockDiameter:
             return dict(self._udr_responses[public_identity])
         return {"result_code": self._default_sh_result_code, "user_data": None}
 
-    def sh_pur(self, public_identity: str,
+    async def sh_pur(self, public_identity: str,
                data_reference: int,
                xml: str,
                service_indication: Optional[str] = None) -> Optional[dict]:
@@ -6357,7 +6367,7 @@ class MockDiameter:
             return dict(self._pur_responses[public_identity])
         return {"result_code": self._default_sh_result_code}
 
-    def sh_snr(self, public_identity: str,
+    async def sh_snr(self, public_identity: str,
                data_reference: Union[int, list[int]],
                subs_req_type: int,
                service_indication: Optional[str] = None) -> Optional[dict]:
@@ -6456,7 +6466,7 @@ class MockDiameter:
 
     # -- Rf: CDF integration (offline charging — TS 32.299) --
 
-    def rf_acr_start(
+    async def rf_acr_start(
         self,
         *,
         calling_party: Optional[str] = None,
@@ -6508,7 +6518,7 @@ class MockDiameter:
             peer=peer,
         )
 
-    def rf_acr_interim(
+    async def rf_acr_interim(
         self,
         session_id: str,
         record_number: int,
@@ -6562,7 +6572,7 @@ class MockDiameter:
             peer=peer,
         )
 
-    def rf_acr_stop(
+    async def rf_acr_stop(
         self,
         session_id: str,
         record_number: int,
@@ -6618,7 +6628,7 @@ class MockDiameter:
             peer=peer,
         )
 
-    def rf_acr_event(
+    async def rf_acr_event(
         self,
         *,
         calling_party: Optional[str] = None,
@@ -7054,7 +7064,7 @@ class MockDiameter:
 
     # -- S6a (TS 29.272) — MME ↔ HSS for LTE attach/auth --
 
-    def s6a_air(self, imsi: str, visited_plmn_id: bytes, num_vectors: int = 1,
+    async def s6a_air(self, imsi: str, visited_plmn_id: bytes, num_vectors: int = 1,
                 immediate_response_preferred: bool = True,
                 resync_info: Optional[bytes] = None,
                 peer: Optional[str] = None) -> Optional[dict]:
@@ -7079,7 +7089,7 @@ class MockDiameter:
                           vectors: Optional[list] = None) -> None:
         self._air_response = {"result_code": result_code, "vectors": vectors or []}
 
-    def s6a_ulr(self, imsi: str, visited_plmn_id: bytes, rat_type: int = 1004,
+    async def s6a_ulr(self, imsi: str, visited_plmn_id: bytes, rat_type: int = 1004,
                 ulr_flags: int = 0, peer: Optional[str] = None) -> Optional[dict]:
         """Mock Update-Location. Returns a 2001 with subscription data present."""
         return getattr(self, "_ulr_response", None) or {
@@ -7097,14 +7107,14 @@ class MockDiameter:
             "has_subscription_data": has_subscription_data,
         }
 
-    def s6a_purge_ue(self, imsi: str, pur_flags: Optional[int] = None,
+    async def s6a_purge_ue(self, imsi: str, pur_flags: Optional[int] = None,
                      peer: Optional[str] = None) -> Optional[dict]:
         """Mock Purge-UE. Returns a 2001."""
         return {"result_code": 2001}
 
     # -- S6c (TS 29.336) --
 
-    def s6c_srr(self, msisdn: str, sc_address: str,
+    async def s6c_srr(self, msisdn: str, sc_address: str,
                 sm_rp_mti: Optional[int] = None) -> Optional[dict]:
         """Mock Send-Routing-Info-for-SM. Configure responses via
         :meth:`set_srr_response`; default is a successful answer with
@@ -7136,7 +7146,7 @@ class MockDiameter:
             "mme_number_for_mt_sms": mme_number_for_mt_sms,
         }
 
-    def s6c_rsr(self, user_name: str, sc_address: str,
+    async def s6c_rsr(self, user_name: str, sc_address: str,
                 delivery_outcome: int) -> Optional[dict]:
         """Mock Report-SM-Delivery-Status. Records the call on
         ``self.rsrs`` for assertions and returns a 2001."""
@@ -7155,7 +7165,7 @@ class MockDiameter:
 
     # -- SGd (TS 29.338) --
 
-    def sgd_tfr(self, user_name: str, sc_address: str, sm_rp_ui: bytes,
+    async def sgd_tfr(self, user_name: str, sc_address: str, sm_rp_ui: bytes,
                 smsmi_correlation_id: Optional[str] = None,
                 sm_rp_mti: Optional[int] = None) -> Optional[dict]:
         """Mock MT-Forward-Short-Message. Records the TPDU on ``self.tfrs``
@@ -7194,7 +7204,7 @@ class MockDiameter:
     # -- Generic spec-name API (matches Rust `diameter.send_request` /
     # `@diameter.on_command`) --
 
-    def send_request(self, command: str, application: str,
+    async def send_request(self, command: str, application: str,
                      peer: Optional[str] = None,
                      timeout_ms: int = 10_000,
                      **avps: Any) -> Optional[dict]:

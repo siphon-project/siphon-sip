@@ -42,7 +42,7 @@ UAT_DE_REGISTRATION = 1
 UAT_REGISTRATION_AND_CAPABILITIES = 2
 
 
-def find_scscf_for_register(request, user_auth_type=None):
+async def find_scscf_for_register(request, user_auth_type=None):
     """Discover the S-CSCF for a REGISTER via Diameter Cx UAR.
 
     Sends a User-Authorization-Request to the HSS, which returns the
@@ -58,7 +58,7 @@ def find_scscf_for_register(request, user_auth_type=None):
     """
     if diameter.peer_count() > 0:
         visited = request.get_header("P-Visited-Network-ID") or REALM
-        result = diameter.cx_uar(str(request.from_uri), visited,
+        result = await diameter.cx_uar(str(request.from_uri), visited,
                                  user_auth_type=user_auth_type)
         if result and result.get("server_name"):
             log.info(f"UAR -> S-CSCF: {result['server_name']}")
@@ -72,7 +72,7 @@ def find_scscf_for_register(request, user_auth_type=None):
     return None
 
 
-def find_scscf_for_request(request):
+async def find_scscf_for_request(request):
     """Discover the serving S-CSCF via Diameter Cx LIR.
 
     Sends a Location-Info-Request to the HSS for the target user.
@@ -81,7 +81,7 @@ def find_scscf_for_request(request):
     Falls back to SCSCF_FALLBACK when no Diameter peer is connected.
     """
     if diameter.peer_count() > 0:
-        result = diameter.cx_lir(str(request.ruri))
+        result = await diameter.cx_lir(str(request.ruri))
         if result and result.get("server_name"):
             log.info(f"LIR -> S-CSCF: {result['server_name']}")
             return result["server_name"]
@@ -95,10 +95,10 @@ def find_scscf_for_request(request):
 
 
 @proxy.on_request("REGISTER")
-def handle_register(request):
+async def handle_register(request):
     log.info(f"I-CSCF REGISTER from {request.from_uri}")
 
-    scscf = find_scscf_for_register(request)
+    scscf = await find_scscf_for_register(request)
     if not scscf:
         log.error(f"no S-CSCF found for {request.from_uri}")
         request.reply(500, "No S-CSCF Available")
@@ -110,7 +110,7 @@ def handle_register(request):
 
 
 @proxy.on_failure
-def register_failure(request, reply):
+async def register_failure(request, reply):
     """S-CSCF failover: re-query HSS with REGISTRATION_AND_CAPABILITIES."""
     if request.method != "REGISTER":
         reply.relay()
@@ -123,7 +123,7 @@ def register_failure(request, reply):
     first_scscf = request.get_header("X-I-CSCF-First-SCSCF")
     log.warn(f"S-CSCF {first_scscf} failed ({reply.status_code}), trying capabilities query")
 
-    next_scscf = find_scscf_for_register(
+    next_scscf = await find_scscf_for_register(
         request, user_auth_type=UAT_REGISTRATION_AND_CAPABILITIES)
 
     if next_scscf and next_scscf != first_scscf:
@@ -145,7 +145,7 @@ def handle_options(request):
 
 
 @proxy.on_request
-def handle_request(request):
+async def handle_request(request):
     if request.method in ("REGISTER", "OPTIONS"):
         return  # handled above
 
@@ -161,7 +161,7 @@ def handle_request(request):
         return
 
     # Initial request — find the serving S-CSCF via Cx LIR.
-    scscf = find_scscf_for_request(request)
+    scscf = await find_scscf_for_request(request)
     if not scscf:
         log.error(f"no S-CSCF found for {request.ruri}")
         request.reply(404, "User Not Found")

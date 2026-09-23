@@ -1,7 +1,12 @@
 """Tests for IMS CSCF example scripts using MockHss and MockPcrf."""
+import asyncio
 from pathlib import Path
 import pytest
 from siphon_sdk.testing import SipTestHarness
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 # Resolve example script paths relative to repo root (tests run from sdk/).
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -408,7 +413,7 @@ class TestMockHss:
             impi="alice", impu="sip:alice@example.com",
             server_name="sip:scscf:6060",
         )
-        result = self.harness.diameter.cx_uar("sip:alice@example.com")
+        result = run(self.harness.diameter.cx_uar("sip:alice@example.com"))
         assert result is not None
         assert result["result_code"] == 2001
         assert result["server_name"] == "sip:scscf:6060"
@@ -418,7 +423,7 @@ class TestMockHss:
             impi="alice", impu="sip:alice@example.com",
             server_name="sip:scscf:6060",
         )
-        result = self.harness.diameter.cx_lir("sip:alice@example.com")
+        result = run(self.harness.diameter.cx_lir("sip:alice@example.com"))
         assert result is not None
         assert result["server_name"] == "sip:scscf:6060"
 
@@ -427,7 +432,7 @@ class TestMockHss:
             impi="alice", impu="sip:alice@example.com",
             ifc_xml="<ServiceProfile><InitialFilterCriteria/></ServiceProfile>",
         )
-        result = self.harness.diameter.cx_sar("sip:alice@example.com")
+        result = run(self.harness.diameter.cx_sar("sip:alice@example.com"))
         assert result is not None
         assert result["result_code"] == 2001
         assert "ServiceProfile" in result["user_data"]
@@ -451,7 +456,7 @@ class TestMockHss:
         )
         self.harness.hss.remove_subscriber("sip:alice@example.com")
         # UAR should now return None (no per-user response, no default)
-        result = self.harness.diameter.cx_uar("sip:alice@example.com")
+        result = run(self.harness.diameter.cx_uar("sip:alice@example.com"))
         assert result is None
 
     def test_subscriber_count(self):
@@ -482,13 +487,13 @@ class TestMockPcrf:
 
     def test_accept_all(self):
         self.harness.pcrf.accept_all()
-        result = self.harness.diameter.rx_aar()
+        result = run(self.harness.diameter.rx_aar())
         assert result is not None
         assert result["result_code"] == 2001
 
     def test_reject_all(self):
         self.harness.pcrf.reject_all(result_code=5003)
-        result = self.harness.diameter.rx_aar()
+        result = run(self.harness.diameter.rx_aar())
         assert result is not None
         assert result["result_code"] == 5003
 
@@ -496,15 +501,15 @@ class TestMockPcrf:
         self.harness.pcrf.accept_all()
         self.harness.pcrf.reject_session("bad-session", result_code=5003)
         # Normal session succeeds
-        result = self.harness.diameter.rx_aar(session_id="good-session")
+        result = run(self.harness.diameter.rx_aar(session_id="good-session"))
         assert result["result_code"] == 2001
         # Rejected session fails
-        result = self.harness.diameter.rx_aar(session_id="bad-session")
+        result = run(self.harness.diameter.rx_aar(session_id="bad-session"))
         assert result["result_code"] == 5003
 
     def test_rx_str(self):
         self.harness.pcrf.accept_all()
-        result = self.harness.diameter.rx_str("session-1")
+        result = run(self.harness.diameter.rx_str("session-1"))
         assert result == 2001
 
 
@@ -520,17 +525,17 @@ class TestMockDiameterCx:
         self.diameter = self.harness.diameter
 
     def test_cx_uar_no_config_returns_none(self):
-        result = self.diameter.cx_uar("sip:unknown@example.com")
+        result = run(self.diameter.cx_uar("sip:unknown@example.com"))
         assert result is None
 
     def test_cx_uar_with_default_server(self):
         self.diameter.set_default_server_name("sip:scscf:6060")
-        result = self.diameter.cx_uar("sip:anyone@example.com")
+        result = run(self.diameter.cx_uar("sip:anyone@example.com"))
         assert result is not None
         assert result["server_name"] == "sip:scscf:6060"
 
     def test_cx_sar_default_success(self):
-        result = self.diameter.cx_sar("sip:alice@example.com")
+        result = run(self.diameter.cx_sar("sip:alice@example.com"))
         assert result is not None
         assert result["result_code"] == 2001
         assert result["user_data"] is None
@@ -540,11 +545,11 @@ class TestMockDiameterCx:
             "sip:alice@example.com",
             server_name="sip:scscf2:6060",
         )
-        result = self.diameter.cx_lir("sip:alice@example.com")
+        result = run(self.diameter.cx_lir("sip:alice@example.com"))
         assert result["server_name"] == "sip:scscf2:6060"
 
     def test_rx_aar_default(self):
-        result = self.diameter.rx_aar()
+        result = run(self.diameter.rx_aar())
         assert result is not None
         assert result["result_code"] == 2001
         assert "session_id" in result
@@ -555,7 +560,7 @@ class TestMockDiameterCx:
         self.diameter.set_uar_response("sip:alice@x", server_name="sip:s:6060")
         self.diameter.clear()
         assert not self.diameter.is_connected("hss1")
-        assert self.diameter.cx_uar("sip:alice@x") is None
+        assert run(self.diameter.cx_uar("sip:alice@x")) is None
 
 
 # ---------------------------------------------------------------------------

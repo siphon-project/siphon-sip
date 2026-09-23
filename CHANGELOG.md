@@ -6,6 +6,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: every `diameter` request method is now awaitable.** `cx_uar`,
+  `cx_sar`, `cx_lir`, `s6a_air`, `s6a_ulr`, `s6a_purge_ue`, `rx_aar`, `rx_str`,
+  `sh_udr`, `sh_pur`, `sh_snr`, `s6c_srr`, `s6c_rsr`, `sgd_tfr`, `send_request`
+  and the four `rf_acr_*` methods return a coroutine and must be `await`ed.
+
+  They blocked the thread that called them, and for an `async def` handler that
+  thread is its asyncio driver — one of a small pool (`script.async_pool_size`,
+  defaulting to the CPU count), each running many coroutines at once. A Diameter
+  request takes up to `DEFAULT_REQUEST_TIMEOUT` (10s), and for all of it that
+  loop turned nothing: every coroutine on it stopped, including ones belonging
+  to calls that never touched Diameter. On a two-core node a handful of
+  concurrent requests could stall async dispatch process-wide. 1.9.1 bounded the
+  worker-side wait so a wedged handler could not abort the process, but nothing
+  could release a *driver*.
+
+  **Migrating:** add `await`, and make the handler `async def` if it is not
+  already — a sync handler cannot await, so one that calls these must be
+  converted. The shipped IMS examples show it: `examples/ims_icscf.py` and
+  `examples/ims_scscf.py` had sync handlers calling `cx_uar` / `cx_lir` /
+  `cx_sar` and are now `async def` throughout.
+
+  Arguments are still read, and still validated, at the call — the Python
+  objects cannot cross into the future — so a malformed `rx_aar` media component
+  raises where you called it rather than where you await it. The "no peer
+  connected" paths return a coroutine resolving to `None`, so one `await`
+  covers every path.
+
+
 ### Fixed
 
 - **The registrar's write-through queue is bounded, and `aor_count()` no longer

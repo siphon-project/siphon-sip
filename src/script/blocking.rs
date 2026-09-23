@@ -1,7 +1,70 @@
-//! Running blocking Rust-API futures from synchronous script handlers without
-//! stalling the free-threaded interpreter.
+//! How a script API reaches async Rust: awaitably where the caller is a
+//! coroutine, and by blocking a handler thread where it is not.
+//!
+//! Prefer [`awaitable`]. A script API that blocks does so on whatever thread
+//! called it, and for an `async def` handler that thread is its asyncio
+//! driver — one of a small pool, each running `run_forever` for many
+//! coroutines at once. Blocking it stops every coroutine on that loop,
+//! including ones belonging to calls that never touched the API. Handing back
+//! a future instead lets the loop keep turning while the work runs on tokio.
+//!
+//! [`detach_block_on`] remains for the paths that are genuinely synchronous
+//! (siphon's own internals, reached from a Rust worker rather than a
+//! coroutine), where there is no loop to yield to.
 
+use std::ffi::CString;
 use std::future::Future;
+use std::sync::OnceLock;
+
+use pyo3::prelude::*;
+
+/// Hand Python a coroutine that resolves to `value` without doing any work.
+///
+/// For the early returns of an otherwise-awaitable API — "no Diameter peer is
+/// connected", and the like. The caller writes one `await` and it has to work
+/// on every path, so a method returning a plain value on its error path and a
+/// coroutine on its success path is unusable.
+///
+/// Deliberately **not** [`awaitable`]: `future_into_py` needs a running asyncio
+/// loop at construction time, and these paths are exactly the ones that may not
+/// have one — a sync caller, or a unit test with no loop at all. A plain Python
+/// `async def` has no such requirement, so it works in every caller context.
+pub(crate) fn ready<'py, T>(python: Python<'py>, value: T) -> PyResult<Bound<'py, PyAny>>
+where
+    T: IntoPyObject<'py>,
+{
+    static HELPER: OnceLock<Py<PyAny>> = OnceLock::new();
+    if let Some(helper) = HELPER.get() {
+        return helper.bind(python).call1((value,));
+    }
+
+    let source = CString::new("async def _ready(value):\n    return value\n").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("ready helper source: {error}"))
+    })?;
+    let file_name = CString::new("_siphon_ready_helper.py").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("ready helper file: {error}"))
+    })?;
+    let module_name = CString::new("_siphon_ready_helper").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("ready helper module: {error}"))
+    })?;
+    let module = pyo3::types::PyModule::from_code(python, &source, &file_name, &module_name)?;
+    let helper = module.getattr("_ready")?;
+    let _ = HELPER.set(helper.clone().unbind());
+    helper.call1((value,))
+}
+
+/// Run `future` on tokio and hand Python a coroutine for its result.
+///
+/// The awaitable counterpart of [`detach_block_on`]: the calling thread
+/// returns immediately, so an asyncio driver keeps turning its other
+/// coroutines while this runs.
+pub(crate) fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+{
+    pyo3_async_runtimes::tokio::future_into_py(python, future)
+}
 
 /// Drive `future` to completion, blocking the current handler thread, with the
 /// Python interpreter **released** for the duration.

@@ -338,6 +338,10 @@ struct RxAarRequest {
 
 impl RxAarRequest {
     /// Validates in the order `rx_aar` always has, so a bad call raises what it did.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     fn parse(
         session_id: Option<&str>,
         framed_ip: Option<&str>,
@@ -1030,6 +1034,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
     ///     or ``None`` if no Diameter peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity, visited_network_id=None, user_auth_type=None))]
     fn cx_uar<'py>(
         &self,
@@ -1037,7 +1045,7 @@ impl PyDiameter {
         public_identity: &str,
         visited_network_id: Option<&str>,
         user_auth_type: Option<u32>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Cx, None)
@@ -1045,32 +1053,36 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("cx_uar: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
-        let visited = visited_network_id.unwrap_or("");
-        let answer = crate::script::detach_block_on(client.send_uar(
-            public_identity,
-            visited,
-            user_auth_type,
-        ));
+        let public_identity = public_identity.to_string();
+        let visited = visited_network_id.unwrap_or("").to_string();
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                let server_name = required_str(&message.avps, "Server-Name");
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_uar(&public_identity, &visited, user_auth_type)
+                .await;
 
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                dict.set_item("server_name", server_name)?;
-                Ok(Some(dict))
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    let server_name = required_str(&message.avps, "Server-Name");
+
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        dict.set_item("server_name", server_name)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "cx_uar failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "cx_uar failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send a Cx Server-Assignment-Request to the HSS.
@@ -1086,6 +1098,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``user_data`` (str or None, iFC XML),
     ///     or ``None`` if no Diameter peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity, server_name=None, assignment_type=1))]
     fn cx_sar<'py>(
         &self,
@@ -1093,7 +1109,7 @@ impl PyDiameter {
         public_identity: &str,
         server_name: Option<&str>,
         assignment_type: u32,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Cx, None)
@@ -1101,30 +1117,37 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("cx_sar: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
-        let name = server_name.unwrap_or("");
-        let answer =
-            crate::script::detach_block_on(client.send_sar(public_identity, name, assignment_type));
+        let public_identity = public_identity.to_string();
+        let name = server_name.unwrap_or("").to_string();
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                // User-Data AVP (code 606, 3GPP) carries iFC XML as OctetString
-                let user_data = octet_string_as_utf8(&message.avps, "User-Data");
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_sar(&public_identity, &name, assignment_type)
+                .await;
 
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                dict.set_item("user_data", user_data)?;
-                Ok(Some(dict))
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    // User-Data AVP (code 606, 3GPP) carries iFC XML as OctetString
+                    let user_data = octet_string_as_utf8(&message.avps, "User-Data");
+
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        dict.set_item("user_data", user_data)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "cx_sar failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "cx_sar failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send a Cx Location-Info-Request to the HSS.
@@ -1138,12 +1161,16 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
     ///     or ``None`` if no Diameter peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity,))]
     fn cx_lir<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Cx, None)
@@ -1151,27 +1178,33 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("cx_lir: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
-        let answer = crate::script::detach_block_on(client.send_lir(public_identity));
+        let public_identity = public_identity.to_string();
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                let server_name = required_str(&message.avps, "Server-Name");
+        crate::script::awaitable(python, async move {
+            let answer = client.send_lir(&public_identity).await;
 
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                dict.set_item("server_name", server_name)?;
-                Ok(Some(dict))
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    let server_name = required_str(&message.avps, "Server-Name");
+
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        dict.set_item("server_name", server_name)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "cx_lir failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "cx_lir failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send an S6a Authentication-Information-Request to the HSS (MME role).
@@ -1187,6 +1220,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict ``{"result_code": int, "vectors": [{"rand","xres","autn","kasme"}]}``
     ///     (vector fields are ``bytes``), or ``None`` if no peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (imsi, visited_plmn_id, num_vectors=1, immediate_response_preferred=true, resync_info=None, peer=None))]
     #[allow(clippy::too_many_arguments)]
     fn s6a_air<'py>(
@@ -1198,46 +1235,57 @@ impl PyDiameter {
         immediate_response_preferred: bool,
         resync_info: Option<Vec<u8>>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_air: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_air(
-            imsi,
-            &visited_plmn_id,
-            num_vectors,
-            immediate_response_preferred,
-            resync_info.as_deref(),
-        ));
-        match answer {
-            Ok(message) => {
-                let parsed = match crate::diameter::s6a::parse_aia(&message) {
-                    Some(parsed) => parsed,
-                    None => return Ok(None),
-                };
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", parsed.result_code)?;
-                let vectors = pyo3::types::PyList::empty(python);
-                for vector in &parsed.vectors {
-                    let item = PyDict::new(python);
-                    item.set_item("rand", pyo3::types::PyBytes::new(python, &vector.rand))?;
-                    item.set_item("xres", pyo3::types::PyBytes::new(python, &vector.xres))?;
-                    item.set_item("autn", pyo3::types::PyBytes::new(python, &vector.autn))?;
-                    item.set_item("kasme", pyo3::types::PyBytes::new(python, &vector.kasme))?;
-                    vectors.append(item)?;
+        let imsi = imsi.to_string();
+
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_air(
+                    &imsi,
+                    &visited_plmn_id,
+                    num_vectors,
+                    immediate_response_preferred,
+                    resync_info.as_deref(),
+                )
+                .await;
+
+            match answer {
+                Ok(message) => {
+                    let Some(parsed) = crate::diameter::s6a::parse_aia(&message) else {
+                        return Ok(None);
+                    };
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", parsed.result_code)?;
+                        let vectors = pyo3::types::PyList::empty(python);
+                        for vector in &parsed.vectors {
+                            let item = PyDict::new(python);
+                            item.set_item("rand", pyo3::types::PyBytes::new(python, &vector.rand))?;
+                            item.set_item("xres", pyo3::types::PyBytes::new(python, &vector.xres))?;
+                            item.set_item("autn", pyo3::types::PyBytes::new(python, &vector.autn))?;
+                            item.set_item(
+                                "kasme",
+                                pyo3::types::PyBytes::new(python, &vector.kasme),
+                            )?;
+                            vectors.append(item)?;
+                        }
+                        dict.set_item("vectors", vectors)?;
+                        Ok(Some(dict.unbind()))
+                    })
                 }
-                dict.set_item("vectors", vectors)?;
-                Ok(Some(dict))
+                Err(error) => {
+                    warn!(error = %error, "s6a_air failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "s6a_air failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send an S6a Update-Location-Request to the HSS (MME role).
@@ -1252,6 +1300,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict ``{"result_code": int, "ula_flags": int|None,
     ///     "has_subscription_data": bool}`` or ``None``.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (imsi, visited_plmn_id, rat_type=1004, ulr_flags=0, peer=None))]
     fn s6a_ulr<'py>(
         &self,
@@ -1261,42 +1313,49 @@ impl PyDiameter {
         rat_type: u32,
         ulr_flags: u32,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_ulr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_ulr(
-            imsi,
-            rat_type,
-            ulr_flags,
-            &visited_plmn_id,
-        ));
-        match answer {
-            Ok(message) => {
-                let parsed = match crate::diameter::s6a::parse_ula(&message) {
-                    Some(parsed) => parsed,
-                    None => return Ok(None),
-                };
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", parsed.result_code)?;
-                dict.set_item("ula_flags", parsed.ula_flags)?;
-                dict.set_item("has_subscription_data", parsed.has_subscription_data)?;
-                Ok(Some(dict))
+        let imsi = imsi.to_string();
+
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_ulr(&imsi, rat_type, ulr_flags, &visited_plmn_id)
+                .await;
+
+            match answer {
+                Ok(message) => {
+                    let Some(parsed) = crate::diameter::s6a::parse_ula(&message) else {
+                        return Ok(None);
+                    };
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", parsed.result_code)?;
+                        dict.set_item("ula_flags", parsed.ula_flags)?;
+                        dict.set_item("has_subscription_data", parsed.has_subscription_data)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "s6a_ulr failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "s6a_ulr failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send an S6a Purge-UE-Request to the HSS (MME role).
     ///
     /// Returns ``{"result_code": int}`` or ``None`` if no peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (imsi, pur_flags=None, peer=None))]
     fn s6a_purge_ue<'py>(
         &self,
@@ -1304,26 +1363,29 @@ impl PyDiameter {
         imsi: &str,
         pur_flags: Option<u32>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_purge_ue: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_purge_ue(imsi, pur_flags));
-        match answer {
-            Ok(message) => {
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", extract_result_code(&message.avps))?;
-                Ok(Some(dict))
+        let imsi = imsi.to_string();
+
+        crate::script::awaitable(python, async move {
+            match client.send_purge_ue(&imsi, pur_flags).await {
+                Ok(message) => Python::attach(|python| {
+                    let dict = PyDict::new(python);
+                    dict.set_item("result_code", extract_result_code(&message.avps))?;
+                    Ok(Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "s6a_purge_ue failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "s6a_purge_ue failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send an Rx AA-Request to authorize an IMS media session.
@@ -1359,6 +1421,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``session_id`` (str),
     ///     or ``None`` if no Rx peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         session_id=None,
         framed_ip=None,
@@ -1378,7 +1444,7 @@ impl PyDiameter {
         af_application_id: &str,
         subscription_id: Option<&Bound<'py, PyAny>>,
         specific_actions: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Rx, None)
@@ -1386,10 +1452,13 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("rx_aar: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
+        // Parsed here, not in the future: these are `Bound` values that cannot
+        // cross into it, and a malformed media component should raise at the
+        // call rather than on `await`.
         let request = RxAarRequest::parse(
             session_id,
             framed_ip,
@@ -1400,23 +1469,22 @@ impl PyDiameter {
             specific_actions,
         )?;
 
-        let answer = crate::script::detach_block_on(crate::diameter::rx::send_aar(
-            client.peer(),
-            &request.params(),
-        ));
+        crate::script::awaitable(python, async move {
+            let answer = crate::diameter::rx::send_aar(client.peer(), &request.params()).await;
 
-        match answer {
-            Ok(answer) => {
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", answer.result_code)?;
-                dict.set_item("session_id", answer.session_id)?;
-                Ok(Some(dict))
+            match answer {
+                Ok(answer) => Python::attach(|python| {
+                    let dict = PyDict::new(python);
+                    dict.set_item("result_code", answer.result_code)?;
+                    dict.set_item("session_id", answer.session_id)?;
+                    Ok(Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "rx_aar failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "rx_aar failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Register the server mode CER identity callback.
@@ -1650,6 +1718,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``user_data`` (str or None,
     ///     the Sh-Data XML payload), or ``None`` if no Diameter peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity, data_reference, service_indication=None))]
     fn sh_udr<'py>(
         &self,
@@ -1657,7 +1729,7 @@ impl PyDiameter {
         public_identity: &str,
         data_reference: &Bound<'_, PyAny>,
         service_indication: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Sh, None)
@@ -1665,33 +1737,40 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("sh_udr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
+        // Read off the Python object before the future: a `Bound` cannot cross
+        // into it, and a bad `data_reference` should raise here rather than
+        // resolve to an exception the caller only sees on `await`.
         let references = extract_references(data_reference)?;
+        let public_identity = public_identity.to_string();
+        let service_indication = service_indication.map(str::to_string);
 
-        let answer = crate::script::detach_block_on(client.send_udr(
-            public_identity,
-            &references,
-            service_indication,
-        ));
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_udr(&public_identity, &references, service_indication.as_deref())
+                .await;
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                let user_data = octet_string_as_utf8(&message.avps, "User-Data-Sh");
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    let user_data = octet_string_as_utf8(&message.avps, "User-Data-Sh");
 
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                dict.set_item("user_data", user_data)?;
-                Ok(Some(dict))
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        dict.set_item("user_data", user_data)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "sh_udr failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "sh_udr failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send a Sh Profile-Update-Request to the HSS (AS role).
@@ -1710,6 +1789,10 @@ impl PyDiameter {
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity, data_reference, xml, service_indication=None))]
     fn sh_pur<'py>(
         &self,
@@ -1718,7 +1801,7 @@ impl PyDiameter {
         data_reference: u32,
         xml: &str,
         service_indication: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Sh, None)
@@ -1726,29 +1809,39 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("sh_pur: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
-        let answer = crate::script::detach_block_on(client.send_pur(
-            public_identity,
-            data_reference,
-            xml,
-            service_indication,
-        ));
+        let public_identity = public_identity.to_string();
+        let xml = xml.to_string();
+        let service_indication = service_indication.map(str::to_string);
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                Ok(Some(dict))
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_pur(
+                    &public_identity,
+                    data_reference,
+                    &xml,
+                    service_indication.as_deref(),
+                )
+                .await;
+
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "sh_pur failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "sh_pur failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     /// Send a Sh Subscribe-Notifications-Request to the HSS (AS role).
@@ -1769,6 +1862,10 @@ impl PyDiameter {
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), or ``None`` if no peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (public_identity, data_reference, subs_req_type, service_indication=None))]
     fn sh_snr<'py>(
         &self,
@@ -1777,7 +1874,7 @@ impl PyDiameter {
         data_reference: &Bound<'_, PyAny>,
         subs_req_type: u32,
         service_indication: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Sh, None)
@@ -1785,35 +1882,43 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("sh_snr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
         let references = extract_references(data_reference)?;
+        let public_identity = public_identity.to_string();
+        let service_indication = service_indication.map(str::to_string);
 
-        let answer = crate::script::detach_block_on(client.send_snr(
-            public_identity,
-            &references,
-            subs_req_type,
-            service_indication,
-        ));
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_snr(
+                    &public_identity,
+                    &references,
+                    subs_req_type,
+                    service_indication.as_deref(),
+                )
+                .await;
 
-        match answer {
-            Ok(message) => {
-                let result_code = extract_result_code(&message.avps);
-                let dict = PyDict::new(python);
-                dict.set_item("result_code", result_code)?;
-                Ok(Some(dict))
+            match answer {
+                Ok(message) => {
+                    let result_code = extract_result_code(&message.avps);
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", result_code)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, "sh_snr failed");
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                warn!(error = %error, "sh_snr failed");
-                Ok(None)
-            }
-        }
+        })
     }
 
     #[pyo3(signature = (session_id,))]
-    fn rx_str(&self, session_id: &str) -> PyResult<Option<u32>> {
+    fn rx_str<'py>(&self, python: Python<'py>, session_id: &str) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Rx, None)
@@ -1821,24 +1926,28 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("rx_str: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<u32>);
             }
         };
 
-        let peer = client.peer();
-        let answer = crate::script::detach_block_on(crate::diameter::rx::send_str(
-            peer,
-            session_id,
-            crate::diameter::rx::TERMINATION_CAUSE_LOGOUT,
-        ));
+        let session_id = session_id.to_string();
 
-        match answer {
-            Ok(result_code) => Ok(Some(result_code)),
-            Err(error) => {
-                warn!(error = %error, "rx_str failed");
-                Ok(None)
+        crate::script::awaitable(python, async move {
+            let answer = crate::diameter::rx::send_str(
+                client.peer(),
+                &session_id,
+                crate::diameter::rx::TERMINATION_CAUSE_LOGOUT,
+            )
+            .await;
+
+            match answer {
+                Ok(result_code) => Ok(Some(result_code)),
+                Err(error) => {
+                    warn!(error = %error, "rx_str failed");
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     /// Send an S6c Send-Routing-Info-for-SM request to the HSS.
@@ -1860,6 +1969,10 @@ impl PyDiameter {
     ///     ``sgsn_number`` (str, set when 2G/3G delivery), and
     ///     ``mme_number_for_mt_sms`` (str, set when LTE delivery).
     ///     ``None`` when no Diameter peer is connected.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (msisdn, sc_address, sm_rp_mti=None))]
     fn s6c_srr<'py>(
         &self,
@@ -1867,7 +1980,7 @@ impl PyDiameter {
         msisdn: &str,
         sc_address: &str,
         sm_rp_mti: Option<u32>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::S6c, None)
@@ -1875,31 +1988,35 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("s6c_srr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_srr(msisdn, sc_address, sm_rp_mti));
-        match answer {
-            Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
-                Some(sra) => {
-                    let dict = PyDict::new(python);
-                    dict.set_item("result_code", sra.result_code)?;
-                    dict.set_item("experimental_result_code", sra.experimental_result_code)?;
-                    dict.set_item("user_name", sra.user_name)?;
-                    dict.set_item("sgsn_number", sra.sgsn_number)?;
-                    dict.set_item("mme_number_for_mt_sms", sra.mme_number_for_mt_sms)?;
-                    Ok(Some(dict))
-                }
-                None => {
-                    warn!("s6c_srr: HSS answer was not parseable as SRA");
+        let msisdn = msisdn.to_string();
+        let sc_address = sc_address.to_string();
+
+        crate::script::awaitable(python, async move {
+            match client.send_srr(&msisdn, &sc_address, sm_rp_mti).await {
+                Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
+                    Some(sra) => Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", sra.result_code)?;
+                        dict.set_item("experimental_result_code", sra.experimental_result_code)?;
+                        dict.set_item("user_name", sra.user_name)?;
+                        dict.set_item("sgsn_number", sra.sgsn_number)?;
+                        dict.set_item("mme_number_for_mt_sms", sra.mme_number_for_mt_sms)?;
+                        Ok(Some(dict.unbind()))
+                    }),
+                    None => {
+                        warn!("s6c_srr: HSS answer was not parseable as SRA");
+                        Ok(None)
+                    }
+                },
+                Err(error) => {
+                    warn!(error = %error, "s6c_srr failed");
                     Ok(None)
                 }
-            },
-            Err(error) => {
-                warn!(error = %error, "s6c_srr failed");
-                Ok(None)
             }
-        }
+        })
     }
 
     /// Send an S6c Report-SM-Delivery-Status request to the HSS.
@@ -1916,6 +2033,10 @@ impl PyDiameter {
     ///         2 = UE_MEMORY_CAPACITY_EXCEEDED,
     ///         3 = SUCCESSFUL_TRANSFER_NOT_LAST,
     ///         4 = TEMPORARY_ERROR.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (user_name, sc_address, delivery_outcome))]
     fn s6c_rsr<'py>(
         &self,
@@ -1923,7 +2044,7 @@ impl PyDiameter {
         user_name: &str,
         sc_address: &str,
         delivery_outcome: u32,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::S6c, None)
@@ -1931,33 +2052,36 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("s6c_rsr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_rsr(
-            user_name,
-            sc_address,
-            delivery_outcome,
-        ));
-        match answer {
-            Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
-                Some(rsa) => {
-                    let dict = PyDict::new(python);
-                    dict.set_item("result_code", rsa.result_code)?;
-                    dict.set_item("experimental_result_code", rsa.experimental_result_code)?;
-                    dict.set_item("user_name", rsa.user_name)?;
-                    Ok(Some(dict))
-                }
-                None => {
-                    warn!("s6c_rsr: HSS answer was not parseable as RSA");
+        let user_name = user_name.to_string();
+        let sc_address = sc_address.to_string();
+
+        crate::script::awaitable(python, async move {
+            match client
+                .send_rsr(&user_name, &sc_address, delivery_outcome)
+                .await
+            {
+                Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
+                    Some(rsa) => Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", rsa.result_code)?;
+                        dict.set_item("experimental_result_code", rsa.experimental_result_code)?;
+                        dict.set_item("user_name", rsa.user_name)?;
+                        Ok(Some(dict.unbind()))
+                    }),
+                    None => {
+                        warn!("s6c_rsr: HSS answer was not parseable as RSA");
+                        Ok(None)
+                    }
+                },
+                Err(error) => {
+                    warn!(error = %error, "s6c_rsr failed");
                     Ok(None)
                 }
-            },
-            Err(error) => {
-                warn!(error = %error, "s6c_rsr failed");
-                Ok(None)
             }
-        }
+        })
     }
 
     /// Send an SGd MT-Forward-Short-Message request to the served node
@@ -1975,6 +2099,10 @@ impl PyDiameter {
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``absent_user_diagnostic``
     ///     (int or None — set when the UE was unreachable).
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None))]
     fn sgd_tfr<'py>(
         &self,
@@ -1984,7 +2112,7 @@ impl PyDiameter {
         sm_rp_ui: &[u8],
         smsmi_correlation_id: Option<&str>,
         sm_rp_mti: Option<u32>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Sgd, None)
@@ -1992,35 +2120,45 @@ impl PyDiameter {
             Some(client) => client,
             None => {
                 warn!("sgd_tfr: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
-        let answer = crate::script::detach_block_on(client.send_tfr(
-            user_name,
-            sc_address,
-            sm_rp_ui,
-            smsmi_correlation_id,
-            sm_rp_mti,
-        ));
-        match answer {
-            Ok(message) => match crate::diameter::sgd::parse_tfa(&message) {
-                Some(tfa) => {
-                    let dict = PyDict::new(python);
-                    dict.set_item("result_code", tfa.result_code)?;
-                    dict.set_item("experimental_result_code", tfa.experimental_result_code)?;
-                    dict.set_item("absent_user_diagnostic", tfa.absent_user_diagnostic)?;
-                    Ok(Some(dict))
-                }
-                None => {
-                    warn!("sgd_tfr: peer answer was not parseable as TFA");
+        let user_name = user_name.to_string();
+        let sc_address = sc_address.to_string();
+        let sm_rp_ui = sm_rp_ui.to_vec();
+        let smsmi_correlation_id = smsmi_correlation_id.map(str::to_string);
+
+        crate::script::awaitable(python, async move {
+            let answer = client
+                .send_tfr(
+                    &user_name,
+                    &sc_address,
+                    &sm_rp_ui,
+                    smsmi_correlation_id.as_deref(),
+                    sm_rp_mti,
+                )
+                .await;
+
+            match answer {
+                Ok(message) => match crate::diameter::sgd::parse_tfa(&message) {
+                    Some(tfa) => Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("result_code", tfa.result_code)?;
+                        dict.set_item("experimental_result_code", tfa.experimental_result_code)?;
+                        dict.set_item("absent_user_diagnostic", tfa.absent_user_diagnostic)?;
+                        Ok(Some(dict.unbind()))
+                    }),
+                    None => {
+                        warn!("sgd_tfr: peer answer was not parseable as TFA");
+                        Ok(None)
+                    }
+                },
+                Err(error) => {
+                    warn!(error = %error, "sgd_tfr failed");
                     Ok(None)
                 }
-            },
-            Err(error) => {
-                warn!(error = %error, "sgd_tfr failed");
-                Ok(None)
             }
-        }
+        })
     }
 
     /// Originate a Diameter request by spec name + application name +
@@ -2060,6 +2198,10 @@ impl PyDiameter {
     ///
     /// Raises ``ValueError`` for unknown command/application names or
     /// unrecognised AVP kwargs.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         command,
         application,
@@ -2075,7 +2217,7 @@ impl PyDiameter {
         peer: Option<&str>,
         timeout_ms: u64,
         avps: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown Diameter command name: {command}"
@@ -2099,7 +2241,7 @@ impl PyDiameter {
                     application = application,
                     "diameter.send_request: no peer connected"
                 );
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
 
@@ -2154,21 +2296,24 @@ impl PyDiameter {
             &avp_bytes,
         );
 
-        let answer = crate::script::detach_block_on(
-            client
-                .peer()
-                .send_request_timeout(wire, request_timeout(timeout_ms)),
-        );
-        let message = match answer {
-            Ok(message) => message,
-            Err(error) => {
-                warn!(error = %error, command = command, "diameter.send_request failed");
-                return Ok(None);
-            }
-        };
+        let command = command.to_string();
+        let timeout = request_timeout(timeout_ms);
 
-        let dict = decode_avps_to_pydict(python, &message.avps)?;
-        Ok(Some(dict))
+        crate::script::awaitable(python, async move {
+            let answer = client.peer().send_request_timeout(wire, timeout).await;
+            let message = match answer {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(error = %error, command = command, "diameter.send_request failed");
+                    return Ok(None);
+                }
+            };
+
+            Python::attach(|python| {
+                let dict = decode_avps_to_pydict(python, &message.avps)?;
+                Ok(Some(dict.unbind()))
+            })
+        })
     }
 
     // ── Rf ACR/ACA — IMS offline charging (TS 32.299) ────────────────────
@@ -2188,6 +2333,10 @@ impl PyDiameter {
     /// ``node_functionality`` accepts ``"scscf"``, ``"pcscf"``, ``"icscf"``,
     /// ``"mrfc"``, ``"mgcf"``, ``"bgcf"``, ``"as"``, ``"ibcf"``, ``"ecscf"``,
     /// ``"atcf"``, ``"mmtel"``, ``"tpf"``, ``"atgw"`` (TS 32.299 §7.2.111).
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         *,
         calling_party=None, called_party=None, sip_method=None,
@@ -2254,12 +2403,12 @@ impl PyDiameter {
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_start: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
         let ims_data = build_ims_data(
@@ -2305,29 +2454,41 @@ impl PyDiameter {
             user_session_id,
         )?;
 
-        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
-        params.user_name = user_name;
+        // The charging data is owned, so it moves into the future; only
+        // `AccountingParams` borrows, so it is assembled in there from these.
         let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
-        params.subscription_ids = &subscription_ids;
-        params.ims_data = ims_data.as_ref();
-        params.sms_data = sms_data.as_ref();
-        params.service_context_id = service_context_id;
-
+        let user_name = user_name.map(str::to_string);
+        let service_context_id = service_context_id.map(str::to_string);
         let peer_handle = client.peer().clone();
-        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
-        match answer {
-            Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
-            Err(error) => {
-                warn!(error = %error, "rf_acr_start failed");
-                Ok(None)
+
+        crate::script::awaitable(python, async move {
+            let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+            params.user_name = user_name.as_deref();
+            params.subscription_ids = &subscription_ids;
+            params.ims_data = ims_data.as_ref();
+            params.sms_data = sms_data.as_ref();
+            params.service_context_id = service_context_id.as_deref();
+
+            match rf::send_acr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|python| {
+                    accounting_answer_to_dict(python, answer, None).map(|dict| Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "rf_acr_start failed");
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     /// Send an Rf ACR-INTERIM to the CDF.
     ///
     /// `record_number` MUST be a strictly increasing non-zero integer
     /// scoped to the same `session_id` per RFC 6733 §9.8.3.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         session_id, record_number,
         *,
@@ -2397,12 +2558,12 @@ impl PyDiameter {
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_interim: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
         let ims_data = build_ims_data(
@@ -2448,29 +2609,33 @@ impl PyDiameter {
             user_session_id,
         )?;
 
-        let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
-        params.record_number = record_number;
-        params.session_id = Some(session_id);
-        params.user_name = user_name;
         let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
-        params.subscription_ids = &subscription_ids;
-        params.ims_data = ims_data.as_ref();
-        params.sms_data = sms_data.as_ref();
-        params.service_context_id = service_context_id;
-
+        let session_id = session_id.to_string();
+        let user_name = user_name.map(str::to_string);
+        let service_context_id = service_context_id.map(str::to_string);
         let peer_handle = client.peer().clone();
-        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
-        match answer {
-            Ok(answer) => Ok(Some(accounting_answer_to_dict(
-                python,
-                answer,
-                Some(session_id),
-            )?)),
-            Err(error) => {
-                warn!(error = %error, "rf_acr_interim failed");
-                Ok(None)
+
+        crate::script::awaitable(python, async move {
+            let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
+            params.record_number = record_number;
+            params.session_id = Some(session_id.as_str());
+            params.user_name = user_name.as_deref();
+            params.subscription_ids = &subscription_ids;
+            params.ims_data = ims_data.as_ref();
+            params.sms_data = sms_data.as_ref();
+            params.service_context_id = service_context_id.as_deref();
+
+            match rf::send_acr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|python| {
+                    accounting_answer_to_dict(python, answer, Some(session_id.as_str()))
+                        .map(|dict| Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "rf_acr_interim failed");
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     /// Send an Rf ACR-STOP to the CDF.
@@ -2480,6 +2645,10 @@ impl PyDiameter {
     /// session teardown.  Use 8 (DIAMETER_SESSION_TIMEOUT) for
     /// session-timer expiry, 4 (DIAMETER_ADMINISTRATIVE) for forced
     /// teardown.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         session_id, record_number,
         *,
@@ -2551,12 +2720,12 @@ impl PyDiameter {
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_stop: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
         let ims_data = build_ims_data(
@@ -2602,36 +2771,44 @@ impl PyDiameter {
             user_session_id,
         )?;
 
-        let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
-        params.record_number = record_number;
-        params.session_id = Some(session_id);
-        params.user_name = user_name;
         let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
-        params.subscription_ids = &subscription_ids;
-        params.ims_data = ims_data.as_ref();
-        params.sms_data = sms_data.as_ref();
-        params.service_context_id = service_context_id;
-        params.termination_cause = Some(termination_cause);
-
+        let session_id = session_id.to_string();
+        let user_name = user_name.map(str::to_string);
+        let service_context_id = service_context_id.map(str::to_string);
         let peer_handle = client.peer().clone();
-        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
-        match answer {
-            Ok(answer) => Ok(Some(accounting_answer_to_dict(
-                python,
-                answer,
-                Some(session_id),
-            )?)),
-            Err(error) => {
-                warn!(error = %error, "rf_acr_stop failed");
-                Ok(None)
+
+        crate::script::awaitable(python, async move {
+            let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
+            params.record_number = record_number;
+            params.session_id = Some(session_id.as_str());
+            params.user_name = user_name.as_deref();
+            params.subscription_ids = &subscription_ids;
+            params.ims_data = ims_data.as_ref();
+            params.sms_data = sms_data.as_ref();
+            params.service_context_id = service_context_id.as_deref();
+            params.termination_cause = Some(termination_cause);
+
+            match rf::send_acr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|python| {
+                    accounting_answer_to_dict(python, answer, Some(session_id.as_str()))
+                        .map(|dict| Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "rf_acr_stop failed");
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     /// Send an Rf ACR-EVENT to the CDF.
     ///
     /// Used for one-shot accounting (REGISTER, MESSAGE, SUBSCRIBE, …).
     /// Record-Number is fixed at 0 per RFC 6733 §9.8.3.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
     #[pyo3(signature = (
         *,
         calling_party=None, called_party=None, sip_method=None,
@@ -2698,12 +2875,12 @@ impl PyDiameter {
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self.pick_rf_peer(peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_event: no Diameter peer connected");
-                return Ok(None);
+                return crate::script::ready(python, None::<Py<PyDict>>);
             }
         };
         let ims_data = build_ims_data(
@@ -2749,23 +2926,29 @@ impl PyDiameter {
             user_session_id,
         )?;
 
-        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
-        params.user_name = user_name;
         let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
-        params.subscription_ids = &subscription_ids;
-        params.ims_data = ims_data.as_ref();
-        params.sms_data = sms_data.as_ref();
-        params.service_context_id = service_context_id;
-
+        let user_name = user_name.map(str::to_string);
+        let service_context_id = service_context_id.map(str::to_string);
         let peer_handle = client.peer().clone();
-        let answer = crate::script::detach_block_on(rf::send_acr(&peer_handle, &params));
-        match answer {
-            Ok(answer) => Ok(Some(accounting_answer_to_dict(python, answer, None)?)),
-            Err(error) => {
-                warn!(error = %error, "rf_acr_event failed");
-                Ok(None)
+
+        crate::script::awaitable(python, async move {
+            let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+            params.user_name = user_name.as_deref();
+            params.subscription_ids = &subscription_ids;
+            params.ims_data = ims_data.as_ref();
+            params.sms_data = sms_data.as_ref();
+            params.service_context_id = service_context_id.as_deref();
+
+            match rf::send_acr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|python| {
+                    accounting_answer_to_dict(python, answer, None).map(|dict| Some(dict.unbind()))
+                }),
+                Err(error) => {
+                    warn!(error = %error, "rf_acr_event failed");
+                    Ok(None)
+                }
             }
-        }
+        })
     }
 
     /// Send a Ro CCR-INITIAL (open a Credit-Control session, RFC 8506 / TS
@@ -3391,6 +3574,20 @@ mod tests {
         assert!(!py_diameter.is_connected("hss2"));
     }
 
+    /// Drive one of the namespace's coroutines to its result.
+    ///
+    /// Every method here now hands back an awaitable, so "returns None with no
+    /// peer" is only true once the coroutine has run — which is a stronger
+    /// assertion than the old direct return, and the reason these tests await
+    /// rather than inspect the object.
+    fn resolve<'py>(python: Python<'py>, coroutine: Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+        python
+            .import("asyncio")
+            .expect("asyncio")
+            .call_method1("run", (coroutine,))
+            .expect("coroutine resolves")
+    }
+
     #[test]
     fn cx_uar_returns_none_without_peer() {
         pyo3::Python::initialize();
@@ -3400,7 +3597,7 @@ mod tests {
             let result = py_diameter
                 .cx_uar(python, "sip:alice@example.com", None, None)
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3413,7 +3610,7 @@ mod tests {
             let result = py_diameter
                 .cx_uar(python, "sip:alice@example.com", None, Some(0))
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3426,7 +3623,7 @@ mod tests {
             let result = py_diameter
                 .cx_sar(python, "sip:alice@example.com", None, 1)
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3437,7 +3634,7 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter.cx_lir(python, "sip:alice@example.com").unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3570,7 +3767,7 @@ mod tests {
             let result = py_diameter
                 .rx_aar(python, None, None, None, None, "IMS Services", None, None)
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3952,10 +4149,13 @@ mod tests {
 
     #[test]
     fn rx_str_returns_none_without_peer() {
+        pyo3::Python::initialize();
         let manager = Arc::new(DiameterManager::new());
         let py_diameter = PyDiameter::new(manager);
-        let result = py_diameter.rx_str("rx-session-1").unwrap();
-        assert!(result.is_none());
+        pyo3::Python::attach(|python| {
+            let result = py_diameter.rx_str(python, "rx-session-1").unwrap();
+            assert!(resolve(python, result).is_none());
+        });
     }
 
     #[test]
@@ -3973,7 +4173,7 @@ mod tests {
                     Some("simservs"),
                 )
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -3992,7 +4192,7 @@ mod tests {
                     Some("simservs"),
                 )
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -4012,7 +4212,7 @@ mod tests {
                     Some("simservs"),
                 )
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
@@ -4088,7 +4288,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            assert!(result.is_none());
+            assert!(resolve(python, result).is_none());
         });
     }
 
