@@ -4,6 +4,13 @@ All notable changes to SIPhon are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Versioning is lockstep across
 the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
+**Versioning policy.** The Python scripting API may break on a **minor**
+release, never on a patch. A release that breaks it says so with a
+`BREAKING` entry here and ships a migration note under `docs/`. The Rust
+library API follows the same rule. Config (`siphon.yaml`) keys are additive
+within a major: a key may gain values or a default may change with a `Changed`
+entry, but a working config keeps working.
+
 ## [Unreleased]
 
 ### Changed
