@@ -138,6 +138,13 @@ entry, but a working config keeps working.
   challenge and relayed the request. The enclosing handlers are now `async def`
   where the example defines one.
 
+- **The SDK docstring examples showed the same seventeen.** Those docstrings are
+  the reference a script author — or a code assistant reading the package — works
+  from, so an example there propagates like any other. Prose that merely names a
+  method is unchanged; only example code was corrected. The two examples that
+  drive the API from a synchronous test now show `asyncio.run(...)`, which is
+  what the SDK's own tests do, rather than an `await` that cannot run there.
+
   A `scripts/check_awaited_apis.py` gate now walks the AST of every shipped
   script, and of every python block in the docs, and fails on an awaitable
   siphon call that is not awaited. That is the only way to catch this class:

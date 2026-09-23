@@ -289,8 +289,8 @@ class Request:
         username carrying a validity prefix or tenant qualifier — reduces it
         here, **after** verification::
 
-            if not auth.verify_digest(request, realm):
-                auth.require_www_digest(request, realm)
+            if not await auth.verify_digest(request, realm):
+                await auth.require_www_digest(request, realm)
                 return
             request.auth_user = normalise(request.auth_user)
             registrar.save(request)

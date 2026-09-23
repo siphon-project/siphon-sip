@@ -235,8 +235,8 @@ class Call:
         Example::
 
             @b2bua.on_invite
-            def new_call(call):
-                if not auth.require_proxy_digest(call, realm="example.com"):
+            async def new_call(call):
+                if not await auth.require_proxy_digest(call, realm="example.com"):
                     return          # 407 armed; siphon answers the A-leg
                 log.info(f"call from {call.auth_user}")
                 call.dial(call.ruri)
@@ -247,8 +247,8 @@ class Call:
         has been answered::
 
             @b2bua.on_invite
-            def new_call(call):
-                if not auth.require_proxy_digest(call, realm="example.com"):
+            async def new_call(call):
+                if not await auth.require_proxy_digest(call, realm="example.com"):
                     return
                 call.auth_user = normalise(call.auth_user)
 
