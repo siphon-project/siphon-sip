@@ -7,7 +7,12 @@ terminated state auto-removes too — so scripts never leak dialog state and
 subsequent state changes for the resource don't fan NOTIFYs out to gone
 watchers (RFC 6665 §4.4.1).
 """
+import asyncio
 from siphon_sdk import mock_module
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 def _fresh_presence():
@@ -31,7 +36,7 @@ def test_terminate_sends_terminated_notify_and_removes_dialog():
     )
     assert presence.subscription_count() == 1
 
-    sent = presence.terminate(sub_id, reason="timeout")
+    sent = run(presence.terminate(sub_id, reason="timeout"))
     assert sent is True
 
     notification = presence.notifications[-1]
@@ -51,16 +56,16 @@ def test_terminate_default_reason_is_noresource():
         from_tag="bt",
         to_tag="st",
     )
-    presence.terminate(sub_id)
+    run(presence.terminate(sub_id))
     assert presence.notifications[-1]["subscription_state"] \
         == "terminated;reason=noresource"
 
 
 def test_terminate_unknown_subscription_returns_false_and_is_idempotent():
     presence = _fresh_presence()
-    assert presence.terminate("sub-nonexistent") is False
+    assert run(presence.terminate("sub-nonexistent")) is False
     # Second call is still safe and observably the same.
-    assert presence.terminate("sub-nonexistent") is False
+    assert run(presence.terminate("sub-nonexistent")) is False
     assert presence.notifications == []
 
 
@@ -77,12 +82,12 @@ def test_notify_with_terminated_state_auto_removes_subscription():
         from_tag="bt",
         to_tag="st",
     )
-    presence.notify(
+    run(presence.notify(
         sub_id,
         body="<reginfo/>",
         content_type="application/reginfo+xml",
         subscription_state="terminated;reason=deactivated",
-    )
+    ))
     assert presence.subscription_count() == 0
 
 
@@ -97,7 +102,7 @@ def test_notify_with_active_state_does_not_remove():
         from_tag="bt",
         to_tag="st",
     )
-    presence.notify(sub_id, subscription_state="active;expires=3600")
+    run(presence.notify(sub_id, subscription_state="active;expires=3600"))
     assert presence.subscription_count() == 1
 
 

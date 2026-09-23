@@ -1,6 +1,11 @@
 """Notifier acceptance mirrors the native dialog lifecycle."""
+import asyncio
 from siphon_sdk.mock_module import MockSubscribeState
 from siphon_sdk.request import Request
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 def subscription(tag="", expires=300):
@@ -35,5 +40,5 @@ def test_zero_expiry_can_be_terminated_and_does_not_leak():
     for _ in range(200):
         handle = state.accept(subscription(expires=0))
         assert handle.expires == 0
-        handle.terminate(reason="deactivated", body="Messages-Waiting: no\r\n")
+        run(handle.terminate(reason="deactivated", body="Messages-Waiting: no\r\n"))
         assert state.local_count == 0

@@ -172,14 +172,16 @@ impl PySubscribeState {
     /// Look up a previously-created handle by id.  Returns ``None`` if
     /// the dialog is unknown, expired, or terminated.
     #[pyo3(signature = (id))]
-    fn get(&self, id: &str) -> PyResult<Option<PySubscribeHandle>> {
+    fn get<'py>(&self, python: Python<'py>, id: &str) -> PyResult<Bound<'py, PyAny>> {
         let store = Arc::clone(&self.store);
         let id_owned = id.to_string();
-        let found = crate::script::detach_block_on(store.get(&id_owned));
-        Ok(found.map(|dialog| PySubscribeHandle {
-            store: Arc::clone(&self.store),
-            id: dialog.id,
-        }))
+        crate::script::awaitable(python, async move {
+            let found = store.get(&id_owned).await;
+            Ok(found.map(|dialog| PySubscribeHandle {
+                store: Arc::clone(&store),
+                id: dialog.id,
+            }))
+        })
     }
 
     /// Number of subscribe dialogs currently held in the in-process
@@ -225,8 +227,10 @@ impl PySubscribeState {
         headers=None,
         timeout_ms=2000,
     ))]
-    fn send(
+    #[allow(clippy::too_many_arguments)]
+    fn send<'py>(
         &self,
+        python: Python<'py>,
         ruri: &str,
         event: &str,
         expires: u64,
@@ -234,205 +238,32 @@ impl PySubscribeState {
         target_uri: Option<&str>,
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
         timeout_ms: u64,
-    ) -> PyResult<PySubscribeHandle> {
-        let uac_sender = UAC_SENDER.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "subscribe_state.send() unavailable: UAC sender not initialized",
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Read the header dict here: a `Bound` cannot cross into the future.
+        let extra_headers: Vec<(String, String)> = match headers {
+            Some(dict) => dict
+                .iter()
+                .map(|(key, value)| Ok((key.extract::<String>()?, value.extract::<String>()?)))
+                .collect::<PyResult<_>>()?,
+            None => Vec::new(),
+        };
+        let store = Arc::clone(&self.store);
+        let (ruri, event) = (ruri.to_string(), event.to_string());
+        let accept = accept.map(str::to_string);
+        let target_uri = target_uri.map(str::to_string);
+
+        crate::script::awaitable(python, async move {
+            Self::send_inner(
+                store,
+                &ruri,
+                &event,
+                expires,
+                accept.as_deref(),
+                target_uri.as_deref(),
+                extra_headers,
+                timeout_ms,
             )
-        })?;
-        let resolver = SEND_RESOLVER.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "subscribe_state.send() unavailable: DNS resolver not initialized",
-            )
-        })?;
-
-        let ruri_parsed = parse_uri_standalone(ruri).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid request URI '{ruri}': {error}"
-            ))
-        })?;
-
-        // Resolve the next-hop: explicit target_uri (pre-loaded Route)
-        // wins, else the Request-URI.
-        let resolve_target = target_uri.unwrap_or(ruri);
-        let resolve_uri = parse_uri_standalone(resolve_target).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid target URI '{resolve_target}': {error}"
-            ))
-        })?;
-
-        let transport_hint = resolve_uri
-            .get_param("transport")
-            .map(|s: &str| s.to_string());
-        let resolver_clone = Arc::clone(resolver);
-        let host = resolve_uri.host.clone();
-        let port = resolve_uri.port;
-        let scheme = resolve_uri.scheme.clone();
-
-        let destination = crate::script::detach_block_on(resolver_clone.resolve(
-            &host,
-            port,
-            scheme.as_str(),
-            transport_hint.as_deref(),
-        ));
-        let target = destination.into_iter().next().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{resolve_target}'"
-            ))
-        })?;
-
-        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-            Some(hint) => match hint.to_lowercase().as_str() {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                "ws" => Transport::WebSocket,
-                "wss" => Transport::WebSocketSecure,
-                "sctp" => Transport::Sctp,
-                _ => Transport::Udp,
-            },
-            None => {
-                if scheme == "sips" {
-                    Transport::Tls
-                } else {
-                    Transport::Udp
-                }
-            }
-        };
-
-        // Mint dialog identity on our side.
-        let call_id = format!("py-sub-{}", Uuid::new_v4());
-        let local_tag = short_uuid();
-        // Advertise our own reachable host (FQDN-aware) + listen port in the
-        // Via/Contact so the notifier can route the response and any in-dialog
-        // NOTIFY back to us; addr_for only supplies the port here.
-        let local_host = uac_sender.via_host_for(&transport);
-        let local_port = uac_sender.addr_for(&transport).port();
-        let local_uri_default = strip_uri_params(ruri);
-
-        // Pre-extract the script-supplied header dict into a Vec so the
-        // builder can be assembled inside a non-Python helper that is unit
-        // testable.
-        let mut extra_headers: Vec<(String, String)> = Vec::new();
-        if let Some(header_dict) = headers {
-            for (key, value) in header_dict.iter() {
-                let name: String = key.extract().map_err(|error| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "header name must be str: {error}"
-                    ))
-                })?;
-                let val: String = value.extract().map_err(|error| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "header value must be str: {error}"
-                    ))
-                })?;
-                extra_headers.push((name, val));
-            }
-        }
-
-        let (message, cseq_value, from_override) = build_outbound_subscribe(
-            ruri,
-            ruri_parsed,
-            event,
-            expires,
-            accept,
-            target_uri,
-            transport,
-            &local_host,
-            local_port,
-            &call_id,
-            &local_tag,
-            &extra_headers,
-        )?;
-
-        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
-
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        let result =
-            crate::script::detach_block_on(async { tokio::time::timeout(timeout, receiver).await });
-
-        let response = match result {
-            Ok(Ok(crate::uac::UacResult::Response(message))) => *message,
-            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "subscribe_state.send() timed out waiting for 2xx",
-                ));
-            }
-        };
-
-        let status = response.status_code().unwrap_or(0);
-        if !(200..300).contains(&status) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "subscribe_state.send() got non-2xx response: {status}"
-            )));
-        }
-
-        // Extract dialog state from the 2xx.
-        let to_raw = response
-            .headers
-            .get("To")
-            .or_else(|| response.headers.get("t"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header"))?;
-        let remote_tag = extract_tag(&to_raw).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "2xx response To header missing tag — peer did not establish dialog",
-            )
-        })?;
-        let remote_uri = strip_nameaddr(&to_raw);
-
-        // Contact in 2xx is the notifier's remote target. Per RFC 3265,
-        // it's mandatory for SUBSCRIBE 2xx; tolerate absence by falling
-        // back to the original R-URI (some buggy peers omit it for
-        // already-established dialogs).
-        let remote_target = response
-            .headers
-            .get("Contact")
-            .or_else(|| response.headers.get("m"))
-            .map(|c| strip_nameaddr(c))
-            .unwrap_or_else(|| local_uri_default.clone());
-
-        // Reverse Record-Route per RFC 3261 §12.1.2 — we reverse here
-        // because the same field on inbound dialogs is reversed at
-        // create() time, so all storage holds Route in the order needed
-        // for outgoing in-dialog traffic.
-        let route_set: Vec<String> = response
-            .headers
-            .get_all("Record-Route")
-            .map(|entries| entries.iter().rev().cloned().collect())
-            .unwrap_or_default();
-
-        let local_uri = match from_override.as_ref() {
-            Some(val) => strip_nameaddr(val),
-            None => local_uri_default,
-        };
-
-        let id = short_uuid();
-        let dialog = SubscribeDialog {
-            id: id.clone(),
-            call_id,
-            local_tag,
-            remote_tag,
-            local_uri,
-            remote_uri,
-            remote_target,
-            received_address: None,
-            received_transport: None,
-            received_connection_id: None,
-            route_set,
-            event: event.to_string(),
-            expires_secs: expires,
-            created_at_unix: now_unix(),
-            cseq: cseq_value,
-            event_version: 0,
-            terminated: false,
-            is_outbound: true,
-        };
-        self.store.put(dialog);
-        debug!(id, "subscribe_state: outbound dialog established");
-
-        Ok(PySubscribeHandle {
-            store: Arc::clone(&self.store),
-            id,
+            .await
         })
     }
 
@@ -542,33 +373,39 @@ impl PySubscribeHandle {
     /// Returns ``True`` on success, ``False`` if the dialog has been
     /// terminated or is unknown.
     #[pyo3(signature = (body=None, content_type=None, state=None))]
-    fn notify(
+    fn notify<'py>(
         &self,
+        python: Python<'py>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         state: Option<&str>,
-    ) -> PyResult<bool> {
-        let dialog = match self.bump_cseq()? {
-            Some(dialog) => dialog,
-            None => return Ok(false),
-        };
-
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Read the body here: a `Bound` cannot cross into the future. The CSeq
+        // bump stays here too, so two NOTIFYs a script sends in order keep
+        // their order.
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
             None => None,
         };
-
+        let dialog = match self.bump_cseq()? {
+            Some(dialog) => dialog,
+            None => return crate::script::ready(python, false),
+        };
         let subscription_state = state
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("active;expires={}", dialog.remaining_secs()));
+        let content_type = content_type.map(str::to_string);
 
-        send_notify(
-            &dialog,
-            &subscription_state,
-            content_type,
-            body_bytes.as_deref(),
-        )?;
-        Ok(true)
+        crate::script::awaitable(python, async move {
+            send_notify(
+                &dialog,
+                &subscription_state,
+                content_type.as_deref(),
+                body_bytes.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        })
     }
 
     /// Terminate the subscription dialog.
@@ -585,43 +422,48 @@ impl PySubscribeHandle {
     /// the store. ``reason`` defaults to ``"noresource"`` and is only
     /// used for the notifier path.
     #[pyo3(signature = (reason=None, body=None, content_type=None))]
-    fn terminate(
+    fn terminate<'py>(
         &self,
+        python: Python<'py>,
         reason: Option<&str>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
-    ) -> PyResult<bool> {
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let body_bytes = match body {
+            Some(obj) => Some(super::request::extract_body_bytes(obj)?),
+            None => None,
+        };
         let dialog = match self.bump_cseq()? {
             Some(dialog) => dialog,
-            None => return Ok(false),
+            None => return crate::script::ready(python, false),
         };
+        let subscription_state = format!("terminated;reason={}", reason.unwrap_or("noresource"));
+        let content_type = content_type.map(str::to_string);
+        let store = Arc::clone(&self.store);
+        let id = self.id.clone();
 
-        if dialog.is_outbound {
-            // Watcher role — terminate by sending SUBSCRIBE Expires:0.
-            send_in_dialog_subscribe(&dialog, 0)?;
-        } else {
-            // Notifier role — send the final NOTIFY.
-            let reason_str = reason.unwrap_or("noresource");
-            let subscription_state = format!("terminated;reason={reason_str}");
-            let body_bytes = match body {
-                Some(obj) => Some(super::request::extract_body_bytes(obj)?),
-                None => None,
-            };
-            send_notify(
-                &dialog,
-                &subscription_state,
-                content_type,
-                body_bytes.as_deref(),
-            )?;
-        }
+        crate::script::awaitable(python, async move {
+            if dialog.is_outbound {
+                // Watcher role — terminate by sending SUBSCRIBE Expires:0.
+                send_in_dialog_subscribe(&dialog, 0).await?;
+            } else {
+                // Notifier role — send the final NOTIFY.
+                send_notify(
+                    &dialog,
+                    &subscription_state,
+                    content_type.as_deref(),
+                    body_bytes.as_deref(),
+                )
+                .await?;
+            }
 
-        // Mark terminated + remove.  Mark-then-remove gives a brief
-        // window where get() returns None even if the cache still has
-        // the entry (race-safe for cross-instance lookups).
-        self.store
-            .update(&self.id, |dialog| dialog.terminated = true);
-        self.store.remove(&self.id);
-        Ok(true)
+            // Mark terminated + remove.  Mark-then-remove gives a brief
+            // window where get() returns None even if the cache still has
+            // the entry (race-safe for cross-instance lookups).
+            store.update(&id, |dialog| dialog.terminated = true);
+            store.remove(&id);
+            Ok(true)
+        })
     }
 
     /// Re-SUBSCRIBE to refresh the dialog. Only valid on dialogs
@@ -635,7 +477,12 @@ impl PySubscribeHandle {
     /// non-2xx, timeout, or transport failure (existing dialog is
     /// kept; the script can decide to retry or terminate).
     #[pyo3(signature = (expires=None, timeout_ms=2000))]
-    fn refresh(&self, expires: Option<u64>, timeout_ms: u64) -> PyResult<bool> {
+    fn refresh<'py>(
+        &self,
+        python: Python<'py>,
+        expires: Option<u64>,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let dialog = self.load_sync()?;
         if !dialog.is_outbound {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -658,13 +505,17 @@ impl PySubscribeHandle {
                 ))
             })?;
 
-        send_in_dialog_subscribe_with_timeout(&bumped, new_expires, timeout_ms)?;
+        let store = Arc::clone(&self.store);
+        let id = self.id.clone();
+        crate::script::awaitable(python, async move {
+            send_in_dialog_subscribe_with_timeout(&bumped, new_expires, timeout_ms).await?;
 
-        // Commit the new expiry anchor.
-        self.store.update(&self.id, |dialog| {
-            dialog.refresh(new_expires);
-        });
-        Ok(true)
+            // Commit the new expiry anchor.
+            store.update(&id, |dialog| {
+                dialog.refresh(new_expires);
+            });
+            Ok(true)
+        })
     }
 
     /// Send a final NOTIFY using an already-built
@@ -684,6 +535,17 @@ impl PySubscribeHandle {
 }
 
 impl PySubscribeHandle {
+    /// Load the dialog, blocking on an L2 miss.
+    ///
+    /// The one blocking path left here, and deliberately so: it backs the
+    /// Python **properties** (`event`, `expires`, `local_tag`, …), and a
+    /// property cannot be awaited. Making it awaitable would mean turning them
+    /// into methods, which is a larger API change than this one.
+    ///
+    /// The exposure is small but real: an L1 hit — the common case — touches
+    /// no network, and only a miss reaches Redis and can hold an asyncio
+    /// driver. Read a property on a dialog this instance created and it is
+    /// always L1.
     fn load_sync(&self) -> PyResult<SubscribeDialog> {
         let store = Arc::clone(&self.store);
         let id = self.id.clone();
@@ -813,12 +675,12 @@ fn capture_incoming(
 
 /// Finish expired notifier dialogs outside the dispatcher task: DNS resolution
 /// must not stall SIP dispatch. State has already been removed by the sweep.
-pub(crate) fn notify_expired(mut dialog: SubscribeDialog) {
+pub(crate) async fn notify_expired(mut dialog: SubscribeDialog) {
     if dialog.terminated || dialog.is_outbound {
         return;
     }
     dialog.next_cseq();
-    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None) {
+    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None).await {
         tracing::error!(id = %dialog.id, %error, "failed to notify subscription expiry");
     }
 }
@@ -834,7 +696,7 @@ fn received_transport(name: &str) -> Transport {
     }
 }
 
-fn send_notify(
+async fn send_notify(
     dialog: &SubscribeDialog,
     subscription_state: &str,
     content_type: Option<&str>,
@@ -889,12 +751,9 @@ fn send_notify(
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
 
-        let destination = crate::script::detach_block_on(resolver_clone.resolve(
-            &host,
-            port,
-            scheme.as_str(),
-            transport_hint.as_deref(),
-        ));
+        let destination = resolver_clone
+            .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
+            .await;
 
         let target = destination.into_iter().next().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1010,8 +869,8 @@ fn send_notify(
 /// Send an in-dialog SUBSCRIBE (refresh or Expires:0 termination)
 /// without waiting for a response. Used by `terminate()` on outbound
 /// dialogs — the response carries no information we need.
-fn send_in_dialog_subscribe(dialog: &SubscribeDialog, expires_secs: u64) -> PyResult<()> {
-    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs)?;
+async fn send_in_dialog_subscribe(dialog: &SubscribeDialog, expires_secs: u64) -> PyResult<()> {
+    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs).await?;
     let uac_sender = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "subscribe_state outbound unavailable: UAC sender not initialized",
@@ -1024,12 +883,12 @@ fn send_in_dialog_subscribe(dialog: &SubscribeDialog, expires_secs: u64) -> PyRe
 /// Send an in-dialog SUBSCRIBE and block until the peer responds.
 /// Used by `refresh()` so the script learns about a non-2xx refresh
 /// failure synchronously.
-fn send_in_dialog_subscribe_with_timeout(
+async fn send_in_dialog_subscribe_with_timeout(
     dialog: &SubscribeDialog,
     expires_secs: u64,
     timeout_ms: u64,
 ) -> PyResult<()> {
-    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs)?;
+    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs).await?;
     let uac_sender = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "subscribe_state refresh unavailable: UAC sender not initialized",
@@ -1037,8 +896,7 @@ fn send_in_dialog_subscribe_with_timeout(
     })?;
     let receiver = uac_sender.send_request_with_response(message, target_addr, transport);
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let result =
-        crate::script::detach_block_on(async { tokio::time::timeout(timeout, receiver).await });
+    let result = tokio::time::timeout(timeout, receiver).await;
     match result {
         Ok(Ok(crate::uac::UacResult::Response(message))) => {
             let status = message.status_code().unwrap_or(0);
@@ -1058,7 +916,7 @@ fn send_in_dialog_subscribe_with_timeout(
 
 /// Build a SUBSCRIBE message inside an established dialog. Used for
 /// both refresh (`Expires: <new>`) and termination (`Expires: 0`).
-fn build_in_dialog_subscribe(
+async fn build_in_dialog_subscribe(
     dialog: &SubscribeDialog,
     expires_secs: u64,
 ) -> PyResult<(
@@ -1106,12 +964,9 @@ fn build_in_dialog_subscribe(
     let port = resolve_uri.port;
     let scheme = resolve_uri.scheme.clone();
 
-    let destination = crate::script::detach_block_on(resolver_clone.resolve(
-        &host,
-        port,
-        scheme.as_str(),
-        transport_hint.as_deref(),
-    ));
+    let destination = resolver_clone
+        .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
+        .await;
     let target = destination.into_iter().next().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "cannot resolve destination for '{resolve_target}'"
@@ -1383,6 +1238,200 @@ pub(crate) fn strip_nameaddr(value: &str) -> String {
         .unwrap_or(trimmed)
         .trim()
         .to_string()
+}
+
+impl PySubscribeState {
+    /// The outbound SUBSCRIBE itself: resolve, send, await the 2xx, record the
+    /// dialog. Awaitable because both the DNS lookup and the response wait are
+    /// network waits an asyncio driver must not be held for.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_inner(
+        store: Arc<SubscribeStore>,
+        ruri: &str,
+        event: &str,
+        expires: u64,
+        accept: Option<&str>,
+        target_uri: Option<&str>,
+        extra_headers: Vec<(String, String)>,
+        timeout_ms: u64,
+    ) -> PyResult<PySubscribeHandle> {
+        let uac_sender = UAC_SENDER.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "subscribe_state.send() unavailable: UAC sender not initialized",
+            )
+        })?;
+        let resolver = SEND_RESOLVER.get().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "subscribe_state.send() unavailable: DNS resolver not initialized",
+            )
+        })?;
+
+        let ruri_parsed = parse_uri_standalone(ruri).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid request URI '{ruri}': {error}"
+            ))
+        })?;
+
+        // Resolve the next-hop: explicit target_uri (pre-loaded Route)
+        // wins, else the Request-URI.
+        let resolve_target = target_uri.unwrap_or(ruri);
+        let resolve_uri = parse_uri_standalone(resolve_target).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid target URI '{resolve_target}': {error}"
+            ))
+        })?;
+
+        let transport_hint = resolve_uri
+            .get_param("transport")
+            .map(|s: &str| s.to_string());
+        let resolver_clone = Arc::clone(resolver);
+        let host = resolve_uri.host.clone();
+        let port = resolve_uri.port;
+        let scheme = resolve_uri.scheme.clone();
+
+        let destination = resolver_clone
+            .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
+            .await;
+        let target = destination.into_iter().next().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "cannot resolve destination for '{resolve_target}'"
+            ))
+        })?;
+
+        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
+            Some(hint) => match hint.to_lowercase().as_str() {
+                "tcp" => Transport::Tcp,
+                "tls" => Transport::Tls,
+                "ws" => Transport::WebSocket,
+                "wss" => Transport::WebSocketSecure,
+                "sctp" => Transport::Sctp,
+                _ => Transport::Udp,
+            },
+            None => {
+                if scheme == "sips" {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                }
+            }
+        };
+
+        // Mint dialog identity on our side.
+        let call_id = format!("py-sub-{}", Uuid::new_v4());
+        let local_tag = short_uuid();
+        // Advertise our own reachable host (FQDN-aware) + listen port in the
+        // Via/Contact so the notifier can route the response and any in-dialog
+        // NOTIFY back to us; addr_for only supplies the port here.
+        let local_host = uac_sender.via_host_for(&transport);
+        let local_port = uac_sender.addr_for(&transport).port();
+        let local_uri_default = strip_uri_params(ruri);
+
+        // Pre-extract the script-supplied header dict into a Vec so the
+        // builder can be assembled inside a non-Python helper that is unit
+        // testable. The header pairs were read from Python by the caller.
+
+        let (message, cseq_value, from_override) = build_outbound_subscribe(
+            ruri,
+            ruri_parsed,
+            event,
+            expires,
+            accept,
+            target_uri,
+            transport,
+            &local_host,
+            local_port,
+            &call_id,
+            &local_tag,
+            &extra_headers,
+        )?;
+
+        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
+
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let result = tokio::time::timeout(timeout, receiver).await;
+
+        let response = match result {
+            Ok(Ok(crate::uac::UacResult::Response(message))) => *message,
+            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "subscribe_state.send() timed out waiting for 2xx",
+                ));
+            }
+        };
+
+        let status = response.status_code().unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "subscribe_state.send() got non-2xx response: {status}"
+            )));
+        }
+
+        // Extract dialog state from the 2xx.
+        let to_raw = response
+            .headers
+            .get("To")
+            .or_else(|| response.headers.get("t"))
+            .cloned()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header"))?;
+        let remote_tag = extract_tag(&to_raw).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "2xx response To header missing tag — peer did not establish dialog",
+            )
+        })?;
+        let remote_uri = strip_nameaddr(&to_raw);
+
+        // Contact in 2xx is the notifier's remote target. Per RFC 3265,
+        // it's mandatory for SUBSCRIBE 2xx; tolerate absence by falling
+        // back to the original R-URI (some buggy peers omit it for
+        // already-established dialogs).
+        let remote_target = response
+            .headers
+            .get("Contact")
+            .or_else(|| response.headers.get("m"))
+            .map(|c| strip_nameaddr(c))
+            .unwrap_or_else(|| local_uri_default.clone());
+
+        // Reverse Record-Route per RFC 3261 §12.1.2 — we reverse here
+        // because the same field on inbound dialogs is reversed at
+        // create() time, so all storage holds Route in the order needed
+        // for outgoing in-dialog traffic.
+        let route_set: Vec<String> = response
+            .headers
+            .get_all("Record-Route")
+            .map(|entries| entries.iter().rev().cloned().collect())
+            .unwrap_or_default();
+
+        let local_uri = match from_override.as_ref() {
+            Some(val) => strip_nameaddr(val),
+            None => local_uri_default,
+        };
+
+        let id = short_uuid();
+        let dialog = SubscribeDialog {
+            id: id.clone(),
+            call_id,
+            local_tag,
+            remote_tag,
+            local_uri,
+            remote_uri,
+            remote_target,
+            received_address: None,
+            received_transport: None,
+            received_connection_id: None,
+            route_set,
+            event: event.to_string(),
+            expires_secs: expires,
+            created_at_unix: now_unix(),
+            cseq: cseq_value,
+            event_version: 0,
+            terminated: false,
+            is_outbound: true,
+        };
+        store.put(dialog);
+        debug!(id, "subscribe_state: outbound dialog established");
+
+        Ok(PySubscribeHandle { store, id })
+    }
 }
 
 #[cfg(test)]

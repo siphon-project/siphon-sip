@@ -381,28 +381,34 @@ class MockSubscribeHandle:
 
     def notify(self, body=None, content_type: Optional[str] = None,
                state: Optional[str] = None) -> bool:
-        if self._id not in self._parent._dialogs:
-            return False
-        entry = {
-            "id": self._id,
-            "body": body,
-            "content_type": content_type,
-            "state": state or f"active;expires={self.expires}",
-        }
-        self._parent.notifies.append(entry)
-        return True
+        async def _run():
+            if self._id not in self._parent._dialogs:
+                return False
+            entry = {
+                "id": self._id,
+                "body": body,
+                "content_type": content_type,
+                "state": state or f"active;expires={self.expires}",
+            }
+            self._parent.notifies.append(entry)
+            return True
+
+        return _run()
 
     def terminate(self, reason: Optional[str] = None,
                   body=None, content_type: Optional[str] = None) -> bool:
-        reason_str = reason or "noresource"
-        self._parent.terminates.append({
-            "id": self._id,
-            "reason": reason_str,
-            "body": body,
-            "content_type": content_type,
-        })
-        self._parent._dialogs.pop(self._id, None)
-        return True
+        async def _run():
+            reason_str = reason or "noresource"
+            self._parent.terminates.append({
+                "id": self._id,
+                "reason": reason_str,
+                "body": body,
+                "content_type": content_type,
+            })
+            self._parent._dialogs.pop(self._id, None)
+            return True
+
+        return _run()
 
     def refresh(self, expires: Optional[int] = None,
                 timeout_ms: int = 2000) -> bool:
@@ -412,20 +418,23 @@ class MockSubscribeHandle:
         the dialog wasn't created via ``send()`` (consistent with the
         Rust contract that refresh is only valid on outbound dialogs).
         """
-        if not self._dialog.get("is_outbound"):
-            raise RuntimeError(
-                "refresh() is only valid on outbound dialogs (created via send())"
-            )
-        if not hasattr(self._parent, "refreshes"):
-            self._parent.refreshes = []
-        new_expires = expires if expires is not None else self.expires
-        self._dialog["expires_secs"] = new_expires
-        self._parent.refreshes.append({
-            "id": self._id,
-            "expires": new_expires,
-            "timeout_ms": timeout_ms,
-        })
-        return True
+        async def _run():
+            if not self._dialog.get("is_outbound"):
+                raise RuntimeError(
+                    "refresh() is only valid on outbound dialogs (created via send())"
+                )
+            if not hasattr(self._parent, "refreshes"):
+                self._parent.refreshes = []
+            new_expires = expires if expires is not None else self.expires
+            self._dialog["expires_secs"] = new_expires
+            self._parent.refreshes.append({
+                "id": self._id,
+                "expires": new_expires,
+                "timeout_ms": timeout_ms,
+            })
+            return True
+
+        return _run()
 
     def __repr__(self) -> str:
         return f"MockSubscribeHandle(id={self._id!r})"
@@ -484,10 +493,13 @@ class MockSubscribeState:
         return handle
 
     def get(self, id: str) -> Optional[MockSubscribeHandle]:
-        dialog = self._dialogs.get(id)
-        if dialog is None:
-            return None
-        return MockSubscribeHandle(self, id, dialog)
+        async def _run():
+            dialog = self._dialogs.get(id)
+            if dialog is None:
+                return None
+            return MockSubscribeHandle(self, id, dialog)
+
+        return _run()
 
     def send(
         self,
@@ -504,33 +516,36 @@ class MockSubscribeState:
         Tests can assert on the recorded ``self.sends`` list to verify a
         script originated a SUBSCRIBE with the expected parameters.
         """
-        import uuid
-        if not hasattr(self, "sends"):
-            self.sends = []
-        handle_id = uuid.uuid4().hex
-        local_tag = uuid.uuid4().hex
-        remote_tag = uuid.uuid4().hex
-        dialog = {
-            "id": handle_id,
-            "event": event,
-            "expires_secs": expires,
-            "call_id": f"py-sub-{uuid.uuid4().hex}",
-            "local_tag": local_tag,
-            "remote_tag": remote_tag,
-            "event_version": 0,
-            "is_outbound": True,
-        }
-        self._dialogs[handle_id] = dialog
-        self.sends.append({
-            "ruri": ruri,
-            "event": event,
-            "expires": expires,
-            "accept": accept,
-            "target_uri": target_uri,
-            "headers": dict(headers or {}),
-            "timeout_ms": timeout_ms,
-        })
-        return MockSubscribeHandle(self, handle_id, dialog)
+        async def _run():
+            import uuid
+            if not hasattr(self, "sends"):
+                self.sends = []
+            handle_id = uuid.uuid4().hex
+            local_tag = uuid.uuid4().hex
+            remote_tag = uuid.uuid4().hex
+            dialog = {
+                "id": handle_id,
+                "event": event,
+                "expires_secs": expires,
+                "call_id": f"py-sub-{uuid.uuid4().hex}",
+                "local_tag": local_tag,
+                "remote_tag": remote_tag,
+                "event_version": 0,
+                "is_outbound": True,
+            }
+            self._dialogs[handle_id] = dialog
+            self.sends.append({
+                "ruri": ruri,
+                "event": event,
+                "expires": expires,
+                "accept": accept,
+                "target_uri": target_uri,
+                "headers": dict(headers or {}),
+                "timeout_ms": timeout_ms,
+            })
+            return MockSubscribeHandle(self, handle_id, dialog)
+
+        return _run()
 
     def find(
         self,
@@ -7579,14 +7594,17 @@ class MockPresence:
             content_type: Content-Type of the body.
             subscription_state: Subscription-State header value (default ``"active"``).
         """
-        self._notifications.append({
-            "subscription_id": subscription_id,
-            "body": body,
-            "content_type": content_type,
-            "subscription_state": subscription_state,
-        })
-        if _is_terminated_subscription_state(subscription_state):
-            self._subscriptions.pop(subscription_id, None)
+        async def _run():
+            self._notifications.append({
+                "subscription_id": subscription_id,
+                "body": body,
+                "content_type": content_type,
+                "subscription_state": subscription_state,
+            })
+            if _is_terminated_subscription_state(subscription_state):
+                self._subscriptions.pop(subscription_id, None)
+
+        return _run()
 
     def terminate(self, subscription_id: str, reason: Optional[str] = None,
                   body: Optional[str] = None,
@@ -7617,16 +7635,19 @@ class MockPresence:
             ...
             presence.terminate(sub_id, reason="timeout")
         """
-        if subscription_id not in self._subscriptions:
-            return False
-        reason_str = reason or "noresource"
-        self.notify(
-            subscription_id,
-            body=body,
-            content_type=content_type,
-            subscription_state=f"terminated;reason={reason_str}",
-        )
-        return True
+        async def _run():
+            if subscription_id not in self._subscriptions:
+                return False
+            reason_str = reason or "noresource"
+            await self.notify(
+                subscription_id,
+                body=body,
+                content_type=content_type,
+                subscription_state=f"terminated;reason={reason_str}",
+            )
+            return True
+
+        return _run()
 
     @property
     def notifications(self) -> list:
