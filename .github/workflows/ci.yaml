@@ -87,6 +87,23 @@ jobs:
       - run: scripts/check_file_size.py
       - run: scripts/check_too_many_lines_allows.py
 
+  # ── Missing-`await` gate ────────────────────────────────────────────────
+  # A forgotten `await` on an awaitable script API does not raise: the call
+  # returns a truthy coroutine that never runs, so the handler reads as
+  # working. Neither the scripts nor the doc snippets are executed by any
+  # test, so this is the only place that catches it. Toolchain-free, same as
+  # the size gate.
+  script-await:
+    name: script await
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Prove the matcher still discriminates before trusting its verdict — a
+      # gate that silently stops matching is how a check like this fails.
+      - run: scripts/check_awaited_apis.py --self-test
+      - run: scripts/check_awaited_apis.py
+      - run: scripts/check_awaited_apis.py --docs
+
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
   # are needed for the crate to compile at all). `-D warnings` turns any

@@ -13,7 +13,7 @@ from siphon import proxy, registrar, auth, log
 DOMAIN = "example.com"
 
 @proxy.on_request
-def route(request):
+async def route(request):
     # 1. Drop malformed / torture traffic before any work (RFC 4475).
     #    Scoped to out-of-dialog requests; dropped silently so we don't
     #    fingerprint the server to scanners.
@@ -35,7 +35,7 @@ def route(request):
 
     # 4. REGISTER.
     if request.method == "REGISTER":
-        if not auth.require_digest(request, realm=DOMAIN):
+        if not await auth.require_digest(request, realm=DOMAIN):
             return
         registrar.save(request)
         return

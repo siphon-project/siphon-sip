@@ -49,6 +49,7 @@ the case for a dialog this instance created — touches no network.
 
 Add `await`, and make the handler `async def` if it is not already:
 
+<!-- await-gate: shows the pre-1.10 form on purpose -->
 ```python
 # before
 @proxy.on_request("REGISTER")
@@ -87,6 +88,7 @@ Loud, and it names the fix.
 **You forgot the `await` itself.** This one is quiet and it is the dangerous
 one. The call returns a coroutine, which is **truthy**, so:
 
+<!-- await-gate: demonstrates the missing-await bug on purpose -->
 ```python
 if not auth.require_digest(request, realm=REALM):   # missing await
     return                                          # never taken

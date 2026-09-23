@@ -1704,7 +1704,7 @@ class MockRegistrar:
         Example::
 
             if request.method == "REGISTER":
-                if not auth.require_digest(request, realm=DOMAIN):
+                if not await auth.require_digest(request, realm=DOMAIN):
                     return
                 # Generate an opaque token, write it into Path so MT
                 # requests come back with it on the topmost Route.
@@ -2594,7 +2594,7 @@ class MockAuth:
         check::
 
             if not auth.validate_nonce(nonce_from_the_header):
-                auth.require_www_digest(request, realm)   # stale — re-challenge
+                await auth.require_www_digest(request, realm)   # stale — re-challenge
                 return
 
         The mock checks freshness only — it has no shared secret, so it cannot
@@ -2740,8 +2740,8 @@ class MockAuth:
         A-leg::
 
             @b2bua.on_invite
-            def new_call(call):
-                if not auth.require_proxy_digest(call, realm="example.com"):
+            async def new_call(call):
+                if not await auth.require_proxy_digest(call, realm="example.com"):
                     return          # 407 armed; siphon answers the A-leg
                 call.dial(call.ruri)
 
@@ -2980,8 +2980,8 @@ class MockAuth:
         no credential source configured at all::
 
             secret = await cache.fetch("secrets", request.auth_user)
-            if not auth.verify_digest(request, realm, password=secret):
-                auth.require_www_digest(request, realm)
+            if not await auth.verify_digest(request, realm, password=secret):
+                await auth.require_www_digest(request, realm)
                 return
 
         ``ha1=`` takes an already-computed H(A1) verbatim, so a deployment can
@@ -6083,6 +6083,7 @@ class MockDiameter:
 
     Example::
 
+        import asyncio
         from siphon_sdk import mock_module
         mock_module.install()
         diameter = mock_module.get_diameter()
@@ -6091,7 +6092,9 @@ class MockDiameter:
 
         from siphon import diameter
         assert diameter.is_connected("hss1")
-        result = diameter.cx_uar("sip:alice@ims.example.com")
+        # The request methods are awaitable, as they are in siphon, so a
+        # synchronous test drives one through asyncio.run.
+        result = asyncio.run(diameter.cx_uar("sip:alice@ims.example.com"))
         assert result["server_name"] == "sip:scscf.ims.example.com:6060"
     """
 
@@ -6358,7 +6361,7 @@ class MockDiameter:
 
         Example::
 
-            result = diameter.rx_aar(
+            result = await diameter.rx_aar(
                 framed_ip=request.source_ip,
                 media_components=components,
                 # loss of bearer, release of bearer, failed allocation
@@ -7633,7 +7636,7 @@ class MockPresence:
 
             sub_id = presence.subscribe_dialog(...)
             ...
-            presence.terminate(sub_id, reason="timeout")
+            await presence.terminate(sub_id, reason="timeout")
         """
         async def _run():
             if subscription_id not in self._subscriptions:
@@ -8325,11 +8328,14 @@ class MockSbi:
 
     Example::
 
+        import asyncio
         from siphon_sdk import mock_module
         mock_module.install()
 
         from siphon import sbi
-        result = sbi.create_session(sip_call_id="call-1", ue_ipv4="10.0.0.1")
+        # Awaitable, as in siphon, so a synchronous test drives it through
+        # asyncio.run; an async test just awaits it.
+        result = asyncio.run(sbi.create_session(sip_call_id="call-1", ue_ipv4="10.0.0.1"))
         assert result["authorized"] is True
     """
 
@@ -8436,7 +8442,7 @@ class MockSbi:
 
         Example::
 
-            result = sbi.create_session(
+            result = await sbi.create_session(
                 sip_call_id=request.call_id,
                 ue_ipv4=request.source_ip,
                 notif_uri="http://192.0.2.10:8080/sbi/events",
@@ -8496,8 +8502,8 @@ class MockSbi:
         Example::
 
             @sbi.on_terminate
-            def handle_termination(termination):
-                if not sbi.delete_session(termination["resUri"]):
+            async def handle_termination(termination):
+                if not await sbi.delete_session(termination["resUri"]):
                     log.warn("app session delete failed; PCF still holds it")
         """
         if self._delete_failure:
@@ -8665,7 +8671,7 @@ class MockSbi:
             @sbi.on_terminate
             async def handle_termination(termination):
                 log.warn(f"PCF ended app session: {termination['termCause']}")
-                sbi.delete_session(termination["resUri"])
+                await sbi.delete_session(termination["resUri"])
         """
         return fn
 
@@ -9473,7 +9479,7 @@ class MockQos:
         components = qos.media_flows_from_sdp(
             offer=request.body, answer=reply.body, direction="orig",
         )
-        diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
+        await diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
     """
 
     def media_flows_from_sdp(self, *, offer: Any, answer: Any,

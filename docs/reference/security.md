@@ -8,9 +8,9 @@ STIR/SHAKEN signing and verification.
 from siphon import auth
 
 @proxy.on_request("INVITE")
-def route(request):
-    if not auth.verify_digest(request, "example.com"):
-        auth.require_proxy_digest(request, "example.com")
+async def route(request):
+    if not await auth.verify_digest(request, "example.com"):
+        await auth.require_proxy_digest(request, "example.com")
         return
     request.relay()
 ```
@@ -26,8 +26,8 @@ simply never run.
 from siphon import auth, b2bua, log
 
 @b2bua.on_invite
-def new_call(call):
-    if not auth.require_proxy_digest(call, realm="example.com"):
+async def new_call(call):
+    if not await auth.require_proxy_digest(call, realm="example.com"):
         return                      # 407 armed; siphon answers the A-leg
     log.info(f"call from {call.auth_user}")
     call.dial(str(call.ruri))
@@ -61,9 +61,9 @@ writable, so the script reduces the credential **after** verification:
 
 ```python
 @proxy.on_request("REGISTER")
-def register(request):
-    if not auth.verify_digest(request, realm="example.com"):
-        auth.require_www_digest(request, realm="example.com")
+async def register(request):
+    if not await auth.verify_digest(request, realm="example.com"):
+        await auth.require_www_digest(request, realm="example.com")
         return
     request.auth_user = request.auth_user.split(":", 1)[1]
     registrar.save(request)
@@ -171,8 +171,8 @@ for siphon to fetch a value the script already has.
 @proxy.on_request("REGISTER")
 async def register(request):
     secret = await cache.fetch("secrets", derive_key(request))
-    if secret is None or not auth.verify_digest(request, realm, password=secret):
-        auth.require_www_digest(request, realm)
+    if secret is None or not await auth.verify_digest(request, realm, password=secret):
+        await auth.require_www_digest(request, realm)
         return
     registrar.save(request)
 ```

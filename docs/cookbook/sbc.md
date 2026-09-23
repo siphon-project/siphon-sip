@@ -350,8 +350,8 @@ while lightly proxying registrations:
 
 ```python
 @proxy.on_request("REGISTER")
-def on_register(request):
-    if auth.require_digest(request, realm=DOMAIN):
+async def on_register(request):
+    if await auth.require_digest(request, realm=DOMAIN):
         registrar.save(request)
 
 @b2bua.on_invite
@@ -371,8 +371,8 @@ digest helpers instead:
 from siphon import auth, b2bua, gateway, log
 
 @b2bua.on_invite
-def on_invite(call):
-    if not auth.require_proxy_digest(call, realm=DOMAIN):
+async def on_invite(call):
+    if not await auth.require_proxy_digest(call, realm=DOMAIN):
         return                      # 407 armed; siphon answers the A-leg
 
     log.info(f"authenticated {call.auth_user}")

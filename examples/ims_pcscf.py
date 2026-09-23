@@ -106,7 +106,7 @@ async def on_invite_reply(request, reply):
         direction="orig",
     )
 
-    result = diameter.rx_aar(
+    result = await diameter.rx_aar(
         framed_ip=source_ip,
         media_components=components,
     )
@@ -130,7 +130,7 @@ async def _release_qos(call_id):
         return
     await cache.delete(QOS_CACHE, call_id)
     if diameter.peer_count() > 0:
-        result = diameter.rx_str(session_id)
+        result = await diameter.rx_str(session_id)
         log.info(f"Rx STR for call {call_id}: result_code={result}")
 
 

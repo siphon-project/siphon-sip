@@ -9,11 +9,11 @@ direction — outbound REGISTER to upstream carriers and SBCs.
 from siphon import registrar
 
 @proxy.on_request("REGISTER")
-def register(request):
-    if auth.verify_digest(request, "example.com"):
+async def register(request):
+    if await auth.verify_digest(request, "example.com"):
         registrar.save(request)   # saves contacts and sends 200 OK
     else:
-        auth.require_www_digest(request, "example.com")
+        await auth.require_www_digest(request, "example.com")
 ```
 
 When the registrar refuses a binding, `registrar.save()` answers the REGISTER

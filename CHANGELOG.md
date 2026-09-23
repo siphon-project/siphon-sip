@@ -123,6 +123,35 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The IMS P-CSCF example reserved and released no QoS bearer.** Both Rx calls
+  in `examples/ims_pcscf.py` were written without `await` against APIs that are
+  now awaitable, so each returned a coroutine that never ran: the AAR reserved
+  nothing on the dedicated bearer, and the STR on teardown released nothing,
+  leaving the PCRF session to age out on its own. Neither raised — the AAR's
+  coroutine is truthy, so the success branch was taken and logged, and the STR's
+  was simply formatted into the log line as if it were a result code.
+
+- **The docs showed twenty calls without the `await` they now need**, across the
+  README, four cookbook pages and three reference pages — including
+  `if not auth.require_www_digest(...)`, which is the shape that silently
+  authenticates. Copied as written, those snippets would have skipped the
+  challenge and relayed the request. The enclosing handlers are now `async def`
+  where the example defines one.
+
+- **The SDK docstring examples showed the same seventeen.** Those docstrings are
+  the reference a script author — or a code assistant reading the package — works
+  from, so an example there propagates like any other. Prose that merely names a
+  method is unchanged; only example code was corrected. The two examples that
+  drive the API from a synchronous test now show `asyncio.run(...)`, which is
+  what the SDK's own tests do, rather than an `await` that cannot run there.
+
+  A `scripts/check_awaited_apis.py` gate now walks the AST of every shipped
+  script, and of every python block in the docs, and fails on an awaitable
+  siphon call that is not awaited. That is the only way to catch this class:
+  neither the scripts nor the snippets are executed by any test, and a missed
+  `await` reads as working code at every other layer. The gate self-tests
+  against a labelled fixture in CI, so it cannot quietly stop matching.
+
 - **The registrar's write-through queue is bounded, and `aor_count()` no longer
   waits on it without a deadline.** `registrar.aor_count()` awaited a oneshot
   with no timeout, queued behind a writer draining an **unbounded** channel. Each
