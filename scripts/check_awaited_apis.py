@@ -348,10 +348,11 @@ def main(argv):
 
     findings, checked = [], 0
     for root in roots:
-        if docs:
-            paths = sorted(root.rglob("*.md")) if root.is_dir() else [root]
-        else:
-            paths = sorted(root.rglob("*.py"))
+        # A file argument must check that file. `rglob` on a non-directory
+        # yields nothing, which would report a cheerful zero-findings pass over
+        # zero files — the silent no-op this gate exists to prevent.
+        pattern = "*.md" if docs else "*.py"
+        paths = sorted(root.rglob(pattern)) if root.is_dir() else [root]
         for path in paths:
             checked += 1
             try:

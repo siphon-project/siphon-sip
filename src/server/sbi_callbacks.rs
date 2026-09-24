@@ -8,13 +8,12 @@
 //! |------------------------------|----------------------|----------------------|----------------------|
 //! | `POST /sbi/events/notify`    | `eventNotification`  | `EventsNotification` | `@sbi.on_event`      |
 //! | `POST /sbi/events/terminate` | `terminationRequest` | `TerminationInfo`    | `@sbi.on_terminate`  |
-//! | `POST /sbi/events`           | none (deprecated)    | `EventsNotification` | `@sbi.on_event`      |
 //!
-//! The bare route predates the suffixed ones and only serves a PCF that posts
-//! to the advertised URI as-is. Everything else is 404.
+//! Everything else is 404, including the bare `POST /sbi/events`. That route
+//! predated the suffixed ones and served a PCF that posted to the advertised
+//! URI without the suffix; it was deprecated in 1.9.0 and removed in 1.10.0.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -35,10 +34,6 @@ struct CallbackState {
     script_state: Arc<ArcSwap<ScriptState>>,
 }
 
-/// Set once the deprecated bare route has been used, so the deprecation is
-/// logged once per process rather than once per notification.
-static BARE_ROUTE_SEEN: AtomicBool = AtomicBool::new(false);
-
 /// The callback routes, dispatching to the handlers in `script_state`.
 pub(super) fn router(script_state: Arc<ArcSwap<ScriptState>>) -> Router {
     Router::new()
@@ -52,19 +47,6 @@ pub(super) fn router(script_state: Arc<ArcSwap<ScriptState>>) -> Router {
             "/sbi/events/terminate",
             post(|State(state): State<CallbackState>, body: Bytes| {
                 handle_callback(state, HandlerKind::SbiOnTerminate, "sbi.on_terminate", body)
-            }),
-        )
-        .route(
-            "/sbi/events",
-            post(|State(state): State<CallbackState>, body: Bytes| {
-                if !BARE_ROUTE_SEEN.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "a PCF event notification arrived on the deprecated /sbi/events route; \
-                         TS 29.514 posts to {{notifUri}}/notify, and the bare route goes away \
-                         in the next minor release"
-                    );
-                }
-                handle_callback(state, HandlerKind::SbiOnEvent, "sbi.on_event", body)
             }),
         )
         .with_state(CallbackState { script_state })

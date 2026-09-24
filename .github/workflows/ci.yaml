@@ -103,6 +103,11 @@ jobs:
       - run: scripts/check_awaited_apis.py --self-test
       - run: scripts/check_awaited_apis.py
       - run: scripts/check_awaited_apis.py --docs
+      # The other half of the same trade-off: a handler that awaits needs a
+      # driver, and one that does not must not pay for it. Measured at 645 % vs
+      # 297 % peak CPU on the 40k row, identical throughput.
+      - run: scripts/check_hot_path_dispatch.py --self-test
+      - run: scripts/check_hot_path_dispatch.py
 
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev

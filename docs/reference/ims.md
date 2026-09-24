@@ -36,9 +36,10 @@ only arrive for what the session subscribed to, with
 `create_session(events=[...], notif_uri=...)` or
 `update_session(events=[...])`.
 
-`POST /sbi/events` without a suffix still reaches `@sbi.on_event` for a PCF
-that posts to the advertised URI as-is. It is deprecated and will be removed in
-the next minor release.
+The bare `POST /sbi/events`, which reached `@sbi.on_event` for a PCF that posted
+to the advertised URI without a suffix, was deprecated in 1.9.0 and removed in
+1.10.0. It now answers `404` like any other unknown path. A PCF that appends the
+TS 29.514 suffix — which is what the spec defines — is unaffected.
 
 ::: siphon_sdk.mock_module.MockSbi
 

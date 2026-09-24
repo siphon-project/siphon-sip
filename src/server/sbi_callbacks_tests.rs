@@ -159,17 +159,20 @@ async fn terminate_route_runs_on_terminate_and_not_on_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bare_events_route_still_runs_on_event() {
+async fn bare_events_route_is_gone_and_runs_nothing() {
+    // Deprecated in 1.9.0 with the removal release named, removed in 1.10.0.
+    // TS 29.514 has the PCF append a suffix to `notifUri`, so the bare path only
+    // ever served a PCF that posted the advertised URI verbatim. Asserting the
+    // 404 *and* that no handler ran keeps the removal honest: a route that
+    // silently dispatched to `@sbi.on_event` anyway would still pass a
+    // status-only check if it answered 404 for some other reason.
     let recording = recording("on_event");
     let app = router(Arc::clone(&recording.script_state));
 
     let status = post(app, "/sbi/events", EVENTS_NOTIFICATION).await;
 
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(
-        recording.received(),
-        vec![("sbi.on_event".to_string(), json(EVENTS_NOTIFICATION))]
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(recording.received().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -188,7 +191,7 @@ async fn non_json_body_is_rejected_on_every_route() {
     let recording = recording("on_event");
     let app = router(Arc::clone(&recording.script_state));
 
-    for path in ["/sbi/events/notify", "/sbi/events/terminate", "/sbi/events"] {
+    for path in ["/sbi/events/notify", "/sbi/events/terminate"] {
         let status = post(app.clone(), path, "not json at all").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
