@@ -7197,13 +7197,26 @@ class MockDiameter:
             "user_name": None,
             "sgsn_number": None,
             "mme_number_for_mt_sms": None,
+            "mme_name": None,
+            "mme_realm": None,
+            "sgsn_name": None,
+            "sgsn_realm": None,
+            "msc_number": None,
         }
 
     def set_srr_response(self, msisdn: str, *, result_code: int = 2001,
                           user_name: Optional[str] = None,
                           sgsn_number: Optional[str] = None,
                           mme_number_for_mt_sms: Optional[str] = None,
+                          mme_name: Optional[str] = None,
+                          mme_realm: Optional[str] = None,
+                          sgsn_name: Optional[str] = None,
+                          sgsn_realm: Optional[str] = None,
+                          msc_number: Optional[str] = None,
                           experimental_result_code: Optional[int] = None) -> None:
+        """`mme_name` / `mme_realm` are the located node's Diameter identity from the
+        grouped Serving-Node — for a UE doing SMS over NAS on 5G that is the SMSF
+        (TS 29.338 §6.3.2.4), which is what an MT-Forward-Short-Message is addressed to."""
         if not hasattr(self, "_srr_responses"):
             self._srr_responses = {}
         self._srr_responses[msisdn] = {
@@ -7212,6 +7225,11 @@ class MockDiameter:
             "user_name": user_name,
             "sgsn_number": sgsn_number,
             "mme_number_for_mt_sms": mme_number_for_mt_sms,
+            "mme_name": mme_name,
+            "mme_realm": mme_realm,
+            "sgsn_name": sgsn_name,
+            "sgsn_realm": sgsn_realm,
+            "msc_number": msc_number,
         }
 
     async def s6c_rsr(self, user_name: str, sc_address: str,
@@ -7235,10 +7253,16 @@ class MockDiameter:
 
     async def sgd_tfr(self, user_name: str, sc_address: str, sm_rp_ui: bytes,
                 smsmi_correlation_id: Optional[str] = None,
-                sm_rp_mti: Optional[int] = None) -> Optional[dict]:
+                sm_rp_mti: Optional[int] = None,
+                destination_host: Optional[str] = None,
+                destination_realm: Optional[str] = None) -> Optional[dict]:
         """Mock MT-Forward-Short-Message. Records the TPDU on ``self.tfrs``
         for assertions; returns 2001 unless overridden via
-        :meth:`set_tfr_response`."""
+        :meth:`set_tfr_response`.
+
+        ``destination_host`` is the node the preceding SRI-SM located (``mme_name``).
+        Omitting it falls back to static peer config, which addresses the request at
+        whatever the relay's catch-all route resolves to rather than at the serving node."""
         if not hasattr(self, "tfrs"):
             self.tfrs = []
         self.tfrs.append({
@@ -7247,6 +7271,8 @@ class MockDiameter:
             "sm_rp_ui": bytes(sm_rp_ui),
             "smsmi_correlation_id": smsmi_correlation_id,
             "sm_rp_mti": sm_rp_mti,
+            "destination_host": destination_host,
+            "destination_realm": destination_realm,
         })
         if not hasattr(self, "_tfr_responses"):
             self._tfr_responses = {}

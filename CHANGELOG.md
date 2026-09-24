@@ -137,6 +137,33 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An S6c SRA is read for the node it actually names, and the SGd MT-Forward is
+  addressed there.** `parse_sra` read `SGSN-Number` and `MME-Number-for-MT-SMS`
+  from the top level of the answer, but TS 29.338 §6.3.2 carries the located node
+  in the grouped `Serving-Node` AVP. A conformant answer therefore parsed as "no
+  serving node" and nothing in the log said so, so MT-SMS never took the SGd path
+  at all. The group is now read first, with the top level kept as a fallback for
+  peers that flatten it.
+
+  `build_mt_forward_short_message_request` then took `Destination-Realm` and
+  `Destination-Host` from static peer config and ignored the answer entirely, so
+  the request matched whatever catch-all route the relay had and was delivered to
+  the HSS rather than to the serving node. Because the HSS answers, the misroute
+  read as a rejection rather than as wrong addressing.
+
+  `s6c_srr` gains `mme_name`, `mme_realm`, `sgsn_name`, `sgsn_realm` and
+  `msc_number` in its result, and `sgd_tfr` gains `destination_host` and
+  `destination_realm`; omitting them keeps the previous peer-config behaviour. For
+  a UE registered for SMS over NAS on 5G the HSS folds the **SMSF** identity into
+  `MME-Name` (TS 29.338 §6.3.2.4), so anything logging it should say "serving
+  node" or a 5G delivery reads as a 4G one in every trace.
+
+  The `Serving-Node` family (2401–2410) and `User-Identifier` (3102) are added to
+  the AVP dictionary. `User-Identifier` is what names the originating subscriber
+  on an inbound `MO-Forward-Short-Message`; its `MSISDN` child is the only thing
+  in an OFR that says who sent the message, and without it a receiving SMSC has
+  nothing but the IMSI and the recipient cannot reply.
+
 - **An `async def` handler that never awaits no longer costs an asyncio task.**
   `await`, `async for` and `async with` all compile to a `YIELD_VALUE` in the
   enclosing coroutine, so a handler whose code object contains none — in it or
