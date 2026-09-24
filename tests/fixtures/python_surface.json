@@ -767,7 +767,7 @@
       "sgd_tfr": {
         "doc": "Send an SGd MT-Forward-Short-Message request to the served node",
         "kind": "method_descriptor",
-        "sig": "($self, user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None)"
+        "sig": "($self, user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None, destination_host=None, destination_realm=None)"
       },
       "sh_pur": {
         "doc": "Send a Sh Profile-Update-Request to the HSS (AS role).",

@@ -1966,8 +1966,14 @@ impl PyDiameter {
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), ``user_name`` (IMSI, optional),
-    ///     ``sgsn_number`` (str, set when 2G/3G delivery), and
-    ///     ``mme_number_for_mt_sms`` (str, set when LTE delivery).
+    ///     ``sgsn_number`` (str, set when 2G/3G delivery),
+    ///     ``mme_number_for_mt_sms`` (str, set when LTE delivery), and the
+    ///     located node from the grouped ``Serving-Node``: ``mme_name`` /
+    ///     ``mme_realm``, ``sgsn_name`` / ``sgsn_realm``, ``msc_number``.
+    ///     ``mme_name`` is the SMSF identity for a UE registered for SMS over
+    ///     NAS on 5G (TS 29.338 §6.3.2.4), so it names whichever node
+    ///     terminates SMS. Pass it and its realm to :meth:`sgd_tfr` as
+    ///     ``destination_host`` / ``destination_realm``.
     ///     ``None`` when no Diameter peer is connected.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
@@ -2004,6 +2010,11 @@ impl PyDiameter {
                         dict.set_item("user_name", sra.user_name)?;
                         dict.set_item("sgsn_number", sra.sgsn_number)?;
                         dict.set_item("mme_number_for_mt_sms", sra.mme_number_for_mt_sms)?;
+                        dict.set_item("mme_name", sra.mme_name)?;
+                        dict.set_item("mme_realm", sra.mme_realm)?;
+                        dict.set_item("sgsn_name", sra.sgsn_name)?;
+                        dict.set_item("sgsn_realm", sra.sgsn_realm)?;
+                        dict.set_item("msc_number", sra.msc_number)?;
                         Ok(Some(dict.unbind()))
                     }),
                     None => {
@@ -2095,6 +2106,13 @@ impl PyDiameter {
     ///     smsmi_correlation_id: Optional opaque correlation reference
     ///         the SMSC uses to bind the TFR to its own queueing state.
     ///     sm_rp_mti: SM-RP MTI — 0 = SMS Deliver, 1 = Status Report.
+    ///     destination_host: Diameter identity of the node to address the
+    ///         TFR to — ``mme_name`` from the preceding :meth:`s6c_srr`.
+    ///         Omitting it falls back to static peer config, which in a
+    ///         deployed core matches the relay's catch-all route and delivers
+    ///         the message to the HSS instead of the serving node.
+    ///     destination_realm: Realm of ``destination_host``. Defaults to the
+    ///         peer's configured realm.
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``absent_user_diagnostic``
@@ -2103,7 +2121,8 @@ impl PyDiameter {
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (user_name, sc_address, sm_rp_ui, smsmi_correlation_id=None, sm_rp_mti=None, destination_host=None, destination_realm=None))]
     fn sgd_tfr<'py>(
         &self,
         python: Python<'py>,
@@ -2112,6 +2131,8 @@ impl PyDiameter {
         sm_rp_ui: &[u8],
         smsmi_correlation_id: Option<&str>,
         sm_rp_mti: Option<u32>,
+        destination_host: Option<&str>,
+        destination_realm: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -2127,8 +2148,13 @@ impl PyDiameter {
         let sc_address = sc_address.to_string();
         let sm_rp_ui = sm_rp_ui.to_vec();
         let smsmi_correlation_id = smsmi_correlation_id.map(str::to_string);
+        let destination_host = destination_host.map(str::to_string);
+        let destination_realm = destination_realm.map(str::to_string);
 
         crate::script::awaitable(python, async move {
+            let destination = destination_host
+                .as_deref()
+                .map(|host| (host, destination_realm.as_deref()));
             let answer = client
                 .send_tfr(
                     &user_name,
@@ -2136,6 +2162,7 @@ impl PyDiameter {
                     &sm_rp_ui,
                     smsmi_correlation_id.as_deref(),
                     sm_rp_mti,
+                    destination,
                 )
                 .await;
 

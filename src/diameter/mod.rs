@@ -366,6 +366,7 @@ impl DiameterClient {
 
     /// Send an SGd MT-Forward-Short-Message-Request (SMSC → MME) and
     /// return the TFA. `sm_rp_ui` is the SMS-DELIVER TPDU.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_tfr(
         &self,
         user_name: &str,
@@ -373,6 +374,7 @@ impl DiameterClient {
         sm_rp_ui: &[u8],
         smsmi_correlation_id_ref: Option<&str>,
         sm_rp_mti: Option<u32>,
+        destination: Option<(&str, Option<&str>)>,
     ) -> Result<codec::DiameterMessage, String> {
         let session_id = self.peer.new_session_id();
         let wire = sgd::build_mt_forward_short_message_request(
@@ -383,6 +385,7 @@ impl DiameterClient {
             sm_rp_ui,
             smsmi_correlation_id_ref,
             sm_rp_mti,
+            destination,
             self.peer.next_hbh(),
             self.peer.next_e2e(),
         );

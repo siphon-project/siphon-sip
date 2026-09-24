@@ -1651,6 +1651,18 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "Application-Port-Identifier",
         data_type: AvpType::Unsigned32,
     },
+    // User-Identifier (TS 29.336 §6.3.3) — the grouped AVP naming the subscriber an
+    // MO-Forward-Short-Message came from. Its MSISDN child (701) is the only thing in an OFR that
+    // says who sent the message; without it a receiving SMSC has nothing but the IMSI, and the
+    // recipient cannot reply. The RP-layer names for these addresses (sm-RP-DA / sm-RP-OA) are
+    // MAP IEs from TS 29.002 and have no Diameter code point — the RP layer terminates at the
+    // serving node.
+    AvpDef {
+        code: 3102,
+        vendor_id: TGPP,
+        name: "User-Identifier",
+        data_type: AvpType::Grouped,
+    },
     AvpDef {
         code: 3111,
         vendor_id: TGPP,
@@ -2377,6 +2389,7 @@ pub mod avp {
     pub const SGSN_REALM: u32 = 2410;
 
     // 3GPP S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
+    pub const USER_IDENTIFIER: u32 = 3102;
     pub const SC_ADDRESS: u32 = 3300;
     pub const SM_RP_UI: u32 = 3301;
     pub const SM_RP_MTI: u32 = 3308;

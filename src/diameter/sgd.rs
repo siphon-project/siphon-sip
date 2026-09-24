@@ -103,6 +103,11 @@ impl SgdAnswerBuilder {
 ///   the IMSI sub-AVP inside SMSMI-Correlation-ID grouped AVP.
 /// `sm_rp_mti` is the SM-RP Message Type Indicator: 0 = SMS Deliver
 ///   (the standard MT case), 1 = SMS Status Report.
+/// `destination` is the `(host, realm)` the S6c SRI-SM located, and overrides the static peer
+///   config. A TFR is addressed to *the node serving this subscriber*, which only the SRA knows;
+///   falling back to peer config sends it wherever the relay's catch-all route points, which in a
+///   deployed core is the HSS. Realm falls back to the peer config when the SRA gave only a host.
+#[allow(clippy::too_many_arguments)]
 pub fn build_mt_forward_short_message_request(
     config: &crate::diameter::peer::PeerConfig,
     session_id: &str,
@@ -111,6 +116,7 @@ pub fn build_mt_forward_short_message_request(
     sm_rp_ui: &[u8],
     smsmi_correlation_id_ref: Option<&str>,
     sm_rp_mti: Option<u32>,
+    destination: Option<(&str, Option<&str>)>,
     hop_by_hop: u32,
     end_to_end: u32,
 ) -> Vec<u8> {
@@ -118,11 +124,20 @@ pub fn build_mt_forward_short_message_request(
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    avp_bytes.extend_from_slice(&encode_avp_utf8(
-        avp::DESTINATION_REALM,
-        &config.destination_realm,
-    ));
-    if let Some(dest_host) = &config.destination_host {
+    let (dest_host, dest_realm) = match destination {
+        Some((host, realm)) => (
+            Some(host.to_string()),
+            realm
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| config.destination_realm.clone()),
+        ),
+        None => (
+            config.destination_host.clone(),
+            config.destination_realm.clone(),
+        ),
+    };
+    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &dest_realm));
+    if let Some(dest_host) = &dest_host {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
     }
     avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
@@ -292,6 +307,78 @@ mod tests {
         }
     }
 
+    /// The TFR has to be addressed at the node the S6c SRA named, not at static peer config.
+    /// With peer config, Destination-Realm is the IMS realm and Destination-Host is whatever the
+    /// bind happens to point at, so the relay's catch-all route delivers the message to the HSS
+    /// and the UE never sees it.
+    #[test]
+    fn tfr_is_addressed_at_the_node_the_sra_located() {
+        let pdu: Vec<u8> = vec![0x04, 0x0B, 0x91, 0x12, 0x34];
+        let wire = build_mt_forward_short_message_request(
+            &config(),
+            "test;1;1",
+            "001010000000001",
+            "999000000001",
+            &pdu,
+            None,
+            Some(0),
+            Some((
+                "smsf-0.epc.mnc001.mcc001.3gppnetwork.org",
+                Some("epc.mnc001.mcc001.3gppnetwork.org"),
+            )),
+            42,
+            43,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Host")
+                .and_then(|v| v.as_str()),
+            Some("smsf-0.epc.mnc001.mcc001.3gppnetwork.org")
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Realm")
+                .and_then(|v| v.as_str()),
+            Some("epc.mnc001.mcc001.3gppnetwork.org"),
+            "the realm follows the host, or the request leaves our own realm"
+        );
+    }
+
+    /// An SRA that gave a host but no realm keeps the peer's realm rather than emitting none.
+    #[test]
+    fn a_located_host_without_a_realm_falls_back_to_the_peer_realm() {
+        let wire = build_mt_forward_short_message_request(
+            &config(),
+            "test;1;1",
+            "001010000000001",
+            "999000000001",
+            &[0x04],
+            None,
+            None,
+            Some(("mme-0.example.com", None)),
+            1,
+            1,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Host")
+                .and_then(|v| v.as_str()),
+            Some("mme-0.example.com")
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("Destination-Realm")
+                .and_then(|v| v.as_str()),
+            Some(config().destination_realm.as_str())
+        );
+    }
+
     #[test]
     fn tfr_encodes_with_pdu_payload() {
         let pdu: Vec<u8> = vec![0x04, 0x0B, 0x91, 0x12, 0x34]; // arbitrary TPDU prefix
@@ -303,6 +390,7 @@ mod tests {
             &pdu,
             None,
             Some(0),
+            None,
             42,
             43,
         );
@@ -336,6 +424,7 @@ mod tests {
             &[0u8; 4],
             None,
             None,
+            None,
             1,
             1,
         );
@@ -366,6 +455,7 @@ mod tests {
             "31611111111",
             &[0u8; 4],
             Some("001010000000001"),
+            None,
             None,
             1,
             1,
@@ -436,6 +526,54 @@ mod tests {
         assert_eq!(parsed.user_name.as_deref(), Some("001010000000001"));
         assert_eq!(parsed.sc_address.as_deref(), Some("31611111111"));
         assert_eq!(parsed.sm_rp_ui.as_deref(), Some(pdu.as_slice()));
+    }
+
+    /// The originating subscriber's MSISDN rides in the grouped `User-Identifier` (TS 29.336
+    /// §6.3.3), which is the only thing in an OFR that says who sent the message. This asserts it
+    /// through the same dictionary lookup a script's `get_avp("User-Identifier")` uses, because
+    /// the failure mode is silent: an unnamed AVP simply does not resolve, the caller falls back
+    /// to the IMSI, and the recipient gets a message it cannot reply to.
+    #[test]
+    fn parse_ofr_names_the_originator_in_user_identifier() {
+        let mut identifier = Vec::new();
+        identifier.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
+        identifier.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::MSISDN,
+            &codec::encode_isdn_address_string(
+                "001010000000001",
+                codec::TON_NPI_INTERNATIONAL_E164,
+            ),
+        ));
+
+        let mut avp_bytes = Vec::new();
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "mme1.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(avp::USER_IDENTIFIER, &identifier));
+        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_RP_UI, &[0x21, 0x09]));
+
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_MO_FORWARD_SHORT_MESSAGE,
+            dictionary::SGD_APP_ID,
+            1,
+            1,
+            &avp_bytes,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        let identifier = decoded
+            .avps
+            .get("User-Identifier")
+            .expect("the grouped AVP must resolve by name, or no script can read the originator");
+        assert_eq!(
+            identifier.get("MSISDN").and_then(|v| v.as_str()),
+            Some("001010000000001"),
+            "MSISDN is an ISDN-AddressString, so the dictionary TBCD-decodes it to digits"
+        );
+        assert_eq!(
+            identifier.get("User-Name").and_then(|v| v.as_str()),
+            Some("001010000000001")
+        );
     }
 
     #[test]
