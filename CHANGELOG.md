@@ -137,6 +137,36 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An `async def` handler that never awaits no longer costs an asyncio task.**
+  `await`, `async for` and `async with` all compile to a `YIELD_VALUE` in the
+  enclosing coroutine, so a handler whose code object contains none — in it or
+  anything nested in it — provably cannot suspend. Those now run on a single
+  `send(None)` with no task, no event loop and no cross-thread handoff.
+
+  Measured on `scale_test.sh 40000 10000 8` with a catch-all that is `async def`
+  and awaits nothing: **669 % → 321 % peak CPU**, against a synchronous floor of
+  293 %. It rescues the common shape of "I made the handler `async` because the
+  framework wanted it, and this one never awaits"; a handler that does await is
+  untouched and still gets a driver, which is what keeps one slow call from
+  blocking the others.
+
+  Why it is safe when probing a coroutine in general is not: there is no
+  suspension to mishandle. A probed `await` on a real future cannot be given back
+  to asyncio (`RuntimeError: await wasn't used with future`), which is why the
+  fast path is taken only where suspension is statically impossible. The analysis
+  is conservative in both directions — anything it cannot analyse is treated as
+  suspending — and if a handler it cleared were to suspend anyway, the call fails
+  loudly naming it as an analysis bug rather than continuing half-run.
+
+- **The asyncio handover is one Python call instead of five.** Submitting a
+  coroutine took `import asyncio`, a getattr, the call, another getattr and that
+  call, plus an `is_closed()` probe and a `__qualname__` read, each touching an
+  object shared by every worker thread. One pre-compiled helper now does it, the
+  probe is gone (`run_coroutine_threadsafe` raises on a closed loop by itself)
+  and the handler name is read only on the timeout path. Worth ~10 % on the async
+  path, which is inside this measurement's run-to-run spread — it removes real
+  per-request work rather than a number anyone should quote.
+
 - **The shipped scripts no longer pay asyncio dispatch on the per-message path.**
   Making the digest helpers awaitable forced `scripts/proxy_default.py` and five
   siblings to `async def route`, because their REGISTER branch awaits the

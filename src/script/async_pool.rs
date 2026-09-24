@@ -115,6 +115,18 @@ pub struct AsyncPool {
     /// watchdog's stall window so a wedged handler is a failed call rather
     /// than a failed node.
     coroutine_timeout: Duration,
+    /// `submit(coro, loop, done) -> concurrent.futures.Future`, compiled once.
+    ///
+    /// Handing a coroutine over used to take five separate Rust→Python calls
+    /// per request: `import asyncio`, a getattr for `run_coroutine_threadsafe`,
+    /// the call itself, a getattr for `add_done_callback`, and that call. Every
+    /// one of them touches an object shared by every worker thread — the
+    /// `asyncio` module, the loop, the `Future` type — and under free-threaded
+    /// Python a shared-object touch is an atomic refcount update on a cache
+    /// line all 24 threads are contending for. Doing the same work inside one
+    /// Python function turns those into local lookups behind a single boundary
+    /// crossing.
+    submit_fn: Py<PyAny>,
 }
 
 impl AsyncPool {
@@ -194,6 +206,7 @@ impl AsyncPool {
             drivers,
             next: AtomicUsize::new(0),
             coroutine_timeout,
+            submit_fn: compile_submit_fn(),
         }
     }
 
@@ -309,28 +322,33 @@ impl AsyncPool {
             .unwrap_or(start % self.drivers.len());
         let driver_loop = self.drivers[index].loop_obj.bind(python);
 
-        // Sanity-check: pyo3-async-runtimes will drop responses into a closed
-        // loop with a confusing `RuntimeError: Event loop is closed` — better
-        // to surface that here.
-        if driver_loop
-            .call_method0("is_closed")
-            .and_then(|v| v.extract::<bool>())
-            .unwrap_or(false)
-        {
-            return Err(PyRuntimeError::new_err(
-                "async pool driver loop is closed (pool already shut down)",
-            ));
-        }
-
-        let asyncio = python.import("asyncio")?;
-        let cf = asyncio.call_method1("run_coroutine_threadsafe", (coroutine, driver_loop))?;
-
         let (sender, receiver) = oneshot::channel();
         let bridge = AsyncPoolBridge {
             sender: StdMutex::new(Some(sender)),
         };
         let py_bridge = Py::new(python, bridge)?;
-        cf.call_method1("add_done_callback", (py_bridge,))?;
+
+        // One boundary crossing for the whole handover. The `is_closed()`
+        // pre-check this replaced cost a Python call on every request to
+        // improve an error message; `run_coroutine_threadsafe` on a closed loop
+        // raises anyway, so the message is recovered below instead.
+        let cf = self
+            .submit_fn
+            .bind(python)
+            .call1((coroutine, driver_loop, py_bridge))
+            .map_err(|error| {
+                if driver_loop
+                    .call_method0("is_closed")
+                    .and_then(|value| value.extract::<bool>())
+                    .unwrap_or(false)
+                {
+                    PyRuntimeError::new_err(
+                        "async pool driver loop is closed (pool already shut down)",
+                    )
+                } else {
+                    error
+                }
+            })?;
         Ok((receiver, cf.unbind()))
     }
 }
@@ -560,9 +578,11 @@ pub(crate) fn run_coroutine_via_pool(
         return Ok(None);
     };
 
-    // The handler's name, read before the coroutine is handed over: after a
-    // timeout the only thing that says which handler wedged is this log line.
-    let handler = coroutine_name(coroutine);
+    // The handler's name is only needed if this wedges, so it is read lazily.
+    // Reading it eagerly cost a `__qualname__` getattr and a String allocation
+    // on every request to serve one log line on the rare timeout path. The
+    // coroutine object outlives the wait (the caller holds `future`), so it is
+    // still nameable afterwards.
     let (receiver, future) = pool.submit(python, coroutine)?;
 
     // We need to await the oneshot synchronously.  `Handle::current()`
@@ -620,6 +640,7 @@ pub(crate) fn run_coroutine_via_pool(
                 .call_method0("cancel")
                 .and_then(|value| value.extract::<bool>())
                 .unwrap_or(false);
+            let handler = coroutine_name(coroutine);
             error!(
                 handler = %handler,
                 timeout_secs = timeout.as_secs(),
@@ -638,6 +659,41 @@ pub(crate) fn run_coroutine_via_pool(
 ///
 /// `__qualname__` names the `async def` the script author wrote; the code
 /// object's name is the fallback for a coroutine built some other way.
+/// Compile `submit(coro, loop, done)` once, for [`AsyncPool::submit_fn`].
+///
+/// Falls back to a `None` object on failure rather than panicking at startup;
+/// `submit` then raises on first use, which surfaces as a failed call instead of
+/// a node that will not boot.
+fn compile_submit_fn() -> Py<PyAny> {
+    const SOURCE: &str = "\
+import asyncio
+
+
+def submit(coro, loop, done):
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    future.add_done_callback(done)
+    return future
+";
+    Python::attach(|python| {
+        let build = || -> PyResult<Py<PyAny>> {
+            let module = PyModule::from_code(
+                python,
+                &std::ffi::CString::new(SOURCE)?,
+                &std::ffi::CString::new("siphon_async_pool_submit.py")?,
+                &std::ffi::CString::new("siphon_async_pool_submit")?,
+            )?;
+            Ok(module.getattr("submit")?.unbind())
+        };
+        match build() {
+            Ok(function) => function,
+            Err(error) => {
+                error!(%error, "could not compile the async pool submit helper");
+                python.None()
+            }
+        }
+    })
+}
+
 fn coroutine_name(coroutine: &Bound<'_, PyAny>) -> String {
     coroutine
         .getattr("__qualname__")
@@ -789,6 +845,43 @@ mod tests {
             let value = dispatch(factory).await;
             let extracted: i64 = Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 3);
+        });
+    }
+
+    /// The submit helper must still fail loudly on a closed loop.
+    ///
+    /// `submit` replaced a per-request `loop.is_closed()` pre-check, whose only
+    /// job was to turn a confusing error into a clear one. Dropping it is only
+    /// safe because `run_coroutine_threadsafe` raises on a closed loop by
+    /// itself — if it returned a future that never settled instead, the removal
+    /// would have traded a clear error for a handler that hangs until the
+    /// coroutine timeout. This pins that precondition rather than the wording.
+    #[test]
+    fn submit_helper_raises_on_a_closed_loop() {
+        Python::initialize();
+        Python::attach(|python| {
+            let submit = compile_submit_fn();
+            let asyncio = python.import("asyncio").unwrap();
+            let event_loop = asyncio.call_method0("new_event_loop").unwrap();
+            event_loop.call_method0("close").unwrap();
+
+            let coroutine = build_factory(python, "async def factory():\n    return 1\n");
+            let coroutine = coroutine.bind(python).call0().unwrap();
+            let noop = python
+                .eval(
+                    &std::ffi::CString::new("lambda future: None").unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let outcome = submit.bind(python).call1((coroutine, event_loop, noop));
+
+            assert!(
+                outcome.is_err(),
+                "submitting to a closed loop must raise, not hand back a future \
+                 that never settles"
+            );
         });
     }
 

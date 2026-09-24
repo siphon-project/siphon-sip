@@ -13,7 +13,6 @@
 //! With free-threaded Python 3.14t there is no GIL — multiple Rust worker
 //! threads can call into Python concurrently.
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +23,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ReloadMode, ScriptConfig};
 use crate::error::{Result, SiphonError};
+use crate::script::inline_dispatch;
+// Coroutine execution lives in `inline_dispatch`; re-exported so the many
+// `engine::run_coroutine` call sites keep their import.
+pub(crate) use crate::script::inline_dispatch::{run_coroutine, run_coroutine_value};
 
 /// Serializes the `clear → exec → extract` sequence against the global
 /// `_siphon_registry` Python module. Free-threaded Python 3.14t no longer
@@ -622,6 +625,8 @@ impl ScriptEngine {
                     "script reloaded successfully"
                 );
                 self.state.store(Arc::new(new_state));
+                // The verdicts describe code objects this reload replaced.
+                inline_dispatch::clear_inline_verdicts();
                 self.restart_timers();
                 Ok(())
             }
@@ -1463,99 +1468,6 @@ async fn timer_loop(
 // ---------------------------------------------------------------------------
 // Async Python coroutine runner (shared by dispatcher and timer scheduler)
 // ---------------------------------------------------------------------------
-
-thread_local! {
-    /// Per-thread asyncio event loop reused across `run_coroutine` calls.
-    ///
-    /// `pyo3_async_runtimes::tokio::future_into_py(...)` captures the asyncio
-    /// loop that is running at the moment a script `await`s the bridged
-    /// awaitable, then later wakes the awaiter from a Tokio worker via
-    /// `loop.call_soon_threadsafe(...)`.  Driving each handler with a fresh
-    /// `asyncio.run(coro)` would close that loop between handler invocations,
-    /// racing the Tokio side and surfacing as `RuntimeError: Event loop is
-    /// closed` (with the chained `TypeError` because the awaiter's result is
-    /// never delivered).  Reusing one long-lived loop per worker thread keeps
-    /// `call_soon_threadsafe` targets valid for the lifetime of the thread.
-    static PYTHON_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
-}
-
-/// Acquire — creating it on first use — this thread's persistent fallback
-/// asyncio loop (the legacy path used when no global async pool is installed).
-/// Reused across calls so `call_soon_threadsafe` targets stay valid for the
-/// lifetime of the thread (see [`PYTHON_LOOP`]).
-///
-/// Pulled out as a named helper so the per-thread caching can be unit-tested
-/// directly: the public [`run_coroutine`] entry point short-circuits to the
-/// global async pool when one is installed (a process-wide `OnceLock`), which
-/// would otherwise route around — and thus never populate — this fallback loop
-/// whenever a sibling test installs the pool.
-fn fallback_thread_loop(python: Python<'_>) -> PyResult<Py<PyAny>> {
-    PYTHON_LOOP.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        match slot.as_ref() {
-            Some(handle) => Ok(handle.clone_ref(python)),
-            None => {
-                let asyncio = python.import("asyncio")?;
-                let new_loop = asyncio.call_method0("new_event_loop")?;
-                // Bind this loop to the thread for any code path that still
-                // calls the (deprecated) `asyncio.get_event_loop()`.  The
-                // running-loop lookup used by `pyo3_async_runtimes` is set
-                // automatically by `run_until_complete`.
-                asyncio.call_method1("set_event_loop", (&new_loop,))?;
-                let unbound = new_loop.unbind();
-                let handle = unbound.clone_ref(python);
-                *slot = Some(unbound);
-                Ok(handle)
-            }
-        }
-    })
-}
-
-/// Run a Python coroutine to completion on this thread's persistent asyncio
-/// event loop.
-///
-/// `block_in_place` lets the multi-threaded Tokio runtime steal this worker
-/// for the duration of the synchronous `loop.run_until_complete(...)` call so
-/// other Tokio tasks (transport I/O, timers, RTPEngine UDP, etc.) keep
-/// progressing on other workers.
-pub(crate) fn run_coroutine(
-    python: Python<'_>,
-    coroutine: &Bound<'_, pyo3::PyAny>,
-) -> PyResult<()> {
-    run_coroutine_value(python, coroutine).map(|_| ())
-}
-
-/// Run a Python coroutine to completion on this thread's persistent asyncio
-/// event loop and return its resolved value.
-///
-/// Same scheduling semantics as [`run_coroutine`] — exposed separately so
-/// callers that need the coroutine's return value (e.g. host extensions
-/// dispatching to script handlers) don't have to re-drive the loop.
-///
-/// When the global async pool is installed (the production path,
-/// initialised from `SiphonServer` bootstrap), the coroutine is dispatched
-/// onto one of the pool's long-running asyncio loops via
-/// `asyncio.run_coroutine_threadsafe`.  That path keeps the loop running
-/// across handler invocations so `asyncio.create_task(...)` actually runs
-/// to completion (see `script::async_pool` for details).  When no pool is
-/// installed (e.g. in lightweight tests that don't need fire-and-forget
-/// task semantics), we fall back to the legacy per-thread
-/// `loop.run_until_complete(coro)` path below.
-pub(crate) fn run_coroutine_value(
-    python: Python<'_>,
-    coroutine: &Bound<'_, pyo3::PyAny>,
-) -> PyResult<Py<PyAny>> {
-    if let Some(value) = crate::script::async_pool::run_coroutine_via_pool(python, coroutine)? {
-        return Ok(value);
-    }
-    let loop_handle = fallback_thread_loop(python)?;
-
-    let bound_loop = loop_handle.bind(python);
-    let result = tokio::task::block_in_place(|| {
-        bound_loop.call_method1("run_until_complete", (coroutine,))
-    })?;
-    Ok(result.unbind())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -4208,29 +4120,5 @@ mod async_runner_tests {
             handle.await.unwrap();
         }
         assert_eq!(success.load(Ordering::Relaxed), total);
-    }
-
-    /// The fallback (no-pool) path must reuse the same per-thread asyncio
-    /// loop across calls; tearing the loop down between calls is exactly what
-    /// creates the closed-loop race.
-    ///
-    /// Exercises `fallback_thread_loop` directly rather than going through
-    /// `run_coroutine`: the public entry point short-circuits to the global
-    /// async pool when a sibling test has installed it (a process-wide
-    /// `OnceLock`), which would route around — and thus never populate — the
-    /// per-thread fallback loop this test verifies.  Both calls run on the
-    /// same thread inside one `Python::attach`, so they share the thread-local.
-    #[test]
-    fn fallback_loop_is_reused_across_calls() {
-        Python::initialize();
-        Python::attach(|python| {
-            let first = fallback_thread_loop(python).expect("first fallback loop");
-            let second = fallback_thread_loop(python).expect("second fallback loop");
-            assert_eq!(
-                first.bind(python).as_ptr() as usize,
-                second.bind(python).as_ptr() as usize,
-                "the same per-thread fallback asyncio loop must be reused across calls"
-            );
-        });
     }
 }
