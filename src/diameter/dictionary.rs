@@ -1597,6 +1597,46 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "SM-Service-Type",
         data_type: AvpType::Enumerated,
     },
+    // Serving-Node (TS 29.272 §7.3.109) — the grouped AVP an S6c SRA carries the located node in.
+    // Without these the SRA reads as "no serving node" and every MT-SMS falls through to the
+    // off-net trunk, which is exactly what it looked like before: the SGd path silently unused.
+    // Codes cross-checked against Wireshark's own 3GPP Diameter dissector, not just our table.
+    AvpDef {
+        code: 2401,
+        vendor_id: TGPP,
+        name: "Serving-Node",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 2402,
+        vendor_id: TGPP,
+        name: "MME-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 2403,
+        vendor_id: TGPP,
+        name: "MSC-Number",
+        data_type: AvpType::ISDNAddressString,
+    },
+    AvpDef {
+        code: 2408,
+        vendor_id: TGPP,
+        name: "MME-Realm",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 2409,
+        vendor_id: TGPP,
+        name: "SGSN-Name",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 2410,
+        vendor_id: TGPP,
+        name: "SGSN-Realm",
+        data_type: AvpType::DiameterIdentity,
+    },
     // Charging — Visited Network Identifier (TS 32.299 §7.2.74)
     AvpDef {
         code: 2713,
@@ -2327,6 +2367,14 @@ pub mod avp {
     // 3GPP S6c served-node identifiers
     pub const SGSN_NUMBER: u32 = 1489;
     pub const MME_NUMBER_FOR_MT_SMS: u32 = 1645;
+    // Serving-Node (TS 29.272 §7.3.109) and its children — where an S6c SRA actually names
+    // the node serving the subscriber.
+    pub const SERVING_NODE: u32 = 2401;
+    pub const MME_NAME: u32 = 2402;
+    pub const MSC_NUMBER: u32 = 2403;
+    pub const MME_REALM: u32 = 2408;
+    pub const SGSN_NAME: u32 = 2409;
+    pub const SGSN_REALM: u32 = 2410;
 
     // 3GPP S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
     pub const SC_ADDRESS: u32 = 3300;

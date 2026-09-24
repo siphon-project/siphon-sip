@@ -155,6 +155,35 @@ pub struct SendRoutingInfoAnswer {
     pub sgsn_number: Option<String>,
     /// MME GT for LTE delivery (Some → use SGd via MME).
     pub mme_number_for_mt_sms: Option<String>,
+    /// Diameter identity of the serving MME, from the grouped `Serving-Node`. For a UE registered
+    /// for SMS over NAS on 5G the HSS puts the **SMSF** identity here (TS 29.338 §6.3.2.4), so
+    /// this names whichever node terminates SMS, not necessarily an MME.
+    pub mme_name: Option<String>,
+    /// Realm of [`Self::mme_name`].
+    pub mme_realm: Option<String>,
+    /// Diameter identity of the serving SGSN, from the grouped `Serving-Node`.
+    pub sgsn_name: Option<String>,
+    /// Realm of [`Self::sgsn_name`].
+    pub sgsn_realm: Option<String>,
+    /// MSC GT for 2G/3G circuit-switched delivery (SS7/MAP, not SGd).
+    pub msc_number: Option<String>,
+}
+
+impl SendRoutingInfoAnswer {
+    /// The `(Destination-Host, Destination-Realm)` an SGd MT-Forward-Short-Message must be
+    /// addressed to, when the HSS located a Diameter serving node.
+    ///
+    /// This is the whole point of the SRI-SM. Addressing the TFR from static peer config instead
+    /// sends it to whatever the relay's catch-all route resolves to — in a deployed core, the HSS
+    /// — and the message is never delivered.
+    pub fn sgd_destination(&self) -> Option<(&str, Option<&str>)> {
+        if let Some(name) = self.mme_name.as_deref() {
+            return Some((name, self.mme_realm.as_deref()));
+        }
+        self.sgsn_name
+            .as_deref()
+            .map(|name| (name, self.sgsn_realm.as_deref()))
+    }
 }
 
 /// Decode an SRA from a peer answer. Returns `None` if the message is
@@ -175,12 +204,30 @@ pub fn parse_sra(message: &codec::DiameterMessage) -> Option<SendRoutingInfoAnsw
         .and_then(|v| v.get("Experimental-Result-Code"))
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
+    // TS 29.338 §6.3.2 puts the located node in the grouped `Serving-Node`, not at the top level.
+    // Reading only the top level is why a conformant SRA parsed as "no serving node": an HSS that
+    // names the node sets MME-Name/MME-Realm inside the group and nothing outside it. The top
+    // level is still consulted as a fallback for peers that flatten it.
+    let serving_node = avps.get("Serving-Node");
+    let in_serving_node = |name: &str| {
+        serving_node
+            .and_then(|sn| sn.get(name))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let anywhere = |name: &str| in_serving_node(name).or_else(|| optional_str(avps, name));
+
     Some(SendRoutingInfoAnswer {
         result_code,
         experimental_result_code,
         user_name: optional_str(avps, "User-Name"),
-        sgsn_number: optional_str(avps, "SGSN-Number"),
-        mme_number_for_mt_sms: optional_str(avps, "MME-Number-for-MT-SMS"),
+        sgsn_number: anywhere("SGSN-Number"),
+        mme_number_for_mt_sms: anywhere("MME-Number-for-MT-SMS"),
+        mme_name: anywhere("MME-Name"),
+        mme_realm: anywhere("MME-Realm"),
+        sgsn_name: anywhere("SGSN-Name"),
+        sgsn_realm: anywhere("SGSN-Realm"),
+        msc_number: anywhere("MSC-Number"),
     })
 }
 
@@ -500,6 +547,121 @@ mod tests {
         assert_eq!(parsed.user_name.as_deref(), Some("001010000000001"));
         assert_eq!(parsed.mme_number_for_mt_sms.as_deref(), Some("31698765432"));
         assert!(parsed.sgsn_number.is_none());
+    }
+
+    /// TS 29.338 §6.3.2 carries the located node inside the grouped `Serving-Node`. Reading only
+    /// the top level made every conformant SRA look like "no serving node", so MT-SMS never took
+    /// the SGd path at all and fell through to the off-net trunk instead.
+    #[test]
+    fn parse_sra_reads_the_grouped_serving_node() {
+        let mut serving = Vec::new();
+        serving.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::MME_NAME,
+            "smsf-0.epc.mnc001.mcc001.3gppnetwork.org",
+        ));
+        serving.extend_from_slice(&encode_avp_utf8_3gpp(
+            avp::MME_REALM,
+            "epc.mnc001.mcc001.3gppnetwork.org",
+        ));
+        serving.extend_from_slice(&encode_avp_octet_3gpp(
+            avp::MME_NUMBER_FOR_MT_SMS,
+            &codec::encode_isdn_address_string("999000000001", codec::TON_NPI_INTERNATIONAL_E164),
+        ));
+
+        let mut avp_bytes = Vec::new();
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "hss1.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
+        avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(avp::SERVING_NODE, &serving));
+
+        let wire = encode_diameter_message(
+            FLAG_PROXIABLE,
+            dictionary::CMD_SEND_ROUTING_INFO_FOR_SM,
+            dictionary::S6C_APP_ID,
+            1,
+            1,
+            &avp_bytes,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        let parsed = parse_sra(&decoded).expect("SRA must parse");
+
+        assert_eq!(
+            parsed.mme_name.as_deref(),
+            Some("smsf-0.epc.mnc001.mcc001.3gppnetwork.org"),
+            "an SMSF identity arrives in MME-Name per TS 29.338 §6.3.2.4"
+        );
+        assert_eq!(
+            parsed.mme_realm.as_deref(),
+            Some("epc.mnc001.mcc001.3gppnetwork.org")
+        );
+        assert_eq!(
+            parsed.mme_number_for_mt_sms.as_deref(),
+            Some("999000000001")
+        );
+        assert_eq!(
+            parsed.sgd_destination(),
+            Some((
+                "smsf-0.epc.mnc001.mcc001.3gppnetwork.org",
+                Some("epc.mnc001.mcc001.3gppnetwork.org")
+            )),
+            "this is what the TFR must be addressed to"
+        );
+    }
+
+    /// An SGSN-served subscriber resolves to the SGSN, and only when no MME/SMSF was named.
+    #[test]
+    fn the_sgd_destination_prefers_the_packet_core_node() {
+        let mut serving = Vec::new();
+        serving.extend_from_slice(&encode_avp_utf8_3gpp(avp::SGSN_NAME, "sgsn-0.example.com"));
+        serving.extend_from_slice(&encode_avp_utf8_3gpp(avp::SGSN_REALM, "example.com"));
+
+        let mut avp_bytes = Vec::new();
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "hss1.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
+        avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(avp::SERVING_NODE, &serving));
+
+        let wire = encode_diameter_message(
+            FLAG_PROXIABLE,
+            dictionary::CMD_SEND_ROUTING_INFO_FOR_SM,
+            dictionary::S6C_APP_ID,
+            1,
+            1,
+            &avp_bytes,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        let parsed = parse_sra(&decoded).expect("SRA must parse");
+        assert_eq!(parsed.mme_name, None);
+        assert_eq!(
+            parsed.sgd_destination(),
+            Some(("sgsn-0.example.com", Some("example.com")))
+        );
+    }
+
+    /// A success with no Serving-Node at all: nothing to address a TFR to, and the caller has to
+    /// treat that as "not reachable over SGd" rather than sending to peer config.
+    #[test]
+    fn an_sra_without_a_serving_node_has_no_sgd_destination() {
+        let mut avp_bytes = Vec::new();
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "hss1.example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        avp_bytes.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
+
+        let wire = encode_diameter_message(
+            FLAG_PROXIABLE,
+            dictionary::CMD_SEND_ROUTING_INFO_FOR_SM,
+            dictionary::S6C_APP_ID,
+            1,
+            1,
+            &avp_bytes,
+        );
+        let decoded = codec::decode_diameter(&wire).unwrap();
+        let parsed = parse_sra(&decoded).expect("SRA must parse");
+        assert_eq!(parsed.sgd_destination(), None);
     }
 
     /// Parser must tolerate peers that omit the ToN/NPI prefix and ship
