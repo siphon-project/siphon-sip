@@ -13,7 +13,7 @@
 
 # ── Permanent ───────────────────────────────────────────────────────────────
 # Data, not logic. Splitting a table costs greppability and buys nothing.
-src/diameter/dictionary.rs  2400  # AVP dictionary (TS 29.229/32.299/29.272); a table
+src/diameter/dictionary.rs  2460  # AVP dictionary (TS 29.229/32.299/29.272); a table. +54 for the grouped Serving-Node (TS 29.338 6.3.2) and its members (MME-Name/MME-Realm, SGSN-Name/SGSN-Realm, MSC-Number) plus User-Identifier, without which a conformant S6c answer parses as no serving node
 src/metrics/mod.rs          2000  # metric registry: one struct field + one registration per metric. +26 for the gateway/registrant provisioning-source pairs (last-success timestamp + failure counter each), +17 for the abandoned-job counter (a pool losing workers to stuck handlers reads identically to a busy one without it), +43 for the registrar backend queue (depth gauge, drop counter, and the two count_aors histograms that split queue wait from backend time), +19 for histogram_summary, which renders a plain Histogram for /admin/metrics.json the way the HistogramVec helper already did (the shared body is factored out, so this is the smaller half of a net-new helper)
 
 # ── Scheduled for the 1.9.0 module split ────────────────────────────────────
@@ -25,7 +25,7 @@ src/server/mod.rs            2627  # run_async is one 2,214-line fn; decomposed 
 # rejected. Splitting needs the thin-wrapper restructure, scheduled post-1.9.0.
 # A large share of each is `///` docstrings, which are the SDK's LLM context and
 # are load-bearing rather than padding.
-src/script/api/diameter.rs   3540  # single #[pymethods] block; kwargs marshalling per interface. +110 for making all 19 methods awaitable: each grows the owned-argument prep a future needs plus the Python::attach that rebuilds its dict on the way out, and the no-peer arm becomes a resolved coroutine; +76 for the per-method note saying so, which is the docstring a script author and the SDK both read
+src/script/api/diameter.rs   3560  # single #[pymethods] block; kwargs marshalling per interface. +110 for making all 19 methods awaitable: each grows the owned-argument prep a future needs plus the Python::attach that rebuilds its dict on the way out, and the no-peer arm becomes a resolved coroutine; +76 for the per-method note saying so, which is the docstring a script author and the SDK both read; +12 for the located-node keys s6c_srr now returns and the destination_host/realm kwargs that address the SGd MT-Forward at that node
 src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    2000  # same; +43 for the client-transport accessors and their docs
