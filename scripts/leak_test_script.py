@@ -12,8 +12,24 @@ from siphon import proxy, registrar, auth, log, timer
 DOMAIN = "example.com"
 
 
+@proxy.on_request("REGISTER")
+async def register(request):
+    # Split out of `route` because it is the only branch that awaits, so the
+    # per-message path below stays a synchronous handler and does not pay
+    # asyncio dispatch. An in-dialog REGISTER is left to `route`'s loose-routing
+    # branch, exactly as before the split.
+    if request.in_dialog:
+        return
+    if not await auth.require_digest(request, realm=DOMAIN):
+        return
+    registrar.save(request)
+
+
 @proxy.on_request
-async def route(request):
+def route(request):
+    if request.method == "REGISTER" and not request.in_dialog:
+        return                      # handled by `register` above
+
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
         return
@@ -26,12 +42,6 @@ async def route(request):
         # request whose route set simply points somewhere else next.
         request.loose_route()
         request.relay()
-        return
-
-    if request.method == "REGISTER":
-        if not await auth.require_digest(request, realm=DOMAIN):
-            return
-        registrar.save(request)
         return
 
     if request.method == "SUBSCRIBE":

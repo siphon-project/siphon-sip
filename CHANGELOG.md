@@ -15,6 +15,18 @@ entry, but a working config keeps working.
 
 ## [1.10.0] — 2026-09-24
 
+### Removed
+
+- **`POST /sbi/events` on `sbi.notif_listen`.** Deprecated in 1.9.0, which named
+  this release as the one that removes it, and warned on first use for two
+  releases. The bare path now answers `404` like any other unknown path;
+  `POST /sbi/events/notify` and `POST /sbi/events/terminate` are unchanged.
+
+  TS 29.514 has the PCF append a suffix to `notifUri`, so a spec-compliant PCF
+  never used the bare path and is unaffected. Scripts keep advertising
+  `http://<notif_listen>/sbi/events` as `notif_uri` exactly as before — it is the
+  base the PCF appends to, not a route.
+
 ### Changed
 
 - **BREAKING: `proxy.send_request` no longer sends without `await`.** It always
@@ -124,6 +136,29 @@ entry, but a working config keeps working.
 
 
 ### Fixed
+
+- **The shipped scripts no longer pay asyncio dispatch on the per-message path.**
+  Making the digest helpers awaitable forced `scripts/proxy_default.py` and five
+  siblings to `async def route`, because their REGISTER branch awaits the
+  challenge. Nothing on the INVITE path awaits, so every call was paying a
+  coroutine build, a cross-thread handoff to an asyncio driver and a resolve, for
+  a coroutine that never suspended.
+
+  It cost about half the CPU. On `scale_test.sh 40000 10000 8` (proxy, UDP), same
+  binary, only the handler shape differing: **645 % → 297 % peak CPU**, against a
+  pre-1.10 floor of 286 %, with peak CPS unchanged (9 928 vs 9 904). Throughput
+  was never the casualty — headroom was, and with it the margin that keeps the
+  bounded handler pool from shedding jobs under burst. Two of nine runs on the
+  unsplit script logged `Python executor queue full`, which makes the client
+  retransmit; nine of nine pre-1.10 runs were clean.
+
+  The awaiting branch now lives in a method-filtered `@proxy.on_request("REGISTER")`
+  handler and the unfiltered handler is synchronous again. Behaviour is unchanged:
+  an unfiltered handler matches every method and a filtered one only its own, and
+  they share one action slot, so the split moves no decisions. `docs/migrating-to-1.10.md`
+  documents the pattern for script authors, and `scripts/check_hot_path_dispatch.py`
+  fails CI on an unfiltered per-message handler whose every `await` sits under a
+  single-method branch.
 
 - **The IMS P-CSCF example reserved and released no QoS bearer.** Both Rx calls
   in `examples/ims_pcscf.py` were written without `await` against APIs that are

@@ -12,8 +12,34 @@ from siphon import proxy, registrar, auth, log, presence
 DOMAIN = "example.com"
 
 
+@proxy.on_request("REGISTER")
+async def register(request):
+    # The only branch that awaits, so it gets its own handler and `route` below
+    # stays synchronous. An `async def` handler is dispatched through an asyncio
+    # driver; a `def` handler runs on the synchronous worker pool. Keeping the
+    # per-message path synchronous is worth roughly half the CPU at scale (645 %
+    # -> 297 % peak on `scale_test.sh 40000 10000 8`), because a coroutine that
+    # reaches no `await` still costs a build, a cross-thread handoff and a
+    # resolve on every single message.
+    #
+    # Both handlers run for REGISTER — an unfiltered handler matches every
+    # method, a filtered one only its own — and they share one action slot, so
+    # `route` returning without acting leaves this handler's decision standing.
+    if request.in_dialog:
+        return                  # in-dialog: `route` loose-routes it, as before
+    if not proxy.sanity_check(request):
+        return
+    if not await auth.require_digest(request, realm=DOMAIN):
+        return
+    registrar.save(request)
+
+
 @proxy.on_request
-async def route(request):
+def route(request):
+    # Out-of-dialog REGISTER belongs to `register` above.
+    if request.method == "REGISTER" and not request.in_dialog:
+        return
+
     # Reject malformed / RFC 4475 torture traffic before doing any work.
     # The Rust side already drops unparseable messages and auto-483s
     # Max-Forwards==0; sanity_check adds the *semantic* checks on a message that
@@ -40,12 +66,6 @@ async def route(request):
         # request whose route set simply points somewhere else next.
         request.loose_route()
         request.relay()
-        return
-
-    if request.method == "REGISTER":
-        if not await auth.require_digest(request, realm=DOMAIN):
-            return
-        registrar.save(request)
         return
 
     # PUBLISH — handle locally as Event State Compositor (RFC 3903)

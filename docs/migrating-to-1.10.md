@@ -67,11 +67,70 @@ async def handle_register(request):
 ```
 
 A handler can be `async def` whether or not it awaits anything; siphon detects
-which it is at decoration time and dispatches accordingly. Converting a handler
-costs nothing on its own.
+which it is at decoration time and dispatches accordingly.
 
 If a helper function of yours calls one of these, it becomes `async def` too,
 and its callers must await it — all the way up to the handler.
+
+### Keep the per-message path synchronous
+
+**Converting a handler is not free, and on a per-message path it is expensive.**
+An `async def` handler is dispatched through an asyncio driver; a `def` handler
+runs on the synchronous worker pool. For a handler that awaits, the driver is
+what stops one slow call from blocking the others — that is the whole point of
+this release. For a handler that reaches no `await` on the path a given message
+takes, it is a coroutine built, handed across threads and resolved, per message,
+for nothing.
+
+It is worth about half the CPU. Measured on `scale_test.sh 40000 10000 8`
+(proxy, UDP, 10 000 cps), same binary, only the handler shape differing:
+
+| handler shape | peak CPU | peak CPS |
+|---|---:|---:|
+| one `async def` catch-all | 645 % | 9 928 |
+| `def` catch-all + `async` REGISTER handler | 297 % | 9 904 |
+
+Throughput is identical; what the coroutine costs is headroom.
+
+So put the `await` in a handler only that method reaches. An unfiltered handler
+matches every method and a filtered one only its own, so splitting the one
+awaiting branch out leaves the hot path synchronous:
+
+```python
+# before — every INVITE, ACK and BYE pays asyncio dispatch so that REGISTER
+# can await its challenge
+@proxy.on_request
+async def route(request):
+    if request.method == "REGISTER":
+        if not await auth.require_digest(request, realm=REALM):
+            return
+        registrar.save(request)
+        return
+    request.relay()
+
+# after
+@proxy.on_request("REGISTER")
+async def register(request):
+    if not await auth.require_digest(request, realm=REALM):
+        return
+    registrar.save(request)
+
+@proxy.on_request
+def route(request):
+    if request.method == "REGISTER":
+        return                      # handled by `register`
+    request.relay()
+```
+
+Both handlers run for REGISTER, and they share one action slot, so `route`
+returning without acting leaves `register`'s decision standing. Every other
+method reaches only `route`, synchronously.
+
+The shipped `scripts/proxy_default.py` and `scripts/b2bua_default.py` are
+written this way, and `scripts/check_hot_path_dispatch.py` fails CI on an
+unfiltered per-message handler whose every `await` sits under a single-method
+branch. If your handler genuinely awaits on the path every message takes, leave
+it `async` — there the driver is doing its job.
 
 ## The two failure modes, and how to tell them apart
 

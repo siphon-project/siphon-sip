@@ -13,18 +13,23 @@ from siphon import b2bua, proxy, registrar, auth, log
 DOMAIN = "siphon.test"
 
 
+@proxy.on_request("REGISTER")
+async def register(request):
+    # Split out of `route` because it is the only branch that awaits. An
+    # `async def` handler goes through an asyncio driver, a `def` handler runs
+    # on the synchronous pool, and a coroutine that reaches no `await` still
+    # costs a build, a cross-thread handoff and a resolve per message. Keeping
+    # the per-message path synchronous roughly halves CPU at scale.
+    if not await auth.require_digest(request, realm=DOMAIN):
+        return
+    registrar.save(request)
+
+
 @proxy.on_request
-async def route(request):
+def route(request):
     # OPTIONS keepalive
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
-        return
-
-    # REGISTER with digest auth
-    if request.method == "REGISTER":
-        if not await auth.require_digest(request, realm=DOMAIN):
-            return
-        registrar.save(request)
         return
 
 
