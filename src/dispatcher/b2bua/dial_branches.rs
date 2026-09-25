@@ -161,6 +161,60 @@ pub fn control_dial_branches_for_failure(
         .collect()
 }
 
+/// Resolve an AoR to one dial target per registered contact, each carrying its
+/// own flow and Path route set.
+///
+/// This is what makes a phone on TCP, TLS or WSS reachable: such a contact is
+/// only reachable over the connection it registered on, so DNS-resolving its
+/// Contact URI (what `originate` does with a bare URI) reaches nothing. Mirrors
+/// what a script gets from `call.fork(registrar.lookup(aor))`.
+pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
+    let Some(registrar) = crate::script::api::registrar_arc() else {
+        return Err(DialError::NoContacts(aor.to_string()));
+    };
+    let contacts = registrar.lookup(aor);
+    if contacts.is_empty() {
+        return Err(DialError::NoContacts(aor.to_string()));
+    }
+    // The key the bindings are stored under, which is what a watcher of the
+    // AoR subscribed to, however the controller spelled it.
+    let registered = registrar
+        .registered_aor(aor)
+        .unwrap_or_else(|| crate::registrar::normalize_aor(aor));
+    Ok(contacts
+        .into_iter()
+        .map(|contact| {
+            // Each branch carries the route set of its *own* binding (RFC 3327
+            // §5.3); a shared one would put every branch through the first
+            // binding's proxy chain.
+            let path: Vec<String> = contact.path.iter().map(|value| value.to_string()).collect();
+            let route = crate::proxy::core::route_set_from_path(&path)
+                .map(|value| vec![value])
+                .unwrap_or_default();
+            // The captured inbound flow, same view the scripting API hands to
+            // `call.fork` — `None` for a binding whose socket has gone, which
+            // then falls back to resolving the Contact URI.
+            let flow = contact
+                .flow()
+                .map(|flow| crate::script::api::registrar::PyFlow {
+                    transport: flow.transport.as_scheme().to_string(),
+                    source_addr: flow.source_addr,
+                    local_addr: flow.local_addr,
+                    connection_id: flow.connection_id,
+                });
+            DialTarget {
+                uri: contact.uri.to_string(),
+                next_hop: None,
+                flow,
+                route,
+                headers: std::collections::HashMap::new(),
+                aor: Some(registered.clone()),
+                ..Default::default()
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
