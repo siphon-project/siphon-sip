@@ -652,7 +652,7 @@ pub(super) fn handle_request(
             // Family-matched to the socket the probe arrived on, so a v6 probe
             // gets a v6 Contact and the exact arrival port.
             &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
-            inbound.local_addr.port(),
+            state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             inbound.transport,
         ) else {
             debug!(
@@ -977,7 +977,7 @@ pub(super) fn handle_request(
                     // Family-matched to the socket the OPTIONS arrived on, so a v6
                     // probe gets a v6 Contact/Via and the exact arrival port.
                     &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
-                    inbound.local_addr.port(),
+                    state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
                     inbound.transport,
                 );
             }

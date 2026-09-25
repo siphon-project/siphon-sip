@@ -59,6 +59,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         self_identity: Arc::new(crate::proxy::core::SelfIdentity::new()),
         local_addr,
         advertised_addrs: HashMap::new(),
+        advertised_ports: HashMap::new(),
         listen_addrs: HashMap::new(),
         listener_registry: crate::transport::ListenerRegistry::from_entries(Vec::new()),
         mtu: None,

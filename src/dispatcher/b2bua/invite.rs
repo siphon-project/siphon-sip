@@ -395,13 +395,14 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // Store our Contact for the A-leg direction (what we advertise to the caller).
     // via_host() applies the advertised_address fallback and substitutes the
     // sanitized local_addr when bound to 0.0.0.0/[::]. The PORT is the listener the
-    // INVITE arrived on (`inbound.local_addr.port()`), NOT via_port() (the
-    // first-configured listener), so a multi-homed host anchors the dialog on the
-    // socket the call actually landed on — matches sanitize_b2bua_response's Contact.
+    // INVITE arrived on (its advertised port when its `advertise` names one, else
+    // `inbound.local_addr.port()`), NOT via_port() (the first-configured
+    // listener), so a multi-homed host anchors the dialog on the socket the call
+    // actually landed on — matches sanitize_b2bua_response's Contact.
     a_leg.dialog.local_contact = Some(format!(
         "<sip:{}:{};transport={}>",
         state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
-        inbound.local_addr.port(),
+        state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
         inbound.transport.to_string().to_lowercase(),
     ));
 

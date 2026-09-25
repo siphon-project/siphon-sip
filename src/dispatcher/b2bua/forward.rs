@@ -162,7 +162,7 @@ pub fn b2bua_forward_indialog_request(
     } else {
         (
             state.a_leg_advertised_host(target_local_addr, &transport),
-            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+            state.a_leg_advertised_port(target_local_addr, &transport),
         )
     };
     let via_value = format!(
