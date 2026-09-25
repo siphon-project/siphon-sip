@@ -3169,12 +3169,44 @@ mod liveness_tests {
     async fn an_inbound_tcp_connection_from_the_registrar_ip_does_not_mask_a_dead_trunk() {
         let registry = StreamConnections::new();
         let pool = pool(&registry);
-        registry.register(
-            "192.0.2.10:40001".parse().unwrap(),
-            Transport::Tcp,
-            ConnectionId(78),
+        // A real TCP listener sharing the registry, as the server wires it:
+        // every accepted connection is registered for flow reuse.
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let listener = crate::transport::tcp::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            flume::unbounded().0,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Arc::new(crate::transport::acl::TransportAcl::new(vec![], vec![])),
+            registry.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // The registrar's host opens a connection to siphon's listener.
+        let inbound = TcpStream::connect(listener).await.unwrap();
+        let inbound_peer = inbound.local_addr().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.get(&inbound_peer, Transport::Tcp).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the inbound TCP connection was never registered");
+
+        // siphon's own connection to the registrar, on the same host, is gone
+        // (nothing was ever pooled to it).
+        let registrar = SocketAddr::new(inbound_peer.ip(), 9);
+        assert!(
+            registry.reuse(registrar, Transport::Tcp).is_some(),
+            "precondition: the registry matches the registrar's IP for TCP, \
+             which is what an IP-level check would have read as alive"
         );
-        let manager = registered_trunk("192.0.2.10:5060".parse().unwrap(), Transport::Tcp);
+        let manager = registered_trunk(registrar, Transport::Tcp);
 
         let refreshed = force_refresh_lost_connections(&manager, &pool);
 

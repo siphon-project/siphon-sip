@@ -2490,13 +2490,12 @@ mod tests {
     /// for the stream-connection registry.
     ///
     /// An outbound TLS connection also registers under its destination, which
-    /// is what relays reuse and what the registrant's liveness check reads. A
-    /// client-certificate reload retires the pooled entry and the next send
-    /// opens a replacement, whose registration takes the destination over while
-    /// the old connection is still open. When the old reader then ends, its
-    /// cleanup must leave the replacement registered: removing by destination
-    /// alone made a live trunk connection look lost, and the registrant
-    /// re-registered on every liveness tick.
+    /// is what relays reuse. A client-certificate reload retires the pooled
+    /// entry and the next send opens a replacement, whose registration takes
+    /// the destination over while the old connection is still open. When the
+    /// old reader then ends, its cleanup must leave the replacement registered:
+    /// removing by destination alone made a live trunk connection unreachable
+    /// for reuse.
     ///
     /// Current-thread on purpose: the reader's cleanup drops the connection from
     /// `connection_map` and from the registry within one poll.

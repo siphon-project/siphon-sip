@@ -58,6 +58,9 @@ entry, but a working config keeps working.
   `Arc<ConnectionPool>` as its last argument instead of an
   `Option<StreamConnections>`, so an embedder that spawns the loop itself
   passes the pool its stream transports send through.
+  `StreamConnections::has_ip_transport` is removed: the liveness check was its
+  only caller, and an IP-level match is the wrong question for any one
+  connection. Use `get` / `is_alive` for an exact peer.
 ### Changed
 
 - **A client transaction now retains the octets it sent, not the parsed
