@@ -2633,6 +2633,11 @@
         "doc": "Notifier tag shared by the SUBSCRIBE response and every NOTIFY.",
         "kind": "getset_descriptor"
       },
+      "mirror_reply": {
+        "doc": "Send a final NOTIFY using an already-built",
+        "kind": "method_descriptor",
+        "sig": "($self, reply)"
+      },
       "next_event_version": {
         "doc": "Atomically increment and return the next event-package body version.",
         "kind": "method_descriptor",
