@@ -1024,6 +1024,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "udp_at_buffer_limit": metrics.udp_datagrams_at_buffer_limit_total.get(),
             "firewall_commands_dropped": metrics.firewall_commands_dropped_total.get(),
             "firewall_command_failures": metrics.firewall_command_failures_total.get(),
+            "firewall_redeclared": metrics.firewall_redeclared_total.get(),
         },
     }))
 }

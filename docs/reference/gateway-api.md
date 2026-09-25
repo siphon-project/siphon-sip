@@ -34,12 +34,14 @@ gateway:
   database:
     url: "postgresql://siphon@db.internal/siphon"
     query: 'SELECT "group", uri, address, transport, weight, priority,
-             username, password, registers, enabled FROM gateways WHERE node = $1'
+             username, password, registers, enabled, probe FROM gateways
+             WHERE node = $1'
     refresh_secs: 30
 ```
 
 `group` (or `group_name`, since `group` is a reserved word) and `uri` are
-required; every other column is optional. When the statement references `$1`,
+required; every other column is optional. `probe` and `require_registration`
+are `boolean` columns, the `probe_*` counts integers. When the statement references `$1`,
 siphon binds `server.instance_id` to it.
 
 ## Response (source → siphon)
@@ -76,6 +78,11 @@ destination; rows are gathered into groups by `group`.
 | `algorithm` | string | `"weighted"` | Group-wide: `weighted`, `round_robin`, `hash` |
 | `attrs` | object | `{}` | Matched by `gateway.select(attrs=…)` |
 | `source_networks` | array | `[]` | Group-wide source CIDRs for `from_gateway()` |
+| `probe` | bool | `true` | Group-wide: health-probe with `OPTIONS` ([probe policy](#probe-policy)) |
+| `probe_interval_secs` | int | `30` | Group-wide: seconds between probes; `0` is refused |
+| `probe_failure_threshold` | int | `3` | Group-wide: failed probes before a destination is marked down |
+| `probe_from_user` | string | `"siphon"` | Group-wide: user part of the probe's `From` |
+| `probe_from_domain` | string | local address | Group-wide: host part of the probe's `From` |
 | `username` | string | — | Digest username this destination challenges with |
 | `password` | string | — | Plaintext password. Supply this **or** `ha1` |
 | `ha1` | string | — | `H(username:realm:password)` hex |
@@ -83,6 +90,48 @@ destination; rows are gathered into groups by `group`.
 | `registers` | string | — | AoR of the outbound registration this destination belongs to |
 | `require_registration` | bool | `false` | Withhold from selection while `registers` is down |
 | `enabled` | bool | `true` | `false` drops the destination without removing the row |
+
+## Probe policy
+
+A source group is probed with `OPTIONS` every 30 s unless its rows say
+otherwise, which is also what a `gateway.groups` entry does. The `probe_*`
+fields are the row form of that entry's `probe:` block, and are group-wide:
+each is taken from the first row of the group that carries it, so they can sit
+on one row or on all of them.
+
+Turn probing off for a carrier that does not answer `OPTIONS`. Probed anyway,
+it fails its probe, its destinations are marked down and selection skips them:
+the carrier is taken out of service by being provisioned. Moving a
+hand-written group with `probe.enabled: false` to a source means carrying that
+`false` across as `"probe": false`.
+
+Set `probe_from_user` / `probe_from_domain` for a carrier that rejects an
+`OPTIONS` whose `From` it does not recognise. A probe rejected that way looks
+exactly like a carrier that is down.
+
+- **A change keeps what the prober learned.** Changing any `probe_*` field
+  replaces the group, because a prober's period and `From` are fixed when it
+  starts, but its destinations carry over with their health, failure count and
+  `Retry-After` cooldown. A poll that changes none of them leaves the group and
+  its prober alone.
+- **Switching probing off puts the prober's verdicts back in service.** A
+  destination the prober had marked down is marked up again, because with no
+  prober nothing ever would. This is the migration case above: the carrier went
+  down for not answering `OPTIONS`, not for being down.
+- **An unprobed group has no prober to re-resolve it.** A hostname
+  destination's send address is resolved once, when the destination is built,
+  exactly as for a `gateway.groups` entry with `probe.enabled: false`. Its
+  membership for `from_gateway()` is re-resolved on the kernel allow set's floor
+  tick when [that set](../kernel-firewall.md#gateway-allow-set) is on.
+
+```json
+{"group": "carriers", "uri": "sip:gw1.carrier.example:5060", "probe": false}
+```
+
+```json
+{"group": "carriers", "uri": "sip:gw1.carrier.example:5060",
+ "probe_interval_secs": 15, "probe_from_domain": "sbc.example.com"}
+```
 
 ## Linking a destination to its registration
 

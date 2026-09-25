@@ -58,7 +58,11 @@ const NFNL_MSG_BATCH_END: u16 = 17;
 // nf_tables message types (subsystem-relative). Wire type =
 // `(NFNL_SUBSYS_NFTABLES << 8) | msg`.
 const NFT_MSG_NEWTABLE: u16 = 0;
+/// Look a table up by name. Like the other `GET` messages below it is sent
+/// bare rather than inside a batch, and opens no transaction.
+const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_NEWSET: u16 = 9;
+const NFT_MSG_GETSET: u16 = 10;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_DELSETELEM: u16 = 14;
 
@@ -68,6 +72,7 @@ const NFPROTO_INET: u8 = 1;
 
 // `enum nft_table_attributes`
 const NFTA_TABLE_NAME: u16 = 1;
+const NFTA_TABLE_HANDLE: u16 = 4;
 
 // `enum nft_set_attributes`
 const NFTA_SET_TABLE: u16 = 1;
@@ -76,6 +81,7 @@ const NFTA_SET_FLAGS: u16 = 3;
 const NFTA_SET_KEY_TYPE: u16 = 4;
 const NFTA_SET_KEY_LEN: u16 = 5;
 const NFTA_SET_ID: u16 = 10;
+const NFTA_SET_HANDLE: u16 = 16;
 
 // `enum nft_set_flags`
 const NFT_SET_TIMEOUT: u32 = 0x10;
@@ -122,6 +128,7 @@ const NFTA_LIST_ELEM: u16 = 1;
 // --- self-contained chain + drop rule (manage_rule) ------------------------
 
 const NFT_MSG_NEWCHAIN: u16 = 3;
+const NFT_MSG_GETCHAIN: u16 = 4;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_DELRULE: u16 = 8;
 
@@ -132,6 +139,7 @@ const NF_DROP: u32 = 0;
 
 // `enum nft_chain_attributes`
 const NFTA_CHAIN_TABLE: u16 = 1;
+const NFTA_CHAIN_HANDLE: u16 = 2;
 const NFTA_CHAIN_NAME: u16 = 3;
 const NFTA_CHAIN_HOOK: u16 = 4;
 const NFTA_CHAIN_TYPE: u16 = 7;
@@ -502,6 +510,48 @@ fn build_flush_chain(table: &str, chain: &str, seq: u32) -> Vec<u8> {
     )
 }
 
+// --- identity queries -------------------------------------------------------
+
+/// Look up one table by name (`NFT_MSG_GETTABLE`, no dump). The kernel answers
+/// with the table's description and an errno-0 ack when it exists, and a lone
+/// `ENOENT` when it does not. The GET builders below answer the same way.
+fn build_get_table(table: &str, seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_TABLE_NAME, table);
+    nlmsg(
+        nft_type(NFT_MSG_GETTABLE),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        &body,
+    )
+}
+
+/// Look up one set by table + name (`NFT_MSG_GETSET`, no dump).
+fn build_get_set(table: &str, set: &str, seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_SET_TABLE, table);
+    push_nla_str(&mut body, NFTA_SET_NAME, set);
+    nlmsg(
+        nft_type(NFT_MSG_GETSET),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        &body,
+    )
+}
+
+/// Look up one chain by table + name (`NFT_MSG_GETCHAIN`, no dump).
+fn build_get_chain(table: &str, chain: &str, seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_CHAIN_TABLE, table);
+    push_nla_str(&mut body, NFTA_CHAIN_NAME, chain);
+    nlmsg(
+        nft_type(NFT_MSG_GETCHAIN),
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        &body,
+    )
+}
+
 /// Append one expression: `NFTA_LIST_ELEM { NFTA_EXPR_NAME, NFTA_EXPR_DATA }`.
 fn push_expr(list: &mut Vec<u8>, name: &str, data: &[u8]) {
     let mut expr = Vec::new();
@@ -709,6 +759,134 @@ fn count_acks(buffer: &[u8], benign_errno: Option<i32>) -> io::Result<usize> {
     Ok(ok)
 }
 
+/// Read one chunk of the answer to an identity query.
+///
+/// The kernel answers a found object with its description and then an errno-0
+/// ack, possibly across two `recv`s. The description's `handle_attr` is stored
+/// in `handle`; the ack finishes the query as `Some(true)`, and `ENOENT`
+/// finishes it as `Some(false)`. `None` means the ack is still to come.
+///
+/// Any other errno is a real error. `EPERM` from a lost capability must not
+/// read as "absent", which would re-declare into the same failure every tick,
+/// nor as "present", which would hide it.
+fn read_lookup(
+    buffer: &[u8],
+    handle_attr: u16,
+    handle: &mut Option<u64>,
+) -> io::Result<Option<bool>> {
+    let mut offset = 0;
+    while offset + NLMSG_HDR_LEN <= buffer.len() {
+        let len = u32::from_ne_bytes([
+            buffer[offset],
+            buffer[offset + 1],
+            buffer[offset + 2],
+            buffer[offset + 3],
+        ]) as usize;
+        let msg_type = u16::from_ne_bytes([buffer[offset + 4], buffer[offset + 5]]);
+        if len < NLMSG_HDR_LEN || offset + len > buffer.len() {
+            return Err(io::Error::other("nftables: malformed reply"));
+        }
+        if msg_type == NLMSG_ERROR {
+            if len < NLMSG_HDR_LEN + 4 {
+                return Err(io::Error::other("nftables: short NLMSG_ERROR"));
+            }
+            let errno = i32::from_ne_bytes([
+                buffer[offset + NLMSG_HDR_LEN],
+                buffer[offset + NLMSG_HDR_LEN + 1],
+                buffer[offset + NLMSG_HDR_LEN + 2],
+                buffer[offset + NLMSG_HDR_LEN + 3],
+            ]);
+            return match -errno {
+                0 => Ok(Some(true)),
+                ENOENT => Ok(Some(false)),
+                other => Err(io::Error::from_raw_os_error(other)),
+            };
+        }
+        // The object's description: nlmsghdr, nfgenmsg, then its attributes.
+        let attributes_start = offset + NLMSG_HDR_LEN + 4;
+        if attributes_start <= offset + len {
+            if let Some(value) =
+                find_be64_attr(&buffer[attributes_start..offset + len], handle_attr)
+            {
+                *handle = Some(value);
+            }
+        }
+        offset += align_to(len, NLMSG_ALIGNTO);
+    }
+    Ok(None)
+}
+
+/// The value of the first top-level big-endian u64 attribute of `wanted` type.
+fn find_be64_attr(attributes: &[u8], wanted: u16) -> Option<u64> {
+    let mut offset = 0;
+    while offset + 4 <= attributes.len() {
+        let nla_len = u16::from_ne_bytes([attributes[offset], attributes[offset + 1]]) as usize;
+        let nla_type =
+            u16::from_ne_bytes([attributes[offset + 2], attributes[offset + 3]]) & !NLA_F_NESTED;
+        if nla_len < 4 || offset + nla_len > attributes.len() {
+            return None;
+        }
+        if nla_type == wanted && nla_len == 4 + 8 {
+            let mut value = [0u8; 8];
+            value.copy_from_slice(&attributes[offset + 4..offset + 12]);
+            return Some(u64::from_be_bytes(value));
+        }
+        offset += align_to(nla_len, NLA_ALIGNTO);
+    }
+    None
+}
+
+/// Look each object up and collect its kernel handle, stopping at the first
+/// that is missing (`Ok(None)`). One socket for all of them, each query
+/// answered before the next is sent.
+async fn lookup_handles(queries: Vec<(Vec<u8>, u16)>) -> io::Result<Option<Vec<u64>>> {
+    tokio::task::spawn_blocking(move || -> io::Result<Option<Vec<u64>>> {
+        let socket = Socket::new(NETLINK_NETFILTER)?;
+        set_recv_timeout(&socket, ACK_RECV_TIMEOUT)?;
+        socket.connect(&SocketAddr::new(0, 0))?;
+        let mut response = vec![0u8; 8192];
+        let mut handles = Vec::with_capacity(queries.len());
+        for (query, handle_attr) in queries {
+            let sent = socket.send(&query, 0)?;
+            if sent != query.len() {
+                return Err(io::Error::other(format!(
+                    "nftables: short send ({sent}/{})",
+                    query.len()
+                )));
+            }
+            let mut handle = None;
+            let found = loop {
+                let received = socket.recv(&mut &mut response[..], 0).map_err(|error| {
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "nftables: timed out waiting for a lookup answer",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                if let Some(found) = read_lookup(&response[..received], handle_attr, &mut handle)? {
+                    break found;
+                }
+            };
+            if !found {
+                return Ok(None);
+            }
+            let handle = handle.ok_or_else(|| {
+                io::Error::other("nftables: an object was found but its answer carried no handle")
+            })?;
+            handles.push(handle);
+        }
+        Ok(Some(handles))
+    })
+    .await
+    .map_err(|join| io::Error::other(format!("nftables netlink task panic: {join}")))?
+}
+
 // --- public operations ------------------------------------------------------
 
 /// Ensure the `inet` table + both timeout sets exist, and — when `manage_rule`
@@ -783,6 +961,68 @@ pub async fn ensure_firewall(
     // objects ack errno-0, never `EEXIST`), so ANY errno here is a real,
     // batch-aborting failure that must reach the caller.
     send(wrap_batch(&messages), object_count, None).await
+}
+
+/// The kernel identity of everything [`ensure_firewall`] declares with the same
+/// arguments: one handle per object, or `None` when any of them is missing.
+/// A read, not a transaction: a node whose ruleset nobody touched pays a
+/// handful of lookups and changes nothing.
+///
+/// Presence alone is not enough, and handles are why. An operator's own
+/// ruleset that references `@gateways4` only loads if it declares that set
+/// itself — after `delete table` there is nothing to reference — so after a
+/// reload the set is back, under the same name, and **empty**. The table's
+/// handle is what tells the two apart: it comes from a per-namespace counter
+/// that only goes up, so a recreated table never reuses one. The objects'
+/// own handles restart inside a new table and can repeat, which is why the
+/// table's handle is in the fingerprint and not only theirs; theirs catch a
+/// single set deleted and recreated inside a table that survived.
+///
+/// Not seen here: a rule deleted from a chain that still exists, and a set
+/// flushed rather than deleted. Neither changes a handle.
+pub async fn firewall_fingerprint(
+    table: &str,
+    chain: &str,
+    set_v4: &str,
+    set_v6: &str,
+    manage_rule: bool,
+    gateway_sets: Option<(&str, &str)>,
+) -> io::Result<Option<Vec<u64>>> {
+    lookup_handles(identity_queries(
+        table,
+        chain,
+        set_v4,
+        set_v6,
+        manage_rule,
+        gateway_sets,
+    ))
+    .await
+}
+
+/// The lookups [`firewall_fingerprint`] sends, each with the attribute its
+/// answer carries the handle in: the table, then one per object
+/// [`ensure_firewall`] declares.
+fn identity_queries(
+    table: &str,
+    chain: &str,
+    set_v4: &str,
+    set_v6: &str,
+    manage_rule: bool,
+    gateway_sets: Option<(&str, &str)>,
+) -> Vec<(Vec<u8>, u16)> {
+    let mut queries = vec![
+        (build_get_table(table, 1), NFTA_TABLE_HANDLE),
+        (build_get_set(table, set_v4, 2), NFTA_SET_HANDLE),
+        (build_get_set(table, set_v6, 3), NFTA_SET_HANDLE),
+    ];
+    if let Some((gateways_v4, gateways_v6)) = gateway_sets {
+        queries.push((build_get_set(table, gateways_v4, 4), NFTA_SET_HANDLE));
+        queries.push((build_get_set(table, gateways_v6, 5), NFTA_SET_HANDLE));
+    }
+    if manage_rule {
+        queries.push((build_get_chain(table, chain, 6), NFTA_CHAIN_HANDLE));
+    }
+    queries
 }
 
 /// Add a banned source to the appropriate set with a per-element timeout
@@ -1324,6 +1564,177 @@ mod tests {
             !attrs.iter().any(|(ty, _)| *ty == NFTA_RULE_HANDLE),
             "flush must carry no rule handle"
         );
+    }
+
+    #[test]
+    fn get_table_is_a_bare_acked_lookup_by_name() {
+        let message = build_get_table("edge", 1);
+        assert_eq!(u16_at(&message, 4), (10 << 8) | NFT_MSG_GETTABLE);
+        // No NLM_F_CREATE, no batch: a lookup must never be able to declare.
+        assert_eq!(u16_at(&message, 6), NLM_F_REQUEST | NLM_F_ACK);
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_TABLE_NAME, "name"), b"edge\0");
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn get_set_is_a_bare_acked_lookup_by_table_and_name() {
+        let message = build_get_set("edge", "gateways4", 1);
+        assert_eq!(u16_at(&message, 4), (10 << 8) | NFT_MSG_GETSET);
+        assert_eq!(u16_at(&message, 6), NLM_F_REQUEST | NLM_F_ACK);
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_TABLE, "table"), b"edge\0");
+        assert_eq!(attr(&attrs, NFTA_SET_NAME, "name"), b"gateways4\0");
+        assert_eq!(attrs.len(), 2);
+    }
+
+    #[test]
+    fn get_chain_is_a_bare_acked_lookup_by_table_and_name() {
+        let message = build_get_chain("edge", "input", 1);
+        assert_eq!(u16_at(&message, 4), (10 << 8) | NFT_MSG_GETCHAIN);
+        assert_eq!(u16_at(&message, 6), NLM_F_REQUEST | NLM_F_ACK);
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_CHAIN_TABLE, "table"), b"edge\0");
+        assert_eq!(attr(&attrs, NFTA_CHAIN_NAME, "name"), b"input\0");
+    }
+
+    /// `(message type, handle attribute)` of each identity query.
+    fn query_shapes(queries: &[(Vec<u8>, u16)]) -> Vec<(u16, u16)> {
+        queries
+            .iter()
+            .map(|(message, handle_attr)| (u16_at(message, 4) & 0xff, *handle_attr))
+            .collect()
+    }
+
+    #[test]
+    fn identity_queries_cover_the_table_and_every_declared_object() {
+        let queries = identity_queries(
+            "edge",
+            "input",
+            "banned4",
+            "banned6",
+            true,
+            Some(("gateways4", "gateways6")),
+        );
+        assert_eq!(
+            query_shapes(&queries),
+            vec![
+                (NFT_MSG_GETTABLE, NFTA_TABLE_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+                (NFT_MSG_GETCHAIN, NFTA_CHAIN_HANDLE),
+            ]
+        );
+        let set_names: Vec<&[u8]> = queries[1..5]
+            .iter()
+            .map(|(message, _)| {
+                attr(
+                    &walk_attrs(&message[NLMSG_HDR_LEN + 4..]),
+                    NFTA_SET_NAME,
+                    "set name",
+                )
+            })
+            .collect();
+        assert_eq!(
+            set_names,
+            vec![
+                &b"banned4\0"[..],
+                &b"banned6\0"[..],
+                &b"gateways4\0"[..],
+                &b"gateways6\0"[..],
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_queries_skip_what_was_not_declared() {
+        // manage_rule off and no allow set: only the table and the ban sets
+        // were declared, so a missing chain must not read as a reload.
+        let queries = identity_queries("siphon", "input", "banned4", "banned6", false, None);
+        assert_eq!(
+            query_shapes(&queries),
+            vec![
+                (NFT_MSG_GETTABLE, NFTA_TABLE_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+                (NFT_MSG_GETSET, NFTA_SET_HANDLE),
+            ]
+        );
+    }
+
+    /// An `NLMSG_ERROR` carrying `errno` (kernel sign convention: negative).
+    fn nlmsg_error(errno: i32) -> Vec<u8> {
+        let mut body = errno.to_ne_bytes().to_vec();
+        body.extend_from_slice(&[0u8; NLMSG_HDR_LEN]); // the echoed request header
+        nlmsg(NLMSG_ERROR, 0, 1, &body)
+    }
+
+    /// A found set's description, as the kernel sends it: nfgenmsg, the name,
+    /// and the handle as a be64 attribute.
+    fn set_description(handle: u64) -> Vec<u8> {
+        let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+        push_nla_str(&mut body, NFTA_SET_NAME, "gateways4");
+        push_nla_be64(&mut body, NFTA_SET_HANDLE, handle);
+        nlmsg(nft_type(NFT_MSG_NEWSET), 0, 1, &body)
+    }
+
+    #[test]
+    fn a_found_object_yields_its_handle_on_the_ack() {
+        let mut reply = set_description(7);
+        reply.extend_from_slice(&nlmsg_error(0));
+        let mut handle = None;
+        assert_eq!(
+            read_lookup(&reply, NFTA_SET_HANDLE, &mut handle).unwrap(),
+            Some(true)
+        );
+        assert_eq!(handle, Some(7));
+    }
+
+    #[test]
+    fn the_ack_may_arrive_in_a_later_recv() {
+        let mut handle = None;
+        assert_eq!(
+            read_lookup(&set_description(9), NFTA_SET_HANDLE, &mut handle).unwrap(),
+            None,
+            "the description alone does not finish the query"
+        );
+        assert_eq!(handle, Some(9));
+        assert_eq!(
+            read_lookup(&nlmsg_error(0), NFTA_SET_HANDLE, &mut handle).unwrap(),
+            Some(true)
+        );
+        assert_eq!(handle, Some(9), "the ack must not clear the handle");
+    }
+
+    #[test]
+    fn enoent_reads_as_absent() {
+        let mut handle = None;
+        assert_eq!(
+            read_lookup(&nlmsg_error(-ENOENT), NFTA_SET_HANDLE, &mut handle).unwrap(),
+            Some(false)
+        );
+        assert_eq!(handle, None);
+    }
+
+    #[test]
+    fn any_other_errno_surfaces() {
+        // EPERM (a lost CAP_NET_ADMIN) is neither present nor absent.
+        let mut handle = None;
+        let error = read_lookup(&nlmsg_error(-1), NFTA_SET_HANDLE, &mut handle)
+            .expect_err("EPERM must surface");
+        assert_eq!(error.raw_os_error(), Some(1));
+    }
+
+    #[test]
+    fn a_handle_under_another_attribute_is_not_taken() {
+        // NFTA_TABLE_HANDLE (4) is NFTA_SET_KEY_TYPE on a set: reading the
+        // wrong attribute would fingerprint the key type, which never changes.
+        let mut handle = None;
+        let mut reply = set_description(7);
+        reply.extend_from_slice(&nlmsg_error(0));
+        read_lookup(&reply, NFTA_CHAIN_HANDLE, &mut handle).unwrap();
+        assert_eq!(handle, None);
     }
 
     #[test]

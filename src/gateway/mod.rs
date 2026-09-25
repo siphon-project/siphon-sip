@@ -279,7 +279,7 @@ impl Destination {
 // ---------------------------------------------------------------------------
 
 /// Per-group health probe configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeConfig {
     pub enabled: bool,
     pub interval: Duration,
@@ -1228,7 +1228,7 @@ pub fn resolve_address(address: &str) -> Result<SocketAddr, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::transport::OutboundRouter;
 
@@ -1735,13 +1735,13 @@ mod tests {
 
     /// A `UacSender` over flume channels, holding every receiver open so a test
     /// can observe what a prober actually puts on the wire.
-    struct TestUac {
-        sender: Arc<UacSender>,
-        udp: flume::Receiver<crate::transport::OutboundMessage>,
+    pub(crate) struct TestUac {
+        pub(crate) sender: Arc<UacSender>,
+        pub(crate) udp: flume::Receiver<crate::transport::OutboundMessage>,
         _other: Vec<flume::Receiver<crate::transport::OutboundMessage>>,
     }
 
-    fn test_uac() -> TestUac {
+    pub(crate) fn test_uac() -> TestUac {
         let (udp_tx, udp_rx) = flume::unbounded();
         let (tcp_tx, tcp_rx) = flume::unbounded();
         let (tls_tx, tls_rx) = flume::unbounded();

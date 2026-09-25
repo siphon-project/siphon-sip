@@ -200,10 +200,74 @@ gateway inside a `trusted_cidrs` block goes in once.
 - On a 60-second floor tick, which also re-resolves groups with
   `probe.enabled: false` — nothing else ever revisits their DNS.
 
+Each of these first checks that the sets are still the ones SIPhon declared
+([below](#referencing-the-sets-from-your-own-table)).
+
 A publish that changes nothing issues no netlink transaction at all. A publish
 replaces the set contents wholesale rather than diffing, so a carrier removed
-from your source stops being admitted, and the sets converge again even after
-someone runs `nft flush ruleset` underneath a running node.
+from your source stops being admitted.
+
+### Referencing the sets from your own table
+
+An nf_tables set is scoped to its table. A rule in your `table inet edge`
+cannot name `@gateways4` in `table inet siphon`; `nft` refuses the load with
+`No such file or directory`. So to reference the sets, point SIPhon at the
+table your ruleset lives in:
+
+```yaml
+security:
+  firewall:
+    table: edge
+    manage_rule: false      # usually: your ruleset already has its input chain
+```
+
+That table is yours, and you will reload it the way any ruleset is reloaded,
+by deleting and redefining it so rules do not stack on every load:
+
+```nft
+table inet edge
+delete table inet edge
+table inet edge {
+    set gateways4 { type ipv4_addr; flags interval; }
+    set gateways6 { type ipv6_addr; flags interval; }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        ip  saddr @gateways4 udp dport 5060 accept
+        ip6 saddr @gateways6 udp dport 5060 accept
+    }
+}
+```
+
+The file has to declare the sets itself, because after the `delete` there is
+nothing for its rules to reference. The sets come back **empty**, and the
+`delete` also took SIPhon's ban sets (and its chain, with `manage_rule: true`)
+with it.
+
+SIPhon notices the next time it republishes: at the latest on the floor tick,
+sooner on a `gateway.backend` reconcile or an admin refresh. It keeps the kernel handle of every
+object it declared, and a recreated table always gets a new one, so a set that
+is back under the same name still reads as new. It then re-runs its start-up
+declaration, which is idempotent and leaves your own objects and rules alone,
+republishes the allow set whether or not the gateway view changed, and logs a
+`warn` naming the table. `siphon_firewall_redeclared_total` counts each time.
+A check that finds everything as it was reads a few handles and writes nothing.
+
+What that leaves you to plan for:
+
+- **A window after each reload**, in which the allow set is empty and your
+  ruleset drops the carriers' answers. It lasts until the next republish: the
+  floor tick (60 s) at the latest. With a `gateway.backend` source, close it at
+  once by following the reload with
+  `curl -X POST http://127.0.0.1:9091/admin/gateways/refresh`.
+- **Bans placed before the reload are enforced in userspace only.** The ban
+  sets come back empty, and SIPhon does not replay its active bans into them;
+  bans placed after the recovery reach the kernel as usual.
+- **A set flushed rather than deleted is not noticed.** `nft flush set` keeps
+  the set and its handle, so nothing tells SIPhon; the next change to the
+  gateway view refills it. Reload by redefining the table, not by flushing.
+
+The same recovery covers `nft flush ruleset` underneath a running node, with
+SIPhon's own `siphon` table.
 
 ### CIDRs go in as written
 
@@ -275,12 +339,13 @@ nft list ruleset
   are present in `nft list ruleset`. With the default `manage_rule: true` SIPhon
   installs them; with `manage_rule: false` you add them yourself (see above).
 
-Two counters on `/metrics` cover the runtime failure modes:
+Three counters on `/metrics` cover the runtime failure modes:
 
 | Metric | Alert when | Meaning |
 |---|---|---|
 | `siphon_firewall_command_failures_total` | any sustained `rate() > 0` | Bans are **not** reaching the kernel (ruleset deleted out from under SIPhon, capability lost). Userspace ACL is the only enforcement left. |
 | `siphon_firewall_commands_dropped_total` | sustained `rate() > 0` | A ban storm is outrunning the netlink actor's queue; kernel enforcement lags the ban rate (userspace ACL still enforces every ban). |
+| `siphon_firewall_redeclared_total` | increases with no deploy behind it | SIPhon found its sets deleted or recreated (a [ruleset reload](#referencing-the-sets-from-your-own-table)) and re-declared them. Expected once per reload of the table that holds them. |
 
 ### Lifting a false-positive ban
 

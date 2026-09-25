@@ -2769,8 +2769,11 @@ jobs:
 
       # Build the test binary WITH network, OUTSIDE the namespace, so the
       # network-isolated `unshare -n` run below never needs to fetch or compile.
-      - name: Build the firewall live test
-        run: PYO3_PYTHON=python3.14 cargo test --lib --no-run firewall::nftables
+      - name: Build the firewall live tests
+        run: PYO3_PYTHON=python3.14 cargo test --lib --no-run firewall::
 
-      - name: nftables live-kernel roundtrip (isolated user+net namespace)
-        run: unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib firewall::nftables::tests::live_kernel_roundtrip -- --ignored --nocapture
+      # Every ignored firewall test: the netlink roundtrip, and the allow set
+      # recovering from an operator reloading the table that holds it. One
+      # thread, because both read back the one namespace's ruleset.
+      - name: nftables live-kernel tests (isolated user+net namespace)
+        run: unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib firewall:: -- --ignored --nocapture --test-threads=1

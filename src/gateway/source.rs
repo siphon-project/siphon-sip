@@ -78,6 +78,29 @@ pub struct GatewayRow {
     /// `from_gateway()`. Group-wide; taken from the first row that carries any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_networks: Vec<String>,
+    /// Health-probe this group with SIP `OPTIONS`. Group-wide, like every
+    /// `probe_*` field: each is taken from the first row that carries it.
+    /// Absent means probed, as a `gateway.groups` entry is by default.
+    ///
+    /// `false` is for a carrier that does not answer `OPTIONS`, which would
+    /// otherwise fail its probe and be taken out of service by the act of
+    /// provisioning it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<bool>,
+    /// Seconds between probes. Default 30; `0` is refused as a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_interval_secs: Option<u32>,
+    /// Consecutive failed probes before a destination is marked down. Default 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_failure_threshold: Option<u32>,
+    /// User part of the probe's `From`. Default `siphon`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_from_user: Option<String>,
+    /// Host part of the probe's `From`. Default the local address. For a
+    /// carrier that rejects an `OPTIONS` from a domain it does not know, which
+    /// is otherwise indistinguishable from a carrier that is down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_from_domain: Option<String>,
     /// Digest username this destination challenges with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -205,7 +228,60 @@ pub struct DesiredGroup {
     pub name: String,
     pub algorithm: Algorithm,
     pub source_networks: Vec<String>,
+    pub probe: DesiredProbe,
     pub destinations: Vec<DesiredDestination>,
+}
+
+/// The group's `probe_*` fields as the rows gave them, each from the first row
+/// that carries it. Unset fields fall back to [`ProbeConfig::default`], so a
+/// source that sets none of them provisions exactly what it did before they
+/// existed.
+#[derive(Debug, Clone, Default)]
+pub struct DesiredProbe {
+    enabled: Option<bool>,
+    interval_secs: Option<u32>,
+    failure_threshold: Option<u32>,
+    from_user: Option<String>,
+    from_domain: Option<String>,
+}
+
+impl DesiredProbe {
+    fn of(row: &GatewayRow) -> Self {
+        Self {
+            enabled: row.probe,
+            interval_secs: row.probe_interval_secs,
+            failure_threshold: row.probe_failure_threshold,
+            from_user: row.probe_from_user.clone(),
+            from_domain: row.probe_from_domain.clone(),
+        }
+    }
+
+    /// Fill whatever this group has not set yet from a later row.
+    fn fill_from(&mut self, row: &GatewayRow) {
+        self.enabled = self.enabled.or(row.probe);
+        self.interval_secs = self.interval_secs.or(row.probe_interval_secs);
+        self.failure_threshold = self.failure_threshold.or(row.probe_failure_threshold);
+        if self.from_user.is_none() {
+            self.from_user = row.probe_from_user.clone();
+        }
+        if self.from_domain.is_none() {
+            self.from_domain = row.probe_from_domain.clone();
+        }
+    }
+
+    pub fn config(&self) -> ProbeConfig {
+        let default = ProbeConfig::default();
+        ProbeConfig {
+            enabled: self.enabled.unwrap_or(default.enabled),
+            interval: self
+                .interval_secs
+                .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
+                .unwrap_or(default.interval),
+            failure_threshold: self.failure_threshold.unwrap_or(default.failure_threshold),
+            from_user: self.from_user.clone().or(default.from_user),
+            from_domain: self.from_domain.clone().or(default.from_domain),
+        }
+    }
 }
 
 /// Turn source rows into the groups they describe.
@@ -239,6 +315,7 @@ pub fn group_rows(rows: &[GatewayRow]) -> (Vec<DesiredGroup>, usize) {
                 if group.source_networks.is_empty() && !row.source_networks.is_empty() {
                     group.source_networks = row.source_networks.clone();
                 }
+                group.probe.fill_from(row);
                 group.destinations.push(destination);
             }
             None => groups.push(DesiredGroup {
@@ -249,6 +326,7 @@ pub fn group_rows(rows: &[GatewayRow]) -> (Vec<DesiredGroup>, usize) {
                     .and_then(Algorithm::from_str)
                     .unwrap_or(Algorithm::Weighted),
                 source_networks: row.source_networks.clone(),
+                probe: DesiredProbe::of(row),
                 destinations: vec![destination],
             }),
         }
@@ -300,6 +378,12 @@ fn desired_destination(row: &GatewayRow) -> Result<DesiredDestination, String> {
             )?,
         }),
     };
+
+    // A zero period panics `tokio::time::interval`, which would kill the
+    // group's prober task and leave the group looking probed.
+    if row.probe_interval_secs == Some(0) {
+        return Err("`probe_interval_secs` must be at least 1".to_string());
+    }
 
     if row.require_registration && row.registers.is_none() {
         return Err("`require_registration` needs a `registers` AoR to gate on".to_string());
@@ -440,8 +524,11 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
             .iter()
             .filter_map(|spec| super::parse_source_network(spec))
             .collect();
+        let probe = group.probe.config();
         let group_changed = live_group.as_ref().is_some_and(|existing| {
-            existing.algorithm != group.algorithm || existing.source_networks != source_networks
+            existing.algorithm != group.algorithm
+                || existing.source_networks != source_networks
+                || existing.probe_config != probe
         });
 
         if existed && !changed && !group_changed {
@@ -451,9 +538,31 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
             continue;
         }
 
+        // A probe change does replace the group, because the prober's period
+        // and `From` are fixed when it is spawned. What it has learned is not
+        // lost with it: that lives on the destinations, carried over above.
+        //
+        // Except when probing is switched off. A destination the prober marked
+        // down would then stay down for good, since only a probe ever marks one
+        // up again, and switching probing off is exactly what an operator does
+        // for the carrier that failed its probes by not answering OPTIONS.
+        if !probe.enabled
+            && live_group
+                .as_ref()
+                .is_some_and(|existing| existing.probe_config.enabled)
+        {
+            for destination in &destinations {
+                if !destination.is_healthy() {
+                    info!(group = %group.name, uri = %destination.uri,
+                          "gateway source: probing switched off — marking the destination up");
+                    destination.mark_up();
+                }
+            }
+        }
+
         manager.add_group(
             DispatcherGroup::from_existing(group.name.clone(), group.algorithm, destinations)
-                .with_probe_config(ProbeConfig::default())
+                .with_probe_config(probe)
                 .with_source_networks(source_networks)
                 .from_source(),
         );
@@ -810,6 +919,15 @@ mod postgres {
             registers: text(row, "registers"),
             require_registration: boolean(row, "require_registration").unwrap_or(false),
             enabled: boolean(row, "enabled").unwrap_or(true),
+            probe: boolean(row, "probe"),
+            // Clamped rather than dropped: a negative interval reaches the row
+            // check as 0 and is refused there, not silently defaulted.
+            probe_interval_secs: integer(row, "probe_interval_secs")
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
+            probe_failure_threshold: integer(row, "probe_failure_threshold")
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
+            probe_from_user: text(row, "probe_from_user"),
+            probe_from_domain: text(row, "probe_from_domain"),
         }
     }
 
@@ -890,6 +1008,11 @@ mod tests {
             registers: None,
             require_registration: false,
             enabled: true,
+            probe: None,
+            probe_interval_secs: None,
+            probe_failure_threshold: None,
+            probe_from_user: None,
+            probe_from_domain: None,
         }
     }
 
@@ -1135,6 +1258,183 @@ mod tests {
         assert_eq!(group.all_destinations()[0].weight, 5);
     }
 
+    // --- Probe policy from the source ---
+
+    #[test]
+    fn a_source_that_sets_no_probe_field_keeps_the_default() {
+        // Nothing changes for a source written before the fields existed.
+        let manager = manager();
+        apply_rows(&manager, &[row("carriers", "sip:gw1.carrier.example:5060")]);
+        let group = manager.get_group("carriers").expect("group");
+        assert_eq!(group.probe_config, ProbeConfig::default());
+    }
+
+    #[test]
+    fn a_row_provisions_an_unprobed_group() {
+        let manager = manager();
+        let mut unprobed = row("carriers", "sip:gw1.carrier.example:5060");
+        unprobed.probe = Some(false);
+        apply_rows(&manager, &[unprobed]);
+        let group = manager.get_group("carriers").expect("group");
+        assert!(!group.probe_config.enabled);
+        assert!(group.probing_disabled());
+    }
+
+    #[test]
+    fn a_row_sets_the_probe_period_threshold_and_from() {
+        let manager = manager();
+        let mut probed = row("carriers", "sip:gw1.carrier.example:5060");
+        probed.probe_interval_secs = Some(10);
+        probed.probe_failure_threshold = Some(5);
+        probed.probe_from_user = Some("edge".to_string());
+        probed.probe_from_domain = Some("sbc.example.com".to_string());
+        apply_rows(&manager, &[probed]);
+        let group = manager.get_group("carriers").expect("group");
+        assert_eq!(
+            group.probe_config,
+            ProbeConfig {
+                enabled: true,
+                interval: std::time::Duration::from_secs(10),
+                failure_threshold: 5,
+                from_user: Some("edge".to_string()),
+                from_domain: Some("sbc.example.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn probe_fields_are_group_wide_and_each_comes_from_the_first_row_carrying_it() {
+        let mut first = row("carriers", "sip:gw1.carrier.example:5060");
+        first.probe_interval_secs = Some(10);
+        let mut second = row("carriers", "sip:gw2.carrier.example:5060");
+        second.probe_interval_secs = Some(99);
+        second.probe_from_domain = Some("sbc.example.com".to_string());
+        let (groups, rejected) = group_rows(&[first, second]);
+        assert_eq!(rejected, 0);
+        let probe = groups[0].probe.config();
+        assert_eq!(probe.interval, std::time::Duration::from_secs(10));
+        assert_eq!(probe.from_domain.as_deref(), Some("sbc.example.com"));
+    }
+
+    #[test]
+    fn a_zero_probe_interval_is_rejected_as_a_row() {
+        let mut zero = row("carriers", "sip:gw1.carrier.example:5060");
+        zero.probe_interval_secs = Some(0);
+        let (groups, rejected) = group_rows(&[zero]);
+        assert!(groups.is_empty());
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn an_unchanged_probe_policy_leaves_the_group_alone() {
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gw1.carrier.example:5060")];
+        rows[0].probe_interval_secs = Some(10);
+        rows[0].probe_from_domain = Some("sbc.example.com".to_string());
+        apply_rows(&manager, &rows);
+        let first = manager.get_group("carriers").expect("group");
+
+        assert_eq!(apply_rows(&manager, &rows), ReconcileReport::default());
+        assert!(Arc::ptr_eq(
+            &first,
+            &manager.get_group("carriers").expect("group")
+        ));
+    }
+
+    #[test]
+    fn a_probe_change_replaces_the_group_but_keeps_what_the_prober_learned() {
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gw1.carrier.example:5060")];
+        apply_rows(&manager, &rows);
+        let destination = Arc::clone(&manager.get_group("carriers").unwrap().all_destinations()[0]);
+        destination.mark_down();
+
+        rows[0].probe_from_domain = Some("sbc.example.com".to_string());
+        assert_eq!(apply_rows(&manager, &rows).updated, 1);
+        let group = manager.get_group("carriers").expect("group");
+        assert_eq!(
+            group.probe_config.from_domain.as_deref(),
+            Some("sbc.example.com")
+        );
+        assert!(Arc::ptr_eq(&destination, &group.all_destinations()[0]));
+        assert!(!destination.is_healthy(), "a probe change reset health");
+    }
+
+    #[test]
+    fn switching_probing_off_puts_a_prober_verdict_back_in_service() {
+        // The migration case: the carrier does not answer OPTIONS, so the
+        // default probing marked it down. Without this it would stay down for
+        // good, because only a probe ever marks a destination up again.
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gw1.carrier.example:5060")];
+        apply_rows(&manager, &rows);
+        let destination = Arc::clone(&manager.get_group("carriers").unwrap().all_destinations()[0]);
+        destination
+            .mark_down_until(std::time::Instant::now() + std::time::Duration::from_secs(600));
+
+        rows[0].probe = Some(false);
+        assert_eq!(apply_rows(&manager, &rows).updated, 1);
+        assert!(destination.is_healthy());
+        assert!(!destination.in_cooldown());
+    }
+
+    #[test]
+    fn a_new_unprobed_group_does_not_touch_health() {
+        // Only a transition from probed marks anything up; a group that was
+        // never probed has no prober verdict to undo.
+        let manager = manager();
+        let mut rows = vec![row("carriers", "sip:gw1.carrier.example:5060")];
+        rows[0].probe = Some(false);
+        apply_rows(&manager, &rows);
+        let destination = Arc::clone(&manager.get_group("carriers").unwrap().all_destinations()[0]);
+        destination.mark_down();
+
+        rows.push(row("carriers", "sip:gw2.carrier.example:5060"));
+        assert_eq!(apply_rows(&manager, &rows).updated, 1);
+        assert!(!destination.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn the_prober_runs_only_for_a_probed_source_group_and_survives_an_unchanged_poll() {
+        let uac = crate::gateway::tests::test_uac();
+        let manager = manager();
+        crate::gateway::spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+
+        let mut unprobed = row("quiet", "sip:gw1.carrier.example:5060");
+        unprobed.probe = Some(false);
+        let mut probed = row("probed", "sip:gw2.carrier.example:5060");
+        probed.probe_from_user = Some("edge".to_string());
+        probed.probe_from_domain = Some("sbc.example.com".to_string());
+        let rows = vec![unprobed, probed];
+        apply_rows(&manager, &rows);
+
+        assert!(manager.prober_handle("quiet").is_none());
+        let handle = manager
+            .prober_handle("probed")
+            .expect("probed group has a prober");
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), uac.udp.recv_async())
+            .await
+            .expect("the prober sent nothing")
+            .expect("outbound channel closed");
+        let options = String::from_utf8_lossy(&sent.data);
+        let from = options
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("from:"))
+            .expect("From header");
+        assert!(
+            from.contains("sip:edge@sbc.example.com"),
+            "the probe's From is not the one the row asked for: {from}"
+        );
+
+        apply_rows(&manager, &rows);
+        assert!(
+            !handle.is_finished(),
+            "an unchanged poll restarted the prober"
+        );
+        assert_eq!(manager.prober_count(), 1);
+    }
+
     // --- Wire contract ---
 
     #[test]
@@ -1148,6 +1448,21 @@ mod tests {
         assert_eq!(parsed.priority, 1);
         assert!(parsed.enabled);
         assert!(!parsed.require_registration);
+    }
+
+    #[test]
+    fn the_http_contract_carries_the_probe_fields() {
+        let json = r#"{"gateways":[{"group":"carriers","uri":"sip:gw1.carrier.example:5060",
+            "probe":false,"probe_interval_secs":15,"probe_failure_threshold":2,
+            "probe_from_user":"edge","probe_from_domain":"sbc.example.com"}]}"#;
+        let response: GatewayListResponse =
+            serde_json::from_str(json).expect("the contract parses");
+        let parsed = &response.gateways[0];
+        assert_eq!(parsed.probe, Some(false));
+        assert_eq!(parsed.probe_interval_secs, Some(15));
+        assert_eq!(parsed.probe_failure_threshold, Some(2));
+        assert_eq!(parsed.probe_from_user.as_deref(), Some("edge"));
+        assert_eq!(parsed.probe_from_domain.as_deref(), Some("sbc.example.com"));
     }
 
     #[test]

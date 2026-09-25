@@ -85,18 +85,7 @@ impl KernelFirewall {
 /// typically a missing `CAP_NET_ADMIN`.
 #[cfg(target_os = "linux")]
 pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<KernelFirewall> {
-    nftables::ensure_firewall(
-        &config.table,
-        &config.chain,
-        &config.set_v4,
-        &config.set_v6,
-        config.manage_rule,
-        config.gateway_set.then_some((
-            config.set_gateways_v4.as_str(),
-            config.set_gateways_v6.as_str(),
-        )),
-    )
-    .await?;
+    declare(config).await?;
 
     // Sized for the worst realistic burst: the APIBAN poller's first fetch
     // pushes its whole blocklist (thousands of IPs) as fast as it parses
@@ -135,6 +124,49 @@ pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<Ke
         "kernel firewall active (nf_tables) — banned sources dropped in-kernel"
     );
     Ok(KernelFirewall { sender })
+}
+
+/// Declare every object `config` asks for: the table, the ban sets, the allow
+/// sets when `gateway_set` is on, and the chain and drop rules when
+/// `manage_rule` is. Idempotent — see [`nftables::ensure_firewall`] — so it is
+/// both the start-up path and the recovery after a ruleset reload.
+#[cfg(target_os = "linux")]
+pub async fn declare(config: &crate::config::FirewallConfig) -> std::io::Result<()> {
+    nftables::ensure_firewall(
+        &config.table,
+        &config.chain,
+        &config.set_v4,
+        &config.set_v6,
+        config.manage_rule,
+        gateway_sets(config),
+    )
+    .await
+}
+
+/// The kernel identity of everything [`declare`] creates, or `None` when any of
+/// it is missing — see [`nftables::firewall_fingerprint`]. A read that opens no
+/// transaction.
+#[cfg(target_os = "linux")]
+pub async fn fingerprint(
+    config: &crate::config::FirewallConfig,
+) -> std::io::Result<Option<Vec<u64>>> {
+    nftables::firewall_fingerprint(
+        &config.table,
+        &config.chain,
+        &config.set_v4,
+        &config.set_v6,
+        config.manage_rule,
+        gateway_sets(config),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+fn gateway_sets(config: &crate::config::FirewallConfig) -> Option<(&str, &str)> {
+    config.gateway_set.then_some((
+        config.set_gateways_v4.as_str(),
+        config.set_gateways_v6.as_str(),
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]

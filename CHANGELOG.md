@@ -68,6 +68,32 @@ entry, but a working config keeps working.
   reading it back resurrects a dialog the sweeper has already sent the
   terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
   ask for it with `await handle.reload()`.
+- **Probe policy on `gateway.backend` rows.** `probe`, `probe_interval_secs`,
+  `probe_failure_threshold`, `probe_from_user` and `probe_from_domain`, group-wide
+  like `algorithm`, in the HTTP contract, as SQL columns and in
+  `siphon_sdk.gateways`. A source group used to be probed every 30 s with no way
+  to turn it off, so a carrier that does not answer `OPTIONS` was marked down by
+  being provisioned. Omitted fields keep that default. Switching probing off
+  marks the destinations the prober had marked down back up; a change that
+  leaves the probe policy alone leaves the prober alone.
+- **`siphon_firewall_redeclared_total`**, counting each time siphon found its
+  nf_tables objects deleted or recreated underneath it and re-declared them.
+
+### Fixed
+
+- **The kernel gateway allow set survives a reload of the table that holds it.**
+  Referencing the sets means putting them in your own table
+  (`security.firewall.table`), because an nf_tables set is scoped to its table,
+  and reloading that table deletes them. siphon declared them once at start-up
+  and trusted its publish cache afterwards, so the node kept dialling its
+  carriers while the kernel dropped every answer, silently, until a restart.
+  siphon now reads back the kernel handles of its objects on every republish;
+  on a difference it re-declares them, republishes the allow set and logs a
+  `warn`. Handles rather than presence, because a reloaded ruleset has to
+  redeclare the sets it references and they come back present and empty. The
+  1.10.0 note that the sets converge after `nft flush ruleset` was not true
+  until now. Ban sets are re-declared too, but come back empty: bans placed
+  before the reload are enforced in userspace only.
 
 ### Fixed
 
