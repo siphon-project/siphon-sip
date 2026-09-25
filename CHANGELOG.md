@@ -20,39 +20,6 @@ entry, but a working config keeps working.
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
   `proxy::reply_pipeline` module are removed.
 
-### Fixed
-
-- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
-  the handler but the proxy response path never dispatched it, so a script that
-  used it got no callback and no error. It is now shorthand for
-  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
-  `@proxy.on_reply` handler, in registration order.
-- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
-  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
-  awaits into a filtered form that does not exist. `on_invite` is no longer
-  checked, since every call it sees is an INVITE. The suggested filter is also
-  built from method comparisons alone, so
-- **The initial NOTIFY overtook the 200 that accepted the subscription.**
-  `proxy.subscribe_state.accept()` stages the 200, which goes out when the handler
-  returns, while `await handle.notify()` sends from inside it. The queue that held
-  in-handler NOTIFYs behind the reply was per-thread, and since `notify()` became
-  awaitable it runs on a tokio worker under an `async def` handler, so the queue
-  never saw it and a subscriber received the NOTIFY first. The handle returned by
-  `accept()` / `create()` now carries a hold scoped to the SUBSCRIBE, closed once
-  the handlers return: a NOTIFY or terminating NOTIFY sent in the handler goes
-  out after the 200, one sent later goes out immediately (RFC 6665 §4.1.2.3).
-
-- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
-  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
-  only under a method branch and told the author to move the awaits into
-  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
-  takes a method filter. Those two hooks now get a non-failing note that states
-  the cost. The suggested filter is also built from method comparisons alone, so
-  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
-  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
-  method test with anything else no longer counts as method-gated.
-### Changed
-
 - **A client transaction now retains the octets it sent, not the parsed
   request.** The INVITE and non-INVITE client transactions (RFC 3261 §17.1.1 /
   §17.1.2) keep a request only so they can retransmit it, and §17.1.1.2 wants
@@ -122,6 +89,23 @@ entry, but a working config keeps working.
   awaits into a filtered form that does not exist. `on_invite` is no longer
   checked, since every call it sees is an INVITE. The suggested filter is also
   built from method comparisons alone, so
+
+- **The initial NOTIFY overtook the 200 that accepted the subscription.**
+  `proxy.subscribe_state.accept()` stages the 200, which goes out when the handler
+  returns, while `await handle.notify()` sends from inside it. The queue that held
+  in-handler NOTIFYs behind the reply was per-thread, and since `notify()` became
+  awaitable it runs on a tokio worker under an `async def` handler, so the queue
+  never saw it and a subscriber received the NOTIFY first. The handle returned by
+  `accept()` / `create()` now carries a hold scoped to the SUBSCRIBE, closed once
+  the handlers return: a NOTIFY or terminating NOTIFY sent in the handler goes
+  out after the 200, one sent later goes out immediately (RFC 6665 §4.1.2.3).
+
+- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
+  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
+  only under a method branch and told the author to move the awaits into
+  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
+  takes a method filter. Those two hooks now get a non-failing note that states
+  the cost. The suggested filter is also built from method comparisons alone, so
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.
