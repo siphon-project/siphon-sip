@@ -13,49 +13,12 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
-### Added
-
-- **`siphon::config::expand_env_vars` is public.** Extensions that load their
-  own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules
-  `siphon.yaml` uses instead of keeping their own copy.
-- **`@proxy.on_reply` takes an optional method filter**, the same shape as
-  `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
-  `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
-  response answers. Filtered and unfiltered handlers all run, in registration
-  order, and a response no handler matches is forwarded unchanged. A reply
-  handler that only awaits for one method can now be split so every other
-  response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
-  an unfiltered `async` reply handler that should be.
-
 ### Changed
 
 - **Rust library: `HandlerKind::ProxyReply` carries the filter**
   (`ProxyReply(Option<String>)`), `ScriptState::proxy_reply_handlers(method)`
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
   `proxy::reply_pipeline` module are removed.
-
-### Fixed
-
-- **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
-  now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
-  (it was documented but never applied), and if the script registers
-  `@http.route` handlers but an HTTP listener cannot bind (port in use, missing
-  TLS file), siphon exits at startup instead of running with the routes
-  unreachable.
-- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
-  the handler but the proxy response path never dispatched it, so a script that
-  used it got no callback and no error. It is now shorthand for
-  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
-  `@proxy.on_reply` handler, in registration order.
-- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
-  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
-  awaits into a filtered form that does not exist. `on_invite` is no longer
-  checked, since every call it sees is an INVITE. The suggested filter is also
-  built from method comparisons alone, so
-  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
-  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
-  method test with anything else no longer counts as method-gated.
-### Changed
 
 - **A client transaction now retains the octets it sent, not the parsed
   request.** The INVITE and non-INVITE client transactions (RFC 3261 §17.1.1 /
@@ -98,17 +61,6 @@ entry, but a working config keeps working.
   those four could pin a driver too despite being awaitable. All five paths are
   fixed together.
 
-### Added
-
-- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
-  the configured `subscribe_state.cache`, refreshing this instance's view of it,
-  and returns whether a live dialog is in hand afterwards. It is the explicit,
-  awaited counterpart to the implicit cache read the properties no longer make
-  (below) — for a dialog another replica owns whose local entry has since been
-  reaped.
-
-### Changed
-
 - **A `SubscribeHandle` whose dialog has been reaped raises `LookupError`
   instead of being revived from the L2 cache.** The narrow behaviour change that
   comes with the fix above: the sweeper drops an expired or terminated dialog
@@ -116,6 +68,92 @@ entry, but a working config keeps working.
   reading it back resurrects a dialog the sweeper has already sent the
   terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
   ask for it with `await handle.reload()`.
+
+### Fixed
+
+- **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
+  now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
+  (it was documented but never applied), and if the script registers
+  `@http.route` handlers but an HTTP listener cannot bind (port in use, missing
+  TLS file), siphon exits at startup instead of running with the routes
+  unreachable.
+
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
+- **A `dial` target's own `from` now pins its host.** The per-target identity
+  took only the user part of `from` and substituted it as a number, so the B-leg
+  went out as `"203" <sip:account@<advertised address>>`: the host the target
+  named was rewritten away and the caller's display name stayed beside it. A
+  target's `from` / `from_display` now shape the `From` exactly as the dial's
+  own do (whole URI, host pinned, caller's display dropped unless one is named),
+  on every branch of a fork and every attempt of a sequential hunt. A target
+  `from` that is not a SIP URI is now `bad_request` before anything rings, as
+  the dial-level one already was.
+
+- **`P-Asserted-Identity` goes out as a `name-addr`.** An identity given as a
+  bare URI (`sip:+15550123@example.com`) was rendered bare by `dial`, and one
+  given in brackets was double-wrapped (`<<...>>`) by `originate`. Both now
+  render `<sip:...>` whichever spelling came in, entry by entry for a
+  `sip:` + `tel:` pair (RFC 3325 §9.1).
+
+### Added
+
+- **`siphon::config::expand_env_vars` is public.** Extensions that load their
+  own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules
+  `siphon.yaml` uses instead of keeping their own copy.
+
+- **`@proxy.on_reply` takes an optional method filter**, the same shape as
+  `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
+  `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
+  response answers. Filtered and unfiltered handlers all run, in registration
+  order, and a response no handler matches is forwarded unchanged. A reply
+  handler that only awaits for one method can now be split so every other
+  response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
+  an unfiltered `async` reply handler that should be.
+
+- **`@proxy.on_reply` takes an optional method filter**, the same shape as
+  `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
+  `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
+  response answers. Filtered and unfiltered handlers all run, in registration
+  order, and a response no handler matches is forwarded unchanged. A reply
+  handler that only awaits for one method can now be split so every other
+  response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
+  an unfiltered `async` reply handler that should be.
+
+- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
+  the configured `subscribe_state.cache`, refreshing this instance's view of it,
+  and returns whether a live dialog is in hand afterwards. It is the explicit,
+  awaited counterpart to the implicit cache read the properties no longer make
+  (below) — for a dialog another replica owns whose local entry has since been
+  reaped.
 
 ## [1.10.0] — 2026-09-24
 

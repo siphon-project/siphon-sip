@@ -486,6 +486,13 @@ pub fn b2bua_advance_route_with_numbers(
             next_hop = ?next_hop,
             "LCR: dialing carrier",
         );
+        // A sequential `dial` target that named its own identity presents it
+        // on this attempt alone, over the dial's.
+        let presented = route.presented_from.as_ref().map(|from| {
+            let mut own = original_request.clone();
+            own.headers.set("From", from.clone());
+            own
+        });
         let sent = b2bua_send_b_leg_invite(
             call_id,
             &target,
@@ -494,11 +501,12 @@ pub fn b2bua_advance_route_with_numbers(
             &[],
             send_socket.as_ref(),
             None,
-            original_request,
+            presented.as_ref().unwrap_or(original_request),
             carrier_number_policy.as_deref(),
             retarget.as_deref(),
             route.caller_id.as_deref(),
             caller_id_presentation,
+            route.from_host.as_deref(),
             &extra_headers,
             state,
         );

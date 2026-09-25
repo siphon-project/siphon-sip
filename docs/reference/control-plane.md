@@ -744,19 +744,23 @@ the mandatory dialog tag (RFC 3261 §8.1.1.3), which only shows up later, on the
 ACK.
 
 - `from` replaces the whole URI and **pins the host**, opting this leg out of
-  the `From` host rewrite.
+  the `From` host rewrite. A target's own `from` pins that target's host, so
+  each carrier in a hunt sees its own domain.
 - `from_display` sets the display name; `""` removes it. Naming a `from` without
   a `from_display` drops the caller's, rather than presenting `"203"` beside the
   number that replaced it.
 - `p_asserted_identity` is injected **after** the header policy, so a preset that
   strips `P-*` at a trust boundary cannot silently drop an identity the
-  controller named.
+  controller named. It goes out as a `name-addr` (`<sip:...>`) whether it was
+  given bare or in brackets; a `sip:` and a `tel:` identity may be given
+  together, comma-separated (RFC 3325 §9.1).
 - `privacy: "restricted"` anonymises `From` and asserts `Privacy: id` while
   `p_asserted_identity` keeps the real identity for the trusted next hop
   (RFC 3323 §4.1 / RFC 3325 §7 / TS 24.607). `"allowed"` presents it. Anything
   else is `bad_request` — guessing at a privacy setting is how identities leak.
 
-A `from` that is not a SIP URI is `bad_request`, refused before any phone rings.
+A `from` that is not a SIP URI, on the dial or on any target, is `bad_request`,
+refused before any phone rings.
 
 ### Anchoring the media
 

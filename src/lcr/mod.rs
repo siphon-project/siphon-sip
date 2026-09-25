@@ -296,6 +296,19 @@ pub struct Route {
     /// puts that one carrier back on failing over at `timeout_secs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reroute_after_progress: bool,
+    /// The whole `From` this attempt presents, dialog tag included, when a
+    /// controller `dial` target named an identity of its own.
+    ///
+    /// Not part of the LCR API: a sequential `dial` runs on this failover
+    /// engine, and a target's identity is a URI with a host and a display name,
+    /// which `caller_id` (a number) cannot carry.
+    #[serde(skip)]
+    pub presented_from: Option<String>,
+    /// The `From` host this attempt pins over the B-leg host rewrite, set with
+    /// `presented_from` when the target's `from` named one. Not part of the
+    /// LCR API.
+    #[serde(skip)]
+    pub from_host: Option<String>,
 }
 
 impl Route {

@@ -160,6 +160,64 @@ pub fn assert_calling_identity(message: &mut SipMessage) -> bool {
     true
 }
 
+/// Render a `P-Asserted-Identity` value in `name-addr` form (RFC 3325 §9.1).
+///
+/// The grammar permits a bare `addr-spec`, but the header is a comma-separated
+/// list, `name-addr` is the form that reads unambiguously in one, and it is the
+/// form carriers' SBCs expect: a stricter parser that refuses the bare form
+/// costs the call. So an entry that already carries angle brackets is kept as
+/// written, display name included, and a bare one is wrapped. Both
+/// `sip:alice@example.com` and `<sip:alice@example.com>` go out as the latter,
+/// never as `<<…>>`.
+///
+/// Entries are split on commas outside quotes and angle brackets. A bare URI
+/// cannot itself contain a comma (RFC 3261 §20: such a URI has to be written as
+/// a `name-addr`), so a comma outside both separates two identities, as it does
+/// for a `sip:` and a `tel:` identity asserted together.
+pub fn asserted_identity_value(value: &str) -> String {
+    split_identity_list(value)
+        .into_iter()
+        .map(|entry| {
+            if entry.contains('<') {
+                entry.to_string()
+            } else {
+                format!("<{entry}>")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Split a comma-separated identity list on the commas outside quotes and
+/// angle brackets, trimming each entry and dropping empty ones.
+fn split_identity_list(value: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut depth = 0u32;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '<' if !quoted => depth += 1,
+            '>' if !quoted => depth = depth.saturating_sub(1),
+            ',' if !quoted && depth == 0 => {
+                entries.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(value[start..].trim());
+    entries.retain(|entry| !entry.is_empty());
+    entries
+}
+
 /// Withhold the calling party's identity (CLIR), per RFC 3323 §4.1 and
 /// TS 24.607.
 ///
@@ -515,5 +573,46 @@ mod tests {
 
         assert_eq!(header(&message, "From"), before);
         assert!(header(&message, "Privacy").is_none());
+    }
+
+    #[test]
+    fn a_bare_asserted_identity_is_rendered_as_a_name_addr() {
+        assert_eq!(
+            asserted_identity_value("sip:+15550123@example.com"),
+            "<sip:+15550123@example.com>"
+        );
+        // A URI parameter stays inside the brackets: in a bare addr-spec there
+        // are no header parameters to separate out (RFC 3325 §9.1).
+        assert_eq!(
+            asserted_identity_value("sip:+15550123@example.com;user=phone"),
+            "<sip:+15550123@example.com;user=phone>"
+        );
+        assert_eq!(asserted_identity_value("tel:+15550123"), "<tel:+15550123>");
+    }
+
+    #[test]
+    fn an_asserted_identity_already_in_brackets_is_not_wrapped_again() {
+        assert_eq!(
+            asserted_identity_value("<sip:+15550123@example.com>"),
+            "<sip:+15550123@example.com>"
+        );
+        assert_eq!(
+            asserted_identity_value("  \"Example Ltd\" <sip:+15550123@example.com>  "),
+            "\"Example Ltd\" <sip:+15550123@example.com>"
+        );
+    }
+
+    #[test]
+    fn every_entry_of_an_asserted_identity_list_is_rendered() {
+        assert_eq!(
+            asserted_identity_value("sip:+15550123@example.com, tel:+15550123"),
+            "<sip:+15550123@example.com>, <tel:+15550123>"
+        );
+        // A comma inside a quoted display name or inside the brackets does not
+        // split the entry.
+        assert_eq!(
+            asserted_identity_value("\"Doe, \\\"J\\\"\" <sip:+15550123@example.com>,tel:+15550123"),
+            "\"Doe, \\\"J\\\"\" <sip:+15550123@example.com>, <tel:+15550123>"
+        );
     }
 }

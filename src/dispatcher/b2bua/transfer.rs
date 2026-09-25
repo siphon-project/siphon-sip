@@ -887,6 +887,7 @@ pub fn b2bua_start_leg_replacement(
             None,
             None,
             None,
+            None,
             triggered_extra_headers.as_slice(),
             state,
         )
