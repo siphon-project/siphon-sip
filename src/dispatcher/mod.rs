@@ -113,6 +113,8 @@ mod prack_offer_answer_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
+mod proxy_reply_filter_tests;
+#[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
 mod relayed_identity_tests;

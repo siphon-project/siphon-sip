@@ -51,8 +51,11 @@ const EMBEDDED_SCRIPT_PATH: &str = "<embedded>";
 pub enum HandlerKind {
     /// `@proxy.on_request` — optional method filter (None = all methods).
     ProxyRequest(Option<String>),
-    /// `@proxy.on_reply` — intercept responses.
-    ProxyReply,
+    /// `@proxy.on_reply` — intercept responses. Optional method filter matched
+    /// against the relayed request's method (None = every response).
+    /// `@proxy.on_register_reply` is shorthand for `@proxy.on_reply("REGISTER")`
+    /// and registers as `ProxyReply(Some("REGISTER"))`.
+    ProxyReply(Option<String>),
     /// `@proxy.on_failure` — all branches failed.
     ProxyFailure,
     /// `@proxy.on_cancel` — relayed INVITE was CANCELled before a final
@@ -60,8 +63,6 @@ pub enum HandlerKind {
     /// original INVITE so a script can release per-call resources
     /// (Diameter Rx/N5 QoS, rtpengine media) that no BYE will ever clear.
     ProxyCancel,
-    /// `@proxy.on_register_reply` — REGISTER-specific reply handler.
-    ProxyRegisterReply,
     /// `@b2bua.on_invite`
     B2buaInvite,
     /// `@b2bua.on_early_media` — provisional response with SDP (183/180).
@@ -246,6 +247,15 @@ pub struct ScriptState {
     pub handlers: Vec<HandlerEntry>,
 }
 
+/// A pipe-separated method filter (`"INVITE|SUBSCRIBE"`) matches `method`;
+/// no filter matches every method.
+fn method_filter_matches(filter: &Option<String>, method: &str) -> bool {
+    match filter {
+        None => true,
+        Some(filter) => filter.split('|').any(|candidate| candidate == method),
+    }
+}
+
 impl ScriptState {
     /// Return all handlers that match the given kind.
     pub fn handlers_for(&self, kind: &HandlerKind) -> Vec<&HandlerEntry> {
@@ -258,8 +268,20 @@ impl ScriptState {
         self.handlers
             .iter()
             .filter(|h| match &h.kind {
-                HandlerKind::ProxyRequest(None) => true,
-                HandlerKind::ProxyRequest(Some(filter)) => filter.split('|').any(|m| m == method),
+                HandlerKind::ProxyRequest(filter) => method_filter_matches(filter, method),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `ProxyReply` handlers whose method filter matches
+    /// `request_method`, the method of the request the response answers.
+    /// A handler with `None` filter matches every response.
+    pub fn proxy_reply_handlers(&self, request_method: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::ProxyReply(filter) => method_filter_matches(filter, request_method),
                 _ => false,
             })
             .collect()
@@ -1219,10 +1241,9 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
 
         let kind = match kind_str.as_str() {
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
-            "proxy.on_reply" => HandlerKind::ProxyReply,
+            "proxy.on_reply" => HandlerKind::ProxyReply(filter),
             "proxy.on_failure" => HandlerKind::ProxyFailure,
             "proxy.on_cancel" => HandlerKind::ProxyCancel,
-            "proxy.on_register_reply" => HandlerKind::ProxyRegisterReply,
             "b2bua.on_invite" => HandlerKind::B2buaInvite,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
             "b2bua.on_answer" => HandlerKind::B2buaAnswer,
@@ -1960,6 +1981,45 @@ def handle_invite_subscribe(request):
         assert_eq!(handlers.len(), 1);
         let handlers = state.proxy_request_handlers("REGISTER");
         assert!(handlers.is_empty());
+    }
+
+    #[test]
+    fn proxy_on_reply_with_filter() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_reply("INVITE|UPDATE")
+def handle_reply(request, reply):
+    pass
+
+@proxy.on_reply()
+def every_reply(request, reply):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::ProxyReply(Some("INVITE|UPDATE".to_owned()))
+        );
+        assert_eq!(state.handlers[1].kind, HandlerKind::ProxyReply(None));
+        assert_eq!(state.proxy_reply_handlers("INVITE").len(), 2);
+        assert_eq!(state.proxy_reply_handlers("UPDATE").len(), 2);
+        assert_eq!(state.proxy_reply_handlers("REGISTER").len(), 1);
+        // Reply filters do not leak into request dispatch.
+        assert!(state.proxy_request_handlers("INVITE").is_empty());
+    }
+
+    #[test]
+    fn proxy_on_reply_rejects_a_non_string_filter() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_reply(42)
+def handle_reply(request, reply):
+    pass
+"#;
+        let error = compile_temp_script(source).unwrap_err().to_string();
+        assert!(error.contains("proxy.on_reply expects"), "{error}");
     }
 
     #[test]
@@ -2786,7 +2846,7 @@ def handle_reply(request, reply):
 "#;
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 1);
-        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyReply);
+        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyReply(None));
     }
 
     #[test]
@@ -2814,7 +2874,10 @@ async def handle_register_reply(request, reply):
 "#;
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 1);
-        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyRegisterReply);
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::ProxyReply(Some("REGISTER".to_owned()))
+        );
         assert!(state.handlers[0].is_async);
     }
 

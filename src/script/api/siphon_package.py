@@ -17,6 +17,32 @@ import _siphon_registry as _registry
 # Proxy namespace
 # ---------------------------------------------------------------------------
 
+def _method_filtered(kind, fn_or_filter):
+    """Decorator body shared by the hooks that take an optional method filter.
+
+    Accepts ``@hook``, ``@hook()``, ``@hook("REGISTER")`` and
+    ``@hook("INVITE|SUBSCRIBE")``.
+    """
+    if fn_or_filter is None or callable(fn_or_filter):
+        method_filter = None
+    elif isinstance(fn_or_filter, str):
+        method_filter = fn_or_filter
+    else:
+        raise TypeError(
+            f"{kind} expects a callable or method filter string, "
+            f"got {type(fn_or_filter).__name__}"
+        )
+
+    def decorator(fn):
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register(kind, method_filter, fn, is_async)
+        return fn
+
+    if callable(fn_or_filter):
+        return decorator(fn_or_filter)
+    return decorator
+
+
 class _ProxyNamespace:
     """Namespace for stateful/stateless proxy event handlers.
 
@@ -48,47 +74,22 @@ class _ProxyNamespace:
             @proxy.on_request("REGISTER")  # single method
             @proxy.on_request("INVITE|SUBSCRIBE")  # pipe-separated
         """
-        if fn_or_filter is None or callable(fn_or_filter):
-            # @proxy.on_request or @proxy.on_request without parens
-            fn = fn_or_filter
-            if fn is not None:
-                is_async = _asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", None, fn, is_async)
-                return fn
-            # @proxy.on_request() — called with no args, return decorator
-            def decorator(fn):
-                is_async = _asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", None, fn, is_async)
-                return fn
-            return decorator
-
-        if isinstance(fn_or_filter, str):
-            # @proxy.on_request("REGISTER")
-            method_filter = fn_or_filter
-            def decorator(fn):
-                is_async = _asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", method_filter, fn, is_async)
-                return fn
-            return decorator
-
-        raise TypeError(
-            f"proxy.on_request expects a callable or method filter string, "
-            f"got {type(fn_or_filter).__name__}"
-        )
+        return _method_filtered("proxy.on_request", fn_or_filter)
 
     @staticmethod
-    def on_reply(fn):
+    def on_reply(fn_or_filter=None):
         """
         Register a handler for SIP replies (responses).
 
         Usage:
-            @proxy.on_reply
-            def handle_reply(request, reply):
-                ...
+            @proxy.on_reply                    # every response
+            @proxy.on_reply("REGISTER")        # responses to REGISTER only
+            @proxy.on_reply("INVITE|UPDATE")   # pipe-separated
+
+        The filter matches the method of the request the response answers.
+        Handlers run in registration order, filtered and unfiltered alike.
         """
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("proxy.on_reply", None, fn, is_async)
-        return fn
+        return _method_filtered("proxy.on_reply", fn_or_filter)
 
     @staticmethod
     def on_failure(fn):
@@ -133,16 +134,15 @@ class _ProxyNamespace:
     @staticmethod
     def on_register_reply(fn):
         """
-        Register a handler for REGISTER replies.
+        Register a handler for REGISTER replies. Shorthand for
+        ``@proxy.on_reply("REGISTER")``.
 
         Usage:
             @proxy.on_register_reply
             def handle_register_reply(request, reply):
                 ...
         """
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("proxy.on_register_reply", None, fn, is_async)
-        return fn
+        return _method_filtered("proxy.on_reply", "REGISTER")(fn)
 
 
 # ---------------------------------------------------------------------------

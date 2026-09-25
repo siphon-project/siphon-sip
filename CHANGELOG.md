@@ -13,14 +13,36 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`@proxy.on_reply` takes an optional method filter**, the same shape as
+  `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
+  `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
+  response answers. Filtered and unfiltered handlers all run, in registration
+  order, and a response no handler matches is forwarded unchanged. A reply
+  handler that only awaits for one method can now be split so every other
+  response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
+  an unfiltered `async` reply handler that should be.
+
+### Changed
+
+- **Rust library: `HandlerKind::ProxyReply` carries the filter**
+  (`ProxyReply(Option<String>)`), `ScriptState::proxy_reply_handlers(method)`
+  selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
+  `proxy::reply_pipeline` module are removed.
+
 ### Fixed
 
-- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
-  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
-  only under a method branch and told the author to move the awaits into
-  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
-  takes a method filter. Those two hooks now get a non-failing note that states
-  the cost. The suggested filter is also built from method comparisons alone, so
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.

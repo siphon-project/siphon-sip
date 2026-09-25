@@ -25,34 +25,31 @@ What this does NOT flag: a handler that awaits on the path every message takes.
 There the driver is doing its job, and making it synchronous would block the
 pool instead.
 
-Only `proxy.on_request` takes a method filter. `proxy.on_reply` and
-`b2bua.on_invite` register unfiltered by construction, so there is no filtered
-handler to move the awaits into. The same shape on those hooks is reported as a
-note that states the cost and does not fail the check.
+`proxy.on_reply` is checked the same way: it takes the same method filter,
+matched against the method of the request the response answers.
+`b2bua.on_invite` is not checked. Every call it sees is an INVITE, so there is
+no method branch to split out and no filter to move it into.
 """
 
 import ast
 import pathlib
 import sys
 
-# Decorators whose handlers run per message or per call.
-PER_MESSAGE = {"on_request", "on_invite", "on_reply"}
-
-# The subset that accepts a method filter, so the split this check prescribes
-# can actually be written. The others have no filtered form.
-FILTERABLE = {"on_request"}
+# Per-message decorators that take a method filter, so the split this check
+# prescribes can actually be written.
+PER_MESSAGE = {"on_request", "on_reply"}
 
 SCRIPT_ROOTS = ["scripts"]
 
 
 def _unfiltered_per_message(function):
-    """`(namespace.hook, hook)` when `function` is an unfiltered per-message handler."""
+    """The decorator name when `function` is an unfiltered per-message handler."""
     for decorator in function.decorator_list:
         # `@proxy.on_request` — an Attribute, so no call and no method filter.
         # `@proxy.on_request("REGISTER")` parses as a Call and is filtered.
         if isinstance(decorator, ast.Attribute) and decorator.attr in PER_MESSAGE:
             namespace = decorator.value.id if isinstance(decorator.value, ast.Name) else "?"
-            return f"{namespace}.{decorator.attr}", decorator.attr
+            return f"{namespace}.{decorator.attr}"
     return None
 
 
@@ -128,39 +125,28 @@ def _method_guarded_awaits(function):
 
 
 def check(path):
-    """`(findings, notes)` for one script. Findings fail the check; notes do not."""
-    findings, notes = [], []
+    findings = []
     tree = ast.parse(path.read_text(), str(path))
     for node in ast.walk(tree):
         if not isinstance(node, ast.AsyncFunctionDef):
             continue
-        matched = _unfiltered_per_message(node)
-        if matched is None:
+        decorator = _unfiltered_per_message(node)
+        if decorator is None:
             continue
-        decorator, hook = matched
         methods = _method_guarded_awaits(node)
-        if not methods:
-            continue
-        joined = "|".join(sorted(methods))
-        if hook in FILTERABLE:
+        if methods:
+            joined = "|".join(sorted(methods))
             findings.append(
                 f"{path}:{node.lineno}: `async def {node.name}` is an unfiltered "
                 f"@{decorator} handler, but every await is under a "
                 f"{joined} branch — move those into @{decorator}(\"{joined}\") "
                 f"and leave this handler `def`, so the per-message path does not "
                 f"pay asyncio dispatch")
-        else:
-            notes.append(
-                f"{path}:{node.lineno}: `async def {node.name}` awaits only under a "
-                f"{joined} branch, so every other message through @{decorator} "
-                f"pays asyncio dispatch for nothing. @{decorator} takes no method "
-                f"filter, so there is no handler to split this into; keep it "
-                f"`async` if the awaited calls need an event loop")
-    return findings, notes
+    return findings
 
 
 SELF_TEST_FIXTURE = '''
-from siphon import proxy, auth, registrar, rtpengine
+from siphon import proxy, auth, registrar, b2bua, rtpengine
 
 DOMAIN = "example.com"
 
@@ -220,61 +206,61 @@ def already_sync(request):
 
 
 @proxy.on_reply
-async def reply_has_no_filter(request, reply):   # NOTE
-    # on_reply takes no method filter, so this is a note, not a finding.
+async def reply_needless(request, reply):        # FINDING INVITE
     if request.method == "INVITE" and reply.has_body("application/sdp"):
         await rtpengine.answer(reply)
     reply.relay()
+
+
+@proxy.on_reply("INVITE")
+async def reply_filtered_is_fine(request, reply):
+    if reply.has_body("application/sdp"):
+        await rtpengine.answer(reply)
+    reply.relay()
+
+
+@b2bua.on_invite
+async def on_invite_is_not_checked(call):
+    # Every call on_invite sees is an INVITE; there is nothing to split.
+    if call.get_header("X-Anchor") == "yes":
+        await rtpengine.offer(call)
+    call.dial(call.ruri)
 
 '''
 
 
 def _fixture_labels():
-    """`{line: expected filter}` for findings and `{line}` for notes."""
-    findings, notes = {}, set()
-    for number, line in enumerate(SELF_TEST_FIXTURE.splitlines(), start=1):
-        if "# FINDING " in line:
-            findings[number] = line.split("# FINDING ", 1)[1].strip()
-        elif "# NOTE" in line:
-            notes.add(number)
-    return findings, notes
+    """`{line: expected filter}` for every planted finding."""
+    return {number: line.split("# FINDING ", 1)[1].strip()
+            for number, line in enumerate(SELF_TEST_FIXTURE.splitlines(), start=1)
+            if "# FINDING " in line}
 
 
 def self_test():
     """Check the matcher against the labelled fixture; return a process code."""
     import tempfile
 
-    expected_findings, expected_notes = _fixture_labels()
+    expected = _fixture_labels()
     with tempfile.TemporaryDirectory() as directory:
         fixture = pathlib.Path(directory) / "fixture.py"
         fixture.write_text(SELF_TEST_FIXTURE)
-        findings, notes = check(fixture)
+        found = {int(finding.split(":")[1]): finding for finding in check(fixture)}
 
-    found = {int(finding.split(":")[1]): finding for finding in findings}
-    noted = {int(note.split(":")[1]) for note in notes}
     problems = []
-    for number in sorted(set(expected_findings) - set(found)):
+    for number in sorted(set(expected) - set(found)):
         problems.append(f"missed a planted finding on fixture line {number}")
-    for number in sorted(set(found) - set(expected_findings)):
+    for number in sorted(set(found) - set(expected)):
         problems.append(f"flagged a handler that legitimately awaits, line {number}")
-    for number, joined in sorted(expected_findings.items()):
+    for number, joined in sorted(expected.items()):
         if number in found and f'("{joined}")' not in found[number]:
             problems.append(f"line {number} should suggest (\"{joined}\"): {found[number]}")
-    for number in sorted(expected_notes - noted):
-        problems.append(f"missed a planted note on fixture line {number}")
-    for number in sorted(noted - expected_notes):
-        problems.append(f"noted a handler that should be silent, line {number}")
-    for note in notes:
-        if '("' in note:
-            problems.append(f"a note prescribes a filter its hook cannot take: {note}")
 
     if problems:
         print("FAIL: the hot-path matcher no longer agrees with its fixture.")
         for problem in problems:
             print(f"  {problem}")
         return 1
-    print(f"OK: matcher caught all {len(expected_findings)} planted findings and "
-          f"{len(expected_notes)} notes, and nothing else.")
+    print(f"OK: matcher caught all {len(expected)} planted findings and nothing else.")
     return 0
 
 
@@ -284,21 +270,15 @@ def main(argv):
 
     given = [argument for argument in argv[1:] if not argument.startswith("--")]
     roots = [pathlib.Path(p) for p in given or SCRIPT_ROOTS]
-    findings, notes, checked = [], [], 0
+    findings, checked = [], 0
     for root in roots:
         paths = sorted(root.rglob("*.py")) if root.is_dir() else [root]
         for path in paths:
             checked += 1
             try:
-                file_findings, file_notes = check(path)
+                findings.extend(check(path))
             except SyntaxError as error:
                 findings.append(f"{path}: could not parse: {error}")
-                continue
-            findings.extend(file_findings)
-            notes.extend(file_notes)
-
-    for note in notes:
-        print(f"note: {note}")
 
     if findings:
         print(f"FAIL: {len(findings)} per-message handler(s) async without need:")
