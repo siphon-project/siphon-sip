@@ -416,7 +416,8 @@ class SipTestHarness:
     ) -> ReplyResult:
         """Send a mock SIP reply and return the handler's result.
 
-        Dispatches to handlers registered via ``@proxy.on_reply``.
+        Dispatches to handlers registered via ``@proxy.on_reply`` whose method
+        filter matches ``request.method`` (unfiltered handlers always run).
 
         Args:
             request: Original request (auto-created if ``None``).
@@ -447,7 +448,7 @@ class SipTestHarness:
         )
 
         registry = mock_module.get_registry()
-        handlers = registry.get("proxy.on_reply")
+        handlers = registry.get("proxy.on_reply", request.method)
 
         for fn, is_async in handlers:
             if is_async:

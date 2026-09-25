@@ -14,4 +14,10 @@ def observe(request, reply):
     reply.relay()
 ```
 
+`@proxy.on_reply("INVITE")` / `@proxy.on_reply("INVITE|UPDATE")` narrows a
+handler to responses to those request methods, the same filter shape as
+`@proxy.on_request`. Filtered and unfiltered handlers all run, in registration
+order, and a response no handler matches is forwarded unchanged.
+`@proxy.on_register_reply` is shorthand for `@proxy.on_reply("REGISTER")`.
+
 ::: siphon_sdk.reply.Reply

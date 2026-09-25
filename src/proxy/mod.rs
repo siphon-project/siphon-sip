@@ -8,5 +8,4 @@
 
 pub mod core;
 pub mod fork;
-pub mod reply_pipeline;
 pub mod session;

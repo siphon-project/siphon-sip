@@ -103,15 +103,41 @@ def _run_async(coroutine: Any) -> Any:
 # Proxy namespace
 # ---------------------------------------------------------------------------
 
+def _method_filtered(kind: str, fn_or_filter: Union[Callable, str, None]) -> Any:
+    """Decorator body shared by the hooks that take an optional method filter.
+
+    Accepts ``@hook``, ``@hook()``, ``@hook("REGISTER")`` and
+    ``@hook("INVITE|SUBSCRIBE")``.
+    """
+    if fn_or_filter is None or callable(fn_or_filter):
+        method_filter = None
+    elif isinstance(fn_or_filter, str):
+        method_filter = fn_or_filter
+    else:
+        raise TypeError(
+            f"{kind} expects a callable or method filter string, "
+            f"got {type(fn_or_filter).__name__}"
+        )
+
+    def decorator(fn: Callable) -> Callable:
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register(kind, method_filter, fn, is_async)
+        return fn
+
+    if callable(fn_or_filter):
+        return decorator(fn_or_filter)
+    return decorator
+
+
 class MockProxy:
     """Mock proxy namespace with decorator registration and utility stubs.
 
     Decorators:
         - ``@proxy.on_request`` / ``@proxy.on_request("INVITE")``
-        - ``@proxy.on_reply``
+        - ``@proxy.on_reply`` / ``@proxy.on_reply("INVITE")``
         - ``@proxy.on_failure``
         - ``@proxy.on_cancel``
-        - ``@proxy.on_register_reply``
+        - ``@proxy.on_register_reply`` (shorthand for ``@proxy.on_reply("REGISTER")``)
 
     Example::
 
@@ -159,42 +185,40 @@ class MockProxy:
         several handlers at once.)
 
         """
-        if fn_or_filter is None or callable(fn_or_filter):
-            fn = fn_or_filter
-            if fn is not None:
-                is_async = asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", None, fn, is_async)
-                return fn
-
-            def decorator(fn: Callable) -> Callable:
-                is_async = asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", None, fn, is_async)
-                return fn
-            return decorator
-
-        if isinstance(fn_or_filter, str):
-            method_filter = fn_or_filter
-
-            def decorator(fn: Callable) -> Callable:
-                is_async = asyncio.iscoroutinefunction(fn)
-                _registry.register("proxy.on_request", method_filter, fn, is_async)
-                return fn
-            return decorator
-
-        raise TypeError(
-            f"proxy.on_request expects a callable or method filter string, "
-            f"got {type(fn_or_filter).__name__}"
-        )
+        return _method_filtered("proxy.on_request", fn_or_filter)
 
     @staticmethod
-    def on_reply(fn: Callable) -> Callable:
+    def on_reply(fn_or_filter: Union[Callable, str, None] = None) -> Any:
         """Register a handler for SIP replies.
 
         Handler signature: ``(request, reply) -> None``
+
+        Can be used as:
+            - ``@proxy.on_reply`` — every response
+            - ``@proxy.on_reply()`` — same, explicit call
+            - ``@proxy.on_reply("REGISTER")`` — responses to REGISTER only
+            - ``@proxy.on_reply("INVITE|UPDATE")`` — pipe-separated filter
+
+        The filter matches the method of the request the response answers
+        (its CSeq method), not anything in the response itself. Filtered and
+        unfiltered handlers all run, in registration order, as with
+        ``@proxy.on_request``. A response that no handler matches is
+        forwarded unchanged, exactly as when no reply handler is registered.
+
+        Filtering is how a reply handler that awaits for one method stays off
+        the asyncio driver for every other response::
+
+            @proxy.on_reply("INVITE")
+            async def anchor_answer(request, reply):
+                if reply.has_body("application/sdp"):
+                    await rtpengine.answer(reply)
+                reply.relay()
+
+            @proxy.on_reply
+            def every_reply(request, reply):
+                reply.relay()
         """
-        is_async = asyncio.iscoroutinefunction(fn)
-        _registry.register("proxy.on_reply", None, fn, is_async)
-        return fn
+        return _method_filtered("proxy.on_reply", fn_or_filter)
 
     @staticmethod
     def on_failure(fn: Callable) -> Callable:
@@ -236,11 +260,12 @@ class MockProxy:
     def on_register_reply(fn: Callable) -> Callable:
         """Register a handler for REGISTER replies.
 
+        Shorthand for ``@proxy.on_reply("REGISTER")``: it runs alongside any
+        unfiltered ``@proxy.on_reply`` handler, in registration order.
+
         Handler signature: ``(request, reply) -> None``
         """
-        is_async = asyncio.iscoroutinefunction(fn)
-        _registry.register("proxy.on_register_reply", None, fn, is_async)
-        return fn
+        return _method_filtered("proxy.on_reply", "REGISTER")(fn)
 
     async def send_request(self, method: str, ruri: str,
                            headers: Optional[dict[str, str]] = None,

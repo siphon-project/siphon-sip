@@ -19,9 +19,11 @@ class Reply:
 
     This object is passed as the second argument to reply handlers:
 
-    - ``@proxy.on_reply`` — all responses
+    - ``@proxy.on_reply`` — all responses, or ``@proxy.on_reply("INVITE")``
+      for responses to one method
     - ``@proxy.on_failure`` — aggregated failure response
-    - ``@proxy.on_register_reply`` — REGISTER responses
+    - ``@proxy.on_register_reply`` — REGISTER responses (same as
+      ``@proxy.on_reply("REGISTER")``)
 
     Example::
 

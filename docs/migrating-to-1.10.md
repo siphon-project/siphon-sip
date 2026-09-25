@@ -136,14 +136,28 @@ method reaches only `route`, synchronously.
 
 The shipped `scripts/proxy_default.py` and `scripts/b2bua_default.py` are
 written this way, and `scripts/check_hot_path_dispatch.py` fails CI on an
-unfiltered `@proxy.on_request` handler whose every `await` sits under a method
-branch. If your handler genuinely awaits on the path every message takes, leave
-it `async` — there the driver is doing its job.
+unfiltered `@proxy.on_request` or `@proxy.on_reply` handler whose every `await`
+sits under a method branch. If your handler genuinely awaits on the path every
+message takes, leave it `async` — there the driver is doing its job.
 
-The split only works where the hook takes a method filter, and only
-`@proxy.on_request` does. `@proxy.on_reply` and `@b2bua.on_invite` have no
-filtered form, so the check reports the same shape on them as a note, not a
-failure: the cost is real, but the fix is not available.
+`@proxy.on_reply` takes the same filter, matched against the method of the
+request the response answers, so a reply handler that only awaits for INVITE
+splits the same way:
+
+```python
+@proxy.on_reply("INVITE")
+async def anchor_answer(request, reply):
+    if reply.has_body("application/sdp"):
+        await rtpengine.answer(reply)
+    reply.relay()
+
+@proxy.on_reply
+def every_reply(request, reply):
+    reply.relay()
+```
+
+`@b2bua.on_invite` has no filter and needs none: every call it sees is an
+INVITE, so there is no other method to keep off the driver.
 
 ## The two failure modes, and how to tell them apart
 

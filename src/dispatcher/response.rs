@@ -1230,7 +1230,11 @@ pub(super) fn run_reply_handlers(
     };
 
     let engine_state = state.engine.state();
-    let reply_handlers = engine_state.handlers_for(&HandlerKind::ProxyReply);
+    let reply_handlers = engine_state.proxy_reply_handlers(
+        original_request
+            .method()
+            .map_or("", crate::sip::message::Method::as_str),
+    );
 
     if reply_handlers.is_empty() {
         return (message, true, None);
