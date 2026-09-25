@@ -431,7 +431,47 @@ impl Config {
         config.validate_admin_tls()?;
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
+        config.validate_timer_intervals()?;
         Ok(config)
+    }
+
+    /// Reject a zero period on a timer siphon runs for the life of the process.
+    ///
+    /// Each of these feeds `tokio::time::interval`, which panics on a zero
+    /// period. The panic kills the spawned task, not the process, so the node
+    /// keeps running with the gateway prober or keepalive silently gone while
+    /// its config still says it is on. Refused at load instead, naming the
+    /// field. (To turn one off, each has an `enabled: false`.)
+    fn validate_timer_intervals(&self) -> Result<()> {
+        let zero = |field: String| {
+            Err(SiphonError::Config(format!(
+                "{field} is 0 — it must be at least 1 second. To turn this off, set its \
+                 `enabled: false` instead."
+            )))
+        };
+        if let Some(gateway) = &self.gateway {
+            for group in &gateway.groups {
+                if group.probe.enabled && group.probe.interval_secs == 0 {
+                    return zero(format!(
+                        "gateway.groups[{}].probe.interval_secs",
+                        group.name
+                    ));
+                }
+            }
+        }
+        if let Some(nat) = &self.nat {
+            if let Some(keepalive) = &nat.keepalive {
+                if keepalive.enabled && keepalive.interval_secs == 0 {
+                    return zero("nat.keepalive.interval_secs".to_string());
+                }
+            }
+            if let Some(keepalive) = &nat.crlf_keepalive {
+                if keepalive.enabled && keepalive.interval_secs == 0 {
+                    return zero("nat.crlf_keepalive.interval_secs".to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject a `listen:` entry siphon cannot honour.

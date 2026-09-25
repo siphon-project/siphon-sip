@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use ipnet::IpNet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod source;
 
@@ -747,6 +747,18 @@ impl DispatcherManager {
     fn start_prober(&self, name: String, group: &Arc<DispatcherGroup>) {
         self.stop_prober(&name);
         if !group.probe_config.enabled {
+            return;
+        }
+        // `tokio::time::interval` panics on a zero period, which would kill the
+        // prober task and leave the group looking probed. Config load and the
+        // source row check both refuse 0; this catches a `ProbeConfig` built
+        // any other way, loudly, rather than spawning a task that dies.
+        if group.probe_config.interval.is_zero() {
+            error!(
+                group = %name,
+                "dispatcher health prober NOT started: probe interval is 0 — this group is \
+                 not being health-checked"
+            );
             return;
         }
         let Some(prober_runtime) = self.prober_runtime.get() else {
@@ -1869,6 +1881,24 @@ pub(crate) mod tests {
         );
         let second = manager.prober_handle("carriers").expect("second prober");
         assert!(!second.is_finished(), "the replacement was not probed");
+    }
+
+    #[tokio::test]
+    async fn a_zero_probe_interval_spawns_no_prober_rather_than_one_that_panics() {
+        // Config load and the source row check refuse 0; a ProbeConfig built
+        // directly (an embedding binary) must still not reach
+        // `tokio::time::interval(0)`.
+        let uac = test_uac();
+        let manager = Arc::new(DispatcherManager::new());
+        spawn_health_probers(Arc::clone(&manager), Arc::clone(&uac.sender));
+
+        manager.add_group(probed_group("zero").with_probe_config(ProbeConfig {
+            interval: Duration::ZERO,
+            ..ProbeConfig::default()
+        }));
+
+        assert_eq!(manager.prober_count(), 0);
+        assert!(manager.get_group("zero").is_some());
     }
 
     #[tokio::test]

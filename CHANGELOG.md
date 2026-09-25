@@ -94,6 +94,13 @@ entry, but a working config keeps working.
   1.10.0 note that the sets converge after `nft flush ruleset` was not true
   until now. Ban sets are re-declared too, but come back empty: bans placed
   before the reload are enforced in userspace only.
+- **A zero timer interval is refused at load instead of killing its task.**
+  `gateway.groups[].probe.interval_secs`, `nat.keepalive.interval_secs` and
+  `nat.crlf_keepalive.interval_secs` set to `0` panicked the spawned prober or
+  keepalive task, and the node carried on without it while its config said it
+  was on. Each is now a config error naming the field (`enabled: false` is the
+  way to turn one off), and a `gateway.backend` row with
+  `probe_interval_secs: 0` is refused like any other bad row.
 
 ### Fixed
 
