@@ -189,15 +189,33 @@ impl SubscribeStore {
         self.dialogs.insert(dialog.id.clone(), dialog);
     }
 
+    /// Fetch a dialog from L1 only — synchronous, no network, never blocks.
+    ///
+    /// `None` for unknown *and* for terminated, the same contract as
+    /// [`Self::get`].  This is the read behind the Python handle's properties:
+    /// every call that hands a script a `SubscribeHandle` has already put the
+    /// dialog in L1 (`put`, or `get`'s own hydration), so L1 holds whatever a
+    /// live handle refers to and the L2 round-trip `get` would make is dead
+    /// weight there.  It is still a *live* read — the same DashMap entry a
+    /// SUBSCRIBE refresh mutates — not a snapshot.
+    pub fn get_local(&self, id: &str) -> Option<SubscribeDialog> {
+        let entry = self.dialogs.get(id)?;
+        if entry.terminated {
+            return None;
+        }
+        Some(entry.clone())
+    }
+
     /// Fetch a dialog by id.  Looks in L1 first; on miss, tries L2 and
     /// hydrates L1.  Returns ``None`` if the dialog is unknown or has
     /// been terminated.
     pub async fn get(&self, id: &str) -> Option<SubscribeDialog> {
-        if let Some(entry) = self.dialogs.get(id) {
-            if entry.terminated {
-                return None;
-            }
-            return Some(entry.clone());
+        // Present in L1 settles it either way: a terminated entry must answer
+        // `None` rather than fall through and be revived out of L2, where
+        // `remove`'s delete and `update`'s terminated write-through are two
+        // independent spawns whose order is not guaranteed.
+        if self.dialogs.contains_key(id) {
+            return self.get_local(id);
         }
 
         let (manager, cache_name) = self.cache.as_ref()?;
@@ -489,6 +507,55 @@ mod tests {
         dialog.terminated = true;
         store.put(dialog);
         assert!(store.get("abc").await.is_none());
+    }
+
+    /// `get_local` must answer exactly what `get` answers for anything L1
+    /// holds — that equivalence is the whole argument for the Python handle
+    /// reading through it instead of blocking on `get`.
+    #[tokio::test]
+    async fn get_local_agrees_with_get_on_every_l1_state() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("live"));
+        let mut terminated = sample_dialog("dead");
+        terminated.terminated = true;
+        store.put(terminated);
+
+        assert_eq!(
+            store.get_local("live").map(|dialog| dialog.call_id),
+            store.get("live").await.map(|dialog| dialog.call_id),
+            "a live dialog must read the same through both"
+        );
+        assert!(store.get_local("dead").is_none());
+        assert!(store.get("dead").await.is_none());
+        assert!(store.get_local("never-existed").is_none());
+        assert!(store.get("never-existed").await.is_none());
+    }
+
+    /// The live-read property: `get_local` reflects a mutation made after the
+    /// handle was built, so the Python `expires` property is not a snapshot.
+    #[test]
+    fn get_local_sees_a_later_refresh() {
+        let store = SubscribeStore::new();
+        let mut dialog = sample_dialog("abc");
+        dialog.expires_secs = 30;
+        store.put(dialog);
+        assert_eq!(store.get_local("abc").map(|d| d.expires_secs), Some(30));
+
+        store.update("abc", |dialog| dialog.refresh(600));
+        assert_eq!(store.get_local("abc").map(|d| d.expires_secs), Some(600));
+    }
+
+    /// A dialog only the L2 cache holds is invisible to `get_local` by design:
+    /// reaching it is what the awaitable path is for.
+    #[test]
+    fn get_local_does_not_reach_l2() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("abc"));
+        // `take_stale` is the one thing that drops an L1 entry while the L2
+        // key may still be alive on its own TTL.
+        store.update("abc", |dialog| dialog.expires_secs = 0);
+        assert_eq!(store.take_stale().len(), 1);
+        assert!(store.get_local("abc").is_none());
     }
 
     #[test]
