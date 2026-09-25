@@ -431,8 +431,8 @@ impl ConnectionPool {
     ) -> Result<ConnectionId, std::io::Error> {
         // Default outbound: bind to the local IP (correct interface) but
         // an ephemeral port — see send_tcp_inner for the rationale.
-        let bind_addr = SocketAddr::new(self.local_addr.ip(), 0);
-        self.send_tcp_inner(bind_addr, destination, data).await
+        self.send_tcp_inner(self.default_tcp_bind(), destination, data)
+            .await
     }
 
     /// Send data to a destination, binding the local socket to a
@@ -1156,6 +1156,43 @@ impl ConnectionPool {
     /// Number of active pooled connections.
     pub fn active_connections(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Whether the connection a default [`send_tcp`](Self::send_tcp) or
+    /// [`send_tls`](Self::send_tls) to exactly `destination` would reuse is
+    /// still open.
+    ///
+    /// Answers for that one connection only: another port on the same host,
+    /// the other transport, a source-bound connection (IPsec, `send_socket=`)
+    /// and any inbound connection the peer opened are all different
+    /// connections and never count. A connection is gone once its reader has
+    /// evicted it (peer close, read error, the TCP idle timeout) or its writer
+    /// has stopped (write error or stall), whichever comes first. A TLS
+    /// connection dropped from reuse by a client-certificate reload reads as
+    /// gone too, since the next send opens a fresh one.
+    ///
+    /// The pool opens only TCP and TLS connections, so every other transport
+    /// is `false`.
+    pub fn has_live(&self, destination: SocketAddr, transport: Transport) -> bool {
+        let bind = match transport {
+            Transport::Tcp => Some(self.default_tcp_bind()),
+            Transport::Tls => None,
+            _ => return false,
+        };
+        let key = PoolKey {
+            destination,
+            transport,
+            bind,
+        };
+        self.connections
+            .get(&key)
+            .is_some_and(|entry| !entry.sender.is_closed())
+    }
+
+    /// The bind address of a default outbound TCP connection: the local IP
+    /// (so the right interface is used) with an ephemeral port.
+    fn default_tcp_bind(&self) -> SocketAddr {
+        SocketAddr::new(self.local_addr.ip(), 0)
     }
 
     /// Atomically swap the outbound TLS client config (e.g. after a renewed
@@ -2570,5 +2607,111 @@ mod tests {
              other caller to the same destination behind it. The guarded block \
              was:{guarded}"
         );
+    }
+
+    /// `has_live` answers for the one connection a default send to that exact
+    /// destination and transport reuses, and for nothing else.
+    #[tokio::test]
+    async fn has_live_names_the_exact_destination_and_transport() {
+        let pool = test_pool();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registrar = listener.local_addr().unwrap();
+        let other_port = SocketAddr::new(registrar.ip(), registrar.port().wrapping_add(1));
+        assert!(
+            !pool.has_live(registrar, Transport::Tcp),
+            "nothing pooled yet"
+        );
+
+        pool.send_tcp(registrar, Bytes::from_static(b"REGISTER"))
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+
+        assert!(pool.has_live(registrar, Transport::Tcp));
+        assert!(
+            !pool.has_live(other_port, Transport::Tcp),
+            "another port on the same host is a different connection"
+        );
+        assert!(
+            !pool.has_live(registrar, Transport::Tls),
+            "a TCP connection is not a TLS one"
+        );
+        for transport in [
+            Transport::Udp,
+            Transport::Sctp,
+            Transport::WebSocket,
+            Transport::WebSocketSecure,
+        ] {
+            assert!(
+                !pool.has_live(registrar, transport),
+                "the pool opens no {transport} connections"
+            );
+        }
+
+        drop(accepted);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(registrar, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a connection the peer closed still reads as live");
+    }
+
+    /// A source-bound connection (IPsec, `send_socket=`) to the same
+    /// destination is not the one a default send reuses.
+    #[tokio::test]
+    async fn has_live_ignores_a_source_bound_connection() {
+        let pool = test_pool();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registrar = listener.local_addr().unwrap();
+
+        pool.send_tcp_from(
+            "127.0.0.2:0".parse().unwrap(),
+            registrar,
+            Bytes::from_static(b"REGISTER"),
+        )
+        .await
+        .unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+
+        assert!(!pool.has_live(registrar, Transport::Tcp));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn has_live_sees_an_outbound_tls_connection_until_it_closes() {
+        let pool = test_pool();
+        let certs = generate_mtls_certs();
+        let acceptor = plain_server_acceptor(&certs);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registrar = listener.local_addr().unwrap();
+        let (close_sender, close_receiver) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("handshake");
+            let _ = close_receiver.await;
+            drop(tls);
+        });
+
+        pool.send_tls(
+            registrar,
+            Some("localhost"),
+            Bytes::from_static(b"REGISTER"),
+        )
+        .await
+        .unwrap();
+
+        assert!(pool.has_live(registrar, Transport::Tls));
+        assert!(!pool.has_live(registrar, Transport::Tcp));
+
+        close_sender.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(registrar, Transport::Tls) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a TLS connection the peer closed still reads as live");
     }
 }
