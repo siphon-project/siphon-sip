@@ -10,6 +10,7 @@
 //! handlers run once, before the caller hears anything, and what they left on
 //! the `Call` decides whether the call ends, how, or lives on.
 
+use crate::b2bua::actor::FailureConclusion;
 use crate::dispatcher::*;
 
 /// How many times `@b2bua.on_failure` may route one call again.
@@ -220,13 +221,19 @@ pub fn run_b2bua_failure_handlers(
 /// For a call that came in: one siphon placed goes through
 /// [`run_originated_failure_handlers`], since it has no caller to answer.
 pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &DispatcherState) {
-    let Some(reroutes) = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| call.failure_reroutes)
-    else {
-        debug!(call_id = %call_id, "B2BUA: the failed call is already gone — nothing left to conclude");
-        return;
+    // Claimed under the per-call lock: the handlers run without it, and another
+    // path can reach the same failure meanwhile (the ring timeout, a straggler
+    // response on another worker). Only one concludes it.
+    let reroutes = match state.call_actors.claim_failure_conclusion(call_id) {
+        FailureConclusion::Claimed { reroutes } => reroutes,
+        FailureConclusion::AlreadyConcluding => {
+            debug!(call_id = %call_id, "B2BUA: the call's failure is already being concluded — not concluding it again");
+            return;
+        }
+        FailureConclusion::Gone => {
+            debug!(call_id = %call_id, "B2BUA: the failed call is already gone — nothing left to conclude");
+            return;
+        }
     };
     let (status_code, reason) = end.status_and_reason();
     let mut outcome = run_b2bua_failure_handlers(call_id, status_code, &reason, state);
@@ -282,13 +289,17 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
                 failed_with = status_code,
                 "B2BUA: @b2bua.on_failure handed the failed call over to a control app"
             );
+            state.call_actors.release_failure_conclusion(call_id);
             reroute_failed_call(call_id, action, outcome, state);
         }
-        FailureDecision::Answered => info!(
-            call_id = %call_id,
-            failed_with = status_code,
-            "B2BUA: @b2bua.on_failure answered the caller itself — the call lives on"
-        ),
+        FailureDecision::Answered => {
+            info!(
+                call_id = %call_id,
+                failed_with = status_code,
+                "B2BUA: @b2bua.on_failure answered the caller itself — the call lives on"
+            );
+            state.call_actors.release_failure_conclusion(call_id);
+        }
         FailureDecision::Inapplicable { action, why } => {
             warn!(
                 call_id = %call_id,

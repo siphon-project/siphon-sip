@@ -186,7 +186,12 @@ impl Sequence {
     /// The caller's call forked in parallel to `addresses`, one branch each,
     /// with no script.
     pub(super) fn start_fork(addresses: &[&str]) -> Sequence {
-        let mut sequence = Sequence::new_call("");
+        Sequence::start_fork_with_script(addresses, "")
+    }
+
+    /// [`Sequence::start_fork`] through a dispatcher running `script`.
+    pub(super) fn start_fork_with_script(addresses: &[&str], script: &str) -> Sequence {
+        let mut sequence = Sequence::new_call(script);
         {
             let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
             for address in addresses {

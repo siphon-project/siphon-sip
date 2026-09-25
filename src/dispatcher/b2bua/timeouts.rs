@@ -235,6 +235,13 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             if !matches!(call.state, CallState::Calling | CallState::Ringing) {
                 return;
             }
+            // Or its last branch failed and that failure is concluding it now,
+            // the handler running while the call still reads as ringing. That
+            // conclusion is the call's; ringing it out as well would run
+            // @b2bua.on_failure a second time.
+            if call.failure_concluding {
+                return;
+            }
             // We are giving up on this ring, so stop retransmitting every B-leg
             // INVITE that never drew a response. The CANCELs below cover the
             // legs whose INVITE was stashed; this also catches a leg whose stash

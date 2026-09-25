@@ -83,6 +83,18 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`@b2bua.on_failure` could run twice for one failed call.** A fork branch's
+  final response arriving twice (the callee's retransmission) was recorded
+  again when the second copy was handled while the first copy's handler was
+  still running, so the call was concluded twice: the handler ran twice, the
+  caller got two final responses, and a handler that routed the call again
+  dialled twice. A branch now settles once and later copies are only ACKed. A
+  failed call is also concluded once: the ring timeout no longer concludes a
+  call whose last failure is already running `@b2bua.on_failure`, and a
+  duplicated rejection of an originated call no longer runs it again.
+  `@b2bua.on_cancel` had the same race with a retransmitted CANCEL, which ran it
+  twice and sent the caller a second 487; the copy now gets its 200 and
+  nothing else.
 - **`@proxy.on_register_reply` handlers never ran.** The decorator registered
   the handler but the proxy response path never dispatched it, so a script that
   used it got no callback and no error. It is now shorthand for
