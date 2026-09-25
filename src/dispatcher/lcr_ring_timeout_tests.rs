@@ -95,7 +95,7 @@ pub(super) fn top_via_branch(message: &SipMessage) -> String {
 /// `status_code` for the carrier's INVITE, as its server transaction would send
 /// it (RFC 3261 §8.2.6.2): the INVITE's Via, From, Call-ID and CSeq, and a To
 /// the carrier has tagged on anything but a 100.
-fn carrier_response(invite: &SipMessage, status_code: u16, reason: &str) -> SipMessage {
+pub(super) fn carrier_response(invite: &SipMessage, status_code: u16, reason: &str) -> SipMessage {
     let header = |name: &str| {
         invite
             .headers

@@ -997,7 +997,7 @@ pub fn apply_routing_action(
     drop(message_guard);
     b2bua_dispatch_burned_routes(call_id, &burned_routes, state);
     if let Some(settlement) = fork_settlement {
-        cancel_settled_branches(&settlement.cancelled, state);
+        cancel_settled_branches(call_id, &settlement.cancelled, state);
         if let Some(best) = settlement.failure {
             fail_forked_call(call_id, best, state);
         }

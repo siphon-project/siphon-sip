@@ -96,7 +96,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
-                verb("dial", "Ring one or more targets as B-legs while the caller stays unanswered and this app keeps the channel: the first 2xx answers the caller and the pair becomes an ordinary two-leg call, and a failure or timeout arrives as DialFailed with the caller still ringing (args: targets, strategy, timeout, headers, profile, from, from_display, p_asserted_identity, privacy). A target is a URI string, {uri, next_hop, headers} or {aor} — an AoR forks to every registered contact over its own flow, which is the only way to reach a phone registered on TCP, TLS or WSS. The identity arguments present a From of the controller's choosing instead of the caller's own, which on a call out to a trunk is the internal extension"),
+                verb("dial", "Ring one or more targets as B-legs while the caller stays unanswered and this app keeps the channel: each branch is named as it is created by DialBranch (leg_id, leg_sip_call_id, target) and as it ends by DialBranchFailed or DialAnswered, the first 2xx answers the caller and the pair becomes an ordinary two-leg call, and a failure or timeout arrives as DialFailed, listing every branch, with the caller still ringing (args: targets, strategy, timeout, headers, profile, from, from_display, p_asserted_identity, privacy). A target is a URI string, {uri, next_hop, headers} or {aor} — an AoR forks to every registered contact over its own flow, which is the only way to reach a phone registered on TCP, TLS or WSS. The identity arguments present a From of the controller's choosing instead of the caller's own, which on a call out to a trunk is the internal extension"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
@@ -158,6 +158,17 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelBridged".to_string(),
                 "BridgeFailed".to_string(),
                 "ChannelUnbridged".to_string(),
+                // The verdict on a `dial`, per branch and for the dial. Each
+                // B-leg it rings is its own SIP dialog on a Call-ID siphon
+                // generated, so every branch is named when it is created
+                // (DialBranch, the later attempts of a sequential hunt
+                // included), once more when it ends without answering
+                // (DialBranchFailed), and the winner as DialAnswered. A dial
+                // nobody answered is one DialFailed listing every branch.
+                "DialBranch".to_string(),
+                "DialBranchFailed".to_string(),
+                "DialAnswered".to_string(),
+                "DialFailed".to_string(),
                 // The verdict on a `replace_peer`, for the same reason: the
                 // reply says only that the INVITE to the target left the box.
                 // Whether the target answered, whether the survivor took the

@@ -175,10 +175,18 @@ pub fn schedule_zombie_cancelled_expiry(
 /// The store has already kept each one answerable, so the 487 its CANCEL draws
 /// gets an ACK and a 2xx that crosses the CANCEL an ACK and a BYE. This puts the
 /// CANCELs on the wire and arms the expiry of what was kept.
-pub fn cancel_settled_branches(legs: &[crate::b2bua::actor::Leg], state: &DispatcherState) {
+pub fn cancel_settled_branches(
+    call_id: &str,
+    legs: &[crate::b2bua::actor::Leg],
+    state: &DispatcherState,
+) {
     if legs.is_empty() {
         return;
     }
+    // The branches of a controller-issued `dial` among them are over, and the
+    // controller is told which. One settled already (a ring timeout that led to
+    // this CANCEL) keeps the outcome it was reported with.
+    control_dial_legs_cancelled(call_id, legs, state);
     let mut kept = Vec::with_capacity(legs.len());
     for leg in legs {
         // Stop retransmitting the INVITE, as the ring-timeout CANCEL does: an

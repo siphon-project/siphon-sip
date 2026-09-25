@@ -287,16 +287,20 @@ pub fn absorb_answered_retransmit(
         .map(|idx| state.call_actors.try_win(call_id, idx))
     {
         Some(crate::b2bua::actor::WinOutcome::FirstWin { cancelled }) => {
+            // The winner of a controller-issued `dial` is named before the
+            // branches it beat are reported cancelled.
+            control_dial_branch_answered(call_id, message, snapshot, state);
             // This branch won, so the ones still ringing are over (RFC 3261
             // §16.7). CANCEL them now rather than leave them ringing beside an
             // answered call until each gives up on its own.
-            cancel_settled_branches(&cancelled, state);
+            cancel_settled_branches(call_id, &cancelled, state);
             false
         }
         Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered) => true,
         None if snapshot.call_state == CallState::Answered => true,
         None => {
             state.call_actors.set_state(call_id, CallState::Answered);
+            control_dial_branch_answered(call_id, message, snapshot, state);
             false
         }
     };
@@ -311,6 +315,27 @@ pub fn absorb_answered_retransmit(
     );
     ack_b_leg_2xx(call_id, message, state, snapshot);
     true
+}
+
+/// The branch this 2xx came on answered a controller-issued `dial`.
+fn control_dial_branch_answered(
+    call_id: &str,
+    message: &SipMessage,
+    snapshot: &BLegResponseSnapshot,
+    state: &DispatcherState,
+) {
+    let status_code = match &message.start_line {
+        StartLine::Response(status) => status.status_code,
+        StartLine::Request(_) => return,
+    };
+    control_dial_branch_ended(
+        call_id,
+        &snapshot.branch,
+        status_code,
+        response_reason_phrase(message),
+        crate::b2bua::actor::DialBranchCause::Answered,
+        state,
+    );
 }
 
 /// ACK a 2xx the B-leg sent for the call's INVITE (RFC 3261 §13.2.2.4): the

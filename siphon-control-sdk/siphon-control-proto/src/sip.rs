@@ -68,6 +68,8 @@ pub enum SipVerb {
     /// The first 2xx answers the caller and the pair becomes an ordinary two-leg
     /// call; a failure or timeout arrives as `DialFailed` with the caller still
     /// ringing and still parked, so the application decides what happens next.
+    /// Every branch is named as it is created (`DialBranch`) and as it ends
+    /// (`DialBranchFailed` / `DialAnswered`), by its leg id and SIP Call-ID.
     Dial,
     /// Set a header on the stored A-leg INVITE.
     SetHeader,
@@ -229,6 +231,18 @@ pub enum SipEvent {
     /// `detached`) followed by a fresh started. Any reason other than
     /// `detached` leaves a live call with no media far side.
     WsBridgeEnded,
+    /// A branch of a `dial` was created ([`DialBranchPayload`]): its INVITE is
+    /// about to go out. Every fork branch, and each attempt of a sequential
+    /// hunt when the hunt places it.
+    DialBranch,
+    /// A branch of a `dial` ended without answering ([`DialBranchOutcome`]).
+    DialBranchFailed,
+    /// A branch of a `dial` answered ([`DialAnsweredPayload`]); the caller is
+    /// answered with it.
+    DialAnswered,
+    /// A `dial` ended with nobody answering ([`DialFailedPayload`]). The caller
+    /// is still ringing and still owned.
+    DialFailed,
     /// Any other event name (forward-compatible catch-all).
     Other(String),
 }
@@ -257,6 +271,10 @@ impl SipEvent {
             SipEvent::WsTeeEnded => "WsTeeEnded",
             SipEvent::WsBridgeStarted => "WsBridgeStarted",
             SipEvent::WsBridgeEnded => "WsBridgeEnded",
+            SipEvent::DialBranch => "DialBranch",
+            SipEvent::DialBranchFailed => "DialBranchFailed",
+            SipEvent::DialAnswered => "DialAnswered",
+            SipEvent::DialFailed => "DialFailed",
             SipEvent::Other(name) => name.as_str(),
         }
     }
@@ -285,6 +303,10 @@ impl From<&str> for SipEvent {
             "WsTeeEnded" => SipEvent::WsTeeEnded,
             "WsBridgeStarted" => SipEvent::WsBridgeStarted,
             "WsBridgeEnded" => SipEvent::WsBridgeEnded,
+            "DialBranch" => SipEvent::DialBranch,
+            "DialBranchFailed" => SipEvent::DialBranchFailed,
+            "DialAnswered" => SipEvent::DialAnswered,
+            "DialFailed" => SipEvent::DialFailed,
             other => SipEvent::Other(other.to_string()),
         }
     }
@@ -723,6 +745,147 @@ pub struct ChannelUnbridgedPayload {
     /// The reason the `unbridge` carried (default `"unbridged"`).
     #[serde(default)]
     pub reason: String,
+}
+
+/// The `payload` of a [`SipEvent::DialBranch`] event: a B-leg a `dial` rings.
+///
+/// Each branch is its own SIP dialog, on a Call-ID the server generated, so
+/// this is what ties it to the channel. The pair follows
+/// [`ChannelBridgedPayload`]'s `peer_call_id` / `peer_sip_call_id`; the frame's
+/// own `sip_call_id` stays the caller's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialBranchPayload {
+    /// The server's id for the B-leg, stable across a 401/407 or 422 retry of
+    /// it. The key the branch's later events carry.
+    pub leg_id: String,
+    /// The SIP `Call-ID` the branch's INVITE carries — the CDR / HEP join key
+    /// for this leg.
+    #[serde(default)]
+    pub leg_sip_call_id: String,
+    /// The target the branch was dialled at.
+    #[serde(default)]
+    pub target: String,
+}
+
+/// How a `dial` branch ended without answering — the `cause` of a
+/// [`DialBranchOutcome`].
+///
+/// Unrecognised tokens map to [`DialBranchCause::Other`] rather than failing,
+/// so a newer server never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum DialBranchCause {
+    /// The far end sent a final non-2xx; `code` / `reason` are its own.
+    Rejected,
+    /// It rang out (`408`).
+    Timeout,
+    /// The server CANCELled it (`487`): another branch answered, a 6xx ended
+    /// the fork, or the caller hung up.
+    Cancelled,
+    /// The INVITE never reached the transport (`503`).
+    Unsent,
+    /// Any other cause token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl DialBranchCause {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            DialBranchCause::Rejected => "rejected",
+            DialBranchCause::Timeout => "timeout",
+            DialBranchCause::Cancelled => "cancelled",
+            DialBranchCause::Unsent => "unsent",
+            DialBranchCause::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for DialBranchCause {
+    fn from(token: &str) -> Self {
+        match token {
+            "rejected" => DialBranchCause::Rejected,
+            "timeout" => DialBranchCause::Timeout,
+            "cancelled" => DialBranchCause::Cancelled,
+            "unsent" => DialBranchCause::Unsent,
+            other => DialBranchCause::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for DialBranchCause {
+    fn from(token: String) -> Self {
+        DialBranchCause::from(token.as_str())
+    }
+}
+
+impl From<DialBranchCause> for String {
+    fn from(cause: DialBranchCause) -> Self {
+        cause.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for DialBranchCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A `dial` branch and how it ended: the `payload` of a
+/// [`SipEvent::DialBranchFailed`] event, and each entry of
+/// [`DialFailedPayload::branches`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialBranchOutcome {
+    /// The branch's leg id, as its [`DialBranchPayload`] named it.
+    pub leg_id: String,
+    /// The branch's SIP `Call-ID`.
+    #[serde(default)]
+    pub leg_sip_call_id: String,
+    /// The target the branch was dialled at.
+    #[serde(default)]
+    pub target: String,
+    /// The status it ended on.
+    pub code: u16,
+    /// The reason phrase that goes with `code`.
+    #[serde(default)]
+    pub reason: String,
+    /// Why it ended.
+    pub cause: DialBranchCause,
+}
+
+/// The `payload` of a [`SipEvent::DialAnswered`] event: the branch that
+/// answered the `dial`, named as its [`DialBranchPayload`] was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialAnsweredPayload {
+    /// The branch's leg id.
+    pub leg_id: String,
+    /// The branch's SIP `Call-ID`.
+    #[serde(default)]
+    pub leg_sip_call_id: String,
+    /// The target the branch was dialled at.
+    #[serde(default)]
+    pub target: String,
+    /// The 2xx it answered with.
+    pub code: u16,
+}
+
+/// The `payload` of a [`SipEvent::DialFailed`] event: nobody answered the
+/// `dial`, and the caller is still ringing and still owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialFailedPayload {
+    /// The status the dial ended on.
+    pub code: u16,
+    /// The reason phrase that goes with `code`.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether it ended at the ring timeout.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// Every branch the dial rang, each with its outcome. Empty from a server
+    /// that predates branch reporting.
+    #[serde(default)]
+    pub branches: Vec<DialBranchOutcome>,
 }
 
 /// The `payload` of a [`SipEvent::PeerReplaced`] event: a leg replacement
@@ -1204,6 +1367,90 @@ mod tests {
         .unwrap();
         assert_eq!(unbridged.peer_call_id, "call-b");
         assert_eq!(unbridged.reason, "supervisor took over");
+    }
+
+    #[test]
+    fn dial_events_round_trip_as_typed_variants() {
+        for (wire, expected) in [
+            ("DialBranch", SipEvent::DialBranch),
+            ("DialBranchFailed", SipEvent::DialBranchFailed),
+            ("DialAnswered", SipEvent::DialAnswered),
+            ("DialFailed", SipEvent::DialFailed),
+        ] {
+            let parsed = SipEvent::from(wire);
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), wire);
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn dial_payloads_parse_every_server_shape() {
+        let branch: DialBranchPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-1",
+            "leg_sip_call_id": "b1@host",
+            "target": "sip:204@example.com",
+        }))
+        .unwrap();
+        assert_eq!(branch.leg_id, "leg-1");
+        assert_eq!(branch.leg_sip_call_id, "b1@host");
+        assert_eq!(branch.target, "sip:204@example.com");
+
+        let busy: DialBranchOutcome = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-1",
+            "leg_sip_call_id": "b1@host",
+            "target": "sip:204@example.com",
+            "code": 486,
+            "reason": "Busy Here",
+            "cause": "rejected",
+        }))
+        .unwrap();
+        assert_eq!(busy.code, 486);
+        assert_eq!(busy.cause, DialBranchCause::Rejected);
+
+        let answered: DialAnsweredPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-2",
+            "leg_sip_call_id": "b2@host",
+            "target": "sip:205@example.com",
+            "code": 200,
+        }))
+        .unwrap();
+        assert_eq!(answered.leg_sip_call_id, "b2@host");
+        assert_eq!(answered.code, 200);
+
+        let failed: DialFailedPayload = serde_json::from_value(serde_json::json!({
+            "code": 408,
+            "reason": "Request Timeout",
+            "timed_out": true,
+            "branches": [
+                {"leg_id": "leg-1", "leg_sip_call_id": "b1@host", "target": "sip:204@example.com",
+                 "code": 408, "reason": "Request Timeout", "cause": "timeout"},
+                {"leg_id": "leg-2", "leg_sip_call_id": "b2@host", "target": "sip:205@example.com",
+                 "code": 487, "reason": "Request Terminated", "cause": "cancelled"},
+            ],
+        }))
+        .unwrap();
+        assert!(failed.timed_out);
+        assert_eq!(failed.branches.len(), 2);
+        assert_eq!(failed.branches[1].cause, DialBranchCause::Cancelled);
+
+        // A server that predates branch reporting sends no list.
+        let older: DialFailedPayload = serde_json::from_value(serde_json::json!({
+            "code": 486, "reason": "Busy Here", "timed_out": false,
+        }))
+        .unwrap();
+        assert!(older.branches.is_empty());
+
+        for token in ["rejected", "timeout", "cancelled", "unsent"] {
+            assert_eq!(DialBranchCause::from(token).as_str(), token);
+        }
+        assert_eq!(
+            DialBranchCause::from("something_new"),
+            DialBranchCause::Other("something_new".to_string())
+        );
     }
 
     /// Every stream event name must survive the wire round trip as a typed

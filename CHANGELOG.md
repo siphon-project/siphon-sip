@@ -83,6 +83,31 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
+- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
+  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
+  only under a method branch and told the author to move the awaits into
+  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
+  takes a method filter. Those two hooks now get a non-failing note that states
+  the cost. The suggested filter is also built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
 - **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
   now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
   (it was documented but never applied), and if the script registers
@@ -213,6 +238,36 @@ entry, but a working config keeps working.
   `sip:` + `tel:` pair (RFC 3325 §9.1).
 
 ### Added
+
+- **`siphon::config::expand_env_vars` is public.** Extensions that load their
+  own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules
+  `siphon.yaml` uses instead of keeping their own copy.
+
+- **`@proxy.on_reply` takes an optional method filter**, the same shape as
+  `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
+  `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
+  response answers. Filtered and unfiltered handlers all run, in registration
+  order, and a response no handler matches is forwarded unchanged. A reply
+  handler that only awaits for one method can now be split so every other
+  response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
+  an unfiltered `async` reply handler that should be.
+
+- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
+  the configured `subscribe_state.cache`, refreshing this instance's view of it,
+  and returns whether a live dialog is in hand afterwards. It is the explicit,
+  awaited counterpart to the implicit cache read the properties no longer make
+  (below) — for a dialog another replica owns whose local entry has since been
+  reaped.
+
+- **The control-plane `dial` names every B-leg it rings.** Each branch had its
+  own generated Call-ID and nothing tied it back to the call, so a controller
+  could not associate the legs with its channel. New channel events:
+  `DialBranch {leg_id, leg_sip_call_id, target}` when a branch is created (each
+  attempt of a sequential hunt too), `DialBranchFailed` with `code`, `reason`
+  and a `cause` of `rejected` / `timeout` / `cancelled` / `unsent`, and
+  `DialAnswered` for the winner. `DialFailed` gains `branches`, every branch
+  with its outcome. All four are listed in `describe` and typed in the control
+  SDKs.
 
 - **`siphon::config::expand_env_vars` is public.** Extensions that load their
   own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules

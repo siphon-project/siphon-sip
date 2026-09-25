@@ -1005,7 +1005,7 @@ pub fn carry_out_refusal(
         cdr_clear_b2bua_answer(state, call_id);
     } else {
         let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-        cancel_settled_branches(&cancelled, state);
+        cancel_settled_branches(call_id, &cancelled, state);
     }
     end_call_without_rerouting(call_id, status_code, state);
 }

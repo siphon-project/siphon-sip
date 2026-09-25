@@ -16,10 +16,13 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod dial_branch;
 mod failure;
 mod fork;
 mod route_progress;
 mod session_timer;
+
+pub use dial_branch::SettledDialBranches;
 
 /// How long a torn-down call's SIP Call-IDs stay answerable with 481.
 ///

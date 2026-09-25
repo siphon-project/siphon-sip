@@ -96,7 +96,7 @@ pub fn b_leg_provisional(
                 // Never forward an unanchored answer after promising a media
                 // profile. Cancel the outstanding legs and resolve the call.
                 let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-                cancel_settled_branches(&cancelled, state);
+                cancel_settled_branches(call_id, &cancelled, state);
                 report_control_dial_failure(call_id, 503, "Media negotiation failed", false, state);
                 return;
             }

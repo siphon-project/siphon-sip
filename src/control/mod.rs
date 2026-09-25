@@ -67,8 +67,56 @@ pub use registry::{
 /// controlled. A no-op when the control plane is not installed. Signalling-path
 /// helper — never blocks, never panics.
 pub fn notify_channel_event(sip_call_id: &str, event: &str, payload: serde_json::Value) {
+    #[cfg(test)]
+    channel_event_capture::record(sip_call_id, event, &payload);
     if let Some(bus) = ControlBus::global() {
         bus.forward_channel_event(sip_call_id, event, payload);
+    }
+}
+
+/// What [`notify_channel_event`] was asked to publish, for the Call-IDs a test
+/// watches.
+///
+/// The bus it publishes on is process-global and installed once, and installing
+/// one in the library tests would change what every other test sees (a handover
+/// with no bus fails fast, for one). This records the event at the one function
+/// every channel event passes through, before the bus is looked up, so a test can
+/// read the events a signalling path produced without one. Only a watched
+/// Call-ID is recorded, so the lib test binary does not accumulate the events of
+/// every call it ever ran.
+#[cfg(test)]
+pub(crate) mod channel_event_capture {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `(event, payload)` in the order they were published.
+    pub(crate) type Captured = Vec<(String, serde_json::Value)>;
+
+    fn store() -> &'static Mutex<HashMap<String, Captured>> {
+        static STORE: OnceLock<Mutex<HashMap<String, Captured>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Start recording the events published for `sip_call_id`.
+    pub(crate) fn watch(sip_call_id: &str) {
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        store.insert(sip_call_id.to_string(), Vec::new());
+    }
+
+    pub(super) fn record(sip_call_id: &str, event: &str, payload: &serde_json::Value) {
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(captured) = store.get_mut(sip_call_id) {
+            captured.push((event.to_string(), payload.clone()));
+        }
+    }
+
+    /// The events published for `sip_call_id` since the last look.
+    pub(crate) fn take(sip_call_id: &str) -> Captured {
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        store
+            .get_mut(sip_call_id)
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 }
 

@@ -710,6 +710,10 @@ pub fn b2bua_send_b_leg_invite(
         return false;
     }
     spawn_b_leg_actor(call_id, &b_leg, state);
+    // A branch of a controller-issued `dial` is named to the controller now,
+    // with the Call-ID this INVITE carries: before the send, so nothing the
+    // branch answers can be reported ahead of it.
+    control_dial_branch_created(call_id, &b_leg, target_uri, state);
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
@@ -797,6 +801,14 @@ pub fn b2bua_send_b_leg_invite(
             // INVITE is not on the wire and nothing will ever answer it. Report
             // the failure so the caller fails the call now instead of leaving it
             // to the ring timeout; the leg goes with the call's teardown.
+            control_dial_branch_ended(
+                call_id,
+                &branch,
+                503,
+                "Service Unavailable",
+                crate::b2bua::actor::DialBranchCause::Unsent,
+                state,
+            );
             return false;
         }
     } else {

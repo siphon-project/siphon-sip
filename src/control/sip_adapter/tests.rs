@@ -1309,6 +1309,22 @@ fn describe_lists_the_bridge_events() {
     }
 }
 
+/// Every event a `dial` reports is discoverable: a controller that cannot find
+/// DialBranch in `describe` has no way to learn its legs are named at all.
+#[test]
+fn describe_lists_the_dial_events() {
+    let schema = SipControlAdapter::new().describe();
+    let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
+    for expected in [
+        "DialBranch",
+        "DialBranchFailed",
+        "DialAnswered",
+        "DialFailed",
+    ] {
+        assert!(events.contains(&expected), "missing event {expected}");
+    }
+}
+
 /// Every WebSocket stream a controller can start over this rail must have
 /// its lifecycle on the same rail. `stream_start` shipped before the events
 /// did, which left a controller able to start a tee and unable to learn it

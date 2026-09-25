@@ -144,7 +144,7 @@ fn cancel_pending_branches(call_id: &str, state: &DispatcherState) {
         let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
     let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-    super::response::cancel_settled_branches(&cancelled, state);
+    super::response::cancel_settled_branches(call_id, &cancelled, state);
 }
 
 /// Wait for the in-flight work a teardown pass leaves behind.

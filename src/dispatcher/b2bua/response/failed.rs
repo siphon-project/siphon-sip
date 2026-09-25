@@ -33,6 +33,18 @@ pub fn b_leg_failed(
         return;
     }
 
+    // Neither retry saved it, so this branch of a controller-issued `dial` is
+    // over. Named before anything below can fail the dial or move a sequential
+    // hunt on to its next attempt, so the controller hears it in that order.
+    control_dial_branch_ended(
+        call_id,
+        branch,
+        status_code,
+        response_reason_phrase(message),
+        crate::b2bua::actor::DialBranchCause::Rejected,
+        state,
+    );
+
     // A parallel fork: one branch failing is not the call failing while another
     // can still answer (RFC 3261 §16.7). The failure is recorded, the best one
     // kept, and the call fails only once no branch is left. A plain dial is a
@@ -63,7 +75,7 @@ pub fn b_leg_failed(
         ack_b_leg_non2xx(branch, message, state, snapshot);
         return;
     };
-    cancel_settled_branches(&settlement.cancelled, state);
+    cancel_settled_branches(call_id, &settlement.cancelled, state);
     match settlement.failure {
         None => {
             ack_b_leg_non2xx(branch, message, state, snapshot);

@@ -234,6 +234,10 @@ export type SipEventKind =
   | "WsTeeEnded"
   | "WsBridgeStarted"
   | "WsBridgeEnded"
+  | "DialBranch"
+  | "DialBranchFailed"
+  | "DialAnswered"
+  | "DialFailed"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -473,6 +477,73 @@ export interface ChannelUnbridgedPayload {
 }
 
 /**
+ * The `payload` of a `DialBranch` event — a B-leg a `dial` just created, its
+ * INVITE about to go out. Every fork branch, and each attempt of a sequential
+ * hunt when the hunt places it.
+ *
+ * Each branch is its own SIP dialog, on a Call-ID the server generated, so this
+ * is what ties it to the channel. The pair follows
+ * {@link ChannelBridgedPayload}'s `peer_call_id` / `peer_sip_call_id`; the
+ * frame's own `sip_call_id` stays the caller's.
+ */
+export interface DialBranchPayload {
+  /** The server's id for the B-leg, stable across a 401/407 or 422 retry of it. */
+  leg_id: string;
+  /** The SIP `Call-ID` the branch's INVITE carries — the CDR / HEP join key for this leg. */
+  leg_sip_call_id: string;
+  /** The target the branch was dialled at. */
+  target: string;
+}
+
+/**
+ * How a `dial` branch ended without answering: `rejected` (the far end's final
+ * non-2xx), `timeout` (`408`, it rang out), `cancelled` (`487`, the server
+ * CANCELled it: another branch answered, a 6xx ended the fork, or the caller
+ * hung up) or `unsent` (`503`, the INVITE never reached the transport). Unknown
+ * tokens pass through verbatim (forward-compatible).
+ */
+export type DialBranchCause =
+  | "rejected"
+  | "timeout"
+  | "cancelled"
+  | "unsent"
+  | (string & {});
+
+/**
+ * A `dial` branch and how it ended — the `payload` of a `DialBranchFailed`
+ * event, and each entry of {@link DialFailedPayload.branches}.
+ */
+export interface DialBranchOutcome extends DialBranchPayload {
+  /** The status it ended on. */
+  code: number;
+  /** The reason phrase that goes with `code`. */
+  reason: string;
+  /** Why it ended. */
+  cause: DialBranchCause;
+}
+
+/** The `payload` of a `DialAnswered` event — the branch that answered the `dial`. */
+export interface DialAnsweredPayload extends DialBranchPayload {
+  /** The 2xx it answered with. */
+  code: number;
+}
+
+/**
+ * The `payload` of a `DialFailed` event — nobody answered the `dial`, and the
+ * caller is still ringing and still owned.
+ */
+export interface DialFailedPayload {
+  /** The status the dial ended on. */
+  code: number;
+  /** The reason phrase that goes with `code`. */
+  reason: string;
+  /** Whether it ended at the ring timeout. */
+  timed_out: boolean;
+  /** Every branch the dial rang, each with its outcome. Absent from a server that predates branch reporting. */
+  branches?: DialBranchOutcome[];
+}
+
+/**
  * The `payload` of a `PeerReplaced` event — a leg replacement completed.
  *
  * The target answered, was promoted into the surviving pair, and the leg it
@@ -610,4 +681,13 @@ export interface WsBridgeEndedPayload {
  */
 export function isBridgeFinal(name: string): boolean {
   return name === "ChannelBridged" || name === "BridgeFailed";
+}
+
+/**
+ * Whether an event name ends a `dial`. Exactly one `DialAnswered` or
+ * `DialFailed` arrives per dial, so this is the signal to stop waiting;
+ * `DialBranch` / `DialBranchFailed` are per-branch and may be many.
+ */
+export function isDialFinal(name: string): boolean {
+  return name === "DialAnswered" || name === "DialFailed";
 }
