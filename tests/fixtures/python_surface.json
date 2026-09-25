@@ -2653,6 +2653,11 @@
         "kind": "method_descriptor",
         "sig": "($self, expires=None, timeout_ms=2000)"
       },
+      "reload": {
+        "doc": "Re-read the dialog through the configured L2 cache, refreshing this",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
       "terminate": {
         "doc": "Terminate the subscription dialog.",
         "kind": "method_descriptor",

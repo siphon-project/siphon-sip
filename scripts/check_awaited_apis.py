@@ -65,7 +65,7 @@ SUBSCRIBE_STATE_AWAITABLE = {"get", "send"}
 # variable bound from one of these is a SubscribeHandle, whose own awaitable
 # methods we then police.
 SUBSCRIBE_STATE_HANDLE_SOURCES = {"accept", "create", "get"}
-HANDLE_AWAITABLE = {"notify", "terminate", "refresh"}
+HANDLE_AWAITABLE = {"notify", "terminate", "refresh", "reload"}
 
 # Awaitable methods whose receiver is a per-request object rather than a
 # namespace, and whose name collides with nothing else in these trees.
@@ -235,6 +235,9 @@ async def handler(request, socket, process):
     handle = proxy.subscribe_state.create(request)
     handle.notify(body="x")                               # FINDING
     await handle.terminate()
+    handle.reload()                                       # FINDING
+    if handle.expires > 0:                                # a property, not a call
+        pass
     asyncio.create_task(handle.refresh(60))
     later = await proxy.subscribe_state.get("id")
     proxy.subscribe_state.get("id")                       # FINDING

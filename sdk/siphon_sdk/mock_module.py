@@ -339,21 +339,33 @@ class MockSubscribeHandle:
         self._id = id_
         self._dialog = dialog
 
+    def _live(self) -> dict:
+        """The dialog, or ``LookupError`` once it is gone.
+
+        Mirrors the Rust handle, which reads local store state only — so a
+        property never waits on the L2 cache, and a dialog that has been
+        terminated or reaped raises instead of being revived from it.
+        ``await handle.reload()`` is the way back.
+        """
+        if self._id not in self._parent._dialogs:
+            raise LookupError(f"subscribe_state dialog '{self._id}' not found")
+        return self._dialog
+
     @property
     def id(self) -> str:
         return self._id
 
     @property
     def local_tag(self) -> str:
-        return self._dialog.get("local_tag", "")
+        return self._live().get("local_tag", "")
 
     @property
     def event(self) -> str:
-        return self._dialog.get("event", "")
+        return self._live().get("event", "")
 
     @property
     def expires(self) -> int:
-        return int(self._dialog.get("expires_secs", 0))
+        return int(self._live().get("expires_secs", 0))
 
     @property
     def event_version(self) -> int:
@@ -363,7 +375,7 @@ class MockSubscribeHandle:
         RFC 3680 reginfo / RFC 4235 dialog-info / RFC 4575 conference
         bodies that require a monotonic ``version=`` attribute.
         """
-        return int(self._dialog.get("event_version", 0))
+        return int(self._live().get("event_version", 0))
 
     def next_event_version(self) -> int:
         """Atomically increment and return the next event-package body version.
@@ -372,18 +384,34 @@ class MockSubscribeHandle:
 
             version = handle.next_event_version()
             body = registrar.reginfo_xml(aor, state="full", version=version)
-            handle.notify(body=body, content_type="application/reginfo+xml")
+            await handle.notify(body=body, content_type="application/reginfo+xml")
         """
-        current = int(self._dialog.get("event_version", 0))
-        new_version = current + 1
-        self._dialog["event_version"] = new_version
+        dialog = self._live()
+        new_version = int(dialog.get("event_version", 0)) + 1
+        dialog["event_version"] = new_version
         return new_version
+
+    def reload(self) -> bool:
+        """Awaitable re-read of the dialog; ``True`` when it is still live.
+
+        In siphon this goes to the L2 cache, so a replica can recover a dialog
+        another one owns after its own entry was reaped. The mock has one tier,
+        so this is a liveness check::
+
+            if not await handle.reload():
+                return
+        """
+        async def _run():
+            return self._id in self._parent._dialogs
+
+        return _run()
 
     def notify(self, body=None, content_type: Optional[str] = None,
                state: Optional[str] = None) -> bool:
         async def _run():
-            if self._id not in self._parent._dialogs:
-                return False
+            # Raises like the native handle: a NOTIFY in a dialog that is gone
+            # is a script bug, and a False return would hide it.
+            self._live()
             entry = {
                 "id": self._id,
                 "body": body,
@@ -398,6 +426,7 @@ class MockSubscribeHandle:
     def terminate(self, reason: Optional[str] = None,
                   body=None, content_type: Optional[str] = None) -> bool:
         async def _run():
+            self._live()
             reason_str = reason or "noresource"
             self._parent.terminates.append({
                 "id": self._id,
@@ -419,7 +448,7 @@ class MockSubscribeHandle:
         Rust contract that refresh is only valid on outbound dialogs).
         """
         async def _run():
-            if not self._dialog.get("is_outbound"):
+            if not self._live().get("is_outbound"):
                 raise RuntimeError(
                     "refresh() is only valid on outbound dialogs (created via send())"
                 )

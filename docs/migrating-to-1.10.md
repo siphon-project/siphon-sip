@@ -41,9 +41,17 @@ no I/O, so it stays synchronous. So do `auth.stamp_integrity_protected` and
 call.
 
 `SubscribeHandle`'s properties (`event`, `expires`, `local_tag`, …) also stay
-synchronous. A Python property cannot be awaited, so they read through a loader
-that still blocks on an L2 (Redis) miss. An L1 hit — the common case, and always
-the case for a dialog this instance created — touches no network.
+synchronous, and stay properties. A Python property cannot be awaited, so in
+1.10.0 they read through a loader that still blocked on an L2 (Redis) miss. An
+L1 hit — the common case, and always the case for a dialog this instance created
+— touched no network.
+
+**1.11.0 closes that last gap without moving the API.** The loader reads local
+state only, so no property can wait on anything; nothing to `await`, nothing to
+rewrite. The one behaviour that changed with it is narrow: a property on a
+dialog whose local entry has since been reaped now raises `LookupError` instead
+of fetching a copy the shared cache may still hold. `await handle.reload()` is
+the explicit re-read if you want it. See the 1.11.0 changelog entry.
 
 ## Migrating
 

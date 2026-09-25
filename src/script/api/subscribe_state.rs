@@ -305,20 +305,20 @@ impl PySubscribeHandle {
     /// Notifier tag shared by the SUBSCRIBE response and every NOTIFY.
     #[getter]
     fn local_tag(&self) -> PyResult<String> {
-        Ok(self.load_sync()?.local_tag)
+        Ok(self.load_local()?.local_tag)
     }
 
     /// The SIP Event package (copied from the SUBSCRIBE).
     #[getter]
     fn event(&self) -> PyResult<String> {
-        let dialog = self.load_sync()?;
+        let dialog = self.load_local()?;
         Ok(dialog.event)
     }
 
     /// Seconds remaining until the dialog expires.
     #[getter]
     fn expires(&self) -> PyResult<u64> {
-        let dialog = self.load_sync()?;
+        let dialog = self.load_local()?;
         Ok(dialog.remaining_secs())
     }
 
@@ -330,7 +330,7 @@ impl PySubscribeHandle {
     /// :meth:`next_event_version` to advance it.
     #[getter]
     fn event_version(&self) -> PyResult<u32> {
-        let dialog = self.load_sync()?;
+        let dialog = self.load_local()?;
         Ok(dialog.event_version)
     }
 
@@ -342,11 +342,12 @@ impl PySubscribeHandle {
     /// ```python
     /// version = handle.next_event_version()
     /// body = registrar.reginfo_xml(aor, state="full", version=version)
-    /// handle.notify(body=body, content_type="application/reginfo+xml")
+    /// await handle.notify(body=body, content_type="application/reginfo+xml")
     /// ```
     fn next_event_version(&self) -> PyResult<u32> {
-        // Hydrate L1 in case we're on a different worker than the creator.
-        let _ = self.load_sync()?;
+        // Raise rather than no-op when the dialog is gone; the update below is
+        // local-only, so this is the whole liveness check.
+        let _ = self.load_local()?;
         let updated = self.store.update(&self.id, |dialog| {
             dialog.next_event_version();
         });
@@ -363,6 +364,30 @@ impl PySubscribeHandle {
         format!("SubscribeHandle(id={:?})", self.id)
     }
 
+    /// Re-read the dialog through the configured L2 cache, refreshing this
+    /// instance's local view of it.  Returns ``True`` when a live dialog is in
+    /// hand afterwards, ``False`` when it is unknown or terminated.
+    ///
+    /// Every property and every send on a handle reads local state only, so
+    /// none of them can block.  This is the awaited counterpart for the one
+    /// case that needs the cache: a dialog another replica owns, whose local
+    /// entry has since been reaped, where a property would otherwise raise
+    /// ``LookupError``.
+    ///
+    /// ```python
+    /// if not await handle.reload():
+    ///     return              # the subscription is gone
+    /// log.info(f"{handle.expires}s left")
+    /// ```
+    ///
+    /// Without an L2 cache configured (``subscribe_state.cache``) this is just
+    /// a liveness check against local state.
+    fn reload<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let store = Arc::clone(&self.store);
+        let id = self.id.clone();
+        crate::script::awaitable(python, async move { Ok(store.get(&id).await.is_some()) })
+    }
+
     /// Send an in-dialog NOTIFY with ``body``/``content_type``.
     ///
     /// ``state`` is the full ``Subscription-State`` header value.  When
@@ -370,8 +395,11 @@ impl PySubscribeHandle {
     /// explicitly for ``pending``, ``active;expires=N;reason=...``, or
     /// to override the expiry.
     ///
-    /// Returns ``True`` on success, ``False`` if the dialog has been
-    /// terminated or is unknown.
+    /// Returns ``True`` on success.  Raises ``LookupError`` when the dialog is
+    /// unknown — terminated, or reaped on expiry — since sending a NOTIFY in a
+    /// dialog that no longer exists is a script bug, not a quiet no-op.  The
+    /// ``False`` return is the narrow race where it went away between the
+    /// lookup and the CSeq bump.
     #[pyo3(signature = (body=None, content_type=None, state=None))]
     fn notify<'py>(
         &self,
@@ -483,7 +511,7 @@ impl PySubscribeHandle {
         expires: Option<u64>,
         timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let dialog = self.load_sync()?;
+        let dialog = self.load_local()?;
         if !dialog.is_outbound {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "refresh() is only valid on outbound dialogs (created via send())",
@@ -535,22 +563,27 @@ impl PySubscribeHandle {
 }
 
 impl PySubscribeHandle {
-    /// Load the dialog, blocking on an L2 miss.
+    /// Load the dialog out of the local store. Synchronous and non-blocking:
+    /// no network, nothing an asyncio driver can be held for.
     ///
-    /// The one blocking path left here, and deliberately so: it backs the
-    /// Python **properties** (`event`, `expires`, `local_tag`, …), and a
-    /// property cannot be awaited. Making it awaitable would mean turning them
-    /// into methods, which is a larger API change than this one.
+    /// This backs the Python **properties** (`event`, `expires`, `local_tag`,
+    /// …), which cannot be awaited, so the loader they read through must not be
+    /// able to wait on anything. It reads L1 only, and that costs nothing here:
+    /// a `SubscribeHandle` only ever comes from a call that has already put its
+    /// dialog in L1 — `accept`/`create`/`send` via `put`, `find` off an L1 scan,
+    /// and the awaitable `get`, which hydrates L1 from the cache before it
+    /// builds the handle. A handle is a Python object, so it cannot arrive from
+    /// another process either. L1 therefore holds whatever a live handle refers
+    /// to, and it is still a *live* read — the same entry a SUBSCRIBE refresh
+    /// mutates, not a snapshot taken at construction.
     ///
-    /// The exposure is small but real: an L1 hit — the common case — touches
-    /// no network, and only a miss reaches Redis and can hold an asyncio
-    /// driver. Read a property on a dialog this instance created and it is
-    /// always L1.
-    fn load_sync(&self) -> PyResult<SubscribeDialog> {
-        let store = Arc::clone(&self.store);
-        let id = self.id.clone();
-        let found = crate::script::detach_block_on(store.get(&id));
-        found.ok_or_else(|| {
+    /// What it gives up is the implicit revival: once the sweeper reaps the
+    /// local entry (expired or terminated) this raises instead of fetching a
+    /// copy the cache may still hold on its own TTL — a copy the sweeper has
+    /// already sent the terminating NOTIFY for. Scripts that genuinely want the
+    /// cache re-read ask for it with `await handle.reload()`.
+    fn load_local(&self) -> PyResult<SubscribeDialog> {
+        self.store.get_local(&self.id).ok_or_else(|| {
             pyo3::exceptions::PyLookupError::new_err(format!(
                 "subscribe_state dialog '{}' not found",
                 self.id
@@ -561,8 +594,11 @@ impl PySubscribeHandle {
     /// Increment CSeq and return the updated dialog snapshot, or
     /// ``None`` if the dialog has disappeared.
     fn bump_cseq(&self) -> PyResult<Option<SubscribeDialog>> {
-        // Ensure L1 is hydrated (cross-replica case).
-        let _ = self.load_sync()?;
+        // Liveness check first, so a reaped dialog raises rather than silently
+        // no-opping. Stays synchronous: `update` must not be reordered against
+        // a sibling NOTIFY, so the CSeq it takes cannot be decided inside a
+        // future (RFC 6665 §4.4.1 — NOTIFY CSeq is monotonic per dialog).
+        let _ = self.load_local()?;
         let updated = self.store.update(&self.id, |dialog| {
             dialog.next_cseq();
         });
@@ -1474,7 +1510,7 @@ mod tests {
             let namespace = PySubscribeState::new(Arc::clone(&store));
             let request = incoming(python, "", 300);
             let handle = namespace.accept(&request, Some(300)).unwrap().unwrap();
-            let initial = handle.load_sync().unwrap();
+            let initial = handle.load_local().unwrap();
             assert_eq!(
                 initial.received_address.unwrap().to_string(),
                 "198.51.100.20:43210"
@@ -1492,7 +1528,7 @@ mod tests {
             let refresh = incoming(python, &format!(";tag={}", initial.local_tag), 600);
             let refreshed = namespace.accept(&refresh, Some(600)).unwrap().unwrap();
             assert_eq!(refreshed.id, handle.id);
-            let updated = refreshed.load_sync().unwrap();
+            let updated = refreshed.load_local().unwrap();
             assert_eq!(
                 (updated.cseq, updated.event_version, updated.expires_secs),
                 (7, 4, 600)
@@ -1525,12 +1561,198 @@ mod tests {
             let namespace = PySubscribeState::new(store);
             let request = incoming(python, "", 0);
             let handle = namespace.accept(&request, Some(0)).unwrap().unwrap();
-            assert_eq!(handle.load_sync().unwrap().expires_secs, 0);
+            assert_eq!(handle.load_local().unwrap().expires_secs, 0);
             assert!(request
                 .borrow_mut()
                 .take_reply_headers()
                 .iter()
                 .any(|(_, name, value)| name == "Expires" && value == "0"));
+        });
+    }
+
+    /// The regression guard for the driver-pinning bug, and it works precisely
+    /// because it is a plain `#[test]`: reading a property used to go through
+    /// `detach_block_on`, which needs an ambient tokio runtime and panics with
+    /// none in scope ("there is no reactor running"). So this test could not
+    /// have been written before, and it fails the moment a property starts
+    /// waiting on anything again.
+    ///
+    /// (Spelling the primitive's name here would trip the source-level guard in
+    /// `script::blocking`, which scans this whole directory for it.)
+    #[test]
+    fn handle_properties_read_without_a_tokio_runtime() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+
+            assert_eq!(handle.event().unwrap(), "message-summary");
+            assert_eq!(handle.expires().unwrap(), 300);
+            assert!(!handle.local_tag().unwrap().is_empty());
+            assert_eq!(handle.event_version().unwrap(), 0);
+            assert_eq!(handle.next_event_version().unwrap(), 1);
+            assert_eq!(handle.event_version().unwrap(), 1);
+
+            // Still a live read, not a snapshot taken at construction: a
+            // refresh landing on the store is visible through the same handle.
+            store.update(&handle.id, |dialog| dialog.refresh(600));
+            assert_eq!(handle.expires().unwrap(), 600);
+        });
+    }
+
+    /// Once the sweeper has reaped the dialog, every property raises
+    /// `LookupError` rather than reaching the cache for a copy the sweeper has
+    /// already sent the terminating NOTIFY for.
+    #[test]
+    fn handle_properties_raise_lookup_error_once_the_dialog_is_reaped() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+
+            store.update(&handle.id, |dialog| dialog.expires_secs = 0);
+            assert_eq!(store.take_stale().len(), 1);
+
+            for error in [
+                handle.event().unwrap_err(),
+                handle.expires().unwrap_err(),
+                handle.local_tag().unwrap_err(),
+                handle.event_version().unwrap_err(),
+                handle.next_event_version().unwrap_err(),
+            ] {
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyLookupError>(python),
+                    "a reaped dialog must raise LookupError, got {error}"
+                );
+                assert!(error.to_string().contains(&handle.id));
+            }
+            // `id` is the handle's own state and keeps answering, which is what
+            // lets a script log or re-`get()` the dialog it just lost.
+            assert!(!handle.id().is_empty());
+        });
+    }
+
+    /// `refresh` reads the dialog before it builds its coroutine, so it must
+    /// raise the same way — and, like the properties, without a runtime.
+    #[test]
+    fn refresh_raises_lookup_error_for_a_reaped_dialog() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+            store.update(&handle.id, |dialog| dialog.is_outbound = true);
+
+            // Live: the outbound check passes and it gets as far as needing a
+            // loop, which is the awaitable contract every 1.10 API has.
+            let error = handle.refresh(python, None, 2000).unwrap_err();
+            assert!(error.to_string().contains("await"), "got {error}");
+
+            store.remove(&handle.id);
+            let error = handle.refresh(python, None, 2000).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyLookupError>(python));
+        });
+    }
+
+    /// The L2-miss path: a dialog only the cache holds is invisible to the
+    /// properties — no implicit fetch, so nothing to block on — and the
+    /// documented recovery (`reload`, whose body is this `get`) restores them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_only_dialog_raises_until_reload_hydrates_it() {
+        Python::initialize();
+        let cache_name = "subscribe_dialogs";
+        let manager = Arc::new(crate::cache::CacheManager::new(&[
+            crate::config::NamedCacheConfig {
+                name: cache_name.to_string(),
+                // Unreachable on purpose: the local LRU alone stands in for
+                // the shared cache, the way `cache_tests.rs` does it.
+                url: "redis://127.0.0.1:1".to_string(),
+                local_ttl_secs: Some(60),
+                local_max_entries: Some(16),
+            },
+        ]));
+
+        // A dialog written by "another replica": it reaches the cache without
+        // ever passing through this process's local store.
+        let mut dialog = SubscribeDialog {
+            id: "cache-only".to_string(),
+            call_id: "c1".to_string(),
+            local_tag: "ltag".to_string(),
+            remote_tag: "rtag".to_string(),
+            local_uri: "sip:mailbox@example.com".to_string(),
+            remote_uri: "sip:201@example.com".to_string(),
+            remote_target: "sip:201@192.0.2.20:5061".to_string(),
+            received_address: None,
+            received_transport: None,
+            received_connection_id: None,
+            route_set: Vec::new(),
+            event: "message-summary".to_string(),
+            expires_secs: 900,
+            created_at_unix: now_unix(),
+            cseq: 4,
+            event_version: 2,
+            terminated: false,
+            is_outbound: false,
+        };
+        dialog.event_version = 2;
+        let json = serde_json::to_string(&dialog).expect("serialize dialog");
+        assert!(
+            manager
+                .store(cache_name, "subscribe_dialog:cache-only", &json, Some(900))
+                .await
+        );
+
+        let store = Arc::new(
+            SubscribeStore::new().with_cache(Arc::clone(&manager), cache_name.to_string()),
+        );
+        let handle = PySubscribeHandle {
+            store: Arc::clone(&store),
+            id: "cache-only".to_string(),
+        };
+
+        Python::attach(|python| {
+            let error = handle.event().unwrap_err();
+            assert!(
+                error.is_instance_of::<pyo3::exceptions::PyLookupError>(python),
+                "a cache-only dialog must not be fetched implicitly, got {error}"
+            );
+        });
+
+        // What `reload()` awaits.
+        assert!(store.get("cache-only").await.is_some());
+
+        Python::attach(|_| {
+            assert_eq!(handle.event().unwrap(), "message-summary");
+            assert_eq!(handle.event_version().unwrap(), 2);
+            assert!(handle.expires().unwrap() > 0);
+        });
+    }
+
+    /// `reload` is awaitable, so from a synchronous handler it raises the error
+    /// that names the fix rather than quietly returning a value.
+    #[test]
+    fn reload_without_a_running_loop_explains_the_await() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(store);
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+
+            let error = handle.reload(python).unwrap_err();
+            assert!(
+                error.to_string().contains("await") && error.to_string().contains("async def"),
+                "got {error}"
+            );
         });
     }
 
