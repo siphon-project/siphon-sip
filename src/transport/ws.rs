@@ -218,7 +218,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     }
 
     connection_map.remove(&connection_id);
-    stream_connections.unregister(&remote_addr, connection_id);
+    stream_connections.unregister(&remote_addr, transport_variant, connection_id);
     // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
     // any binding that arrived on this WS/WSS connection.  Best-effort.
     if let Some(close_tx) = &close_tx {
@@ -602,8 +602,7 @@ mod tests {
                         .await
                         .expect("the WebSocket upgrade must succeed");
                 tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while registry.get(&remote_addr) != Some((Transport::WebSocket, connection_id))
-                    {
+                    while registry.get(&remote_addr, Transport::WebSocket) != Some(connection_id) {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -623,8 +622,8 @@ mod tests {
             .expect("the old connection's task must not panic");
 
         assert_eq!(
-            registry.get(&remote_addr),
-            Some((Transport::WebSocket, ConnectionId(502))),
+            registry.get(&remote_addr, Transport::WebSocket),
+            Some(ConnectionId(502)),
             "the old connection's cleanup unregistered the live connection that replaced it"
         );
     }

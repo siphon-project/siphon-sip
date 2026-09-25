@@ -898,21 +898,31 @@ impl OutboundRouter {
 }
 
 /// Cross-transport registry of live stream connections, keyed by the peer's
-/// socket address.  Supersedes the former TLS-only `tls_addr_map`: TLS and
-/// WS/WSS listeners register their accepted (inbound) connections here, and
-/// the connection pool registers the outbound TLS connections it creates, so
-/// the relay path can reuse an existing connection instead of dialing a new
-/// one.  For WebSocket this is the *only* way to reach a UE — the connection
-/// is client-initiated and can never be re-opened by the server (RFC 7118 §5
-/// / RFC 5626 connection reuse).
+/// socket address *and* the transport.  Supersedes the former TLS-only
+/// `tls_addr_map`: the TCP, TLS and WS/WSS listeners register their accepted
+/// (inbound) connections here, and the connection pool registers the outbound
+/// TLS connections it creates, so the relay path can reuse an existing
+/// connection instead of dialing a new one.  For WebSocket this is the *only*
+/// way to reach a UE — the connection is client-initiated and can never be
+/// re-opened by the server (RFC 7118 §5 / RFC 5626 connection reuse).  The
+/// same holds for a TCP peer behind NAT or behind a connection-terminating
+/// front: the connection it opened is the only way back (RFC 5923 / RFC 5626
+/// §5.3), which is why inbound TCP registers here too.
 ///
-/// The value carries the [`Transport`] alongside the [`ConnectionId`] so
-/// consumers (relay reuse, NAT keepalive, registrant liveness, `Flow.is_alive`)
-/// can discriminate which kind of connection a given peer holds.  Cheap to
+/// Registering is not routing.  Every consumer asks for one transport by name
+/// (relay reuse, NAT keepalive, registrant liveness, `Flow.is_alive`, the
+/// `subscribe_state` received-flow send), and the plain-TCP URI relay never
+/// consults the registry at all — it goes through the outbound pool — so a TCP
+/// entry is only ever used when the signalling explicitly asked for the
+/// captured connection.
+///
+/// The key carries the [`Transport`] so a peer holding a TCP and a TLS (or WS)
+/// connection from the same source address keeps both: one transport's
+/// registration can never evict, or be handed out for, another's.  Cheap to
 /// clone — it is an `Arc` around the shared map.
 #[derive(Clone, Default)]
 pub struct StreamConnections {
-    map: Arc<DashMap<SocketAddr, (Transport, ConnectionId)>>,
+    map: Arc<DashMap<(SocketAddr, Transport), ConnectionId>>,
 }
 
 impl StreamConnections {
@@ -922,31 +932,34 @@ impl StreamConnections {
         }
     }
 
-    /// Register (or overwrite) the live connection for `peer`.  Called by the
-    /// stream listeners on accept and by the pool when it opens an outbound
-    /// connection.
+    /// Register (or overwrite) the live `transport` connection for `peer`.
+    /// Called by the stream listeners on accept and by the pool when it opens
+    /// an outbound connection.
     pub fn register(&self, peer: SocketAddr, transport: Transport, connection_id: ConnectionId) {
-        self.map.insert(peer, (transport, connection_id));
+        self.map.insert((peer, transport), connection_id);
     }
 
-    /// Remove `peer`'s registration, but only while it is still `connection_id`
-    /// (the connection closed or errored).
+    /// Remove `peer`'s `transport` registration, but only while it is still
+    /// `connection_id` (the connection closed or errored).
     ///
-    /// A peer address can have two live connections at once, and the later one
-    /// takes the registration over: a pooled connection replaced while the old
-    /// one is still open, a UE that reconnects before its old connection is torn
-    /// down, or a trunk that sends from its listening port, which puts its
-    /// inbound connection and siphon's outbound one to it on the same address.
-    /// Removing by address alone let the older connection's cleanup drop the
-    /// survivor's registration.
-    pub fn unregister(&self, peer: &SocketAddr, connection_id: ConnectionId) {
-        self.map
-            .remove_if(peer, |_, (_, registered)| *registered == connection_id);
+    /// A peer address can have two live connections of one transport at once,
+    /// and the later one takes the registration over: a pooled connection
+    /// replaced while the old one is still open, a UE that reconnects before
+    /// its old connection is torn down, or a trunk that sends from its
+    /// listening port, which puts its inbound connection and siphon's outbound
+    /// one to it on the same address.  Removing by address alone let the older
+    /// connection's cleanup drop the survivor's registration.
+    pub fn unregister(&self, peer: &SocketAddr, transport: Transport, connection_id: ConnectionId) {
+        self.map.remove_if(&(*peer, transport), |_, registered| {
+            *registered == connection_id
+        });
     }
 
-    /// Exact-match lookup of the connection for `peer`, if any.
-    pub fn get(&self, peer: &SocketAddr) -> Option<(Transport, ConnectionId)> {
-        self.map.get(peer).map(|entry| *entry.value())
+    /// Exact-match lookup of the `transport` connection for `peer`, if any.
+    pub fn get(&self, peer: &SocketAddr, transport: Transport) -> Option<ConnectionId> {
+        self.map
+            .get(&(*peer, transport))
+            .map(|entry| *entry.value())
     }
 
     /// Find a reusable `connection_id` to `destination` on `transport` —
@@ -955,21 +968,19 @@ impl StreamConnections {
     /// Both steps are filtered by `transport` so a WS connection is never
     /// returned for a TLS relay (and vice versa).
     pub fn reuse(&self, destination: SocketAddr, transport: Transport) -> Option<ConnectionId> {
-        if let Some(entry) = self.map.get(&destination) {
-            if entry.value().0 == transport {
-                return Some(entry.value().1);
-            }
+        if let Some(connection_id) = self.get(&destination, transport) {
+            return Some(connection_id);
         }
         self.map
             .iter()
-            .find(|entry| entry.key().ip() == destination.ip() && entry.value().0 == transport)
-            .map(|entry| entry.value().1)
+            .find(|entry| entry.key().0.ip() == destination.ip() && entry.key().1 == transport)
+            .map(|entry| *entry.value())
     }
 
     /// Whether *any* connection from `ip` is currently registered (IP-only,
     /// transport-agnostic).  Diagnostic helper.
     pub fn has_ip(&self, ip: IpAddr) -> bool {
-        self.map.iter().any(|entry| entry.key().ip() == ip)
+        self.map.iter().any(|entry| entry.key().0.ip() == ip)
     }
 
     /// Whether any `transport` connection from `ip` is currently registered.
@@ -981,7 +992,7 @@ impl StreamConnections {
     pub fn has_ip_transport(&self, ip: IpAddr, transport: Transport) -> bool {
         self.map
             .iter()
-            .any(|entry| entry.key().ip() == ip && entry.value().0 == transport)
+            .any(|entry| entry.key().0.ip() == ip && entry.key().1 == transport)
     }
 
     /// True only when the exact `(peer, transport, connection_id)` triple is
@@ -994,10 +1005,7 @@ impl StreamConnections {
         transport: Transport,
         connection_id: ConnectionId,
     ) -> bool {
-        self.map
-            .get(&peer)
-            .map(|entry| *entry.value() == (transport, connection_id))
-            .unwrap_or(false)
+        self.get(&peer, transport) == Some(connection_id)
     }
 
     /// Number of registered connections (diagnostics / metrics).
@@ -1015,7 +1023,7 @@ impl StreamConnections {
     pub fn entries(&self) -> Vec<(SocketAddr, Transport, ConnectionId)> {
         self.map
             .iter()
-            .map(|entry| (*entry.key(), entry.value().0, entry.value().1))
+            .map(|entry| (entry.key().0, entry.key().1, *entry.value()))
             .collect()
     }
 }
@@ -1396,10 +1404,14 @@ mod tests {
         registry.register(peer, Transport::WebSocketSecure, ConnectionId(7));
         assert_eq!(registry.len(), 1);
         assert_eq!(
-            registry.get(&peer),
-            Some((Transport::WebSocketSecure, ConnectionId(7)))
+            registry.get(&peer, Transport::WebSocketSecure),
+            Some(ConnectionId(7))
         );
-        assert_eq!(registry.get(&addr("10.0.0.2:50000")), None);
+        assert_eq!(registry.get(&peer, Transport::WebSocket), None);
+        assert_eq!(
+            registry.get(&addr("10.0.0.2:50000"), Transport::WebSocketSecure),
+            None
+        );
     }
 
     #[test]
@@ -1441,6 +1453,34 @@ mod tests {
         );
     }
 
+    /// A peer can hold a plaintext TCP and a TLS connection from the same
+    /// source address at once (a trunk that binds its listening port for every
+    /// connection it opens). Registering one must not evict the other, or TLS
+    /// reuse to that peer silently falls back to dialing a fresh connection
+    /// the moment it also connects over TCP.
+    #[test]
+    fn stream_connections_keep_one_entry_per_transport_for_a_shared_address() {
+        let registry = StreamConnections::new();
+        let peer = addr("192.0.2.20:5060");
+        registry.register(peer, Transport::Tls, ConnectionId(21));
+        registry.register(peer, Transport::Tcp, ConnectionId(22));
+
+        assert_eq!(registry.reuse(peer, Transport::Tls), Some(ConnectionId(21)));
+        assert_eq!(registry.reuse(peer, Transport::Tcp), Some(ConnectionId(22)));
+        assert!(registry.is_alive(peer, Transport::Tls, ConnectionId(21)));
+        assert!(registry.is_alive(peer, Transport::Tcp, ConnectionId(22)));
+        assert_eq!(registry.len(), 2);
+
+        // Neither transport's cleanup touches the other's entry.
+        registry.unregister(&peer, Transport::Tcp, ConnectionId(21));
+        assert_eq!(registry.reuse(peer, Transport::Tls), Some(ConnectionId(21)));
+        registry.unregister(&peer, Transport::Tcp, ConnectionId(22));
+        assert_eq!(registry.reuse(peer, Transport::Tcp), None);
+        assert_eq!(registry.reuse(peer, Transport::Tls), Some(ConnectionId(21)));
+        registry.unregister(&peer, Transport::Tls, ConnectionId(21));
+        assert!(registry.is_empty());
+    }
+
     #[test]
     fn stream_connections_is_alive_tracks_exact_triple() {
         let registry = StreamConnections::new();
@@ -1455,7 +1495,7 @@ mod tests {
         assert!(!registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(11)));
         assert!(registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(12)));
         // Unregistered → dead.
-        registry.unregister(&peer, ConnectionId(12));
+        registry.unregister(&peer, Transport::WebSocketSecure, ConnectionId(12));
         assert!(!registry.is_alive(peer, Transport::WebSocketSecure, ConnectionId(12)));
     }
 
@@ -1493,9 +1533,9 @@ mod tests {
         let registry = StreamConnections::new();
         let peer = addr("10.0.0.1:50000");
         registry.register(peer, Transport::Tls, ConnectionId(5));
-        registry.unregister(&peer, ConnectionId(5));
+        registry.unregister(&peer, Transport::Tls, ConnectionId(5));
         assert!(registry.is_empty());
-        assert_eq!(registry.get(&peer), None);
+        assert_eq!(registry.get(&peer, Transport::Tls), None);
     }
 
     /// A connection that has been replaced unregisters nothing: the entry
@@ -1507,11 +1547,11 @@ mod tests {
         registry.register(peer, Transport::Tls, ConnectionId(5));
         registry.register(peer, Transport::Tls, ConnectionId(6));
 
-        registry.unregister(&peer, ConnectionId(5));
-        assert_eq!(registry.get(&peer), Some((Transport::Tls, ConnectionId(6))));
+        registry.unregister(&peer, Transport::Tls, ConnectionId(5));
+        assert_eq!(registry.get(&peer, Transport::Tls), Some(ConnectionId(6)));
         assert!(registry.is_alive(peer, Transport::Tls, ConnectionId(6)));
 
-        registry.unregister(&peer, ConnectionId(6));
+        registry.unregister(&peer, Transport::Tls, ConnectionId(6));
         assert!(registry.is_empty());
     }
 
@@ -1532,8 +1572,8 @@ mod tests {
         }
         assert_eq!(registry.len(), 16);
         assert_eq!(
-            registry.get(&addr("10.0.0.5:50000")),
-            Some((Transport::WebSocket, ConnectionId(4))),
+            registry.get(&addr("10.0.0.5:50000"), Transport::WebSocket),
+            Some(ConnectionId(4)),
         );
     }
 

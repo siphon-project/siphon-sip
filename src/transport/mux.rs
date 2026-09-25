@@ -371,9 +371,11 @@ async fn dispatch<S>(
                 prefix,
                 inbound_tx,
                 sip_connection_map,
-                // TCP reaches peers through the outbound pool; the secure and
-                // WebSocket transports route back over the inbound flow.
-                (sip_transport == Transport::Tls).then_some(stream_connections),
+                // Registered under its own transport (TCP or TLS) for the
+                // connection's lifetime, exactly as the dedicated listeners do,
+                // so a flow-routed send can reach a peer over the connection it
+                // opened. The plain URI relay still dials TCP through the pool.
+                Some(stream_connections),
                 crlf_pong_tracker,
                 close_tx,
             )
@@ -431,6 +433,7 @@ mod tests {
         inbound_rx: flume::Receiver<InboundMessage>,
         sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
         websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+        registry: StreamConnections,
     }
 
     /// Start a mux listener on a port the kernel picks.
@@ -443,6 +446,7 @@ mod tests {
         let websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
+        let registry = StreamConnections::new();
         let addr = listen(
             "127.0.0.1:0".parse().unwrap(),
             tls_config,
@@ -454,7 +458,7 @@ mod tests {
             },
             inbound_tx,
             Arc::new(TransportAcl::new(vec![], vec![])),
-            StreamConnections::new(),
+            registry.clone(),
             None,
             None,
             None,
@@ -470,6 +474,7 @@ mod tests {
             inbound_rx,
             sip_connection_map,
             websocket_connection_map,
+            registry,
         }
     }
 
@@ -564,6 +569,34 @@ mod tests {
             Message::Text(text) => assert_eq!(text.as_str(), "SIP/2.0 200 OK\r\n\r\n"),
             other => panic!("expected a text frame, got {other:?}"),
         }
+    }
+
+    /// Raw SIP on the TCP+WS mux is registered for flow reuse under TCP, the
+    /// same as on the dedicated TCP listener, and evicted when it closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_ws_mux_registers_raw_sip_as_a_tcp_flow_until_it_closes() {
+        let harness = spawn_mux(None).await;
+        let mut client = tokio::net::TcpStream::connect(harness.addr).await.unwrap();
+        let peer = client.local_addr().unwrap();
+        client.write_all(REGISTER.as_bytes()).await.unwrap();
+        let message = next_inbound(&harness).await;
+        assert_eq!(message.transport, Transport::Tcp);
+        assert_eq!(
+            harness.registry.get(&peer, Transport::Tcp),
+            Some(message.connection_id),
+            "raw SIP on the mux must be registered as a TCP flow"
+        );
+        assert_eq!(harness.registry.reuse(peer, Transport::Tls), None);
+        assert_eq!(harness.registry.reuse(peer, Transport::WebSocket), None);
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while harness.registry.get(&peer, Transport::Tcp).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the TCP flow must be evicted when the connection closes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

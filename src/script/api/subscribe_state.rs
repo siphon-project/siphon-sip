@@ -905,14 +905,12 @@ async fn send_notify(
         // Exact match only: IP-only reuse can select another subscriber's
         // connection when several phones share one front proxy.
         let connection_id = super::stream_connections()
-            .and_then(|registry| registry.get(&destination))
-            .filter(|(registered_transport, _)| *registered_transport == transport)
-            .filter(|(_, connection_id)| {
+            .and_then(|registry| registry.get(&destination, transport))
+            .filter(|connection_id| {
                 dialog
                     .received_connection_id
                     .map_or(true, |expected| connection_id.0 == expected)
             })
-            .map(|(_, connection_id)| connection_id)
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "SUBSCRIBE transport flow is no longer connected",

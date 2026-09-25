@@ -236,6 +236,20 @@ entry, but a working config keeps working.
   given in brackets was double-wrapped (`<<...>>`) by `originate`. Both now
   render `<sip:...>` whichever spelling came in, entry by entry for a
   `sip:` + `tel:` pair (RFC 3325 §9.1).
+- **An inbound TCP connection could not be reached back over.** The plaintext
+  TCP listener (and the SIP half of the TCP+WS mux) left accepted connections
+  out of the stream-connection registry, so for a peer that is reachable only
+  over the connection it opened (behind NAT, or behind a front that terminates
+  the connection; RFC 5923, RFC 5626 §5.3) `Flow.is_alive` always read `False`
+  and a `subscribe_state` NOTIFY on the received flow failed with "transport
+  flow is no longer connected". Inbound TCP connections are now registered for
+  their lifetime and evicted on close, as TLS and WS already were. Reuse stays
+  opt-in: a request relayed to a URI over TCP still dials through the outbound
+  pool, so a TCP trunk that does not route over its flow is unaffected. The
+  registry is now keyed by address and transport, so a peer holding a TCP and a
+  TLS connection from one source address keeps both and neither is handed out
+  for the other. Rust API: `StreamConnections::get` and `unregister` take the
+  transport, and `transport::tcp::listen` takes the registry.
 
 ### Added
 
