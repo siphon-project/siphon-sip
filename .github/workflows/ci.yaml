@@ -2666,6 +2666,26 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: [self-hosted, linux, x64, ipsec]
     needs: rust-tests
+    # One at a time across the whole repository. This is the only compose job on
+    # a *persistent* runner: the other 25 get an ephemeral `ubuntu-latest` with
+    # their own Docker daemon and cannot collide. Here every run shares one
+    # daemon, one compose project, and the fixed `container_name:` values in
+    # sipp/docker-compose.yaml, so a second run's "Reset stale test containers"
+    # step (`down -v --remove-orphans`) destroys the first run's containers
+    # mid-flight. That is what took this job red across v1.10.0: three pushes to
+    # main inside three minutes, and the overlapping jobs tore each other down —
+    # once as `siphon-scscf-test exited (0)` with no logs, once as `No such
+    # container` between create and start. Neither was a fault in siphon.
+    #
+    # `cancel-in-progress: false` queues rather than discards: this job is a real
+    # gate, so every commit to main has to run it, not just the newest. It never
+    # runs on a PR, so serialising costs no review latency.
+    #
+    # Per-run `COMPOSE_PROJECT_NAME` would not fix this — `container_name:` is
+    # absolute and ignores the project prefix, and there are 87 of them.
+    concurrency:
+      group: sipp-ipsec-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
