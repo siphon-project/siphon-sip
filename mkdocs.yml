@@ -92,6 +92,7 @@ nav:
       - Supply chain & SBOM: supply-chain.md
       - Migrating from Kamailio / OpenSIPS: migrating-from-kamailio-opensips.md
       - Migrating to 1.10 (awaitable APIs): migrating-to-1.10.md
+      - Migrating to 1.11: migrating-to-1.11.md
   - Extensions:
       - Overview: extensions.md
       - SMPP addon docs ↗: https://smpp.siphon-sip.org/

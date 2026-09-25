@@ -18,7 +18,6 @@ use crate::subscribe_state::{SubscribeDialog, SubscribeStore};
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
-use super::reply::PyReply;
 use super::request::PyRequest;
 
 static UAC_SENDER: OnceLock<Arc<UacSender>> = OnceLock::new();
@@ -544,21 +543,6 @@ impl PySubscribeHandle {
             });
             Ok(true)
         })
-    }
-
-    /// Send a final NOTIFY using an already-built
-    /// ``Subscription-State`` value built elsewhere (advanced).
-    ///
-    /// Wraps :meth:`notify` but without the automatic
-    /// ``active;expires=...`` default.
-    #[pyo3(signature = (reply))]
-    #[allow(dead_code)]
-    fn mirror_reply(&self, reply: &Bound<'_, PyReply>) -> PyResult<bool> {
-        // Kept as a placeholder for a later convenience that builds a
-        // NOTIFY body from an existing :class:`Reply`.  For now just
-        // no-ops so the attribute exists; scripts should use notify().
-        let _ = reply;
-        Ok(false)
     }
 }
 

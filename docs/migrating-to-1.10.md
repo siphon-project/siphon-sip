@@ -51,7 +51,7 @@ state only, so no property can wait on anything; nothing to `await`, nothing to
 rewrite. The one behaviour that changed with it is narrow: a property on a
 dialog whose local entry has since been reaped now raises `LookupError` instead
 of fetching a copy the shared cache may still hold. `await handle.reload()` is
-the explicit re-read if you want it. See the 1.11.0 changelog entry.
+the explicit re-read if you want it. See [Migrating to 1.11](migrating-to-1.11.md).
 
 ## Migrating
 
