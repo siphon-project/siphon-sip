@@ -77,6 +77,16 @@ pub fn b_leg_failed(
     };
     cancel_settled_branches(call_id, &settlement.cancelled, state);
     match settlement.failure {
+        None if settlement.already_settled => {
+            // Its branch already had its final response: a retransmission, owed
+            // the ACK and nothing else (RFC 3261 §17.1.1.2).
+            ack_b_leg_non2xx(branch, message, state, snapshot);
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                "B2BUA: absorbing a final response on a branch already settled"
+            );
+        }
         None => {
             ack_b_leg_non2xx(branch, message, state, snapshot);
             debug!(

@@ -1102,6 +1102,91 @@ fn the_last_branch_settles_the_fork_with_the_best_response() {
     );
 }
 
+/// The failure this exists for: the callee's final response arriving twice (its
+/// retransmission, or a duplicate datagram), the second copy handled before the
+/// first has ended the call. The first copy hands the fork's failure over; the
+/// second found the branch failed, recorded it again as the fork's best, and
+/// settled the call a second time, so `@b2bua.on_failure` ran twice and the
+/// caller got two final responses. A branch has one final response.
+#[test]
+fn a_retransmitted_final_response_does_not_settle_the_fork_again() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+    assert!(call
+        .record_branch_failure(0, 486, &branch_failure(486, "busy"))
+        .failure
+        .is_none());
+    let first = call.record_branch_failure(1, 302, &branch_failure(302, "moved"));
+    assert_eq!(first.failure.map(|best| best.status_code), Some(302));
+    assert!(!first.already_settled);
+
+    let again = call.record_branch_failure(1, 302, &branch_failure(302, "moved"));
+
+    assert!(
+        again.failure.is_none(),
+        "the fork was settled by the first copy"
+    );
+    assert!(again.already_settled, "the copy is only owed its ACK");
+    assert!(
+        call.fork_best_failure.is_none(),
+        "a straggler is not held as the failure of a later routing"
+    );
+    let busy = call.record_branch_failure(0, 486, &branch_failure(486, "busy"));
+    assert!(busy.already_settled && busy.failure.is_none());
+}
+
+/// A 6xx settles the fork at once; the same 6xx again, or the 487 a CANCELled
+/// sibling draws, settles nothing more.
+#[test]
+fn a_6xx_settles_the_fork_once() {
+    let mut call = CallActor::new(make_a_leg());
+    call.add_b_leg(make_sent_b_leg(0));
+    call.add_b_leg(make_sent_b_leg(1));
+
+    let declined = call.record_branch_failure(0, 603, &branch_failure(603, "decline"));
+    assert_eq!(declined.failure.map(|best| best.status_code), Some(603));
+
+    let again = call.record_branch_failure(0, 603, &branch_failure(603, "decline"));
+    assert!(again.already_settled && again.failure.is_none());
+    let cancelled = call.record_branch_failure(1, 487, &branch_failure(487, "gone"));
+    assert!(cancelled.already_settled && cancelled.failure.is_none());
+    assert_eq!(call.b_leg_status[1], BLegStatus::Cancelled);
+}
+
+/// `@b2bua.on_failure` concludes a call once: a second path reaching the same
+/// failed call (the ring timeout, a straggler) is refused while the first one
+/// runs, and a call routed again may fail, and be concluded, again.
+#[test]
+fn a_failed_call_is_concluded_once_until_it_is_routed_again() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+
+    assert_eq!(
+        store.claim_failure_conclusion(&call_id),
+        FailureConclusion::Claimed { reroutes: 0 }
+    );
+    assert!(store.is_failure_concluding(&call_id));
+    assert_eq!(
+        store.claim_failure_conclusion(&call_id),
+        FailureConclusion::AlreadyConcluding
+    );
+
+    store.begin_failure_reroute(&call_id, true);
+    assert!(!store.is_failure_concluding(&call_id));
+    assert_eq!(
+        store.claim_failure_conclusion(&call_id),
+        FailureConclusion::Claimed { reroutes: 1 }
+    );
+    store.release_failure_conclusion(&call_id);
+    assert!(!store.is_failure_concluding(&call_id));
+
+    assert_eq!(
+        store.claim_failure_conclusion("no-such-call"),
+        FailureConclusion::Gone
+    );
+}
+
 /// A 6xx means no branch will do (RFC 3261 §16.7), so the fork settles on it at
 /// once and the branches still ringing are cancelled rather than waited for.
 #[test]

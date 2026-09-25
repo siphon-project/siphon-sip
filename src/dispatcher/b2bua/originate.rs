@@ -854,6 +854,19 @@ pub fn handle_originated_call_response(
         state,
     );
 
+    // A copy of the rejection handled while the first is still concluding the
+    // call (its @b2bua.on_failure runs without the lock) is owed the ACK above
+    // and nothing more.
+    if state.call_actors.claim_failure_conclusion(internal_call_id)
+        == crate::b2bua::actor::FailureConclusion::AlreadyConcluding
+    {
+        debug!(
+            call_id = %internal_call_id,
+            status = status_code,
+            "originate: absorbing a retransmitted rejection"
+        );
+        return;
+    }
     warn!(
         call_id = %internal_call_id,
         %sip_call_id,

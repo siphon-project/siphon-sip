@@ -497,6 +497,16 @@ pub struct CallActor {
     /// a handler that keeps re-dialling a target that keeps failing cannot hold
     /// the call, or the thread, forever.
     pub failure_reroutes: u32,
+    /// True from the moment a failure starts concluding the call (running
+    /// `@b2bua.on_failure`) until the call is routed again. Claimed under the
+    /// per-call lock, so a second path reaching the same failure (the ring
+    /// timeout, a straggler response) is refused instead of concluding it twice.
+    pub failure_concluding: bool,
+    /// True once the caller's CANCEL has been taken on (RFC 3261 §9.2). Claimed
+    /// under the per-call lock with the unanswered-call check, so a CANCEL
+    /// retransmitted while the first one's `@b2bua.on_cancel` runs is answered
+    /// `200` and nothing more.
+    pub cancel_claimed: bool,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -589,6 +599,8 @@ impl CallActor {
             fork_dispatching: false,
             fork_best_failure: None,
             failure_reroutes: 0,
+            failure_concluding: false,
+            cancel_claimed: false,
         }
     }
 
@@ -1151,6 +1163,18 @@ impl CallActor {
         status_code: u16,
         response: &SipMessage,
     ) -> BranchSettlement {
+        // A branch has one final response. Another on a branch already settled,
+        // the callee's retransmission or a duplicate datagram, possibly handled
+        // on another worker while the first copy is still concluding the call,
+        // is owed its ACK and nothing else (RFC 3261 §17.1.1.2). Recording it
+        // again put its failure back in the fork after the first copy had
+        // handed it over, and settled the call a second time.
+        if !self.is_pending_branch(index) {
+            return BranchSettlement {
+                already_settled: true,
+                ..BranchSettlement::default()
+            };
+        }
         if let Some(status) = self.b_leg_status.get_mut(index) {
             *status = BLegStatus::Failed(status_code);
         }
@@ -1185,7 +1209,7 @@ impl CallActor {
         if self.state == CallState::Answered {
             return BranchSettlement {
                 cancelled: self.cancel_pending_branches(self.winner),
-                failure: None,
+                ..BranchSettlement::default()
             };
         }
         self.settle_fork()
@@ -1220,7 +1244,11 @@ impl CallActor {
         } else {
             self.fork_best_failure.take()
         };
-        BranchSettlement { cancelled, failure }
+        BranchSettlement {
+            cancelled,
+            failure,
+            already_settled: false,
+        }
     }
 
     /// On the ring timeout: the failure this fork already holds, when it beats
@@ -1241,6 +1269,7 @@ impl CallActor {
         Some(BranchSettlement {
             cancelled: self.cancel_pending_branches(None),
             failure: self.fork_best_failure.take(),
+            already_settled: false,
         })
     }
 
@@ -1256,6 +1285,7 @@ impl CallActor {
     /// retransmission from one still finds its call.
     pub fn begin_failure_reroute(&mut self, replaces_route_sequence: bool) {
         self.failure_reroutes = self.failure_reroutes.saturating_add(1);
+        self.failure_concluding = false;
         self.fork_best_failure = None;
         self.answer_deadline = None;
         if replaces_route_sequence {
@@ -1375,6 +1405,10 @@ pub struct BranchSettlement {
     /// all of them, which the A-leg is sent. `None` while the call can still be
     /// answered, or when it already has been.
     pub failure: Option<BranchFailure>,
+    /// The response was for a branch that had already ended (a retransmitted
+    /// final, or the 487 of a branch siphon CANCELled): it settles nothing and
+    /// is owed only its ACK.
+    pub already_settled: bool,
 }
 
 /// Outcome of an atomic answer claim ([`CallActorStore::try_win`]).

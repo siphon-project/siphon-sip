@@ -18,6 +18,7 @@ use super::*;
 
 mod dial_branch;
 mod failure;
+pub use failure::FailureConclusion;
 mod fork;
 mod route_progress;
 mod session_timer;
