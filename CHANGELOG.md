@@ -24,43 +24,6 @@ entry, but a working config keeps working.
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.
-### Removed
-
-- **BREAKING: `SubscribeHandle.mirror_reply()`.** It took a `Reply`, discarded
-  it, and returned `False`. No NOTIFY, no state change, nothing — a placeholder
-  for a convenience that was never built, sitting on the scripting surface
-  reading as a capability. Removed rather than implemented: `notify()` already
-  does the job, and the automatic `active;expires=…` default that `mirror_reply`
-  existed to bypass is bypassed by passing `state=` explicitly.
-
-  **Nothing can have depended on its behaviour** — every call got `False` and no
-  side effect. But the *call* now raises `AttributeError`, which in a handler is
-  a hard runtime failure, not a silent one. So grep your scripts for it. The
-  replacement is the awaited `notify()`:
-
-  ```python
-  # before — did nothing, returned False
-  handle.mirror_reply(reply)
-
-  # after
-  await handle.notify(body=body, content_type="application/reginfo+xml")
-  # or, to set Subscription-State yourself instead of the active;expires= default
-  await handle.notify(body=body, content_type=ct, state="pending")
-  ```
-
-  Permissible here because the Python scripting API may break on a minor release
-  (see the versioning policy above); it would not have been on a patch.
-
-### Added
-
-- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
-  the configured `subscribe_state.cache`, refreshing this instance's view of it,
-  and returns whether a live dialog is in hand afterwards. It is the explicit,
-  awaited counterpart to the implicit cache read the properties no longer make
-  (below) — for a dialog another replica owns whose local entry has since been
-  reaped.
-
-### Fixed
 
 - **A `SubscribeHandle` property can no longer block its asyncio driver.** The
   1.10.0 "every blocking script API is awaitable" work left these as a
@@ -80,6 +43,15 @@ entry, but a working config keeps working.
   `refresh` and `next_event_version` before they handed back their coroutine, so
   those four could pin a driver too despite being awaitable. All five paths are
   fixed together.
+
+### Added
+
+- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
+  the configured `subscribe_state.cache`, refreshing this instance's view of it,
+  and returns whether a live dialog is in hand afterwards. It is the explicit,
+  awaited counterpart to the implicit cache read the properties no longer make
+  (below) — for a dialog another replica owns whose local entry has since been
+  reaped.
 
 ### Changed
 
