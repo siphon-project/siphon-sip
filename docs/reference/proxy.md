@@ -41,8 +41,8 @@ authenticating the subscriber and authorizing the event package and resource.
 It sends the 200 response with the dialog's To-tag and negotiated Expires. An
 unknown in-dialog request receives 481 and returns `None`. Refresh returns the
 same handle without resetting NOTIFY CSeq or event-body version. Immediately
-call `handle.notify(body=..., content_type=...)`; for Expires zero, call
-`handle.terminate(reason="deactivated", body=..., content_type=...)` instead.
+`await handle.notify(body=..., content_type=...)`; for Expires zero,
+`await handle.terminate(reason="deactivated", body=..., content_type=...)` instead.
 The notifier tag is available as `handle.local_tag`. Expiry sends a terminating
 NOTIFY automatically; scripts still own package content and change notifications.
 
@@ -56,5 +56,14 @@ Subscriptions with Record-Route follow their established route set.
 ## `SubscribeHandle`
 
 A single subscription dialog returned by `proxy.subscribe_state.create(...)`.
+
+Its properties read this instance's own dialog state, so none of them can wait
+on the network — which is what makes them safe to touch from an `async def`
+handler, where blocking would stop every other coroutine on that asyncio driver.
+They are still live reads, not a snapshot: a SUBSCRIBE refresh landing on the
+store shows up through a handle built before it. Once the dialog is gone
+(terminated, or reaped on expiry) they raise `LookupError` rather than answering
+stale, and `await handle.reload()` is the explicit re-read through the L2 cache
+for the cross-replica case.
 
 ::: siphon_sdk.mock_module.MockSubscribeHandle

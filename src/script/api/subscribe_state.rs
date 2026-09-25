@@ -1572,9 +1572,13 @@ mod tests {
 
     /// The regression guard for the driver-pinning bug, and it works precisely
     /// because it is a plain `#[test]`: reading a property used to go through
-    /// `detach_block_on`, whose `block_in_place` + `Handle::current()` panics
-    /// with no tokio runtime in scope. So this test could not have been written
-    /// before, and it fails the moment a property starts waiting on anything.
+    /// `detach_block_on`, which needs an ambient tokio runtime and panics with
+    /// none in scope ("there is no reactor running"). So this test could not
+    /// have been written before, and it fails the moment a property starts
+    /// waiting on anything again.
+    ///
+    /// (Spelling the primitive's name here would trip the source-level guard in
+    /// `script::blocking`, which scans this whole directory for it.)
     #[test]
     fn handle_properties_read_without_a_tokio_runtime() {
         Python::initialize();

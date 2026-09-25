@@ -24,6 +24,45 @@ entry, but a working config keeps working.
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.
+### Added
+
+- **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
+  the configured `subscribe_state.cache`, refreshing this instance's view of it,
+  and returns whether a live dialog is in hand afterwards. It is the explicit,
+  awaited counterpart to the implicit cache read the properties no longer make
+  (below) — for a dialog another replica owns whose local entry has since been
+  reaped.
+
+### Fixed
+
+- **A `SubscribeHandle` property can no longer block its asyncio driver.** The
+  1.10.0 "every blocking script API is awaitable" work left these as a
+  documented exception, on the reasoning that a Python property cannot be
+  awaited and so could only be fixed by turning it into a method — a wider break
+  than that release was taking. It did not need either: the loader behind the
+  properties went through the store's `async get`, which falls back to the L2
+  cache, and it is unreachable for a handle. Every call that hands a script a
+  handle has already put the dialog in the local store — `accept`/`create`/`send`
+  write it, `find` scans it, and the already-awaitable `get` hydrates it from the
+  cache *before* building the handle — and a handle is a Python object, so it
+  cannot arrive from another process. The loader now reads local state only: no
+  network, nothing to await, and the properties keep their shape and stay live
+  reads rather than becoming a snapshot.
+
+  The same loader ran, synchronously, in the prologue of `notify`, `terminate`,
+  `refresh` and `next_event_version` before they handed back their coroutine, so
+  those four could pin a driver too despite being awaitable. All five paths are
+  fixed together.
+
+### Changed
+
+- **A `SubscribeHandle` whose dialog has been reaped raises `LookupError`
+  instead of being revived from the L2 cache.** The narrow behaviour change that
+  comes with the fix above: the sweeper drops an expired or terminated dialog
+  from the local store but leaves the cache key to age out on its own TTL, and
+  reading it back resurrects a dialog the sweeper has already sent the
+  terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
+  ask for it with `await handle.reload()`.
 
 ## [1.10.0] — 2026-09-24
 
