@@ -387,7 +387,7 @@ pub fn send_uas_response(
     // a Contact naming the wrong port strands every in-dialog request.
     if code > 100 {
         let host = state.a_leg_advertised_host(local_addr, &transport);
-        let port = a_leg_advertised_port(local_addr, state.via_port(&transport));
+        let port = state.a_leg_advertised_port(local_addr, &transport);
         response.headers.set(
             "Contact",
             format!(

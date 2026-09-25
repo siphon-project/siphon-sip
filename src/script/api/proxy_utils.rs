@@ -478,13 +478,13 @@ impl PyProxyUtils {
                 }
             };
 
-            // Via sent-by = our advertised host (FQDN-aware) + listen port, so
+            // Via sent-by = our advertised host (FQDN-aware) + advertised port, so
             // the peer's response comes back to us rather than the resolved
             // destination.
             let local_sent_by = format!(
                 "{}:{}",
                 uac.via_host_for(&transport),
-                uac.addr_for(&transport).port(),
+                uac.via_port_for(&transport),
             );
             let (message, branch) = inputs
                 .build(uri, transport, &local_sent_by)

@@ -268,7 +268,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         } else {
             (
                 state.a_leg_advertised_host(target_local_addr, &transport),
-                a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+                state.a_leg_advertised_port(target_local_addr, &transport),
             )
         };
         let via_value = format!(

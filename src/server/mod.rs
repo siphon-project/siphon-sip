@@ -1356,13 +1356,19 @@ impl SiphonServer {
         let mut listen_addrs = std::collections::HashMap::new();
         let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> =
             std::collections::HashMap::new();
+        // The advertised port paired with each `advertised_addrs` host, for the
+        // transports whose advertising listener names one (`advertise:
+        // "host:port"`). Filled by `record_advertised` alongside the host so the
+        // two always come from the same listener.
+        let mut advertised_ports: std::collections::HashMap<transport::Transport, u16> =
+            std::collections::HashMap::new();
         // Every configured listener (transport + bound addr + advertised host),
         // for `send_socket=` egress resolution.  Unlike `listen_addrs` (first
         // per transport), this keeps the FULL multi-homed set across transports.
         let mut listener_registry_entries: Vec<(
             transport::Transport,
             std::net::SocketAddr,
-            Option<String>,
+            Option<config::AdvertisedAddress>,
         )> = Vec::new();
 
         // DSCP → TOS byte resolution helper.
@@ -1398,15 +1404,16 @@ impl SiphonServer {
             listen_addrs
                 .entry(transport::Transport::Udp)
                 .or_insert(addr);
-            if let Some(adv) = entry.advertise() {
-                advertised_addrs
-                    .entry(transport::Transport::Udp)
-                    .or_insert_with(|| adv.to_string());
-            }
+            record_advertised(
+                &mut advertised_addrs,
+                &mut advertised_ports,
+                transport::Transport::Udp,
+                entry.advertise(),
+            );
             listener_registry_entries.push((
                 transport::Transport::Udp,
                 addr,
-                entry.advertise().map(str::to_string),
+                entry.advertise().cloned(),
             ));
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
@@ -1530,15 +1537,16 @@ impl SiphonServer {
             listen_addrs
                 .entry(transport::Transport::Tcp)
                 .or_insert(addr);
-            if let Some(adv) = entry.advertise() {
-                advertised_addrs
-                    .entry(transport::Transport::Tcp)
-                    .or_insert_with(|| adv.to_string());
-            }
+            record_advertised(
+                &mut advertised_addrs,
+                &mut advertised_ports,
+                transport::Transport::Tcp,
+                entry.advertise(),
+            );
             listener_registry_entries.push((
                 transport::Transport::Tcp,
                 addr,
-                entry.advertise().map(str::to_string),
+                entry.advertise().cloned(),
             ));
             let tos = resolve_tos(entry);
             // Built once here rather than per connection: the allowlist is
@@ -1695,15 +1703,16 @@ impl SiphonServer {
                 listen_addrs
                     .entry(transport::Transport::Tls)
                     .or_insert(addr);
-                if let Some(adv) = entry.advertise() {
-                    advertised_addrs
-                        .entry(transport::Transport::Tls)
-                        .or_insert_with(|| adv.to_string());
-                }
+                record_advertised(
+                    &mut advertised_addrs,
+                    &mut advertised_ports,
+                    transport::Transport::Tls,
+                    entry.advertise(),
+                );
                 listener_registry_entries.push((
                     transport::Transport::Tls,
                     addr,
-                    entry.advertise().map(str::to_string),
+                    entry.advertise().cloned(),
                 ));
                 if tls_wss_mux.contains(&addr) {
                     continue; // served by the TLS+WSS mux listener below
@@ -1751,15 +1760,16 @@ impl SiphonServer {
             listen_addrs
                 .entry(transport::Transport::WebSocket)
                 .or_insert(addr);
-            if let Some(adv) = entry.advertise() {
-                advertised_addrs
-                    .entry(transport::Transport::WebSocket)
-                    .or_insert_with(|| adv.to_string());
-            }
+            record_advertised(
+                &mut advertised_addrs,
+                &mut advertised_ports,
+                transport::Transport::WebSocket,
+                entry.advertise(),
+            );
             listener_registry_entries.push((
                 transport::Transport::WebSocket,
                 addr,
-                entry.advertise().map(str::to_string),
+                entry.advertise().cloned(),
             ));
             if tcp_ws_mux.contains(&addr) {
                 continue; // served by the TCP+WS mux listener below
@@ -1804,15 +1814,16 @@ impl SiphonServer {
                 listen_addrs
                     .entry(transport::Transport::WebSocketSecure)
                     .or_insert(addr);
-                if let Some(adv) = entry.advertise() {
-                    advertised_addrs
-                        .entry(transport::Transport::WebSocketSecure)
-                        .or_insert_with(|| adv.to_string());
-                }
+                record_advertised(
+                    &mut advertised_addrs,
+                    &mut advertised_ports,
+                    transport::Transport::WebSocketSecure,
+                    entry.advertise(),
+                );
                 listener_registry_entries.push((
                     transport::Transport::WebSocketSecure,
                     addr,
-                    entry.advertise().map(str::to_string),
+                    entry.advertise().cloned(),
                 ));
                 if tls_wss_mux.contains(&addr) {
                     continue; // served by the TLS+WSS mux listener below
@@ -1967,15 +1978,16 @@ impl SiphonServer {
                 listen_addrs
                     .entry(transport::Transport::Sctp)
                     .or_insert(addr);
-                if let Some(adv) = entry.advertise() {
-                    advertised_addrs
-                        .entry(transport::Transport::Sctp)
-                        .or_insert_with(|| adv.to_string());
-                }
+                record_advertised(
+                    &mut advertised_addrs,
+                    &mut advertised_ports,
+                    transport::Transport::Sctp,
+                    entry.advertise(),
+                );
                 listener_registry_entries.push((
                     transport::Transport::Sctp,
                     addr,
-                    entry.advertise().map(str::to_string),
+                    entry.advertise().cloned(),
                 ));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
@@ -2073,15 +2085,18 @@ impl SiphonServer {
             .as_ref()
             .and_then(|server| server.user_agent_header.clone())
             .or_else(|| Some(format!("{product_name}/{product_version}")));
-        let uac_sender = Arc::new(UacSender::new(
-            Arc::clone(&outbound_senders),
-            local_addr,
-            listen_addrs.clone(),
-            advertised_addrs.clone(),
-            config.advertised_address.clone(),
-            hep_sender.clone(),
-            uac_user_agent,
-        ));
+        let uac_sender = Arc::new(
+            UacSender::new(
+                Arc::clone(&outbound_senders),
+                local_addr,
+                listen_addrs.clone(),
+                advertised_addrs.clone(),
+                config.advertised_address.clone(),
+                hep_sender.clone(),
+                uac_user_agent,
+            )
+            .with_advertised_ports(advertised_ports.clone()),
+        );
 
         // Wire UAC sender into proxy.send_request() Python API
         {
@@ -2529,6 +2544,7 @@ impl SiphonServer {
             local_addr,
             listen_addrs,
             advertised_addrs,
+            advertised_ports,
             transport::ListenerRegistry::from_entries(listener_registry_entries),
             hep_sender,
             uac_sender,

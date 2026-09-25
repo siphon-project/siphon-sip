@@ -307,7 +307,7 @@ fn default_udp_egress_addr_honours_extended_form() {
     // plain string form — selection keys on `address()`, not the variant.
     let entries = vec![config::ListenEntry::Extended {
         address: "198.51.100.4:5062".to_string(),
-        advertise: Some("sip.example.org".to_string()),
+        advertise: Some(config::AdvertisedAddress::host_only("sip.example.org")),
         dscp: None,
         proxy_protocol: None,
     }];
@@ -315,6 +315,57 @@ fn default_udp_egress_addr_honours_extended_form() {
         default_udp_egress_addr(&entries),
         Some("198.51.100.4:5062".parse().unwrap())
     );
+}
+
+#[test]
+fn record_advertised_pairs_the_port_with_the_host_of_the_same_listener() {
+    let mut hosts = std::collections::HashMap::new();
+    let mut ports = std::collections::HashMap::new();
+    let with_port = config::AdvertisedAddress::parse("sip.example.com:5061").unwrap();
+    let host_only = config::AdvertisedAddress::host_only("other.example.com");
+
+    // No advertise: nothing recorded.
+    record_advertised(&mut hosts, &mut ports, transport::Transport::Tls, None);
+    assert!(hosts.is_empty() && ports.is_empty());
+
+    // First advertising listener wins, host and port together.
+    record_advertised(
+        &mut hosts,
+        &mut ports,
+        transport::Transport::Tls,
+        Some(&with_port),
+    );
+    record_advertised(
+        &mut hosts,
+        &mut ports,
+        transport::Transport::Tls,
+        Some(&host_only),
+    );
+    assert_eq!(
+        hosts.get(&transport::Transport::Tls).map(String::as_str),
+        Some("sip.example.com")
+    );
+    assert_eq!(ports.get(&transport::Transport::Tls), Some(&5061));
+
+    // A host-only first listener leaves the transport on its bound port, and a
+    // later listener's port cannot attach itself to that host.
+    record_advertised(
+        &mut hosts,
+        &mut ports,
+        transport::Transport::Udp,
+        Some(&host_only),
+    );
+    record_advertised(
+        &mut hosts,
+        &mut ports,
+        transport::Transport::Udp,
+        Some(&with_port),
+    );
+    assert_eq!(
+        hosts.get(&transport::Transport::Udp).map(String::as_str),
+        Some("other.example.com")
+    );
+    assert_eq!(ports.get(&transport::Transport::Udp), None);
 }
 
 #[test]

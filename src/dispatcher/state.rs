@@ -43,6 +43,11 @@ pub struct DispatcherState {
     /// Configured via `listen: { tls: [{ address: ..., advertise: "..." }] }`.
     /// Falls back to the global `advertised_address` config when not set per-transport.
     pub advertised_addrs: std::collections::HashMap<Transport, String>,
+    /// Per-transport advertised port, paired with the `advertised_addrs` host
+    /// of the same listener, for transports whose `advertise` names a port
+    /// (`advertise: "host:port"`, a front that translates the port). Absent
+    /// transports advertise the bound port.
+    pub advertised_ports: std::collections::HashMap<Transport, u16>,
     /// Per-transport listen address for HEP capture (so TLS responses report
     /// port 5061, not the UDP/TCP port 5060).
     pub listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
@@ -546,12 +551,57 @@ impl DispatcherState {
             .unwrap_or_else(|| format_sip_host(&self.local_addr.ip().to_string()))
     }
 
-    /// Return the port to use in Via/Contact headers for the given transport.
+    /// Return the port to use in Via/Contact headers for the given transport:
+    /// the advertised port when the transport's advertising listener names
+    /// one, else the first listener's bound port.
     pub fn via_port(&self, transport: &Transport) -> u16 {
+        if let Some(port) = self.advertised_ports.get(transport) {
+            return *port;
+        }
         self.listen_addrs
             .get(transport)
             .map(|a| a.port())
             .unwrap_or(self.local_addr.port())
+    }
+
+    /// Port to advertise to the A-leg (Contact / Via / Record-Route) for the
+    /// socket the request arrived on: that listener's advertised port when its
+    /// `advertise` names one, else the arrival port; [`via_port`](Self::via_port)
+    /// when the arrival socket is unknown. Port-side twin of
+    /// [`a_leg_advertised_host`](Self::a_leg_advertised_host).
+    pub fn a_leg_advertised_port(
+        &self,
+        a_leg_local_addr: Option<SocketAddr>,
+        transport: &Transport,
+    ) -> u16 {
+        a_leg_advertised_port(
+            &self.listener_registry,
+            transport,
+            a_leg_local_addr,
+            self.via_port(transport),
+        )
+    }
+
+    /// Sent-by for a leg pinned to a wildcard-bound socket (`0.0.0.0:5060`),
+    /// whose own IP cannot go in a header: that listener's `advertise` (host,
+    /// and port when it names one) when configured, else the transport's
+    /// advertised host with the socket's bound port. See [`pinned_sent_by`].
+    pub fn wildcard_pinned_sent_by(
+        &self,
+        transport: &Transport,
+        local: SocketAddr,
+    ) -> (String, u16) {
+        match self
+            .listener_registry
+            .resolve(*transport, local)
+            .and_then(|socket| socket.advertise)
+        {
+            Some(advertise) => (
+                format_sip_host(&advertise.host),
+                advertise.port.unwrap_or(local.port()),
+            ),
+            None => (self.via_host(transport), local.port()),
+        }
     }
 
     /// Family-matched host to advertise to the A-leg (Contact / Via /

@@ -89,7 +89,12 @@ listen:
   #     - "10.0.0.1:5060"                            # plain string = no advertise
   #   tls:
   #     - address: "10.0.0.1:5061"                    # extended form
-  #       advertise: "sip.example.com"                # hostname or IP for Record-Route
+  #       advertise: "sip.example.com"                # host (optionally :port) for
+  #                                                   # Via / Record-Route / Contact.
+  #                                                   # A port ("sip.example.com:5061",
+  #                                                   # "[2001:db8::1]:5061") is for a
+  #                                                   # front that translates the port;
+  #                                                   # without one the bound port is used.
   #       dscp: EF                                    # per-listener override (default is global dscp)
   #
   # The global `advertised_address` (below) serves as fallback for transports
@@ -180,6 +185,8 @@ domain:
 advertised_address: "127.0.0.1"
 # advertised_address: "1.2.3.4"        # <- your public IPv4 for real traffic
 # advertised_address: "2001:db8::1"    # <- your public IPv6
+# Host only: a port here is refused at startup (this is the fallback for every
+# transport). Put a translated port on the listener's `advertise` instead.
 
 # ---------------------------------------------------------------------------
 # TLS certificate (required when listen.tls or listen.wss is set)

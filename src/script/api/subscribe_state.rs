@@ -120,7 +120,7 @@ impl PySubscribeState {
             .map(|sender| {
                 format_default_contact(
                     &sender.via_host_for(&transport),
-                    sender.addr_for(&transport).port(),
+                    sender.via_port_for(&transport),
                     transport,
                 )
             })
@@ -841,7 +841,7 @@ async fn send_notify(
         "SIP/2.0/{} {}:{};branch={}",
         transport,
         uac_sender.via_host_for(&transport),
-        uac_sender.addr_for(&transport).port(),
+        uac_sender.via_port_for(&transport),
         branch
     );
     let cseq_str = format!("{} NOTIFY", dialog.cseq);
@@ -863,7 +863,7 @@ async fn send_notify(
             "Contact",
             format_default_contact(
                 &uac_sender.via_host_for(&transport),
-                uac_sender.addr_for(&transport).port(),
+                uac_sender.via_port_for(&transport),
                 transport,
             ),
         )
@@ -1377,11 +1377,11 @@ impl PySubscribeState {
         // Mint dialog identity on our side.
         let call_id = format!("py-sub-{}", Uuid::new_v4());
         let local_tag = short_uuid();
-        // Advertise our own reachable host (FQDN-aware) + listen port in the
+        // Advertise our own reachable host (FQDN-aware) + advertised port in the
         // Via/Contact so the notifier can route the response and any in-dialog
-        // NOTIFY back to us; addr_for only supplies the port here.
+        // NOTIFY back to us (the listen port unless `advertise` names another).
         let local_host = uac_sender.via_host_for(&transport);
-        let local_port = uac_sender.addr_for(&transport).port();
+        let local_port = uac_sender.via_port_for(&transport);
         let local_uri_default = strip_uri_params(ruri);
 
         // Pre-extract the script-supplied header dict into a Vec so the
