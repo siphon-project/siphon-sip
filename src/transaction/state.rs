@@ -5,9 +5,12 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::{Method, SipMessage, StartLine};
+use crate::sip::parser::parse_sip_message_bytes;
 use crate::transaction::timer::TimerConfig;
 
 /// Generate a random URL-safe To-tag for UAS-built responses
@@ -81,6 +84,23 @@ impl From<crate::transport::Transport> for Transport {
 pub enum Action {
     /// Send a SIP message over the transport.
     SendMessage(SipMessage),
+    /// Put already-serialized octets on the wire — the exact frame that went
+    /// out before.
+    ///
+    /// Client transactions retransmit through this instead of re-serializing a
+    /// retained `SipMessage`. RFC 3261 §17.1.1.2 requires a retransmission to
+    /// be the same request; handing back the octets that were sent makes that
+    /// structural rather than something the serializer has to keep
+    /// guaranteeing, and it is why the parse is not retained at all. A parsed
+    /// `SipMessage` costs 5.4x the octets it represents — every header is two
+    /// `String`s and a `Vec`, each its own allocation rounded up to a size
+    /// class — and a proxy holds one per in-flight request for up to 32 s:
+    /// Timer B/D (§17.1.1) and Timer F (§17.1.2). On a 943-byte INVITE with
+    /// SDP that took a live INVITE client transaction from 5506 to 1415 bytes,
+    /// or 1.76 GB to 0.45 GB at 10k calls/sec
+    /// (`tests/transaction_footprint_tests.rs` pins it). Cloning a frame for a
+    /// retransmit is a refcount bump; the serialize it replaces is not.
+    SendFrame(Bytes),
     /// Pass a received message to the Transaction User (TU).
     PassToTu(SipMessage),
     /// Start or restart a timer that fires after `duration`.
@@ -515,28 +535,34 @@ pub struct Nict {
     pub state: NictState,
     pub transport: Transport,
     pub timers: TimerConfig,
-    /// The original request (for retransmissions).
-    pub request: SipMessage,
+    /// The request exactly as it left, for Timer E retransmission
+    /// (RFC 3261 §17.1.2.2). See [`Action::SendFrame`] for why this is the
+    /// octets and not the parse.
+    pub request_bytes: Bytes,
     /// Current Timer E interval.
     pub timer_e_interval: Duration,
 }
 
 impl Nict {
-    /// Create and start a new NICT. Returns the initial actions (send request, start timers).
+    /// Create and start a new NICT. Returns the initial actions (send request,
+    /// start timers).
+    ///
+    /// `request_bytes` must be the exact octets the caller puts on the wire:
+    /// they are what Timer E retransmits.
     pub fn new(
-        request: SipMessage,
+        request_bytes: Bytes,
         transport: Transport,
         timers: TimerConfig,
     ) -> (Self, Vec<Action>) {
         let timer_e_interval = timers.timer_e_initial();
+        let mut actions = vec![Action::SendFrame(request_bytes.clone())];
         let nict = Self {
             state: NictState::Trying,
             transport,
             timers,
-            request: request.clone(),
+            request_bytes,
             timer_e_interval,
         };
-        let mut actions = vec![Action::SendMessage(request)];
         // Start Timer F (overall timeout)
         actions.push(Action::StartTimer(TimerName::F, nict.timers.timer_f()));
         // Start Timer E for UDP
@@ -553,7 +579,7 @@ impl Nict {
                 // Retransmit, double interval (capped at T2)
                 self.timer_e_interval = self.timers.next_retransmit(self.timer_e_interval);
                 vec![
-                    Action::SendMessage(self.request.clone()),
+                    Action::SendFrame(self.request_bytes.clone()),
                     Action::StartTimer(TimerName::E, self.timer_e_interval),
                 ]
             }
@@ -593,7 +619,7 @@ impl Nict {
             (NictState::Proceeding, NictEvent::TimerE) => {
                 // In Proceeding, retransmit interval is T2 (not doubling)
                 vec![
-                    Action::SendMessage(self.request.clone()),
+                    Action::SendFrame(self.request_bytes.clone()),
                     Action::StartTimer(TimerName::E, self.timers.t2),
                 ]
             }
@@ -685,30 +711,37 @@ pub struct Ict {
     pub state: IctState,
     pub transport: Transport,
     pub timers: TimerConfig,
-    pub request: SipMessage,
+    /// The INVITE exactly as it left, for Timer A retransmission
+    /// (RFC 3261 §17.1.1.2). See [`Action::SendFrame`] for why this is the
+    /// octets and not the parse.
+    pub request_bytes: Bytes,
     /// Current Timer A interval.
     pub timer_a_interval: Duration,
-    /// Cached ACK for non-2xx retransmission (RFC 3261 §17.1.1.3).
-    cached_ack: Option<SipMessage>,
+    /// Cached ACK for non-2xx retransmission (RFC 3261 §17.1.1.3), serialized
+    /// once when it is built for the same reason as `request_bytes`.
+    cached_ack: Option<Bytes>,
 }
 
 impl Ict {
     /// Create and start a new ICT. Returns the initial actions.
+    ///
+    /// `request_bytes` must be the exact octets the caller puts on the wire:
+    /// they are what Timer A retransmits.
     pub fn new(
-        request: SipMessage,
+        request_bytes: Bytes,
         transport: Transport,
         timers: TimerConfig,
     ) -> (Self, Vec<Action>) {
         let timer_a_interval = timers.timer_a_initial();
+        let mut actions = vec![Action::SendFrame(request_bytes.clone())];
         let ict = Self {
             state: IctState::Calling,
             transport,
             timers,
-            request: request.clone(),
+            request_bytes,
             timer_a_interval,
             cached_ack: None,
         };
-        let mut actions = vec![Action::SendMessage(request)];
         // Start Timer B (overall timeout)
         actions.push(Action::StartTimer(TimerName::B, ict.timers.timer_b()));
         // Start Timer A for UDP
@@ -732,19 +765,26 @@ impl Ict {
     /// Returns an error string instead of silently dropping when the
     /// INVITE itself is malformed (missing Via/From/Call-ID) so the TU
     /// gets a log line rather than a mysteriously missing ACK.
+    ///
+    /// The INVITE is retained as octets, not as a parse (see
+    /// [`Action::SendFrame`]), so this is the one path that has to read it
+    /// back. It runs at most once per INVITE, on a non-2xx final, where
+    /// retaining the parse would have been paid by every in-flight
+    /// transaction — including every one that is answered 2xx and never builds
+    /// an ACK here at all.
     fn build_ack_for_non2xx(&self, response: &SipMessage) -> Result<SipMessage, String> {
-        let request_uri = match &self.request.start_line {
+        let request = parse_sip_message_bytes(&self.request_bytes)
+            .map_err(|error| format!("sent INVITE does not parse back: {error}"))?;
+        let request_uri = match &request.start_line {
             StartLine::Request(request_line) => request_line.request_uri.clone(),
             _ => return Err("ICT request is not a Request (never happens)".into()),
         };
-        let via = self
-            .request
+        let via = request
             .headers
             .via()
             .ok_or_else(|| "original INVITE missing Via header".to_string())?
             .to_string();
-        let from = self
-            .request
+        let from = request
             .headers
             .from()
             .ok_or_else(|| "original INVITE missing From header".to_string())?
@@ -755,17 +795,15 @@ impl Ict {
         let to = response
             .headers
             .to()
-            .or_else(|| self.request.headers.to())
+            .or_else(|| request.headers.to())
             .ok_or_else(|| "neither response nor INVITE has a To header".to_string())?
             .to_string();
-        let call_id = self
-            .request
+        let call_id = request
             .headers
             .call_id()
             .ok_or_else(|| "original INVITE missing Call-ID".to_string())?
             .to_string();
-        let cseq_num = self
-            .request
+        let cseq_num = request
             .headers
             .cseq()
             .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
@@ -790,7 +828,7 @@ impl Ict {
                 // FIX: Cap at T2 using next_retransmit (RFC 3261 §17.1.1.2)
                 self.timer_a_interval = self.timers.next_retransmit(self.timer_a_interval);
                 vec![
-                    Action::SendMessage(self.request.clone()),
+                    Action::SendFrame(self.request_bytes.clone()),
                     Action::StartTimer(TimerName::A, self.timer_a_interval),
                 ]
             }
@@ -834,8 +872,9 @@ impl Ict {
                 let mut actions = Vec::new();
                 match self.build_ack_for_non2xx(&response) {
                     Ok(ack) => {
-                        self.cached_ack = Some(ack.clone());
-                        actions.push(Action::SendMessage(ack));
+                        let frame = Bytes::from(ack.to_bytes());
+                        self.cached_ack = Some(frame.clone());
+                        actions.push(Action::SendFrame(frame));
                     }
                     Err(error) => {
                         actions.push(Action::ProtocolError(format!(
@@ -889,8 +928,9 @@ impl Ict {
                 let mut actions = Vec::new();
                 match self.build_ack_for_non2xx(&response) {
                     Ok(ack) => {
-                        self.cached_ack = Some(ack.clone());
-                        actions.push(Action::SendMessage(ack));
+                        let frame = Bytes::from(ack.to_bytes());
+                        self.cached_ack = Some(frame.clone());
+                        actions.push(Action::SendFrame(frame));
                     }
                     Err(error) => {
                         actions.push(Action::ProtocolError(format!(
@@ -916,7 +956,7 @@ impl Ict {
             (IctState::Completed, IctEvent::ResponseNon2xx(_)) => {
                 // RFC 3261 §17.1.1.3: retransmitted non-2xx MUST cause ACK retransmission
                 if let Some(ref ack) = self.cached_ack {
-                    vec![Action::SendMessage(ack.clone())]
+                    vec![Action::SendFrame(ack.clone())]
                 } else {
                     vec![]
                 }
@@ -973,6 +1013,25 @@ mod tests {
             .unwrap()
     }
 
+    /// The wire frame a caller hands a client transaction: what it sends, and
+    /// therefore what it must retransmit verbatim (RFC 3261 §17.1.1.2).
+    fn request_frame() -> Bytes {
+        Bytes::from(dummy_request().to_bytes())
+    }
+
+    fn invite_frame() -> Bytes {
+        Bytes::from(dummy_invite().to_bytes())
+    }
+
+    /// The frame of the first send in `actions`, whichever send variant it is.
+    fn sent_frame(actions: &[Action]) -> Option<Bytes> {
+        actions.iter().find_map(|a| match a {
+            Action::SendFrame(frame) => Some(frame.clone()),
+            Action::SendMessage(message) => Some(Bytes::from(message.to_bytes())),
+            _ => None,
+        })
+    }
+
     fn dummy_response(code: u16, reason: &str) -> SipMessage {
         SipMessageBuilder::new()
             .response(code, reason.to_string())
@@ -990,8 +1049,12 @@ mod tests {
         actions.iter().any(predicate)
     }
 
+    /// "Did the state machine put something on the wire" — server transactions
+    /// emit a `SipMessage`, client transactions a pre-serialized frame.
     fn has_send(actions: &[Action]) -> bool {
-        has_action(actions, |a| matches!(a, Action::SendMessage(_)))
+        has_action(actions, |a| {
+            matches!(a, Action::SendMessage(_) | Action::SendFrame(_))
+        })
     }
 
     fn has_pass_to_tu(actions: &[Action]) -> bool {
@@ -1427,7 +1490,7 @@ mod tests {
 
     #[test]
     fn nict_new_sends_request_and_starts_timers() {
-        let (nict, actions) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (nict, actions) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         assert_eq!(nict.state, NictState::Trying);
         assert!(has_send(&actions));
         assert!(has_timer(&actions, TimerName::F));
@@ -1436,14 +1499,14 @@ mod tests {
 
     #[test]
     fn nict_tcp_no_timer_e() {
-        let (_, actions) = Nict::new(dummy_request(), Transport::Reliable, TimerConfig::default());
+        let (_, actions) = Nict::new(request_frame(), Transport::Reliable, TimerConfig::default());
         assert!(has_timer(&actions, TimerName::F));
         assert!(!has_timer(&actions, TimerName::E));
     }
 
     #[test]
     fn nict_timer_e_retransmits_and_doubles() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         assert_eq!(nict.timer_e_interval, Duration::from_millis(500));
 
         let actions = nict.process(NictEvent::TimerE);
@@ -1463,7 +1526,7 @@ mod tests {
 
     #[test]
     fn nict_timer_f_timeout() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         let actions = nict.process(NictEvent::TimerF);
         assert_eq!(nict.state, NictState::Terminated);
         assert!(has_timeout(&actions));
@@ -1472,7 +1535,7 @@ mod tests {
 
     #[test]
     fn nict_provisional_to_proceeding() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         let actions = nict.process(NictEvent::Provisional(dummy_response(100, "Trying")));
         assert_eq!(nict.state, NictState::Proceeding);
         assert!(has_pass_to_tu(&actions));
@@ -1480,7 +1543,7 @@ mod tests {
 
     #[test]
     fn nict_final_response_to_completed_udp() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         let actions = nict.process(NictEvent::FinalResponse(dummy_response(200, "OK")));
         assert_eq!(nict.state, NictState::Completed);
         assert!(has_pass_to_tu(&actions));
@@ -1489,7 +1552,7 @@ mod tests {
 
     #[test]
     fn nict_final_response_tcp_immediate_terminate() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Reliable, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Reliable, TimerConfig::default());
         let actions = nict.process(NictEvent::FinalResponse(dummy_response(200, "OK")));
         assert_eq!(nict.state, NictState::Terminated);
         assert!(has_pass_to_tu(&actions));
@@ -1498,7 +1561,7 @@ mod tests {
 
     #[test]
     fn nict_timer_k_terminates() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         nict.process(NictEvent::FinalResponse(dummy_response(200, "OK")));
         let actions = nict.process(NictEvent::TimerK);
         assert_eq!(nict.state, NictState::Terminated);
@@ -1507,7 +1570,7 @@ mod tests {
 
     #[test]
     fn nict_completed_absorbs_retransmit() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         nict.process(NictEvent::FinalResponse(dummy_response(200, "OK")));
         let actions = nict.process(NictEvent::FinalResponse(dummy_response(200, "OK")));
         assert!(actions.is_empty());
@@ -1515,7 +1578,7 @@ mod tests {
 
     #[test]
     fn nict_proceeding_timer_e_uses_t2() {
-        let (mut nict, _) = Nict::new(dummy_request(), Transport::Udp, TimerConfig::default());
+        let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());
         nict.process(NictEvent::Provisional(dummy_response(100, "Trying")));
         let actions = nict.process(NictEvent::TimerE);
         // In Proceeding, Timer E fires at T2 interval
@@ -1532,7 +1595,7 @@ mod tests {
 
     #[test]
     fn ict_new_sends_invite_and_starts_timers() {
-        let (ict, actions) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (ict, actions) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         assert_eq!(ict.state, IctState::Calling);
         assert!(has_send(&actions));
         assert!(has_timer(&actions, TimerName::B));
@@ -1541,14 +1604,14 @@ mod tests {
 
     #[test]
     fn ict_tcp_no_timer_a() {
-        let (_, actions) = Ict::new(dummy_invite(), Transport::Reliable, TimerConfig::default());
+        let (_, actions) = Ict::new(invite_frame(), Transport::Reliable, TimerConfig::default());
         assert!(has_timer(&actions, TimerName::B));
         assert!(!has_timer(&actions, TimerName::A));
     }
 
     #[test]
     fn ict_timer_a_retransmits_and_doubles() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
 
         ict.process(IctEvent::TimerA);
@@ -1560,7 +1623,7 @@ mod tests {
 
     #[test]
     fn ict_timer_b_timeout() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::TimerB);
         assert_eq!(ict.state, IctState::Terminated);
         assert!(has_timeout(&actions));
@@ -1569,7 +1632,7 @@ mod tests {
 
     #[test]
     fn ict_provisional_to_proceeding() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         assert_eq!(ict.state, IctState::Proceeding);
         assert!(has_pass_to_tu(&actions));
@@ -1579,7 +1642,7 @@ mod tests {
 
     #[test]
     fn ict_2xx_terminates() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::Response2xx(dummy_response(200, "OK")));
         assert_eq!(ict.state, IctState::Terminated);
         assert!(has_pass_to_tu(&actions));
@@ -1588,7 +1651,7 @@ mod tests {
 
     #[test]
     fn ict_non2xx_to_completed_udp() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Completed);
         assert!(
@@ -1601,7 +1664,7 @@ mod tests {
 
     #[test]
     fn ict_non2xx_tcp_immediate_terminate() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Reliable, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Reliable, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Terminated);
         assert!(
@@ -1626,7 +1689,11 @@ mod tests {
         // fallback — then strip the INVITE's To too so both fallbacks fail.
         let mut broken_invite = dummy_invite();
         broken_invite.headers.remove("To");
-        let (mut ict, _) = Ict::new(broken_invite, Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(
+            Bytes::from(broken_invite.to_bytes()),
+            Transport::Udp,
+            TimerConfig::default(),
+        );
         let mut broken_response = dummy_response(486, "Busy Here");
         broken_response.headers.remove("To");
 
@@ -1652,7 +1719,7 @@ mod tests {
         fn has_protocol_error(actions: &[Action]) -> bool {
             has_action(actions, |a| matches!(a, Action::ProtocolError(_)))
         }
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         let mut response = dummy_response(486, "Busy Here");
         response.headers.remove("To");
 
@@ -1668,7 +1735,7 @@ mod tests {
 
     #[test]
     fn ict_timer_d_terminates() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         let actions = ict.process(IctEvent::TimerD);
         assert_eq!(ict.state, IctState::Terminated);
@@ -1678,7 +1745,7 @@ mod tests {
     #[test]
     fn ict_completed_retransmits_ack() {
         // RFC 3261 §17.1.1.3: retransmitted non-2xx in Completed MUST cause ACK retransmission
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(actions.len(), 1);
@@ -1690,7 +1757,7 @@ mod tests {
 
     #[test]
     fn ict_proceeding_2xx_terminates() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         let actions = ict.process(IctEvent::Response2xx(dummy_response(200, "OK")));
         assert_eq!(ict.state, IctState::Terminated);
@@ -1700,7 +1767,7 @@ mod tests {
 
     #[test]
     fn ict_proceeding_non2xx_to_completed() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(603, "Decline")));
         assert_eq!(ict.state, IctState::Completed);
@@ -1719,7 +1786,7 @@ mod tests {
     /// beyond it, per RFC 3261 §17.1.1.2.
     #[test]
     fn ict_timer_a_capped_at_t2() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         // Default T1=500ms, T2=4000ms
         // Intervals: 500 → 1000 → 2000 → 4000 → 4000 (capped)
         assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
@@ -1744,7 +1811,7 @@ mod tests {
     /// without retransmission (RFC 3261 §17.1.1.2: SHOULD NOT retransmit).
     #[test]
     fn ict_proceeding_timer_a_no_retransmit() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
         assert_eq!(ict.timer_a_interval, Duration::from_millis(500));
 
         // Enter Proceeding — Timer A should be cancelled
@@ -1764,7 +1831,7 @@ mod tests {
     /// in Proceeding state (RFC 3261 §17.1.1.2).
     #[test]
     fn ict_proceeding_non2xx_cancels_timer_a() {
-        let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
 
         // Enter Proceeding
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
@@ -1778,5 +1845,139 @@ mod tests {
         assert!(has_cancel_timer(&actions, TimerName::A));
         assert!(has_cancel_timer(&actions, TimerName::B));
         assert!(has_pass_to_tu(&actions));
+    }
+    // =======================================================================
+    // Retained-request byte identity (RFC 3261 §17.1.1.2 / §17.1.2.2)
+    // =======================================================================
+
+    /// The property the whole retained-octets representation rests on: a
+    /// retransmission is the frame that was sent, byte for byte, however many
+    /// times Timer A fires.
+    #[test]
+    fn ict_timer_a_retransmit_is_byte_identical() {
+        let frame = invite_frame();
+        let (mut ict, initial) = Ict::new(frame.clone(), Transport::Udp, TimerConfig::default());
+        assert_eq!(
+            sent_frame(&initial).as_deref(),
+            Some(&frame[..]),
+            "the initial send must be the caller's own frame"
+        );
+
+        for attempt in 1..=3 {
+            let actions = ict.process(IctEvent::TimerA);
+            assert_eq!(
+                sent_frame(&actions).as_deref(),
+                Some(&frame[..]),
+                "Timer A retransmit {attempt} must be byte-identical to the INVITE sent"
+            );
+        }
+    }
+
+    /// Same property for the non-INVITE client transaction, in both states that
+    /// retransmit (Trying on a doubling Timer E, Proceeding at T2).
+    #[test]
+    fn nict_timer_e_retransmit_is_byte_identical() {
+        let frame = request_frame();
+        let (mut nict, initial) = Nict::new(frame.clone(), Transport::Udp, TimerConfig::default());
+        assert_eq!(sent_frame(&initial).as_deref(), Some(&frame[..]));
+
+        let actions = nict.process(NictEvent::TimerE);
+        assert_eq!(sent_frame(&actions).as_deref(), Some(&frame[..]));
+
+        nict.process(NictEvent::Provisional(dummy_response(100, "Trying")));
+        let actions = nict.process(NictEvent::TimerE);
+        assert_eq!(
+            sent_frame(&actions).as_deref(),
+            Some(&frame[..]),
+            "Proceeding-state Timer E must retransmit the same octets"
+        );
+    }
+
+    /// The ICT keeps only octets, so the ACK for a non-2xx is built off a
+    /// re-parse of them. Prove the ACK still carries everything §17.1.1.3
+    /// requires from the INVITE — same branch (hop-by-hop), same From,
+    /// Call-ID, CSeq number and Request-URI — with the To taken from the
+    /// response so the remote tag is right.
+    #[test]
+    fn ict_ack_is_built_from_the_retained_octets() {
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
+        let mut response = dummy_response(486, "Busy Here");
+        response
+            .headers
+            .set("To", "<sip:bob@biloxi.com>;tag=remote-99".to_string());
+
+        let actions = ict.process(IctEvent::ResponseNon2xx(response));
+        let frame = sent_frame(&actions).expect("ICT must ACK a non-2xx");
+        let ack = parse_sip_message_bytes(&frame).expect("the ACK must parse");
+
+        match &ack.start_line {
+            StartLine::Request(request_line) => {
+                assert_eq!(request_line.method, Method::Ack);
+                assert_eq!(request_line.request_uri.to_string(), "sip:bob@biloxi.com");
+            }
+            _ => panic!("expected an ACK request line"),
+        }
+        assert_eq!(
+            ack.headers.via().map(String::as_str),
+            Some("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-inv"),
+            "the ACK is hop-by-hop: same branch as the INVITE"
+        );
+        assert_eq!(
+            ack.headers.from().map(String::as_str),
+            Some("<sip:alice@atlanta.com>;tag=xyz")
+        );
+        assert_eq!(
+            ack.headers.call_id().map(String::as_str),
+            Some("invite-call-id")
+        );
+        assert_eq!(ack.headers.cseq().map(String::as_str), Some("1 ACK"));
+        assert_eq!(
+            ack.headers.to().map(String::as_str),
+            Some("<sip:bob@biloxi.com>;tag=remote-99"),
+            "the To must come from the response, which carries the remote tag"
+        );
+    }
+
+    /// §17.1.1.3: a retransmitted non-2xx retransmits the ACK — and the cached
+    /// ACK is octets, so it goes back byte-identical rather than being rebuilt.
+    #[test]
+    fn ict_ack_retransmit_is_byte_identical() {
+        let (mut ict, _) = Ict::new(invite_frame(), Transport::Udp, TimerConfig::default());
+        let first = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
+        let ack = sent_frame(&first).expect("ICT must ACK a non-2xx");
+
+        for attempt in 1..=3 {
+            let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
+            assert_eq!(
+                sent_frame(&actions).as_deref(),
+                Some(&ack[..]),
+                "ACK retransmit {attempt} must be byte-identical to the first ACK"
+            );
+        }
+    }
+
+    /// The retained octets are what went on the wire, so they always parse
+    /// back — but the ACK path must not become a silent drop if they somehow
+    /// do not. It reports the anomaly exactly like a malformed INVITE does
+    /// (§17.1.1.3: never skip the ACK quietly).
+    #[test]
+    fn ict_unparseable_retained_octets_report_a_protocol_error() {
+        let (mut ict, _) = Ict::new(
+            Bytes::from_static(b"this is not a SIP message"),
+            Transport::Udp,
+            TimerConfig::default(),
+        );
+        let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
+
+        assert_eq!(ict.state, IctState::Completed);
+        assert!(!has_send(&actions), "no ACK could be built");
+        assert!(has_action(&actions, |a| matches!(
+            a,
+            Action::ProtocolError(_)
+        )));
+        assert!(
+            has_pass_to_tu(&actions),
+            "the response must still reach the TU"
+        );
     }
 }

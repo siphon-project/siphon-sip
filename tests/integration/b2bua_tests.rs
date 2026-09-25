@@ -701,12 +701,14 @@ fn client_transaction_lifecycle_options() {
         .build()
         .unwrap();
 
-    // Create client transaction
+    // Create client transaction. The caller hands over the frame it sends;
+    // the transaction retains those octets for its retransmits.
+    let wire = bytes::Bytes::from(request.to_bytes());
     let (key, actions) = manager
-        .new_client_transaction(request, TxnTransport::Udp)
+        .new_client_transaction(&request, wire, TxnTransport::Udp)
         .unwrap();
     assert_eq!(manager.count(), 1);
-    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+    assert!(actions.iter().any(|a| matches!(a, Action::SendFrame(_))));
     assert!(actions
         .iter()
         .any(|a| matches!(a, Action::StartTimer(TimerName::F, _))));

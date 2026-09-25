@@ -6408,13 +6408,14 @@ fn transaction_manager_creates_client_transaction() {
     let manager = TransactionManager::default();
     let invite = sample_invite();
     let txn_transport = crate::transaction::state::Transport::Udp;
+    let wire = Bytes::from(invite.to_bytes());
     let (key, actions) = manager
-        .new_client_transaction(invite, txn_transport)
+        .new_client_transaction(&invite, wire, txn_transport)
         .unwrap();
     assert_eq!(key.method, Method::Invite);
     assert_eq!(manager.count(), 1);
-    // Should have SendMessage + StartTimer(B) + StartTimer(A) for UDP
-    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+    // Should have SendFrame + StartTimer(B) + StartTimer(A) for UDP
+    assert!(actions.iter().any(|a| matches!(a, Action::SendFrame(_))));
     assert!(actions
         .iter()
         .any(|a| matches!(a, Action::StartTimer(TimerName::B, _))));
@@ -6453,8 +6454,9 @@ fn provisional_100_cancels_invite_client_timer_a() {
         .build()
         .unwrap();
 
+    let wire = Bytes::from(invite.to_bytes());
     let (key, start_actions) = manager
-        .new_client_transaction(invite, crate::transaction::state::Transport::Udp)
+        .new_client_transaction(&invite, wire, crate::transaction::state::Transport::Udp)
         .unwrap();
     assert!(
         start_actions

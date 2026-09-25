@@ -428,10 +428,11 @@ pub(super) fn relay_request(
     let retransmit_source =
         client_retransmit_source(outbound_transport, destination, flow, send_socket);
     let mut inserted_session_arc: Option<Arc<RwLock<ProxySession>>> = None;
-    let client_key_opt = match state
-        .transaction_manager
-        .new_client_transaction(relayed, txn_transport)
-    {
+    let client_key_opt = match state.transaction_manager.new_client_transaction(
+        &relayed,
+        data.clone(),
+        txn_transport,
+    ) {
         Ok((client_key, actions)) => {
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
@@ -979,10 +980,11 @@ pub(super) fn relay_fork_branch(
     let placeholder_connection_id = inbound.connection_id;
     let retransmit_source =
         client_retransmit_source(outbound_transport, destination, flow, send_socket);
-    let client_key_opt = match state
-        .transaction_manager
-        .new_client_transaction(relayed, txn_transport)
-    {
+    let client_key_opt = match state.transaction_manager.new_client_transaction(
+        &relayed,
+        data.clone(),
+        txn_transport,
+    ) {
         Ok((client_key, actions)) => {
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
