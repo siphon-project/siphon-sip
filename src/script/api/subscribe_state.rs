@@ -18,6 +18,7 @@ use crate::subscribe_state::{SubscribeDialog, SubscribeStore};
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
+use super::proxy_utils::ReplyGate;
 use super::reply::PyReply;
 use super::request::PyRequest;
 
@@ -52,6 +53,10 @@ impl PySubscribeState {
     /// existing handle on refresh, or None after replying 481 to an unknown
     /// in-dialog request. The script must immediately notify (or terminate for
     /// Expires:0); package bodies and access policy remain script-owned.
+    ///
+    /// The 200 is staged and sent when the handler returns. The handle carries
+    /// the request's reply gate, so a NOTIFY the handler awaits is held and
+    /// leaves behind that 200 (RFC 6665 §4.1.2.3).
     #[pyo3(signature = (request, expires=None))]
     fn accept(
         &self,
@@ -142,6 +147,7 @@ impl PySubscribeState {
         Ok(Some(PySubscribeHandle {
             store: Arc::clone(&self.store),
             id,
+            reply_gate: borrowed.reply_gate(),
         }))
     }
 
@@ -166,6 +172,7 @@ impl PySubscribeState {
         Ok(PySubscribeHandle {
             store: Arc::clone(&self.store),
             id,
+            reply_gate: request.borrow().reply_gate(),
         })
     }
 
@@ -180,6 +187,7 @@ impl PySubscribeState {
             Ok(found.map(|dialog| PySubscribeHandle {
                 store: Arc::clone(&store),
                 id: dialog.id,
+                reply_gate: None,
             }))
         })
     }
@@ -282,6 +290,7 @@ impl PySubscribeState {
             .map(|dialog| PySubscribeHandle {
                 store: Arc::clone(&self.store),
                 id: dialog.id,
+                reply_gate: None,
             })
     }
 }
@@ -291,6 +300,10 @@ impl PySubscribeState {
 pub struct PySubscribeHandle {
     store: Arc<SubscribeStore>,
     id: String,
+    /// The accepting request's reply gate: a NOTIFY sent while the handler is
+    /// still running waits for the SUBSCRIBE's reply. `None` for handles not
+    /// obtained from `accept()` / `create()`.
+    reply_gate: Option<Arc<ReplyGate>>,
 }
 
 #[pymethods]
@@ -423,6 +436,7 @@ impl PySubscribeHandle {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("active;expires={}", dialog.remaining_secs()));
         let content_type = content_type.map(str::to_string);
+        let gate = self.reply_gate.clone();
 
         crate::script::awaitable(python, async move {
             send_notify(
@@ -430,6 +444,7 @@ impl PySubscribeHandle {
                 &subscription_state,
                 content_type.as_deref(),
                 body_bytes.as_deref(),
+                gate.as_deref(),
             )
             .await?;
             Ok(true)
@@ -467,6 +482,7 @@ impl PySubscribeHandle {
         };
         let subscription_state = format!("terminated;reason={}", reason.unwrap_or("noresource"));
         let content_type = content_type.map(str::to_string);
+        let gate = self.reply_gate.clone();
         let store = Arc::clone(&self.store);
         let id = self.id.clone();
 
@@ -481,6 +497,7 @@ impl PySubscribeHandle {
                     &subscription_state,
                     content_type.as_deref(),
                     body_bytes.as_deref(),
+                    gate.as_deref(),
                 )
                 .await?;
             }
@@ -716,7 +733,7 @@ pub(crate) async fn notify_expired(mut dialog: SubscribeDialog) {
         return;
     }
     dialog.next_cseq();
-    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None).await {
+    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None, None).await {
         tracing::error!(id = %dialog.id, %error, "failed to notify subscription expiry");
     }
 }
@@ -737,6 +754,7 @@ async fn send_notify(
     subscription_state: &str,
     content_type: Option<&str>,
     body: Option<&[u8]>,
+    gate: Option<&ReplyGate>,
 ) -> PyResult<()> {
     let uac_sender = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
@@ -870,33 +888,39 @@ async fn send_notify(
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build NOTIFY: {error}"))
     })?;
 
-    // If called from inside a request handler, the dispatcher may defer
-    // until after the SUBSCRIBE reply is sent (RFC 6665 §4.1).
-    if !super::proxy_utils::try_defer_send(message.clone(), destination, transport) {
-        if dialog.route_set.is_empty()
-            && dialog.received_address.is_some()
-            && transport != Transport::Udp
-        {
-            // Exact match only: IP-only reuse can select another subscriber's
-            // connection when several phones share one front proxy.
-            let connection_id = super::stream_connections()
-                .and_then(|registry| registry.get(&destination))
-                .filter(|(registered_transport, _)| *registered_transport == transport)
-                .filter(|(_, connection_id)| {
-                    dialog
-                        .received_connection_id
-                        .map_or(true, |expected| connection_id.0 == expected)
-                })
-                .map(|(_, connection_id)| connection_id)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "SUBSCRIBE transport flow is no longer connected",
-                    )
-                })?;
-            uac_sender.send_request_on_connection(message, destination, transport, connection_id);
-        } else {
-            uac_sender.send_request(message, destination, transport);
-        }
+    // Sent from the handler that accepted the subscription: hold it behind the
+    // SUBSCRIBE's reply, which the dispatcher sends once the handler returns
+    // (RFC 6665 §4.1.2.3). Once the gate has closed it goes out now.
+    let message = match gate {
+        Some(gate) => match gate.hold(message, destination, transport) {
+            None => return Ok(()),
+            Some(message) => message,
+        },
+        None => message,
+    };
+    if dialog.route_set.is_empty()
+        && dialog.received_address.is_some()
+        && transport != Transport::Udp
+    {
+        // Exact match only: IP-only reuse can select another subscriber's
+        // connection when several phones share one front proxy.
+        let connection_id = super::stream_connections()
+            .and_then(|registry| registry.get(&destination))
+            .filter(|(registered_transport, _)| *registered_transport == transport)
+            .filter(|(_, connection_id)| {
+                dialog
+                    .received_connection_id
+                    .map_or(true, |expected| connection_id.0 == expected)
+            })
+            .map(|(_, connection_id)| connection_id)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "SUBSCRIBE transport flow is no longer connected",
+                )
+            })?;
+        uac_sender.send_request_on_connection(message, destination, transport, connection_id);
+    } else {
+        uac_sender.send_request(message, destination, transport);
     }
     debug!(id = %dialog.id, "subscribe_state: NOTIFY sent");
     Ok(())
@@ -1466,7 +1490,11 @@ impl PySubscribeState {
         store.put(dialog);
         debug!(id, "subscribe_state: outbound dialog established");
 
-        Ok(PySubscribeHandle { store, id })
+        Ok(PySubscribeHandle {
+            store,
+            id,
+            reply_gate: None,
+        })
     }
 }
 
@@ -1716,6 +1744,7 @@ mod tests {
         let handle = PySubscribeHandle {
             store: Arc::clone(&store),
             id: "cache-only".to_string(),
+            reply_gate: None,
         };
 
         Python::attach(|python| {

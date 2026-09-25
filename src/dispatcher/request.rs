@@ -767,6 +767,14 @@ pub(super) fn handle_request(
     // What the client spoke, when a front declared it. Parallel to
     // `transport_name` above, which stays the hop siphon accepted.
     request.set_client_transport(inbound.client_transport);
+    // In-dialog messages a SUBSCRIBE handler sends through the handle it
+    // accepted wait here until the reply has been dispatched (RFC 6665
+    // §4.1.2.3). Only SUBSCRIBE creates such a handle, so only it pays for one.
+    let reply_gate = (method == "SUBSCRIBE").then(|| {
+        let gate = crate::script::api::proxy_utils::ReplyGate::open();
+        request.set_reply_gate(Arc::clone(&gate));
+        gate
+    });
 
     // Call Python handlers
     let (
@@ -885,6 +893,29 @@ pub(super) fn handle_request(
             auth_user,
         )
     });
+
+    // Every handler has returned, so whatever the gate holds was sent while
+    // the script was still deciding. Move it onto this thread's deferred queue,
+    // where the reply path picks up what goes to the same peer and the flush at
+    // the end sends the rest. A send after this point bypasses the gate.
+    if let Some(gate) = reply_gate {
+        for held in gate.close() {
+            if !crate::script::api::proxy_utils::try_defer_send(
+                held.message.clone(),
+                held.destination,
+                held.transport,
+            ) {
+                // Deferred mode never switched on (the PyRequest could not be
+                // built): nothing is going to be ordered against, send now.
+                match crate::script::api::proxy_utils::uac_sender() {
+                    Some(uac_sender) => {
+                        uac_sender.send_request(held.message, held.destination, held.transport)
+                    }
+                    None => warn!("held in-dialog message dropped: UAC sender not available"),
+                }
+            }
+        }
+    }
 
     // Process the action
     let Ok(message_guard) = message_arc.lock() else {

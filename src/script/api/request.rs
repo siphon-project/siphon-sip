@@ -223,6 +223,10 @@ pub struct PyRequest {
     /// recover pre-pop metadata such as the `orig`/`term` user-part the
     /// P-CSCF preloaded on the IMS service-route.
     consumed_routes: Vec<String>,
+    /// Hold for in-dialog messages that must follow this request's reply.
+    /// Set by the dispatcher for SUBSCRIBE only; `subscribe_state.accept()` /
+    /// `create()` hand it to the handle they return.
+    reply_gate: Option<Arc<super::proxy_utils::ReplyGate>>,
 }
 
 impl PyRequest {
@@ -254,6 +258,7 @@ impl PyRequest {
             local_addr: None,
             inbound_connection_id: None,
             consumed_routes: vec![],
+            reply_gate: None,
         }
     }
 
@@ -311,6 +316,7 @@ impl PyRequest {
             local_addr: None,
             inbound_connection_id: None,
             consumed_routes: vec![],
+            reply_gate: None,
         }
     }
 
@@ -327,6 +333,18 @@ impl PyRequest {
     pub fn set_inbound_flow(&mut self, local_addr: std::net::SocketAddr, connection_id: u64) {
         self.local_addr = Some(local_addr);
         self.inbound_connection_id = Some(connection_id);
+    }
+
+    /// Attach the gate that holds in-dialog messages behind this request's
+    /// reply. The dispatcher keeps its own clone and closes it once the
+    /// handlers have returned.
+    pub fn set_reply_gate(&mut self, gate: Arc<super::proxy_utils::ReplyGate>) {
+        self.reply_gate = Some(gate);
+    }
+
+    /// The gate set by [`Self::set_reply_gate`], if any.
+    pub(crate) fn reply_gate(&self) -> Option<Arc<super::proxy_utils::ReplyGate>> {
+        self.reply_gate.clone()
     }
 
     /// Record what the client spoke, when a front's PROXY header reported a
