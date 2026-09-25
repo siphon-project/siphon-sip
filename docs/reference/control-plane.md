@@ -434,6 +434,75 @@ wait forever with nothing to tell it.
 It fires whether or not a `@registrar.on_change` handler is registered: a
 dashboard should not depend on a script existing.
 
+#### Dialog state of registered AoRs: `DialogStateChanged`
+
+`events: [dialog]` subscribes an app to the RFC 4235 state of every dialog a
+registered AoR has through siphon's B2BUA, so a controller can serve the
+`dialog` event package (busy-lamp field) truthfully: ringing, talking or idle,
+per phone, ring groups and calls the phone places itself included. Every state
+comes from what siphon observed on the wire; nothing is inferred.
+
+```yaml
+control:
+  apps:
+    - name: presence
+      token: "${PRESENCE_TOKEN}"
+      events: [registration, dialog]
+```
+
+The payload, all from the AoR's point of view as dialog-info renders it:
+
+| field | meaning |
+|---|---|
+| `aor` | the registered AoR (its canonical registrar key, implicit-set aliases resolved to the primary) |
+| `state` | `trying`, `proceeding`, `early` (ringing), `confirmed` (in a call) or `terminated` |
+| `direction` | `initiator` (the phone placed the call) or `recipient` (it is being called) |
+| `leg_id` | siphon's id for the phone's leg: stable for the dialog's life and unique, so usable as the dialog-info `id`. For a branch of a `dial` it is the `leg_id` the branch's `DialBranch` named |
+| `call_id` | the SIP Call-ID of the phone's own dialog |
+| `local_tag` | the phone's tag, `null` until known (on a call ringing the phone, until its first tagged response) |
+| `remote_tag` | the other end's tag, `null` until known (on a call the phone placed, until siphon's first tagged response to it) |
+| `remote_identity` | `{uri, display_name}`: the party the phone is talking to, as presented on the phone's leg — the To of the INVITE it sent, or the From of the INVITE it received |
+
+A dialog moves only forward through the states and reports `terminated` exactly
+once, on every path that ends it: a BYE from either side, a CANCEL, a final
+failure, a ring timeout, a branch siphon CANCELled because another answered (a
+ring group's other members), a 2xx that lost an answer glare (reported
+`terminated`, never `confirmed`), a transfer's referrer, a dialog `Replaces`
+took over, and every call teardown. A phone is idle when every dialog it had has
+reported `terminated`. A ring group shows each member `early`, then the one that
+answered `confirmed` and the rest `terminated`; `DialAnswered` names that
+member's `aor` too.
+
+**Which AoR a leg belongs to.** A leg is reported only when siphon can tell
+whose it is from what it observed, never from a header a caller writes alone:
+
+- *A call a phone places*: the From must name a registered AoR, and a live
+  binding of it must vouch for the INVITE. It does when the INVITE
+  authenticated (a digest challenge in `@b2bua.on_invite`) as the identity that
+  REGISTERed the binding, or — for a binding stored without an authenticated
+  identity, or an INVITE that presented none — when the INVITE came from the
+  address that REGISTER came from. A From naming a phone, sent from anywhere
+  else, is not reported. The dialog is reported once the call is going
+  somewhere (routed, handed over, answered); an INVITE refused at admission, a
+  digest challenge included, never shows as a call.
+- *A call siphon places to a phone* (a B-leg, or an `originate`): the AoR an
+  `{aor}` target of a `dial` resolved from; otherwise the one AoR with a live
+  binding whose Contact is the INVITE's Request-URI. A Contact that bindings of
+  two AoRs share names neither.
+
+**Not covered: INVITEs the proxy relays.** A proxy keeps no dialog state once
+the INVITE transaction is over, and it sees the BYE only when the script
+Record-Routes and both ends honour the route set. Reporting those dialogs would
+leave a phone shown in a call forever whenever the BYE bypassed siphon, which is
+worse than no report, so a deployment that routes its phones through the proxy
+gets no `DialogStateChanged` for them.
+
+**Cost.** Nothing unless an app subscribes: every hook asks first. With a
+subscriber, matching a leg that siphon places at a raw URI to a registration
+scans the registrar's bindings (the same O(total contacts) scan as
+`registrar.lookup_contact`), once per B-leg INVITE; an `{aor}` target skips it.
+The per-dialog record lives on the call and is released with it.
+
 An **inbound REFER on a controlled call** (a party asking to be transferred) is
 handed to the owning app rather than the in-process `@b2bua.on_refer` path: siphon
 holds the REFER un-answered and pushes a `TransferRequested` event, payload
@@ -714,13 +783,20 @@ the caller's own.
 
 | event | payload | when |
 |---|---|---|
-| `DialBranch` | `{leg_id, leg_sip_call_id, target}` | a branch was created; its INVITE goes out next |
+| `DialBranch` | `{leg_id, leg_sip_call_id, target, aor?}` | a branch was created; its INVITE goes out next |
 | `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a branch ended without answering. `cause` is `rejected` (the far end's final non-2xx, `code`/`reason` its own), `timeout` (`408`, it rang out), `cancelled` (`487`, siphon CANCELled it: another branch answered, a `6xx` ended the fork, or the caller hung up) or `unsent` (`503`, the INVITE never reached the transport) |
 | `DialAnswered` | `{leg_id, leg_sip_call_id, target, code}` | this branch answered; sent before the branches it beat are reported `cancelled` |
 | `DialFailed` | `{code, reason, timed_out, branches}` | nobody answered. `branches` lists every branch the dial rang as `{leg_id, leg_sip_call_id, target, code, reason, cause}` |
 
 Each branch is reported once. A second `dial` on the same channel starts a
 fresh list, so its `DialFailed` carries only its own branches.
+
+Every branch event, and each `DialFailed.branches` entry, also carries `aor`
+when the branch was dialled at a contact an `{aor}` target resolved to: the
+registered AoR (its canonical key) the branch rang, so `DialAnswered.aor` is the
+phone that picked up. It is absent for a URI dialled as written, even one that
+happens to be a registered contact — only an `{aor}` target says whom the branch
+was dialled for.
 
 A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and

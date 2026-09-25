@@ -238,6 +238,7 @@ export type SipEventKind =
   | "DialBranchFailed"
   | "DialAnswered"
   | "DialFailed"
+  | "DialogStateChanged"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -493,6 +494,12 @@ export interface DialBranchPayload {
   leg_sip_call_id: string;
   /** The target the branch was dialled at. */
   target: string;
+  /**
+   * The registered AoR the branch was dialled for, when the target was one of
+   * the contacts an `{aor}` target resolved to. Absent for a raw URI, and from a
+   * server that predates it. Answers "which phone rang / picked up".
+   */
+  aor?: string;
 }
 
 /**
@@ -681,6 +688,60 @@ export interface WsBridgeEndedPayload {
  */
 export function isBridgeFinal(name: string): boolean {
   return name === "ChannelBridged" || name === "BridgeFailed";
+}
+
+/**
+ * An RFC 4235 dialog state — the `state` of a {@link DialogStateChangedPayload}:
+ * `trying` (INVITE sent or received, nothing answered), `proceeding` (an
+ * untagged provisional), `early` (a tagged provisional: ringing), `confirmed`
+ * (a 2xx: in a call) or `terminated`. Unknown tokens pass through verbatim.
+ */
+export type DialogState =
+  | "trying"
+  | "proceeding"
+  | "early"
+  | "confirmed"
+  | "terminated"
+  | (string & {});
+
+/**
+ * Which end of the dialog the AoR is: `initiator` (the phone placed the call)
+ * or `recipient` (the phone is being called).
+ */
+export type DialogDirection = "initiator" | "recipient" | (string & {});
+
+/** The party a dialog is with, as dialog-info renders `<remote><identity>`. */
+export interface DialogIdentity {
+  /** The other party's URI, as presented on the phone's leg. */
+  uri: string;
+  /** Its display name, or `null` when the header carried none. */
+  display_name: string | null;
+}
+
+/**
+ * The `payload` of a `DialogStateChanged` event — application-level, behind
+ * `control.apps[].events: [dialog]`, so its frame has no channel. One dialog of
+ * a registered AoR moved to a new RFC 4235 state, as the server observed it on
+ * the wire; everything is from the AoR's point of view. Each dialog reports its
+ * states in order and `terminated` exactly once.
+ */
+export interface DialogStateChangedPayload {
+  /** The registered AoR (its canonical key) the dialog belongs to. */
+  aor: string;
+  state: DialogState;
+  direction: DialogDirection;
+  /**
+   * The server's id for the phone's leg — stable and unique, usable as the
+   * dialog-info `id`. For a `dial` branch it is the `leg_id` of its `DialBranch`.
+   */
+  leg_id: string;
+  /** The SIP Call-ID of the phone's own dialog. */
+  call_id: string;
+  /** The phone's tag, or `null` until known. */
+  local_tag: string | null;
+  /** The other end's tag, or `null` until known. */
+  remote_tag: string | null;
+  remote_identity: DialogIdentity;
 }
 
 /**

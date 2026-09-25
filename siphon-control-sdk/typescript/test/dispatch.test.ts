@@ -9,7 +9,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import WebSocket from "ws";
 
 import { SipClient, SipServer, SUBPROTOCOL } from "../src/index";
-import type { Call } from "../src/index";
+import type { AppEvent, Call, DialogStateChangedPayload } from "../src/index";
 import { ControlStub, waitFor } from "./helpers";
 
 interface ReplyLike {
@@ -69,6 +69,48 @@ describe("inbound-persistent SipClient.onCall dispatch", () => {
     await waitFor(() =>
       stub.received.some((f) => f.verb === "answer" && f.target?.channel === "ch1"),
     );
+
+    sip.shutdown();
+    await runPromise;
+  });
+});
+
+describe("application-level events on SipClient", () => {
+  it("hands a channel-less DialogStateChanged to onAppEvent, never to a call", async () => {
+    const stub = await ControlStub.start();
+    cleanup.push(() => stub.stop());
+    const sip = await SipClient.connect({ url: stub.url(), app: "presence", token: "t" });
+
+    const events: AppEvent[] = [];
+    sip.onAppEvent((event) => events.push(event));
+    let calls = 0;
+    const runPromise = sip.onCall(() => {
+      calls += 1;
+    });
+
+    await waitFor(() => stub.connectionCount() === 1);
+    stub.pushEvent({
+      event: "DialogStateChanged",
+      app: "presence",
+      payload: {
+        aor: "sip:201@example.com",
+        state: "confirmed",
+        direction: "recipient",
+        leg_id: "leg-1",
+        call_id: "b1@host",
+        local_tag: "phone-tag",
+        remote_tag: "server-tag",
+        remote_identity: { uri: "sip:15550100042@example.com", display_name: null },
+      },
+    });
+
+    await waitFor(() => events.length === 1);
+    expect(events[0]?.kind).toBe("DialogStateChanged");
+    const payload = events[0]?.payload as DialogStateChangedPayload;
+    expect(payload.aor).toBe("sip:201@example.com");
+    expect(payload.state).toBe("confirmed");
+    expect(payload.remote_identity.display_name).toBeNull();
+    expect(calls).toBe(0);
 
     sip.shutdown();
     await runPromise;

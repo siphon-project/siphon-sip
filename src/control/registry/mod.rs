@@ -277,6 +277,20 @@ impl ControlBus {
         CONTROL_BUS.get().cloned()
     }
 
+    /// The process-global bus, if installed, without taking a reference: for a
+    /// signalling-path check that runs on every call.
+    pub fn global_ref() -> Option<&'static Arc<ControlBus>> {
+        CONTROL_BUS.get()
+    }
+
+    /// Whether any configured app asked for the application-level event
+    /// `class` (`control.apps[].events`).
+    pub fn wants_app_class(&self, class: &str) -> bool {
+        self.app_config
+            .values()
+            .any(|config| config.events.iter().any(|wanted| wanted == class))
+    }
+
     /// A cloneable sender for the command channel (used by the listener).
     pub fn command_sender(&self) -> flume::Sender<ControlCommand> {
         self.command_tx.clone()

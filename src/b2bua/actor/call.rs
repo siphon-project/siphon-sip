@@ -453,6 +453,21 @@ pub struct CallActor {
     /// Every B-leg the controller's current `dial` rang, with the outcome each
     /// has been reported with. See [`DialBranch`].
     pub dial_branches: Vec<DialBranch>,
+    /// The registered AoR each target of the controller's `dial` was resolved
+    /// from, by target URI: `(contact URI, AoR)` for every `{aor}` target. A
+    /// branch dialled at one of these URIs was dialled *for* that AoR, which
+    /// is what its events name. Empty for a dial of raw URIs.
+    pub control_dial_aors: Vec<(String, String)>,
+    /// The RFC 4235 dialog state of every leg of this call that belongs to a
+    /// registered AoR, as the control plane has been told of it. Only kept
+    /// while an app subscribes to `dialog` events; released with the call. See
+    /// [`DialogWatch`].
+    pub dialog_watches: Vec<DialogWatch>,
+    /// How far siphon's own responses have taken the caller's dialog: `Early`
+    /// once a provisional carrying siphon's To-tag went to the caller,
+    /// `Confirmed` once a 2xx did. Kept so a watch that starts after the
+    /// script answered reports what the caller already saw.
+    pub caller_dialog_state: DialogState,
     /// Control-loss policy for a handed-over call ("hangup"/"continue"/
     /// "fallback"). Owned by the control plane on owner disconnect; stored here
     /// for observability.
@@ -580,6 +595,9 @@ impl CallActor {
             control_dial_offer: None,
             control_dial_from_header: None,
             dial_branches: Vec::new(),
+            control_dial_aors: Vec::new(),
+            dialog_watches: Vec::new(),
+            caller_dialog_state: DialogState::Trying,
             on_control_loss: None,
             handoff_pending: false,
             originated: false,

@@ -97,6 +97,8 @@ mod control_originate_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
+mod dialog_state_events_tests;
+#[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]
 mod late_provisional_tests;

@@ -562,6 +562,10 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
         return false;
     }
 
+    // A call placed to a registered phone is that phone's dialog: watched
+    // before the INVITE goes, so no response can overtake it.
+    watch_originated_dialog(&prepared.internal_call_id, &prepared.invite, state);
+
     let data = Bytes::from(prepared.invite.to_bytes());
     arm_b2bua_retransmit(
         &prepared.invite,
@@ -654,6 +658,12 @@ pub fn handle_originated_call_response(
             "originate: absorbing a non-INVITE response on the originate branch"
         );
         return;
+    }
+
+    // A provisional or the first 2xx moves a registered callee's dialog state;
+    // a retransmitted 2xx moves nothing, and a final failure ends the call below.
+    if !already_answered {
+        observe_originated_response(internal_call_id, message, status_code, state);
     }
 
     if (100..200).contains(&status_code) {

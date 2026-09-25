@@ -74,6 +74,81 @@ pub fn notify_channel_event(sip_call_id: &str, event: &str, payload: serde_json:
     }
 }
 
+/// Publish an application-level event of `class` to every app that opted into
+/// it (`control.apps[].events`). A no-op when the control plane is not
+/// installed. Signalling-path helper — never blocks, never panics.
+pub fn notify_app_event(class: &str, event: &str, payload: serde_json::Value) {
+    #[cfg(test)]
+    app_event_capture::record(event, &payload);
+    if let Some(bus) = ControlBus::global_ref() {
+        bus.publish_app_event(class, event, payload);
+    }
+}
+
+/// Whether any configured app opted into the application-level event `class`.
+///
+/// Asked before the work that builds such an event, so a deployment nobody
+/// subscribed to it pays nothing: the answer is fixed at start-up, and without
+/// a control plane it is `false`.
+pub fn app_event_wanted(class: &str) -> bool {
+    #[cfg(test)]
+    if app_event_capture::active() {
+        return true;
+    }
+    ControlBus::global_ref().is_some_and(|bus| bus.wants_app_class(class))
+}
+
+/// What [`notify_app_event`] was asked to publish, for the AoRs a test watches.
+///
+/// The application-level twin of [`channel_event_capture`], for the same
+/// reason: the bus is process-global. Keyed by the payload's `aor`, so each
+/// test reads only the events of the extensions it registered. Watching turns
+/// [`app_event_wanted`] on for the rest of the test binary; events for an AoR
+/// nobody watches are dropped at once.
+#[cfg(test)]
+pub(crate) mod app_event_capture {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// `(event, payload)` in the order they were published.
+    pub(crate) type Captured = Vec<(String, serde_json::Value)>;
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    fn store() -> &'static Mutex<HashMap<String, Captured>> {
+        static STORE: OnceLock<Mutex<HashMap<String, Captured>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Start recording the events published for `aor`.
+    pub(crate) fn watch(aor: &str) {
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        store.insert(aor.to_string(), Vec::new());
+        ACTIVE.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn active() -> bool {
+        ACTIVE.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn record(event: &str, payload: &serde_json::Value) {
+        let Some(aor) = payload.get("aor").and_then(|aor| aor.as_str()) else {
+            return;
+        };
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(captured) = store.get_mut(aor) {
+            captured.push((event.to_string(), payload.clone()));
+        }
+    }
+
+    /// The events published for `aor` since the last look.
+    pub(crate) fn take(aor: &str) -> Captured {
+        let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
+        store.get_mut(aor).map(std::mem::take).unwrap_or_default()
+    }
+}
+
 /// What [`notify_channel_event`] was asked to publish, for the Call-IDs a test
 /// watches.
 ///

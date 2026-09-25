@@ -311,6 +311,37 @@ entry, but a working config keeps working.
   awaited counterpart to the implicit cache read the properties no longer make
   (below) — for a dialog another replica owns whose local entry has since been
   reaped.
+- **Dialog state of registered phones on the control plane: `DialogStateChanged`.**
+  An app that lists `dialog` in `control.apps[].events` is told the RFC 4235
+  state of every dialog a registered AoR has through the B2BUA, so it can serve
+  the `dialog` event package (busy-lamp field): `{aor, state, direction, leg_id,
+  call_id, local_tag, remote_tag, remote_identity}`, with `state` one of
+  `trying` / `proceeding` / `early` / `confirmed` / `terminated`, all from the
+  phone's side. It covers calls a phone places, every B-leg to a registered
+  contact (a ring group shows each member ringing, then the one that answered
+  confirmed and the others terminated) and `originate` to a registered contact.
+  Each dialog reports `terminated` exactly once, whatever ended it: BYE from
+  either side, CANCEL, a final failure, the ring timeout, a branch cancelled
+  because another answered, a 2xx that lost an answer glare. A call a phone
+  places is matched to its AoR only when a live binding vouches for the INVITE
+  (its authenticated identity, or the address the binding registered from),
+  never by the From header alone. INVITEs the proxy relays are **not**
+  reported: the proxy cannot see every BYE, and a dialog it could never end is
+  worse than none. Nothing is tracked unless an app subscribes.
+
+- **Control-plane `dial` branch events name the AoR they rang.** `DialBranch`,
+  `DialBranchFailed`, `DialAnswered` and each `DialFailed.branches` entry carry
+  `aor` when the branch was one of an `{aor}` target's contacts, so
+  `DialAnswered.aor` is the phone that picked up. Absent for a URI dialled as
+  written.
+
+- **Control SDKs receive application-level events.** The SIP facades dropped
+  every frame without a channel, so `RegistrationChanged` never reached an app
+  that used them. `SipClient::set_app_event_handler` / `app_events()` (Rust),
+  `@client.on_app_event` (Python, called as `handler(event, payload)`) and
+  `SipClient.onAppEvent` (TypeScript) deliver them now. `DialogStateChanged` is
+  typed in the Rust (`DialogStateChangedPayload`, `AppEvent::dialog_state`) and
+  TypeScript SDKs, and the dial branch payloads gain `aor`.
 
 ## [1.10.0] — 2026-09-24
 

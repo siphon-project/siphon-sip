@@ -110,6 +110,31 @@ async def _stub_handler(websocket):
                 )
             )
             await _reply_ok(websocket, frame_id, {})
+        elif verb == "test_push_app_event":
+            # Application-level: no channel, no call ids.
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "event",
+                        "event": "DialogStateChanged",
+                        "app": APP,
+                        "payload": {
+                            "aor": "sip:201@example.com",
+                            "state": "early",
+                            "direction": "recipient",
+                            "leg_id": "leg-1",
+                            "call_id": "b1@host",
+                            "local_tag": "phone-tag",
+                            "remote_tag": "server-tag",
+                            "remote_identity": {
+                                "uri": "sip:15550100042@example.com",
+                                "display_name": None,
+                            },
+                        },
+                    }
+                )
+            )
+            await _reply_ok(websocket, frame_id, {})
         else:
             await _reply_ok(websocket, frame_id, {"state": "answered"})
 
@@ -125,6 +150,7 @@ async def _serve_stub():
 
 def test_module_surface():
     assert hasattr(ControlClient, "on_call")
+    assert hasattr(ControlClient, "on_app_event")
     assert hasattr(ControlServer, "on_call")
     assert hasattr(ControlServer, "serve")
     assert hasattr(ControlServer, "run")
@@ -194,6 +220,37 @@ def test_on_call_async_dispatch():
             assert channel == "ch1"
             assert reattached is False
             assert header == "203.0.113.7"
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_on_app_event_dispatch():
+    """An application-level event (no channel) reaches `@client.on_app_event`."""
+
+    async def scenario():
+        async with _serve_stub() as url:
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            fired = asyncio.get_event_loop().create_future()
+
+            @client.on_app_event
+            async def handle(event, payload):
+                if not fired.done():
+                    fired.set_result((event, payload))
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_app_event")
+
+            event, payload = await asyncio.wait_for(fired, timeout=5)
+            assert event == "DialogStateChanged"
+            assert payload["aor"] == "sip:201@example.com"
+            assert payload["state"] == "early"
+            assert payload["remote_identity"]["display_name"] is None
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

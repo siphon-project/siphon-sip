@@ -33,6 +33,11 @@ fn identity(branch: &DialBranch) -> serde_json::Map<String, serde_json::Value> {
         branch.leg_sip_call_id.clone().into(),
     );
     fields.insert("target".into(), branch.target.clone().into());
+    // Only when the branch was dialled for a registered AoR: a raw URI names
+    // nobody, and an absent field says so without inventing one.
+    if let Some(aor) = &branch.aor {
+        fields.insert("aor".into(), aor.clone().into());
+    }
     fields
 }
 
@@ -166,6 +171,7 @@ mod tests {
             leg_id: "leg-1".to_string(),
             leg_sip_call_id: "b-leg-1@siphon".to_string(),
             target: "sip:15550100077@198.51.100.7".to_string(),
+            aor: None,
             outcome,
         }
     }
@@ -187,6 +193,18 @@ mod tests {
                 "reason": "Busy Here",
                 "cause": "rejected",
             })
+        );
+    }
+
+    /// A branch dialled for a registered AoR names it in every event.
+    #[test]
+    fn a_branch_dialled_for_an_aor_names_it() {
+        let mut named = branch(None);
+        named.aor = Some("sip:201@example.com".to_string());
+        assert_eq!(dial_branch_summary(&named)["aor"], "sip:201@example.com");
+        assert!(
+            dial_branch_summary(&branch(None)).get("aor").is_none(),
+            "a raw URI names no AoR"
         );
     }
 

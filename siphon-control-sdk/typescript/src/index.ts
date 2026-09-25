@@ -97,6 +97,10 @@ export type {
   DialBranchOutcome,
   DialAnsweredPayload,
   DialFailedPayload,
+  DialogState,
+  DialogDirection,
+  DialogIdentity,
+  DialogStateChangedPayload,
   PlayFinishedPayload,
   WsTeeStartedPayload,
   WsTeeEndedPayload,
@@ -123,6 +127,8 @@ export {
   recordStopArgs,
 } from "./sip";
 export type {
+  AppEvent,
+  AppEventHandler,
   CallEvent,
   CallHandler,
   DialTarget,

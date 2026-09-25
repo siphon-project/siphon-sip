@@ -2287,6 +2287,13 @@ log:
 #                                   #     connection of the app, not one picked
 #                                   #     round robin: a dashboard behind two
 #                                   #     replicas needs both to see it.
+#                                   #   dialog -> DialogStateChanged {aor, state,
+#                                   #     direction, leg_id, call_id, local_tag,
+#                                   #     remote_tag, remote_identity}: the RFC
+#                                   #     4235 state of every dialog a registered
+#                                   #     AoR has through the B2BUA (busy-lamp
+#                                   #     field). Proxy-relayed dialogs are not
+#                                   #     reported.
 #   limits:
 #     event_queue_depth: 1024       # bounded per-connection outbound queue
 #     slow_consumer: drop_oldest    # drop_oldest | disconnect

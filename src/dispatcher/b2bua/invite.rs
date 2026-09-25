@@ -571,6 +571,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         .call_actors
         .set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
+    // Who the caller authenticated as, if the script challenged it: what a
+    // registered phone's own call is recognised by (`watch_caller_dialog`).
+    let auth_user = outcome.auth_user.clone();
     apply_handler_side_state(&call_id, outcome, state);
 
     // The INVITE carried a `Replaces` naming a dialog this node hosts, and the
@@ -589,8 +592,35 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 return;
             };
             b2bua_bridge_inbound_replaces(&inbound, &message_guard, &call_id, &pending, state);
+            // A takeover that went through put this leg in the A-leg slot of
+            // the call it joined, answered: a registered phone that did it (a
+            // call pickup, an attended transfer's target) is on that call now.
+            let adopted = state
+                .call_actors
+                .get_call(&pending.replaced_call_id)
+                .is_some_and(|call| call.a_leg.dialog.call_id == sip_call_id);
+            if adopted {
+                watch_caller_dialog(&pending.replaced_call_id, auth_user.as_deref(), state);
+            }
             return;
         }
+    }
+
+    // A call a registered phone placed is watched from here, once it is going
+    // somewhere: routed, handed over, or answered by the script. A reject (a
+    // digest challenge, a refusal) or a silent drop never became a call, and a
+    // phone is never shown in one for it.
+    let going_somewhere = match &action {
+        CallAction::Dial { .. }
+        | CallAction::Fork { .. }
+        | CallAction::RouteSequence { .. }
+        | CallAction::Handover { .. }
+        | CallAction::Answered => true,
+        CallAction::None => handlers.is_empty() && state.control_inbound.is_some(),
+        _ => false,
+    };
+    if going_somewhere {
+        watch_caller_dialog(&call_id, auth_user.as_deref(), state);
     }
 
     match action {

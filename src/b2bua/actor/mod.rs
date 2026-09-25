@@ -29,6 +29,7 @@
 
 mod call;
 mod dial_branch;
+mod dialog_watch;
 mod helpers;
 mod leg;
 mod leg_actor;
@@ -44,6 +45,7 @@ mod tests;
 // private: splitting the file must not add a second public path to maintain.
 pub use call::*;
 pub use dial_branch::*;
+pub use dialog_watch::*;
 pub use helpers::*;
 pub use leg::*;
 pub use leg_actor::*;

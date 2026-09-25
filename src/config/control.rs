@@ -143,8 +143,13 @@ pub struct ControlAppConfig {
     /// sending them to every connected app would put a registration storm on
     /// the event queue of an application that only makes outbound calls.
     ///
-    /// Known class: `registration` — `RegistrationChanged {aor, event,
-    /// contacts}` on every registrar state change.
+    /// Known classes:
+    ///
+    /// - `registration` — `RegistrationChanged {aor, event, contacts}` on every
+    ///   registrar state change.
+    /// - `dialog` — `DialogStateChanged {aor, state, direction, call_id, …}`,
+    ///   the RFC 4235 state of every dialog of a registered AoR that siphon's
+    ///   B2BUA carries, for a controller serving the `dialog` event package.
     #[serde(default)]
     pub events: Vec<String>,
 }

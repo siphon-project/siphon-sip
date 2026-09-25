@@ -760,6 +760,10 @@ pub struct DialTarget {
     /// Calling-identity presentation for this branch alone (RFC 3323 §4.1).
     /// One carrier may be trusted with the real identity where another is not.
     pub privacy: Option<crate::sip::privacy::CallerIdPresentation>,
+    /// The registered AoR this target is a contact of, when it came from an
+    /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
+    /// as the AoR it was dialled for; `None` for a URI dialled as written.
+    pub aor: Option<String>,
 }
 
 impl DialTarget {
@@ -995,6 +999,11 @@ pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
     if contacts.is_empty() {
         return Err(DialError::NoContacts(aor.to_string()));
     }
+    // The key the bindings are stored under, which is what a watcher of the
+    // AoR subscribed to, however the controller spelled it.
+    let registered = registrar
+        .registered_aor(aor)
+        .unwrap_or_else(|| crate::registrar::normalize_aor(aor));
     Ok(contacts
         .into_iter()
         .map(|contact| {
@@ -1022,6 +1031,7 @@ pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
                 flow,
                 route,
                 headers: std::collections::HashMap::new(),
+                aor: Some(registered.clone()),
                 ..Default::default()
             }
         })
@@ -1198,6 +1208,16 @@ pub(crate) fn b2bua_dial_call_with_state(
     // Ownership is deliberately NOT released — that is the whole difference
     // from `route`.
     state.call_actors.set_control_dial(&internal_call_id, true);
+    // Which registered AoR each `{aor}` target's contacts belong to, so every
+    // branch this dial places — a sequential hunt's later attempts included —
+    // names the AoR it was dialled for. Replaced per dial: a second dial on the
+    // channel names only its own.
+    if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
+        call.control_dial_aors = targets
+            .iter()
+            .filter_map(|target| Some((target.uri.clone(), target.aor.clone()?)))
+            .collect();
+    }
 
     let sent = if parallel {
         dial_parallel(
