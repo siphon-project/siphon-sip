@@ -68,6 +68,17 @@ entry, but a working config keeps working.
   reading it back resurrects a dialog the sweeper has already sent the
   terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
   ask for it with `await handle.reload()`.
+### Added
+
+- **The control-plane `dial` names every B-leg it rings.** Each branch had its
+  own generated Call-ID and nothing tied it back to the call, so a controller
+  could not associate the legs with its channel. New channel events:
+  `DialBranch {leg_id, leg_sip_call_id, target}` when a branch is created (each
+  attempt of a sequential hunt too), `DialBranchFailed` with `code`, `reason`
+  and a `cause` of `rejected` / `timeout` / `cancelled` / `unsent`, and
+  `DialAnswered` for the winner. `DialFailed` gains `branches`, every branch
+  with its outcome. All four are listed in `describe` and typed in the control
+  SDKs.
 
 ### Fixed
 

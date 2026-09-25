@@ -692,7 +692,7 @@ media reach the caller as they do for a script's `call.fork`; the first 2xx
 answers the caller with the winner's SDP and the pair becomes an ordinary
 two-leg B2BUA call, with the app still owning it.
 
-A failure or a timeout arrives as `DialFailed {code, reason, timed_out}` with
+A failure or a timeout arrives as `DialFailed {code, reason, timed_out, branches}` with
 the caller **still ringing and still parked**. A timeout is `code: 408`, except
 on a `sequential` dial whose last target never sent a 101-199: nothing rang, and
 it is `503`. Nothing is forwarded to it, so
@@ -701,6 +701,26 @@ answer into voicemail, or reject with its own code. That is the difference from
 [`route`](#route), which hands the call back to siphon — the app gets
 `StasisEnd{reason: routed}` and loses it, so "ring the extension, then
 voicemail" is not expressible with `route`.
+
+**Every branch is named.** Each B-leg is its own SIP dialog, on a Call-ID siphon
+generates, so nothing on the wire ties it to the caller's call. The events do:
+each branch is named when its INVITE is built (every fork branch, and each
+attempt of a `sequential` hunt when the hunt places it), and named again with
+its outcome. A branch is identified by `leg_id`, siphon's id for the B-leg,
+stable across a 401/407 or 422 retry of that leg, and `leg_sip_call_id`, the
+Call-ID its INVITE carries. The pair follows `ChannelBridged`'s
+`peer_call_id` / `peer_sip_call_id`; the bare `sip_call_id` on the frame stays
+the caller's own.
+
+| event | payload | when |
+|---|---|---|
+| `DialBranch` | `{leg_id, leg_sip_call_id, target}` | a branch was created; its INVITE goes out next |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a branch ended without answering. `cause` is `rejected` (the far end's final non-2xx, `code`/`reason` its own), `timeout` (`408`, it rang out), `cancelled` (`487`, siphon CANCELled it: another branch answered, a `6xx` ended the fork, or the caller hung up) or `unsent` (`503`, the INVITE never reached the transport) |
+| `DialAnswered` | `{leg_id, leg_sip_call_id, target, code}` | this branch answered; sent before the branches it beat are reported `cancelled` |
+| `DialFailed` | `{code, reason, timed_out, branches}` | nobody answered. `branches` lists every branch the dial rang as `{leg_id, leg_sip_call_id, target, code, reason, cause}` |
+
+Each branch is reported once. A second `dial` on the same channel starts a
+fresh list, so its `DialFailed` carries only its own branches.
 
 A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and

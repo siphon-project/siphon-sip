@@ -12,6 +12,7 @@ import {
   Call,
   encodeCommand,
   isBridgeFinal,
+  isDialFinal,
   isTransferFinal,
   sipEventKind,
   SipVerb,
@@ -27,6 +28,10 @@ import type {
   CallEvent,
   ChannelBridgedPayload,
   ChannelUnbridgedPayload,
+  DialAnsweredPayload,
+  DialBranchOutcome,
+  DialBranchPayload,
+  DialFailedPayload,
   TransferOutcomePayload,
 } from "../src/index";
 import type { CommandTransport } from "../src/session";
@@ -156,6 +161,42 @@ describe("SipVerb wire tokens + event names", () => {
       '{"peer_call_id":"call-b","peer_sip_call_id":"b@host","reason":"supervisor took over"}',
     );
     expect(unbridged.reason).toBe("supervisor took over");
+  });
+
+  it("marks exactly the dial outcomes as final", () => {
+    expect(isDialFinal("DialAnswered")).toBe(true);
+    expect(isDialFinal("DialFailed")).toBe(true);
+    expect(isDialFinal("DialBranch")).toBe(false);
+    expect(isDialFinal("DialBranchFailed")).toBe(false);
+    expect(sipEventKind("DialBranch")).toBe("DialBranch");
+  });
+
+  it("decodes the dial event payloads", () => {
+    // Byte-identical to what the server pushes on the dialling channel.
+    const branch: DialBranchPayload = JSON.parse(
+      '{"leg_id":"leg-1","leg_sip_call_id":"b1@host","target":"sip:204@example.com"}',
+    );
+    expect(branch.leg_sip_call_id).toBe("b1@host");
+
+    const busy: DialBranchOutcome = JSON.parse(
+      '{"leg_id":"leg-1","leg_sip_call_id":"b1@host","target":"sip:204@example.com",' +
+        '"code":486,"reason":"Busy Here","cause":"rejected"}',
+    );
+    expect(busy.cause).toBe("rejected");
+    expect(busy.code).toBe(486);
+
+    const answered: DialAnsweredPayload = JSON.parse(
+      '{"leg_id":"leg-2","leg_sip_call_id":"b2@host","target":"sip:205@example.com","code":200}',
+    );
+    expect(answered.leg_id).toBe("leg-2");
+
+    const failed: DialFailedPayload = JSON.parse(
+      '{"code":408,"reason":"Request Timeout","timed_out":true,"branches":[' +
+        '{"leg_id":"leg-1","leg_sip_call_id":"b1@host","target":"sip:204@example.com",' +
+        '"code":408,"reason":"Request Timeout","cause":"timeout"}]}',
+    );
+    expect(failed.timed_out).toBe(true);
+    expect(failed.branches?.[0]?.leg_sip_call_id).toBe("b1@host");
   });
 
   it("decodes a transfer verdict payload", () => {

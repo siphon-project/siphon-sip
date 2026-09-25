@@ -450,6 +450,9 @@ pub struct CallActor {
     /// voicemail box, a retry on another trunk — presents it too unless that
     /// dial names a different one.
     pub control_dial_from_header: Option<String>,
+    /// Every B-leg the controller's current `dial` rang, with the outcome each
+    /// has been reported with. See [`DialBranch`].
+    pub dial_branches: Vec<DialBranch>,
     /// Control-loss policy for a handed-over call ("hangup"/"continue"/
     /// "fallback"). Owned by the control plane on owner disconnect; stored here
     /// for observability.
@@ -576,6 +579,7 @@ impl CallActor {
             control_dial_media: false,
             control_dial_offer: None,
             control_dial_from_header: None,
+            dial_branches: Vec::new(),
             on_control_loss: None,
             handoff_pending: false,
             originated: false,
@@ -930,6 +934,10 @@ impl CallActor {
             // The retry re-sends the superseded INVITE's offer, so the session
             // description in force on the dialog is the same one.
             leg.dialog.last_sent_sdp = superseded.last_sent_sdp.clone();
+            // And it is the same leg, so it keeps the leg's identity: the control
+            // plane named this leg by its id when it was dialled, and the retry's
+            // outcome has to settle that branch rather than one nobody was told of.
+            leg.id = self.b_legs[index].id.clone();
             let old_branch = std::mem::replace(&mut self.b_legs[index], leg).branch;
             self.b_leg_status[index] = BLegStatus::Trying;
             self.b_leg_handles[index] = None;

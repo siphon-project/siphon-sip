@@ -170,6 +170,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     let cancel_a_leg_flow = py_flow_from_leg(&call.a_leg.transport);
     drop(call);
 
+    // The caller gave up: every branch of a controller-issued `dial` still
+    // ringing is CANCELled below, and the controller is told which.
+    control_dial_open_branches_ended(
+        &call_id,
+        487,
+        "Request Terminated",
+        crate::b2bua::actor::DialBranchCause::Cancelled,
+        state,
+    );
+
     // Emit the prepared CANCELs after dropping the call lock so the
     // outbound path doesn't reenter the DashMap.
     for (cancel_msg, b_transport, b_dest, b_local) in bleg_targets {

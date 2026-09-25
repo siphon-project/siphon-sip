@@ -1145,6 +1145,7 @@ pub(crate) fn b2bua_dial_call_with_state(
                 "reason": unhonoured_tags_response(&unsupported).1,
                 "timed_out": false,
                 "unsupported": unsupported.clone(),
+                "branches": control_dial_branches_for_failure(&internal_call_id, state),
             }),
         );
         refuse_bad_extension(&internal_call_id, &template, unsupported, state);
@@ -1234,6 +1235,7 @@ pub(crate) fn b2bua_dial_call_with_state(
                 "code": 503,
                 "reason": "no branch could be sent",
                 "timed_out": false,
+                "branches": control_dial_branches_for_failure(&internal_call_id, state),
             }),
         );
         return Ok(true);
@@ -1494,6 +1496,7 @@ pub fn report_control_dial_failure(
             "code": status_code,
             "reason": reason,
             "timed_out": timed_out,
+            "branches": control_dial_branches_for_failure(call_id, state),
         }),
     );
     true

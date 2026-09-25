@@ -816,7 +816,11 @@ export class Call {
    * The first 2xx answers the caller with the winner's SDP and the pair becomes
    * an ordinary two-leg call, still owned by this app. A failure or timeout
    * arrives as a `DialFailed` event with the caller still ringing and still
-   * parked, so the app decides what happens next.
+   * parked, so the app decides what happens next. Every branch is named as it is
+   * created (`DialBranch`) and as it ends (`DialBranchFailed` / `DialAnswered`),
+   * by its `leg_id` and `leg_sip_call_id` — see
+   * {@link import("./protocol").DialBranchPayload} — and `DialFailed` lists them
+   * all.
    *
    * Each target is a URI (dialed as written) or an `{aor}` (forked to every
    * registered contact over its own flow) — see {@link DialTarget}, and note

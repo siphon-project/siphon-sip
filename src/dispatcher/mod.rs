@@ -89,6 +89,8 @@ mod bad_extension_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_dial_branch_events_tests;
+#[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
 mod control_originate_tests;

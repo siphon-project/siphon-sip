@@ -253,6 +253,17 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         None => return,
     };
 
+    // Every branch of a controller-issued `dial` still ringing has rung out:
+    // named as timed out now, ahead of the CANCELs below (which would otherwise
+    // report them as cancelled) and of a sequential hunt's next attempt.
+    control_dial_open_branches_ended(
+        call_id,
+        408,
+        "Request Timeout",
+        crate::b2bua::actor::DialBranchCause::Timeout,
+        state,
+    );
+
     // What the call fails with if this timeout ends it. Whether the carrier in
     // flight sent a 101-199 is read here, before anything below can advance the
     // sequence, which takes the next carrier and clears it.
@@ -311,7 +322,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
         }
         let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-        cancel_settled_branches(&cancelled, state);
+        cancel_settled_branches(call_id, &cancelled, state);
         let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
             Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
             _ => RouteAdvance::none(),
@@ -344,7 +355,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
         }
         let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-        cancel_settled_branches(&cancelled, state);
+        cancel_settled_branches(call_id, &cancelled, state);
         if report_control_dial_failure(
             call_id,
             failure_status,
@@ -373,7 +384,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             for tx in &handle_txs {
                 let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
             }
-            cancel_settled_branches(&settlement.cancelled, state);
+            cancel_settled_branches(call_id, &settlement.cancelled, state);
             fail_forked_call(call_id, best, state);
             return;
         }
@@ -393,7 +404,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
     }
     let cancelled = state.call_actors.cancel_ringing_branches(call_id);
-    cancel_settled_branches(&cancelled, state);
+    cancel_settled_branches(call_id, &cancelled, state);
 
     // A ring that ran out is a 408 (RFC 3261 §16.8), or a 503 for a route
     // sequence no carrier of which reached the callee, and the call concludes on

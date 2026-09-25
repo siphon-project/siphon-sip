@@ -19,11 +19,13 @@
 
 use serde_json::json;
 
-use siphon_control_proto::sip::SipVerb;
+use siphon_control_proto::sip::{
+    DialAnsweredPayload, DialBranchOutcome, DialBranchPayload, DialFailedPayload, SipEvent, SipVerb,
+};
 
 use crate::error::ControlError;
 use crate::originate::OriginatePrivacy;
-use crate::sip::{headers_to_json, Call};
+use crate::sip::{headers_to_json, Call, CallEvent};
 
 /// One target of a [`Call::dial`] — a URI to dial as written, or an AoR to fork
 /// to its registered contacts.
@@ -392,7 +394,10 @@ impl Call {
     /// SDP and the pair becomes an ordinary two-leg call, with this app still
     /// owning it. A failure or a timeout arrives as a `DialFailed` event with the
     /// caller still ringing and still parked, so nothing is forwarded to it and
-    /// the app decides what happens next.
+    /// the app decides what happens next. Each branch is named as it is created
+    /// ([`CallEvent::dial_branch`](crate::CallEvent::dial_branch)) and as it ends
+    /// (`dial_branch_failed` / `dial_answered`), by its leg id and the SIP
+    /// Call-ID its INVITE carries, and `DialFailed` lists them all.
     ///
     /// Each target is a [`DialTarget::Uri`] (dialed as written) or a
     /// [`DialTarget::Aor`] (forked to every registered contact over its own
@@ -460,9 +465,139 @@ impl Call {
     }
 }
 
+/// Typed views over the events a `dial` produces. Each branch it rings is its
+/// own SIP dialog, on a Call-ID the server generated, so these are what tie a
+/// leg back to the channel.
+impl CallEvent {
+    /// The typed [`DialBranchPayload`] when this is a [`SipEvent::DialBranch`]
+    /// event, else `None`: a B-leg the `dial` just created, by the leg id its
+    /// later events carry and the Call-ID its INVITE carries.
+    pub fn dial_branch(&self) -> Option<DialBranchPayload> {
+        if self.kind != SipEvent::DialBranch {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`DialBranchOutcome`] when this is a
+    /// [`SipEvent::DialBranchFailed`] event, else `None`: one branch of the
+    /// `dial` ended without answering, and why.
+    pub fn dial_branch_failed(&self) -> Option<DialBranchOutcome> {
+        if self.kind != SipEvent::DialBranchFailed {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`DialAnsweredPayload`] when this is a
+    /// [`SipEvent::DialAnswered`] event, else `None`: the branch that answered.
+    pub fn dial_answered(&self) -> Option<DialAnsweredPayload> {
+        if self.kind != SipEvent::DialAnswered {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`DialFailedPayload`] when this is a [`SipEvent::DialFailed`]
+    /// event, else `None`: nobody answered, with every branch and its outcome.
+    pub fn dial_failed(&self) -> Option<DialFailedPayload> {
+        if self.kind != SipEvent::DialFailed {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether this event ends a `dial` — exactly one `DialAnswered` or
+    /// `DialFailed` arrives per dial, so this is the signal to stop waiting.
+    pub fn is_dial_final(&self) -> bool {
+        matches!(self.kind, SipEvent::DialAnswered | SipEvent::DialFailed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use siphon_control_proto::sip::DialBranchCause;
+    use siphon_control_proto::EventFrame;
+
+    #[test]
+    fn dial_events_parse_from_frames() {
+        let frame = |event: &str, payload: serde_json::Value| {
+            let frame = EventFrame::new(event, "ch1", "ivr-app", "call-uuid", "sip@host", payload);
+            CallEvent {
+                kind: frame.sip_kind(),
+                payload: frame.payload.clone(),
+                frame,
+            }
+        };
+
+        let created = frame(
+            "DialBranch",
+            json!({
+                "leg_id": "leg-1",
+                "leg_sip_call_id": "b1@host",
+                "target": "sip:204@example.com"
+            }),
+        );
+        assert_eq!(created.kind, SipEvent::DialBranch);
+        let payload = created.dial_branch().expect("branch payload");
+        assert_eq!(payload.leg_id, "leg-1");
+        assert_eq!(payload.leg_sip_call_id, "b1@host");
+        assert!(!created.is_dial_final());
+        assert!(created.dial_failed().is_none());
+
+        let busy = frame(
+            "DialBranchFailed",
+            json!({
+                "leg_id": "leg-1",
+                "leg_sip_call_id": "b1@host",
+                "target": "sip:204@example.com",
+                "code": 486,
+                "reason": "Busy Here",
+                "cause": "rejected"
+            }),
+        );
+        let payload = busy.dial_branch_failed().expect("branch outcome");
+        assert_eq!(payload.code, 486);
+        assert_eq!(payload.cause, DialBranchCause::Rejected);
+        assert!(!busy.is_dial_final());
+
+        let answered = frame(
+            "DialAnswered",
+            json!({
+                "leg_id": "leg-2",
+                "leg_sip_call_id": "b2@host",
+                "target": "sip:205@example.com",
+                "code": 200
+            }),
+        );
+        let payload = answered.dial_answered().expect("answered payload");
+        assert_eq!(payload.leg_sip_call_id, "b2@host");
+        assert!(answered.is_dial_final());
+        assert!(answered.dial_branch().is_none());
+
+        let failed = frame(
+            "DialFailed",
+            json!({
+                "code": 486,
+                "reason": "Busy Here",
+                "timed_out": false,
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:204@example.com",
+                    "code": 486,
+                    "reason": "Busy Here",
+                    "cause": "rejected"
+                }]
+            }),
+        );
+        let payload = failed.dial_failed().expect("failed payload");
+        assert_eq!(payload.branches.len(), 1);
+        assert_eq!(payload.branches[0].leg_sip_call_id, "b1@host");
+        assert!(failed.is_dial_final());
+    }
 
     /// A target with no overrides stays a bare string, which is the shape the
     /// server's own examples use.

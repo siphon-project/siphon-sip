@@ -28,6 +28,7 @@
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
 mod call;
+mod dial_branch;
 mod helpers;
 mod leg;
 mod leg_actor;
@@ -42,6 +43,7 @@ mod tests;
 // every item keeps the name it had when this was one file. The submodules are
 // private: splitting the file must not add a second public path to maintain.
 pub use call::*;
+pub use dial_branch::*;
 pub use helpers::*;
 pub use leg::*;
 pub use leg_actor::*;

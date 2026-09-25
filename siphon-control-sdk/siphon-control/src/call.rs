@@ -627,6 +627,13 @@ impl Call {
     /// timeout arrives as a ``DialFailed`` event with the caller still ringing
     /// and still parked, so the app decides what happens next.
     ///
+    /// Every branch is named on the event stream: ``DialBranch`` when it is
+    /// created, then ``DialBranchFailed`` (with ``code``, ``reason`` and a
+    /// ``cause`` of ``rejected`` / ``timeout`` / ``cancelled`` / ``unsent``) or
+    /// ``DialAnswered``. Each carries ``leg_id`` and ``leg_sip_call_id``, the
+    /// Call-ID the branch's INVITE went out with, and ``DialFailed`` lists every
+    /// branch under ``branches``.
+    ///
     /// Each target is a dict: ``{"uri": ..., "next_hop": ..., "headers": {...}}``
     /// is dialed as written and resolved by DNS, while
     /// ``{"aor": ..., "headers": {...}}`` is forked to **every** contact
