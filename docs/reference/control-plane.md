@@ -565,7 +565,7 @@ control:
 subscription check or the tracking store's emptiness, measured at under a
 nanosecond (`benches/dialog_state.rs`, `gate_unsubscribed`). With a
 subscriber, each INVITE branch pays a scan of the registrar's bindings to match
-its target (about 46 µs at 1,000 bindings, `match_callee_1k_bindings`; an
+its target (about 36 µs at 1,000 bindings, `match_callee_1k_bindings`; an
 `{aor}` target of a `dial` skips it), and each tracked proxied call about
 1.5 µs of bookkeeping from INVITE to BYE (`track_proxied_call`). A B2BUA leg's
 record lives on its call and is released with it; the proxy store drains as
