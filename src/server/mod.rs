@@ -1553,9 +1553,10 @@ impl SiphonServer {
         }
 
         // Stream-connection registry — created before the pool/listeners so all
-        // stream transports (TLS, WS, WSS) and the pool register here, and the
-        // dispatcher can reuse an inbound connection for MT routing (the only
-        // way to reach a WebSocket UE; RFC 7118 §5 / RFC 5626 §5.3).  Supersedes
+        // stream transports (TCP, TLS, WS, WSS) and the pool register here, and
+        // the dispatcher can reuse an inbound connection for MT routing (the
+        // only way to reach a WebSocket UE, or a TCP peer behind NAT; RFC 7118
+        // §5 / RFC 5626 §5.3 / RFC 5923).  Supersedes
         // the former TLS-only `tls_addr_map`.
         let stream_connections = transport::StreamConnections::new();
         // Publish it process-globally so the Python `Flow.is_alive` getter can
@@ -1668,6 +1669,7 @@ impl SiphonServer {
                 tcp_outbound_rx.clone(),
                 Arc::clone(&tcp_connection_map),
                 Arc::clone(&transport_acl),
+                stream_connections.clone(),
                 tos,
                 Some(Arc::clone(&connection_pool)),
                 crlf_pong_tracker.clone(),

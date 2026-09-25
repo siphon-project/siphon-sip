@@ -96,10 +96,7 @@ fn lookup_tls_connection(
     stream_connections: &StreamConnections,
     addr: SocketAddr,
 ) -> Option<ConnectionId> {
-    stream_connections
-        .get(&addr)
-        .filter(|(transport, _)| *transport == Transport::Tls)
-        .map(|(_, connection_id)| connection_id)
+    stream_connections.get(&addr, Transport::Tls)
 }
 
 /// Send OPTIONS pings to all registered contacts with a source address.

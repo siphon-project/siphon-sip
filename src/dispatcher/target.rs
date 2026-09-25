@@ -304,11 +304,10 @@ pub(super) fn mtu_tcp_upgrade(
 ///
 /// Returns `None` (keep the default reuse / cached-socket path) unless: the
 /// forward is B→A, over TLS, there is no dialog route set to follow, and the
-/// leg's TLS connection is no longer registered as alive. Scoped to TLS
-/// because only the TLS listener registers inbound connections in
-/// `stream_connections` (a TCP inbound connection is invisible there, so its
-/// liveness can't be judged this way, and a NAT'd peer must keep its cached
-/// source socket).
+/// leg's TLS connection is no longer registered as alive. Scoped to TLS on
+/// purpose: inbound TCP connections are in `stream_connections` too, but a
+/// NAT'd TCP peer must keep its cached source socket (its Contact is often
+/// unreachable), so a dead TCP flow is not a reason to dial the Contact.
 pub(super) fn contact_fallback_target(
     from_a_leg: bool,
     send_dest: SocketAddr,

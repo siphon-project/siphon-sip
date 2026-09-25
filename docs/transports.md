@@ -323,12 +323,21 @@ two layers for it.
 
 ### Layer 1 — automatic connection reuse (zero config)
 
-SIPhon registers every accepted stream connection in a process-global registry
-keyed by the client's source address (with an IP-only fallback for NAT). Responses
-always go back over the originating connection, and a terminating request whose
-target address matches a live connection reuses it. For a single-node proxy where
-the same box holds the registration and routes the call, browser delivery often
-*just works* with no extra code.
+SIPhon registers every accepted stream connection (TCP, TLS, WS, WSS) in a
+process-global registry keyed by the client's source address and transport (with
+an IP-only fallback for NAT). A TCP entry is never handed out for a TLS send, or
+the reverse. Responses always go back over the originating connection, and on
+TLS, WS and WSS a terminating request whose target address matches a live
+connection reuses it. For a single-node proxy where the same box holds the
+registration and routes the call, browser delivery often *just works* with no
+extra code.
+
+Plain TCP is the exception on purpose: a request relayed to a URI still dials
+the peer through the outbound connection pool, so a TCP trunk that did not ask
+for reuse is routed exactly as before. To reach a TCP peer over the connection
+it opened (behind NAT, or behind a front that terminates the connection), route
+over its flow as in Layer 2 below. `flow.is_alive` and the `subscribe_state`
+received-flow NOTIFY read the same registry, so they track TCP connections too.
 
 ### Layer 2 — flow tokens (explicit, robust, multi-node)
 

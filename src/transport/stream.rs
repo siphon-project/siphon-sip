@@ -419,9 +419,10 @@ fn spawn_outbound_distributor_with(
 /// that arrived inside the sniff window is never lost. Callers with nothing
 /// pre-read pass an empty buffer.
 ///
-/// `stream_connections` is `Some` for the transports that support MT routing
-/// back over the inbound flow (TLS, WS, WSS) and `None` for TCP, which reaches
-/// peers through the outbound [`ConnectionPool`] instead.
+/// `stream_connections` is the registry the connection is entered in for its
+/// lifetime, so a flow-routed send can reach the peer over the connection it
+/// opened (RFC 5923 / RFC 5626 §5.3). Every listener passes it; `None` is for
+/// tests and callers that serve a stream nobody routes back over.
 pub(crate) async fn serve_sip_stream<R, W>(
     reader: R,
     mut writer: W,
@@ -450,7 +451,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     //
     // Taken here rather than off `connection_map`/`StreamConnections`: the TCP
     // and TLS maps are shared with the outbound pool so their length mixes both
-    // directions, and the registry deliberately omits TCP entirely.
+    // directions, and the registry also holds the pool's outbound TLS entries.
     let _connection_gauge = crate::transport::ConnectionGauge::register(transport);
 
     // Per-connection outbound channel. Cloned for the read task so it can write
@@ -622,7 +623,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
 
     connection_map.remove(&connection_id);
     if let Some(registry) = stream_connections.as_ref() {
-        registry.unregister(&remote_addr, connection_id);
+        registry.unregister(&remote_addr, transport, connection_id);
     }
     // RFC 5626 §4.2.2 flow failure: notify the registrar so it can deregister
     // any binding that arrived on this connection. Best-effort.
@@ -1649,19 +1650,19 @@ mod tests {
             Some(close_tx),
         ));
         // Wait for registration to land, then close the peer.
-        while registry.get(&context.remote_addr).is_none() {
+        while registry.get(&context.remote_addr, Transport::Tls).is_none() {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            registry.get(&context.remote_addr),
-            Some((Transport::Tls, ConnectionId(42)))
+            registry.get(&context.remote_addr, Transport::Tls),
+            Some(ConnectionId(42))
         );
         assert!(connection_map.contains_key(&ConnectionId(42)));
 
         drop(client);
         served.await.unwrap();
         assert!(
-            registry.get(&context.remote_addr).is_none(),
+            registry.get(&context.remote_addr, Transport::Tls).is_none(),
             "flow must be unregistered on close"
         );
         assert!(!connection_map.contains_key(&ConnectionId(42)));
@@ -1708,7 +1709,7 @@ mod tests {
             let registry = registry.clone();
             async move {
                 tokio::time::timeout(Duration::from_secs(10), async {
-                    while registry.get(&remote_addr) != Some((Transport::Tls, connection_id)) {
+                    while registry.get(&remote_addr, Transport::Tls) != Some(connection_id) {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -1732,8 +1733,8 @@ mod tests {
             .expect("the old connection's task must not panic");
 
         assert_eq!(
-            registry.get(&remote_addr),
-            Some((Transport::Tls, ConnectionId(43))),
+            registry.get(&remote_addr, Transport::Tls),
+            Some(ConnectionId(43)),
             "the old connection's cleanup unregistered the live connection that replaced it"
         );
     }

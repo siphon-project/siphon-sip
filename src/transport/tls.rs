@@ -1406,8 +1406,8 @@ mod tests {
             "stream registry should track the TLS connection by remote address"
         );
         assert_eq!(
-            stream_connections.get(&remote_addr),
-            Some((Transport::Tls, connection_id)),
+            stream_connections.get(&remote_addr, Transport::Tls),
+            Some(connection_id),
         );
 
         // Drop the client

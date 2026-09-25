@@ -1079,7 +1079,11 @@ impl ConnectionPool {
                                 conn_map.remove(&connection_id);
                                 evict_if_current(&connections, &key_for_cleanup, connection_id);
                                 if let Some(ref stream_connections) = stream_connections {
-                                    stream_connections.unregister(&destination, connection_id);
+                                    stream_connections.unregister(
+                                        &destination,
+                                        Transport::Tls,
+                                        connection_id,
+                                    );
                                 }
                                 return;
                             }
@@ -1094,7 +1098,7 @@ impl ConnectionPool {
             conn_map.remove(&connection_id);
             evict_if_current(&connections, &key_for_cleanup, connection_id);
             if let Some(ref stream_connections) = stream_connections {
-                stream_connections.unregister(&destination, connection_id);
+                stream_connections.unregister(&destination, Transport::Tls, connection_id);
             }
         });
 

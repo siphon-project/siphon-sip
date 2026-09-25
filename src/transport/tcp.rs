@@ -25,7 +25,7 @@ use crate::transport::stream::{
 };
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
-    Transport,
+    StreamConnections, Transport,
 };
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
@@ -44,6 +44,7 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
+    stream_connections: StreamConnections,
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
@@ -109,6 +110,7 @@ pub async fn listen(
                     };
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
+                    let stream_connections = stream_connections.clone();
 
                     configure_tcp_socket(&socket, tos);
 
@@ -204,10 +206,18 @@ pub async fn listen(
                             seed,
                             inbound_tx,
                             connection_map,
-                            // TCP reaches peers through the outbound pool, not
-                            // by sending back over the inbound flow, so it does
-                            // not register in the stream-connection registry.
-                            None,
+                            // Registered for the connection's lifetime, as TLS
+                            // and WS are: a peer behind NAT or behind a front
+                            // that terminates the connection is reachable only
+                            // over the connection it opened (RFC 5923, RFC 5626
+                            // §5.3). Registering is not routing: the plain URI
+                            // relay still goes through the outbound pool, and
+                            // the entry is used only where the signalling asked
+                            // for the captured flow (`relay(flow=...)`,
+                            // `Flow.is_alive`, the `subscribe_state`
+                            // received-flow NOTIFY). Keyed as TCP, so a TLS send
+                            // to the same address never picks it.
+                            Some(stream_connections),
                             crlf_pong_tracker,
                             close_tx,
                         )
@@ -881,6 +891,7 @@ mod tests {
             outbound_rx,
             Arc::new(DashMap::new()),
             Arc::new(TransportAcl::new(vec![], vec![])),
+            StreamConnections::new(),
             None,
             None,
             None,
@@ -925,6 +936,7 @@ mod tests {
             outbound_rx,
             Arc::new(DashMap::new()),
             acl,
+            StreamConnections::new(),
             None,
             None,
             None,
@@ -1080,6 +1092,227 @@ mod tests {
         assert_eq!(inbound.transport, Transport::Tcp);
     }
 
+    // --- end to end: inbound TCP connections in the flow registry -----------
+
+    /// A TCP listener wired to a stream-connection registry, with the outbound
+    /// channel and connection map handed back so a test can send over the
+    /// flow the peer opened and watch the per-connection state drain.
+    struct RegisteredListener {
+        addr: SocketAddr,
+        inbound_rx: flume::Receiver<InboundMessage>,
+        outbound_tx: flume::Sender<OutboundMessage>,
+        registry: StreamConnections,
+        connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    }
+
+    async fn spawn_registered_listener() -> RegisteredListener {
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let registry = StreamConnections::new();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let addr = listen(
+            "127.0.0.1:0".parse().unwrap(),
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            registry.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tcp listener must bind");
+        RegisteredListener {
+            addr,
+            inbound_rx,
+            outbound_tx,
+            registry,
+            connection_map,
+        }
+    }
+
+    /// A REGISTER from a peer that asks for its connection to be reused
+    /// (RFC 5626 outbound: `;ob` on the Contact, `reg-id`/`+sip.instance`).
+    const FLOW_REGISTER: &str = concat!(
+        "REGISTER sip:example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/TCP 192.0.2.30:5060;branch=z9hG4bK-flow;alias\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@example.com>;tag=flow1\r\n",
+        "To: <sip:alice@example.com>\r\n",
+        "Call-ID: tcp-flow-reuse@example.com\r\n",
+        "CSeq: 1 REGISTER\r\n",
+        "Contact: <sip:alice@192.0.2.30:5060;transport=tcp;ob>;reg-id=1;",
+        "+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-000000000001>\"\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+
+    const MT_OPTIONS: &str = concat!(
+        "OPTIONS sip:alice@192.0.2.30:5060;transport=tcp SIP/2.0\r\n",
+        "Via: SIP/2.0/TCP 198.51.100.1:5060;branch=z9hG4bK-mt\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:proxy@example.com>;tag=mt1\r\n",
+        "To: <sip:alice@example.com>\r\n",
+        "Call-ID: tcp-flow-mt@example.com\r\n",
+        "CSeq: 1 OPTIONS\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+
+    /// Connect, send the REGISTER, and hand back the client socket, its local
+    /// address (the peer address siphon sees) and the connection id siphon
+    /// gave it.
+    async fn connect_and_register(
+        listener: &RegisteredListener,
+    ) -> (tokio::net::TcpStream, SocketAddr, ConnectionId) {
+        use tokio::io::AsyncWriteExt;
+
+        let mut client = tokio::net::TcpStream::connect(listener.addr).await.unwrap();
+        let peer = client.local_addr().unwrap();
+        client.write_all(FLOW_REGISTER.as_bytes()).await.unwrap();
+        let inbound = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.inbound_rx.recv_async(),
+        )
+        .await
+        .expect("the REGISTER must be dispatched")
+        .unwrap();
+        assert_eq!(inbound.remote_addr, peer);
+        assert_eq!(inbound.transport, Transport::Tcp);
+        (client, peer, inbound.connection_id)
+    }
+
+    /// A peer that can only be reached over the connection it opened (behind
+    /// NAT, or behind a front that terminates the connection) needs that
+    /// connection registered, or every flow-routed send to it (`Flow.is_alive`,
+    /// the `subscribe_state` received-flow NOTIFY, `relay(flow=...)` guarded by
+    /// liveness) finds nothing and fails.  The registration is keyed as TCP,
+    /// so it can never be picked for a TLS send to the same address.
+    #[tokio::test]
+    async fn an_inbound_tcp_connection_is_registered_for_flow_reuse() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = spawn_registered_listener().await;
+        let (mut client, peer, connection_id) = connect_and_register(&listener).await;
+
+        assert_eq!(
+            listener.registry.get(&peer, Transport::Tcp),
+            Some(connection_id),
+            "an inbound TCP connection must be in the stream-connection registry"
+        );
+        assert!(listener
+            .registry
+            .is_alive(peer, Transport::Tcp, connection_id));
+        assert_eq!(
+            listener.registry.reuse(peer, Transport::Tls),
+            None,
+            "a TCP registration must never be handed out for a TLS send"
+        );
+
+        // Send back over the flow the registry names, the way the received-flow
+        // NOTIFY path does, and read it on the peer's own socket.
+        let flow_connection = listener
+            .registry
+            .get(&peer, Transport::Tcp)
+            .expect("registered above");
+        listener
+            .outbound_tx
+            .send(OutboundMessage {
+                followups: None,
+                connection_id: flow_connection,
+                transport: Transport::Tcp,
+                destination: peer,
+                data: Bytes::from_static(MT_OPTIONS.as_bytes()),
+                source_local_addr: None,
+                server_name: None,
+            })
+            .unwrap();
+        let mut received = vec![0u8; MT_OPTIONS.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_exact(&mut received),
+        )
+        .await
+        .expect("the request must arrive over the peer's own connection")
+        .unwrap();
+        assert_eq!(received, MT_OPTIONS.as_bytes());
+    }
+
+    /// Wait until `condition` holds, failing the test after five seconds.
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// The registration lives exactly as long as the connection: once the peer
+    /// closes, the entry goes, so a flow-routed send reports the flow dead
+    /// instead of writing to a connection that no longer exists.
+    #[tokio::test]
+    async fn the_tcp_registration_goes_when_the_connection_closes() {
+        let listener = spawn_registered_listener().await;
+        let (client, peer, connection_id) = connect_and_register(&listener).await;
+        assert!(listener
+            .registry
+            .is_alive(peer, Transport::Tcp, connection_id));
+
+        drop(client);
+        eventually("the registration to be evicted", || {
+            listener.registry.get(&peer, Transport::Tcp).is_none()
+        })
+        .await;
+        assert!(!listener
+            .registry
+            .is_alive(peer, Transport::Tcp, connection_id));
+        eventually("the connection map entry to be removed", || {
+            !listener.connection_map.contains_key(&connection_id)
+        })
+        .await;
+    }
+
+    /// Steady-state leak gate for the per-connection store: after a batch of
+    /// complete connect → REGISTER → close cycles, the registry and the
+    /// connection map are back at their starting size.  An inbound TCP entry
+    /// that is inserted on accept and never evicted on close shows up here.
+    #[tokio::test]
+    async fn tcp_flow_registry_drains_to_baseline_after_connection_churn() {
+        const CYCLES: usize = 200;
+        const CONCURRENT: usize = 20;
+
+        let listener = spawn_registered_listener().await;
+        let registry_baseline = listener.registry.len();
+        let map_baseline = listener.connection_map.len();
+
+        for _ in 0..CYCLES / CONCURRENT {
+            let mut open = Vec::with_capacity(CONCURRENT);
+            for _ in 0..CONCURRENT {
+                open.push(connect_and_register(&listener).await);
+            }
+            assert!(
+                listener.registry.len() >= registry_baseline + CONCURRENT,
+                "every open connection must be registered while it is up"
+            );
+            drop(open);
+        }
+
+        eventually("the registry to drain to its baseline", || {
+            listener.registry.len() == registry_baseline
+        })
+        .await;
+        eventually("the connection map to drain to its baseline", || {
+            listener.connection_map.len() == map_baseline
+        })
+        .await;
+    }
+
     // --- end to end: the client's transport at the front ---------------------
 
     /// Start a TCP SIP listener that sits behind a front and is given the
@@ -1093,6 +1326,7 @@ mod tests {
             outbound_rx,
             Arc::new(DashMap::new()),
             Arc::new(TransportAcl::new(vec![], vec![])),
+            StreamConnections::new(),
             None,
             None,
             None,
