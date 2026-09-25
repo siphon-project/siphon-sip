@@ -128,9 +128,14 @@ method reaches only `route`, synchronously.
 
 The shipped `scripts/proxy_default.py` and `scripts/b2bua_default.py` are
 written this way, and `scripts/check_hot_path_dispatch.py` fails CI on an
-unfiltered per-message handler whose every `await` sits under a single-method
+unfiltered `@proxy.on_request` handler whose every `await` sits under a method
 branch. If your handler genuinely awaits on the path every message takes, leave
 it `async` — there the driver is doing its job.
+
+The split only works where the hook takes a method filter, and only
+`@proxy.on_request` does. `@proxy.on_reply` and `@b2bua.on_invite` have no
+filtered form, so the check reports the same shape on them as a note, not a
+failure: the cost is real, but the fix is not available.
 
 ## The two failure modes, and how to tell them apart
 
