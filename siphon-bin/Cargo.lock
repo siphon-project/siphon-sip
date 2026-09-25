@@ -3156,8 +3156,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-http"
-version = "1.0.2"
-source = "git+https://github.com/siphon-project/siphon-http?tag=v1.0.2#99b639d5734699ec4212503f92d6d61d1e2337d1"
+version = "1.1.0"
+source = "git+https://github.com/siphon-project/siphon-http?tag=v1.1.0#c95b9d61a201c004ea1143a6f7c55379e892b42f"
 dependencies = [
  "async-trait",
  "axum",
@@ -3178,7 +3178,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-http 0.6.11",
+ "tower-http 0.7.0",
  "tracing",
 ]
 
@@ -3223,7 +3223,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.10.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#11adda91a16b98b245e628598f594204f8d5f336"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#36fd186d6828d45572d4e1797fe78379d8724ca1"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3869,13 +3869,10 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
- "tokio",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
@@ -3888,10 +3885,14 @@ dependencies = [
  "bitflags 2.13.0",
  "bytes",
  "http",
+ "http-body",
+ "http-body-util",
  "percent-encoding",
  "pin-project-lite",
+ "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
