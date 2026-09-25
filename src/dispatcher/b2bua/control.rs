@@ -818,6 +818,7 @@ pub struct DialShaping {
 }
 
 /// The `From` a dial's identity arguments shaped.
+#[derive(Debug, Clone)]
 struct ShapedFrom {
     /// The whole header value, dialog tag included.
     header: String,
@@ -838,6 +839,16 @@ fn apply_dial_identity(
     template: &mut SipMessage,
     shaping: &DialShaping,
 ) -> Result<Option<ShapedFrom>, String> {
+    let shaped = shape_from(template, shaping)?;
+    if let Some(shaped) = &shaped {
+        template.headers.set("From", shaped.header.clone());
+    }
+    Ok(shaped)
+}
+
+/// The `From` `shaping` presents over `template`'s own, or `None` when it names
+/// no identity and the template's stands.
+fn shape_from(template: &SipMessage, shaping: &DialShaping) -> Result<Option<ShapedFrom>, String> {
     if shaping.from.is_none() && shaping.from_display.is_none() {
         return Ok(None);
     }
@@ -845,9 +856,8 @@ fn apply_dial_identity(
         .headers
         .get("From")
         .or_else(|| template.headers.get("f"))
-        .cloned()
         .ok_or("the call has no From header to present an identity on")?;
-    let mut nameaddr = crate::sip::headers::nameaddr::NameAddr::parse(&raw)
+    let mut nameaddr = crate::sip::headers::nameaddr::NameAddr::parse(raw)
         .map_err(|error| format!("cannot parse the call's From header: {error}"))?;
     let mut host = None;
     if let Some(from) = shaping.from.as_deref() {
@@ -866,9 +876,35 @@ fn apply_dial_identity(
         None if shaping.from.is_some() => nameaddr.display_name = None,
         None => {}
     }
-    let header = nameaddr.to_string();
-    template.headers.set("From", header.clone());
-    Ok(Some(ShapedFrom { header, host }))
+    Ok(Some(ShapedFrom {
+        header: nameaddr.to_string(),
+        host,
+    }))
+}
+
+/// The `From` each target presents where it names an identity of its own, in
+/// target order, over the dial-shaped `template`.
+///
+/// A target's identity is shaped exactly as the dial's is — the whole URI with
+/// its host pinned, the caller's display name dropped unless one is named —
+/// resolved field by field over the dial's through
+/// [`DialTarget::shaping_over`]. Every target is shaped before any branch is
+/// sent, so an identity siphon cannot put on the wire refuses the dial before
+/// anything rings rather than after the first phone already has.
+fn branch_identities(
+    targets: &[DialTarget],
+    template: &SipMessage,
+    shaping: &DialShaping,
+) -> Result<Vec<Option<ShapedFrom>>, String> {
+    targets
+        .iter()
+        .map(|target| {
+            if target.from.is_none() && target.from_display.is_none() {
+                return Ok(None);
+            }
+            shape_from(template, &target.shaping_over(shaping))
+        })
+        .collect()
 }
 
 /// The command headers with `P-Asserted-Identity` on them.
@@ -890,7 +926,10 @@ fn dial_headers_with_asserted_identity(
         .filter(|(name, _)| !name.eq_ignore_ascii_case("P-Asserted-Identity"))
         .cloned()
         .collect();
-    headers.push(("P-Asserted-Identity".to_string(), identity.to_string()));
+    headers.push((
+        "P-Asserted-Identity".to_string(),
+        crate::sip::privacy::asserted_identity_value(identity),
+    ));
     headers
 }
 
@@ -1126,6 +1165,8 @@ pub(crate) fn b2bua_dial_call_with_state(
             call.from_host_override = Some(host);
         }
     }
+    let branch_froms =
+        branch_identities(&targets, &template, shaping).map_err(DialError::InvalidIdentity)?;
 
     if let Some(profile) = shaping.profile.as_deref() {
         let source_ip = state
@@ -1161,6 +1202,7 @@ pub(crate) fn b2bua_dial_call_with_state(
         dial_parallel(
             &internal_call_id,
             &targets,
+            &branch_froms,
             &extra_headers,
             &template,
             shaping,
@@ -1170,6 +1212,7 @@ pub(crate) fn b2bua_dial_call_with_state(
         dial_sequential(
             &internal_call_id,
             targets,
+            branch_froms,
             timeout_secs,
             &extra_headers,
             &template,
@@ -1211,23 +1254,32 @@ pub(crate) fn b2bua_dial_call_with_state(
 fn dial_parallel(
     call_id: &str,
     targets: &[DialTarget],
+    branch_froms: &[Option<ShapedFrom>],
     extra_headers: &[(String, String)],
     template: &SipMessage,
     shaping: &DialShaping,
     state: &DispatcherState,
 ) -> usize {
     let mut sent = 0usize;
-    for target in targets {
+    for (target, branch_from) in targets.iter().zip(branch_froms) {
         let branch = target.shaping_over(shaping);
         let headers = merged_headers(
             extra_headers,
             &target.headers,
             branch.p_asserted_identity.as_deref(),
         );
-        // A branch naming its own calling number is presented through the same
-        // tag-preserving substitution a per-carrier LCR route uses. The dial's
-        // own identity is already on the template, so this only carries what
-        // this target asked to differ.
+        // A branch naming its own identity presents it whole — URI, display
+        // name and pinned host — on a template of its own. The dial's identity
+        // is already on the shared template, so only a target that asked to
+        // differ costs a clone.
+        let branch_template = branch_from.as_ref().map(|shaped| {
+            let mut own = template.clone();
+            own.headers.set("From", shaped.header.clone());
+            own
+        });
+        // Its number also goes through the tag-preserving substitution a
+        // per-carrier LCR route uses, which carries it onto an asserted
+        // identity the header policy let through.
         let caller_id = target
             .from
             .as_deref()
@@ -1241,11 +1293,14 @@ fn dial_parallel(
             &target.route,
             None,
             None,
-            template,
+            branch_template.as_ref().unwrap_or(template),
             None,
             None,
             caller_id.as_deref(),
             branch.privacy,
+            branch_from
+                .as_ref()
+                .and_then(|shaped| shaped.host.as_deref()),
             &headers,
             state,
         ) {
@@ -1263,13 +1318,15 @@ fn dial_parallel(
 /// shown progress would keep the call.
 fn sequential_dial_routes(
     targets: Vec<DialTarget>,
+    branch_froms: Vec<Option<ShapedFrom>>,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
     shaping: &DialShaping,
 ) -> Vec<crate::lcr::Route> {
     targets
         .into_iter()
-        .map(|target| {
+        .zip(branch_froms)
+        .map(|(target, branch_from)| {
             let branch = target.shaping_over(shaping);
             // A target's own identity rides the route's per-carrier fields,
             // which is what they are for: `caller_id` substitutes the calling
@@ -1300,6 +1357,10 @@ fn sequential_dial_routes(
                 caller_id_presentation: branch
                     .privacy
                     .map(|presentation| presentation_token(presentation).to_string()),
+                // The rest of the target's identity — the host its `from` named
+                // and the display name — which a number cannot carry.
+                from_host: branch_from.as_ref().and_then(|shaped| shaped.host.clone()),
+                presented_from: branch_from.map(|shaped| shaped.header),
                 ..Default::default()
             }
         })
@@ -1312,7 +1373,8 @@ fn sequential_dial_routes(
 /// That field substitutes a *number*, not a URI: it is applied by
 /// `set_calling_number`, which keeps the From's host and dialog tag. A target
 /// naming a full `sip:` URI therefore contributes its user part here, and the
-/// host it named is pinned separately for the branch.
+/// host it named is pinned separately for the branch (see
+/// [`branch_identities`]).
 fn calling_number_of(from: &str) -> String {
     parse_uri_standalone(from)
         .ok()
@@ -1326,13 +1388,15 @@ fn calling_number_of(from: &str) -> String {
 fn dial_sequential(
     call_id: &str,
     targets: Vec<DialTarget>,
+    branch_froms: Vec<Option<ShapedFrom>>,
     timeout_secs: u32,
     extra_headers: &[(String, String)],
     template: &SipMessage,
     shaping: &DialShaping,
     state: &DispatcherState,
 ) -> usize {
-    let routes = sequential_dial_routes(targets, timeout_secs, extra_headers, shaping);
+    let routes =
+        sequential_dial_routes(targets, branch_froms, timeout_secs, extra_headers, shaping);
     state.call_actors.start_route_sequence(
         call_id,
         crate::b2bua::actor::RouteSequenceState {
@@ -1370,7 +1434,10 @@ fn merged_headers(
         // Replace rather than add: the two spellings must not both reach the
         // wire in an undefined order.
         merged.retain(|name, _| !name.eq_ignore_ascii_case("P-Asserted-Identity"));
-        merged.insert("P-Asserted-Identity".to_string(), identity.to_string());
+        merged.insert(
+            "P-Asserted-Identity".to_string(),
+            crate::sip::privacy::asserted_identity_value(identity),
+        );
     }
     merged.into_iter().collect()
 }
@@ -1482,6 +1549,7 @@ mod tests {
             .collect();
         let routes = sequential_dial_routes(
             targets,
+            vec![None, None],
             20,
             &[("X-Hunt".to_string(), "desk".to_string())],
             &DialShaping::default(),
@@ -1508,6 +1576,7 @@ mod tests {
             .collect();
         let routes = sequential_dial_routes(
             targets,
+            vec![None, None],
             20,
             &[],
             &DialShaping {
@@ -1524,6 +1593,7 @@ mod tests {
                 uri: "sip:1001@pbx.example.com".to_string(),
                 ..Default::default()
             }],
+            vec![None],
             20,
             &[],
             &DialShaping::default(),
@@ -1602,16 +1672,18 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let routes = sequential_dial_routes(
-            targets,
-            20,
-            &[],
-            &DialShaping {
-                from: Some("sip:2025550100@pbx.example.com".to_string()),
-                privacy: Some(crate::sip::privacy::CallerIdPresentation::Restricted),
-                ..Default::default()
-            },
-        );
+        let dial = DialShaping {
+            from: Some("sip:2025550100@pbx.example.com".to_string()),
+            privacy: Some(crate::sip::privacy::CallerIdPresentation::Restricted),
+            ..Default::default()
+        };
+        let branch_froms = branch_identities(
+            &targets,
+            &from_template("\"203\" <sip:203@pbx.example.com>;tag=caller-tag"),
+            &dial,
+        )
+        .expect("both identities are SIP URIs");
+        let routes = sequential_dial_routes(targets, branch_froms, 20, &[], &dial);
 
         // `caller_id` substitutes a number, not a URI, so each route carries
         // its own carrier's user part.
@@ -1629,8 +1701,16 @@ mod tests {
                 .headers
                 .get("P-Asserted-Identity")
                 .map(String::as_str),
-            Some("sip:2025550222@carrier-b.example"),
-            "a branch's asserted identity rides its own headers"
+            Some("<sip:2025550222@carrier-b.example>"),
+            "a branch's asserted identity rides its own headers, as a name-addr"
+        );
+        // Each route pins its own carrier's host, and presents no display name
+        // since neither the target nor the dial named one.
+        assert_eq!(routes[0].from_host.as_deref(), Some("carrier-a.example"));
+        assert_eq!(routes[1].from_host.as_deref(), Some("carrier-b.example"));
+        assert_eq!(
+            routes[0].presented_from.as_deref(),
+            Some("<sip:2025550111@carrier-a.example>;tag=caller-tag")
         );
     }
 

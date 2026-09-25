@@ -119,6 +119,10 @@ pub fn b2bua_send_b_leg_invite(
     // Whether the calling identity may be presented to this carrier (LCR
     // `caller_id_presentation`). Applied last, after the number policy.
     caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
+    // `From` host this branch alone pins, over the call's own
+    // (`call.set_from_host()` / a dial-level `from`): a controller `dial`
+    // target that names its own `from`, whose host belongs to that carrier.
+    branch_from_host: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -372,9 +376,14 @@ pub fn b2bua_send_b_leg_invite(
         // pinned a host via `call.set_from_host()`, use that instead — opt
         // out of From topology-hiding for multitenant edges that select the
         // tenant from the From domain (a domainless call would otherwise land
-        // in the downstream's unauthenticated/default routing context).
+        // in the downstream's unauthenticated/default routing context). A
+        // branch's own pin (a `dial` target naming its own `from`) outranks the
+        // call's: that host is the one carrier's the branch is going to.
         // From header format: ["Display" ]<sip:user@host[:port][;params]>[;tag=...]
-        let from_host = from_host_override.unwrap_or_else(|| state.via_host(&outbound_transport));
+        let from_host = branch_from_host
+            .map(str::to_string)
+            .or(from_host_override)
+            .unwrap_or_else(|| state.via_host(&outbound_transport));
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];

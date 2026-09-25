@@ -116,6 +116,22 @@ entry, but a working config keeps working.
   reading it back resurrects a dialog the sweeper has already sent the
   terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
   ask for it with `await handle.reload()`.
+### Fixed
+
+- **A `dial` target's own `from` now pins its host.** The per-target identity
+  took only the user part of `from` and substituted it as a number, so the B-leg
+  went out as `"203" <sip:account@<advertised address>>`: the host the target
+  named was rewritten away and the caller's display name stayed beside it. A
+  target's `from` / `from_display` now shape the `From` exactly as the dial's
+  own do (whole URI, host pinned, caller's display dropped unless one is named),
+  on every branch of a fork and every attempt of a sequential hunt. A target
+  `from` that is not a SIP URI is now `bad_request` before anything rings, as
+  the dial-level one already was.
+- **`P-Asserted-Identity` goes out as a `name-addr`.** An identity given as a
+  bare URI (`sip:+15550123@example.com`) was rendered bare by `dial`, and one
+  given in brackets was double-wrapped (`<<...>>`) by `originate`. Both now
+  render `<sip:...>` whichever spelling came in, entry by entry for a
+  `sip:` + `tel:` pair (RFC 3325 §9.1).
 
 ## [1.10.0] — 2026-09-24
 

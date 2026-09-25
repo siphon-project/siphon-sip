@@ -364,7 +364,10 @@ pub fn build_originate_invite(
         builder = builder.header("User-Agent", user_agent.to_string());
     }
     if let Some(ref asserted) = params.p_asserted_identity {
-        builder = builder.header("P-Asserted-Identity", format!("<{asserted}>"));
+        builder = builder.header(
+            "P-Asserted-Identity",
+            crate::sip::privacy::asserted_identity_value(asserted),
+        );
     }
     let builder = match &params.media {
         OriginateMedia::Offer { body, content_type } => builder

@@ -146,6 +146,23 @@ fn originate_applies_the_full_calling_identity() {
     );
 }
 
+/// An identity that already carries its brackets is taken as written, not
+/// wrapped a second time into `<<…>>`, which no parser reads as a URI.
+#[test]
+fn originate_accepts_an_asserted_identity_already_in_brackets() {
+    let mut params = params(OriginateMedia::Anchor {
+        profile: "rtp_passthrough".to_string(),
+        ws_uri: None,
+    });
+    params.p_asserted_identity = Some("<sip:+14035550100@siphon.example>".to_string());
+    let invite = build(&params);
+
+    assert_eq!(
+        invite.headers.get("P-Asserted-Identity").unwrap(),
+        "<sip:+14035550100@siphon.example>"
+    );
+}
+
 #[test]
 fn originate_with_restricted_privacy_anonymises_from_and_asserts_privacy_id() {
     // RFC 3323 §4.1 / TS 24.607: the real identity stays in PAI for the

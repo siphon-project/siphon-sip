@@ -423,3 +423,200 @@ fn advance_from_the_stored_invite(dispatcher: &TestDispatcher, call_id: &str) {
     let advanced = b2bua_advance_route(call_id, &stored, &dispatcher.state);
     assert!(advanced.dialed, "the sequence had another target to try");
 }
+
+/// The account a carrier assigned, at the carrier's own host: what a target
+/// names when the carrier validates or routes on the `From` domain.
+const CARRIER_FROM: &str = "sip:account@198.51.100.20";
+
+fn target_with_identity(address: &str, from: &str) -> DialTarget {
+    DialTarget {
+        uri: format!("sip:15550100077@{address}"),
+        from: Some(from.to_string()),
+        ..Default::default()
+    }
+}
+
+fn dial_targets(
+    dispatcher: &TestDispatcher,
+    targets: Vec<DialTarget>,
+    parallel: bool,
+    shaping: &DialShaping,
+) -> Result<bool, DialError> {
+    b2bua_dial_call_with_state(
+        SIP_CALL_ID,
+        targets,
+        parallel,
+        30,
+        &[],
+        shaping,
+        &dispatcher.state,
+    )
+}
+
+/// A target's `from` is the same identity argument as the dial's: the whole
+/// URI, host included, and not the caller's display name beside it. Before it
+/// was only the user part, substituted as a number, so the carrier saw the
+/// account at siphon's advertised address and `"203"` in front of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_targets_own_from_pins_its_host_and_drops_the_callers_display() {
+    for parallel in [true, false] {
+        let dispatcher = test_dispatcher();
+        park(&dispatcher);
+        assert!(dial_targets(
+            &dispatcher,
+            vec![target_with_identity(FIRST_TARGET, CARRIER_FROM)],
+            parallel,
+            &DialShaping::default(),
+        )
+        .expect("the dial runs"));
+
+        let sent = wire(&dispatcher);
+        assert_eq!(summaries(&sent), [format!("INVITE to {FIRST_TARGET}")]);
+        let from = from_header(&sent[0]);
+        assert!(
+            from.starts_with(&format!("<{CARRIER_FROM}>")),
+            "parallel={parallel}: the target's identity is not on the wire whole: {from}"
+        );
+        assert!(
+            !from.contains("203"),
+            "parallel={parallel}: the caller's display name or extension leaked: {from}"
+        );
+        assert_has_a_fresh_dialog_tag(&sent[0], "target identity");
+    }
+}
+
+/// A target's host outranks the dial's, and a target naming nothing keeps the
+/// dial's: each branch presents the host of the carrier it is going to.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_branch_of_a_fork_pins_its_own_targets_host() {
+    let dispatcher = test_dispatcher();
+    park(&dispatcher);
+    assert!(dial_targets(
+        &dispatcher,
+        vec![
+            target_with_identity(FIRST_TARGET, CARRIER_FROM),
+            DialTarget {
+                uri: format!("sip:15550100077@{SECOND_TARGET}"),
+                ..Default::default()
+            },
+        ],
+        true,
+        &trunk_identity(),
+    )
+    .expect("the dial runs"));
+
+    let sent = wire(&dispatcher);
+    assert_eq!(sent.len(), 2);
+    let first = from_header(&sent[0]);
+    assert!(
+        first.starts_with(&format!("\"{PRESENTED_DISPLAY}\" <{CARRIER_FROM}>")),
+        "the first branch presents its own URI under the dial's display name: {first}"
+    );
+    let second = from_header(&sent[1]);
+    assert!(
+        second.starts_with(&format!("\"{PRESENTED_DISPLAY}\" <{PRESENTED_FROM}>")),
+        "the second branch keeps the dial's identity and host: {second}"
+    );
+}
+
+/// The attempt a sequential hunt makes after the first is rebuilt from the
+/// stored A-leg INVITE, so a target's identity has to ride its own route or
+/// the second carrier would see the first one's host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sequential_hunt_pins_each_targets_own_host() {
+    const SECOND_CARRIER_FROM: &str = "sip:other-account@203.0.113.30";
+    let dispatcher = test_dispatcher();
+    let call_id = park(&dispatcher);
+    assert!(dial_targets(
+        &dispatcher,
+        vec![
+            target_with_identity(FIRST_TARGET, CARRIER_FROM),
+            target_with_identity(SECOND_TARGET, SECOND_CARRIER_FROM),
+        ],
+        false,
+        &DialShaping::default(),
+    )
+    .expect("the dial runs"));
+    let first = wire(&dispatcher);
+    assert!(from_header(&first[0]).starts_with(&format!("<{CARRIER_FROM}>")));
+
+    advance_from_the_stored_invite(&dispatcher, &call_id);
+
+    let sent = wire(&dispatcher);
+    assert_eq!(summaries(&sent), [format!("INVITE to {SECOND_TARGET}")]);
+    let from = from_header(&sent[0]);
+    assert!(
+        from.starts_with(&format!("<{SECOND_CARRIER_FROM}>")),
+        "the second attempt presents {from}"
+    );
+    assert_has_a_fresh_dialog_tag(&sent[0], "second target identity");
+}
+
+/// A target's `from` is held to the dial's rule: not a SIP URI is refused
+/// before anything rings, including the targets listed before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_target_identity_is_refused_before_anything_rings() {
+    let dispatcher = test_dispatcher();
+    park(&dispatcher);
+    let refused = dial_targets(
+        &dispatcher,
+        vec![
+            DialTarget {
+                uri: format!("sip:15550100077@{FIRST_TARGET}"),
+                ..Default::default()
+            },
+            target_with_identity(SECOND_TARGET, "not a uri"),
+        ],
+        true,
+        &DialShaping::default(),
+    );
+    assert!(
+        matches!(refused, Err(DialError::InvalidIdentity(_))),
+        "{refused:?}"
+    );
+    assert!(wire(&dispatcher).is_empty(), "nothing rang");
+}
+
+/// RFC 3325 §9.1 permits a bare addr-spec, but the name-addr form is the one a
+/// strict SBC accepts, so a bare identity goes out in angle brackets, on every
+/// branch and every attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_asserted_identity_goes_out_in_angle_brackets() {
+    for parallel in [true, false] {
+        let dispatcher = test_dispatcher();
+        park(&dispatcher);
+        let shaping = DialShaping {
+            p_asserted_identity: Some("sip:+15550123@example.com".to_string()),
+            ..Default::default()
+        };
+        let mut targets = targets(&[FIRST_TARGET]);
+        targets.push(DialTarget {
+            uri: format!("sip:15550100077@{SECOND_TARGET}"),
+            p_asserted_identity: Some("tel:+15550124".to_string()),
+            ..Default::default()
+        });
+        assert!(dial_targets(&dispatcher, targets, parallel, &shaping).expect("the dial runs"));
+
+        let sent = wire(&dispatcher);
+        assert_eq!(
+            sent[0]
+                .message
+                .headers
+                .get("P-Asserted-Identity")
+                .map(String::as_str),
+            Some("<sip:+15550123@example.com>"),
+            "parallel={parallel}"
+        );
+        if parallel {
+            assert_eq!(
+                sent[1]
+                    .message
+                    .headers
+                    .get("P-Asserted-Identity")
+                    .map(String::as_str),
+                Some("<tel:+15550124>"),
+                "a target's own identity"
+            );
+        }
+    }
+}
