@@ -13,6 +13,18 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
+  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
+  only under a method branch and told the author to move the awaits into
+  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
+  takes a method filter. Those two hooks now get a non-failing note that states
+  the cost. The suggested filter is also built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
 ## [1.10.0] — 2026-09-24
 
 ### Removed
