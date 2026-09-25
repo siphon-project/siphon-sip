@@ -36,6 +36,12 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
+  now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
+  (it was documented but never applied), and if the script registers
+  `@http.route` handlers but an HTTP listener cannot bind (port in use, missing
+  TLS file), siphon exits at startup instead of running with the routes
+  unreachable.
 - **`@proxy.on_register_reply` handlers never ran.** The decorator registered
   the handler but the proxy response path never dispatched it, so a script that
   used it got no callback and no error. It is now shorthand for
