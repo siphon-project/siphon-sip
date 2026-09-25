@@ -46,6 +46,80 @@ pub struct ControlConfig {
     /// registered to decide.
     #[serde(default)]
     pub inbound: Option<ControlInboundConfig>,
+    /// How dialogs of registered AoRs are kept truthful for `DialogStateChanged`
+    /// (`control.apps[].events: [dialog]`): the liveness checks that end a
+    /// dialog no BYE ended. Inert unless an app subscribes to `dialog`.
+    #[serde(default)]
+    pub dialog_state: DialogStateConfig,
+}
+
+/// Liveness of the dialogs `DialogStateChanged` reports (`control.dialog_state`).
+///
+/// A B2BUA is a party to every dialog it carries and ends it itself. A proxy is
+/// not, so for a dialog it relays siphon also ends the reported state when:
+/// the binding that vouched for a phone is gone, a negotiated RFC 4028 session
+/// timer runs out, an in-dialog OPTIONS probe finds the dialog gone, or the hard
+/// lifetime passes. None of these tears the call down: only the state ends.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DialogStateConfig {
+    /// Seconds between in-dialog OPTIONS probes (RFC 3261 §11) to each watched
+    /// end of a confirmed proxied dialog. `0` turns probing off. Default 300.
+    #[serde(default = "DialogStateConfig::default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+    /// How long a probe waits for its response. Default 8.
+    #[serde(default = "DialogStateConfig::default_probe_timeout_secs")]
+    pub probe_timeout_secs: u64,
+    /// Consecutive unanswered (timed-out or 408) probes after which an end's
+    /// dialog is taken as gone. A `481` ends it at once. Default 2.
+    #[serde(default = "DialogStateConfig::default_probe_failures")]
+    pub probe_failures: u32,
+    /// Seconds a proxied dialog may stay unanswered (`trying` / `proceeding` /
+    /// `early`) before it is ended — the RFC 3261 §16.6 Timer C bound on how
+    /// long a proxy lets an INVITE ring. Default 300.
+    #[serde(default = "DialogStateConfig::default_max_early_secs")]
+    pub max_early_secs: u64,
+    /// Hard lifetime of a proxied dialog in seconds, the backstop behind every
+    /// other check. Default 43200 (12 h).
+    #[serde(default = "DialogStateConfig::default_max_lifetime_secs")]
+    pub max_lifetime_secs: u64,
+    /// Grace past a negotiated session interval before a proxied dialog with no
+    /// refresh is ended (RFC 4028 §10). Default 32 (Timer F).
+    #[serde(default = "DialogStateConfig::default_session_timer_grace_secs")]
+    pub session_timer_grace_secs: u64,
+}
+
+impl Default for DialogStateConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval_secs: Self::default_probe_interval_secs(),
+            probe_timeout_secs: Self::default_probe_timeout_secs(),
+            probe_failures: Self::default_probe_failures(),
+            max_early_secs: Self::default_max_early_secs(),
+            max_lifetime_secs: Self::default_max_lifetime_secs(),
+            session_timer_grace_secs: Self::default_session_timer_grace_secs(),
+        }
+    }
+}
+
+impl DialogStateConfig {
+    fn default_probe_interval_secs() -> u64 {
+        300
+    }
+    fn default_probe_timeout_secs() -> u64 {
+        8
+    }
+    fn default_probe_failures() -> u32 {
+        2
+    }
+    fn default_max_early_secs() -> u64 {
+        300
+    }
+    fn default_max_lifetime_secs() -> u64 {
+        43_200
+    }
+    fn default_session_timer_grace_secs() -> u64 {
+        32
+    }
 }
 
 /// TLS for the inbound control listener (`control.tls`).
@@ -148,8 +222,8 @@ pub struct ControlAppConfig {
     /// - `registration` — `RegistrationChanged {aor, event, contacts}` on every
     ///   registrar state change.
     /// - `dialog` — `DialogStateChanged {aor, state, direction, call_id, …}`,
-    ///   the RFC 4235 state of every dialog of a registered AoR that siphon's
-    ///   B2BUA carries, for a controller serving the `dialog` event package.
+    ///   the RFC 4235 state of every dialog of a registered AoR through siphon,
+    ///   B2BUA or proxy, for a controller serving the `dialog` event package.
     #[serde(default)]
     pub events: Vec<String>,
 }

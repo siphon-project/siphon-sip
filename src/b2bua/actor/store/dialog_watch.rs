@@ -67,6 +67,45 @@ impl CallActorStore {
         publish_dialog_states(report.into_iter().collect());
     }
 
+    /// End every watch whose binding `binding_live` no longer knows — the phone
+    /// de-registered, its binding expired, or registrar liveness reaped it —
+    /// and publish the reports. The call itself is left alone: it ends on its
+    /// own teardown, session timer or duration cap.
+    pub fn end_dialogs_without_binding(&self, binding_live: &dyn Fn(&str, &str) -> bool) {
+        // Candidates under read locks first; a write lock only on a call that has
+        // a watch to end.
+        let candidates: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|entry| {
+                entry.dialog_watches.iter().any(|watch| {
+                    watch.state != DialogState::Terminated
+                        && watch
+                            .contact
+                            .as_deref()
+                            .is_some_and(|contact| !binding_live(&watch.aor, contact))
+                })
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut reports = Vec::new();
+        for call_id in candidates {
+            let Some(mut call) = self.calls.get_mut(&call_id) else {
+                continue;
+            };
+            for watch in &mut call.dialog_watches {
+                let gone = watch
+                    .contact
+                    .as_deref()
+                    .is_some_and(|contact| !binding_live(&watch.aor, contact));
+                if gone && watch.advance(DialogState::Terminated, None) {
+                    reports.push(watch.clone());
+                }
+            }
+        }
+        publish_dialog_states(reports);
+    }
+
     /// The watches of `call_id`, for a test to read the state it is in.
     #[cfg(test)]
     pub fn dialog_watches(&self, call_id: &str) -> Vec<DialogWatch> {

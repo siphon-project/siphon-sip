@@ -245,6 +245,34 @@ pub struct Contact {
     pub auth_user: Option<Box<str>>,
 }
 
+/// `contact_uri` parsed for [`same_contact`], angle brackets allowed.
+fn parse_contact_target(contact_uri: &str) -> Option<SipUri> {
+    let trimmed = contact_uri
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>');
+    crate::sip::parser::parse_uri_standalone(trimmed).ok()
+}
+
+/// Whether two Contact URIs name the same device the way [`normalize_aor`]
+/// compares them — scheme, user, host (case-insensitively) and port, a default
+/// port equal to none, parameters ignored — without building a string per
+/// binding: the reverse lookups that use it scan every binding.
+fn same_contact(stored: &SipUri, target: &SipUri) -> bool {
+    let default_port = |uri: &SipUri| {
+        if matches!(uri.scheme, crate::sip::uri::Scheme::Sips) {
+            5061
+        } else {
+            5060
+        }
+    };
+    stored.scheme == target.scheme
+        && stored.user == target.user
+        && stored.host.eq_ignore_ascii_case(&target.host)
+        && stored.port.unwrap_or_else(|| default_port(stored))
+            == target.port.unwrap_or_else(|| default_port(target))
+}
+
 /// Append a binding without letting `Vec` round the capacity up to four.
 ///
 /// `Vec::push` on an empty vec allocates `MIN_NON_ZERO_CAP` slots, which is 4
@@ -1153,23 +1181,68 @@ impl Registrar {
     ///
     /// An **O(total contacts)** scan, like `lookup_contact`.
     pub fn aor_for_contact(&self, contact_uri: &str) -> Option<Aor> {
-        let target = normalize_aor(contact_uri);
-        let mut found: Option<Aor> = None;
-        for entry in self.bindings.iter() {
-            let matches = entry.value().iter().any(|contact| {
-                contact.kind == ContactKind::Ue
-                    && !contact.is_expired()
-                    && normalize_aor(&contact.uri.to_string()) == target
-            });
-            if !matches {
-                continue;
+        self.binding_for_contact(contact_uri).map(|(aor, _)| aor)
+    }
+
+    /// [`aor_for_contact`](Self::aor_for_contact) with the matched binding's
+    /// Contact URI, which is what [`has_live_contact`](Self::has_live_contact)
+    /// later asks about.
+    pub fn binding_for_contact(&self, contact_uri: &str) -> Option<(Aor, String)> {
+        match parse_contact_target(contact_uri) {
+            Some(target) => self.unique_binding(|contact| same_contact(&contact.uri, &target)),
+            None => {
+                let target = normalize_aor(contact_uri);
+                self.unique_binding(|contact| normalize_aor(&contact.uri.to_string()) == target)
             }
-            if found.as_deref().is_some_and(|aor| aor != entry.key()) {
+        }
+    }
+
+    /// The one AoR whose live UE binding's REGISTER came from `source`, with
+    /// that binding's Contact URI. `None` when none did, or bindings of two
+    /// AoRs did (a shared device), as for [`binding_for_contact`](Self::binding_for_contact).
+    /// For a request relayed over a captured flow, whose Request-URI need not be
+    /// the Contact. An **O(total contacts)** scan.
+    pub fn binding_for_source(&self, source: SocketAddr) -> Option<(Aor, String)> {
+        self.unique_binding(|contact| contact.source_addr == Some(source))
+    }
+
+    /// The single AoR with a live UE binding `matches` accepts, with the first
+    /// such binding's Contact URI.
+    fn unique_binding(&self, matches: impl Fn(&Contact) -> bool) -> Option<(Aor, String)> {
+        let mut found: Option<(Aor, String)> = None;
+        for entry in self.bindings.iter() {
+            let Some(contact) = entry.value().iter().find(|contact| {
+                contact.kind == ContactKind::Ue && !contact.is_expired() && matches(contact)
+            }) else {
+                continue;
+            };
+            if found.as_ref().is_some_and(|(aor, _)| aor != entry.key()) {
                 return None;
             }
-            found = Some(entry.key().clone());
+            if found.is_none() {
+                found = Some((entry.key().clone(), contact.uri.to_string()));
+            }
         }
         found
+    }
+
+    /// Whether `aor` still has a live UE binding whose Contact is
+    /// `contact_uri` (matched as [`lookup_contact`](Self::lookup_contact)
+    /// matches). `false` once it was de-registered, expired, or reaped.
+    pub fn has_live_contact(&self, aor: &str, contact_uri: &str) -> bool {
+        let primary = self.resolve_alias(aor);
+        let target = parse_contact_target(contact_uri);
+        let normalized = normalize_aor(contact_uri);
+        self.bindings.get(primary.as_str()).is_some_and(|entry| {
+            entry.value().iter().any(|contact| {
+                contact.kind == ContactKind::Ue
+                    && !contact.is_expired()
+                    && match &target {
+                        Some(target) => same_contact(&contact.uri, target),
+                        None => normalize_aor(&contact.uri.to_string()) == normalized,
+                    }
+            })
+        })
     }
 
     /// The registered AoR placing a request whose From names `from_aor`, when a
@@ -1190,19 +1263,35 @@ impl Registrar {
         auth_user: Option<&str>,
         source: SocketAddr,
     ) -> Option<Aor> {
+        self.binding_placing_request(from_aor, auth_user, source)
+            .map(|(aor, _)| aor)
+    }
+
+    /// [`aor_placing_request`](Self::aor_placing_request) with the Contact URI
+    /// of the binding that vouched.
+    pub fn binding_placing_request(
+        &self,
+        from_aor: &str,
+        auth_user: Option<&str>,
+        source: SocketAddr,
+    ) -> Option<(Aor, String)> {
         let primary = self.resolve_alias(from_aor);
         let entry = self.bindings.get(primary.as_str())?;
-        let vouched = entry.value().iter().any(|contact| {
-            if contact.kind != ContactKind::Ue || contact.is_expired() {
-                return false;
-            }
-            match (auth_user, contact.auth_user.as_deref()) {
-                (Some(presented), Some(registered)) => presented == registered,
-                _ => contact.source_addr == Some(source),
-            }
-        });
+        let contact = entry
+            .value()
+            .iter()
+            .find(|contact| {
+                if contact.kind != ContactKind::Ue || contact.is_expired() {
+                    return false;
+                }
+                match (auth_user, contact.auth_user.as_deref()) {
+                    (Some(presented), Some(registered)) => presented == registered,
+                    _ => contact.source_addr == Some(source),
+                }
+            })
+            .map(|contact| contact.uri.to_string());
         drop(entry);
-        vouched.then_some(primary)
+        contact.map(|contact| (primary, contact))
     }
 
     /// Number of registered AoRs (with at least one non-expired UE-side
@@ -5810,6 +5899,38 @@ mod tests {
         assert!(registrar
             .aor_placing_request("sip:202@example.com", None, phone)
             .is_none());
+    }
+
+    #[test]
+    fn bindings_are_found_by_source_and_checked_for_liveness() {
+        let registrar = Registrar::default();
+        save_binding(
+            &registrar,
+            "sip:203@example.com",
+            contact_uri("203", "192.0.2.23"),
+            "192.0.2.23:5062",
+            None,
+        );
+        let (aor, contact) = registrar
+            .binding_for_source("192.0.2.23:5062".parse().unwrap())
+            .expect("found by the REGISTER's source");
+        assert_eq!(aor, "sip:203@example.com");
+        assert!(registrar.has_live_contact(&aor, &contact));
+        assert!(registrar
+            .binding_for_source("192.0.2.23:5099".parse().unwrap())
+            .is_none());
+        assert_eq!(
+            registrar
+                .binding_placing_request(
+                    "sip:203@example.com",
+                    None,
+                    "192.0.2.23:5062".parse().unwrap()
+                )
+                .map(|(_, contact)| contact),
+            Some(contact.clone())
+        );
+        registrar.remove_contact(&aor, &contact);
+        assert!(!registrar.has_live_contact(&aor, &contact));
     }
 
     #[test]

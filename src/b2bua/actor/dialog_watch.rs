@@ -108,6 +108,12 @@ pub struct DialogWatch {
     pub remote_display_name: Option<String>,
     /// The state last reported.
     pub state: DialogState,
+    /// The Contact of the registrar binding that tied this leg to `aor`: the
+    /// binding that vouched for a call the phone placed, or the one a call to
+    /// the phone was sent to. When it is gone the phone is no longer reachable
+    /// through siphon and the dialog is reported ended. `None` when no single
+    /// binding applies. Never reported.
+    pub contact: Option<String>,
 }
 
 impl DialogWatch {
@@ -132,7 +138,7 @@ impl DialogWatch {
     /// the observation carried. Returns whether the state moved, so a report
     /// goes out once per step and never for a step backwards: a provisional
     /// reordered behind its 2xx, or a straggler after the teardown.
-    fn advance(&mut self, state: DialogState, observed_tag: Option<&str>) -> bool {
+    pub fn advance(&mut self, state: DialogState, observed_tag: Option<&str>) -> bool {
         if state <= self.state {
             return false;
         }
@@ -307,6 +313,7 @@ mod tests {
             remote_uri: "sip:201@example.com".to_string(),
             remote_display_name: Some("Front Desk".to_string()),
             state: DialogState::Trying,
+            contact: None,
         }
     }
 
@@ -380,6 +387,7 @@ mod tests {
             remote_uri: "sip:15550100077@example.com".to_string(),
             remote_display_name: None,
             state: DialogState::Trying,
+            contact: None,
         };
         assert!(call.watch_dialog(watch).is_some());
         // A 100 and an untagged 180 do not make the caller's dialog early.

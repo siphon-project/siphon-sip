@@ -1,4 +1,4 @@
-//! Reporting the RFC 4235 dialog state of registered AoRs the B2BUA carries,
+//! Reporting the RFC 4235 dialog state of registered AoRs through the B2BUA,
 //! as the application-level `DialogStateChanged` event.
 //!
 //! Opt-in (`control.apps[].events: [dialog]`) and free when nobody opted in:
@@ -23,13 +23,17 @@
 //!   ([`Registrar::aor_for_contact`](crate::registrar::Registrar::aor_for_contact)),
 //!   which refuses a Contact two AoRs share.
 //!
-//! ## What is not covered
+//! ## INVITEs the proxy relays
 //!
-//! INVITEs the **proxy** relays are not reported. A proxy keeps no dialog
-//! state once the INVITE transaction is over, and it sees the BYE only when the
-//! script Record-Routes and both ends honour the route set, so it could report
-//! `confirmed` and then never report `terminated`. A dialog stuck in
-//! `confirmed` is a phone shown busy forever, which is worse than no report.
+//! Tracked by [`crate::proxy::dialog_state`] with the same matching rules, from
+//! the hooks in `dispatcher::proxy_dialog_state`.
+//!
+//! ## Liveness
+//!
+//! A leg whose binding is gone (de-registered, expired, reaped by registrar
+//! liveness) is reported ended by the liveness pass (`dialog_state_sweep_at`),
+//! while the call itself is left to its own teardown: the phone is no longer
+//! reachable through siphon, and nothing else siphon holds says otherwise.
 
 use crate::b2bua::actor::{DialogDirection, DialogState, DialogWatch, DIALOG_EVENT_CLASS};
 use crate::dispatcher::*;
@@ -103,7 +107,8 @@ pub fn watch_caller_dialog(call_id: &str, auth_user: Option<&str>, state: &Dispa
     else {
         return;
     };
-    let Some(aor) = registrar.aor_placing_request(&aor_of(&from), auth_user, source) else {
+    let Some((aor, contact)) = registrar.binding_placing_request(&aor_of(&from), auth_user, source)
+    else {
         return;
     };
     let (remote_uri, remote_display_name) = identity_of(&to);
@@ -123,6 +128,7 @@ pub fn watch_caller_dialog(call_id: &str, auth_user: Option<&str>, state: &Dispa
             // siphon answers every INVITE with an untagged 100 the moment it
             // arrives, so the phone's dialog is proceeding at the least.
             state: reached.max(DialogState::Proceeding),
+            contact: Some(contact),
         },
     );
 }
@@ -146,8 +152,11 @@ pub fn watch_callee_dialog(
         .call_actors
         .get_call(call_id)
         .and_then(|call| call.control_dial_aor(target_uri));
-    let Some(aor) = dialled_for
-        .or_else(|| registrar().and_then(|registrar| registrar.aor_for_contact(target_uri)))
+    // A branch of an `{aor}` target was dialled at one of that AoR's
+    // Contacts, which is its binding.
+    let Some((aor, contact)) = dialled_for
+        .map(|aor| (aor, target_uri.to_string()))
+        .or_else(|| registrar().and_then(|registrar| registrar.binding_for_contact(target_uri)))
     else {
         return;
     };
@@ -169,6 +178,7 @@ pub fn watch_callee_dialog(
             remote_uri,
             remote_display_name,
             state: DialogState::Trying,
+            contact: Some(contact),
         },
     );
 }
@@ -186,7 +196,7 @@ pub fn watch_originated_dialog(call_id: &str, invite: &SipMessage, state: &Dispa
         StartLine::Request(request_line) => request_line.request_uri.to_string(),
         StartLine::Response(_) => return,
     };
-    let Some(aor) = registrar.aor_for_contact(&target) else {
+    let Some((aor, contact)) = registrar.binding_for_contact(&target) else {
         return;
     };
     let Some((leg_id, sip_call_id, siphon_tag)) = state.call_actors.get_call(call_id).map(|call| {
@@ -215,6 +225,7 @@ pub fn watch_originated_dialog(call_id: &str, invite: &SipMessage, state: &Dispa
             remote_uri,
             remote_display_name,
             state: DialogState::Trying,
+            contact: Some(contact),
         },
     );
 }

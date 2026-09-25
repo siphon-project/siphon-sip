@@ -45,7 +45,7 @@ pub use cdr::{CdrFileConfig, CdrHttpConfig, CdrSinkConfig, CdrSyslogConfig, CdrY
 pub use charging::{RfConfig, RoConfig};
 pub use control::{
     unimplemented_on_lost, ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits,
-    ControlTlsConfig,
+    ControlTlsConfig, DialogStateConfig,
 };
 pub use diameter::{
     DiameterApplication, DiameterClientEntry, DiameterConfig, DiameterCxConfig,

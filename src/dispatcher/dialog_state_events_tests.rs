@@ -22,7 +22,7 @@ const OUTSIDE_CALLEE: &str = "198.51.100.7:5060";
 /// Register `aor` with one binding whose Contact is `sip:<user>@<address>`,
 /// stored from `address` as the REGISTER's source, and start capturing its
 /// dialog events.
-fn register(aor: &str, address: &str) {
+pub(super) fn register(aor: &str, address: &str) {
     let user = aor
         .trim_start_matches("sip:")
         .split('@')
@@ -45,7 +45,7 @@ fn register(aor: &str, address: &str) {
 }
 
 /// The `DialogStateChanged` payloads published for `aor` since the last look.
-fn dialog_events(aor: &str) -> Vec<serde_json::Value> {
+pub(super) fn dialog_events(aor: &str) -> Vec<serde_json::Value> {
     app_event_capture::take(aor)
         .into_iter()
         .filter(|(event, _)| event == "DialogStateChanged")
@@ -53,28 +53,28 @@ fn dialog_events(aor: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn states(events: &[serde_json::Value]) -> Vec<&str> {
+pub(super) fn states(events: &[serde_json::Value]) -> Vec<&str> {
     events
         .iter()
         .map(|event| event["state"].as_str().expect("a state"))
         .collect()
 }
 
-fn text<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
+pub(super) fn text<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
     payload[field]
         .as_str()
         .unwrap_or_else(|| panic!("no string `{field}` in {payload}"))
 }
 
 /// One message siphon put on the wire.
-struct Sent {
-    destination: String,
-    message: SipMessage,
+pub(super) struct Sent {
+    pub(super) destination: String,
+    pub(super) message: SipMessage,
 }
 
 /// Everything siphon has sent since the last look, the followers of an ordered
 /// group included.
-fn wire(dispatcher: &TestDispatcher) -> Vec<Sent> {
+pub(super) fn wire(dispatcher: &TestDispatcher) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = dispatcher.udp.try_recv() {
         for frame in outbound.frames() {
@@ -88,7 +88,7 @@ fn wire(dispatcher: &TestDispatcher) -> Vec<Sent> {
 }
 
 /// The INVITEs among `sent`, by the address they went to.
-fn invites(sent: &[Sent]) -> Vec<(String, SipMessage)> {
+pub(super) fn invites(sent: &[Sent]) -> Vec<(String, SipMessage)> {
     sent.iter()
         .filter(|sent| sent.message.method() == Some(&Method::Invite))
         .map(|sent| (sent.destination.clone(), sent.message.clone()))
@@ -96,14 +96,14 @@ fn invites(sent: &[Sent]) -> Vec<(String, SipMessage)> {
 }
 
 /// The response with `status_code` among `sent` that went to `address`.
-fn response_to<'a>(sent: &'a [Sent], address: &str, status_code: u16) -> &'a SipMessage {
+pub(super) fn response_to<'a>(sent: &'a [Sent], address: &str, status_code: u16) -> &'a SipMessage {
     sent.iter()
         .find(|sent| sent.destination == address && sent.message.status_code() == Some(status_code))
         .map(|sent| &sent.message)
         .unwrap_or_else(|| panic!("no {status_code} to {address}"))
 }
 
-fn header(message: &SipMessage, name: &str) -> String {
+pub(super) fn header(message: &SipMessage, name: &str) -> String {
     message
         .headers
         .get(name)
@@ -111,7 +111,7 @@ fn header(message: &SipMessage, name: &str) -> String {
         .unwrap_or_else(|| panic!("no {name} header"))
 }
 
-fn tag_of(value: &str) -> String {
+pub(super) fn tag_of(value: &str) -> String {
     value
         .split(';')
         .find_map(|parameter| parameter.trim().strip_prefix("tag="))
@@ -119,7 +119,7 @@ fn tag_of(value: &str) -> String {
         .unwrap_or_else(|| panic!("no tag in {value}"))
 }
 
-fn uri_of(value: &str) -> String {
+pub(super) fn uri_of(value: &str) -> String {
     crate::sip::headers::nameaddr::NameAddr::parse(value)
         .expect("a name-addr")
         .uri
@@ -127,7 +127,12 @@ fn uri_of(value: &str) -> String {
 }
 
 /// The response a phone at the far end of `invite` sends, tagged `to_tag`.
-fn response_for(invite: &SipMessage, status_code: u16, reason: &str, to_tag: &str) -> SipMessage {
+pub(super) fn response_for(
+    invite: &SipMessage,
+    status_code: u16,
+    reason: &str,
+    to_tag: &str,
+) -> SipMessage {
     let mut raw = format!("SIP/2.0 {status_code} {reason}\r\n");
     for via in invite.headers.get_all("Via").cloned().unwrap_or_default() {
         raw.push_str(&format!("Via: {via}\r\n"));
@@ -142,7 +147,7 @@ fn response_for(invite: &SipMessage, status_code: u16, reason: &str, to_tag: &st
 }
 
 /// The far end at `address` sends `status_code` for its `invite`.
-fn responds(
+pub(super) fn responds(
     dispatcher: &TestDispatcher,
     call_id: &str,
     address: &str,
@@ -167,7 +172,7 @@ fn responds(
     assert!(handled, "the call was gone when the {status_code} arrived");
 }
 
-fn inbound(source: &str, raw: &str) -> InboundMessage {
+pub(super) fn inbound(source: &str, raw: &str) -> InboundMessage {
     InboundMessage {
         client_transport: None,
         connection_id: ConnectionId::default(),
@@ -180,7 +185,13 @@ fn inbound(source: &str, raw: &str) -> InboundMessage {
 
 /// A BYE from `source` in the dialog named by `from` (the sender's own
 /// identity, tagged), `to` (the other end's, tagged) and `sip_call_id`.
-fn bye(dispatcher: &TestDispatcher, source: &str, from: &str, to: &str, sip_call_id: &str) {
+pub(super) fn bye(
+    dispatcher: &TestDispatcher,
+    source: &str,
+    from: &str,
+    to: &str,
+    sip_call_id: &str,
+) {
     let raw = format!(
         concat!(
             "BYE sip:192.0.2.1:5060 SIP/2.0\r\n",
@@ -205,7 +216,7 @@ fn bye(dispatcher: &TestDispatcher, source: &str, from: &str, to: &str, sip_call
 }
 
 /// A script whose `@b2bua.on_invite` runs `routing`.
-fn script(routing: &str) -> String {
+pub(super) fn script(routing: &str) -> String {
     format!(
         concat!(
             "from siphon import b2bua\n",
@@ -219,7 +230,7 @@ fn script(routing: &str) -> String {
 }
 
 /// An INVITE from `from` (a full From header value, tagged) to `to`.
-fn invite_raw(source: &str, sip_call_id: &str, from: &str, to: &str) -> String {
+pub(super) fn invite_raw(source: &str, sip_call_id: &str, from: &str, to: &str) -> String {
     format!(
         concat!(
             "INVITE {to_uri} SIP/2.0\r\n",
@@ -241,7 +252,7 @@ fn invite_raw(source: &str, sip_call_id: &str, from: &str, to: &str) -> String {
 }
 
 /// The caller at `source` places the call; returns the internal call id.
-fn place_call(dispatcher: &TestDispatcher, source: &str, raw: &str) -> String {
+pub(super) fn place_call(dispatcher: &TestDispatcher, source: &str, raw: &str) -> String {
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the INVITE parses");
     let sip_call_id = header(&message, "Call-ID");
     tokio::task::block_in_place(|| {
@@ -926,4 +937,62 @@ async fn the_loser_of_an_answer_glare_is_never_shown_in_the_call() {
             .any(|sent| sent.destination == loser && sent.message.method() == Some(&Method::Bye)),
         "the loser's 2xx was released with a BYE"
     );
+}
+
+/// A phone whose binding goes away in the middle of a B2BUA call — it
+/// de-registered, its registration expired, or registrar liveness reaped it —
+/// is no longer reachable through siphon: its dialog is reported ended, while
+/// the call itself is left to its own teardown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_that_goes_ends_the_phones_b2bua_dialog() {
+    let (aor, phone) = ("sip:2901@example.com", "192.0.2.72:5060");
+    register(aor, phone);
+    let dispatcher = test_dispatcher_with_script(&script(&format!(
+        "call.dial(\"sip:15550100077@{OUTSIDE_CALLEE}\")"
+    )));
+    let raw = invite_raw(
+        phone,
+        "binding-goes@192.0.2.72",
+        "<sip:2901@example.com>;tag=bg-tag",
+        "sip:15550100077@example.com",
+    );
+    let call_id = place_call(&dispatcher, phone, &raw);
+    let callee_invite = invites(&wire(&dispatcher))
+        .into_iter()
+        .find(|(destination, _)| destination == OUTSIDE_CALLEE)
+        .map(|(_, invite)| invite)
+        .expect("the callee was dialled");
+    responds(
+        &dispatcher,
+        &call_id,
+        OUTSIDE_CALLEE,
+        &callee_invite,
+        200,
+        "OK",
+        "callee-tag",
+    );
+    assert_eq!(states(&dialog_events(aor)), ["proceeding", "confirmed"]);
+
+    crate::script::api::test_registrar().remove_contact(aor, &format!("sip:2901@{phone}"));
+    tokio::task::block_in_place(|| {
+        dialog_state_sweep_at(&dispatcher.state, std::time::Instant::now())
+    });
+    assert_eq!(states(&dialog_events(aor)), ["terminated"]);
+    assert_eq!(
+        dispatcher.state.call_actors.count(),
+        1,
+        "the call itself goes on"
+    );
+
+    // Its teardown reports nothing further: the dialog already ended.
+    let _ = wire(&dispatcher);
+    bye(
+        &dispatcher,
+        OUTSIDE_CALLEE,
+        &format!("{};tag=callee-tag", header(&callee_invite, "To")),
+        &header(&callee_invite, "From"),
+        &header(&callee_invite, "Call-ID"),
+    );
+    assert!(dialog_events(aor).is_empty());
+    assert_eq!(dispatcher.state.call_actors.count(), 0);
 }

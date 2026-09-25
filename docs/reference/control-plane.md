@@ -437,7 +437,8 @@ dashboard should not depend on a script existing.
 #### Dialog state of registered AoRs: `DialogStateChanged`
 
 `events: [dialog]` subscribes an app to the RFC 4235 state of every dialog a
-registered AoR has through siphon's B2BUA, so a controller can serve the
+registered AoR has through siphon, B2BUA calls and proxied INVITEs alike, so a
+controller can serve the
 `dialog` event package (busy-lamp field) truthfully: ringing, talking or idle,
 per phone, ring groups and calls the phone places itself included. Every state
 comes from what siphon observed on the wire; nothing is inferred.
@@ -490,18 +491,85 @@ whose it is from what it observed, never from a header a caller writes alone:
   binding whose Contact is the INVITE's Request-URI. A Contact that bindings of
   two AoRs share names neither.
 
-**Not covered: INVITEs the proxy relays.** A proxy keeps no dialog state once
-the INVITE transaction is over, and it sees the BYE only when the script
-Record-Routes and both ends honour the route set. Reporting those dialogs would
-leave a phone shown in a call forever whenever the BYE bypassed siphon, which is
-worse than no report, so a deployment that routes its phones through the proxy
-gets no `DialogStateChanged` for them.
+**INVITEs the proxy relays.** Matched to AoRs by the same rules (the caller by
+a binding vouching for it, with the identity the script authenticated; each
+branch by the binding its Request-URI, or its captured flow, names), and
+tracked per branch: a fork shows every registered callee `early` on its own
+branch (with that branch's To-tag), the one that answers `confirmed`, and the
+others `terminated` when siphon CANCELs them. The state is kept by dialog
+(Call-ID and tags), not by the transaction entries that retire on Timer I.
 
-**Cost.** Nothing unless an app subscribes: every hook asks first. With a
-subscriber, matching a leg that siphon places at a raw URI to a registration
-scans the registrar's bindings (the same O(total contacts) scan as
-`registrar.lookup_contact`), once per B-leg INVITE; an `{aor}` target skips it.
-The per-dialog record lives on the call and is released with it.
+**Wire change: siphon Record-Routes a tracked INVITE.** When an app subscribes
+to `dialog` and a relayed or forked INVITE involves a registered AoR on either
+side, siphon adds its Record-Route to it even if the script did not call
+`record_route()` (idempotent when it did). RFC 3261 §16.6 step 4 lets a proxy
+stay on the path this way and §12.2 obliges both UAs to send their in-dialog
+requests along the route set, which is what brings the BYE, from either end,
+back through siphon. A BYE ends the dialog for both ends when it arrives, before
+the script runs, so a BYE the script answers itself ends it too. An INVITE with
+no registered party on either side is relayed exactly as the script left it.
+
+A Record-Route siphon adds on its own carries a `dlgw` URI parameter, and an
+in-dialog request whose topmost Route is that entry is routed by siphon along
+the route set (RFC 3261 §16.12) without running the script. A script written
+without Record-Route never saw a dialog's in-dialog requests and still does
+not have to handle them; one that Record-Routes itself keeps handling them
+exactly as before, and siphon adds nothing to its INVITEs. Responses to those
+in-dialog requests still pass `@proxy.on_reply` like any relayed response.
+
+**No endpoint can leave a phone shown in a call.** A proxy is not a party to
+the dialog, so a BYE siphon never sees would leave the state standing. For a
+proxied dialog siphon also ends the reported state, per phone, when:
+
+- the binding that tied the phone to the dialog is removed — de-registered,
+  expired, or reaped by registrar liveness — since the phone is no longer
+  reachable through siphon (checked on the registration event and on every
+  liveness pass);
+- a session interval negotiated in the 2xx (RFC 4028) runs out without a
+  refresh (a 2xx to a re-INVITE or UPDATE refreshes it), after a grace;
+- an in-dialog OPTIONS probe (RFC 3261 §11) to that phone is answered `481`, or
+  goes unanswered (or `408`) `probe_failures` times in a row. The probe is sent
+  along the dialog's route set as a request from the other end, with the other
+  end's tags and the CSeq the phone last received from it (`0` when it received
+  none): reusing that number rather than going one higher keeps the probe from
+  advancing the phone's view of the other end's CSeq space, which the other
+  end's next real request would then fall below (§12.2.2 answers that with
+  `500`). Only an end whose state is still reported is probed;
+- it stays unanswered longer than `max_early_secs` (the §16.6 Timer C bound on
+  how long a proxy lets an INVITE ring), or exists longer than
+  `max_lifetime_secs`.
+
+None of these tears the call down: siphon ends only the reported state. A
+proxy is not a party to the dialog and has no business sending a BYE for one,
+an unanswered probe can be a signalling path that failed while the media still
+flows, and a BYE siphon generated would end a call a phone may still be in. The
+other end keeps its own state until its own evidence says otherwise.
+
+For a **B2BUA** leg the same binding check applies: a phone whose binding goes
+away mid-call is reported ended, and the call is left to its own teardown,
+session timer or duration cap. The B2BUA needs none of the other checks — it is
+a party to both dialogs, and every way the call can end already ends them.
+
+```yaml
+control:
+  dialog_state:
+    probe_interval_secs: 300      # in-dialog OPTIONS to each watched end; 0 disables
+    probe_timeout_secs: 8
+    probe_failures: 2             # unanswered probes in a row; a 481 ends it at once
+    max_early_secs: 300           # Timer C bound on ringing
+    max_lifetime_secs: 43200      # hard backstop
+    session_timer_grace_secs: 32
+```
+
+**Cost.** Nothing unless an app subscribes: every hook stops at the
+subscription check or the tracking store's emptiness, measured at under a
+nanosecond (`benches/dialog_state.rs`, `gate_unsubscribed`). With a
+subscriber, each INVITE branch pays a scan of the registrar's bindings to match
+its target (about 46 µs at 1,000 bindings, `match_callee_1k_bindings`; an
+`{aor}` target of a `dial` skips it), and each tracked proxied call about
+1.5 µs of bookkeeping from INVITE to BYE (`track_proxied_call`). A B2BUA leg's
+record lives on its call and is released with it; the proxy store drains as
+each dialog ends.
 
 An **inbound REFER on a controlled call** (a party asking to be transferred) is
 handed to the owning app rather than the in-process `@b2bua.on_refer` path: siphon
