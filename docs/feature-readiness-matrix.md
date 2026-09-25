@@ -287,6 +287,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | Presence API | **Production** | `presence.*` | Used for reg-event SUBSCRIBE/NOTIFY |
 | Outbound SUBSCRIBE (RFC 6665 watcher) | Implemented | `proxy.subscribe_state.send/find/refresh` | Originate SUBSCRIBE, capture dialog state from 200 OK, correlate inbound NOTIFY by tags |
 | SUBSCRIBE dialog handle | Implemented | `SubscribeHandle` properties, `reload()` | Properties read this instance's dialog state — live, never a snapshot, and never a network wait, so an `async def` handler cannot pin its asyncio driver on one; a reaped dialog raises `LookupError` and `await handle.reload()` is the explicit L2-cache re-read for the cross-replica case |
+| SUBSCRIBE notifier accept | Implemented | `proxy.subscribe_state.accept()`, `handle.notify()` | The 200 `accept()` stages leaves before any NOTIFY or terminating NOTIFY the same handler awaits (RFC 6665 §4.1.2.3): the handle holds them until the handlers return, whatever thread the coroutine ran on. Later sends go out immediately. Regression-tested through `handle_request` with a real `async def` script (`the_initial_notify_leaves_after_the_200_that_accepted_the_subscription`) |
 | Reginfo XML parser (RFC 3680) | Implemented | `presence.parse_reginfo(xml)` | Watcher-side parser for `application/reginfo+xml` NOTIFY bodies |
 | Lawful intercept API | Implemented | `li.*` | |
 | Logging API | **Production** | `log.*` | |

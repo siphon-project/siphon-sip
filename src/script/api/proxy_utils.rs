@@ -3,7 +3,7 @@
 //! These are injected onto the Python `proxy` namespace alongside the
 //! decorator methods defined in `siphon_package.py`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -114,6 +114,67 @@ pub(crate) fn try_defer_send(
             false
         }
     })
+}
+
+/// Request-scoped hold for in-dialog messages that must follow the reply to
+/// the request that created the dialog (RFC 6665 §4.1.2.3: the initial NOTIFY
+/// follows the 2xx that accepted the subscription).
+///
+/// The thread-local queue above only sees sends made on the dispatcher thread
+/// that ran the handler. An awaitable such as `SubscribeHandle.notify()` builds
+/// and sends its message inside a future polled on a tokio worker, while an
+/// `async def` handler itself runs on an asyncio driver thread, so that queue
+/// is never active where the NOTIFY is sent and the NOTIFY overtook the staged
+/// 200. The gate travels with the handle instead: open while the handler runs,
+/// closed by the dispatcher once it has the script's decision, after which the
+/// held messages ride behind the reply and later sends go straight out.
+#[derive(Default)]
+pub struct ReplyGate {
+    held: Mutex<Option<Vec<DeferredMessage>>>,
+}
+
+impl ReplyGate {
+    /// An open gate, holding nothing yet.
+    pub fn open() -> Arc<Self> {
+        Arc::new(Self {
+            held: Mutex::new(Some(Vec::new())),
+        })
+    }
+
+    /// Hold `message` until the reply has gone. Returns it back (`Some`) when
+    /// the gate has already closed, so the caller sends it immediately.
+    pub(crate) fn hold(
+        &self,
+        message: SipMessage,
+        destination: std::net::SocketAddr,
+        transport: Transport,
+    ) -> Option<SipMessage> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match held.as_mut() {
+            Some(queue) => {
+                queue.push(DeferredMessage {
+                    message,
+                    destination,
+                    transport,
+                });
+                None
+            }
+            None => Some(message),
+        }
+    }
+
+    /// Close the gate and return what it held, in the order it was held.
+    /// Idempotent: a second close returns nothing.
+    pub fn close(&self) -> Vec<DeferredMessage> {
+        self.held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
 }
 
 /// Global DNS resolver for send_request — set alongside the UAC sender.
@@ -976,6 +1037,58 @@ mod deferred_send_tests {
         // be a no-op rather than a panic.
         drain_deferred_sends();
         assert!(drain_deferred_sends_for(addr("10.0.0.1:5060"), Transport::Udp).is_empty());
+    }
+
+    #[test]
+    fn an_open_gate_holds_in_order_and_close_releases_everything() {
+        let peer = addr("10.0.0.1:5060");
+        let gate = ReplyGate::open();
+        assert!(gate
+            .hold(notify_to("alice"), peer, Transport::Tls)
+            .is_none());
+        assert!(gate.hold(notify_to("bob"), peer, Transport::Tls).is_none());
+
+        let released = gate.close();
+        assert_eq!(released.len(), 2);
+        assert!(released[0]
+            .message
+            .to_bytes()
+            .windows(5)
+            .any(|w| w == b"alice"));
+        assert!(released[1]
+            .message
+            .to_bytes()
+            .windows(3)
+            .any(|w| w == b"bob"));
+        assert_eq!(released[0].destination, peer);
+        assert_eq!(released[0].transport, Transport::Tls);
+        assert!(gate.close().is_empty(), "a second close releases nothing");
+    }
+
+    #[test]
+    fn a_closed_gate_hands_the_message_back_to_send_now() {
+        let gate = ReplyGate::open();
+        gate.close();
+        let returned = gate
+            .hold(notify_to("carol"), addr("10.0.0.1:5060"), Transport::Udp)
+            .expect("a closed gate must not swallow a message");
+        assert!(returned.to_bytes().windows(5).any(|w| w == b"carol"));
+    }
+
+    #[test]
+    fn a_gate_holds_across_threads() {
+        // The handle's NOTIFY future is polled on a tokio worker, not the
+        // dispatcher thread that closes the gate.
+        let gate = ReplyGate::open();
+        let holder = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            assert!(holder
+                .hold(notify_to("dave"), addr("10.0.0.1:5060"), Transport::Udp)
+                .is_none());
+        })
+        .join()
+        .expect("holder thread");
+        assert_eq!(gate.close().len(), 1);
     }
 }
 

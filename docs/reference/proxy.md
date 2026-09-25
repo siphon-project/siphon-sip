@@ -38,11 +38,15 @@ Redis-backed persistence.
 
 Use `handle = proxy.subscribe_state.accept(request, expires=seconds)` after
 authenticating the subscriber and authorizing the event package and resource.
-It sends the 200 response with the dialog's To-tag and negotiated Expires. An
-unknown in-dialog request receives 481 and returns `None`. Refresh returns the
-same handle without resetting NOTIFY CSeq or event-body version. Immediately
+It stages the 200 response with the dialog's To-tag and negotiated Expires,
+which siphon sends when the handler returns. An unknown in-dialog request
+receives 481 and returns `None`. Refresh returns the same handle without
+resetting NOTIFY CSeq or event-body version. Immediately
 `await handle.notify(body=..., content_type=...)`; for Expires zero,
 `await handle.terminate(reason="deactivated", body=..., content_type=...)` instead.
+A NOTIFY sent from the handler that accepted the subscription is held until that
+handler returns and goes on the wire after the 200 (RFC 6665 §4.1.2.3). One sent
+later, from a timer or a background task, goes out immediately.
 The notifier tag is available as `handle.local_tag`. Expiry sends a terminating
 NOTIFY automatically; scripts still own package content and change notifications.
 

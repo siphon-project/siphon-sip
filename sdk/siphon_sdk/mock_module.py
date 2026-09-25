@@ -524,7 +524,17 @@ class MockSubscribeState:
         return MockSubscribeHandle(self, handle_id, dialog)
 
     def accept(self, request: Any, expires: Optional[int] = None) -> Optional[MockSubscribeHandle]:
-        """Accept or refresh an authorized notifier subscription; body is script-owned."""
+        """Accept or refresh an authorized notifier subscription; body is script-owned.
+
+        Stages the 200 (To-tag, negotiated Expires, Contact); siphon sends it when
+        the handler returns. A ``handle.notify()`` / ``handle.terminate()`` awaited
+        in the same handler is held and goes on the wire after that 200
+        (RFC 6665 section 4.1.2.3), so a test can expect 200 then NOTIFY::
+
+            handle = proxy.subscribe_state.accept(request, expires=3600)
+            if handle is not None:
+                await handle.notify(body=summary, content_type=MWI_TYPE)
+        """
         import uuid
         to_value = request.get_header("To") or ""
         to_tag = to_value.split(";tag=", 1)[1].split(";", 1)[0] if ";tag=" in to_value else None

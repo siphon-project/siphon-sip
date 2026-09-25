@@ -89,6 +89,23 @@ entry, but a working config keeps working.
   awaits into a filtered form that does not exist. `on_invite` is no longer
   checked, since every call it sees is an INVITE. The suggested filter is also
   built from method comparisons alone, so
+
+- **The initial NOTIFY overtook the 200 that accepted the subscription.**
+  `proxy.subscribe_state.accept()` stages the 200, which goes out when the handler
+  returns, while `await handle.notify()` sends from inside it. The queue that held
+  in-handler NOTIFYs behind the reply was per-thread, and since `notify()` became
+  awaitable it runs on a tokio worker under an `async def` handler, so the queue
+  never saw it and a subscriber received the NOTIFY first. The handle returned by
+  `accept()` / `create()` now carries a hold scoped to the SUBSCRIBE, closed once
+  the handlers return: a NOTIFY or terminating NOTIFY sent in the handler goes
+  out after the 200, one sent later goes out immediately (RFC 6665 §4.1.2.3).
+
+- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
+  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
+  only under a method branch and told the author to move the awaits into
+  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
+  takes a method filter. Those two hooks now get a non-failing note that states
+  the cost. The suggested filter is also built from method comparisons alone, so
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.
