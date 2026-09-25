@@ -395,8 +395,11 @@ impl PySubscribeHandle {
     /// explicitly for ``pending``, ``active;expires=N;reason=...``, or
     /// to override the expiry.
     ///
-    /// Returns ``True`` on success, ``False`` if the dialog has been
-    /// terminated or is unknown.
+    /// Returns ``True`` on success.  Raises ``LookupError`` when the dialog is
+    /// unknown — terminated, or reaped on expiry — since sending a NOTIFY in a
+    /// dialog that no longer exists is a script bug, not a quiet no-op.  The
+    /// ``False`` return is the narrow race where it went away between the
+    /// lookup and the CSeq bump.
     #[pyo3(signature = (body=None, content_type=None, state=None))]
     fn notify<'py>(
         &self,
