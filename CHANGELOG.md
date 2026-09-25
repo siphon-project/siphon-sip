@@ -15,6 +15,9 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`siphon::config::expand_env_vars` is public.** Extensions that load their
+  own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules
+  `siphon.yaml` uses instead of keeping their own copy.
 - **`@proxy.on_reply` takes an optional method filter**, the same shape as
   `@proxy.on_request`: `@proxy.on_reply("INVITE")`,
   `@proxy.on_reply("INVITE|UPDATE")`. It matches the method of the request the
