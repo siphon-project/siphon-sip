@@ -53,7 +53,11 @@ entry, but a working config keeps working.
   connection the pool closes after its 30 s idle timeout, so a trunk with no
   traffic on it re-registers about every 35 s, which re-opens the connection
   the registrar reaches it over. SCTP trunks are no longer
-  checked, since there is no outbound SCTP connection to judge.
+  checked, since there is no outbound SCTP connection to judge. Rust library:
+  `registrant::registration_loop` now takes the outbound
+  `Arc<ConnectionPool>` as its last argument instead of an
+  `Option<StreamConnections>`, so an embedder that spawns the loop itself
+  passes the pool its stream transports send through.
 ### Changed
 
 - **A client transaction now retains the octets it sent, not the parsed
