@@ -69,6 +69,18 @@ entry, but a working config keeps working.
   terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
   ask for it with `await handle.reload()`.
 
+- **Probe policy on `gateway.backend` rows.** `probe`, `probe_interval_secs`,
+  `probe_failure_threshold`, `probe_from_user` and `probe_from_domain`, group-wide
+  like `algorithm`, in the HTTP contract, as SQL columns and in
+  `siphon_sdk.gateways`. A source group used to be probed every 30 s with no way
+  to turn it off, so a carrier that does not answer `OPTIONS` was marked down by
+  being provisioned. Omitted fields keep that default. Switching probing off
+  marks the destinations the prober had marked down back up; a change that
+  leaves the probe policy alone leaves the prober alone.
+
+- **`siphon_firewall_redeclared_total`**, counting each time siphon found its
+  nf_tables objects deleted or recreated underneath it and re-declared them.
+
 ### Fixed
 
 - **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
@@ -106,6 +118,65 @@ entry, but a working config keeps working.
   `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
   takes a method filter. Those two hooks now get a non-failing note that states
   the cost. The suggested filter is also built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+
+- **The kernel gateway allow set survives a reload of the table that holds it.**
+  Referencing the sets means putting them in your own table
+  (`security.firewall.table`), because an nf_tables set is scoped to its table,
+  and reloading that table deletes them. siphon declared them once at start-up
+  and trusted its publish cache afterwards, so the node kept dialling its
+  carriers while the kernel dropped every answer, silently, until a restart.
+  siphon now reads back the kernel handles of its objects on every republish;
+  on a difference it re-declares them, republishes the allow set and logs a
+  `warn`. Handles rather than presence, because a reloaded ruleset has to
+  redeclare the sets it references and they come back present and empty. The
+  1.10.0 note that the sets converge after `nft flush ruleset` was not true
+  until now. Ban sets are re-declared too, but come back empty: bans placed
+  before the reload are enforced in userspace only.
+
+- **A zero timer interval is refused at load instead of killing its task.**
+  `gateway.groups[].probe.interval_secs`, `nat.keepalive.interval_secs` and
+  `nat.crlf_keepalive.interval_secs` set to `0` panicked the spawned prober or
+  keepalive task, and the node carried on without it while its config said it
+  was on. Each is now a config error naming the field (`enabled: false` is the
+  way to turn one off), and a `gateway.backend` row with
+  `probe_interval_secs: 0` is refused like any other bad row.
+
+- **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
+  now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
+  (it was documented but never applied), and if the script registers
+  `@http.route` handlers but an HTTP listener cannot bind (port in use, missing
+  TLS file), siphon exits at startup instead of running with the routes
+  unreachable.
+
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.

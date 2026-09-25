@@ -24,7 +24,20 @@ def test_minimal_row_carries_the_documented_defaults():
 
 def test_absent_optionals_are_omitted_not_null():
     encoded = row().to_dict()
-    for absent in ("address", "transport", "algorithm", "username", "password", "ha1", "registers"):
+    for absent in (
+        "address",
+        "transport",
+        "algorithm",
+        "username",
+        "password",
+        "ha1",
+        "registers",
+        "probe",
+        "probe_interval_secs",
+        "probe_failure_threshold",
+        "probe_from_user",
+        "probe_from_domain",
+    ):
         assert absent not in encoded
     # Empty collections are omitted too, matching skip_serializing_if.
     assert "attrs" not in encoded
@@ -46,8 +59,20 @@ def test_round_trip_preserves_every_field():
         registers="sip:trunk1@carrier.example",
         require_registration=True,
         enabled=False,
+        probe=True,
+        probe_interval_secs=10,
+        probe_failure_threshold=5,
+        probe_from_user="edge",
+        probe_from_domain="sbc.example.com",
     )
     assert GatewayRow.from_dict(original.to_dict()) == original
+
+
+def test_probe_false_is_sent_not_omitted():
+    # False is the value that matters here; dropping it as "falsy" would leave
+    # the group probed by default.
+    encoded = row(probe=False).to_dict()
+    assert encoded["probe"] is False
 
 
 def test_response_round_trips():

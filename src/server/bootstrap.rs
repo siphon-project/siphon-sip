@@ -1449,6 +1449,11 @@ pub(super) async fn init_gateway_allow_set(
         &trusted_cidrs,
         Arc::clone(manager),
     ));
+    // Records what start-up declared, so the first floor tick can tell a
+    // reload that happened since from the declaration itself.
+    if let Err(error) = allow_set.reassert().await {
+        warn!(%error, "kernel firewall: could not read back siphon's declared sets");
+    }
     if let Err(error) = allow_set.publish().await {
         warn!(
             %error,

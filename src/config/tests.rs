@@ -4643,3 +4643,61 @@ fn extensions_preserve_yaml_order() {
     let names: Vec<&str> = extensions.keys().map(String::as_str).collect();
     assert_eq!(names, vec!["zeta", "alpha", "middle"]);
 }
+
+fn base_yaml(block: &str) -> Result<Config> {
+    Config::from_str(&format!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n{block}"
+    ))
+}
+
+const GATEWAY_GROUP_ZERO_PROBE: &str = "gateway:\n  groups:\n    - name: \"carriers\"\n      \
+     probe:\n        interval_secs: 0\n      destinations:\n        \
+     - uri: \"sip:gw1.carrier.example:5060\"\n          address: \"203.0.113.10:5060\"\n";
+
+#[test]
+fn a_zero_gateway_probe_interval_is_refused_at_load() {
+    // A zero period panics the prober task, and the node would carry on with
+    // the group unprobed while its config says it is probed.
+    let error = base_yaml(GATEWAY_GROUP_ZERO_PROBE).expect_err("probe interval 0 must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("gateway.groups[carriers].probe.interval_secs"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_zero_probe_interval_on_an_unprobed_group_still_loads() {
+    // Nothing is spawned for it, so there is nothing to crash.
+    let yaml = GATEWAY_GROUP_ZERO_PROBE.replace(
+        "        interval_secs: 0\n",
+        "        enabled: false\n        interval_secs: 0\n",
+    );
+    base_yaml(&yaml).expect("an unprobed group's interval is never used");
+}
+
+#[test]
+fn a_zero_nat_keepalive_interval_is_refused_at_load() {
+    let error = base_yaml("nat:\n  keepalive:\n    interval_secs: 0\n")
+        .expect_err("keepalive interval 0 must be refused");
+    assert!(
+        error.to_string().contains("nat.keepalive.interval_secs"),
+        "{error}"
+    );
+    base_yaml("nat:\n  keepalive:\n    enabled: false\n    interval_secs: 0\n")
+        .expect("a disabled keepalive spawns nothing");
+}
+
+#[test]
+fn a_zero_crlf_keepalive_interval_is_refused_at_load() {
+    let error = base_yaml("nat:\n  crlf_keepalive:\n    interval_secs: 0\n")
+        .expect_err("crlf keepalive interval 0 must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("nat.crlf_keepalive.interval_secs"),
+        "{error}"
+    );
+    base_yaml("nat:\n  crlf_keepalive:\n    enabled: false\n    interval_secs: 0\n")
+        .expect("a disabled keepalive spawns nothing");
+}

@@ -496,6 +496,11 @@ pub struct SiphonMetrics {
     /// deleted out from under siphon, capability lost, nf_tables broken) —
     /// alert on it; the userspace ACL is the only enforcement left.
     pub firewall_command_failures_total: IntCounter,
+    /// Times siphon found its nf_tables objects deleted or recreated underneath
+    /// it — typically an operator reloading the table that holds them — and
+    /// re-declared them. Expected once per such reload; a rate with no deploys
+    /// behind it means something keeps rewriting the ruleset.
+    pub firewall_redeclared_total: IntCounter,
 
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
@@ -973,6 +978,11 @@ impl SiphonMetrics {
             "Total kernel-firewall (nf_tables) netlink commands that failed — bans not enforced in the kernel",
         )?;
 
+        let firewall_redeclared_total = IntCounter::new(
+            "siphon_firewall_redeclared_total",
+            "Times siphon found its nf_tables sets deleted or recreated underneath it and re-declared them",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -1272,6 +1282,7 @@ impl SiphonMetrics {
         registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(firewall_commands_dropped_total.clone()))?;
         registry.register(Box::new(firewall_command_failures_total.clone()))?;
+        registry.register(Box::new(firewall_redeclared_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_peer_up.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
@@ -1356,6 +1367,7 @@ impl SiphonMetrics {
             rate_limited_total,
             firewall_commands_dropped_total,
             firewall_command_failures_total,
+            firewall_redeclared_total,
             diameter_peers_connected,
             diameter_peer_up,
             diameter_requests_total,

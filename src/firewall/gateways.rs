@@ -22,6 +22,14 @@
 //! An `accept` inside siphon's own chain would also make a gateway immune to
 //! the ban drops, and that is the operator's policy call, not a side effect of
 //! keeping a set current.
+//!
+//! Referencing the sets means naming the table that holds them — an nf_tables
+//! set is scoped to its table — so an operator using this puts siphon's sets in
+//! a table they own, and reloads that table by deleting and redefining it. Each
+//! wake-up therefore checks that siphon's objects are still the ones it
+//! declared, and re-declares and republishes when they are not. Without that,
+//! a reload leaves siphon dialling carriers whose answers the kernel drops,
+//! with the cache below reporting everything published.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -56,8 +64,39 @@ pub struct GatewayAllowSet {
     /// What the kernel was last told, so an unchanged view issues no netlink
     /// transaction at all. Stored only after the kernel acked, so a failed
     /// publish is retried on the next tick rather than remembered as done.
+    ///
+    /// Only true of the sets it was written into: cleared whenever
+    /// [`Self::reassert`] finds those sets replaced.
     published: Mutex<Option<(Vec<IpNet>, Vec<IpNet>)>>,
+    /// The whole firewall section, so [`Self::reassert`] re-declares exactly
+    /// what start-up declared — ban sets and managed chain included, since a
+    /// reload of the table that holds them deletes those too.
+    firewall: crate::config::FirewallConfig,
+    /// The kernel handles of the declared objects when last checked. A
+    /// different fingerprint means someone deleted or recreated them.
+    fingerprint: Mutex<Option<Vec<u64>>>,
     notify: Notify,
+}
+
+/// What a check found when it compared the declared objects against the
+/// last fingerprint.
+#[derive(Debug, PartialEq, Eq)]
+enum Declaration {
+    /// The same objects siphon last saw. Nothing to do.
+    Unchanged,
+    /// Nothing seen yet, and everything is present: the start-up declaration.
+    FirstSeen,
+    /// Something is missing, or was recreated underneath siphon.
+    Replaced,
+}
+
+fn compare_declaration(known: Option<&[u64]>, current: Option<&[u64]>) -> Declaration {
+    match (known, current) {
+        (_, None) => Declaration::Replaced,
+        (None, Some(_)) => Declaration::FirstSeen,
+        (Some(known), Some(current)) if known == current => Declaration::Unchanged,
+        (Some(_), Some(_)) => Declaration::Replaced,
+    }
 }
 
 impl GatewayAllowSet {
@@ -87,6 +126,8 @@ impl GatewayAllowSet {
             dispatcher,
             trusted,
             published: Mutex::new(None),
+            firewall: config.clone(),
+            fingerprint: Mutex::new(None),
             notify: Notify::new(),
         }
     }
@@ -105,24 +146,12 @@ impl GatewayAllowSet {
     /// issued.
     pub async fn publish(&self) -> std::io::Result<bool> {
         let (v4, v6) = self.desired();
-        {
-            let published = self
-                .published
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if published
-                .as_ref()
-                .is_some_and(|(last_v4, last_v6)| last_v4 == &v4 && last_v6 == &v6)
-            {
-                return Ok(false);
-            }
+        if self.is_published(&v4, &v6) {
+            return Ok(false);
         }
         self.replace(&v4, &v6).await?;
         let ranges = v4.len() + v6.len();
-        *self
-            .published
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some((v4, v6));
+        *self.lock_published() = Some((v4, v6));
         tracing::info!(
             table = %self.table,
             set_v4 = %self.set_v4,
@@ -131,6 +160,99 @@ impl GatewayAllowSet {
             "kernel firewall: gateway allow set published"
         );
         Ok(true)
+    }
+
+    fn lock_published(&self) -> std::sync::MutexGuard<'_, Option<(Vec<IpNet>, Vec<IpNet>)>> {
+        self.published
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Whether the kernel was last told exactly this view.
+    fn is_published(&self, v4: &[IpNet], v6: &[IpNet]) -> bool {
+        self.lock_published()
+            .as_ref()
+            .is_some_and(|(last_v4, last_v6)| last_v4 == v4 && last_v6 == v6)
+    }
+
+    /// Stop trusting the cache, so the next [`Self::publish`] writes the sets
+    /// whatever the view is.
+    fn forget_published(&self) {
+        *self.lock_published() = None;
+    }
+
+    /// Make sure siphon's objects are still the ones it declared, and put them
+    /// back when they are not. Returns whether it had to.
+    ///
+    /// A check that finds everything as it was reads a few handles and issues
+    /// no transaction. One that finds a set missing, or recreated — an operator
+    /// reloading the table that holds it — re-runs the start-up declaration and
+    /// drops the publish cache, because the view it remembers was written into
+    /// sets that no longer exist.
+    pub async fn reassert(&self) -> std::io::Result<bool> {
+        let current = self.kernel_fingerprint().await?;
+        let known = self
+            .fingerprint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match compare_declaration(known.as_deref(), current.as_deref()) {
+            Declaration::Unchanged => return Ok(false),
+            Declaration::FirstSeen => {
+                *self
+                    .fingerprint
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = current;
+                return Ok(false);
+            }
+            Declaration::Replaced => {}
+        }
+        self.declare().await?;
+        let declared = self.kernel_fingerprint().await?.ok_or_else(|| {
+            std::io::Error::other(
+                "kernel firewall: objects still missing straight after declaring them",
+            )
+        })?;
+        *self
+            .fingerprint
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(declared);
+        self.forget_published();
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics.firewall_redeclared_total.inc();
+        }
+        tracing::warn!(
+            table = %self.table,
+            missing = current.is_none(),
+            "kernel firewall: siphon's sets were deleted or recreated underneath it (a ruleset \
+             reload?) — re-declared them; the gateway allow set is republished now; bans placed \
+             before the reload are enforced in userspace only"
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn kernel_fingerprint(&self) -> std::io::Result<Option<Vec<u64>>> {
+        super::fingerprint(&self.firewall).await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn kernel_fingerprint(&self) -> std::io::Result<Option<Vec<u64>>> {
+        Err(std::io::Error::other(
+            "firewall: the nf_tables backend is Linux-only",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn declare(&self) -> std::io::Result<()> {
+        super::declare(&self.firewall).await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn declare(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "firewall: the nf_tables backend is Linux-only",
+        ))
     }
 
     #[cfg(target_os = "linux")]
@@ -172,6 +294,15 @@ impl GatewayAllowSet {
                     })
                     .await;
                 }
+            }
+            // On every wake-up, not only the floor tick: a few lookups, and it
+            // lets `POST /admin/gateways/refresh` after a ruleset reload close
+            // the window at once instead of leaving it open until the tick.
+            if let Err(error) = self.reassert().await {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.firewall_command_failures_total.inc();
+                }
+                tracing::warn!(%error, "kernel firewall: could not check or re-declare siphon's sets");
             }
             if let Err(error) = self.publish().await {
                 if let Some(metrics) = crate::metrics::try_metrics() {
@@ -297,5 +428,171 @@ mod tests {
     #[test]
     fn normalise_of_nothing_is_nothing() {
         assert!(normalise(Vec::new()).is_empty());
+    }
+
+    // --- Declaration fingerprint ---
+
+    #[test]
+    fn the_same_handles_are_unchanged() {
+        assert_eq!(
+            compare_declaration(Some(&[4, 1, 2, 3, 4]), Some(&[4, 1, 2, 3, 4])),
+            Declaration::Unchanged
+        );
+    }
+
+    #[test]
+    fn the_first_look_records_rather_than_redeclares() {
+        assert_eq!(
+            compare_declaration(None, Some(&[1, 1, 2])),
+            Declaration::FirstSeen
+        );
+    }
+
+    #[test]
+    fn a_missing_object_is_replaced_whatever_was_known() {
+        assert_eq!(
+            compare_declaration(Some(&[1, 1, 2]), None),
+            Declaration::Replaced
+        );
+        // Missing on the very first look too: start-up declared it, so
+        // something removed it since.
+        assert_eq!(compare_declaration(None, None), Declaration::Replaced);
+    }
+
+    #[test]
+    fn a_recreated_table_is_replaced_even_with_the_same_object_handles() {
+        // What a reload of an operator's table looks like: object handles
+        // restart inside the new table, only the table's own handle moves.
+        assert_eq!(
+            compare_declaration(Some(&[1, 1, 2, 3, 4]), Some(&[2, 1, 2, 3, 4])),
+            Declaration::Replaced
+        );
+    }
+
+    // --- Publish cache ---
+
+    fn allow_set() -> GatewayAllowSet {
+        let config: crate::config::FirewallConfig =
+            serde_yaml_ng::from_str("{}").expect("an empty firewall section parses");
+        GatewayAllowSet::new(&config, &[], Arc::new(DispatcherManager::new()))
+    }
+
+    #[test]
+    fn an_unchanged_view_is_published() {
+        let allow_set = allow_set();
+        let v4 = vec![net("192.0.2.0/24")];
+        assert!(!allow_set.is_published(&v4, &[]), "nothing published yet");
+        *allow_set.lock_published() = Some((v4.clone(), Vec::new()));
+        assert!(allow_set.is_published(&v4, &[]));
+        assert!(!allow_set.is_published(&[net("198.51.100.0/24")], &[]));
+    }
+
+    #[test]
+    fn forgetting_the_cache_forces_the_next_publish() {
+        // The cache describes sets a reload has deleted; the view has not
+        // changed, and publish must still write it.
+        let allow_set = allow_set();
+        let v4 = vec![net("192.0.2.0/24")];
+        *allow_set.lock_published() = Some((v4.clone(), Vec::new()));
+        allow_set.forget_published();
+        assert!(!allow_set.is_published(&v4, &[]));
+    }
+
+    /// The whole recovery against a real kernel: siphon's sets live in a table
+    /// the operator owns, the operator reloads it the way a deploy does, and
+    /// the next floor tick puts the sets back and refills them.
+    ///   `unshare -rn cargo test -- --ignored allow_set_survives --nocapture`
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires CAP_NET_ADMIN (run under `unshare -rn`)"]
+    async fn allow_set_survives_the_operator_reloading_its_table() {
+        let config: crate::config::FirewallConfig =
+            serde_yaml_ng::from_str("table: edge\nmanage_rule: false\n").expect("firewall section");
+        super::super::declare(&config)
+            .await
+            .expect("start-up declaration");
+        let allow_set = GatewayAllowSet::new(
+            &config,
+            &["192.0.2.0/24".to_string()],
+            Arc::new(DispatcherManager::new()),
+        );
+        assert!(!allow_set.reassert().await.expect("first look"));
+        assert!(allow_set.publish().await.expect("first publish"));
+
+        // Nothing deleted, nothing changed: no transaction either way.
+        assert!(!allow_set.reassert().await.expect("unchanged look"));
+        assert!(!allow_set.publish().await.expect("unchanged publish"));
+
+        // The operator's deploy: delete the table and redefine it. It has to
+        // declare the set its own rule references, because nothing else would;
+        // this one declares every set siphon owns, in siphon's own order, so
+        // all of them are present afterwards under the very handles they had
+        // before, and only the table's handle shows that they are new.
+        let ruleset = concat!(
+            "table inet edge\n",
+            "delete table inet edge\n",
+            "table inet edge {\n",
+            "  set banned4 { type ipv4_addr; flags timeout; }\n",
+            "  set banned6 { type ipv6_addr; flags timeout; }\n",
+            "  set gateways4 { type ipv4_addr; flags interval; }\n",
+            "  set gateways6 { type ipv6_addr; flags interval; }\n",
+            "}\n",
+            // After the block, not inside it: `nft` allocates a block's chains
+            // before its sets, which would shift the set handles and hide
+            // whether the table's handle alone is enough.
+            "add chain inet edge input { type filter hook input priority 0; policy accept; }\n",
+            "add rule inet edge input ip saddr @gateways4 udp dport 5060 accept\n",
+        );
+        let path = std::env::temp_dir().join(format!("siphon-reload-{}.nft", std::process::id()));
+        std::fs::write(&path, ruleset).expect("write ruleset");
+        let status = std::process::Command::new("nft")
+            .arg("-f")
+            .arg(&path)
+            .status()
+            .expect("run nft");
+        let _ = std::fs::remove_file(&path);
+        assert!(status.success(), "the operator's ruleset did not load");
+        assert!(
+            !nft_list().contains("192.0.2.0/24"),
+            "the reload was meant to empty the set"
+        );
+
+        // Every set is present again, and the publish cache still believes the
+        // view is in them: only the fingerprint can tell.
+        assert!(
+            allow_set.reassert().await.expect("look after reload"),
+            "a reload that left every set present but empty went unnoticed"
+        );
+        assert!(
+            allow_set.publish().await.expect("publish after reload"),
+            "publish short-circuited on a view written into a deleted set"
+        );
+        let listed = nft_list();
+        assert!(listed.contains("192.0.2.0/24"), "not refilled:\n{listed}");
+        assert!(
+            listed.contains("gateways6"),
+            "v6 set not re-declared:\n{listed}"
+        );
+        assert!(
+            listed.contains("banned4"),
+            "ban set not re-declared:\n{listed}"
+        );
+        assert!(
+            listed.contains("@gateways4 udp dport 5060 accept"),
+            "the operator's own rule must survive the re-declaration:\n{listed}"
+        );
+
+        // And settles again.
+        assert!(!allow_set.reassert().await.expect("settled look"));
+        assert!(!allow_set.publish().await.expect("settled publish"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nft_list() -> String {
+        let output = std::process::Command::new("nft")
+            .args(["list", "table", "inet", "edge"])
+            .output()
+            .expect("run nft");
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }

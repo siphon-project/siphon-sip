@@ -27,6 +27,11 @@ transport, weight, priority, attributes or credentials — and it becomes a new
 destination, which starts healthy, because it is a different peer or a different
 way of reaching one.
 
+**Probe policy is per group.** The ``probe_*`` fields turn health probing off
+for a group or change its period, threshold and ``From``. Omitted, a group is
+probed every 30 s as before. A change replaces the group's prober but keeps
+what it learned, which lives on the destinations.
+
 **Linking to an outbound registration.** :attr:`GatewayRow.registers` names an
 AoR from the registrant source. A destination with no credentials of its own
 then answers challenges with that registration's, so one trunk's secret is
@@ -85,6 +90,31 @@ class GatewayRow:
     """Source CIDRs whose senders also count as members of this group for
     ``request.from_gateway()`` / ``call.from_gateway()``. Group-wide."""
 
+    probe: Optional[bool] = None
+    """Health-probe the group with SIP ``OPTIONS``. ``None`` (omitted) means
+    probed, as a ``gateway.groups`` entry is by default. Set ``False`` for a
+    carrier that does not answer ``OPTIONS``: probed anyway, it fails its probe
+    and is taken out of service by being provisioned. Switching probing off
+    puts a destination the prober had marked down back in service.
+
+    Group-wide, like every ``probe_*`` field: each is taken from the first row
+    of the group that carries it."""
+
+    probe_interval_secs: Optional[int] = None
+    """Seconds between probes. Default 30; ``0`` gets the row refused."""
+
+    probe_failure_threshold: Optional[int] = None
+    """Consecutive failed probes before a destination is marked down.
+    Default 3."""
+
+    probe_from_user: Optional[str] = None
+    """User part of the probe's ``From``. Default ``"siphon"``."""
+
+    probe_from_domain: Optional[str] = None
+    """Host part of the probe's ``From``. Default the local address. For a
+    carrier that rejects an ``OPTIONS`` from a domain it does not recognise,
+    which otherwise looks exactly like a carrier that is down."""
+
     username: Optional[str] = None
     """Digest username this destination challenges with."""
 
@@ -127,6 +157,11 @@ class GatewayRow:
             "password",
             "ha1",
             "registers",
+            "probe",
+            "probe_interval_secs",
+            "probe_failure_threshold",
+            "probe_from_user",
+            "probe_from_domain",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -156,6 +191,11 @@ class GatewayRow:
             registers=data.get("registers"),
             require_registration=data.get("require_registration", False),
             enabled=data.get("enabled", True),
+            probe=data.get("probe"),
+            probe_interval_secs=data.get("probe_interval_secs"),
+            probe_failure_threshold=data.get("probe_failure_threshold"),
+            probe_from_user=data.get("probe_from_user"),
+            probe_from_domain=data.get("probe_from_domain"),
         )
 
 
