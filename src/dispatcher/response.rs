@@ -164,6 +164,10 @@ pub(super) fn handle_response(
         }
     }
 
+    // A response on a branch of a tracked proxied dialog moves the callee's
+    // state; the guard settles the caller's once the handling below returns.
+    let _dialog_settle = proxy_dialog_observe_response(&message, status_code, state);
+
     // RFC 3261 §16.7 step 3: a proxy MUST NOT forward 100 Trying upstream.
     // It is hop-by-hop; the proxy already sends its own 100 Trying to the UAC.
     //
@@ -985,6 +989,7 @@ pub(super) fn handle_response(
                             return;
                         }
 
+                        proxy_dialog_upstream(&outcome.response, best_code, state);
                         // 3GPP TS 33.203 §7.4: the relayed-back response must
                         // egress on the same SA's local endpoint that the
                         // request arrived on.  Pass the session's captured
@@ -1119,6 +1124,9 @@ pub(super) fn handle_response(
             {
                 crate::ipsec::runtime::record_security_server(&source_addr.ip(), &message);
             }
+
+            // What the caller is sent moves the caller's dialog state.
+            proxy_dialog_upstream(&message, status_code, state);
 
             // Feed the response into the server transaction for caching
             let server_event = if status_code < 200 {

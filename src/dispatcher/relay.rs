@@ -382,6 +382,22 @@ pub(super) fn relay_request(
     };
     let branch = core::add_via(&mut relayed.headers, &transport_str, &via_host, via_port);
 
+    // An INVITE of a registered AoR's dialog is tracked for `DialogStateChanged`
+    // and Record-Routed whatever the script asked, so the dialog's BYE comes
+    // back through siphon (RFC 3261 §16.6 step 4, §12.2).
+    let tracked = {
+        let request_uri = match &relayed.start_line {
+            StartLine::Request(request_line) => request_line.request_uri.to_string(),
+            StartLine::Response(_) => String::new(),
+        };
+        proxy_dialog_branch(message, &request_uri, flow, next_hop, &branch, state)
+    };
+    let siphon_record_routes = !record_routed && tracked.is_some();
+    // The session keeps the script's own choice: a later branch of this
+    // request (a failure retarget) decides for itself whether it is tracked.
+    let adds_record_route = record_routed || tracked.is_some();
+    let record_routes_before = record_route_count(&relayed);
+
     // Add Record-Route if the script requested it — one entry per *socket* the
     // dialog crosses, so each peer is handed the socket facing it.  See
     // [`record_route_uris`].  The outbound leg reuses the Via sent-by computed
@@ -389,11 +405,11 @@ pub(super) fn relay_request(
     // used; the Gm port pair is the one place they are allowed to differ,
     // because a Record-Route advertises where requests *arrive* and a Via where
     // the response comes back (see `record_route_port_for`).
-    if record_routed {
+    if adds_record_route {
         let outbound_rr_port = crate::script::api::ipsec::record_route_port_for(
             via_port.unwrap_or_else(|| state.via_port(&outbound_transport)),
         );
-        let (first, second) = record_route_uris(
+        let (mut first, mut second) = record_route_uris(
             inbound.transport,
             crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
@@ -401,10 +417,31 @@ pub(super) fn relay_request(
             outbound_rr_port,
             &via_host,
         );
+        if siphon_record_routes {
+            first = own_record_route(first);
+            second = second.map(own_record_route);
+        }
         core::add_record_route(&mut relayed.headers, &first);
         if let Some(ref second) = second {
             core::add_record_route(&mut relayed.headers, second);
         }
+    }
+
+    if let Some(tracked) = tracked {
+        tracked.register(
+            message,
+            inbound,
+            crate::proxy::dialog_state::Hop {
+                destination,
+                transport: outbound_transport,
+                connection_id: flow
+                    .map(|flow| ConnectionId(flow.connection_id))
+                    .unwrap_or_default(),
+                local_addr: flow_local_addr,
+            },
+            record_route_count(&relayed) - record_routes_before,
+            state,
+        );
     }
 
     // Serialize the relayed request
@@ -940,10 +977,17 @@ pub(super) fn relay_fork_branch(
         Some(via_port),
     );
 
+    // Tracked for `DialogStateChanged`, and then Record-Routed — see the same
+    // step in [`relay_request`].
+    let tracked = proxy_dialog_branch(message, target, flow, None, &branch, state);
+    let siphon_record_routes = !record_routed && tracked.is_some();
+    let record_routed = record_routed || tracked.is_some();
+    let record_routes_before = record_route_count(&relayed);
+
     // One Record-Route entry per socket the dialog crosses — see the same block
     // in [`relay_request`] and [`record_route_uris`].
     if record_routed {
-        let (first, second) = record_route_uris(
+        let (mut first, mut second) = record_route_uris(
             inbound.transport,
             crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
@@ -951,10 +995,31 @@ pub(super) fn relay_fork_branch(
             crate::script::api::ipsec::record_route_port_for(via_port),
             &via_host,
         );
+        if siphon_record_routes {
+            first = own_record_route(first);
+            second = second.map(own_record_route);
+        }
         core::add_record_route(&mut relayed.headers, &first);
         if let Some(ref second) = second {
             core::add_record_route(&mut relayed.headers, second);
         }
+    }
+
+    if let Some(tracked) = tracked {
+        tracked.register(
+            message,
+            inbound,
+            crate::proxy::dialog_state::Hop {
+                destination,
+                transport: outbound_transport,
+                connection_id: flow
+                    .map(|flow| ConnectionId(flow.connection_id))
+                    .unwrap_or_default(),
+                local_addr: flow.map(|flow| flow.local_addr),
+            },
+            record_route_count(&relayed) - record_routes_before,
+            state,
+        );
     }
 
     // Update Request-URI to the fork target (each branch gets its own Contact URI)
@@ -1130,4 +1195,13 @@ pub(super) fn relay_fork_branch(
             }
         }
     }
+}
+
+/// Record-Route entries on `message`, flattened.
+fn record_route_count(message: &SipMessage) -> usize {
+    message
+        .headers
+        .get_all("Record-Route")
+        .map(|values| flatten_record_route_headers(values).len())
+        .unwrap_or(0)
 }

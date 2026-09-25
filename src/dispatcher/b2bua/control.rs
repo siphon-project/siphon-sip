@@ -760,6 +760,10 @@ pub struct DialTarget {
     /// Calling-identity presentation for this branch alone (RFC 3323 §4.1).
     /// One carrier may be trusted with the real identity where another is not.
     pub privacy: Option<crate::sip::privacy::CallerIdPresentation>,
+    /// The registered AoR this target is a contact of, when it came from an
+    /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
+    /// as the AoR it was dialled for; `None` for a URI dialled as written.
+    pub aor: Option<String>,
 }
 
 impl DialTarget {
@@ -980,54 +984,6 @@ impl std::fmt::Display for DialError {
     }
 }
 
-/// Resolve an AoR to one dial target per registered contact, each carrying its
-/// own flow and Path route set.
-///
-/// This is what makes a phone on TCP, TLS or WSS reachable: such a contact is
-/// only reachable over the connection it registered on, so DNS-resolving its
-/// Contact URI (what `originate` does with a bare URI) reaches nothing. Mirrors
-/// what a script gets from `call.fork(registrar.lookup(aor))`.
-pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
-    let Some(registrar) = crate::script::api::registrar_arc() else {
-        return Err(DialError::NoContacts(aor.to_string()));
-    };
-    let contacts = registrar.lookup(aor);
-    if contacts.is_empty() {
-        return Err(DialError::NoContacts(aor.to_string()));
-    }
-    Ok(contacts
-        .into_iter()
-        .map(|contact| {
-            // Each branch carries the route set of its *own* binding (RFC 3327
-            // §5.3); a shared one would put every branch through the first
-            // binding's proxy chain.
-            let path: Vec<String> = contact.path.iter().map(|value| value.to_string()).collect();
-            let route = crate::proxy::core::route_set_from_path(&path)
-                .map(|value| vec![value])
-                .unwrap_or_default();
-            // The captured inbound flow, same view the scripting API hands to
-            // `call.fork` — `None` for a binding whose socket has gone, which
-            // then falls back to resolving the Contact URI.
-            let flow = contact
-                .flow()
-                .map(|flow| crate::script::api::registrar::PyFlow {
-                    transport: flow.transport.as_scheme().to_string(),
-                    source_addr: flow.source_addr,
-                    local_addr: flow.local_addr,
-                    connection_id: flow.connection_id,
-                });
-            DialTarget {
-                uri: contact.uri.to_string(),
-                next_hop: None,
-                flow,
-                route,
-                headers: std::collections::HashMap::new(),
-                ..Default::default()
-            }
-        })
-        .collect())
-}
-
 /// Ring `targets` as B-legs of a controlled call, keeping the caller unanswered
 /// and the call with its controller.
 ///
@@ -1198,6 +1154,16 @@ pub(crate) fn b2bua_dial_call_with_state(
     // Ownership is deliberately NOT released — that is the whole difference
     // from `route`.
     state.call_actors.set_control_dial(&internal_call_id, true);
+    // Which registered AoR each `{aor}` target's contacts belong to, so every
+    // branch this dial places — a sequential hunt's later attempts included —
+    // names the AoR it was dialled for. Replaced per dial: a second dial on the
+    // channel names only its own.
+    if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
+        call.control_dial_aors = targets
+            .iter()
+            .filter_map(|target| Some((target.uri.clone(), target.aor.clone()?)))
+            .collect();
+    }
 
     let sent = if parallel {
         dial_parallel(

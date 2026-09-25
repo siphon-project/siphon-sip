@@ -45,7 +45,7 @@ pub use cdr::{CdrFileConfig, CdrHttpConfig, CdrSinkConfig, CdrSyslogConfig, CdrY
 pub use charging::{RfConfig, RoConfig};
 pub use control::{
     unimplemented_on_lost, ControlAppConfig, ControlConfig, ControlInboundConfig, ControlLimits,
-    ControlTlsConfig,
+    ControlTlsConfig, DialogStateConfig,
 };
 pub use diameter::{
     DiameterApplication, DiameterClientEntry, DiameterConfig, DiameterCxConfig,
@@ -911,7 +911,7 @@ impl Config {
     /// that never come, and there is no request/reply to carry the mistake
     /// back — `events` is read at start-up, not asked for at run time.
     fn validate_control_app_events(&self) -> Result<()> {
-        const KNOWN: &[&str] = &["registration"];
+        const KNOWN: &[&str] = &["registration", "dialog"];
         let Some(control) = &self.control else {
             return Ok(());
         };

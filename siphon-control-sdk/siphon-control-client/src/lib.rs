@@ -66,9 +66,9 @@ pub use server::{ControlServer, ServerConfig};
 
 // Ergonomic top-level re-exports of the common SIP facade.
 pub use sip::{
-    Call, CallEvent, CallStream, DialOptions, DialStrategy, DialTarget, Dialing, DtmfOptions,
-    PeerHangupPolicy, PlayOptions, PlaySource, RecordChannels, RecordDirection, RecordOptions,
-    Recording, RouteTarget, SipClient, SipServer,
+    AppEvent, AppEventStream, Call, CallEvent, CallStream, DialOptions, DialStrategy, DialTarget,
+    Dialing, DtmfOptions, PeerHangupPolicy, PlayOptions, PlaySource, RecordChannels,
+    RecordDirection, RecordOptions, Recording, RouteTarget, SipClient, SipServer,
 };
 
 // Re-export the wire contract so downstreams need only depend on this crate.

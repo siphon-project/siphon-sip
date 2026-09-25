@@ -17,6 +17,7 @@ use crate::sip::message::SipMessage;
 use super::*;
 
 mod dial_branch;
+mod dialog_watch;
 mod failure;
 mod fork;
 mod route_progress;
@@ -239,8 +240,12 @@ impl CallActorStore {
 
     /// Remove a B-leg by index.
     pub fn remove_b_leg(&self, call_id: &str, index: usize) {
+        let mut ended = Vec::new();
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(removed) = call.remove_b_leg(index) {
+                // A leg that leaves the call ends its dialog here, whatever
+                // state it was reported in.
+                ended = call.end_orphaned_dialogs();
                 self.registry.remove_branch(&removed.branch);
                 // Only remove Call-ID mapping if no other leg uses it.
                 // Re-INVITE tracking legs share the A-leg or winning B-leg
@@ -253,6 +258,7 @@ impl CallActorStore {
                 }
             }
         }
+        publish_dialog_states(ended);
     }
 
     /// Update the target_uri of a B-leg (used to mark re-INVITE entries as done).
@@ -330,9 +336,13 @@ impl CallActorStore {
     ///
     /// [`adopt_replaced_dialog`]: Self::adopt_replaced_dialog
     pub fn detach_a_leg_for_adoption(&self, call_id: &str) -> Option<Leg> {
-        let (_, call) = self.calls.remove(call_id)?;
+        let (_, mut call) = self.calls.remove(call_id)?;
         call.shutdown_actors();
         self.registry.remove_branch(&call.a_leg.branch);
+        // The call its watches were kept on is gone, so none may be left
+        // reporting a dialog in progress. The adopting call watches the leg
+        // afresh if it belongs to a registered AoR.
+        publish_dialog_states(call.end_all_dialogs());
         Some(call.a_leg)
     }
 
@@ -387,6 +397,8 @@ impl CallActorStore {
             call.b_leg_handles.push(None);
             call.winner = Some(0);
             call.transition_to(CallState::Answered);
+            // The replaced party and any settled fork loser have left the call.
+            publish_dialog_states(call.end_orphaned_dialogs());
             (replaced, survivor)
         };
 
@@ -1147,14 +1159,21 @@ impl CallActorStore {
                 _ => {}
             }
             let old_referrer = std::mem::replace(&mut call.a_leg, target);
+            // The referrer is transferred away and BYEd next: its dialog ends.
+            let ended = call.end_orphaned_dialogs();
             drop(call);
+            publish_dialog_states(ended);
             self.retire_promoted_referrer(&old_referrer);
             Some(old_referrer)
         } else {
             let old_winner_idx = call.winner?;
             let old_referrer = call.b_legs.get(old_winner_idx).cloned()?;
             call.winner = Some(target_idx);
+            // The referrer stays in its slot until the call ends, but it is
+            // transferred away and BYEd next: its dialog ends now.
+            let ended = call.advance_dialog(&old_referrer.id.0, DialogState::Terminated, None);
             drop(call);
+            publish_dialog_states(ended.into_iter().collect());
             self.retire_promoted_referrer(&old_referrer);
             Some(old_referrer)
         }
@@ -1190,7 +1209,11 @@ impl CallActorStore {
     /// sides need it: on a B2BUA the A-leg and B-leg Call-IDs differ, and either
     /// peer can be the one whose BYE loses the race.
     pub fn remove_call(&self, call_id: &str) {
-        if let Some((_, call)) = self.calls.remove(call_id) {
+        if let Some((_, mut call)) = self.calls.remove(call_id) {
+            // Every dialog a registered AoR had on the call is over. The same
+            // funnel as the billing below, for the same reason: every ended call
+            // passes through here, whichever path ended it.
+            publish_dialog_states(call.end_all_dialogs());
             // Bill the call out on the way down. This is the one funnel every
             // ended call passes through — a normal BYE, an admin hangup, a
             // failure teardown — so counting here cannot miss a disposition the
@@ -1417,29 +1440,6 @@ impl CallActorStore {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.control_dial = pending;
         }
-    }
-
-    /// Drop every B-leg of a call, leaving the A-leg and its dialog intact.
-    ///
-    /// A controller-owned dial that failed is done with the legs it rang, but
-    /// not with the caller: the controller may dial somewhere else on the same
-    /// channel, and a stale B-leg would make the next attempt look like glare
-    /// and confuse the winner bookkeeping.
-    pub fn clear_b_legs(&self, call_id: &str) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.b_legs.clear();
-            call.b_leg_status.clear();
-            call.b_leg_handles.clear();
-            call.winner = None;
-        }
-    }
-
-    /// Whether a controller-issued `dial` is still awaiting its outcome.
-    pub fn is_control_dial(&self, call_id: &str) -> bool {
-        self.calls
-            .get(call_id)
-            .map(|call| call.control_dial)
-            .unwrap_or(false)
     }
 
     /// Release a parked call from external control: clear the control owner + the

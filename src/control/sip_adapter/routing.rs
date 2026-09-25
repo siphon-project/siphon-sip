@@ -252,6 +252,10 @@ pub(super) fn parse_dial_target(
             .map(|s| s.to_string()),
         privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
             .map_err(|error| error.to_string())?,
+        // A URI dialled as written names no registered AoR, even one that
+        // happens to be a registered contact: only an `{aor}` target says whom
+        // the branch was dialled for.
+        aor: None,
     }])
 }
 

@@ -19,6 +19,16 @@ entry, but a working config keeps working.
   (`ProxyReply(Option<String>)`), `ScriptState::proxy_reply_handlers(method)`
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
   `proxy::reply_pipeline` module are removed.
+- **siphon Record-Routes a proxied INVITE that involves a registered phone when
+  an app subscribes to `dialog` events**, whether or not the script called
+  `record_route()` (idempotent when it did). RFC 3261 §16.6 step 4 lets a proxy
+  stay on the path this way, and §12.2 obliges both UAs to follow the route
+  set, which is what brings the dialog's BYE back through siphon to be
+  reported. The entry carries a `dlgw` URI parameter, and siphon routes the
+  in-dialog requests that follow it along the route set itself, without the
+  script, so a script written without Record-Route needs no in-dialog handling.
+  Without a `dialog` subscriber, or for an INVITE with no registered party on
+  either side, nothing on the wire changes.
 
 - **A client transaction now retains the octets it sent, not the parsed
   request.** The INVITE and non-INVITE client transactions (RFC 3261 §17.1.1 /
@@ -311,6 +321,51 @@ entry, but a working config keeps working.
   awaited counterpart to the implicit cache read the properties no longer make
   (below) — for a dialog another replica owns whose local entry has since been
   reaped.
+- **Dialog state of registered phones on the control plane: `DialogStateChanged`.**
+  An app that lists `dialog` in `control.apps[].events` is told the RFC 4235
+  state of every dialog a registered AoR has through siphon, B2BUA calls and
+  proxied INVITEs alike, so it can serve the `dialog` event package (busy-lamp
+  field): `{aor, state, direction, leg_id, call_id, local_tag, remote_tag,
+  remote_identity}`, with `state` one of `trying` / `proceeding` / `early` /
+  `confirmed` / `terminated`, all from the phone's side. It covers calls a
+  phone places, every B-leg or proxied fork branch to a registered contact (a
+  ring group shows each member ringing, then the one that answered confirmed
+  and the others terminated), transfers in all three REFER modes, a `Replaces`
+  takeover and `originate` to a registered contact. Each dialog reports
+  `terminated` exactly once, whatever ended it: BYE from either side (on the
+  proxy too, including a BYE the script answers itself), CANCEL, a final
+  failure, the ring timeout, a branch cancelled because another answered, a 2xx
+  that lost an answer glare, a transfer's referrer, a replaced party. A call a
+  phone places is matched to its AoR only when a live binding vouches for the
+  INVITE (its authenticated identity, or the address the binding registered
+  from), never by the From header alone. Nothing is tracked unless an app
+  subscribes.
+
+- **Proxied dialogs of registered phones can never be left shown in a call.**
+  For a dialog the proxy relays siphon also ends the reported state (never the
+  call) when the phone's binding is removed, expires or is reaped; a
+  negotiated RFC 4028 session interval runs out; an in-dialog OPTIONS probe
+  (RFC 3261 §11) to that phone is answered `481` or goes unanswered
+  `probe_failures` times; it rings past `max_early_secs`; or it outlives
+  `max_lifetime_secs`. The probe goes along the route set as a request from the
+  other end, reusing the CSeq the phone last received from it so the dialog's
+  CSeq ordering is untouched. New `control.dialog_state` block for the knobs. A
+  B2BUA leg whose phone's binding goes away mid-call is reported ended too; the
+  call is left to its own teardown.
+
+- **Control-plane `dial` branch events name the AoR they rang.** `DialBranch`,
+  `DialBranchFailed`, `DialAnswered` and each `DialFailed.branches` entry carry
+  `aor` when the branch was one of an `{aor}` target's contacts, so
+  `DialAnswered.aor` is the phone that picked up. Absent for a URI dialled as
+  written.
+
+- **Control SDKs receive application-level events.** The SIP facades dropped
+  every frame without a channel, so `RegistrationChanged` never reached an app
+  that used them. `SipClient::set_app_event_handler` / `app_events()` (Rust),
+  `@client.on_app_event` (Python, called as `handler(event, payload)`) and
+  `SipClient.onAppEvent` (TypeScript) deliver them now. `DialogStateChanged` is
+  typed in the Rust (`DialogStateChangedPayload`, `AppEvent::dialog_state`) and
+  TypeScript SDKs, and the dial branch payloads gain `aor`.
 
 ## [1.10.0] — 2026-09-24
 

@@ -103,6 +103,12 @@ pub struct DispatcherState {
     /// script (`control.inbound`). `Some` turns B2BUA mode on by itself, the
     /// way a registered `@b2bua.*` handler does.
     pub control_inbound: Option<crate::config::ControlInboundConfig>,
+    /// Liveness settings for the dialog state `DialogStateChanged` reports
+    /// (`control.dialog_state`).
+    pub dialog_state_config: crate::config::DialogStateConfig,
+    /// The proxied dialogs of registered AoRs being reported, keyed by dialog.
+    /// Empty unless an app subscribes to `dialog` events.
+    pub proxy_dialogs: Arc<crate::proxy::dialog_state::ProxyDialogStore>,
     pub session_timer_config: Option<crate::config::SessionTimerConfig>,
     /// B2BUA header policy library — keyed by qualified name (e.g.
     /// `"transparent-b2bua@2026"`).  Built once at startup by

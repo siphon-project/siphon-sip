@@ -42,6 +42,9 @@ pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recor
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 
+mod app_event;
+pub use app_event::{AppEvent, AppEventStream};
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1171,6 +1174,7 @@ struct SipFacade {
     handler: Mutex<Option<CallHandler>>,
     call_tx: Mutex<Option<mpsc::UnboundedSender<Call>>>,
     channels: Mutex<HashMap<String, mpsc::UnboundedSender<CallEvent>>>,
+    app_handler: Mutex<Option<app_event::AppEventHandler>>,
 }
 
 impl SipFacade {
@@ -1179,6 +1183,7 @@ impl SipFacade {
             handler: Mutex::new(None),
             call_tx: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
+            app_handler: Mutex::new(None),
         })
     }
 
@@ -1223,11 +1228,10 @@ impl SipFacade {
                     lock(&self.channels).remove(&channel);
                 }
             }
-            _ => {
-                if let Some(channel) = frame.channel.clone() {
-                    self.route(&channel, CallEvent::from_frame(frame));
-                }
-            }
+            _ => match frame.channel.clone() {
+                Some(channel) => self.route(&channel, CallEvent::from_frame(frame)),
+                None => self.deliver_app_event(frame),
+            },
         }
     }
 

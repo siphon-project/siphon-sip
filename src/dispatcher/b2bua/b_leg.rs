@@ -714,6 +714,9 @@ pub fn b2bua_send_b_leg_invite(
     // with the Call-ID this INVITE carries: before the send, so nothing the
     // branch answers can be reported ahead of it.
     control_dial_branch_created(call_id, &b_leg, target_uri, state);
+    // And a leg that rings a registered AoR is watched for its dialog state,
+    // from the same point and for the same reason.
+    watch_callee_dialog(call_id, &b_leg, target_uri, &b_leg_invite, state);
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
@@ -809,6 +812,7 @@ pub fn b2bua_send_b_leg_invite(
                 crate::b2bua::actor::DialBranchCause::Unsent,
                 state,
             );
+            callee_dialog_ended(call_id, &branch, state);
             return false;
         }
     } else {
