@@ -841,7 +841,7 @@ pub(super) fn init_registrant(
     listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
-    stream_connections: transport::StreamConnections,
+    connection_pool: &Arc<transport::pool::ConnectionPool>,
 ) {
     use crate::registrant::{RegistrantCredentials, RegistrantEntry};
 
@@ -1017,7 +1017,7 @@ pub(super) fn init_registrant(
     let loop_advertised_addrs = advertised_addrs.clone();
     let loop_advertised_address = config.advertised_address.clone();
     let loop_hep_sender = hep_sender.clone();
-    let loop_stream_connections = Some(stream_connections);
+    let loop_connection_pool = Arc::clone(connection_pool);
     tokio::spawn(async move {
         crate::registrant::registration_loop(
             loop_manager,
@@ -1027,7 +1027,7 @@ pub(super) fn init_registrant(
             loop_advertised_addrs,
             loop_advertised_address,
             loop_hep_sender,
-            loop_stream_connections,
+            loop_connection_pool,
         )
         .await;
     });

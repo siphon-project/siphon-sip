@@ -39,9 +39,8 @@ use crate::ipsec::{
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
-use crate::transport::{
-    ConnectionId, OutboundMessage, OutboundRouter, StreamConnections, Transport,
-};
+use crate::transport::pool::ConnectionPool;
+use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
 use crate::uac::resolve_via_addr;
 
 // ---------------------------------------------------------------------------
@@ -1147,7 +1146,7 @@ pub async fn registration_loop(
     advertised_addrs: HashMap<Transport, String>,
     advertised_address: Option<String>,
     hep_sender: Option<Arc<HepSender>>,
-    stream_connections: Option<StreamConnections>,
+    connection_pool: Arc<ConnectionPool>,
 ) {
     let tick_interval = Duration::from_secs(5);
 
@@ -1176,34 +1175,10 @@ pub async fn registration_loop(
             send_registrant_message(&outbound, egress, message, destination, transport);
         }
 
-        // Detect connection loss on connection-oriented transports
-        // (TLS/TCP/SCTP).  The pool removes dead connections from the
-        // stream registry; if the registrar destination is gone, force
-        // an immediate re-register instead of waiting for the
-        // refresh timer.  The lookup is transport-filtered so an
-        // unrelated WS/WSS UE sharing the trunk's IP can't mask a dead
-        // trunk connection (preserves the pre-unification TLS-only
-        // membership semantics exactly).
-        if let Some(ref stream_connections) = stream_connections {
-            let stale: Vec<String> = manager
-                .entries
-                .iter()
-                .filter(|entry| {
-                    entry.state == RegistrantState::Registered
-                        && matches!(
-                            entry.transport,
-                            Transport::Tls | Transport::Tcp | Transport::Sctp
-                        )
-                        && !stream_connections
-                            .has_ip_transport(entry.destination.ip(), entry.transport)
-                })
-                .map(|entry| entry.aor.clone())
-                .collect();
-            for aor in stale {
-                warn!(aor = %aor, "connection lost — forcing immediate re-register");
-                manager.refresh(&aor);
-            }
-        }
+        // Connection loss on TLS/TCP: re-register on this tick instead of at
+        // the refresh timer, which also re-opens the connection the registrar
+        // reaches this trunk over.
+        force_refresh_lost_connections(&manager, &connection_pool);
 
         // Time out entries stuck in Registering/Challenging (RFC 3261
         // Timer F — 32s).  Catches dead sockets where no response
@@ -1264,6 +1239,39 @@ pub async fn registration_loop(
             }
         }
     }
+}
+
+/// Force an immediate re-register for every Registered TLS/TCP entry whose
+/// own outbound connection is gone. Returns the AoRs it refreshed.
+///
+/// Judged from the pool connection the REGISTERs actually go out on (a default
+/// pool send to exactly the entry's destination and transport), never from the
+/// shared stream registry: that one also holds inbound connections keyed by
+/// peer address, so a connection the registrar's host opened towards siphon
+/// would keep a dead trunk looking alive, and it holds no outbound TCP at all,
+/// which made every TCP trunk look dead on every tick.
+///
+/// SCTP is not checked: the pool has no outbound SCTP path, so there is no
+/// connection of the registrant's own to judge.
+fn force_refresh_lost_connections(
+    manager: &RegistrantManager,
+    connection_pool: &ConnectionPool,
+) -> Vec<String> {
+    let stale: Vec<String> = manager
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.state == RegistrantState::Registered
+                && matches!(entry.transport, Transport::Tls | Transport::Tcp)
+                && !connection_pool.has_live(entry.destination, entry.transport)
+        })
+        .map(|entry| entry.aor.clone())
+        .collect();
+    for aor in &stale {
+        warn!(aor = %aor, "connection lost — forcing immediate re-register");
+        manager.refresh(aor);
+    }
+    stale
 }
 
 /// Put one built registrant message on the wire, with HEP capture.
@@ -3036,5 +3044,140 @@ mod tests {
             !raw.contains("Authorization"),
             "digest initial REGISTER has no auth: {raw}"
         );
+    }
+}
+/// Connection-loss detection for Registered trunks on stream transports.
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::transport::pool::{build_outbound_tls_config, ConnectionPool};
+    use crate::transport::{ConnectionId, StreamConnections};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const AOR: &str = "sip:trunk@example.com";
+
+    fn manager() -> RegistrantManager {
+        RegistrantManager::new(
+            3600,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            Some("SIPhon/test".to_string()),
+        )
+    }
+
+    /// A manager holding one trunk that the registrar has already accepted.
+    fn registered_trunk(destination: SocketAddr, transport: Transport) -> RegistrantManager {
+        let manager = manager();
+        manager.add(RegistrantEntry::new(
+            AOR.to_string(),
+            format!("sip:registrar.example.com;transport={}", transport.label()),
+            destination,
+            transport,
+            RegistrantCredentials::password("trunk".to_string(), "secret".to_string(), None),
+            3600,
+            None,
+        ));
+        manager.handle_success(AOR, 3600);
+        assert_eq!(manager.state(AOR), Some(RegistrantState::Registered));
+        manager
+    }
+
+    fn pool(registry: &StreamConnections) -> ConnectionPool {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        ConnectionPool::new(
+            Arc::new(DashMap::new()),
+            flume::unbounded().0,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            Some(registry.clone()),
+            None,
+            build_outbound_tls_config(None, crate::config::TlsMethod::default()).unwrap(),
+        )
+    }
+
+    /// Open the pool's outbound TCP connection to a local registrar and hand
+    /// back the registrar's end of it, so the test decides when it closes.
+    async fn pooled_tcp_registrar(pool: &ConnectionPool) -> (SocketAddr, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registrar = listener.local_addr().unwrap();
+        pool.send_tcp(
+            registrar,
+            Bytes::from_static(b"REGISTER sip:example.com SIP/2.0\r\n\r\n"),
+        )
+        .await
+        .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        (registrar, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_registered_tcp_trunk_with_a_live_pool_connection_is_not_refreshed() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        let (registrar, _held_open) = pooled_tcp_registrar(&pool).await;
+        let manager = registered_trunk(registrar, Transport::Tcp);
+
+        let refreshed = force_refresh_lost_connections(&manager, &pool);
+
+        assert!(
+            refreshed.is_empty(),
+            "live trunk was force-refreshed: {refreshed:?}"
+        );
+        assert_eq!(manager.state(AOR), Some(RegistrantState::Registered));
+        assert!(manager.entries_due().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_registered_tcp_trunk_whose_pool_connection_closed_re_registers_at_once() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        let (registrar, held_open) = pooled_tcp_registrar(&pool).await;
+        let manager = registered_trunk(registrar, Transport::Tcp);
+
+        drop(held_open);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.active_connections() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pool never noticed the registrar closed the connection");
+
+        let refreshed = force_refresh_lost_connections(&manager, &pool);
+
+        assert_eq!(refreshed, vec![AOR.to_string()]);
+        assert_eq!(manager.entries_due(), vec![AOR.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_inbound_tls_connection_from_the_registrar_ip_does_not_mask_a_dead_trunk() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        registry.register(
+            "192.0.2.10:40000".parse().unwrap(),
+            Transport::Tls,
+            ConnectionId(77),
+        );
+        let manager = registered_trunk("192.0.2.10:5061".parse().unwrap(), Transport::Tls);
+
+        let refreshed = force_refresh_lost_connections(&manager, &pool);
+
+        assert_eq!(refreshed, vec![AOR.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_inbound_tcp_connection_from_the_registrar_ip_does_not_mask_a_dead_trunk() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        registry.register(
+            "192.0.2.10:40001".parse().unwrap(),
+            Transport::Tcp,
+            ConnectionId(78),
+        );
+        let manager = registered_trunk("192.0.2.10:5060".parse().unwrap(), Transport::Tcp);
+
+        let refreshed = force_refresh_lost_connections(&manager, &pool);
+
+        assert_eq!(refreshed, vec![AOR.to_string()]);
     }
 }
