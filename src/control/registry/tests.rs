@@ -1163,3 +1163,55 @@ fn futures_executor_block_on_recv(conn: &Arc<ConnHandle>) -> Vec<OutboundFrame> 
     });
     frames
 }
+
+/// Application-level events reach exactly the apps that opted into their class:
+/// an app subscribed to `registration` alone is never handed a
+/// `DialogStateChanged`, and `wants_app_class` answers the same question the
+/// signalling path asks before it builds one.
+#[tokio::test]
+async fn dialog_events_reach_only_apps_subscribed_to_dialog() {
+    let (command_tx, _rx) = flume::unbounded();
+    let mut registrations_only = app_cfg("dashboard");
+    registrations_only.events = vec!["registration".to_string()];
+    let mut dialogs = app_cfg("presence");
+    dialogs.events = vec!["dialog".to_string()];
+    let bus = ControlBus::new(
+        command_tx,
+        vec![registrations_only, dialogs],
+        16,
+        SlowConsumerPolicy::DropOldest,
+        10,
+        3000,
+    );
+    assert!(bus.wants_app_class("dialog"));
+    assert!(bus.wants_app_class("registration"));
+    assert!(!bus.wants_app_class("something_else"));
+
+    let dashboard = bus.register_connection("dashboard");
+    let presence = bus.register_connection("presence");
+    bus.publish_app_event(
+        "dialog",
+        "DialogStateChanged",
+        serde_json::json!({"aor": "sip:201@example.com", "state": "early"}),
+    );
+    assert_eq!(dashboard.events.depth(), 0, "not subscribed to dialog");
+    assert_eq!(presence.events.depth(), 1);
+    let frames = presence.events.recv_many().await;
+    let text = frames[0].to_json().expect("the frame serialises");
+    let frame: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(frame["event"], "DialogStateChanged");
+    assert_eq!(frame["app"], "presence");
+    assert_eq!(frame["payload"]["state"], "early");
+    assert!(
+        frame.get("channel").is_none(),
+        "an app event has no channel"
+    );
+}
+
+/// Without any app asking for `dialog`, nothing on the signalling path should
+/// do the work of building one.
+#[test]
+fn no_app_wants_dialog_events_unless_one_asks() {
+    let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+    assert!(!bus.wants_app_class("dialog"));
+}

@@ -299,6 +299,10 @@ pub fn handle_b2bua_response(
         return true;
     }
     feed_leg_actor_and_learn_dialog(call_id, message, status_code, state, &snapshot);
+    // A provisional or 2xx to the leg's INVITE moves a registered callee's
+    // dialog state. Here, ahead of the split below, so the transfer-target path
+    // that intercepts every response reports it as well as the ordinary one.
+    observe_callee_response(call_id, branch, message, status_code, state);
 
     // Event-driven response classification.
     // Classified from the response's OWN status line, never from the actor
@@ -369,6 +373,7 @@ pub fn handle_b2bua_response(
                          unknown — cannot ACK, the target will retransmit until Timer H"
                     );
                 }
+                callee_dialog_ended(call_id, branch, state);
                 b2bua_fail_terminated_transfer(call_id, target_idx, status_code, state);
             } else {
                 debug!(

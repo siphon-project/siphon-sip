@@ -69,17 +69,21 @@ pub struct DialBranch {
     pub leg_sip_call_id: String,
     /// The target the branch was dialled at.
     pub target: String,
+    /// The registered AoR the branch was dialled for, when the target was one
+    /// of the contacts an `{aor}` target resolved to. `None` for a raw URI.
+    pub aor: Option<String>,
     /// `None` while it may still answer.
     pub outcome: Option<DialBranchOutcome>,
 }
 
 impl DialBranch {
-    /// A branch just created from `leg`, dialled at `target`.
-    pub fn of_leg(leg: &Leg, target: &str) -> Self {
+    /// A branch just created from `leg`, dialled at `target` for `aor`.
+    pub fn of_leg(leg: &Leg, target: &str, aor: Option<String>) -> Self {
         Self {
             leg_id: leg.id.to_string(),
             leg_sip_call_id: leg.dialog.call_id.clone(),
             target: target.to_string(),
+            aor,
             outcome: None,
         }
     }
@@ -95,9 +99,19 @@ impl CallActor {
         if !self.control_dial {
             return None;
         }
-        let branch = DialBranch::of_leg(leg, target);
+        let aor = self.control_dial_aor(target);
+        let branch = DialBranch::of_leg(leg, target, aor);
         self.dial_branches.push(branch.clone());
         Some(branch)
+    }
+
+    /// The registered AoR the controller's `dial` resolved `target` from, if it
+    /// was one of an `{aor}` target's contacts.
+    pub fn control_dial_aor(&self, target: &str) -> Option<String> {
+        self.control_dial_aors
+            .iter()
+            .find(|(uri, _)| uri == target)
+            .map(|(_, aor)| aor.clone())
     }
 
     /// Settle the branch for `leg_id` as ended on `code` / `reason` for `cause`,
@@ -301,6 +315,30 @@ mod tests {
         let settled = settle_busy(&mut call, "z9hG4bK-b1-retry")
             .expect("the retried leg settles the branch it was named as");
         assert_eq!(settled.leg_id, leg.id.to_string());
+    }
+
+    /// A branch dialled at a contact an `{aor}` target resolved to names that
+    /// AoR; one dialled at a raw URI names none.
+    #[test]
+    fn a_branch_names_the_aor_it_was_dialled_for() {
+        let mut call = CallActor::new(a_leg());
+        call.control_dial = true;
+        call.control_dial_aors = vec![(
+            "sip:201@198.51.100.21:5060".to_string(),
+            "sip:201@example.com".to_string(),
+        )];
+        let registered = b_leg("b-leg-1@siphon", "z9hG4bK-b1");
+        let raw = b_leg("b-leg-2@siphon", "z9hG4bK-b2");
+        call.add_b_leg(registered.clone());
+        call.add_b_leg(raw.clone());
+        let named = call
+            .record_dial_branch(&registered, "sip:201@198.51.100.21:5060")
+            .expect("recorded");
+        assert_eq!(named.aor.as_deref(), Some("sip:201@example.com"));
+        let unnamed = call
+            .record_dial_branch(&raw, "sip:15550100077@198.51.100.7")
+            .expect("recorded");
+        assert!(unnamed.aor.is_none());
     }
 
     #[test]

@@ -26,6 +26,8 @@ const UNACKNOWLEDGED_STATUS: u16 = 500;
 /// What siphon needs of a call to reach its caller once the call's lock is
 /// released.
 struct CallerRoute {
+    /// The call's internal id.
+    call_id: String,
     sip_call_id: String,
     local_tag: String,
     transport: Transport,
@@ -43,6 +45,7 @@ struct CallerRoute {
 impl CallerRoute {
     fn of(call: &crate::b2bua::actor::CallActor) -> CallerRoute {
         CallerRoute {
+            call_id: call.id.clone(),
             sip_call_id: call.a_leg.dialog.call_id.clone(),
             local_tag: call.a_leg.dialog.local_tag.clone(),
             transport: call.a_leg.transport.transport,
@@ -227,6 +230,9 @@ fn record_caller_session(
 /// Put `messages` on the wire to the caller, several as one ordered group: sent
 /// apart on UDP they can overtake each other.
 fn send_to_caller(messages: Vec<SipMessage>, route: &CallerRoute, state: &DispatcherState) {
+    // Every provisional and 2xx siphon sends the caller for its INVITE comes
+    // through here, so this is where the caller's dialog state is read.
+    observe_caller_responses(&route.call_id, &messages, state);
     if messages.len() > 1 {
         send_messages_in_order_from(
             messages,

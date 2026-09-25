@@ -2670,6 +2670,30 @@ fn control_app_events_are_opt_in() {
     );
 }
 
+/// `dialog` is a class siphon publishes (`DialogStateChanged`), alone or next
+/// to `registration`, and a typo of it is still refused with the list.
+#[test]
+fn the_dialog_event_class_loads() {
+    let config = Config::from_str(&backend_yaml(
+        "control:\n  apps:\n    - name: presence\n      token: \"t\"\n      events: [registration, dialog]\n",
+    ))
+    .expect("the dialog event class must load");
+    let apps = &config.control.as_ref().expect("control block").apps;
+    assert_eq!(
+        apps[0].events,
+        vec!["registration".to_string(), "dialog".to_string()]
+    );
+
+    let error = Config::from_str(&backend_yaml(
+        "control:\n  apps:\n    - name: presence\n      token: \"t\"\n      events: [dialogs]\n",
+    ))
+    .expect_err("a typo of dialog must be rejected");
+    assert!(
+        error.to_string().contains("dialog"),
+        "the error lists the classes: {error}"
+    );
+}
+
 /// `fallback` parsed and then behaved as `hangup`, so an operator who set
 /// it to keep calls alive when a controller dies got exactly the opposite,
 /// on every call, with nothing saying so.

@@ -44,6 +44,8 @@ pub fn b_leg_failed(
         crate::b2bua::actor::DialBranchCause::Rejected,
         state,
     );
+    // And a registered callee's dialog is over.
+    callee_dialog_ended(call_id, branch, state);
 
     // A parallel fork: one branch failing is not the call failing while another
     // can still answer (RFC 3261 §16.7). The failure is recorded, the best one

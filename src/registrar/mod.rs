@@ -1128,6 +1128,83 @@ impl Registrar {
         })
     }
 
+    /// The registered AoR `aor` names: its implicit-set primary, the key its
+    /// bindings are stored under. `None` when it has no live UE binding.
+    ///
+    /// What a watcher of the AoR subscribed to, however the caller spelled it
+    /// (an alias, a default port, angle brackets).
+    pub fn registered_aor(&self, aor: &str) -> Option<Aor> {
+        let primary = self.resolve_alias(aor);
+        let live = self.bindings.get(primary.as_str()).is_some_and(|entry| {
+            entry
+                .value()
+                .iter()
+                .any(|contact| contact.kind == ContactKind::Ue && !contact.is_expired())
+        });
+        live.then_some(primary)
+    }
+
+    /// The one AoR a live UE binding with **Contact** `contact_uri` belongs to,
+    /// matched as [`lookup_contact`](Self::lookup_contact) matches.
+    ///
+    /// `None` when no binding has that Contact, and also when bindings of two
+    /// different AoRs share it: a request sent to that Contact reaches a device
+    /// both AoRs registered, and naming either one would be a guess.
+    ///
+    /// An **O(total contacts)** scan, like `lookup_contact`.
+    pub fn aor_for_contact(&self, contact_uri: &str) -> Option<Aor> {
+        let target = normalize_aor(contact_uri);
+        let mut found: Option<Aor> = None;
+        for entry in self.bindings.iter() {
+            let matches = entry.value().iter().any(|contact| {
+                contact.kind == ContactKind::Ue
+                    && !contact.is_expired()
+                    && normalize_aor(&contact.uri.to_string()) == target
+            });
+            if !matches {
+                continue;
+            }
+            if found.as_deref().is_some_and(|aor| aor != entry.key()) {
+                return None;
+            }
+            found = Some(entry.key().clone());
+        }
+        found
+    }
+
+    /// The registered AoR placing a request whose From names `from_aor`, when a
+    /// live UE binding of that AoR vouches for the request, else `None`.
+    ///
+    /// The From header alone is anyone's to write, so it is never enough. A
+    /// binding vouches when:
+    ///
+    /// - the request authenticated as `auth_user` and the binding was stored by
+    ///   a REGISTER that authenticated as the same identity, or
+    /// - the request arrived from `source`, the address the binding's REGISTER
+    ///   came from, and the binding holds no authenticated identity the request
+    ///   failed to present (a binding stored by an authenticated REGISTER is
+    ///   vouched for only by that identity, when the request carries one).
+    pub fn aor_placing_request(
+        &self,
+        from_aor: &str,
+        auth_user: Option<&str>,
+        source: SocketAddr,
+    ) -> Option<Aor> {
+        let primary = self.resolve_alias(from_aor);
+        let entry = self.bindings.get(primary.as_str())?;
+        let vouched = entry.value().iter().any(|contact| {
+            if contact.kind != ContactKind::Ue || contact.is_expired() {
+                return false;
+            }
+            match (auth_user, contact.auth_user.as_deref()) {
+                (Some(presented), Some(registered)) => presented == registered,
+                _ => contact.source_addr == Some(source),
+            }
+        });
+        drop(entry);
+        vouched.then_some(primary)
+    }
+
     /// Number of registered AoRs (with at least one non-expired UE-side
     /// contact) known to *this* instance's in-memory map.
     ///
@@ -5613,5 +5690,162 @@ mod tests {
         };
         registrar.bindings.entry(aor).or_default().push(as_only);
         assert_eq!(registrar.aor_count(), 0);
+    }
+
+    /// Save one binding of `aor` at `contact`, from `source`, stored by a
+    /// REGISTER that authenticated as `auth_user`.
+    fn save_binding(
+        registrar: &Registrar,
+        aor: &str,
+        contact: SipUri,
+        source: &str,
+        auth_user: Option<&str>,
+    ) {
+        registrar
+            .apply_register(
+                aor,
+                vec![update::ContactUpdate {
+                    uri: contact,
+                    expires_secs: 3600,
+                    q: 1.0,
+                    call_id: format!("reg-{aor}"),
+                    cseq: 1,
+                    source_addr: Some(source.parse().unwrap()),
+                    source_transport: Some(Transport::Udp),
+                    sip_instance: None,
+                    reg_id: None,
+                    path: Vec::new(),
+                    flow: FlowCapture::default(),
+                    params: Vec::new(),
+                    auth_user: auth_user.map(str::to_string),
+                }],
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn registered_aor_is_the_primary_and_none_when_unregistered() {
+        let registrar = Registrar::default();
+        save_binding(
+            &registrar,
+            "sip:201@example.com",
+            contact_uri("201", "198.51.100.21"),
+            "198.51.100.21:5060",
+            None,
+        );
+        assert_eq!(
+            registrar
+                .registered_aor("<sip:201@example.com:5060>")
+                .as_deref(),
+            Some("sip:201@example.com")
+        );
+        assert!(registrar.registered_aor("sip:202@example.com").is_none());
+
+        registrar.set_associated_uris(
+            "sip:201@example.com",
+            vec!["sip:201@example.com".into(), "tel:+15550100201".into()],
+        );
+        assert_eq!(
+            registrar.registered_aor("tel:+15550100201").as_deref(),
+            Some("sip:201@example.com"),
+            "an alias names the primary it resolves to"
+        );
+    }
+
+    #[test]
+    fn aor_for_contact_names_the_one_aor_and_refuses_to_guess() {
+        let registrar = Registrar::default();
+        save_binding(
+            &registrar,
+            "sip:201@example.com",
+            contact_uri("201", "198.51.100.21"),
+            "198.51.100.21:5060",
+            None,
+        );
+        assert_eq!(
+            registrar
+                .aor_for_contact("sip:201@198.51.100.21:5060;transport=udp")
+                .as_deref(),
+            Some("sip:201@example.com")
+        );
+        assert!(registrar.aor_for_contact("sip:201@198.51.100.99").is_none());
+
+        // A second AoR registering the same device: either would be a guess.
+        save_binding(
+            &registrar,
+            "sip:301@example.com",
+            contact_uri("201", "198.51.100.21"),
+            "198.51.100.21:5060",
+            None,
+        );
+        assert!(registrar.aor_for_contact("sip:201@198.51.100.21").is_none());
+    }
+
+    #[test]
+    fn aor_placing_request_needs_more_than_the_from_header() {
+        let registrar = Registrar::default();
+        let phone: SocketAddr = "192.0.2.21:5060".parse().unwrap();
+        let elsewhere: SocketAddr = "203.0.113.9:5060".parse().unwrap();
+        save_binding(
+            &registrar,
+            "sip:201@example.com",
+            contact_uri("201", "192.0.2.21"),
+            "192.0.2.21:5060",
+            None,
+        );
+        assert_eq!(
+            registrar
+                .aor_placing_request("sip:201@example.com", None, phone)
+                .as_deref(),
+            Some("sip:201@example.com"),
+            "from the address the binding registered from"
+        );
+        assert!(
+            registrar
+                .aor_placing_request("sip:201@example.com", None, elsewhere)
+                .is_none(),
+            "a From header from anywhere else vouches for nothing"
+        );
+        assert!(registrar
+            .aor_placing_request("sip:202@example.com", None, phone)
+            .is_none());
+    }
+
+    #[test]
+    fn aor_placing_request_prefers_the_authenticated_identity() {
+        let registrar = Registrar::default();
+        let phone: SocketAddr = "192.0.2.22:5060".parse().unwrap();
+        let elsewhere: SocketAddr = "203.0.113.9:5060".parse().unwrap();
+        save_binding(
+            &registrar,
+            "sip:202@example.com",
+            contact_uri("202", "192.0.2.22"),
+            "192.0.2.22:5060",
+            Some("202"),
+        );
+        assert_eq!(
+            registrar
+                .aor_placing_request("sip:202@example.com", Some("202"), elsewhere)
+                .as_deref(),
+            Some("sip:202@example.com"),
+            "the registrant's own identity vouches from any address"
+        );
+        assert!(
+            registrar
+                .aor_placing_request("sip:202@example.com", Some("201"), phone)
+                .is_none(),
+            "another identity does not, even from the phone's address"
+        );
+        assert_eq!(
+            registrar
+                .aor_placing_request("sip:202@example.com", None, phone)
+                .as_deref(),
+            Some("sip:202@example.com"),
+            "unauthenticated, only the registered address vouches"
+        );
+        assert!(registrar
+            .aor_placing_request("sip:202@example.com", None, elsewhere)
+            .is_none());
     }
 }

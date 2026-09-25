@@ -243,6 +243,10 @@ pub enum SipEvent {
     /// A `dial` ended with nobody answering ([`DialFailedPayload`]). The caller
     /// is still ringing and still owned.
     DialFailed,
+    /// Application-level, behind `control.apps[].events: [dialog]`: the RFC 4235
+    /// state of a registered AoR's dialog changed ([`DialogStateChangedPayload`]).
+    /// Not about a channel the app owns, so the frame carries no channel.
+    DialogStateChanged,
     /// Any other event name (forward-compatible catch-all).
     Other(String),
 }
@@ -275,6 +279,7 @@ impl SipEvent {
             SipEvent::DialBranchFailed => "DialBranchFailed",
             SipEvent::DialAnswered => "DialAnswered",
             SipEvent::DialFailed => "DialFailed",
+            SipEvent::DialogStateChanged => "DialogStateChanged",
             SipEvent::Other(name) => name.as_str(),
         }
     }
@@ -307,6 +312,7 @@ impl From<&str> for SipEvent {
             "DialBranchFailed" => SipEvent::DialBranchFailed,
             "DialAnswered" => SipEvent::DialAnswered,
             "DialFailed" => SipEvent::DialFailed,
+            "DialogStateChanged" => SipEvent::DialogStateChanged,
             other => SipEvent::Other(other.to_string()),
         }
     }
@@ -765,6 +771,11 @@ pub struct DialBranchPayload {
     /// The target the branch was dialled at.
     #[serde(default)]
     pub target: String,
+    /// The registered AoR the branch was dialled for, when the target was one of
+    /// the contacts an `{aor}` target resolved to; `None` for a raw URI, and from
+    /// a server that predates it. Answers "which phone rang / picked up".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aor: Option<String>,
 }
 
 /// How a `dial` branch ended without answering — the `cause` of a
@@ -845,6 +856,10 @@ pub struct DialBranchOutcome {
     /// The target the branch was dialled at.
     #[serde(default)]
     pub target: String,
+    /// The registered AoR the branch was dialled for, as its
+    /// [`DialBranchPayload::aor`] named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aor: Option<String>,
     /// The status it ended on.
     pub code: u16,
     /// The reason phrase that goes with `code`.
@@ -866,6 +881,10 @@ pub struct DialAnsweredPayload {
     /// The target the branch was dialled at.
     #[serde(default)]
     pub target: String,
+    /// The registered AoR the branch was dialled for — the phone that picked
+    /// up, when the dial rang `{aor}` targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aor: Option<String>,
     /// The 2xx it answered with.
     pub code: u16,
 }
@@ -886,6 +905,159 @@ pub struct DialFailedPayload {
     /// that predates branch reporting.
     #[serde(default)]
     pub branches: Vec<DialBranchOutcome>,
+}
+
+/// An RFC 4235 §3.7.1 dialog state — the `state` of a
+/// [`DialogStateChangedPayload`].
+///
+/// Unrecognised tokens map to [`DialogState::Other`] rather than failing, so a
+/// newer server never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum DialogState {
+    /// The INVITE was sent or received and nothing has answered it.
+    Trying,
+    /// A provisional without a To-tag answered it.
+    Proceeding,
+    /// A provisional with a To-tag answered it: the phone is ringing.
+    Early,
+    /// A 2xx answered it: the phone is in a call.
+    Confirmed,
+    /// The dialog, or the attempt to set it up, is over.
+    Terminated,
+    /// Any other state token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl DialogState {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            DialogState::Trying => "trying",
+            DialogState::Proceeding => "proceeding",
+            DialogState::Early => "early",
+            DialogState::Confirmed => "confirmed",
+            DialogState::Terminated => "terminated",
+            DialogState::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for DialogState {
+    fn from(token: &str) -> Self {
+        match token {
+            "trying" => DialogState::Trying,
+            "proceeding" => DialogState::Proceeding,
+            "early" => DialogState::Early,
+            "confirmed" => DialogState::Confirmed,
+            "terminated" => DialogState::Terminated,
+            other => DialogState::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for DialogState {
+    fn from(token: String) -> Self {
+        DialogState::from(token.as_str())
+    }
+}
+
+impl From<DialogState> for String {
+    fn from(state: DialogState) -> Self {
+        state.as_str().to_string()
+    }
+}
+
+/// Which end of the dialog the AoR is (RFC 4235 §4.1.1) — the `direction` of a
+/// [`DialogStateChangedPayload`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum DialogDirection {
+    /// The AoR sent the INVITE: a call the phone placed.
+    Initiator,
+    /// The AoR received the INVITE: a call ringing the phone.
+    Recipient,
+    /// Any other direction token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl DialogDirection {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            DialogDirection::Initiator => "initiator",
+            DialogDirection::Recipient => "recipient",
+            DialogDirection::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for DialogDirection {
+    fn from(token: &str) -> Self {
+        match token {
+            "initiator" => DialogDirection::Initiator,
+            "recipient" => DialogDirection::Recipient,
+            other => DialogDirection::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for DialogDirection {
+    fn from(token: String) -> Self {
+        DialogDirection::from(token.as_str())
+    }
+}
+
+impl From<DialogDirection> for String {
+    fn from(direction: DialogDirection) -> Self {
+        direction.as_str().to_string()
+    }
+}
+
+/// The party a registered AoR's dialog is with, as dialog-info renders
+/// `<remote><identity>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogIdentity {
+    /// The other party's URI, as presented on the phone's leg.
+    #[serde(default)]
+    pub uri: String,
+    /// Its display name, when the header carried one.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// The `payload` of a [`SipEvent::DialogStateChanged`] event: one dialog of a
+/// registered AoR moved to a new RFC 4235 state, as the server observed it on
+/// the wire. Everything is from the AoR's point of view, which is how
+/// dialog-info renders it (RFC 4235 §4).
+///
+/// Each dialog reports its states in order and `terminated` exactly once, so a
+/// phone is idle when every dialog it had has reported `terminated`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogStateChangedPayload {
+    /// The registered AoR (its canonical key) the dialog belongs to.
+    pub aor: String,
+    /// The state the dialog is now in.
+    pub state: DialogState,
+    /// Whether the AoR placed the call or is being called.
+    pub direction: DialogDirection,
+    /// The server's id for the phone's leg: stable for the dialog's life and
+    /// unique, so usable as the dialog-info `id`. For a branch of a `dial` it
+    /// is the `leg_id` its [`DialBranchPayload`] named.
+    pub leg_id: String,
+    /// The SIP Call-ID of the phone's own dialog.
+    pub call_id: String,
+    /// The phone's tag, once known.
+    #[serde(default)]
+    pub local_tag: Option<String>,
+    /// The other end's tag, once known.
+    #[serde(default)]
+    pub remote_tag: Option<String>,
+    /// The party the phone is talking to.
+    #[serde(default)]
+    pub remote_identity: DialogIdentity,
 }
 
 /// The `payload` of a [`SipEvent::PeerReplaced`] event: a leg replacement
@@ -1451,6 +1623,92 @@ mod tests {
             DialBranchCause::from("something_new"),
             DialBranchCause::Other("something_new".to_string())
         );
+    }
+
+    #[test]
+    fn dialog_state_changed_round_trips_and_parses() {
+        let parsed = SipEvent::from("DialogStateChanged");
+        assert_eq!(parsed, SipEvent::DialogStateChanged);
+        assert_eq!(parsed.as_str(), "DialogStateChanged");
+
+        let payload: DialogStateChangedPayload = serde_json::from_value(serde_json::json!({
+            "aor": "sip:201@example.com",
+            "state": "early",
+            "direction": "recipient",
+            "leg_id": "leg-1",
+            "call_id": "b1@host",
+            "local_tag": "phone-tag",
+            "remote_tag": "server-tag",
+            "remote_identity": {"uri": "sip:15550100042@example.com", "display_name": "Front Desk"},
+        }))
+        .unwrap();
+        assert_eq!(payload.aor, "sip:201@example.com");
+        assert_eq!(payload.state, DialogState::Early);
+        assert_eq!(payload.direction, DialogDirection::Recipient);
+        assert_eq!(payload.local_tag.as_deref(), Some("phone-tag"));
+        assert_eq!(
+            payload.remote_identity.display_name.as_deref(),
+            Some("Front Desk")
+        );
+
+        // Tags are null until known.
+        let trying: DialogStateChangedPayload = serde_json::from_value(serde_json::json!({
+            "aor": "sip:202@example.com",
+            "state": "trying",
+            "direction": "initiator",
+            "leg_id": "leg-2",
+            "call_id": "a1@host",
+            "local_tag": "phone-tag",
+            "remote_tag": null,
+            "remote_identity": {"uri": "sip:15550100077@example.com", "display_name": null},
+        }))
+        .unwrap();
+        assert!(trying.remote_tag.is_none());
+        assert_eq!(trying.direction, DialogDirection::Initiator);
+
+        for token in ["trying", "proceeding", "early", "confirmed", "terminated"] {
+            assert_eq!(DialogState::from(token).as_str(), token);
+        }
+        assert_eq!(
+            DialogState::from("something_new"),
+            DialogState::Other("something_new".to_string())
+        );
+        assert_eq!(
+            DialogDirection::from("sideways"),
+            DialogDirection::Other("sideways".to_string())
+        );
+    }
+
+    /// A branch dialled for a registered AoR names it; one dialled at a raw URI,
+    /// or reported by an older server, has none and serialises without it.
+    #[test]
+    fn dial_branch_payloads_carry_the_aor_when_there_is_one() {
+        let named: DialAnsweredPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-2",
+            "leg_sip_call_id": "b2@host",
+            "target": "sip:202@198.51.100.22:5060",
+            "aor": "sip:202@example.com",
+            "code": 200,
+        }))
+        .unwrap();
+        assert_eq!(named.aor.as_deref(), Some("sip:202@example.com"));
+
+        let raw: DialBranchPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-1",
+            "leg_sip_call_id": "b1@host",
+            "target": "sip:15550100077@198.51.100.7",
+        }))
+        .unwrap();
+        assert!(raw.aor.is_none());
+        assert!(serde_json::to_value(&raw).unwrap().get("aor").is_none());
+
+        let outcome: DialBranchOutcome = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-3", "leg_sip_call_id": "b3@host", "target": "sip:203@198.51.100.23",
+            "aor": "sip:203@example.com", "code": 487, "reason": "Request Terminated",
+            "cause": "cancelled",
+        }))
+        .unwrap();
+        assert_eq!(outcome.aor.as_deref(), Some("sip:203@example.com"));
     }
 
     /// Every stream event name must survive the wire round trip as a typed

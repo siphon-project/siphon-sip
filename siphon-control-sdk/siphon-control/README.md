@@ -45,6 +45,19 @@ async def main():
 asyncio.run(main())
 ```
 
+### Application-level events
+
+Events an app opts into with `control.apps[].events` (`RegistrationChanged`,
+`DialogStateChanged`) concern no call, so they never reach `on_call`. Register a
+handler for them; `run()` installs it:
+
+```python
+@client.on_app_event
+async def on_app_event(event, payload):
+    if event == "DialogStateChanged":
+        print(payload["aor"], payload["state"])   # early / confirmed / terminated
+```
+
 ### Per-call-connect
 
 ```python
