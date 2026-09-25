@@ -13,17 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
-### Fixed
+## [1.10.1] — 2026-09-25
 
-- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
-  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
-  only under a method branch and told the author to move the awaits into
-  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
-  takes a method filter. Those two hooks now get a non-failing note that states
-  the cost. The suggested filter is also built from method comparisons alone, so
-  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
-  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
-  method test with anything else no longer counts as method-gated.
 ### Changed
 
 - **A client transaction now retains the octets it sent, not the parsed
@@ -47,6 +38,26 @@ entry, but a working config keeps working.
   takes `(&SipMessage, Bytes, Transport)` — the message to key on, and the exact
   octets the caller puts on the wire — and `Action` gained a `SendFrame(Bytes)`
   variant that client transactions emit instead of `SendMessage`.
+
+- **A `SubscribeHandle` whose dialog has been reaped raises `LookupError`
+  instead of being revived from the L2 cache.** The narrow behaviour change that
+  comes with the fix above: the sweeper drops an expired or terminated dialog
+  from the local store but leaves the cache key to age out on its own TTL, and
+  reading it back resurrects a dialog the sweeper has already sent the
+  terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
+  ask for it with `await handle.reload()`.
+
+### Fixed
+
+- **`scripts/check_hot_path_dispatch.py` prescribed filters that do not exist.**
+  It failed an `async` `@proxy.on_reply` or `@b2bua.on_invite` handler that awaits
+  only under a method branch and told the author to move the awaits into
+  `@proxy.on_reply("INVITE")`, which raises at import: only `@proxy.on_request`
+  takes a method filter. Those two hooks now get a non-failing note that states
+  the cost. The suggested filter is also built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
 
 - **A `SubscribeHandle` property can no longer block its asyncio driver.** The
   1.10.0 "every blocking script API is awaitable" work left these as a
@@ -75,16 +86,6 @@ entry, but a working config keeps working.
   awaited counterpart to the implicit cache read the properties no longer make
   (below) — for a dialog another replica owns whose local entry has since been
   reaped.
-
-### Changed
-
-- **A `SubscribeHandle` whose dialog has been reaped raises `LookupError`
-  instead of being revived from the L2 cache.** The narrow behaviour change that
-  comes with the fix above: the sweeper drops an expired or terminated dialog
-  from the local store but leaves the cache key to age out on its own TTL, and
-  reading it back resurrects a dialog the sweeper has already sent the
-  terminating NOTIFY for (RFC 6665 §4.2.2). Scripts that want the cache re-read
-  ask for it with `await handle.reload()`.
 
 ## [1.10.0] — 2026-09-24
 
