@@ -43,6 +43,12 @@ pub(super) fn cancel_fork_branches(
         Ok(s) => s,
         Err(_) => return,
     };
+    // The registered callees among the branches CANCELled stop ringing.
+    proxy_dialog_branches_cancelled(
+        &session.original_request,
+        exclude.map(|key| key.branch.as_str()),
+        state,
+    );
 
     for client_key in &session.client_keys {
         if Some(client_key) == exclude {
@@ -137,6 +143,9 @@ pub(super) fn reject_pending_invite(
             return;
         }
     }
+
+    // A rejected INVITE is over for every party it was tracked for.
+    proxy_dialog_invite_abandoned(original_request, state);
 
     // Hygiene: a rejected INVITE establishes no dialog, so its `by_dialog_key`
     // entry (which exists only to route the end-to-end 2xx ACK) is now dead.
@@ -769,6 +778,8 @@ pub(super) fn handle_cancel_via_session(
         Some(session.inbound_local_addr),
         state,
     );
+    // The caller abandoned the INVITE: its dialog, and every branch's, is over.
+    proxy_dialog_invite_abandoned(&session.original_request, state);
 
     // Fire @proxy.on_cancel before the session is evicted so scripts can
     // release per-call resources (Diameter Rx/N5 QoS, rtpengine media) that

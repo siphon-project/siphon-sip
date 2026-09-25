@@ -61,6 +61,7 @@ mod inbound;
 mod intercept;
 mod liveness;
 mod media_init;
+mod proxy_dialog_state;
 mod registrant;
 mod relay;
 mod request;
@@ -99,6 +100,8 @@ mod delayed_offer_ack_tests;
 #[cfg(test)]
 mod dialog_state_events_tests;
 #[cfg(test)]
+mod dialog_state_transfer_tests;
+#[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]
 mod late_provisional_tests;
@@ -114,6 +117,8 @@ mod originate_auth_tests;
 mod originate_tests;
 #[cfg(test)]
 mod prack_offer_answer_tests;
+#[cfg(test)]
+mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
@@ -198,6 +203,7 @@ use inbound::*;
 use intercept::*;
 use liveness::*;
 use media_init::*;
+use proxy_dialog_state::*;
 use registrant::*;
 use relay::*;
 use request::*;
@@ -463,6 +469,12 @@ pub async fn run(
             .control
             .as_ref()
             .and_then(|control| control.inbound.clone()),
+        dialog_state_config: config
+            .control
+            .as_ref()
+            .map(|control| control.dialog_state.clone())
+            .unwrap_or_default(),
+        proxy_dialogs: Arc::new(crate::proxy::dialog_state::ProxyDialogStore::new()),
         session_timer_config: config.session_timer.clone(),
         mtu: config.listen.mtu,
         header_policy_registry,
@@ -543,6 +555,7 @@ pub async fn run(
     spawn_timer_sweep(&state);
 
     spawn_session_timer_refresh(&state);
+    spawn_dialog_state_sweep(&state);
 
     spawn_registrar_events(&state, registrar_event_rx);
 

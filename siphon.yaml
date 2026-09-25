@@ -2292,13 +2292,35 @@ log:
 #                                   #     remote_tag, remote_identity}: the RFC
 #                                   #     4235 state of every dialog a registered
 #                                   #     AoR has through the B2BUA (busy-lamp
-#                                   #     field). Proxy-relayed dialogs are not
-#                                   #     reported.
+#                                   #     field), B2BUA and proxy alike. A
+#                                   #     proxied INVITE with a registered party
+#                                   #     is Record-Routed by siphon so its BYE
+#                                   #     comes back; siphon routes that
+#                                   #     dialog's in-dialog requests itself,
+#                                   #     without the script (see dialog_state).
 #   limits:
 #     event_queue_depth: 1024       # bounded per-connection outbound queue
 #     slow_consumer: drop_oldest    # drop_oldest | disconnect
 #     reattach_grace_secs: 10       # window for a reconnecting app to `resync`
 #     handoff_deadline_ms: 3000     # default deadline before the parked call degrades
+#
+#   # Keeps the dialog state `events: [dialog]` reports truthful when no BYE
+#   # ends a dialog. Inert unless an app subscribes to `dialog`. A B2BUA is a
+#   # party to its calls and ends them itself; for a dialog the proxy relays,
+#   # siphon ALSO ends the reported state (never the call) when the phone's
+#   # binding is removed / expires / is reaped, a negotiated RFC 4028 session
+#   # interval runs out, an in-dialog OPTIONS probe finds the dialog gone, it
+#   # rings past max_early_secs, or it outlives max_lifetime_secs.
+#   dialog_state:
+#     probe_interval_secs: 300      # in-dialog OPTIONS (RFC 3261 §11) to each
+#                                   # watched end of a confirmed proxied
+#                                   # dialog, along its route set; 0 disables
+#     probe_timeout_secs: 8         # how long a probe waits for its response
+#     probe_failures: 2             # unanswered/408 probes in a row that end an
+#                                   # end's dialog; a 481 ends it at once
+#     max_early_secs: 300           # RFC 3261 §16.6 Timer C bound on ringing
+#     max_lifetime_secs: 43200      # hard backstop (12 h)
+#     session_timer_grace_secs: 32  # past the negotiated interval (Timer F)
 #
 #   # Hand EVERY out-of-dialog INVITE to an app, with no script. Without this
 #   # the only way into the control plane is a script calling call.handover(),

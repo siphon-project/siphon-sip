@@ -486,6 +486,26 @@ impl UacSender {
         destination: SocketAddr,
         transport: Transport,
     ) -> oneshot::Receiver<UacResult> {
+        self.send_request_with_response_on(
+            message,
+            destination,
+            transport,
+            ConnectionId::default(),
+            None,
+        )
+    }
+
+    /// [`send_request_with_response`](Self::send_request_with_response) on a
+    /// known connection and from a pinned listener: the next hop of a dialog
+    /// whose peer is reachable only over the flow it arrived on.
+    pub fn send_request_with_response_on(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+        source_local_addr: Option<SocketAddr>,
+    ) -> oneshot::Receiver<UacResult> {
         let (sender, receiver) = oneshot::channel();
 
         // Extract branch from the topmost Via.  If absent or not UAC-shaped,
@@ -519,11 +539,11 @@ impl UacSender {
 
         let outbound_message = OutboundMessage {
             followups: None,
-            connection_id: ConnectionId::default(),
+            connection_id,
             transport,
             destination,
             data,
-            source_local_addr: None,
+            source_local_addr,
             server_name: None,
         };
 

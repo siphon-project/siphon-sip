@@ -2694,6 +2694,43 @@ fn the_dialog_event_class_loads() {
     );
 }
 
+/// `control.dialog_state` loads with its defaults when absent and takes each
+/// knob when set.
+#[test]
+fn control_dialog_state_knobs_load() {
+    let config = Config::from_str(&backend_yaml(
+        "control:\n  apps:\n    - name: presence\n      token: \"t\"\n      events: [dialog]\n",
+    ))
+    .expect("loads");
+    let defaults = &config.control.as_ref().expect("control block").dialog_state;
+    assert_eq!(defaults.probe_interval_secs, 300);
+    assert_eq!(defaults.probe_timeout_secs, 8);
+    assert_eq!(defaults.probe_failures, 2);
+    assert_eq!(defaults.max_early_secs, 300);
+    assert_eq!(defaults.max_lifetime_secs, 43_200);
+    assert_eq!(defaults.session_timer_grace_secs, 32);
+
+    let config = Config::from_str(&backend_yaml(concat!(
+        "control:\n",
+        "  apps:\n    - name: presence\n      token: \"t\"\n      events: [dialog]\n",
+        "  dialog_state:\n",
+        "    probe_interval_secs: 0\n",
+        "    probe_timeout_secs: 4\n",
+        "    probe_failures: 3\n",
+        "    max_early_secs: 180\n",
+        "    max_lifetime_secs: 7200\n",
+        "    session_timer_grace_secs: 10\n",
+    )))
+    .expect("loads");
+    let set = &config.control.as_ref().expect("control block").dialog_state;
+    assert_eq!(set.probe_interval_secs, 0);
+    assert_eq!(set.probe_timeout_secs, 4);
+    assert_eq!(set.probe_failures, 3);
+    assert_eq!(set.max_early_secs, 180);
+    assert_eq!(set.max_lifetime_secs, 7200);
+    assert_eq!(set.session_timer_grace_secs, 10);
+}
+
 /// `fallback` parsed and then behaved as `hangup`, so an operator who set
 /// it to keep calls alive when a controller dies got exactly the opposite,
 /// on every call, with nothing saying so.

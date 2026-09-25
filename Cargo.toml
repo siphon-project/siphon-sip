@@ -239,6 +239,10 @@ harness = false
 name = "crypto"            # Milenage AKA + digest response (per auth)
 harness = false
 
+[[bench]]
+name = "dialog_state"      # DialogStateChanged: per-message gate, per-branch match, per-call tracking
+harness = false
+
 [features]
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
