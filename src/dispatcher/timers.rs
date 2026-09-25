@@ -325,6 +325,41 @@ pub(super) fn process_timer_actions_with_followups(
                     }
                 }
             }
+            Action::SendFrame(frame) => {
+                // A client transaction's Timer A / Timer E retransmit: the
+                // octets that already went out, re-emitted verbatim
+                // (RFC 3261 §17.1.1.2 / §17.1.2.2). No serialize, and byte
+                // identity is a property of the representation rather than of
+                // the serializer.
+                if let (Some(dest), Some(trans)) = (destination, transport) {
+                    let conn_id = connection_id.unwrap_or_default();
+                    debug!(
+                        destination = %dest,
+                        size = frame.len(),
+                        "retransmitting cached frame"
+                    );
+                    if followups.is_empty() {
+                        send_outbound_from(
+                            frame.clone(),
+                            trans,
+                            dest,
+                            conn_id,
+                            source_local_addr,
+                            state,
+                        );
+                    } else {
+                        send_frames_in_order_from(
+                            frame.clone(),
+                            std::mem::take(&mut followups),
+                            trans,
+                            dest,
+                            conn_id,
+                            source_local_addr,
+                            state,
+                        );
+                    }
+                }
+            }
             Action::StartTimer(name, duration) => {
                 let timer_id = format!("{}:{:?}", key, name);
                 state.timer_wheel.insert(

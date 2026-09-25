@@ -13,6 +13,7 @@ pub mod key;
 pub mod state;
 pub mod timer;
 
+use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
@@ -48,10 +49,12 @@ pub struct ServerTransactionOutcome {
 
 /// The transaction manager — holds all active transactions.
 ///
-/// The map stores each transaction **boxed**. `Transaction` is 536 bytes —
-/// a `Nist` carries two whole `SipMessage`s inline (`original_request` for the
-/// synthesised 100, `last_response` for retransmission) — and storing that
-/// inline made the hash table's bucket 608 bytes. A `hashbrown` table sizes its
+/// The map stores each transaction **boxed**. A `Transaction` is the size of its
+/// largest variant, and that is the `Nist`: it carries two whole `SipMessage`s
+/// inline (`original_request` for the synthesised 100, `last_response` for
+/// retransmission). 536 bytes when this was first measured, 440 today — pinned
+/// by `tests/transaction_footprint_tests.rs`. Storing that inline made the hash
+/// table's bucket 608 bytes, and a `hashbrown` table sizes its
 /// bucket array for the peak number of live entries and **never shrinks it**,
 /// so a box that once ran at N concurrent transactions holds
 /// `N/0.875` rounded to a power of two, times 608 bytes, for the rest of the
@@ -62,6 +65,17 @@ pub struct ServerTransactionOutcome {
 /// grows linearly with offered load. Boxing takes the bucket to 80 bytes and
 /// the retention with it, and moves the 536-byte payload off the memcpy path
 /// that every insert and every table growth pays.
+///
+/// What each boxed transaction *points at* is the larger number, and it is a
+/// separate fight: a parsed `SipMessage` costs 5.4x the octets it represents,
+/// because every header is two `String`s and a `Vec`, each its own allocation
+/// rounded up to a size class. The two client transactions now retain their
+/// request as the octets they sent rather than as the parse (see
+/// [`state::Action::SendFrame`]), which took a live INVITE client transaction
+/// from 5506 to 1415 bytes — 1.76 GB to 0.45 GB at 10k cps with a 32 s window.
+/// The server transactions still keep parses: the `Nist` for the 100 Trying it
+/// may have to synthesise, and both for the response they may have to
+/// retransmit. Projecting those down is the next reduction.
 #[derive(Debug)]
 pub struct TransactionManager {
     transactions: DashMap<TransactionKey, Box<Transaction>>,
@@ -271,16 +285,26 @@ impl TransactionManager {
     /// Create a new client transaction for an outgoing request.
     ///
     /// Returns the initial actions (send request, start timers).
+    ///
+    /// `wire` must be the exact octets the caller puts on the wire for
+    /// `request`. The transaction retains *only* those octets: a retransmission
+    /// (Timer A, §17.1.1.2; Timer E, §17.1.2.2) re-emits them verbatim, which
+    /// is both what the RFC requires and 5.4x cheaper to hold than the parse
+    /// for the up-to-32 s the transaction lives. Callers have already
+    /// serialized by this point — the send is what produced these bytes — so
+    /// handing them over costs a refcount bump and saves the deep
+    /// `SipMessage` clone this constructor used to make per call.
     pub fn new_client_transaction(
         &self,
-        request: SipMessage,
+        request: &SipMessage,
+        wire: Bytes,
         transport: Transport,
     ) -> Result<(TransactionKey, Vec<Action>), String> {
-        let key = Self::key_from_message(&request)?;
+        let key = Self::key_from_message(request)?;
 
         let (transaction, actions) = match request.method() {
             Some(Method::Invite) => {
-                let (ict, actions) = Ict::new(request, transport, self.timers);
+                let (ict, actions) = Ict::new(wire, transport, self.timers);
                 (Transaction::Ict(ict), actions)
             }
             Some(Method::Ack) => {
@@ -288,7 +312,7 @@ impl TransactionManager {
                 return Err("ACK does not create a client transaction".to_string());
             }
             _ => {
-                let (nict, actions) = Nict::new(request, transport, self.timers);
+                let (nict, actions) = Nict::new(wire, transport, self.timers);
                 (Transaction::Nict(nict), actions)
             }
         };
@@ -404,6 +428,12 @@ mod tests {
     use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
     use crate::sip::uri::SipUri;
+
+    /// The frame a caller would put on the wire for `message` — what a client
+    /// transaction retains and retransmits.
+    fn wire_of(message: &SipMessage) -> bytes::Bytes {
+        bytes::Bytes::from(message.to_bytes())
+    }
 
     fn options_request() -> SipMessage {
         SipMessageBuilder::new()
@@ -530,20 +560,25 @@ mod tests {
 
     #[test]
     fn new_nict_client_transaction() {
+        let request = options_request();
         let manager = TransactionManager::default();
         let (key, actions) = manager
-            .new_client_transaction(options_request(), Transport::Udp)
+            .new_client_transaction(&request, wire_of(&request), Transport::Udp)
             .unwrap();
         assert_eq!(key.method, Method::Options);
         assert_eq!(manager.count(), 1);
-        assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
+        // The transaction hands back the caller's own frame, unchanged.
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::SendFrame(frame) if *frame == wire_of(&request))));
     }
 
     #[test]
     fn client_transaction_removed_on_terminate() {
         let manager = TransactionManager::default();
+        let request = options_request();
         let (key, _) = manager
-            .new_client_transaction(options_request(), Transport::Reliable)
+            .new_client_transaction(&request, wire_of(&request), Transport::Reliable)
             .unwrap();
         assert_eq!(manager.count(), 1);
 
@@ -639,11 +674,12 @@ mod tests {
     #[test]
     fn duplicate_client_transaction_is_refused() {
         let manager = TransactionManager::default();
+        let request = options_request();
         manager
-            .new_client_transaction(options_request(), Transport::Udp)
+            .new_client_transaction(&request, wire_of(&request), Transport::Udp)
             .unwrap();
         let error = manager
-            .new_client_transaction(options_request(), Transport::Udp)
+            .new_client_transaction(&request, wire_of(&request), Transport::Udp)
             .expect_err("a colliding client transaction must not replace the live one");
         assert!(
             error.contains("already exists"),

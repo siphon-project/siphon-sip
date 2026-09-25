@@ -363,12 +363,21 @@ pub(super) fn handle_response(
                 Ok(actions) => {
                     for action in &actions {
                         match action {
-                            Action::SendMessage(ack_message) => {
+                            Action::SendFrame(frame) => {
                                 // RFC 3261 §17.1.1.3: send ACK for non-2xx back toward
                                 // the UAS, from the socket the response arrived on
-                                // (multi-homed source-port parity).
-                                send_message_from(
-                                    ack_message.clone(),
+                                // (multi-homed source-port parity). Client
+                                // transactions hand over serialized frames — the ACK
+                                // is built once and its octets cached, so a
+                                // retransmission is the same ACK rather than a rebuild
+                                // of it.
+                                debug!(
+                                    destination = %inbound.remote_addr,
+                                    size = frame.len(),
+                                    "sending cached ACK frame"
+                                );
+                                send_outbound_from(
+                                    frame.clone(),
                                     inbound.transport,
                                     inbound.remote_addr,
                                     inbound.connection_id,

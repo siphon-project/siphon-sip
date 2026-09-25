@@ -24,6 +24,29 @@ entry, but a working config keeps working.
   `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
   `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
   method test with anything else no longer counts as method-gated.
+### Changed
+
+- **A client transaction now retains the octets it sent, not the parsed
+  request.** The INVITE and non-INVITE client transactions (RFC 3261 §17.1.1 /
+  §17.1.2) keep a request only so they can retransmit it, and §17.1.1.2 wants
+  that retransmission to be the same request. They now hold the frame the relay
+  already serialized in order to send it, so a Timer A / Timer E retransmit is a
+  refcount bump instead of a re-serialise, and byte identity is a property of
+  the representation rather than something the serializer has to keep
+  guaranteeing. The cached ACK for a non-2xx (§17.1.1.3) is kept the same way.
+
+  A parsed message costs 5.4x the octets it stands for — every header is two
+  `String`s and a `Vec`, each its own allocation rounded to a size class — and a
+  proxy holds one per in-flight request for up to 32 s. Measured on a 943-byte
+  INVITE with SDP, a live INVITE client transaction dropped from 5506 to 1415
+  bytes, which at 10k calls/sec with a 32 s window is **1.76 GB down to
+  0.45 GB**. Nothing in the scripting API or on the wire changes.
+  `tests/transaction_footprint_tests.rs` pins the figure.
+
+  The Rust library API does change: `TransactionManager::new_client_transaction`
+  takes `(&SipMessage, Bytes, Transport)` — the message to key on, and the exact
+  octets the caller puts on the wire — and `Action` gained a `SendFrame(Bytes)`
+  variant that client transactions emit instead of `SendMessage`.
 
 ## [1.10.0] — 2026-09-24
 

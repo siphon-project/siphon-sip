@@ -186,7 +186,11 @@ fn full_proxy_round_trip_with_transactions() {
     let client_branch = "z9hG4bK-cli-round";
     let relayed = options_request(client_branch);
     let (client_key, _client_actions) = manager
-        .new_client_transaction(relayed, TxnTransport::Udp)
+        .new_client_transaction(
+            &relayed,
+            bytes::Bytes::from(relayed.to_bytes()),
+            TxnTransport::Udp,
+        )
         .unwrap();
 
     // 3. Create ProxySession linking them
