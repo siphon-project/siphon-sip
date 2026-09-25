@@ -910,7 +910,7 @@ impl OutboundRouter {
 /// §5.3), which is why inbound TCP registers here too.
 ///
 /// Registering is not routing.  Every consumer asks for one transport by name
-/// (relay reuse, NAT keepalive, registrant liveness, `Flow.is_alive`, the
+/// (relay reuse, NAT keepalive, `Flow.is_alive`, the
 /// `subscribe_state` received-flow send), and the plain-TCP URI relay never
 /// consults the registry at all — it goes through the outbound pool — so a TCP
 /// entry is only ever used when the signalling explicitly asked for the
@@ -981,18 +981,6 @@ impl StreamConnections {
     /// transport-agnostic).  Diagnostic helper.
     pub fn has_ip(&self, ip: IpAddr) -> bool {
         self.map.iter().any(|entry| entry.key().0.ip() == ip)
-    }
-
-    /// Whether any `transport` connection from `ip` is currently registered.
-    /// Backs registrant outbound-liveness detection: it reproduces the
-    /// pre-unification `tls_addr_map` semantics exactly (that map only ever
-    /// held entries of one transport per consumer), and the transport filter
-    /// keeps an unrelated WS/WSS UE connection from masking a dead TLS/TCP
-    /// trunk that happens to share an IP.
-    pub fn has_ip_transport(&self, ip: IpAddr, transport: Transport) -> bool {
-        self.map
-            .iter()
-            .any(|entry| entry.key().0.ip() == ip && entry.key().1 == transport)
     }
 
     /// True only when the exact `(peer, transport, connection_id)` triple is
@@ -1509,23 +1497,6 @@ mod tests {
         );
         assert!(registry.has_ip("10.0.0.1".parse().unwrap()));
         assert!(!registry.has_ip("10.0.0.2".parse().unwrap()));
-    }
-
-    #[test]
-    fn stream_connections_has_ip_transport_discriminates() {
-        // Registrant liveness: a WS UE from the same IP as a TLS trunk must
-        // not be counted as the trunk's connection.
-        let registry = StreamConnections::new();
-        registry.register(
-            addr("10.0.0.1:50000"),
-            Transport::WebSocket,
-            ConnectionId(1),
-        );
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(registry.has_ip_transport(ip, Transport::WebSocket));
-        assert!(!registry.has_ip_transport(ip, Transport::Tls));
-        registry.register(addr("10.0.0.1:443"), Transport::Tls, ConnectionId(2));
-        assert!(registry.has_ip_transport(ip, Transport::Tls));
     }
 
     #[test]

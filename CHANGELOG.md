@@ -20,6 +20,49 @@ entry, but a working config keeps working.
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
   `proxy::reply_pipeline` module are removed.
 
+### Fixed
+
+- **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
+  now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
+  (it was documented but never applied), and if the script registers
+  `@http.route` handlers but an HTTP listener cannot bind (port in use, missing
+  TLS file), siphon exits at startup instead of running with the routes
+  unreachable.
+- **`@proxy.on_register_reply` handlers never ran.** The decorator registered
+  the handler but the proxy response path never dispatched it, so a script that
+  used it got no callback and no error. It is now shorthand for
+  `@proxy.on_reply("REGISTER")` and runs alongside any unfiltered
+  `@proxy.on_reply` handler, in registration order.
+- **`scripts/check_hot_path_dispatch.py` suggested filters that could not
+  work.** It told the author of an `async` `@b2bua.on_invite` handler to move its
+  awaits into a filtered form that does not exist. `on_invite` is no longer
+  checked, since every call it sees is an INVITE. The suggested filter is also
+  built from method comparisons alone, so
+  `request.method == "INVITE" and reply.has_body("application/sdp")` suggests
+  `"INVITE"` instead of `"INVITE|application/sdp"`, and a branch that `or`s a
+  method test with anything else no longer counts as method-gated.
+- **Outbound registration over TCP re-registered every 5 seconds.** The
+  connection-loss check looked a registered trunk up in the shared stream
+  registry, which holds no outbound TCP connections, so every TCP trunk looked
+  dead on every tick and was re-REGISTERed. The same check matched by IP alone,
+  so an inbound TLS connection from the registrar's host kept a trunk whose own
+  connection had died looking alive. It now asks the outbound connection pool
+  about the one connection the REGISTERs go out on (exact address, port and
+  transport), via the new `ConnectionPool::has_live`. A trunk whose connection
+  is really gone still re-registers on the next tick. That includes a TCP
+  connection the pool closes after its 30 s idle timeout, so a trunk with no
+  traffic on it re-registers about every 35 s, which re-opens the connection
+  the registrar reaches it over. SCTP trunks are no longer
+  checked, since there is no outbound SCTP connection to judge. Rust library:
+  `registrant::registration_loop` now takes the outbound
+  `Arc<ConnectionPool>` as its last argument instead of an
+  `Option<StreamConnections>`, so an embedder that spawns the loop itself
+  passes the pool its stream transports send through.
+  `StreamConnections::has_ip_transport` is removed: the liveness check was its
+  only caller, and an IP-level match is the wrong question for any one
+  connection. Use `get` / `is_alive` for an exact peer.
+### Changed
+
 - **A client transaction now retains the octets it sent, not the parsed
   request.** The INVITE and non-INVITE client transactions (RFC 3261 §17.1.1 /
   §17.1.2) keep a request only so they can retransmit it, and §17.1.1.2 wants
