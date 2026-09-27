@@ -921,7 +921,7 @@ fn drop_refuses_an_answered_call_naming_the_verb_and_the_state() {
     // the call is in — `invalid_state`, not `bad_request` (the frame is fine) and
     // not `not_found` (the call exists).
     let result = drop_result(&channel(), crate::dispatcher::DropOutcome::Answered);
-    let ControlResult::Error { code, message } = result else {
+    let ControlResult::Error { code, message, .. } = result else {
         panic!("drop on an answered call must be refused");
     };
     assert_eq!(code, ControlErrorCode::InvalidState);
@@ -956,7 +956,7 @@ fn drop_on_a_call_that_is_gone_is_not_found() {
     // shape as a call that ended while the controller was deciding: a typed
     // not_found, never a hang and never a silent Ok for a call nobody dropped.
     let result = sip_command("drop", serde_json::json!({ "reason": "unsolicited" }));
-    let ControlResult::Error { code, message } = result else {
+    let ControlResult::Error { code, message, .. } = result else {
         panic!("drop on a missing call must be refused");
     };
     assert_eq!(code, ControlErrorCode::NotFound);
