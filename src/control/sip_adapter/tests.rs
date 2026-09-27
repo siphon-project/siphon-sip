@@ -52,7 +52,7 @@ fn ring_refuses_a_body_because_sdp_on_an_18x_is_early_media() {
         serde_json::json!({ "content_type": "application/sdp" }),
     ] {
         let result = sip_command("ring", args);
-        let ControlResult::Error { code, message } = result else {
+        let ControlResult::Error { code, message, .. } = result else {
             panic!("ring with a body must be refused");
         };
         assert_eq!(code, ControlErrorCode::BadRequest);
@@ -274,7 +274,9 @@ fn originate_without_a_channel_id_is_bad_request() {
     let result =
         originate_args(serde_json::json!({ "to": "sip:1@carrier.example", "media": true }));
     match result {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_eq!(code, ControlErrorCode::BadRequest);
             assert!(message.contains("args.channel"), "message was: {message}");
         }
@@ -319,7 +321,9 @@ fn originate_without_a_media_plan_is_bad_request() {
         "to": "sip:1@carrier.example",
     }));
     match result {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_eq!(code, ControlErrorCode::BadRequest);
             assert!(message.contains("media plan"), "message was: {message}");
         }
@@ -375,7 +379,9 @@ fn originate_refuses_the_unimplemented_on_lost_fallback_policy() {
         "on_lost": "fallback",
     }));
     match result {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_eq!(code, ControlErrorCode::BadRequest, "message was: {message}");
             assert!(
                 message.contains("fallback") && message.contains("not implement"),
@@ -460,7 +466,9 @@ fn originate_rejects_a_duplicate_caller_supplied_id_with_conflict() {
     command.origin.conn_id = conn.id;
     let result = originate_with_bus(&bus, command);
     match result {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_eq!(code, ControlErrorCode::Conflict, "message was: {message}");
             assert!(message.contains("cb-1"), "message was: {message}");
         }
@@ -545,7 +553,9 @@ async fn originate_dispatches_through_apply_as_a_module_level_verb() {
         })))
         .await;
     match result {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_ne!(
                 code,
                 ControlErrorCode::BadRequest,
@@ -670,7 +680,9 @@ fn originate_error_maps_an_invalid_body_to_bad_request() {
         "Content-Type 'text/plain' is neither application/sdp nor a multipart body carrying one"
             .to_string(),
     )) {
-        ControlResult::Error { code, ref message } => {
+        ControlResult::Error {
+            code, ref message, ..
+        } => {
             assert_eq!(code, ControlErrorCode::BadRequest);
             assert!(message.contains("text/plain"), "message was: {message}");
         }
@@ -810,7 +822,7 @@ async fn record_start_rejects_unknown_selectors() {
     for (key, value) in [("direction", "inbound"), ("channels", "quad")] {
         let result = record_start(&channel, &serde_json::json!({ key: value })).await;
         match result {
-            ControlResult::Error { code, message } => {
+            ControlResult::Error { code, message, .. } => {
                 assert_eq!(
                     code,
                     ControlErrorCode::BadRequest,
@@ -2084,7 +2096,7 @@ fn dial_refuses_a_privacy_value_it_does_not_recognise() {
         "dial",
         serde_json::json!({"targets": ["sip:201@example.com"], "privacy": "maybe"}),
     );
-    let ControlResult::Error { code, message } = result else {
+    let ControlResult::Error { code, message, .. } = result else {
         panic!("a privacy siphon cannot honour has to be refused");
     };
     assert_eq!(code, ControlErrorCode::BadRequest);

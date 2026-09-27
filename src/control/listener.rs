@@ -26,7 +26,7 @@ use axum::routing::get;
 use axum::Router;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::protocol::{
     CommandFrame, ControlErrorCode, ControlResult, HelloArgs, PROTOCOL_VERSION, SUBPROTOCOL,
@@ -393,7 +393,17 @@ async fn handle_command(
         response_tx,
     };
 
+    // The two refusals below happen before, and instead of, the dispatch that
+    // logs every other one — so they log themselves. Both are the stack failing
+    // at something possible, which is an `error`, and both are otherwise
+    // indistinguishable from siphon never having received the command at all.
     if bus.command_sender().send(command).is_err() {
+        error!(
+            app = %conn.app,
+            conn_id = conn.id,
+            %verb,
+            "control plane: command refused — the command consumer is not running"
+        );
         conn.events.push_reply(
             ControlResult::error(
                 ControlErrorCode::Unavailable,
@@ -414,6 +424,12 @@ async fn handle_command(
     let result = match response_rx.await {
         Ok(result) => result,
         Err(_) => {
+            error!(
+                app = %conn.app,
+                conn_id = conn.id,
+                %verb,
+                "control plane: command refused — the apply task dropped it without answering"
+            );
             ControlResult::error(ControlErrorCode::Unavailable, "control command was dropped")
         }
     };

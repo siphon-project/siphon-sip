@@ -31,6 +31,8 @@
 pub mod listener;
 pub mod outbound;
 pub mod protocol;
+#[cfg(test)]
+mod refusal_tests;
 pub mod registry;
 pub mod sip_adapter;
 
@@ -50,7 +52,7 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ControlConfig;
 
@@ -374,11 +376,103 @@ pub(crate) async fn run_consumer(
     }
 }
 
+/// Apply one command and log what it did.
+///
+/// The logging is here rather than in each verb because every refusal has to be
+/// covered, including the ones the substrate answers before an adapter is
+/// reached. A verb that is *carried out* leaves its own trace (the call's
+/// logging, the CDR); a verb that is **refused** left none, so a controller told
+/// "siphon refused it" could not be corroborated from siphon's side at all — and
+/// the natural reading of a silent log is that the command never arrived.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
+    bus: &Arc<ControlBus>,
+    adapters: &HashMap<String, Arc<dyn ControlAdapter>>,
+    app: &str,
+    conn_id: u64,
+    module: Option<&str>,
+    verb: &str,
+    target: serde_json::Value,
+    args: serde_json::Value,
+) -> ControlResult {
+    // Both are moved into the dispatch below. `originate` names the channel it
+    // is about to create in `args`, every other verb in `target`.
+    let channel_id = json_str(&target, "channel").or_else(|| json_str(&args, "channel"));
+    let result = dispatch_verb(bus, adapters, app, conn_id, module, verb, target, args).await;
+    log_command_outcome(bus, app, module, verb, channel_id.as_deref(), &result);
+    result
+}
+
+/// Read a string member of a JSON object, if it is one and it is set.
+fn json_str(value: &serde_json::Value, name: &str) -> Option<String> {
+    value
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// One log line per applied command: `debug` when it was carried out, `warn`
+/// when the controller asked for something impossible, `error` when the stack
+/// could not do something possible (`unavailable` — the thing behind the verb is
+/// not there).
+///
+/// One message string across both refusal levels on purpose: a single grep finds
+/// every refusal, and the level is what separates "look in the controller" from
+/// "look in siphon". Fields are the ones already in hand — the application, the
+/// channel, its SIP Call-ID (the CDR / HEP / capture join key), the verb, the
+/// stable error code and the message the controller got.
+fn log_command_outcome(
+    bus: &Arc<ControlBus>,
+    app: &str,
+    module: Option<&str>,
+    verb: &str,
+    channel_id: Option<&str>,
+    result: &ControlResult,
+) {
+    let channel = channel_id.unwrap_or("-");
+    let module = module.unwrap_or("-");
+    let sip_call_id = channel_id
+        .and_then(|channel| bus.sip_call_id_for_channel(channel))
+        .unwrap_or_else(|| "-".to_string());
+    match result {
+        ControlResult::Ok(_) => {
+            debug!(
+                app,
+                module, verb, channel, sip_call_id, "control plane: command applied"
+            );
+        }
+        ControlResult::Error { code, message, .. } if code.is_caller_fault() => {
+            warn!(
+                app,
+                module,
+                verb,
+                channel,
+                sip_call_id,
+                code = code.as_str(),
+                error = %message,
+                "control plane: command refused"
+            );
+        }
+        ControlResult::Error { code, message, .. } => {
+            error!(
+                app,
+                module,
+                verb,
+                channel,
+                sip_call_id,
+                code = code.as_str(),
+                error = %message,
+                "control plane: command refused"
+            );
+        }
+    }
+}
+
 /// Route one command: substrate verbs (`resync`/`describe`/`set_var`/`get_var`)
 /// are handled here; everything else routes to the adapter named by `module`
 /// after the target is resolved + ownership-checked.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch(
+async fn dispatch_verb(
     bus: &Arc<ControlBus>,
     adapters: &HashMap<String, Arc<dyn ControlAdapter>>,
     app: &str,

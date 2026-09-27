@@ -419,35 +419,7 @@ fn the_policy_shapes_the_number_in_an_explicit_ruri() {
     assert!(target.contains("user=phone"), "{target}");
 }
 
-/// Captured log output, for asserting on a warning. Shared with the other
-/// dispatcher test modules that assert on a startup warning.
-#[derive(Clone, Default)]
-pub(super) struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl LogBuffer {
-    pub(super) fn rendered(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("the log buffer lock")).into_owned()
-    }
-}
-
-impl std::io::Write for LogBuffer {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("the log buffer lock")
-            .extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
-    type Writer = LogBuffer;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        self.clone()
-    }
-}
+/// Captured log output, for asserting on a warning. Re-exported at the path the
+/// other dispatcher test modules already reach it by; it lives crate-wide now
+/// that the control plane asserts on a log line too.
+pub(super) use crate::log_capture::LogBuffer;

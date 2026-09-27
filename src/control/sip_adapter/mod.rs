@@ -26,6 +26,11 @@ mod transfer;
 use bridge::apply_bridge_verb;
 use call::{answer, get_header, hangup, reject, remove_header, ring, set_header};
 use media::apply_media_verb;
+/// The media-error mapping and the `play` argument gate, reachable from the
+/// control plane's own tests: both are contract surface (which code a controller
+/// gets, and which argument a refusal names), not media internals.
+#[cfg(test)]
+pub(in crate::control) use media::{media_error, play_blob_refusal};
 use originate::originate;
 #[cfg(test)]
 pub(crate) use originate::staged;

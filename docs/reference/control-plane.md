@@ -237,7 +237,8 @@ command  (client → siphon)  { "id":"c-1", "type":"command", "module":"sip",
                               "verb":"answer", "target":{"channel":"<id>"},
                               "args":{"code":200} }
 reply    (siphon → client)  { "id":"c-1", "type":"reply", "status":"ok",
-                              "result":{...} }   // or "status":"error", "error":{code,message}
+                              "result":{...} }   // or "status":"error",
+                                                 // "error":{code,message,details?}
 event    (siphon → client)  { "type":"event", "event":"StasisStart",
                               "channel":"<id>", "call_id":"<uuid>",
                               "sip_call_id":"<cid>", "payload":{...} }
@@ -246,6 +247,33 @@ event    (siphon → client)  { "type":"event", "event":"StasisStart",
 Every event carries the stable id triple `{channel, call_id, sip_call_id}` —
 `sip_call_id` is byte-identical to the CDR `call_id` and the HEP correlation
 chunk, so logs join Homer and billing with no mapping table.
+
+A failed reply's `error` is `{code, message, details?}`. `code` is the stable
+token to branch on, `message` is prose for a human, and `details` — present only
+when a refusal has something to add — is a JSON object of machine-readable
+fields, so a controller never has to parse the prose:
+
+```json
+{ "id":"c-7", "type":"reply", "status":"error",
+  "error":{ "code":"bad_request",
+            "message":"play args.blob is 323832 bytes of audio, over the 261120-byte limit …",
+            "details":{ "verb":"play", "argument":"blob",
+                        "bytes":323832, "limit_bytes":261120 } } }
+```
+
+### Finding a refusal in siphon's log
+
+Every command siphon applies logs one line. A command that was **carried out**
+logs `control plane: command applied` at `debug`; a command that was **refused**
+logs `control plane: command refused` — at `warn` when the controller asked for
+something impossible, at `error` when the stack could not do something possible
+(`unavailable`, the code for "the thing behind this verb is not there"). One
+message string for both refusal levels, so a single grep finds them all and the
+level is what says where to look next. Fields: `app`, `module`, `verb`,
+`channel`, `sip_call_id`, and on a refusal `code` and `error`.
+
+`sip_call_id` is the join key: a channel id appears nowhere on the wire, so it is
+what lets a refused verb be lined up against a capture, a CDR and HEP.
 
 ### Phase-1 verb set
 
@@ -356,6 +384,16 @@ same way every other verb does — never a hang:
 - A call with no anchored media session answers `not_found`; a backend that
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.
+- An inline `blob` is capped at **261,120 bytes of audio** — the worst-case
+  encoding bound of the media control frame, so it is content-independent and a
+  controller can apply the same check itself. Over it, `play` answers
+  `bad_request` naming the argument and the bound, with
+  `error.details: {verb, argument, bytes, limit_bytes}`, before the media session
+  is resolved and before any frame is built. A longer prompt belongs in
+  `args.file` or `args.url`, which ship a reference rather than the bytes.
+  (Previously an oversized blob reached the frame encoder and came back as
+  `unavailable` — the code for an unreachable engine — so a controller retried a
+  prompt that could never be played.)
 
 ### Recording
 

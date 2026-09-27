@@ -106,6 +106,63 @@ pub enum ControlErrorCode {
     Unavailable,
 }
 
+impl ControlErrorCode {
+    /// The exact token this code serializes to on the wire.
+    ///
+    /// So a refusal reads the same in siphon's own log as in the reply the
+    /// controller got, and an operator can grep one for the other. Kept honest
+    /// by [`tests::as_str_matches_the_wire_token_for_every_code`], which fails
+    /// if a new variant's token here drifts from what serde emits.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlErrorCode::Unauthorized => "unauthorized",
+            ControlErrorCode::Forbidden => "forbidden",
+            ControlErrorCode::NotFound => "not_found",
+            ControlErrorCode::BadRequest => "bad_request",
+            ControlErrorCode::Conflict => "conflict",
+            ControlErrorCode::InvalidState => "invalid_state",
+            ControlErrorCode::RateLimited => "rate_limited",
+            ControlErrorCode::OriginateDenied => "originate_denied",
+            ControlErrorCode::UnsupportedVerb => "unsupported_verb",
+            ControlErrorCode::UnsupportedVersion => "unsupported_version",
+            ControlErrorCode::ProtocolError => "protocol_error",
+            ControlErrorCode::Unavailable => "unavailable",
+        }
+    }
+
+    /// Every code, for a test that sweeps the set. A new variant is forced into
+    /// [`Self::as_str`] by the compiler (its `match` is exhaustive); adding it
+    /// here is what gets it *checked*.
+    #[cfg(test)]
+    pub(crate) const ALL: [ControlErrorCode; 12] = [
+        ControlErrorCode::Unauthorized,
+        ControlErrorCode::Forbidden,
+        ControlErrorCode::NotFound,
+        ControlErrorCode::BadRequest,
+        ControlErrorCode::Conflict,
+        ControlErrorCode::InvalidState,
+        ControlErrorCode::RateLimited,
+        ControlErrorCode::OriginateDenied,
+        ControlErrorCode::UnsupportedVerb,
+        ControlErrorCode::UnsupportedVersion,
+        ControlErrorCode::ProtocolError,
+        ControlErrorCode::Unavailable,
+    ];
+
+    /// Whether this code says the *controller* asked for something impossible
+    /// (a malformed argument, a call that is gone, a verb this build does not
+    /// have) rather than that the stack failed at something possible.
+    ///
+    /// The one distinction the refusal log line is graded on: a controller fault
+    /// is a `warn` (the operator's next step is in the controller), a stack
+    /// fault is an `error` (the next step is here). `unavailable` is the only
+    /// code that means the latter — it is the code for "the thing behind this
+    /// verb is not there".
+    pub fn is_caller_fault(self) -> bool {
+        !matches!(self, ControlErrorCode::Unavailable)
+    }
+}
+
 /// The error body of a failed reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyError {
@@ -113,6 +170,12 @@ pub struct ReplyError {
     pub code: ControlErrorCode,
     /// Human-readable detail.
     pub message: String,
+    /// Stable machine-readable fields beside the prose, so a controller can
+    /// branch on a refusal without parsing English: `{"verb": "play",
+    /// "argument": "blob", "bytes": 323832, "limit_bytes": 261120}`. Absent
+    /// from a refusal that has nothing to add beyond its code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// A reply frame (siphon → client, `id` echoed).
@@ -220,6 +283,8 @@ pub enum ControlResult {
         code: ControlErrorCode,
         /// Human-readable detail.
         message: String,
+        /// Machine-readable fields beside the prose — see [`ReplyError::details`].
+        details: Option<serde_json::Value>,
     },
 }
 
@@ -229,6 +294,25 @@ impl ControlResult {
         ControlResult::Error {
             code,
             message: message.into(),
+            details: None,
+        }
+    }
+
+    /// An error result that also carries machine-readable fields a controller
+    /// can branch on — the argument a refusal is about, the bound it broke.
+    ///
+    /// The prose still says the same thing: `details` is *beside* the message,
+    /// never instead of it, because the message is what reaches an operator's
+    /// log and the fields are what reaches a controller's `if`.
+    pub fn error_with_details(
+        code: ControlErrorCode,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        ControlResult::Error {
+            code,
+            message: message.into(),
+            details: Some(details),
         }
     }
 
@@ -242,12 +326,20 @@ impl ControlResult {
                 result: Some(result),
                 error: None,
             },
-            ControlResult::Error { code, message } => ReplyFrame {
+            ControlResult::Error {
+                code,
+                message,
+                details,
+            } => ReplyFrame {
                 id,
                 frame_type: FrameType::Reply,
                 status: ReplyStatus::Error,
                 result: None,
-                error: Some(ReplyError { code, message }),
+                error: Some(ReplyError {
+                    code,
+                    message,
+                    details,
+                }),
             },
         }
     }
@@ -389,6 +481,53 @@ mod tests {
             serde_json::to_string(&ControlErrorCode::InvalidState).unwrap(),
             "\"invalid_state\""
         );
+    }
+
+    /// The token the log line prints has to be the token the controller got, or
+    /// grepping one for the other silently finds nothing.
+    #[test]
+    fn as_str_matches_the_wire_token_for_every_code() {
+        for code in ControlErrorCode::ALL {
+            let wire = serde_json::to_string(&code).unwrap_or_default();
+            assert_eq!(wire, format!("\"{}\"", code.as_str()), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn error_details_ride_beside_the_message_on_the_wire() {
+        let reply = ControlResult::error_with_details(
+            ControlErrorCode::BadRequest,
+            "play args.blob is 323832 bytes of audio, over the 261120-byte limit",
+            serde_json::json!({
+                "verb": "play",
+                "argument": "blob",
+                "bytes": 323_832,
+                "limit_bytes": 261_120,
+            }),
+        )
+        .into_reply("c-9".to_string());
+        let text = serde_json::to_string(&reply).unwrap();
+        assert!(text.contains("\"code\":\"bad_request\""));
+        // Both: the prose an operator reads and the fields a controller branches
+        // on — never one instead of the other.
+        assert!(text.contains("bytes of audio"), "{text}");
+        assert!(text.contains("\"argument\":\"blob\""), "{text}");
+        let parsed: ReplyFrame = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, reply);
+        let error = parsed.error.expect("an error body");
+        assert_eq!(error.details.expect("details")["limit_bytes"], 261_120);
+    }
+
+    /// A refusal with nothing to add beyond its code carries no `details` key at
+    /// all, so a controller reading `error.details` gets absent, not empty.
+    #[test]
+    fn a_plain_error_omits_details() {
+        let reply = ControlResult::error(ControlErrorCode::NotFound, "no such channel")
+            .into_reply("c-8".to_string());
+        let text = serde_json::to_string(&reply).unwrap();
+        assert!(!text.contains("details"), "{text}");
+        let parsed: ReplyFrame = serde_json::from_str(&text).unwrap();
+        assert!(parsed.error.expect("an error body").details.is_none());
     }
 
     #[test]
