@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-09-27
+
 ### Removed
 
 - **`SubscribeHandle.mirror_reply()` is gone.** It never did anything: it
