@@ -35,7 +35,12 @@ def test_rfc4694_user_parameters_reach_the_wire():
     assert request.ruri.user == "+15551234567"
     assert request.ruri.host == "carrier.example.net"
     assert request.ruri.params == {"user": "phone"}
+    assert request.ruri.user_params == {"npdi": "", "rn": "+15559876543"}
     assert str(request.ruri) == target
+
+
+def test_user_params_is_empty_without_userinfo_parameters():
+    assert make_request().ruri.user_params == {}
 
 
 @pytest.mark.parametrize(

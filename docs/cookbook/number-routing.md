@@ -15,10 +15,12 @@ your real data source: an SQL query, an HTTP API, `cache.fetch`, or
 
 ## LNP: correct the routing number
 
-Dip your ported-number data, and if the number has ported, rewrite the R-URI
-with the routing number (`rn`) and mark the dip as done (`npdi`) per
-[RFC 4694](https://www.rfc-editor.org/rfc/rfc4694). `set_ruri` takes a full URI,
-so the parameters land on the wire verbatim.
+Dip your ported-number data and mark the dip as done (`npdi`) per
+[RFC 4694](https://www.rfc-editor.org/rfc/rfc4694); if the number has ported,
+also carry the routing number (`rn`). A request that already has `npdi` was
+dipped upstream and is not dipped again. `npdi` and `rn` are user parameters
+(before the `@`), so read them from `request.ruri.user_params` and write them
+with `set_ruri`, which takes a full URI and puts it on the wire verbatim.
 
 ```python
 from siphon import proxy, log
@@ -27,17 +29,30 @@ CARRIER_HOST = "carrier.example.net"
 
 def lnp_dip(number: str) -> str | None:
     """Your dip: SS7/SOA query, HTTP API, or a local copy of the LNP database.
-    Returns the LRN for a ported number, else None."""
+    Returns the LRN for a ported number, None if not ported. Raise if the dip
+    itself failed, so the request is not marked npdi."""
     ...
 
 @proxy.on_request("INVITE")
 def route(request):
     called = request.ruri.user or ""
 
+    # npdi says a dip was already done upstream (RFC 4694): trust it, never
+    # dip twice. Any rn it carries is readable too.
+    if "npdi" in request.ruri.user_params:
+        rn = request.ruri.user_params.get("rn")
+        log.info(f"LNP {called} already dipped, rn={rn or '-'}")
+        request.relay()
+        return
+
     lrn = lnp_dip(called)
     if lrn is not None:
+        # Ported: route on the routing number (rn), flag the dip (npdi).
         request.set_ruri(f"sip:{called};npdi;rn={lrn}@{CARRIER_HOST};user=phone")
         log.info(f"LNP {called} ported -> rn={lrn}")
+    else:
+        # Not ported: still flag the dip, so the next hop does not repeat it.
+        request.set_ruri(f"sip:{called};npdi@{CARRIER_HOST};user=phone")
 
     request.relay()
 ```

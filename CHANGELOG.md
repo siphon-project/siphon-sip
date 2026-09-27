@@ -346,6 +346,12 @@ entry, but a working config keeps working.
   `request.remove_ruri_param(name)`** add, replace or remove one Request-URI
   parameter (`;user=phone`, `;transport=tcp`, a flag such as `;lr`) without
   rebuilding the URI. Names match case-insensitively (RFC 3261 §19.1.4).
+- **`SipUri.user_params`** reads the parameters inside the userinfo, between
+  the user and `@`, as a dict (`params` never included them). RFC 4694 number
+  portability is readable at last: `"npdi" in request.ruri.user_params`,
+  `request.ruri.user_params.get("rn")`. The number-routing example now skips
+  the dip when `npdi` is already present and marks a not-ported number with
+  `npdi` too.
 
 - **`siphon::config::expand_env_vars` is public.** Extensions that load their
   own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules

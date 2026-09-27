@@ -3978,6 +3978,21 @@ mod tests {
     }
 
     #[test]
+    fn rfc4694_parameters_are_readable_from_python() {
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone')\n",
+                "assert request.ruri.user == '+15551234567'\n",
+                "assert request.ruri.user_params == {'npdi': '', 'rn': '+15559876543'}\n",
+                "assert 'npdi' in request.ruri.user_params\n",
+                "assert request.ruri.params == {'user': 'phone'}\n",
+            ))
+            .unwrap(),
+            "sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone"
+        );
+    }
+
+    #[test]
     fn tel_phone_context_param_stays_consistent() {
         assert_eq!(
             ruri_after(concat!(

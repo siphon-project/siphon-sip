@@ -2528,6 +2528,10 @@
       "user": {
         "doc": "Assigning on `request.ruri` rewrites the Request-URI; same rules as",
         "kind": "getset_descriptor"
+      },
+      "user_params": {
+        "doc": "User parameters as a dict: the ones inside the userinfo, between the",
+        "kind": "getset_descriptor"
       }
     },
     "SrsParticipant": {

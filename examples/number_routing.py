@@ -24,7 +24,9 @@ CARRIER_HOST = "carrier.example.net"
 # --- your business logic (replace these two stubs) --------------------------
 
 def lnp_dip(number: str) -> str | None:
-    """Return the LRN for a ported number, or None if not ported / unknown.
+    """Return the LRN for a ported number, or None if the dip found it not
+    ported. Raise if the dip itself failed: the caller marks every answered
+    dip with npdi, and a failed one must not be marked as done.
 
     Replace with your real dip: an SS7/SOA query, an HTTP API, or a local copy
     of the ported-number database.
@@ -50,12 +52,22 @@ def routes_for(number: str) -> list[str]:
 def route(request):
     called = request.ruri.user or ""
 
+    # npdi says a dip was already done upstream (RFC 4694): trust it, never
+    # dip twice. Any rn it carries is readable too.
+    if "npdi" in request.ruri.user_params:
+        rn = request.ruri.user_params.get("rn")
+        log.info(f"LNP {called} already dipped, rn={rn or '-'}")
+        request.relay()
+        return
+
     lrn = lnp_dip(called)
     if lrn is not None:
-        # RFC 4694: flag the dip as done (npdi) and carry the routing number
-        # (rn). set_ruri takes a full URI, so the params land on the wire as-is.
+        # Ported: route on the routing number (rn), flag the dip (npdi).
         request.set_ruri(f"sip:{called};npdi;rn={lrn}@{CARRIER_HOST};user=phone")
         log.info(f"LNP {called} ported -> rn={lrn}")
+    else:
+        # Not ported: still flag the dip, so the next hop does not repeat it.
+        request.set_ruri(f"sip:{called};npdi@{CARRIER_HOST};user=phone")
 
     request.relay()
 

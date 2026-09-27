@@ -155,6 +155,27 @@ impl PySipUri {
             .collect()
     }
 
+    /// User parameters as a dict: the ones inside the userinfo, between the
+    /// user and `@`, which `params` does not include. Flag parameters read
+    /// as an empty string. RFC 4694 number portability lives here:
+    ///
+    /// ```python
+    /// # sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone
+    /// request.ruri.user_params   # {"npdi": "", "rn": "+15559876543"}
+    /// "npdi" in request.ruri.user_params    # dip already done
+    /// request.ruri.params                   # {"user": "phone"}
+    /// ```
+    ///
+    /// Read-only: write user parameters as a whole URI with `set_ruri()`.
+    #[getter]
+    fn user_params(&self) -> std::collections::BTreeMap<String, String> {
+        self.inner
+            .user_params()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone().unwrap_or_default()))
+            .collect()
+    }
+
     fn __str__(&self) -> String {
         self.inner.to_string()
     }
@@ -618,6 +639,29 @@ mod tests {
         let mut uri = parsed("sip:bob@example.com");
         uri.user = Some("123;npdi".to_string());
         assert!(checked_uri(uri).is_err());
+    }
+
+    #[test]
+    fn user_params_reads_the_userinfo_parameters_only() {
+        let py_uri = PySipUri::new(parsed(
+            "sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone",
+        ));
+        let user_params = py_uri.user_params();
+        assert_eq!(user_params.get("npdi").map(String::as_str), Some(""));
+        assert_eq!(
+            user_params.get("rn").map(String::as_str),
+            Some("+15559876543")
+        );
+        assert_eq!(user_params.len(), 2);
+        assert_eq!(
+            py_uri.params().get("user").map(String::as_str),
+            Some("phone")
+        );
+        assert_eq!(py_uri.params().len(), 1, "user params are not URI params");
+
+        assert!(PySipUri::new(parsed("sip:bob@example.com"))
+            .user_params()
+            .is_empty());
     }
 
     #[test]

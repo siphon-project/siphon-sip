@@ -210,6 +210,25 @@ class SipUri:
         return {name: (value or "") for name, value in self._params}
 
     @property
+    def user_params(self) -> dict:
+        """User parameters as a dict: the ones inside the userinfo, between
+        the user and ``@``, which :attr:`params` does not include.  Flag
+        parameters read as an empty string.  RFC 4694 number portability
+        lives here.
+
+        Read-only: write user parameters as a whole URI with
+        ``request.set_ruri()``.
+
+        Example::
+
+            # sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone
+            request.ruri.user_params   # {"npdi": "", "rn": "+15559876543"}
+            "npdi" in request.ruri.user_params    # dip already done
+            request.ruri.params                   # {"user": "phone"}
+        """
+        return {name: (value or "") for name, value in self._user_params}
+
+    @property
     def is_local(self) -> bool:
         """``True`` if the host matches one of the locally configured domains.
 
