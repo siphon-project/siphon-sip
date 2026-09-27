@@ -370,19 +370,22 @@ pub(super) fn handle_cancel(
         }
     };
 
-    // Check if this CANCEL belongs to a B2BUA call
-    let engine_state = state.engine.state();
-    if engine_state.has_b2bua_handlers() {
-        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
-        if let Some(ref sip_call_id) = sip_call_id {
-            if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
-                drop(engine_state);
-                handle_b2bua_cancel(inbound, message, state);
-                return;
-            }
+    // Does this CANCEL belong to a B2BUA call? The call actor's existence is the
+    // whole test. It used to be reached only when the script had registered a
+    // B2BUA handler, which asks the wrong question: a call created over
+    // `control.inbound` and driven by a control application has an actor and no
+    // script handlers, so its CANCEL fell through to the ProxySession lookup —
+    // which cannot match a B2BUA call — and was answered 481 while the callee
+    // kept ringing and the flow went on to answer a call the caller had already
+    // abandoned. `handle_b2bua_cancel` does its own lookup and answers 481
+    // itself when there is genuinely no actor, so a proxy CANCEL still falls
+    // through to the branch below.
+    if let Some(sip_call_id) = message.headers.get("Call-ID") {
+        if state.call_actors.find_by_sip_call_id(sip_call_id).is_some() {
+            handle_b2bua_cancel(inbound, message, state);
+            return;
         }
     }
-    drop(engine_state);
 
     // --- Try ProxySession-based CANCEL routing first ---
     // CANCEL shares the same Via branch as the INVITE it cancels.
