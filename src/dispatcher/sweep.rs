@@ -180,6 +180,12 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
         None => (0, 0),
     };
 
+    // Forget sources that have stopped sending unparseable messages, flushing
+    // any count still standing behind their suppressed warning.  Keyed on a
+    // peer-chosen value, so without this the table would hold an entry per
+    // source that was ever noisy for the life of the process.
+    state.parse_error_log.prune(now);
+
     // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time
     // poll → one OPTIONS probe → deregister on no answer).  No-op unless
     // enabled and a P-CSCF IPsec role is configured.
