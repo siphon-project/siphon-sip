@@ -2684,7 +2684,12 @@ jobs:
     # Per-run `COMPOSE_PROJECT_NAME` would not fix this — `container_name:` is
     # absolute and ignores the project prefix, and there are 87 of them.
     concurrency:
-      group: sipp-ipsec-${{ github.repository }}
+      # Shared with nftables-firewall: both land on the same persistent runner,
+      # and this job compiles siphon inside Docker for ~17 min, so an
+      # overlapping host `cargo` build put the machine out of memory and the
+      # kernel killed rustc (`signal: 9`). One group covers the runner, not
+      # just this job.
+      group: ipsec-runner-${{ github.repository }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
@@ -2755,6 +2760,13 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: [self-hosted, linux, x64, ipsec]
     needs: rust-tests
+    # Same persistent runner as sipp-ipsec, so the same group. This job builds
+    # the crate on the host while that one builds it in a container; run at the
+    # same time they exhaust the machine's memory and whichever rustc loses is
+    # SIGKILLed, which reads as a test failure and is not one.
+    concurrency:
+      group: ipsec-runner-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
