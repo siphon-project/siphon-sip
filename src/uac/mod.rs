@@ -738,7 +738,7 @@ mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
 
         let sender = UacSender::new(
@@ -1096,7 +1096,7 @@ mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
 
         let sender = UacSender::new(
@@ -1139,7 +1139,7 @@ mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
 
         let sender = UacSender::new(
@@ -1369,7 +1369,7 @@ mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
         let mut listen_addrs = HashMap::new();
         listen_addrs.insert(Transport::Udp, "0.0.0.0:5060".parse().unwrap());
@@ -1431,7 +1431,7 @@ mod tests {
             tls: stream_tx.clone(),
             ws: stream_tx.clone(),
             wss: stream_tx.clone(),
-            sctp: stream_tx,
+            sctp: Some(stream_tx),
         });
         let bound: SocketAddr = "192.0.2.1:15060".parse().unwrap();
         let sender = UacSender::new(

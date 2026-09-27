@@ -267,6 +267,12 @@ fn default_gateway_ha1_algorithm() -> String {
 impl GatewayDestConfig {
     /// Return the effective transport string: explicit field, URI `;transport=`
     /// param, or `"udp"` as default.
+    ///
+    /// **Not normalised** — the explicit field comes back exactly as written, so
+    /// an error can quote what the operator typed. Parse it with
+    /// [`crate::config::parse_outbound_transport`], which lowercases and refuses
+    /// what siphon cannot dial; matching on this string directly is what let
+    /// `transport: TLS` become plaintext UDP.
     pub fn effective_transport(&self) -> String {
         if let Some(ref transport) = self.transport {
             return transport.clone();
@@ -278,6 +284,33 @@ impl GatewayDestConfig {
             return after[..end].to_string();
         }
         "udp".to_string()
+    }
+
+    /// Which config key carried [`effective_transport`](Self::effective_transport)'s
+    /// value, for an error to name — it can come from either.
+    pub fn transport_source(&self) -> &'static str {
+        if self.transport.is_some() {
+            "transport"
+        } else {
+            "uri (;transport= parameter)"
+        }
+    }
+
+    /// The transport siphon will dial this destination over, or the refusal to
+    /// report under `field`.
+    ///
+    /// The one place the gateway's transport string becomes a
+    /// [`Transport`](crate::transport::Transport):
+    /// [`Config::validate_gateway_transports`](crate::config::Config) refuses an
+    /// `Err` at load and the startup loop skips the destination, so nothing is
+    /// left that can match `"tcp"`/`"tls"` and send the rest over plaintext UDP.
+    pub fn outbound_transport(
+        &self,
+        field: &str,
+    ) -> std::result::Result<crate::transport::Transport, String> {
+        let token = self.effective_transport();
+        crate::config::parse_outbound_transport(&token)
+            .ok_or_else(|| crate::config::outbound_transport_error(field, &token))
     }
 }
 

@@ -384,6 +384,12 @@ registrar:
 #       interval: 1800                # optional — overrides default_interval
 #       contact: "sip:trunk1@1.2.3.4" # optional — auto-generated if omitted
 #       transport: "udp"              # "udp" (default), "tcp", "tls"
+#                                     # (case-insensitive). Anything else is
+#                                     # refused at load: a REGISTER leaves over
+#                                     # UDP or over a connection the outbound
+#                                     # pool opens, and the pool opens TCP and
+#                                     # TLS only — siphon dials no SCTP
+#                                     # association and no WebSocket.
 #
 #     - aor: "sip:trunk2@peer.net"
 #       registrar: "sip:peer.net:5060"
@@ -1622,7 +1628,15 @@ auth:
 #
 #         # Optional explicit overrides (normally derived from URI):
 #         # address: "10.0.0.1:5060"   # bypass DNS, send to this IP:port
-#         # transport: tls             # override URI transport param
+#         # transport: tls             # override URI transport param.
+#         #                            # "udp" (default), "tcp", "tls",
+#         #                            # case-insensitive.  Anything else is
+#         #                            # refused at load, here and in the URI
+#         #                            # parameter: a B-leg leaves over UDP or
+#         #                            # over a connection the outbound pool
+#         #                            # opens, and the pool opens TCP and TLS
+#         #                            # only — siphon dials no SCTP
+#         #                            # association and no WebSocket.
 #
 #     - name: "sbc-pool"
 #       algorithm: hash           # hash on call-id for sticky sessions

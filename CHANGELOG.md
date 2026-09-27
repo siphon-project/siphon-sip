@@ -146,6 +146,51 @@ entry, but a working config keeps working.
   re-REGISTER on the next 5 s tick. Nothing about the configured `interval`
   changed, and the 30 s idle timeout still applies to every other outbound
   connection (health probes, relays).
+- **BREAKING (config): a `registrant.entries[].transport` siphon cannot register
+  over is now refused at load.** Only `udp`, `tcp` and `tls` are accepted, and
+  now case-insensitively. `sctp`, `ws`, `wss` and typos used to parse and then
+  fall through to UDP, so a trunk configured for SCTP registered in the clear
+  over UDP and a mis-cased `"TLS"` did the same — quietly, and looking like it
+  worked. The refusal names the entry, the token and what to use instead; for
+- **BREAKING (config): a transport siphon cannot dial outbound is now refused at
+  load, wherever it is named.** Only `udp`, `tcp` and `tls` are accepted, and now
+  case-insensitively, on `registrant.entries[].transport`, on
+  `gateway.groups[].destinations[].transport` and on the `;transport=` parameter
+  of a gateway destination URI. Every one of those used to parse and then fall
+  through to UDP: a trunk configured for SCTP registered over UDP, a gateway
+  destination written `transport: TLS` matched neither `"tcp"` nor `"tls"` and
+  carried a carrier's traffic — credentials included — in the clear, and a typo
+  did the same. The refusal names the group, the entry or destination, the token,
+  and which key carried it (the `transport` field or the URI parameter); for
+  `sctp` it names the real reason (siphon opens no outbound SCTP association: its
+  SCTP transport writes only to associations it *accepted*, and the outbound
+  connection pool has no SCTP path), and adds that the binary has no SCTP
+  transport at all when built without the `sctp` feature. A configured
+  `listen.sctp` does not change this — there is still no outbound SCTP path — so
+  neither an SCTP registrant nor an SCTP gateway destination is supported either
+  way. `registration.add(transport=)` and `gateway.add_group()` raise
+  `ValueError` for the same set, and the database/HTTP gateway source rejects the
+  row rather than downgrading it. One shared parser
+  (`config::parse_outbound_transport`) now backs all of them, so the
+  case-insensitivity and the refusal cannot drift apart again. **A config with
+  any of these loaded before and is refused now** — it was not doing what it
+  said, and the fix is to name the transport actually in use.
+
+- **An outbound message routed at a transport this node does not serve is now
+  refused out loud instead of discarded.** The outbound router held an SCTP
+  sender whether or not an SCTP listener existed, and the listener loop is that
+  channel's only consumer — so on a node without one, every `Transport::Sctp`
+  send (a script `next_hop` carrying `;transport=sctp`, a NOTIFY to a stored
+  binding or subscription target that named it) went into an unbounded queue
+  nothing ever drained: never on the wire, nothing logged, and the queue grew for
+  the life of the process. The channel is now created only when a listener will
+  read it; without one the router logs the refused destination at `ERROR`, counts
+  it on the new `siphon_outbound_unserved_total{transport}` (also in
+  `/admin/metrics.json` under `counters.outbound_unserved`), and hands the
+  un-sent message back to the caller. Any non-zero value on that counter is a
+  configuration error. A listener-independent outbound SCTP path is still not
+  implemented.
+
 - **A CANCEL for a call driven over the control plane was answered `481
   Call/Transaction Does Not Exist` and cancelled nothing.** The B2BUA route in
   `handle_cancel` was reached only when the *script* had registered a B2BUA

@@ -3062,7 +3062,7 @@ fn soft_ue_router() -> (
         tls: dummy.clone(),
         ws: dummy.clone(),
         wss: dummy.clone(),
-        sctp: dummy,
+        sctp: Some(dummy),
     };
     (router, plain.1, protected_client.1, protected_server.1)
 }

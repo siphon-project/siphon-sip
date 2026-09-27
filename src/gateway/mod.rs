@@ -1715,7 +1715,7 @@ pub(crate) mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
 
         let uac_sender = Arc::new(UacSender::new(
@@ -1768,7 +1768,7 @@ pub(crate) mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
 
         TestUac {

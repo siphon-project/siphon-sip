@@ -6,6 +6,8 @@
 one of the resolved addresses of the named gateway group — siphon's equivalent
 of Kamailio ``ds_is_from_list()`` / OpenSIPS ``ds_is_in_list()``.
 """
+import pytest
+
 from siphon_sdk import mock_module
 
 mock_module.install()
@@ -147,3 +149,35 @@ def test_call_source_ip_in_matches_v4_and_v6():
 def test_call_source_ip_in_false_for_unparseable_source():
     call = Call(source_ip="not-an-ip")
     assert call.source_ip_in(["203.0.113.0/24"]) is False
+
+
+# --- add_group(destinations=[{"transport": ...}]) ---
+#
+# Lives here because this file is where the gateway mock is driven. siphon dials a
+# destination over UDP or over a connection the outbound pool opens, and the pool
+# opens TCP and TLS only, so anything else is refused instead of being quietly
+# downgraded — the Rust binding used to fall through to UDP and dial a `TLS`
+# destination in the clear.
+
+
+def test_add_group_refuses_a_destination_transport_siphon_cannot_dial():
+    for transport in ["sctp", "SCTP", "ws", "wss", "tpc"]:
+        with pytest.raises(ValueError, match="can dial"):
+            gateway.add_group(
+                "carriers",
+                [{"uri": "sip:gw1.carrier.example:5060",
+                  "address": "203.0.113.10:5060",
+                  "transport": transport}],
+            )
+        assert gateway.groups() == []
+
+
+def test_add_group_accepts_the_dialable_destination_transports():
+    for transport in [None, "udp", "tcp", "tls", "TLS"]:
+        mock_module.reset()
+        destination = {"uri": "sip:gw1.carrier.example:5060",
+                       "address": "203.0.113.10:5060"}
+        if transport is not None:
+            destination["transport"] = transport
+        gateway.add_group("carriers", [destination])
+        assert gateway.groups() == ["carriers"]

@@ -243,3 +243,19 @@ fn default_registrant_max_retry() -> u64 {
 fn default_registrant_transport() -> String {
     "udp".to_string()
 }
+
+impl RegistrantEntryConfig {
+    /// The transport this trunk's REGISTER will leave over, or the refusal to
+    /// report under `field`.
+    ///
+    /// The one place the entry's transport string becomes a
+    /// [`Transport`](crate::transport::Transport), so nothing is left that can
+    /// match `"tcp"`/`"tls"` and register the rest over UDP.
+    pub fn outbound_transport(
+        &self,
+        field: &str,
+    ) -> std::result::Result<crate::transport::Transport, String> {
+        crate::config::parse_outbound_transport(&self.transport)
+            .ok_or_else(|| crate::config::outbound_transport_error(field, &self.transport))
+    }
+}

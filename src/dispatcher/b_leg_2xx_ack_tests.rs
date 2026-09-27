@@ -669,7 +669,7 @@ impl Call {
             tls: to_stream.clone(),
             ws: to_stream.clone(),
             wss: to_stream.clone(),
-            sctp: to_stream,
+            sctp: Some(to_stream),
         });
         let call = Call::bridged_on(TestDispatcher { state, udp: others }, false);
         if let Some(mut actor) = call.state.call_actors.get_call_mut(&call.call_id) {
@@ -807,7 +807,7 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
             tls: sender.clone(),
             ws: sender.clone(),
             wss: sender.clone(),
-            sctp: sender,
+            sctp: Some(sender),
         });
         let (state, _, call_id) = Call::caller_on(dispatcher);
         let flow = crate::script::api::registrar::PyFlow {

@@ -1270,15 +1270,14 @@ impl SiphonServer {
         let (tls_outbound_tx, tls_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (ws_outbound_tx, ws_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (wss_outbound_tx, wss_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
-        // The `sctp` sender always exists on the OutboundRouter so the
-        // `Transport::Sctp` routing arm stays infallible; the receiver is only
-        // consumed by the SCTP listener loop, which is compiled in under the
-        // `sctp` feature. Without it the receiver is intentionally unused.
+        // The SCTP egress channel exists only when the listener loop below will
+        // read it; see `transport::sctp_egress_channel` for why. Without the
+        // feature there is no loop at all, so there is no receiver to keep.
         #[cfg(feature = "sctp")]
-        let (sctp_outbound_tx, sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
+        let (sctp_outbound_tx, sctp_outbound_rx) =
+            transport::sctp_egress_channel(!config.listen.sctp.is_empty());
         #[cfg(not(feature = "sctp"))]
-        let (sctp_outbound_tx, _sctp_outbound_rx) =
-            flume::unbounded::<transport::OutboundMessage>();
+        let (sctp_outbound_tx, _) = transport::sctp_egress_channel(!config.listen.sctp.is_empty());
 
         // UDP listeners get a dedicated set of outbound channels each, one per
         // worker — per listener because IPsec sec-agree on the P-CSCF role
@@ -1964,8 +1963,10 @@ impl SiphonServer {
         }
 
         // SCTP — compiled in only under the `sctp` feature (links libsctp).
+        // `sctp_outbound_rx` is `Some` exactly when `listen.sctp` is non-empty,
+        // so the loop and the egress channel are wired or absent together.
         #[cfg(feature = "sctp")]
-        {
+        if let Some(sctp_outbound_rx) = sctp_outbound_rx.as_ref() {
             let sctp_connection_map = Arc::new(dashmap::DashMap::new());
             for entry in &config.listen.sctp {
                 let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {

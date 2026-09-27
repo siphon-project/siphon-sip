@@ -96,6 +96,65 @@ pub use stir::{StirConfig, StirSigningConfig, StirVerificationConfig};
 pub use tls::{SniCertificate, TlsMethod, TlsServerConfig};
 
 // ---------------------------------------------------------------------------
+// Outbound transport parsing — shared by every surface that names one
+// ---------------------------------------------------------------------------
+
+/// The transports siphon can *originate* a request over, parsed
+/// case-insensitively. `None` for anything else.
+///
+/// A request siphon sends of its own accord — an outbound REGISTER, a B-leg to a
+/// gateway destination — leaves over UDP, or over a connection the outbound pool
+/// opens for it, and the pool opens TCP and TLS only. siphon dials no SCTP
+/// association (its SCTP transport writes only to associations it *accepted*)
+/// and no WebSocket (those are client-initiated), so a destination naming either
+/// could never reach the wire.
+///
+/// One function because every caller used to keep its own copy that fell through
+/// to UDP on no match, and two of those copies did not lowercase either: a
+/// registrant `transport: sctp` registered over UDP instead, and a gateway
+/// destination written `transport: TLS` sent a carrier's traffic in the clear.
+/// Callers pass the configured string straight in — normalising is this
+/// function's job, not theirs.
+///
+/// This is not for a *relay* target's `;transport=` hint: that names the hop a
+/// peer asked for on a request siphon is forwarding, and the dispatcher resolves
+/// it per RFC 3263 rather than from config.
+pub fn parse_outbound_transport(token: &str) -> Option<crate::transport::Transport> {
+    match token.to_ascii_lowercase().as_str() {
+        "udp" => Some(crate::transport::Transport::Udp),
+        "tcp" => Some(crate::transport::Transport::Tcp),
+        "tls" => Some(crate::transport::Transport::Tls),
+        _ => None,
+    }
+}
+
+/// The refusal for a `token` that [`parse_outbound_transport`] rejected,
+/// prefixed with the `field` (or API name) that carried it.
+///
+/// `sctp` gets its own wording: it is a transport siphon really does speak, just
+/// never outbound, and an operator told "unknown" would go looking for a typo.
+pub fn outbound_transport_error(field: &str, token: &str) -> String {
+    if token.eq_ignore_ascii_case("sctp") {
+        let mut message = format!(
+            "{field}: siphon opens no outbound SCTP association — its SCTP transport writes only \
+             to associations it accepted, and the outbound connection pool has no SCTP path — so \
+             nothing siphon sent there could reach the wire. Use udp, tcp or tls."
+        );
+        if !cfg!(feature = "sctp") {
+            message.push_str(
+                " This binary was also built without the `sctp` feature, so it has no SCTP \
+                 transport at all.",
+            );
+        }
+        return message;
+    }
+    format!(
+        "{field}: unknown transport {token:?} — use udp, tcp or tls. An unrecognised value used \
+         to fall through to udp instead of being refused, so traffic left on a transport the \
+         config never named."
+    )
+}
+// ---------------------------------------------------------------------------
 // Environment variable expansion — `${VAR}` and `${VAR:-default}`
 // ---------------------------------------------------------------------------
 
@@ -424,7 +483,9 @@ impl Config {
         config.validate_control_apps()?;
         config.validate_control_inbound()?;
         config.validate_registrant_source()?;
+        config.validate_registrant_transports()?;
         config.validate_gateway_source()?;
+        config.validate_gateway_transports()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
@@ -817,6 +878,61 @@ impl Config {
                  Query: {:?}",
                 database.query
             )));
+        }
+        Ok(())
+    }
+
+    /// Reject a `registrant.entries[].transport` siphon cannot register over.
+    ///
+    /// Refused at load because the alternative is worse than a dead trunk: the
+    /// startup path matched `"tcp"`/`"tls"` and sent everything else over UDP,
+    /// so a config asking for SCTP registered over UDP instead — quietly, and
+    /// looking like it worked. A typo and a mis-cased `"TLS"` took the same
+    /// path. See [`parse_outbound_transport`] for which transports siphon can
+    /// actually originate over, and why.
+    fn validate_registrant_transports(&self) -> Result<()> {
+        let Some(registrant) = &self.registrant else {
+            return Ok(());
+        };
+        for entry in &registrant.entries {
+            let field = format!("registrant.entries[{}].transport", entry.aor);
+            entry
+                .outbound_transport(&field)
+                .map_err(SiphonError::Config)?;
+        }
+        Ok(())
+    }
+
+    /// Reject a `gateway.groups[].destinations[].transport` siphon cannot dial.
+    ///
+    /// Same defect, same consequence, one step further out: the startup loop
+    /// matched `"tcp"`/`"tls"` and sent everything else over UDP, and
+    /// `GatewayDestConfig::effective_transport` hands back the explicit field
+    /// *verbatim* — so a destination written `transport: TLS` carried a carrier's
+    /// traffic, credentials included, in the clear over UDP, and `sctp` / `ws` /
+    /// a typo did the same. Separate from
+    /// [`validate_gateway_source`](Self::validate_gateway_source) for the same
+    /// reason the registrant pair is split: the source and the destinations fail
+    /// independently.
+    ///
+    /// The token can come from the `transport:` field or from the destination
+    /// URI's `;transport=` parameter, so the message names which.
+    fn validate_gateway_transports(&self) -> Result<()> {
+        let Some(gateway) = &self.gateway else {
+            return Ok(());
+        };
+        for group in &gateway.groups {
+            for destination in &group.destinations {
+                let field = format!(
+                    "gateway.groups[{}].destinations[{}].{}",
+                    group.name,
+                    destination.uri,
+                    destination.transport_source()
+                );
+                destination
+                    .outbound_transport(&field)
+                    .map_err(SiphonError::Config)?;
+            }
         }
         Ok(())
     }

@@ -424,11 +424,15 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                     continue;
                 }
             };
-            // Derive transport from config field, or from URI ;transport= param
-            let transport_type = match dest_config.effective_transport().as_str() {
-                "tcp" => transport::Transport::Tcp,
-                "tls" => transport::Transport::Tls,
-                _ => transport::Transport::Udp,
+            // Config field, else the URI's ;transport= param. Refused at load
+            // by `Config::validate_gateway_transports`; skipped loudly here
+            // rather than defaulting to plaintext UDP.
+            let transport_type = match dest_config.outbound_transport("gateway destination") {
+                Ok(transport) => transport,
+                Err(reason) => {
+                    error!(uri = %dest_config.uri, "{reason}");
+                    continue;
+                }
             };
             // Store original hostname string for DNS re-resolution on failure
             let is_hostname = address_str.parse::<std::net::SocketAddr>().is_err();
@@ -857,10 +861,15 @@ pub(super) fn init_registrant(
             .or_else(|| entry_config.registrar.strip_prefix("sips:"))
             .unwrap_or(&entry_config.registrar);
 
-        let transport_type = match entry_config.transport.as_str() {
-            "tcp" => transport::Transport::Tcp,
-            "tls" => transport::Transport::Tls,
-            _ => transport::Transport::Udp,
+        // Refused at load by `Config::validate_registrant_transports`; skipped
+        // loudly here rather than defaulting to UDP, which is how an `sctp` or
+        // mis-cased trunk registered on a transport nobody named.
+        let transport_type = match entry_config.outbound_transport("registrant transport") {
+            Ok(transport) => transport,
+            Err(reason) => {
+                error!(aor = %entry_config.aor, "{reason}");
+                continue;
+            }
         };
 
         let default_port: u16 = if transport_type == transport::Transport::Tls {
