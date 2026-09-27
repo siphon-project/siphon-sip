@@ -1905,6 +1905,11 @@
         "kind": "method_descriptor",
         "sig": "($self, prefix)"
       },
+      "remove_ruri_param": {
+        "doc": "Remove a Request-URI parameter by name (case-insensitive). Returns",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
       "reply": {
         "doc": "Send a response with the given status code and reason phrase.",
         "kind": "method_descriptor",
@@ -1920,7 +1925,7 @@
         "kind": "getset_descriptor"
       },
       "ruri": {
-        "doc": "Request-URI as a PySipUri.",
+        "doc": "Request-URI as a SipUri. Assigning to its `user`, `host` or `port`",
         "kind": "getset_descriptor"
       },
       "set_body": {
@@ -1983,8 +1988,13 @@
         "kind": "method_descriptor",
         "sig": "($self, value)"
       },
+      "set_ruri_param": {
+        "doc": "Add or replace one Request-URI parameter (after the host and port),",
+        "kind": "method_descriptor",
+        "sig": "($self, name, value=None)"
+      },
       "set_ruri_user": {
-        "doc": "Set the user part of the Request-URI.",
+        "doc": "Set the user part of the Request-URI, keeping everything else.",
         "kind": "method_descriptor",
         "sig": "($self, value)"
       },
@@ -2494,6 +2504,7 @@
     },
     "SipUri": {
       "host": {
+        "doc": "Assigning on `request.ruri` rewrites the Request-URI; same rules as",
         "kind": "getset_descriptor"
       },
       "is_local": {
@@ -2515,6 +2526,7 @@
         "kind": "getset_descriptor"
       },
       "user": {
+        "doc": "Assigning on `request.ruri` rewrites the Request-URI; same rules as",
         "kind": "getset_descriptor"
       }
     },

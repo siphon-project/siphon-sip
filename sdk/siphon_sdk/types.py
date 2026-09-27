@@ -12,12 +12,146 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+_TOKEN_EXTRA = set("-.!%*_+`'~")
+_PARAMCHAR_EXTRA = set("-_.!~*'()%[]/:&+$")
+_USER_FORBIDDEN = set("@:?<>\"")
+
+
+def _check_user(value: str) -> None:
+    """Refuse a user part that would change the URI's structure (runtime rule)."""
+    if value == "":
+        raise ValueError("empty URI user: pass None to remove the user part")
+    if ";" in value:
+        raise ValueError(
+            f"invalid URI user {value!r}: user parameters (e.g. RFC 4694 npdi/rn) "
+            "go in a full URI via set_ruri()"
+        )
+    for c in value:
+        if c in _USER_FORBIDDEN or c.isspace() or not c.isprintable():
+            raise ValueError(f"invalid URI user {value!r}: {c!r} is not allowed")
+
+
+def _check_host(value: str) -> str:
+    """A bare host (domain, IPv4, IPv6 with optional brackets), normalised."""
+    import ipaddress
+
+    if "[" not in value and ":" not in value:
+        if value and all(c.isascii() and (c.isalnum() or c in "-.") for c in value):
+            return value
+        raise ValueError(
+            f"invalid URI host {value!r}: expected a domain, IPv4 or IPv6 address "
+            "with no scheme, user or port (use set_ruri() to change the port)"
+        )
+    inner = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+    try:
+        ipaddress.IPv6Address(inner)
+    except ValueError:
+        raise ValueError(f"invalid URI host {value!r}: not an IPv6 address") from None
+    return f"[{inner}]"
+
+
+def _check_param(name: str, value: Optional[str]) -> None:
+    """URI parameter: RFC 3261 ``token`` name, ``paramchar`` value."""
+    if not name or not all(c.isascii() and (c.isalnum() or c in _TOKEN_EXTRA) for c in name):
+        raise ValueError(f"invalid URI parameter name {name!r}")
+    if value is not None and (
+        not value or not all(c.isascii() and (c.isalnum() or c in _PARAMCHAR_EXTRA) for c in value)
+    ):
+        raise ValueError(f"invalid value {value!r} for URI parameter {name!r}")
+
+
+def _split_params(text: str) -> list:
+    params = []
+    for piece in text.split(";"):
+        if not piece:
+            continue
+        name, sep, value = piece.partition("=")
+        params.append((name, value if sep else None))
+    return params
+
+
+def _join_params(params) -> str:
+    return "".join(f";{n}" if v is None else f";{n}={v}" for n, v in params)
+
+
+def parse_uri(value: str, strict: bool = False) -> "SipUri":
+    """Parse a URI string the way the runtime does.
+
+    ``strict=True`` is the ``request.set_ruri()`` rule: the whole string must
+    be one URI and every part must pass the runtime's checks, else
+    ``ValueError``.  The lenient form reads what a header held.
+    """
+    text = str(value)
+    if strict and (text != text.strip() or any(c.isspace() for c in text) or ">" in text):
+        raise ValueError(f"invalid SIP URI {text!r}")
+    scheme_end = text.find(":")
+    scheme = text[:scheme_end].lower() if scheme_end > 0 else ""
+    if scheme not in ("sip", "sips", "tel"):
+        if scheme_end > 0 and text[0].isalpha():
+            # absoluteURI (e.g. urn:service:sos): opaque, kept verbatim.
+            return SipUri(scheme=text[:scheme_end], host=text[scheme_end + 1:])
+        if strict:
+            raise ValueError(f"invalid SIP URI {text!r}")
+        scheme, rest = "sip", text
+    else:
+        rest = text[scheme_end + 1:]
+
+    if scheme == "tel":
+        number, _, param_text = rest.partition(";")
+        params = _split_params(param_text)
+        uri = SipUri(scheme="tel", user=number, host="", _params=params)
+        uri._sync_tel_host()
+        return uri
+
+    rest, _, headers = rest.partition("?")
+    user, user_params = None, []
+    if "@" in rest:
+        userinfo, rest = rest.rsplit("@", 1)
+        user, _, user_param_text = userinfo.partition(";")
+        user_params = _split_params(user_param_text)
+    if rest.startswith("["):
+        close = rest.find("]")
+        hostport, param_text = rest[: close + 1], rest[close + 1:]
+        host, port_text = hostport, ""
+        if param_text.startswith(":"):
+            port_text, _, param_text = param_text[1:].partition(";")
+            param_text = ";" + param_text if param_text else ""
+    else:
+        hostport, _, param_text = rest.partition(";")
+        param_text = ";" + param_text if param_text else ""
+        host, _, port_text = hostport.partition(":")
+    port = None
+    if port_text:
+        if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+            if strict:
+                raise ValueError(f"invalid SIP URI {text!r}: bad port {port_text!r}")
+            host, port_text = hostport, ""
+        else:
+            port = int(port_text)
+    params = _split_params(param_text)
+    if strict:
+        if user is not None:
+            _check_user(user)
+        host = _check_host(host)
+        for name, val in params + user_params:
+            _check_param(name, val)
+    uri = SipUri(scheme=scheme, user=user, host=host, port=port, _params=params)
+    uri._user_params = user_params
+    uri._headers = headers
+    return uri
+
+
 @dataclass
 class SipUri:
     """A parsed SIP or SIPS URI (e.g. ``sip:alice@example.com:5060``).
 
     At runtime this is backed by the Rust ``PySipUri`` class.  The mock
     version is a plain dataclass with the same properties.
+
+    Assigning ``user``, ``host`` or ``port`` is checked with the same rules
+    as ``request.set_ruri_user()`` / ``set_ruri_host()`` and raises
+    ``ValueError`` on a bad value.  On ``request.ruri`` the assignment
+    rewrites the request.
 
     Examples::
 
@@ -43,6 +177,38 @@ class SipUri:
     # Set by the engine based on the ``domain:`` config list.
     _is_local: bool = False
 
+    # URI parameters after the host, in order: [(name, value | None)].
+    _params: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_user_params", [])
+        object.__setattr__(self, "_headers", "")
+        object.__setattr__(self, "_checked", True)
+
+    def __setattr__(self, name: str, value) -> None:
+        if getattr(self, "_checked", False) and self.scheme in ("sip", "sips"):
+            if name == "user":
+                if value is None:
+                    object.__setattr__(self, "_user_params", [])
+                else:
+                    _check_user(value)
+            elif name == "host":
+                value = _check_host(value)
+            elif name == "port" and value is not None and not 0 < int(value) < 65536:
+                raise ValueError(f"URI port {value!r} is not a port")
+        object.__setattr__(self, name, value)
+
+    @property
+    def params(self) -> dict:
+        """URI parameters as a dict (after the host).  Flag parameters such as
+        ``;lr`` appear with an empty-string value.
+
+        Example::
+
+            request.ruri.params.get("user")   # "phone" for ...;user=phone
+        """
+        return {name: (value or "") for name, value in self._params}
+
     @property
     def is_local(self) -> bool:
         """``True`` if the host matches one of the locally configured domains.
@@ -57,13 +223,31 @@ class SipUri:
         """``True`` if the scheme is ``tel:``."""
         return self.scheme == "tel"
 
+    def _sync_tel_host(self) -> None:
+        if self.scheme == "tel":
+            object.__setattr__(
+                self, "host", next((v or "" for n, v in self._params if n == "phone-context"), "")
+            )
+
+    def _assign(self, other: "SipUri") -> None:
+        """Take every part of ``other`` in place, so references stay live."""
+        for name in ("scheme", "user", "host", "port", "_params", "_user_params", "_headers"):
+            object.__setattr__(self, name, getattr(other, name))
+
     def __str__(self) -> str:
+        if self.scheme not in ("sip", "sips", "tel"):
+            return f"{self.scheme}:{self.host}"
         uri = f"{self.scheme}:"
+        if self.scheme == "tel":
+            return uri + (self.user or "") + _join_params(self._params)
         if self.user is not None:
-            uri += f"{self.user}@"
+            uri += self.user + _join_params(self._user_params) + "@"
         uri += self.host
         if self.port is not None:
             uri += f":{self.port}"
+        uri += _join_params(self._params)
+        if self._headers:
+            uri += f"?{self._headers}"
         return uri
 
     def __repr__(self) -> str:

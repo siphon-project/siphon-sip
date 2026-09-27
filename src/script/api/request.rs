@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 use ipnet::IpNet;
 use pyo3::prelude::*;
 
-use super::sip_uri::PySipUri;
+use super::sip_uri::{self, PySipUri};
 use crate::sip::headers::cseq::CSeq;
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::headers::route::RouteEntry;
 use crate::sip::headers::via::Via;
 use crate::sip::message::{SipMessage, StartLine};
-use crate::sip::parser::parse_uri_standalone;
+use crate::sip::parser::{parse_uri_complete, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
 
 /// Shared list of local domains from config.
@@ -751,17 +751,20 @@ impl PyRequest {
         }
     }
 
-    /// Request-URI as a PySipUri.
+    /// Request-URI as a SipUri. Assigning to its `user`, `host` or `port`
+    /// rewrites the request, through the same checks as `set_ruri()`.
     #[getter]
     fn ruri(&self) -> PyResult<PySipUri> {
         let message = self.lock()?;
         match &message.start_line {
             StartLine::Request(request_line) => {
                 let uri = request_line.request_uri.clone();
-                match &self.local_domains {
-                    Some(domains) => Ok(PySipUri::with_local_domains(uri, Arc::clone(domains))),
-                    None => Ok(PySipUri::new(uri)),
-                }
+                let py_uri = match &self.local_domains {
+                    Some(domains) => PySipUri::with_local_domains(uri, Arc::clone(domains)),
+                    None => PySipUri::new(uri),
+                };
+                // Assigning `request.ruri.user = ...` rewrites this request.
+                Ok(py_uri.bound_to_request(Arc::clone(&self.message)))
             }
             _ => Err(pyo3::exceptions::PyRuntimeError::new_err("not a request")),
         }
@@ -790,28 +793,18 @@ impl PyRequest {
     /// Raises `ValueError` if the string does not parse, leaving the R-URI
     /// unchanged.
     fn set_ruri(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Try extracting as PySipUri first
-        if let Ok(py_uri) = value.cast::<PySipUri>() {
-            let mut message = self.lock_mut()?;
-            if let StartLine::Request(ref mut request_line) = message.start_line {
-                request_line.request_uri = py_uri.borrow().inner().clone();
-            }
-            return Ok(());
-        }
-        // Fall back to string parsing
-        let uri_string: String = value
-            .extract()
-            .or_else(|_| value.str().map(|s| s.to_string()))
-            .map_err(|_| {
+        let candidate = if let Ok(py_uri) = value.cast::<PySipUri>() {
+            py_uri.borrow().inner().clone()
+        } else {
+            let text: String = value.extract().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err("ruri must be a string or SipUri object")
             })?;
-        let parsed = parse_uri_standalone(&uri_string).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
-        })?;
-        let mut message = self.lock_mut()?;
-        if let StartLine::Request(ref mut request_line) = message.start_line {
-            request_line.request_uri = parsed;
-        }
+            parse_uri_complete(&text).map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
+            })?
+        };
+        sip_uri::check_components(&candidate)?;
+        sip_uri::commit_request_uri(&self.message, candidate)?;
         Ok(())
     }
 
@@ -1494,12 +1487,19 @@ impl PyRequest {
     // R-URI mutation
     // -----------------------------------------------------------------------
 
-    /// Set the user part of the Request-URI.
+    /// Set the user part of the Request-URI, keeping everything else.
+    ///
+    /// Just the user (`"+15551234567"`, `"*21#"`), or `None` to drop the user
+    /// part along with any user parameters. Raises `ValueError` on a value
+    /// holding `@`, `:`, `;` or whitespace; a user with parameters (RFC 4694
+    /// `npdi` / `rn`) is written as a whole URI with `set_ruri()`.
     fn set_ruri_user(&self, value: Option<String>) -> PyResult<()> {
-        let mut message = self.lock_mut()?;
-        if let StartLine::Request(ref mut request_line) = message.start_line {
-            request_line.request_uri.user = value;
+        if let Some(user) = &value {
+            sip_uri::check_user(user)?;
         }
+        let mut candidate = sip_uri::current_request_uri(&self.message)?;
+        sip_uri::set_user_part(&mut candidate, value);
+        sip_uri::commit_request_uri(&self.message, candidate)?;
         Ok(())
     }
 
@@ -1508,13 +1508,68 @@ impl PyRequest {
     /// `"host:5080"`, which would otherwise go out as the IPv6-bracketed
     /// `[host:5080]`. Use `set_ruri()` to change the port.
     fn set_ruri_host(&self, value: &str) -> PyResult<()> {
-        validate_ruri_host(value)?;
-        let mut message = self.lock_mut()?;
-        if let StartLine::Request(ref mut request_line) = message.start_line {
-            // Same shape the parser stores: an IPv6 literal keeps its brackets.
-            request_line.request_uri.host = format_sip_host(value);
-        }
+        let host = sip_uri::check_host(value)?;
+        let mut candidate = sip_uri::current_request_uri(&self.message)?;
+        candidate.host = host;
+        sip_uri::commit_request_uri(&self.message, candidate)?;
         Ok(())
+    }
+
+    /// Add or replace one Request-URI parameter (after the host and port),
+    /// leaving the others alone. `value=None` writes a flag parameter (`;lr`).
+    /// Names match case-insensitively (RFC 3261 §19.1.4).
+    ///
+    /// ```python
+    /// request.set_ruri_param("user", "phone")     # ;user=phone
+    /// request.set_ruri_param("transport", "tcp")  # ;transport=tcp
+    /// request.set_ruri_param("lr")                # ;lr
+    /// ```
+    ///
+    /// Raises `ValueError` on a name that is not a token or a value outside
+    /// RFC 3261 `paramchar`. User parameters before the `@` (RFC 4694 `npdi` /
+    /// `rn`) are not URI parameters; write those with `set_ruri()`.
+    #[pyo3(signature = (name, value=None))]
+    fn set_ruri_param(&self, name: &str, value: Option<String>) -> PyResult<()> {
+        sip_uri::check_param(name, value.as_deref())?;
+        let mut candidate = sip_uri::current_request_uri(&self.message)?;
+        let mut replaced = false;
+        candidate.params.retain_mut(|(existing, existing_value)| {
+            if !existing.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            if replaced {
+                return false;
+            }
+            replaced = true;
+            *existing_value = value.clone();
+            true
+        });
+        if !replaced {
+            candidate.params.push((name.to_string(), value));
+        }
+        sip_uri::sync_tel_host(&mut candidate);
+        sip_uri::commit_request_uri(&self.message, candidate)?;
+        Ok(())
+    }
+
+    /// Remove a Request-URI parameter by name (case-insensitive). Returns
+    /// `True` if it was present.
+    ///
+    /// ```python
+    /// request.remove_ruri_param("transport")
+    /// ```
+    fn remove_ruri_param(&self, name: &str) -> PyResult<bool> {
+        let mut candidate = sip_uri::current_request_uri(&self.message)?;
+        let before = candidate.params.len();
+        candidate
+            .params
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        if candidate.params.len() == before {
+            return Ok(false);
+        }
+        sip_uri::sync_tel_host(&mut candidate);
+        sip_uri::commit_request_uri(&self.message, candidate)?;
+        Ok(true)
     }
 
     /// Rewrite dialable identity userparts into a target E.164 shape.
@@ -2032,33 +2087,6 @@ fn parse_nameaddr_tag(raw: Option<&String>) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// A bare R-URI host: RFC 3261 §25.1 `host` (hostname / IPv4 / IPv6
-/// reference), with the brackets optional on an IPv6 address.
-fn validate_ruri_host(value: &str) -> PyResult<()> {
-    let invalid = || {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid R-URI host {value:?}: expected a domain, IPv4 or IPv6 address \
-             with no scheme, user or port (use set_ruri() to change the port)"
-        ))
-    };
-    let unbracketed = crate::sip::uri::strip_ipv6_brackets(value);
-    if unbracketed.contains(':') {
-        return match unbracketed.parse::<std::net::Ipv6Addr>() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(invalid()),
-        };
-    }
-    if unbracketed.len() != value.len() {
-        // Brackets around something that is not an IPv6 address.
-        return Err(invalid());
-    }
-    let hostname_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
-    if value.is_empty() || !value.chars().all(hostname_char) {
-        return Err(invalid());
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -3872,6 +3900,172 @@ mod tests {
             );
         }
         assert_eq!(request_line_uri(&request), before);
+    }
+
+    /// Run `code` with `request` bound, against a fresh INVITE to
+    /// sip:bob@biloxi.com, and return the R-URI as it would go on the wire.
+    fn ruri_after(code: &str) -> PyResult<String> {
+        Python::initialize();
+        Python::attach(|py| {
+            let object = Py::new(py, make_request()).expect("PyRequest into Python");
+            let locals = pyo3::types::PyDict::new(py);
+            locals.set_item("request", object.bind(py))?;
+            py.run(&std::ffi::CString::new(code).unwrap(), None, Some(&locals))?;
+            let wire = request_line_uri(&object.borrow(py));
+            Ok(wire)
+        })
+    }
+
+    #[test]
+    fn set_ruri_param_adds_replaces_and_writes_flags() {
+        assert_eq!(
+            ruri_after("request.set_ruri_param('user', 'phone')").unwrap(),
+            "sip:bob@biloxi.com;user=phone"
+        );
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('sip:bob@biloxi.com;transport=udp;lr')\n",
+                "request.set_ruri_param('Transport', 'tcp')\n",
+                "request.set_ruri_param('ob')\n",
+            ))
+            .unwrap(),
+            "sip:bob@biloxi.com;transport=tcp;lr;ob",
+            "replaced in place, case-insensitively, and a flag appended",
+        );
+    }
+
+    #[test]
+    fn set_ruri_param_collapses_a_duplicated_name() {
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('sip:bob@biloxi.com;x=1;y;X=2')\n",
+                "request.set_ruri_param('x', '3')\n",
+            ))
+            .unwrap(),
+            "sip:bob@biloxi.com;x=3;y"
+        );
+    }
+
+    #[test]
+    fn set_ruri_param_refuses_what_is_not_a_parameter() {
+        for code in [
+            "request.set_ruri_param('user', 'a;b')",
+            "request.set_ruri_param('user', '')",
+            "request.set_ruri_param('a b', 'x')",
+            "request.set_ruri_param('', None)",
+        ] {
+            let error = ruri_after(code).expect_err(code);
+            Python::attach(|py| {
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                    "{code}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn remove_ruri_param_reports_whether_it_removed() {
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('sip:bob@biloxi.com;transport=tcp;lr')\n",
+                "assert request.remove_ruri_param('TRANSPORT') is True\n",
+                "assert request.remove_ruri_param('maddr') is False\n",
+            ))
+            .unwrap(),
+            "sip:bob@biloxi.com;lr"
+        );
+    }
+
+    #[test]
+    fn tel_phone_context_param_stays_consistent() {
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('tel:1234;phone-context=example.com')\n",
+                "request.set_ruri_param('phone-context', 'example.net')\n",
+                "assert request.ruri.host == 'example.net'\n",
+            ))
+            .unwrap(),
+            "tel:1234;phone-context=example.net"
+        );
+    }
+
+    #[test]
+    fn assigning_on_request_ruri_writes_the_request() {
+        // It used to change a copy, so the relay went out unchanged and the
+        // script got no error.
+        assert_eq!(
+            ruri_after(concat!(
+                "request.ruri.user = '+15551234567'\n",
+                "request.ruri.host = 'gw1.example.net'\n",
+                "request.ruri.port = 5080\n",
+            ))
+            .unwrap(),
+            "sip:+15551234567@gw1.example.net:5080"
+        );
+    }
+
+    #[test]
+    fn assigning_on_request_ruri_is_checked_like_set_ruri() {
+        let error = ruri_after("request.ruri.host = 'gw1.example.net:5080'").unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py)));
+    }
+
+    #[test]
+    fn a_ruri_copy_can_be_edited_and_set_back() {
+        assert_eq!(
+            ruri_after(concat!(
+                "uri = request.ruri\n",
+                "uri.user = 'carol'\n",
+                "request.set_ruri(uri)\n",
+            ))
+            .unwrap(),
+            "sip:carol@biloxi.com"
+        );
+    }
+
+    #[test]
+    fn set_ruri_refuses_trailing_input() {
+        for code in [
+            "request.set_ruri('sip:bob@example.com garbage')",
+            "request.set_ruri('sip:bob@example.com>')",
+            "request.set_ruri('sip:bob@[example.com]')",
+            "request.set_ruri('sip:bob@example.com;user=a b')",
+        ] {
+            let error = ruri_after(code).expect_err(code);
+            Python::attach(|py| {
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                    "{code}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn set_ruri_takes_service_codes_and_service_urns() {
+        assert_eq!(
+            ruri_after("request.set_ruri_user('*21#')").unwrap(),
+            "sip:*21#@biloxi.com"
+        );
+        assert_eq!(
+            ruri_after("request.set_ruri('urn:service:sos')").unwrap(),
+            "urn:service:sos"
+        );
+    }
+
+    #[test]
+    fn set_ruri_user_refuses_user_parameters_and_none_drops_them() {
+        let error = ruri_after("request.set_ruri_user('123;npdi')").unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py)));
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('sip:+15551234567;npdi;rn=+15559876543@carrier.example.net')\n",
+                "request.set_ruri_user(None)\n",
+            ))
+            .unwrap(),
+            "sip:carrier.example.net"
+        );
     }
 
     #[test]
