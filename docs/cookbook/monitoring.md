@@ -155,6 +155,19 @@ would let any peer mint unbounded Prometheus series through the scrape endpoint.
 connectionless, so there is no connection to count; a zero there would read as
 "no UDP traffic", which is a different and wrong statement.
 
+`siphon_non_sip_datagrams_dropped_total{reason}` is **not** an abuse counter and
+feeds nothing into `failed_auth_ban`. It counts payloads siphon refused to hand
+the SIP parser because they cannot be a SIP message: `whitespace` (RFC 3261
+§7.5 / RFC 5626 §4.4.1, any transport), `all_nul` (a vendor NAT keepalive no RFC
+defines, sent at a registered contact every few seconds for the life of the
+binding), and `too_short` (a UDP datagram under the 14-byte grammar floor for a
+SIP start line). A steady `all_nul` rate proportional to your registration count
+is normal. What is worth an alert is a **step change** — a peer changed
+behaviour — or a `too_short` rate with no keepalive behind it, which is worth one
+`RUST_LOG=siphon::dispatcher=trace` session to see the bytes. Anything the parser
+does reject still warns, but only once per source per minute, with the next line
+carrying the count that went unlogged.
+
 ## Call Detail Records
 
 ```yaml
