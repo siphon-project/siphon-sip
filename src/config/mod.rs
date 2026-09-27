@@ -61,7 +61,9 @@ pub use lawful_intercept::{
     LawfulInterceptConfig, LiSiprecConfig, LiTlsConfig, LiX1AdmfConfig, LiX1Config, LiX1TlsConfig,
     LiX2Config, LiX3Config,
 };
-pub use listen::{dscp_to_tos, parse_dscp, DomainConfig, ListenConfig, ListenEntry};
+pub use listen::{
+    dscp_to_tos, parse_dscp, AdvertisedAddress, DomainConfig, ListenConfig, ListenEntry,
+};
 pub use media::{
     CodecFlagsConfig, MediaBackendKind, MediaConfig, MediaProfileConfig, NgFlagsConfig,
     RtpEngineEventsConfig, RtpEngineInstanceConfig, RtpEngineSetConfig, RtpProxyConfig,
@@ -432,6 +434,7 @@ impl Config {
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
         config.validate_timer_intervals()?;
+        config.validate_advertised_address()?;
         Ok(config)
     }
 
@@ -470,6 +473,31 @@ impl Config {
                     return zero("nat.crlf_keepalive.interval_secs".to_string());
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Reject a top-level `advertised_address` siphon cannot put in a header.
+    ///
+    /// Same grammar as a listener's `advertise`, so the two cannot drift, with
+    /// one difference: no port. This value is the fallback for every transport
+    /// at once, and one port cannot be right for UDP on 5060 and TLS on 5061. A
+    /// port set here used to be taken for part of the host and emitted as
+    /// `host:port:port`; now it is refused with a pointer at the per-listener
+    /// form, which is where a translated port belongs.
+    fn validate_advertised_address(&self) -> Result<()> {
+        let Some(ref value) = self.advertised_address else {
+            return Ok(());
+        };
+        let parsed = AdvertisedAddress::parse(value)
+            .map_err(|error| SiphonError::Config(format!("advertised_address: {error}")))?;
+        if let Some(port) = parsed.port {
+            return Err(SiphonError::Config(format!(
+                "advertised_address: '{value}' carries a port ({port}), but this is the \
+                 fallback host for every transport. Set the port per listener instead, e.g. \
+                 listen.tls: [{{ address: \"...\", advertise: \"{}:{port}\" }}]",
+                parsed.host
+            )));
         }
         Ok(())
     }

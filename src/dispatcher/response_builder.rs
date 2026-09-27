@@ -228,7 +228,13 @@ pub(super) fn build_response(
 ///
 /// The ACK is hop-by-hop: each proxy generates its own for non-2xx.
 /// - Request-URI: same as the original INVITE
-/// - Via: only our own Via (the branch that created the client transaction)
+/// - Via: only our own Via — the branch that created the client transaction
+///   and the sent-by the relayed INVITE carried (§17.1.1.3: "equal to the top
+///   Via header field of the original request"; the next hop matches the ACK
+///   to its INVITE server transaction on branch *and* sent-by, §17.2.3). The
+///   sent-by comes from the client transaction key rather than being rebuilt,
+///   so a flow / IPsec / `send_socket` / advertised-port sent-by is repeated
+///   exactly.
 /// - From: from the original request
 /// - To: from the response (includes To-tag added by UAS)
 /// - Call-ID: from the original request
@@ -239,7 +245,7 @@ pub(super) fn build_ack_for_non2xx(
     response: &SipMessage,
     branch: &str,
     downstream_transport: Transport,
-    local_addr: SocketAddr,
+    sent_by: &str,
 ) -> SipMessage {
     let request_uri = match &original_request.start_line {
         StartLine::Request(rl) => rl.request_uri.clone(),
@@ -250,13 +256,9 @@ pub(super) fn build_ack_for_non2xx(
 
     // Via: only our own hop with the client transaction branch
     let transport_str = format!("{}", downstream_transport).to_uppercase();
-    let host = format_sip_host(&local_addr.ip().to_string());
     builder = builder.via(format!(
-        "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        host,
-        local_addr.port(),
-        branch
+        "SIP/2.0/{} {};branch={}",
+        transport_str, sent_by, branch
     ));
 
     if let Some(from) = original_request.headers.from() {

@@ -224,6 +224,8 @@ use dashmap::DashMap;
 use socket2::SockRef;
 use tracing::warn;
 
+pub use crate::config::AdvertisedAddress;
+
 /// Global monotonic counter for assigning connection-oriented connection IDs.
 /// Shared across TCP and TLS listeners so IDs are globally unique.
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -606,22 +608,33 @@ pub struct SendSocket {
     pub transport: Transport,
     /// The listener's bound socket address.
     pub addr: SocketAddr,
-    /// The listener's advertised host (from `listen: { advertise: ... }`),
-    /// used as the outgoing Via sent-by host when set.
-    pub advertise: Option<String>,
+    /// The listener's advertised host and optional port (from
+    /// `listen: { advertise: ... }`), used as the outgoing Via sent-by when set.
+    pub advertise: Option<AdvertisedAddress>,
 }
 
 impl SendSocket {
     /// The Via sent-by `(host, port)` this egress socket should advertise.
     /// Prefers the configured advertised host (external reachability behind
     /// NAT / a load balancer); falls back to the bound IP literal.  The port
-    /// is always the listener's bound port so a response reaches this socket.
+    /// is the advertised one when configured (a front that translates the
+    /// port forwards the response to this socket), else the bound port.
     pub fn via_sent_by(&self) -> (String, u16) {
         let host = self
             .advertise
-            .clone()
+            .as_ref()
+            .map(|advertise| advertise.host.clone())
             .unwrap_or_else(|| self.addr.ip().to_string());
-        (host, self.addr.port())
+        (host, self.advertised_port())
+    }
+
+    /// The port peers are told to use for this listener: the advertised port
+    /// when one is configured, else the bound port.
+    pub fn advertised_port(&self) -> u16 {
+        self.advertise
+            .as_ref()
+            .and_then(|advertise| advertise.port)
+            .unwrap_or(self.addr.port())
     }
 }
 
@@ -656,13 +669,13 @@ pub fn parse_send_socket(spec: &str) -> Result<(Transport, SocketAddr), String> 
 /// `send_socket` needs the *full* set across every transport.
 #[derive(Debug, Default, Clone)]
 pub struct ListenerRegistry {
-    entries: Arc<std::collections::HashMap<(Transport, SocketAddr), Option<String>>>,
+    entries: Arc<std::collections::HashMap<(Transport, SocketAddr), Option<AdvertisedAddress>>>,
 }
 
 impl ListenerRegistry {
     /// Build from `(transport, bound_addr, advertise)` triples.
     pub fn from_entries(
-        entries: impl IntoIterator<Item = (Transport, SocketAddr, Option<String>)>,
+        entries: impl IntoIterator<Item = (Transport, SocketAddr, Option<AdvertisedAddress>)>,
     ) -> Self {
         let map = entries
             .into_iter()
@@ -685,6 +698,17 @@ impl ListenerRegistry {
                 addr,
                 advertise: advertise.clone(),
             })
+    }
+
+    /// The port configured in the `advertise` of the listener bound at exactly
+    /// `(transport, addr)`, when it names one. `None` for a host-only
+    /// `advertise`, no `advertise`, or an address that is not a listener: the
+    /// caller then advertises the bound port, as before ports could be set.
+    pub fn advertised_port(&self, transport: Transport, addr: SocketAddr) -> Option<u16> {
+        self.entries
+            .get(&(transport, addr))
+            .and_then(|advertise| advertise.as_ref())
+            .and_then(|advertise| advertise.port)
     }
 
     /// Resolve the listener of `transport` matching the given address family
@@ -725,7 +749,7 @@ impl ListenerRegistry {
     /// first-per-transport `listen_addrs` / `advertised_addrs` maps the
     /// dispatcher also keeps.  Used to build the Route self-identity
     /// (RFC 3261 §16.4), which has to cover every host we can stamp.
-    pub fn entries(&self) -> Vec<(Transport, SocketAddr, Option<String>)> {
+    pub fn entries(&self) -> Vec<(Transport, SocketAddr, Option<AdvertisedAddress>)> {
         self.entries
             .iter()
             .map(|((transport, addr), advertise)| (*transport, *addr, advertise.clone()))
@@ -1782,7 +1806,7 @@ mod tests {
             (
                 Transport::Udp,
                 addr("10.0.0.1:5060"),
-                Some("sip.example.com".to_string()),
+                Some(AdvertisedAddress::host_only("sip.example.com")),
             ),
             (Transport::Udp, addr("192.168.1.1:5060"), None),
             (Transport::Tcp, addr("10.0.0.1:5060"), None),
@@ -1821,24 +1845,79 @@ mod tests {
     }
 
     #[test]
+    fn via_sent_by_uses_the_advertised_port_when_configured() {
+        // A front owns the public port 5061 and forwards to the inner 15061:
+        // the Via has to name the port the front serves, not the bound one.
+        let registry = ListenerRegistry::from_entries([
+            (
+                Transport::Tls,
+                addr("192.0.2.10:15061"),
+                Some(AdvertisedAddress::parse("sip.example.com:5061").unwrap()),
+            ),
+            (
+                Transport::Udp,
+                addr("[2001:db8::10]:15060"),
+                Some(AdvertisedAddress::parse("[2001:db8::1]:5060").unwrap()),
+            ),
+            (
+                Transport::Tcp,
+                addr("192.0.2.10:5060"),
+                Some(AdvertisedAddress::host_only("sip.example.com")),
+            ),
+        ]);
+        let tls = registry
+            .resolve(Transport::Tls, addr("192.0.2.10:15061"))
+            .unwrap();
+        assert_eq!(tls.via_sent_by(), ("sip.example.com".to_string(), 5061));
+        assert_eq!(tls.advertised_port(), 5061);
+        assert_eq!(
+            registry.advertised_port(Transport::Tls, addr("192.0.2.10:15061")),
+            Some(5061)
+        );
+
+        let v6 = registry
+            .resolve(Transport::Udp, addr("[2001:db8::10]:15060"))
+            .unwrap();
+        assert_eq!(v6.via_sent_by(), ("[2001:db8::1]".to_string(), 5060));
+
+        // Host only: the bound port stays the default.
+        let tcp = registry
+            .resolve(Transport::Tcp, addr("192.0.2.10:5060"))
+            .unwrap();
+        assert_eq!(tcp.via_sent_by(), ("sip.example.com".to_string(), 5060));
+        assert_eq!(
+            registry.advertised_port(Transport::Tcp, addr("192.0.2.10:5060")),
+            None
+        );
+        // Not a listener at all.
+        assert_eq!(
+            registry.advertised_port(Transport::Tcp, addr("192.0.2.99:5060")),
+            None
+        );
+    }
+
+    #[test]
     fn listener_registry_resolve_family_picks_matching_family() {
         let registry = ListenerRegistry::from_entries([
             (
                 Transport::Udp,
                 addr("192.0.2.10:5066"),
-                Some("v4.example".to_string()),
+                Some(AdvertisedAddress::host_only("v4.example")),
             ),
             (Transport::Udp, addr("192.0.2.10:5060"), None),
             (
                 Transport::Udp,
                 addr("[2001:db8::10]:5060"),
-                Some("v6.example".to_string()),
+                Some(AdvertisedAddress::host_only("v6.example")),
             ),
         ]);
         // v6 selector → the v6 listener, carrying its advertise.
         let v6 = registry.resolve_family(Transport::Udp, true).unwrap();
         assert!(v6.addr.is_ipv6());
-        assert_eq!(v6.advertise.as_deref(), Some("v6.example"));
+        assert_eq!(
+            v6.advertise.map(|advertise| advertise.host).as_deref(),
+            Some("v6.example")
+        );
         // v4 selector → deterministically the lowest v4 addr (:5060 < :5066).
         let v4 = registry.resolve_family(Transport::Udp, false).unwrap();
         assert_eq!(v4.addr, addr("192.0.2.10:5060"));

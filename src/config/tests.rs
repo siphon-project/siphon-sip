@@ -4338,6 +4338,112 @@ script:
     assert_eq!(config.listen.udp[0].dscp(), Some(46));
 }
 
+fn listen_yaml(listen: &str) -> String {
+    format!(
+        "listen:\n{listen}domain:\n  local:\n    - \"example.com\"\nscript:\n  path: \"scripts/proxy_default.py\"\n"
+    )
+}
+
+#[test]
+fn listen_advertise_host_only_parses_without_a_port() {
+    let yaml = listen_yaml(
+        "  tcp:\n    - address: \"192.0.2.10:5060\"\n      advertise: \"sip.example.com\"\n",
+    );
+    let config = Config::from_str(&yaml).unwrap();
+    let advertise = config.listen.tcp[0].advertise().expect("advertise");
+    assert_eq!(advertise.host, "sip.example.com");
+    assert_eq!(advertise.port, None);
+}
+
+#[test]
+fn listen_advertise_parses_host_and_port() {
+    let yaml = listen_yaml(
+        "  tls:\n    - address: \"192.0.2.10:15061\"\n      advertise: \"sip.example.com:5061\"\n",
+    );
+    let config = Config::from_str(&yaml).unwrap();
+    let advertise = config.listen.tls[0].advertise().expect("advertise");
+    assert_eq!(advertise.host, "sip.example.com");
+    assert_eq!(advertise.port, Some(5061));
+}
+
+#[test]
+fn listen_advertise_parses_bracketed_ipv6_and_port() {
+    let yaml = listen_yaml(
+        "  udp:\n    - address: \"[2001:db8::10]:15060\"\n      advertise: \"[2001:db8::1]:5060\"\n",
+    );
+    let config = Config::from_str(&yaml).unwrap();
+    let advertise = config.listen.udp[0].advertise().expect("advertise");
+    assert_eq!(advertise.host, "[2001:db8::1]");
+    assert_eq!(advertise.port, Some(5060));
+}
+
+#[test]
+fn listen_advertise_malformed_is_refused_at_load() {
+    for bad in [
+        "sip.example.com:99999",
+        "2001:db8::1:x",
+        "[2001:db8::1]5060",
+        "",
+    ] {
+        let yaml = listen_yaml(&format!(
+            "  tcp:\n    - address: \"192.0.2.10:5060\"\n      advertise: \"{bad}\"\n"
+        ));
+        let error = Config::from_str(&yaml)
+            .expect_err("a malformed advertise must fail the load")
+            .to_string();
+        assert!(
+            error.contains("advertise"),
+            "the error must name the key for '{bad}': {error}"
+        );
+    }
+}
+
+#[test]
+fn top_level_advertised_address_accepts_a_host() {
+    for host in [
+        "203.0.113.10",
+        "2001:db8::1",
+        "[2001:db8::1]",
+        "sip.example.com",
+    ] {
+        let yaml = format!("{}advertised_address: \"{host}\"\n", minimal_yaml());
+        let config = Config::from_str(&yaml).unwrap();
+        assert_eq!(config.advertised_address.as_deref(), Some(host));
+    }
+}
+
+#[test]
+fn top_level_advertised_address_with_a_port_is_refused() {
+    // One port cannot be right for every transport (UDP 5060 and TLS 5061
+    // share this fallback), so a port belongs on the listener's `advertise`.
+    for value in [
+        "sip.example.com:5061",
+        "[2001:db8::1]:5061",
+        "203.0.113.10:5060",
+    ] {
+        let yaml = format!("{}advertised_address: \"{value}\"\n", minimal_yaml());
+        let error = Config::from_str(&yaml)
+            .expect_err("a port on advertised_address must be refused")
+            .to_string();
+        assert!(
+            error.contains("advertised_address") && error.contains("advertise:"),
+            "the error must name the key and point at the per-listener form: {error}"
+        );
+    }
+}
+
+#[test]
+fn top_level_advertised_address_malformed_is_refused() {
+    let yaml = format!(
+        "{}advertised_address: \"sip example.com\"\n",
+        minimal_yaml()
+    );
+    let error = Config::from_str(&yaml)
+        .expect_err("a malformed advertised_address must be refused")
+        .to_string();
+    assert!(error.contains("advertised_address"), "{error}");
+}
+
 #[test]
 fn listen_entry_parses_the_proxy_protocol_allowlist() {
     let yaml = r#"

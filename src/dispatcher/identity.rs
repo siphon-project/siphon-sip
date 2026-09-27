@@ -350,13 +350,22 @@ pub(super) fn build_no_handler_response(
 /// traffic; over a stream transport RFC 5923 connection reuse masks it). On a
 /// single-listener host the arrival port equals `default_via_port`, so this is
 /// a no-op — which is why passing `None` (arrival socket unknown) is safe.
+///
+/// When the arrival listener's `advertise` names a port, that port wins over
+/// the bound one: a front translating the port serves the public port and
+/// forwards to the bound one, so the bound port is not reachable by the peer.
 pub(super) fn a_leg_advertised_port(
+    registry: &crate::transport::ListenerRegistry,
+    transport: &Transport,
     a_leg_local_addr: Option<SocketAddr>,
     default_via_port: u16,
 ) -> u16 {
-    a_leg_local_addr
-        .map(|addr| addr.port())
-        .unwrap_or(default_via_port)
+    match a_leg_local_addr {
+        Some(addr) => registry
+            .advertised_port(*transport, addr)
+            .unwrap_or(addr.port()),
+        None => default_via_port,
+    }
 }
 
 /// The sent-by (host, port) siphon advertises in the `Via` and `Contact` of
@@ -389,11 +398,11 @@ pub(super) fn b_leg_sent_by(
             if *transport == Transport::Udp
                 || crate::ipsec::runtime::is_protected_local_port(local.port()) =>
         {
-            pinned_sent_by(local, || state.via_host(transport))
+            pinned_sent_by(local, || state.wildcard_pinned_sent_by(transport, local))
         }
         Some(local) => (
             state.a_leg_advertised_host(Some(local), transport),
-            local.port(),
+            state.a_leg_advertised_port(Some(local), transport),
         ),
         None => (state.via_host(transport), state.via_port(transport)),
     }
@@ -405,20 +414,23 @@ pub(super) fn b_leg_sent_by(
 /// matters — *advertise the socket you send from* — is unit-testable without a
 /// `DispatcherState` fixture.
 ///
-/// The **port** is the whole point of a pin and is always the socket's own. The
-/// **host** is the socket's own only when it is concrete: `listen: 0.0.0.0:5060`
-/// is the ordinary production shape, and `InboundMessage::local_addr` carries
-/// the bind address, so a captured flow on such a listener would otherwise put
-/// `0.0.0.0` in a Via — an address no peer can answer to and that no
-/// self-identity recognises, which turns the dialog's own in-dialog requests
-/// into `482 Loop Detected` on arrival. On a wildcard socket the host falls back
-/// to the advertised identity for that transport, keeping the pinned port.
+/// On a concrete socket the sent-by is the socket's own IP and port, the whole
+/// point of a pin. The host is the socket's own only when it is concrete:
+/// `listen: 0.0.0.0:5060` is the ordinary production shape, and
+/// `InboundMessage::local_addr` carries the bind address, so a captured flow on
+/// such a listener would otherwise put `0.0.0.0` in a Via — an address no peer
+/// can answer to and that no self-identity recognises, which turns the dialog's
+/// own in-dialog requests into `482 Loop Detected` on arrival. On a wildcard
+/// socket the sent-by comes from `wildcard_sent_by` instead: the advertised
+/// identity of that socket, whose port is the pinned socket's own unless its
+/// `advertise` names another (see
+/// [`DispatcherState::wildcard_pinned_sent_by`]).
 pub(super) fn pinned_sent_by(
     local: SocketAddr,
-    advertised_host: impl FnOnce() -> String,
+    wildcard_sent_by: impl FnOnce() -> (String, u16),
 ) -> (String, u16) {
     if local.ip().is_unspecified() {
-        return (advertised_host(), local.port());
+        return wildcard_sent_by();
     }
     // Bracket a v6 literal — a raw `ip().to_string()` would emit a malformed
     // unbracketed `SIP/2.0/UDP 2001:db8::10:6100` sent-by.
@@ -494,15 +506,17 @@ pub(super) fn record_route_uri(host: &str, port: u16, transport: Transport) -> S
 /// `fallback` even when a flow was attached — is testable without a
 /// `DispatcherState` fixture.
 ///
-/// A flow on a wildcard-bound listener keeps its port but borrows `fallback`'s
-/// host; see [`pinned_sent_by`] for why `0.0.0.0` in a sent-by is fatal.
+/// A flow on a wildcard-bound listener takes `wildcard_flow_sent_by` (the
+/// socket's advertised identity); see [`pinned_sent_by`] for why `0.0.0.0` in
+/// a sent-by is fatal.
 pub(super) fn egress_sent_by(
     flow_local_addr: Option<SocketAddr>,
+    wildcard_flow_sent_by: impl FnOnce(SocketAddr) -> (String, u16),
     send_socket_sent_by: Option<(String, u16)>,
     fallback: impl FnOnce() -> (String, u16),
 ) -> (String, u16) {
     match (flow_local_addr, send_socket_sent_by) {
-        (Some(local), _) => pinned_sent_by(local, || fallback().0),
+        (Some(local), _) => pinned_sent_by(local, || wildcard_flow_sent_by(local)),
         (None, Some((host, port))) => (format_sip_host(&host), port),
         (None, None) => fallback(),
     }
@@ -530,7 +544,7 @@ pub(super) fn leg_sent_by(
         }
         crate::b2bua::actor::LegSide::A => (
             state.a_leg_advertised_host(leg.transport.local_addr, transport),
-            a_leg_advertised_port(leg.transport.local_addr, state.via_port(transport)),
+            state.a_leg_advertised_port(leg.transport.local_addr, transport),
         ),
     }
 }
@@ -576,8 +590,13 @@ pub(super) fn build_self_identity(
             ports.push(port);
         }
     };
-    for (_, addr, _) in listener_registry.entries() {
+    for (_, addr, advertise) in listener_registry.entries() {
         add_port(&mut ports, addr.port());
+        // The port a listener's `advertise` names is the one stamped into its
+        // Record-Route, so it is the port its in-dialog Routes come back on.
+        if let Some(port) = advertise.and_then(|advertise| advertise.port) {
+            add_port(&mut ports, port);
+        }
     }
     for addr in listen_addrs.values() {
         add_port(&mut ports, addr.port());
@@ -592,7 +611,7 @@ pub(super) fn build_self_identity(
     // 1 + 3: every configured listener — its advertise name and its bound IP.
     for (_, addr, advertise) in listener_registry.entries() {
         if let Some(ref advertise) = advertise {
-            identity.add_host(advertise, &ports);
+            identity.add_host(&advertise.host, &ports);
         }
         if !addr.ip().is_unspecified() {
             identity.add_host(&addr.ip().to_string(), &ports);
@@ -679,7 +698,7 @@ pub(super) fn resolve_advertised_host(
 
     // 1. Per-listener advertise for this exact socket.
     if let Some(advertise) = registry.resolve(*transport, addr).and_then(|s| s.advertise) {
-        return format_sip_host(&advertise);
+        return format_sip_host(&advertise.host);
     }
 
     // 2. A transport-level advertised host of the same family (or an FQDN).
@@ -703,7 +722,7 @@ pub(super) fn resolve_advertised_host(
     // 4. Wildcard bind → family-matched fallback.
     if let Some(send) = registry.resolve_family(*transport, ipv6) {
         if let Some(advertise) = send.advertise {
-            return format_sip_host(&advertise);
+            return format_sip_host(&advertise.host);
         }
         if !send.addr.ip().is_unspecified() {
             return format_sip_host(&send.addr.ip().to_string());

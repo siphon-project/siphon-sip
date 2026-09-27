@@ -79,6 +79,8 @@ mod timers;
 #[cfg(test)]
 mod a_leg_reliable_provisional_tests;
 #[cfg(test)]
+mod advertised_port_tests;
+#[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_asserted_identity_tests;
@@ -236,6 +238,7 @@ pub async fn run(
     local_addr: SocketAddr,
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     advertised_addrs: std::collections::HashMap<Transport, String>,
+    advertised_ports: std::collections::HashMap<Transport, u16>,
     listener_registry: crate::transport::ListenerRegistry,
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
@@ -438,6 +441,7 @@ pub async fn run(
         self_identity,
         local_addr: via_addr,
         advertised_addrs: merged_advertised,
+        advertised_ports,
         listen_addrs,
         listener_registry,
         server_header,

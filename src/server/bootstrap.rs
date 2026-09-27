@@ -1329,6 +1329,28 @@ pub(super) fn parse_listen_addr(address: &str, label: &str) -> std::net::SocketA
     })
 }
 
+/// Record a listener's `advertise` as its transport's advertised identity, when
+/// the transport has none yet (the first advertising listener wins, as it
+/// always has for the host). The port goes in only alongside the host it was
+/// written with, so a transport's advertised host and port never come from two
+/// different listeners.
+pub(super) fn record_advertised(
+    advertised_addrs: &mut std::collections::HashMap<transport::Transport, String>,
+    advertised_ports: &mut std::collections::HashMap<transport::Transport, u16>,
+    transport: transport::Transport,
+    advertise: Option<&config::AdvertisedAddress>,
+) {
+    let Some(advertise) = advertise else {
+        return;
+    };
+    if let std::collections::hash_map::Entry::Vacant(slot) = advertised_addrs.entry(transport) {
+        slot.insert(advertise.host.clone());
+        if let Some(port) = advertise.port {
+            advertised_ports.insert(transport, port);
+        }
+    }
+}
+
 /// Index one `listen:` list by socket address, so overlapping addresses across
 /// two lists can be detected (and their entries recovered) before any listener
 /// is spawned.

@@ -1206,17 +1206,63 @@ fn a_leg_advertised_port_prefers_arrival_socket() {
     // :5060. The A-leg Contact / dialog anchor must be the arrival port, else
     // in-dialog requests are directed to a port the dialog isn't on.
     let arrival: SocketAddr = "192.0.2.94:5066".parse().unwrap();
-    assert_eq!(a_leg_advertised_port(Some(arrival), 5060), 5066);
+    let registry = crate::transport::ListenerRegistry::default();
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Udp, Some(arrival), 5060),
+        5066
+    );
+}
+
+#[test]
+fn a_leg_advertised_port_prefers_the_arrival_listeners_advertised_port() {
+    // A front owns the public port 5060 and forwards to the bound 15060: the
+    // A-leg must be told the public one. A host-only listener keeps its own.
+    let translated: SocketAddr = "192.0.2.94:15060".parse().unwrap();
+    let plain: SocketAddr = "192.0.2.94:5066".parse().unwrap();
+    let registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (
+            Transport::Udp,
+            translated,
+            Some(crate::transport::AdvertisedAddress::parse("sip.example.com:5060").unwrap()),
+        ),
+        (
+            Transport::Udp,
+            plain,
+            Some(crate::transport::AdvertisedAddress::host_only(
+                "sip.example.com",
+            )),
+        ),
+    ]);
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Udp, Some(translated), 5070),
+        5060
+    );
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Udp, Some(plain), 5070),
+        5066
+    );
+    // Keyed on transport too: the same socket under TCP is not that listener.
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Tcp, Some(translated), 5070),
+        15060
+    );
 }
 
 #[test]
 fn a_leg_advertised_port_falls_back_to_via_port_when_unknown() {
     // Single-listener host (or arrival socket not captured): fall back to the
     // default per-transport listener port — where the two are the same anyway.
-    assert_eq!(a_leg_advertised_port(None, 5060), 5060);
+    let registry = crate::transport::ListenerRegistry::default();
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Udp, None, 5060),
+        5060
+    );
     // And when the arrival socket happens to equal the default, still correct.
     let same: SocketAddr = "10.0.0.1:5060".parse().unwrap();
-    assert_eq!(a_leg_advertised_port(Some(same), 5060), 5060);
+    assert_eq!(
+        a_leg_advertised_port(&registry, &Transport::Udp, Some(same), 5060),
+        5060
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1236,7 +1282,9 @@ fn a_leg_advertised_port_falls_back_to_via_port_when_unknown() {
 fn pinned_sent_by_names_the_flow_socket_not_the_default_listener() {
     // Soft-UE shape: plain SIP on :5060, protected client port :6100.
     let protected_client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-    let (host, port) = pinned_sent_by(protected_client, || "advertised.example.net".to_string());
+    let (host, port) = pinned_sent_by(protected_client, || {
+        ("advertised.example.net".to_string(), 5060)
+    });
     assert_eq!(host, "192.0.2.10");
     assert_eq!(
         port, 6100,
@@ -1250,7 +1298,7 @@ fn pinned_sent_by_names_the_flow_socket_not_the_default_listener() {
 fn pinned_sent_by_distinguishes_the_two_protected_ports() {
     let client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
     let server: SocketAddr = "192.0.2.10:6101".parse().unwrap();
-    let advertised = || "192.0.2.10".to_string();
+    let advertised = || ("192.0.2.10".to_string(), 5060);
     assert_ne!(
         pinned_sent_by(client, advertised),
         pinned_sent_by(server, advertised)
@@ -1263,7 +1311,7 @@ fn pinned_sent_by_distinguishes_the_two_protected_ports() {
 #[test]
 fn pinned_sent_by_brackets_an_ipv6_flow_socket() {
     let v6: SocketAddr = "[2001:db8::10]:6100".parse().unwrap();
-    let (host, port) = pinned_sent_by(v6, || "192.0.2.10".to_string());
+    let (host, port) = pinned_sent_by(v6, || ("192.0.2.10".to_string(), 5060));
     assert_eq!(host, "[2001:db8::10]");
     assert_eq!(port, 6100);
 }
@@ -1273,27 +1321,69 @@ fn pinned_sent_by_brackets_an_ipv6_flow_socket() {
 /// on such a listener pins to a wildcard.  Stamping `0.0.0.0` into a
 /// sent-by names an address no peer can answer to and that no self-identity
 /// recognises — the dialog's own in-dialog requests come back to us and are
-/// refused `482 Loop Detected`.  Keep the pinned port, take the advertised
-/// host.
+/// refused `482 Loop Detected`.  The wildcard sent-by comes from the socket's
+/// advertised identity instead (`DispatcherState::wildcard_pinned_sent_by`).
 #[test]
 fn pinned_sent_by_never_advertises_a_wildcard_bind() {
     let wildcard: SocketAddr = "0.0.0.0:5060".parse().unwrap();
-    let (host, port) = pinned_sent_by(wildcard, || "192.0.2.10".to_string());
+    let (host, port) = pinned_sent_by(wildcard, || ("192.0.2.10".to_string(), 5060));
     assert_eq!(host, "192.0.2.10");
     assert_eq!(port, 5060, "the pinned port is the whole point of the pin");
 
     let wildcard_v6: SocketAddr = "[::]:5066".parse().unwrap();
-    let (host, port) = pinned_sent_by(wildcard_v6, || "[2001:db8::10]".to_string());
+    let (host, port) = pinned_sent_by(wildcard_v6, || ("[2001:db8::10]".to_string(), 5066));
     assert_eq!(host, "[2001:db8::10]");
     assert_eq!(port, 5066);
 }
 
-/// Same rule through the precedence wrapper: the flow still wins, it just
-/// borrows the fallback's host rather than its port.
+/// A wildcard-bound socket's sent-by: its own `advertise` (host and, when it
+/// names one, port), else the transport's advertised host on the bound port.
+#[test]
+fn wildcard_pinned_sent_by_uses_the_sockets_advertised_port() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let translated: SocketAddr = "0.0.0.0:15060".parse().unwrap();
+    let plain: SocketAddr = "0.0.0.0:5070".parse().unwrap();
+    dispatcher.state.advertised_addrs =
+        std::collections::HashMap::from([(Transport::Udp, "sip.example.com".to_string())]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (
+            Transport::Udp,
+            translated,
+            Some(crate::transport::AdvertisedAddress::parse("edge.example.com:5060").unwrap()),
+        ),
+        (Transport::Udp, plain, None),
+    ]);
+    assert_eq!(
+        dispatcher
+            .state
+            .wildcard_pinned_sent_by(&Transport::Udp, translated),
+        ("edge.example.com".to_string(), 5060)
+    );
+    assert_eq!(
+        dispatcher
+            .state
+            .wildcard_pinned_sent_by(&Transport::Udp, plain),
+        ("sip.example.com".to_string(), 5070)
+    );
+}
+
+/// The wildcard hook for an `egress_sent_by` case whose flow socket (if any)
+/// is concrete, where the hook must never run.
+fn wildcard_not_consulted(local: SocketAddr) -> (String, u16) {
+    panic!("a concrete or absent flow socket ({local}) must not reach the wildcard hook")
+}
+
+/// Same rule through the precedence wrapper: the flow still wins, and a
+/// wildcard flow takes the socket's advertised identity, not the fallback.
 #[test]
 fn egress_sent_by_keeps_a_wildcard_flows_port_but_not_its_host() {
     let wildcard: SocketAddr = "0.0.0.0:5060".parse().unwrap();
-    let sent_by = egress_sent_by(Some(wildcard), None, || ("192.0.2.10".to_string(), 5070));
+    let sent_by = egress_sent_by(
+        Some(wildcard),
+        |local| ("192.0.2.10".to_string(), local.port()),
+        None,
+        || ("192.0.2.10".to_string(), 5070),
+    );
     assert_eq!(sent_by, ("192.0.2.10".to_string(), 5060));
 }
 
@@ -1304,7 +1394,9 @@ fn egress_sent_by_keeps_a_wildcard_flows_port_but_not_its_host() {
 #[test]
 fn egress_sent_by_prefers_the_flow_over_the_default_listener() {
     let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
-    let sent_by = egress_sent_by(Some(flow), None, || ("192.0.2.10".to_string(), 5060));
+    let sent_by = egress_sent_by(Some(flow), wildcard_not_consulted, None, || {
+        ("192.0.2.10".to_string(), 5060)
+    });
     assert_eq!(
         sent_by,
         ("192.0.2.10".to_string(), 6100),
@@ -1319,6 +1411,7 @@ fn egress_sent_by_flow_beats_a_send_socket_pin() {
     let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
     let sent_by = egress_sent_by(
         Some(flow),
+        wildcard_not_consulted,
         Some(("sip.example.com".to_string(), 5080)),
         || ("192.0.2.10".to_string(), 5060),
     );
@@ -1329,12 +1422,17 @@ fn egress_sent_by_flow_beats_a_send_socket_pin() {
 /// pin wins over the default, and with neither, the default stands.
 #[test]
 fn egress_sent_by_without_a_flow_is_unchanged() {
-    let pinned = egress_sent_by(None, Some(("sip.example.com".to_string(), 5080)), || {
-        ("192.0.2.10".to_string(), 5060)
-    });
+    let pinned = egress_sent_by(
+        None,
+        wildcard_not_consulted,
+        Some(("sip.example.com".to_string(), 5080)),
+        || ("192.0.2.10".to_string(), 5060),
+    );
     assert_eq!(pinned, ("sip.example.com".to_string(), 5080));
 
-    let plain = egress_sent_by(None, None, || ("192.0.2.10".to_string(), 5060));
+    let plain = egress_sent_by(None, wildcard_not_consulted, None, || {
+        ("192.0.2.10".to_string(), 5060)
+    });
     assert_eq!(plain, ("192.0.2.10".to_string(), 5060));
 }
 
@@ -1342,9 +1440,12 @@ fn egress_sent_by_without_a_flow_is_unchanged() {
 /// the flow path — the sent-by is a URI host, not a bare address.
 #[test]
 fn egress_sent_by_brackets_an_ipv6_send_socket_host() {
-    let sent_by = egress_sent_by(None, Some(("2001:db8::20".to_string(), 5080)), || {
-        ("192.0.2.10".to_string(), 5060)
-    });
+    let sent_by = egress_sent_by(
+        None,
+        wildcard_not_consulted,
+        Some(("2001:db8::20".to_string(), 5080)),
+        || ("192.0.2.10".to_string(), 5060),
+    );
     assert_eq!(sent_by, ("[2001:db8::20]".to_string(), 5080));
 }
 
@@ -1484,12 +1585,12 @@ fn dualstack_registry() -> crate::transport::ListenerRegistry {
         (
             Transport::Udp,
             "192.0.2.10:5060".parse().unwrap(),
-            None::<String>,
+            None::<crate::transport::AdvertisedAddress>,
         ),
         (
             Transport::Udp,
             "[2001:db8::10]:5060".parse().unwrap(),
-            None::<String>,
+            None::<crate::transport::AdvertisedAddress>,
         ),
     ])
 }
@@ -1501,12 +1602,16 @@ fn resolve_advertised_host_uses_exact_listener_advertise() {
         (
             Transport::Udp,
             "192.0.2.10:5060".parse().unwrap(),
-            Some("pcscf-v4.example".to_string()),
+            Some(crate::transport::AdvertisedAddress::host_only(
+                "pcscf-v4.example",
+            )),
         ),
         (
             Transport::Udp,
             "[2001:db8::10]:5060".parse().unwrap(),
-            Some("pcscf-v6.example".to_string()),
+            Some(crate::transport::AdvertisedAddress::host_only(
+                "pcscf-v6.example",
+            )),
         ),
     ]);
     let advertised = std::collections::HashMap::new();
@@ -1638,7 +1743,7 @@ fn secure_listener_registry(
             (
                 *transport,
                 address.parse().unwrap(),
-                advertise.map(str::to_string),
+                advertise.map(crate::transport::AdvertisedAddress::host_only),
             )
         },
     ))
@@ -4088,13 +4193,20 @@ fn identity_from(
     ipsec_ports: Option<(u16, u16)>,
     path_host: Option<&str>,
 ) -> core::SelfIdentity {
-    let entries: Vec<(Transport, SocketAddr, Option<String>)> = listeners
+    let entries: Vec<(
+        Transport,
+        SocketAddr,
+        Option<crate::transport::AdvertisedAddress>,
+    )> = listeners
         .iter()
         .map(|(transport, addr, advertise)| {
             (
                 *transport,
                 addr.parse().expect("test listener address"),
-                advertise.map(str::to_string),
+                advertise.map(|advertise| {
+                    crate::transport::AdvertisedAddress::parse(advertise)
+                        .expect("test advertise value")
+                }),
             )
         })
         .collect();
@@ -4109,7 +4221,7 @@ fn identity_from(
         if let Some(advertise) = advertise {
             advertised
                 .entry(*transport)
-                .or_insert_with(|| advertise.clone());
+                .or_insert_with(|| advertise.host.clone());
         }
     }
 
@@ -4157,6 +4269,26 @@ fn build_self_identity_covers_a_second_listener_of_the_same_transport() {
     );
     // And bracketed, which is how it comes back on the wire.
     assert!(identity.matches("[2001:db8:ac10::10]", Some(5064)));
+}
+
+#[test]
+fn build_self_identity_matches_the_advertised_port() {
+    // Record-Route carries the advertised port, so the in-dialog Route comes
+    // back on it; it has to be recognised as ours or the request loops out.
+    let identity = identity_for(
+        &[(
+            Transport::Tls,
+            "192.0.2.40:15061",
+            Some("sip.example.com:5061"),
+        )],
+        &[],
+    );
+    assert!(
+        identity.matches("sip.example.com", Some(5061)),
+        "the advertised port must identify us: {:?}",
+        identity.entries(),
+    );
+    assert!(identity.matches("192.0.2.40", Some(15061)));
 }
 
 #[test]
@@ -4794,14 +4926,12 @@ fn build_response_replace_then_add_for_same_header_keeps_replace_then_appends() 
 fn build_ack_for_non2xx_has_correct_headers() {
     let request = sample_invite();
     let response = build_response(&request, 480, "Temporarily Unavailable", None, &[]);
-    let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
-
     let ack = build_ack_for_non2xx(
         &request,
         &response,
         "z9hG4bK-proxy-branch",
         Transport::Tcp,
-        local_addr,
+        "10.0.0.1:5060",
     );
 
     // Must be an ACK request

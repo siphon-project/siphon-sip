@@ -232,13 +232,9 @@ pub fn absorb_completed_reinvite_retransmit(
                                 snapshot.a_leg.transport.local_addr,
                                 &responder_transport,
                             ),
-                            a_leg_advertised_port(
+                            state.a_leg_advertised_port(
                                 snapshot.a_leg.transport.local_addr,
-                                state
-                                    .listen_addrs
-                                    .get(&responder_transport)
-                                    .map(|a| a.port())
-                                    .unwrap_or(state.local_addr.port()),
+                                &responder_transport,
                             ),
                         )
                     };

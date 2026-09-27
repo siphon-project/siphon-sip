@@ -349,17 +349,21 @@ pub(super) fn relay_request(
         // server port (e.g. 5066) is non-default — using the per-
         // transport via_host would emit a Via with the wrong port and
         // the UE's response would land on the wrong listener
-        // (3GPP TS 33.203 §7.4).  A wildcard-bound listener keeps the
-        // pinned port and borrows the advertised host, and a v6 literal
-        // is bracketed — see `pinned_sent_by`.
-        let (host, port) = pinned_sent_by(local, || state.via_host(&outbound_transport));
+        // (3GPP TS 33.203 §7.4).  A wildcard-bound listener takes its
+        // advertised identity (its own port unless `advertise` names
+        // another), and a v6 literal is bracketed — see `pinned_sent_by`.
+        let (host, port) = pinned_sent_by(local, || {
+            state.wildcard_pinned_sent_by(&outbound_transport, local)
+        });
         (host, Some(port))
     } else if let Some(local) = ipsec_source {
         // IPsec auto-source: same correctness invariant as the flow
         // path — the UE's response on SA #4 (UE → port_pc) must land
         // on the Via we advertise, otherwise the kernel selector
         // doesn't match and the response is silently dropped.
-        let (host, port) = pinned_sent_by(local, || state.via_host(&outbound_transport));
+        let (host, port) = pinned_sent_by(local, || {
+            state.wildcard_pinned_sent_by(&outbound_transport, local)
+        });
         (host, Some(port))
     } else if let Some(pin) = send_socket {
         // Script send_socket= egress pin: advertise the selected listener's
@@ -395,7 +399,9 @@ pub(super) fn relay_request(
         );
         let (first, second) = record_route_uris(
             inbound.transport,
-            crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
+            crate::script::api::ipsec::record_route_port_for(
+                state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
+            ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
             outbound_transport,
             outbound_rr_port,
@@ -925,6 +931,7 @@ pub(super) fn relay_fork_branch(
     // with no SA covering it (3GPP TS 33.203 §7.4).
     let (via_host, via_port) = egress_sent_by(
         flow.map(|flow| flow.local_addr),
+        |local| state.wildcard_pinned_sent_by(&outbound_transport, local),
         send_socket.map(|pin| pin.via_sent_by()),
         || {
             (
@@ -945,7 +952,9 @@ pub(super) fn relay_fork_branch(
     if record_routed {
         let (first, second) = record_route_uris(
             inbound.transport,
-            crate::script::api::ipsec::record_route_port_for(inbound.local_addr.port()),
+            crate::script::api::ipsec::record_route_port_for(
+                state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
+            ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
             outbound_transport,
             crate::script::api::ipsec::record_route_port_for(via_port),

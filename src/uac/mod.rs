@@ -137,6 +137,10 @@ pub struct UacSender {
     listen_addrs: HashMap<Transport, SocketAddr>,
     /// Per-transport advertised addresses (e.g. TLS → "1.2.3.4").
     advertised_addrs: HashMap<Transport, String>,
+    /// Per-transport advertised port, paired with `advertised_addrs`, for
+    /// transports whose advertising listener names one (a front that
+    /// translates the port). Absent transports advertise the bound port.
+    advertised_ports: HashMap<Transport, u16>,
     /// Global advertised address fallback from config.
     advertised_address: Option<String>,
     /// HEP capture sender (if tracing is enabled).
@@ -163,12 +167,21 @@ impl UacSender {
             local_addr,
             listen_addrs,
             advertised_addrs,
+            advertised_ports: HashMap::new(),
             advertised_address,
             hep_sender,
             user_agent_header,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
+    }
+
+    /// Set the per-transport advertised ports (`advertise: "host:port"`),
+    /// paired with the `advertised_addrs` hosts passed to [`new`](Self::new).
+    /// Without it every transport advertises its listen port.
+    pub fn with_advertised_ports(mut self, advertised_ports: HashMap<Transport, u16>) -> Self {
+        self.advertised_ports = advertised_ports;
+        self
     }
 
     /// Return the effective address for a given transport, resolving
@@ -192,7 +205,7 @@ impl UacSender {
     ///
     /// Unlike [`addr_for`], this preserves an FQDN `advertised_address`
     /// instead of collapsing it to `127.0.0.1` — pair it with
-    /// `addr_for(..).port()` for the sent-by port.
+    /// [`via_port_for`](Self::via_port_for) for the sent-by port.
     pub fn via_host_for(&self, transport: &Transport) -> String {
         resolve_via_host(
             transport,
@@ -200,6 +213,18 @@ impl UacSender {
             self.advertised_address.as_deref(),
             || self.addr_for(transport).ip().to_string(),
         )
+    }
+
+    /// Return the port to advertise alongside [`via_host_for`](Self::via_host_for)
+    /// in the Via/Contact of a UAC-originated request for `transport`: the
+    /// advertised port when the transport's advertising listener names one,
+    /// else the listen port. [`addr_for`](Self::addr_for) stays the *socket*
+    /// address, which is the bound port whatever is advertised.
+    pub fn via_port_for(&self, transport: &Transport) -> u16 {
+        self.advertised_ports
+            .get(transport)
+            .copied()
+            .unwrap_or_else(|| self.addr_for(transport).port())
     }
 
     /// Send an OPTIONS request to a target address.
@@ -325,19 +350,17 @@ impl UacSender {
         // will reply to (the protected P-CSCF port); otherwise use the
         // configured per-transport address.
         let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
-        // Via/From host: the exact listener IP for a captured-flow probe, else
-        // the advertised host — which may be an FQDN (RFC 3261 §20.42) rather
-        // than the loopback `addr_for` collapses an FQDN to.
-        let via_host = match source_local_addr {
-            Some(local) => format_sip_host(&local.ip().to_string()),
-            None => self.via_host_for(&transport),
+        // Via/From host and port: the exact listener IP and port for a
+        // captured-flow probe, else the advertised host — which may be an FQDN
+        // (RFC 3261 §20.42) rather than the loopback `addr_for` collapses an
+        // FQDN to — with the advertised port when one is configured.
+        let (via_host, via_port) = match source_local_addr {
+            Some(local) => (format_sip_host(&local.ip().to_string()), local.port()),
+            None => (self.via_host_for(&transport), self.via_port_for(&transport)),
         };
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport,
-            via_host,
-            addr.port(),
-            branch
+            transport, via_host, via_port, branch
         );
 
         let from_name = from_user.unwrap_or("siphon");
@@ -356,7 +379,7 @@ impl UacSender {
         let contact = format!(
             "<sip:{from_name}@{}:{};transport={}>",
             via_host,
-            addr.port(),
+            via_port,
             transport.to_string().to_lowercase(),
         );
 
@@ -1371,6 +1394,60 @@ mod tests {
         assert!(
             raw.contains("REFER") && raw.contains("NOTIFY"),
             "Allow must include REFER/NOTIFY so peers discover transfer support: {raw}"
+        );
+    }
+
+    /// A listener advertising a port other than its bound one (a front that
+    /// translates the port): the OPTIONS Via and Contact name the advertised
+    /// port, while the socket-level `addr_for` keeps the bound one.
+    #[test]
+    fn send_options_uses_the_advertised_port_in_via_and_contact() {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (stream_tx, _stream_rx) = flume::unbounded();
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx.into(),
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: stream_tx.clone(),
+            tls: stream_tx.clone(),
+            ws: stream_tx.clone(),
+            wss: stream_tx.clone(),
+            sctp: stream_tx,
+        });
+        let bound: SocketAddr = "192.0.2.1:15060".parse().unwrap();
+        let sender = UacSender::new(
+            router,
+            bound,
+            HashMap::from([(Transport::Udp, bound)]),
+            HashMap::from([(Transport::Udp, "sip.example.com".to_string())]),
+            None,
+            None,
+            None,
+        )
+        .with_advertised_ports(HashMap::from([(Transport::Udp, 5060)]));
+
+        assert_eq!(sender.via_port_for(&Transport::Udp), 5060);
+        assert_eq!(sender.addr_for(&Transport::Udp), bound);
+        // A transport with no advertised port keeps its listen port.
+        assert_eq!(sender.via_port_for(&Transport::Tcp), 15060);
+
+        let _receiver = sender.send_options(
+            "198.51.100.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("198.51.100.1".to_string()),
+        );
+        let outbound = udp_rx.try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(
+            raw.contains("Via: SIP/2.0/UDP sip.example.com:5060;"),
+            "Via must name the advertised port: {raw}"
+        );
+        assert!(
+            raw.contains("Contact: <sip:siphon@sip.example.com:5060;transport=udp>"),
+            "Contact must name the advertised port: {raw}"
+        );
+        assert!(
+            !raw.contains(":15060"),
+            "the bound port must not leak: {raw}"
         );
     }
 }

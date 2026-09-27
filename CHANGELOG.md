@@ -265,6 +265,23 @@ entry, but a working config keeps working.
   handler that only awaits for one method can now be split so every other
   response stays off the asyncio driver, and `check_hot_path_dispatch.py` flags
   an unfiltered `async` reply handler that should be.
+- **A listener's `advertise` can name a port.** `advertise: "sip.example.com:5061"`
+  (or `"[2001:db8::1]:5061"`) puts that port, instead of the bound one, in every
+  header that tells a peer where to reach the listener: Via sent-by,
+  Record-Route, the B2BUA Contact on both legs, the Contact of an answered
+  OPTIONS, and the Via/Contact of requests siphon originates (keepalives, probes,
+  `proxy.send_request`, SUBSCRIBE, in-dialog NOTIFY). For a front that owns the
+  public port and forwards to a different inner one, where a header naming the
+  bound port points at a port nothing serves. A bare host behaves as before. The
+  advertised port is also recognised as siphon's own on an in-dialog Route.
+  Binding and sending are unchanged. The value is parsed at startup and a
+  malformed one stops siphon with an error naming the listener. Top-level
+  `advertised_address` stays host-only: a port there, which used to be emitted as
+  part of the host (`host:port:port`), is now refused at startup with a pointer
+  to the per-listener form. The ACK siphon sends for a non-2xx final response now
+  repeats the relayed INVITE's Via sent-by exactly (RFC 3261 §17.1.1.3) instead
+  of rebuilding it from the bind address, so the next hop matches it to its
+  transaction whatever sent-by the INVITE carried.
 
 - **`await handle.reload()` on a `SubscribeHandle`.** Re-reads the dialog through
   the configured `subscribe_state.cache`, refreshing this instance's view of it,

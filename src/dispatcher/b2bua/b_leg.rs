@@ -256,12 +256,17 @@ pub fn b2bua_send_b_leg_invite(
     let (via_host, via_port) = if flow_local_addr.is_some() {
         b_leg_sent_by(flow_local_addr, state, &outbound_transport)
     } else {
-        egress_sent_by(None, send_socket.map(|pin| pin.via_sent_by()), || {
-            (
-                state.via_host(&outbound_transport),
-                state.via_port(&outbound_transport),
-            )
-        })
+        egress_sent_by(
+            None,
+            |local| state.wildcard_pinned_sent_by(&outbound_transport, local),
+            send_socket.map(|pin| pin.via_sent_by()),
+            || {
+                (
+                    state.via_host(&outbound_transport),
+                    state.via_port(&outbound_transport),
+                )
+            },
+        )
     };
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",

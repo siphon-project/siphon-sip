@@ -62,7 +62,7 @@ pub(super) fn sanitize_b2bua_response_keeping(
     // re-INVITE) to a port the dialog isn't anchored on. Falls back to via_port()
     // when the arrival socket is unknown (single-listener hosts, where they match).
     let a_leg_host = state.a_leg_advertised_host(a_leg_local_addr, &a_leg_transport);
-    let a_leg_port = a_leg_advertised_port(a_leg_local_addr, state.via_port(&a_leg_transport));
+    let a_leg_port = state.a_leg_advertised_port(a_leg_local_addr, &a_leg_transport);
     let contact_value = format!(
         "<sip:{}:{};transport={}>",
         a_leg_host,

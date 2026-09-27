@@ -231,14 +231,15 @@ trust anchor is a different feature from a per-domain server certificate.
     domain in the request, or inbound mTLS, is what identifies a peer.
 
 A listener can be a **plain string** (`"10.0.0.1:5060"`) or the **extended form**
-with a per-socket advertised host, a DSCP override (like OpenSIPS
+with a per-socket advertised host and optional port, a DSCP override (like OpenSIPS
 `socket … as …`), and — on stream transports — a PROXY-protocol allowlist:
 
 ```yaml
 listen:
   tls:
     - address: "10.0.0.1:5061"
-      advertise: "sip.example.com"   # what peers should see in Via/Record-Route
+      advertise: "sip.example.com"   # host (and optional port) peers should see
+                                     # in Via / Record-Route / Contact
       dscp: EF                       # overrides the global listen.dscp
       proxy_protocol:                # stream listeners only — see below
         from: ["198.51.100.7/32"]    # the front(s) allowed to name the client
@@ -438,6 +439,40 @@ listen:
       advertise: "sip-tls.example.com"
 ```
 
+### Advertising a port other than the bound one
+
+`advertise` takes an optional port. Without one, siphon advertises the port the
+socket binds, as it always has. With one, that port goes in every header that
+tells a peer where to reach this listener: the Via sent-by, Record-Route, the
+B2BUA Contact on both legs, the Contact of an answered OPTIONS, and the Via and
+Contact of requests siphon originates (OPTIONS keepalives and probes,
+`proxy.send_request`, SUBSCRIBE and in-dialog NOTIFY). Use it when a front
+translates the port: it owns the public port and forwards to a different inner
+one, so a header naming the inner port points at a port nothing serves.
+
+```yaml
+listen:
+  tls:
+    - address: "10.0.0.1:15061"             # what siphon binds
+      advertise: "sip.example.com:5061"     # what peers are told
+  udp:
+    - address: "[2001:db8::10]:15060"
+      advertise: "[2001:db8::1]:5060"       # an IPv6 literal with a port needs brackets
+```
+
+Accepted forms: `host`, `host:port`, an IP literal (`192.0.2.10`, `2001:db8::1`,
+`[2001:db8::1]`) and `[v6]:port`. The value is parsed at startup and a malformed
+one (a port outside 1-65535, an unbracketed IPv6 literal with a port, a host with
+characters no SIP URI allows) stops siphon with an error naming the listener.
+Only headers change: siphon still binds and sends from the listen `address`, and
+it recognises both the bound and the advertised port as its own on an in-dialog
+Route.
+
+Top-level `advertised_address` takes a host only. It is the fallback for every
+transport at once, and one port cannot be right for UDP on 5060 and TLS on 5061,
+so a value with a port is refused at startup; put the port on the listener's
+`advertise` instead.
+
 !!! warning "TLS and WSS listeners should advertise a DNS name"
     A peer that opens a *new* TLS connection to siphon dials the host siphon put
     in its Contact, Record-Route or Via, and validates the certificate against
@@ -629,7 +664,8 @@ What it does:
 
 - **Advertises the right Via.** The outgoing Via sent-by is the selected
   listener's advertised address (its `advertise:`, else its bound IP) with the
-  listener's port, so the peer's response comes back to the same socket. This is
+  listener's port (the advertised one when `advertise:` names a port), so the
+  peer's response comes back to the same socket. This is
   the correctness reason to use `send_socket` instead of hand-rolling a Via
   rewrite — get the sent-by wrong and the response lands on the wrong listener
   (or nowhere).
