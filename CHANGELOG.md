@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Removed
+
+- **`SubscribeHandle.mirror_reply()` is gone.** It never did anything: it
+  ignored its `reply` argument, returned `False`, and was a placeholder for a
+  convenience that was never built. A script calling it got a silent no-op
+  where it expected a NOTIFY. Use `notify()`, which takes the
+  `Subscription-State` value directly via `state=`.
+
 ### Changed
 
 - **Rust library: `HandlerKind::ProxyReply` carries the filter**
