@@ -343,6 +343,15 @@ pub struct DispatcherState {
     /// sharing their dialog has been answered — see [`DeferredReferrerByeStore`].
     /// Empty except while a siphon-terminated transfer is completing.
     pub deferred_referrer_bye: Arc<DeferredReferrerByeStore>,
+    /// Per-source rate limiter for the inbound SIP parse-error warning.
+    ///
+    /// A peer that sends something unparseable on a timer (a NAT keepalive no
+    /// RFC describes, a scanner retrying the same malformed probe) used to cost
+    /// one WARN per datagram, thousands a day from a single well-behaved source,
+    /// which buries the parse errors that matter.  See [`ParseErrorLimiter`];
+    /// the periodic sweep prunes it, so it holds an entry only per source that
+    /// is *currently* noisy.
+    pub(super) parse_error_log: Arc<ParseErrorLimiter>,
     /// Lawful interception. `None` when `lawful_intercept.enabled` is false.
     ///
     /// The dispatcher consults this on every message, so interception does not

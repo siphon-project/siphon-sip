@@ -451,6 +451,24 @@ pub struct SiphonMetrics {
     /// (TCP/TLS) and dropped, each recorded toward the auto-ban. Excludes
     /// incomplete-but-plausible frames, empty connections, and CRLF keepalives.
     pub malformed_messages_total: IntCounter,
+    /// Total inbound payloads dropped before the SIP parser because they cannot
+    /// be a SIP message under any reading, by `reason`:
+    ///
+    /// - `whitespace` — stray CR / LF / SP only (RFC 3261 §7.5).
+    /// - `all_nul` — an all-NUL UDP datagram. No RFC defines this as a
+    ///   keepalive (RFC 5626 §4.4.1 is CRLF or STUN), but it is a common vendor
+    ///   NAT keepalive: a few bytes poked at a registered contact every several
+    ///   seconds for as long as the registration lives.
+    /// - `too_short` — a UDP datagram with fewer bytes than the shortest SIP
+    ///   start line the grammar permits.
+    ///
+    /// Deliberately **not** a security signal, and never scored toward the
+    /// auto-ban: the dominant source is a well-behaved peer holding a NAT
+    /// pinhole open. The counter exists so the volume stays visible now that
+    /// these drop at TRACE instead of WARN — a step change in `all_nul` means a
+    /// peer changed behaviour, and a `too_short` rate with no keepalive behind
+    /// it is worth one TRACE session.
+    pub non_sip_datagrams_dropped_total: IntCounterVec,
     /// Inbound stream connections refused by `security.connection_limits`,
     /// labelled by which ceiling refused them (`handshakes_per_source`,
     /// `handshakes`, `connections_per_source`, `connections`).
@@ -930,6 +948,14 @@ impl SiphonMetrics {
             "Total non-SIP / unparseable messages received on a stream transport (TCP/TLS) and dropped, each recorded toward the auto-ban",
         )?;
 
+        let non_sip_datagrams_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_non_sip_datagrams_dropped_total",
+                "Total inbound payloads dropped before the SIP parser because they cannot be a SIP message (whitespace-only keepalive, all-NUL vendor NAT keepalive, or fewer bytes than the shortest possible SIP start line)",
+            ),
+            &["reason"],
+        )?;
+
         let connections_refused_total = IntCounterVec::new(
             Opts::new(
                 "siphon_connections_refused_total",
@@ -1273,6 +1299,7 @@ impl SiphonMetrics {
         registry.register(Box::new(credential_failures_total.clone()))?;
         registry.register(Box::new(auth_backend_errors_total.clone()))?;
         registry.register(Box::new(malformed_messages_total.clone()))?;
+        registry.register(Box::new(non_sip_datagrams_dropped_total.clone()))?;
         registry.register(Box::new(connections_refused_total.clone()))?;
         registry.register(Box::new(stream_connections_active.clone()))?;
         registry.register(Box::new(handshakes_in_flight.clone()))?;
@@ -1358,6 +1385,7 @@ impl SiphonMetrics {
             credential_failures_total,
             auth_backend_errors_total,
             malformed_messages_total,
+            non_sip_datagrams_dropped_total,
             connections_refused_total,
             stream_connections_active,
             handshakes_in_flight,

@@ -8,33 +8,59 @@ use super::*;
 
 /// Handle a single inbound SIP message (request or response).
 pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
-    // Defensive drop of all-whitespace UDP datagrams (RFC 3261 §7.5 — peers
-    // may send stray CRLF as a NAT keepalive ping).  Stream transports
-    // (TCP/TLS/WSS/pool) handle RFC 5626 §4.4.1 ping/pong in their own
-    // read tasks before forwarding to the dispatcher, so this branch only
-    // fires for UDP and shields the parser from logging a warn.
-    //
-    // Fast-path gate: real SIP messages start with an uppercase ASCII
-    // letter, so the all-bytes scan only runs when the first byte already
-    // looks like whitespace.
-    if matches!(inbound.data.first(), Some(b'\r' | b'\n' | b' ')) {
-        let all_whitespace = inbound
-            .data
-            .iter()
-            .all(|b| matches!(b, b'\r' | b'\n' | b' '));
-        if all_whitespace {
-            return;
+    // Defensive drop of payloads that cannot be a SIP message at all — stray
+    // CRLF (RFC 3261 §7.5), a vendor's all-NUL UDP NAT keepalive, or a datagram
+    // too short to hold a start line.  Stream transports (TCP/TLS/WSS/pool)
+    // handle RFC 5626 §4.4.1 ping/pong in their own read tasks before
+    // forwarding here, so in practice this only fires for UDP.  TRACE plus a
+    // counter rather than a warning: these are well-behaved peers doing
+    // something the RFCs do not describe, at a steady several-per-minute per
+    // registration, and a WARN an operator learns to scroll past is worse than
+    // none.  See `classify_non_sip` for why each shape qualifies.
+    if let Some(reason) = classify_non_sip(&inbound.data, inbound.transport) {
+        trace!(
+            remote = %inbound.remote_addr,
+            transport = inbound.transport.label(),
+            bytes = inbound.data.len(),
+            reason = reason.label(),
+            "dropping a payload that cannot be SIP"
+        );
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .non_sip_datagrams_dropped_total
+                .with_label_values(&[reason.label()])
+                .inc();
         }
+        return;
     }
 
     // Parse SIP message — supports binary bodies (e.g. SMS TPDU)
     let message = match parse_sip_message_bytes(&inbound.data) {
         Ok(message) => message,
         Err(error) => {
-            warn!(
-                remote = %inbound.remote_addr,
-                "SIP parse error: {}", truncate_for_log(&error.to_string())
-            );
+            // One line per source per window, not one per datagram.  A peer
+            // sending something unparseable every few seconds otherwise buries
+            // every other parse error in the log.  The suppressed count rides
+            // the next summary (and `ParseErrorLimiter::prune` flushes it if the
+            // peer goes quiet first), so nothing is swallowed.
+            let error = error.to_string();
+            let detail = truncate_for_log(&error);
+            match state
+                .parse_error_log
+                .record(inbound.remote_addr.ip(), std::time::Instant::now())
+            {
+                ParseErrorAction::Log { suppressed: 0 } => warn!(
+                    remote = %inbound.remote_addr,
+                    "SIP parse error: {}", detail
+                ),
+                ParseErrorAction::Log { suppressed } => warn!(
+                    remote = %inbound.remote_addr,
+                    suppressed,
+                    "SIP parse error: {} (further unparseable messages from this source went unlogged)",
+                    detail
+                ),
+                ParseErrorAction::Suppress => {}
+            }
             return;
         }
     };

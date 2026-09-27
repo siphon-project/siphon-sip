@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use bytes::Bytes;
 use dashmap::DashMap;
 use pyo3::prelude::*;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::b2bua::actor::{
     CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo as LegTransport,
@@ -58,6 +58,7 @@ mod failure;
 mod identity;
 mod in_dialog;
 mod inbound;
+mod inbound_filter;
 mod intercept;
 mod liveness;
 mod media_init;
@@ -107,6 +108,8 @@ mod dialog_state_events_tests;
 mod dialog_state_transfer_tests;
 #[cfg(test)]
 mod held_bye_tests;
+#[cfg(test)]
+mod inbound_drop_tests;
 #[cfg(test)]
 mod late_provisional_tests;
 #[cfg(test)]
@@ -204,6 +207,7 @@ use failure::*;
 use identity::*;
 use in_dialog::*;
 use inbound::*;
+use inbound_filter::*;
 use intercept::*;
 use liveness::*;
 use media_init::*;
@@ -543,6 +547,7 @@ pub async fn run(
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
+        parse_error_log: Arc::new(ParseErrorLimiter::default()),
         // Interception is enforced here, not in the script. `LI_MANAGER` is
         // set by `init_li` before the dispatcher is built when
         // `lawful_intercept.enabled` is true.

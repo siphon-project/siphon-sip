@@ -15,6 +15,30 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **A vendor UDP NAT keepalive no longer logs as a SIP parse error.** Three
+  payload shapes that cannot be a SIP message are now dropped at TRACE before
+  the parser and counted on the new
+  `siphon_non_sip_datagrams_dropped_total{reason}` (also in
+  `/admin/metrics.json` under `counters.non_sip_datagrams_dropped`):
+  whitespace-only, as before (`whitespace`, any transport); an all-NUL UDP
+  datagram (`all_nul`); and a UDP datagram shorter than the 14-byte grammar
+  floor for a SIP start line (`too_short`). No RFC defines an all-NUL keepalive
+  — RFC 5626 §4.4.1 is CRLF or STUN — but registrars send one at a registered
+  contact every few seconds for as long as the binding lives, which was ~5,700
+  `WARN`s a day per peer. None of the three is scored toward the auto-ban. The
+  length bound is the grammar floor (the shorter of a `Status-Line` with an
+  empty `Reason-Phrase` and a `Request-Line` with a one-character method), so a
+  malformed-but-plausible message still reaches the parser and still warns.
+
+  The parse-error `WARN` that remains is now **rate-limited per source**: the
+  first logs immediately, the next one past a 60 s window logs a summary
+  carrying the count that went unlogged, and the periodic sweep flushes an
+  outstanding count and forgets a source once it goes quiet. The suppression
+  table is capped at 4,096 sources; past the cap every error logs rather than
+  the table growing. Stream transports keep warning on short and NUL frames —
+  their read tasks have their own non-SIP classifier and score what they reject
+  toward the auto-ban, so anything past framing there is a signal.
+
 - **Rust library: `HandlerKind::ProxyReply` carries the filter**
   (`ProxyReply(Option<String>)`), `ScriptState::proxy_reply_handlers(method)`
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
