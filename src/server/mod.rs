@@ -2274,7 +2274,7 @@ impl SiphonServer {
                 &listen_addrs,
                 &advertised_addrs,
                 &hep_sender,
-                stream_connections.clone(),
+                &connection_pool,
             );
         }
 
