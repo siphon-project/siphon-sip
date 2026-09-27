@@ -494,7 +494,7 @@ pub(super) fn dialog_state_sweep_at(state: &DispatcherState, now: Instant) {
 fn probe_request(probe: &Probe, state: &DispatcherState) -> Option<(SipMessage, String)> {
     let transport = probe.hop.transport;
     let (host, port) = match probe.hop.local_addr {
-        Some(local) => pinned_sent_by(local, || state.via_host(&transport)),
+        Some(local) => pinned_sent_by(local, || state.wildcard_pinned_sent_by(&transport, local)),
         None => (state.via_host(&transport), state.via_port(&transport)),
     };
     let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4().simple());
