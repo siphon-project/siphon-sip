@@ -60,6 +60,25 @@ function callEventFromFrame(frame: EventFrame): CallEvent {
   return { kind: sipEventKind(frame.event), payload: frame.payload ?? null, frame };
 }
 
+/**
+ * An application-level event: pushed to every connection of an app that opted
+ * into its class (`control.apps[].events`), about the deployment rather than a
+ * channel — `RegistrationChanged`, `DialogStateChanged` (cast `payload` to
+ * {@link import("./protocol").DialogStateChangedPayload}). Its frame has no
+ * channel, so it reaches {@link SipClient.onAppEvent}, never a call.
+ */
+export interface AppEvent {
+  /** The parsed event kind. */
+  kind: SipEventKind;
+  /** The event-specific payload. */
+  payload: unknown;
+  /** The raw frame. */
+  frame: EventFrame;
+}
+
+/** A handler for application-level events. */
+export type AppEventHandler = (event: AppEvent) => void;
+
 /** Options for a UAS provisional / final response (`answer` / `progress`). */
 export interface ResponseOptions {
   code?: number;
@@ -1192,10 +1211,15 @@ export class CallStream {
 class SipFacade {
   private handler: CallHandler | null = null;
   private callQueue: AsyncQueue<Call> | null = null;
+  private appHandler: AppEventHandler | null = null;
   private readonly channels = new Map<string, AsyncQueue<CallEvent>>();
 
   setHandler(handler: CallHandler): void {
     this.handler = handler;
+  }
+
+  setAppHandler(handler: AppEventHandler): void {
+    this.appHandler = handler;
   }
 
   setStream(): CallStream {
@@ -1240,6 +1264,13 @@ class SipFacade {
       }
     } else if (frame.channel) {
       this.route(frame.channel, callEventFromFrame(frame));
+    } else {
+      // No channel: an application-level event.
+      this.appHandler?.({
+        kind: sipEventKind(frame.event),
+        payload: frame.payload ?? null,
+        frame,
+      });
     }
   }
 
@@ -1339,6 +1370,16 @@ export class SipClient {
   /** A pull-style stream of handed-over calls (alternative to a handler). */
   calls(): CallStream {
     return this.facade.setStream();
+  }
+
+  /**
+   * Register a handler for application-level events — the ones an app opts
+   * into with `control.apps[].events` (`RegistrationChanged`,
+   * `DialogStateChanged`), which concern no channel and so reach no call.
+   * Replaces any previous handler.
+   */
+  onAppEvent(handler: AppEventHandler): void {
+    this.facade.setAppHandler(handler);
   }
 
   /** Drive the supervised connection loop (reconnect + resync). */

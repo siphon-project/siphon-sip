@@ -213,6 +213,9 @@ pub struct ControlBus {
     /// app → set of owned channel ids (disconnect cleanup + resync index).
     app_calls: DashMap<String, HashSet<String>>,
     app_config: HashMap<String, ControlAppConfig>,
+    /// Every application-level event class some app subscribed to, fixed at
+    /// construction: what the signalling path asks before building one.
+    app_classes: HashSet<String>,
     command_tx: flume::Sender<ControlCommand>,
     event_queue_depth: usize,
     slow_consumer: SlowConsumerPolicy,
@@ -233,6 +236,10 @@ impl ControlBus {
         reattach_grace_secs: u64,
         handoff_deadline_ms: u64,
     ) -> Arc<Self> {
+        let app_classes = apps
+            .iter()
+            .flat_map(|app| app.events.iter().cloned())
+            .collect();
         let app_config = apps
             .into_iter()
             .map(|app| (app.name.clone(), app))
@@ -242,6 +249,7 @@ impl ControlBus {
             channels: DashMap::new(),
             app_calls: DashMap::new(),
             app_config,
+            app_classes,
             command_tx,
             event_queue_depth: event_queue_depth.max(1),
             slow_consumer,
@@ -275,6 +283,18 @@ impl ControlBus {
     /// The process-global bus, if installed.
     pub fn global() -> Option<Arc<ControlBus>> {
         CONTROL_BUS.get().cloned()
+    }
+
+    /// The process-global bus, if installed, without taking a reference: for a
+    /// signalling-path check that runs on every call.
+    pub fn global_ref() -> Option<&'static Arc<ControlBus>> {
+        CONTROL_BUS.get()
+    }
+
+    /// Whether any configured app asked for the application-level event
+    /// `class` (`control.apps[].events`).
+    pub fn wants_app_class(&self, class: &str) -> bool {
+        self.app_classes.contains(class)
     }
 
     /// A cloneable sender for the command channel (used by the listener).

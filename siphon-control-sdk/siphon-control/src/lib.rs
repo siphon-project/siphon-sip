@@ -78,7 +78,9 @@ use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
 use siphon_control_client::proto::ControlErrorCode;
-use siphon_control_client::sip::{Call as RustCall, OriginateOptions, SipClient, SipServer};
+use siphon_control_client::sip::{
+    AppEvent, Call as RustCall, OriginateOptions, SipClient, SipServer,
+};
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
 
 mod args;
@@ -222,6 +224,8 @@ struct ClientInner {
     config: ClientConfig,
     client: tokio::sync::Mutex<Option<Arc<SipClient>>>,
     handler: Mutex<Option<Py<PyAny>>>,
+    /// The `@client.on_app_event` handler, for application-level events.
+    app_handler: Mutex<Option<Py<PyAny>>>,
 }
 
 /// The control client. Construct it, register a handler with `@client.on_call`,
@@ -253,6 +257,7 @@ impl ControlClient {
                 config,
                 client: tokio::sync::Mutex::new(None),
                 handler: Mutex::new(None),
+                app_handler: Mutex::new(None),
             }),
         }
     }
@@ -260,6 +265,19 @@ impl ControlClient {
     /// Register the per-call handler. Usable as a decorator: `@client.on_call`.
     fn on_call(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
         *lock(&self.inner.handler) = Some(handler.clone_ref(py));
+        handler
+    }
+
+    /// Register the handler for application-level events. Usable as a
+    /// decorator: `@client.on_app_event`.
+    ///
+    /// These are the events an app opts into with `control.apps[].events` —
+    /// `RegistrationChanged`, `DialogStateChanged` — which concern no channel
+    /// and so never reach an `on_call` handler. The handler is called as
+    /// `handler(event, payload)` with the event name and its payload dict, and
+    /// may be `async`. Installed by `run()`.
+    fn on_app_event(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
+        *lock(&self.inner.app_handler) = Some(handler.clone_ref(py));
         handler
     }
 
@@ -422,8 +440,14 @@ impl ControlClient {
         // the handler bridge can drive Python coroutines from Rust.
         let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         let handler = lock(&self.inner.handler).as_ref().map(|h| h.clone_ref(py));
+        let app_handler = lock(&self.inner.app_handler)
+            .as_ref()
+            .map(|h| h.clone_ref(py));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = ensure_client(&inner).await?;
+            if let Some(app_handler) = app_handler {
+                install_app_event_bridge(&client, app_handler, locals.clone());
+            }
             if let Some(handler) = handler {
                 install_handler_bridge(&client, handler, locals);
             }
@@ -458,6 +482,7 @@ impl ControlClient {
         // shutdown and the socket actually closing would otherwise still be
         // dispatched into an app that has said it is done.
         *lock(&self.inner.handler) = None;
+        *lock(&self.inner.app_handler) = None;
     }
 
     /// `async with ControlClient(...) as client:` — closes on the way out,
@@ -521,6 +546,60 @@ fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLo
             Ok(())
         }
     });
+}
+
+/// Bridge application-level events to the stored Python handler: each one is
+/// handed over as `handler(event, payload)` on the asyncio loop captured in
+/// `locals`, off the client's receive path.
+fn install_app_event_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLocals) {
+    client.set_app_event_handler(move |event: AppEvent| {
+        let Some(handler) = attach_if_running(|py| handler.clone_ref(py)) else {
+            return;
+        };
+        let locals = locals.clone();
+        tokio::spawn(dispatch_app_event(handler, locals, event));
+    });
+}
+
+async fn dispatch_app_event(handler: Py<PyAny>, locals: TaskLocals, event: AppEvent) {
+    // A closed loop cannot run the handler; see `dispatch_to_python`.
+    let loop_usable = attach_if_running(|py| {
+        locals
+            .event_loop(py)
+            .call_method0("is_closed")
+            .and_then(|closed| closed.extract::<bool>())
+            .map(|closed| !closed)
+            .unwrap_or(false)
+    });
+    if loop_usable != Some(true) {
+        return;
+    }
+    let name = event.frame.event.clone();
+    let payload = event.payload;
+    let scoped = pyo3_async_runtimes::tokio::scope(locals, async move {
+        let awaitable = attach_if_running(|py| -> PyResult<Option<_>> {
+            let py_payload = json_to_py(py, &payload)?;
+            let result = handler.bind(py).call1((name, py_payload))?;
+            if result.hasattr("__await__")? {
+                Ok(Some(pyo3_async_runtimes::tokio::into_future(result)?))
+            } else {
+                Ok(None)
+            }
+        })?;
+        Some(match awaitable {
+            Ok(Some(future)) => future.await.map(|_| ()),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        })
+    })
+    .await;
+    if let Some(Err(error)) = scoped {
+        attach_if_running(|py| {
+            if !error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
+                error.print(py);
+            }
+        });
+    }
 }
 
 async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCall) {

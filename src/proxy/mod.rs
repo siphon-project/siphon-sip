@@ -7,5 +7,6 @@
 //! strategy.
 
 pub mod core;
+pub mod dialog_state;
 pub mod fork;
 pub mod session;

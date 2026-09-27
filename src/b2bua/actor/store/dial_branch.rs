@@ -78,4 +78,30 @@ impl CallActorStore {
             .map(|mut call| call.take_dial_branches())
             .unwrap_or_default()
     }
+
+    /// Drop every B-leg of a call, leaving the A-leg and its dialog intact.
+    ///
+    /// A controller-owned dial that failed is done with the legs it rang, but
+    /// not with the caller: the controller may dial somewhere else on the same
+    /// channel, and a stale B-leg would make the next attempt look like glare
+    /// and confuse the winner bookkeeping.
+    pub fn clear_b_legs(&self, call_id: &str) {
+        let mut ended = Vec::new();
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.b_legs.clear();
+            call.b_leg_status.clear();
+            call.b_leg_handles.clear();
+            call.winner = None;
+            ended = call.end_orphaned_dialogs();
+        }
+        publish_dialog_states(ended);
+    }
+
+    /// Whether a controller-issued `dial` is still awaiting its outcome.
+    pub fn is_control_dial(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .map(|call| call.control_dial)
+            .unwrap_or(false)
+    }
 }

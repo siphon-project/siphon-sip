@@ -278,6 +278,10 @@ pub(super) fn handle_request(
         }
     }
 
+    // An in-dialog request of a tracked proxied dialog: a BYE ends it, here and
+    // before the script, so a BYE the script answers itself ends it too.
+    proxy_dialog_in_dialog_request(&message, &method, state);
+
     debug!(
         method = %method,
         remote = %inbound.remote_addr,
@@ -607,6 +611,42 @@ pub(super) fn handle_request(
             inbound.connection_id,
             Some(inbound.local_addr),
             state,
+        );
+        return;
+    }
+
+    // An in-dialog request of a dialog siphon Record-Routed on its own, for
+    // `DialogStateChanged`: the script never asked to see it, so siphon routes it
+    // along the route set itself (RFC 3261 §16.12) — a script written without
+    // Record-Route handles exactly what it handled before.
+    if follows_own_record_route(&message, state) {
+        let mut routed = message;
+        core::consume_self_routes(&mut routed.headers, &state.self_identity);
+        if method == "INVITE" {
+            let trying =
+                build_response(&routed, 100, "Trying", state.server_header.as_deref(), &[]);
+            send_message_from(
+                trying,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+        }
+        relay_request(
+            &routed,
+            None,
+            false,
+            &inbound,
+            server_key.as_ref(),
+            state,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         return;
     }
@@ -1178,6 +1218,9 @@ pub(super) fn handle_request(
                 );
             }
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
+            // A registered phone's INVITE: its dialog is tracked from here,
+            // with the identity the script authenticated.
+            proxy_dialog_begin(&message_guard, auth_user.as_deref(), &inbound, state);
             relay_request(
                 &message_guard,
                 next_hop.as_deref(),
@@ -1192,6 +1235,7 @@ pub(super) fn handle_request(
                 flow.as_ref(),
                 send_socket.as_ref(),
             );
+            proxy_dialog_after_relay(&message_guard, state);
         }
         RequestAction::Fork {
             targets,
@@ -1240,6 +1284,7 @@ pub(super) fn handle_request(
                     _ => crate::proxy::fork::ForkStrategy::Parallel,
                 };
                 let send_socket = state.resolve_send_socket(send_socket.as_deref());
+                proxy_dialog_begin(&message_guard, auth_user.as_deref(), &inbound, state);
                 relay_fork_request(
                     &message_guard,
                     targets,
@@ -1254,6 +1299,7 @@ pub(super) fn handle_request(
                     on_reply_cb,
                     on_failure_cb,
                 );
+                proxy_dialog_after_relay(&message_guard, state);
             }
         }
     }

@@ -163,6 +163,25 @@ pub fn spawn_session_timer_refresh(state: &Arc<DispatcherState>) {
     });
 }
 
+/// The liveness pass behind `DialogStateChanged`, every 5 s: ends the reported
+/// state of dialogs no BYE ended and sends the in-dialog OPTIONS probes that
+/// are due. Costs one check when no app subscribes to `dialog`.
+pub fn spawn_dialog_state_sweep(state: &Arc<DispatcherState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let state = Arc::clone(&state);
+            tokio::task::spawn_blocking(move || {
+                dialog_state_sweep_at(&state, std::time::Instant::now());
+            })
+            .await
+            .ok();
+        }
+    });
+}
+
 /// Registration state changes to the script's `@registrar.on_change`, and
 /// the Rf ACR-EVENT that TS 32.260 §5.1 owes each one.
 pub fn spawn_registrar_events(
@@ -192,6 +211,12 @@ pub fn spawn_registrar_events(
                         (aor.clone(), "expired")
                     }
                 };
+
+                // A binding that went away ends the dialogs it vouched for at
+                // once, rather than at the next liveness pass.
+                if matches!(event_type, "deregistered" | "expired") {
+                    dialog_state_sweep_at(&state_for_events, std::time::Instant::now());
+                }
 
                 // CDR: emit a REGISTER record for this state change when
                 // cdr.auto_emit + cdr.include_register are on — independent of

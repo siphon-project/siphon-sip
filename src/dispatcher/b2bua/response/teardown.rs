@@ -187,6 +187,8 @@ pub fn cancel_settled_branches(
     // controller is told which. One settled already (a ring timeout that led to
     // this CANCEL) keeps the outcome it was reported with.
     control_dial_legs_cancelled(call_id, legs, state);
+    // A registered callee among them stops ringing.
+    callee_dialogs_ended(call_id, legs, state);
     let mut kept = Vec::with_capacity(legs.len());
     for leg in legs {
         // Stop retransmitting the INVITE, as the ring-timeout CANCEL does: an

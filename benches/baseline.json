@@ -1,6 +1,9 @@
 {
   "bencode/decode_offer": 278.7218381689834,
   "bencode/encode_offer": 232.56684675882983,
+  "dialog_state_gate_unsubscribed": 0.7413651537741939,
+  "dialog_state_match_callee_1k_bindings": 35875.071642349416,
+  "dialog_state_track_proxied_call": 1541.452045424578,
   "diameter/decode_mar": 778.2619409049448,
   "diameter/encode_mar": 306.7683137770146,
   "digest/response_aka_md5": 1290.148111456133,

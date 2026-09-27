@@ -32,6 +32,7 @@ import type {
   DialBranchOutcome,
   DialBranchPayload,
   DialFailedPayload,
+  DialogStateChangedPayload,
   TransferOutcomePayload,
 } from "../src/index";
 import type { CommandTransport } from "../src/session";
@@ -161,6 +162,28 @@ describe("SipVerb wire tokens + event names", () => {
       '{"peer_call_id":"call-b","peer_sip_call_id":"b@host","reason":"supervisor took over"}',
     );
     expect(unbridged.reason).toBe("supervisor took over");
+  });
+
+  it("decodes DialogStateChanged and the aor on dial branches", () => {
+    expect(sipEventKind("DialogStateChanged")).toBe("DialogStateChanged");
+    const state: DialogStateChangedPayload = JSON.parse(
+      '{"aor":"sip:202@example.com","state":"trying","direction":"initiator","leg_id":"leg-2",' +
+        '"call_id":"a1@host","local_tag":"phone-tag","remote_tag":null,' +
+        '"remote_identity":{"uri":"sip:15550100077@example.com","display_name":"Outside Line"}}',
+    );
+    expect(state.direction).toBe("initiator");
+    expect(state.remote_tag).toBeNull();
+    expect(state.remote_identity.display_name).toBe("Outside Line");
+
+    const named: DialAnsweredPayload = JSON.parse(
+      '{"leg_id":"leg-2","leg_sip_call_id":"b2@host","target":"sip:202@198.51.100.22:5060",' +
+        '"aor":"sip:202@example.com","code":200}',
+    );
+    expect(named.aor).toBe("sip:202@example.com");
+    const raw: DialBranchPayload = JSON.parse(
+      '{"leg_id":"leg-1","leg_sip_call_id":"b1@host","target":"sip:15550100077@198.51.100.7"}',
+    );
+    expect(raw.aor).toBeUndefined();
   });
 
   it("marks exactly the dial outcomes as final", () => {

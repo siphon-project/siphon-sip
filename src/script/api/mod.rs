@@ -187,6 +187,15 @@ pub fn registrar_arc() -> Option<&'static std::sync::Arc<crate::registrar::Regis
     REGISTRAR_ARC.get()
 }
 
+/// The process-wide registrar, installed with defaults if nothing has installed
+/// one yet: what a test registers its phones into, so the dispatcher finds them
+/// where it finds a script's. Shared by every test in the binary, so each test
+/// registers AoRs and Contacts of its own.
+#[cfg(test)]
+pub(crate) fn test_registrar() -> &'static std::sync::Arc<crate::registrar::Registrar> {
+    REGISTRAR_ARC.get_or_init(|| std::sync::Arc::new(crate::registrar::Registrar::default()))
+}
+
 /// The unified stream-connection registry — stored so `Flow.is_alive` can do a
 /// real cross-transport liveness lookup (is this UE's stream connection still
 /// open on this process?).  Set once at server startup.
