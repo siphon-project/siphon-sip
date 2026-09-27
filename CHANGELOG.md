@@ -51,6 +51,7 @@ entry, but a working config keeps working.
   (`ProxyReply(Option<String>)`), `ScriptState::proxy_reply_handlers(method)`
   selects by it, and `HandlerKind::ProxyRegisterReply` and the unused
   `proxy::reply_pipeline` module are removed.
+
 - **siphon Record-Routes a proxied INVITE that involves a registered phone when
   an app subscribes to `dialog` events**, whether or not the script called
   `record_route()` (idempotent when it did). RFC 3261 §16.6 step 4 lets a proxy
@@ -125,6 +126,16 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A CANCEL for a call driven over the control plane was answered `481
+  Call/Transaction Does Not Exist` and cancelled nothing.** The B2BUA route in
+  `handle_cancel` was reached only when the *script* had registered a B2BUA
+  handler, which asks the wrong question: a call created over `control.inbound`
+  has a call actor and no script handlers, so its CANCEL fell through to the
+  proxy-session lookup — which cannot match a B2BUA call — and the callee kept
+  ringing while the flow went on to answer a call the caller had abandoned. The
+  call actor's existence is now the whole test. A proxy CANCEL still falls
+  through, and a CANCEL with genuinely no actor is still answered 481.
+
 - **An auto-ban left the banned source's open connections running.** Every ban
   check was per *connection* — the transport ACL at accept, and the re-check once
   a TLS/WebSocket handshake completes — so a client that never reconnects met
@@ -196,14 +207,17 @@ entry, but a working config keeps working.
   `@b2bua.on_cancel` had the same race with a retransmitted CANCEL, which ran it
   twice and sent the caller a second 487; the copy now gets its 200 and
   nothing else.
+
 - **`request.set_ruri(uri)` exists.** Scripts calling it got
   `AttributeError: 'builtins.Request' object has no attribute 'set_ruri'`: the
   runtime only had the `request.ruri = ...` property setter, while the SDK mock
   and the number-routing cookbook documented a method. Both forms now work and
   take a full URI string or a `SipUri`.
+
 - **`request.ruri.user = ...` (and `.host`, `.port`) rewrites the request.** It
   changed a copy, so the request was relayed unchanged and the script got no
   error.
+
 - **Every Request-URI change is checked the same way.** `set_ruri`, the `ruri`
   property, `set_ruri_user`, `set_ruri_host`, the new parameter methods and
   assignment on `request.ruri` all go through one check and raise `ValueError`
@@ -215,6 +229,7 @@ entry, but a working config keeps working.
   `token` / `paramchar`. Service codes such as `*21#` still pass. An IPv6 host
   is stored bracketed with or without brackets on input. A refused change
   leaves the R-URI as it was.
+
 - **An absoluteURI with a colon in it survives serialization.**
   `urn:service:sos` (RFC 5031) was written as `urn:[service:sos]`: the IPv6
   bracketing for a SIP host was applied to the opaque part.
@@ -394,6 +409,7 @@ entry, but a working config keeps working.
   `request.remove_ruri_param(name)`** add, replace or remove one Request-URI
   parameter (`;user=phone`, `;transport=tcp`, a flag such as `;lr`) without
   rebuilding the URI. Names match case-insensitively (RFC 3261 §19.1.4).
+
 - **`SipUri.user_params`** reads the parameters inside the userinfo, between
   the user and `@`, as a dict (`params` never included them). RFC 4694 number
   portability is readable at last: `"npdi" in request.ruri.user_params`,
@@ -477,6 +493,7 @@ entry, but a working config keeps working.
   awaited counterpart to the implicit cache read the properties no longer make
   (below) — for a dialog another replica owns whose local entry has since been
   reaped.
+
 - **Dialog state of registered phones on the control plane: `DialogStateChanged`.**
   An app that lists `dialog` in `control.apps[].events` is told the RFC 4235
   state of every dialog a registered AoR has through siphon, B2BUA calls and

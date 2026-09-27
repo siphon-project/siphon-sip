@@ -99,6 +99,8 @@ mod control_dial_branch_events_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
+mod control_inbound_cancel_tests;
+#[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
