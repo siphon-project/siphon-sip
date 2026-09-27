@@ -65,7 +65,9 @@ fn media_target(
 ///   - the backend can't do it (rtpproxy media / non-siphon-rtp ws_tee) →
 ///     `unsupported_verb`,
 ///   - anything else (transport, timeout, engine error) → `unavailable`.
-pub(super) fn media_error(error: crate::rtpengine::error::RtpEngineError) -> ControlResult {
+pub(in crate::control) fn media_error(
+    error: crate::rtpengine::error::RtpEngineError,
+) -> ControlResult {
     use crate::rtpengine::error::RtpEngineError;
     if error.is_call_not_found() {
         ControlResult::error(ControlErrorCode::NotFound, "media session is gone")
@@ -135,6 +137,37 @@ pub(super) fn parse_play_source(
     }
     // Unreachable given count == 1, but return a typed error rather than panic.
     Err("play requires a media source".to_string())
+}
+
+/// Refuse a `play` whose inline `blob` cannot fit a media control frame, as a
+/// `bad_request` that names the verb, the offending argument and the bound —
+/// with the same three carried as machine-readable `details` so a controller can
+/// branch on them without parsing the prose. `None` when the source fits.
+///
+/// Runs **before** the media session is resolved and before any frame is
+/// encoded. Without it the frame encoder refuses instead, as a transport
+/// `Protocol` error that reaches the controller as `unavailable` (the code for
+/// "the engine is not there") carrying a JSON frame length the controller never
+/// constructed — so an oversized prompt read as a dead engine, and the two want
+/// opposite responses: never retry this prompt versus retry later.
+pub(in crate::control) fn play_blob_refusal(
+    source: &crate::rtpengine::client::PlayMediaSource,
+) -> Option<ControlResult> {
+    use crate::rtpengine::client::MAX_PLAY_BLOB_BYTES;
+    let bytes = source.oversized_blob_len()?;
+    Some(ControlResult::error_with_details(
+        ControlErrorCode::BadRequest,
+        format!(
+            "play args.blob is {bytes} bytes of audio, over the {MAX_PLAY_BLOB_BYTES}-byte limit \
+             for an inline blob — play a longer prompt from args.file or args.url instead"
+        ),
+        serde_json::json!({
+            "verb": "play",
+            "argument": "blob",
+            "bytes": bytes,
+            "limit_bytes": MAX_PLAY_BLOB_BYTES,
+        }),
+    ))
 }
 
 /// Which kind of WebSocket stream a `stream_start` / `stream_stop` addresses.
@@ -269,6 +302,11 @@ pub(super) async fn play(channel: &ChannelRef, args: &serde_json::Value) -> Cont
         Ok(source) => source,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
+    // Before the media session is looked up and before a frame is built: an
+    // argument out of range is the caller's, not the engine's.
+    if let Some(refusal) = play_blob_refusal(&source) {
+        return refusal;
+    }
     let repeat = args.get("repeat").and_then(|value| value.as_u64());
     let start_ms = args.get("start_ms").and_then(|value| value.as_u64());
     let duration_ms = args.get("duration_ms").and_then(|value| value.as_u64());

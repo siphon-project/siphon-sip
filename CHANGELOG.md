@@ -135,6 +135,45 @@ entry, but a working config keeps working.
   ringing while the flow went on to answer a call the caller had abandoned. The
   call actor's existence is now the whole test. A proxy CANCEL still falls
   through, and a CANCEL with genuinely no actor is still answered 481.
+- **A refused control verb was logged nowhere, and its refusal named the wrong
+  layer.** Nothing was written for a command the control plane rejected, at any
+  level: a controller told "siphon refused it" could not corroborate that from
+  siphon's own log, and the natural reading of a silent log is that the command
+  never arrived. Every applied command now logs one line — `debug` when it was
+  carried out (`control plane: command applied`), `warn` when the controller
+  asked for something impossible and `error` when the stack could not do
+  something possible (both `control plane: command refused`, one grep, the level
+  is the split) — carrying the application, the module, the verb, the channel,
+  the channel's SIP Call-ID (the CDR / HEP / capture join key) and, on a
+  refusal, the stable error code and the message the controller got. The two
+  refusals that happen before the dispatch — the command consumer not running,
+  and an apply task that dropped a command without answering — log themselves at
+  `error`.
+
+  A failed reply may now carry `error.details`, a JSON object of stable
+  machine-readable fields beside the prose, so a controller can branch without
+  parsing English. Additive and absent unless a refusal has something to add;
+  an existing client that ignores unknown fields is unaffected.
+
+- **`play` now refuses an oversized inline `blob` itself, as `bad_request`
+  rather than `unavailable`.** An inline blob over the media control frame's
+  budget reached the frame encoder, which refused it as a transport protocol
+  error — surfacing to the controller as `unavailable` (the code for "the media
+  engine is not there") carrying a JSON frame length the controller never
+  constructed and no mention of the verb, the argument or the limit. The blob is
+  now checked before the media session is resolved and before any frame is
+  built, and refused with the verb, the offending argument and the bound in
+  bytes of audio, plus `details: {verb, argument, bytes, limit_bytes}`.
+
+  **A controller branching on `unavailable` for this case has to move to
+  `bad_request`**: the two want opposite responses (never retry this prompt
+  versus retry later), which is why they were split. A genuinely unreachable
+  engine still answers `unavailable`. The limit is the worst-case-encoding bound
+  derived from the frame budget (261,120 bytes of audio today), so it is
+  content-independent and a controller can apply it itself; a prompt past it
+  belongs in `args.file` or `args.url`, which ship a reference instead of the
+  bytes. Blobs between that bound and the frame limit were accepted before and
+  are refused now — they only fitted depending on which bytes they contained.
 
 - **An auto-ban left the banned source's open connections running.** Every ban
   check was per *connection* — the transport ACL at accept, and the re-check once

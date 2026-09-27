@@ -58,6 +58,35 @@ pub enum PlayMediaSource {
     Http(String),
 }
 
+/// Worst-case JSON bytes one audio byte costs inside a `blob` source.
+///
+/// The siphon-rtp control frame is JSON, and `serde_json` has no raw-bytes
+/// representation — a byte array renders as decimal numbers with separators, so
+/// the widest a single byte gets is `"255,"`: three digits and a comma.
+const JSON_BYTES_PER_BLOB_BYTE: usize = 4;
+
+/// Room left for everything in a `play media` frame that is not the blob — the
+/// request envelope, the command name, the call-id, the tags and the playback
+/// arguments. Generous on purpose: the bound it produces has to hold for the
+/// longest Call-ID a carrier will hand us, not for the shortest.
+const PLAY_FRAME_ENVELOPE_RESERVE: usize = 4096;
+
+/// The largest inline `blob` a `play` may carry, in **bytes of audio**.
+///
+/// Derived from the media control frame budget ([`siphon_rtp_proto::MAX_FRAME_LEN`])
+/// rather than guessed, and stated in the unit the caller supplied rather than
+/// in encoded frame length: a controller hands us audio, so the bound it is held
+/// to has to be about audio. Checked *before* the frame is built, so a prompt
+/// that cannot fit is a `bad_request` naming the argument and this limit,
+/// instead of a frame-encode failure reported as an unreachable engine.
+///
+/// Content-independent by construction (the worst case, not the average), so the
+/// same prompt is always either accepted or refused, and a controller can apply
+/// the same check itself before sending. Audio past this bound belongs in a
+/// `file` or a `url` source, which ship a reference instead of the bytes.
+pub const MAX_PLAY_BLOB_BYTES: usize =
+    (siphon_rtp_proto::MAX_FRAME_LEN - PLAY_FRAME_ENVELOPE_RESERVE) / JSON_BYTES_PER_BLOB_BYTE;
+
 impl PlayMediaSource {
     /// The source's name as it appears in the scripting API, for error text.
     pub fn kind(&self) -> &'static str {
@@ -67,6 +96,21 @@ impl PlayMediaSource {
             Self::DbId(_) => "db_id",
             Self::Tone(_) => "tone",
             Self::Http(_) => "url",
+        }
+    }
+
+    /// The blob's length when this is an inline `blob` that will not fit a media
+    /// control frame, `None` for every source that fits (and for every source
+    /// that carries a reference rather than the bytes).
+    ///
+    /// Asked before the command is built. The alternative — letting the frame
+    /// encoder find out — answers in the encoder's own vocabulary (a JSON frame
+    /// length the caller never constructed) with a transport error code, which
+    /// is indistinguishable from an engine that is not running.
+    pub fn oversized_blob_len(&self) -> Option<usize> {
+        match self {
+            Self::Blob(data) if data.len() > MAX_PLAY_BLOB_BYTES => Some(data.len()),
+            _ => None,
         }
     }
 }

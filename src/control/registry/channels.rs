@@ -79,6 +79,21 @@ impl ControlBus {
             .map(|entry| entry.key().clone())
     }
 
+    /// The SIP Call-ID of a controlled channel, if it is still registered.
+    ///
+    /// The inverse of [`channel_id_for_sip_call_id`], and O(1) rather than
+    /// O(channels) because the channel id is the map key. Read on the refusal
+    /// path so a rejected command's log line carries the join key an operator
+    /// greps a capture, a CDR and HEP by — the controller names a channel, and a
+    /// channel id appears nowhere on the wire.
+    ///
+    /// [`channel_id_for_sip_call_id`]: Self::channel_id_for_sip_call_id
+    pub fn sip_call_id_for_channel(&self, channel_id: &str) -> Option<String> {
+        self.channels
+            .get(channel_id)
+            .map(|entry| entry.sip_call_id.clone())
+    }
+
     /// Release a controlled channel back to siphon (the controller handed control
     /// back with a routing decision — `route`), emitting a `StasisEnd` with the
     /// given `reason` to the owning connection and draining the channel from the

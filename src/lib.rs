@@ -159,3 +159,48 @@ pub(crate) mod own_process {
         eprint!("{stderr}");
     }
 }
+
+/// Test-only: capture the log a piece of code emits, for asserting on a line.
+///
+/// A log line is part of a contract whenever somebody has to find a failure in
+/// it — a refused control verb, a listener whose certificate does not cover it —
+/// and the only way to hold that contract is to read the rendered output back.
+/// Shared crate-wide so each module asserting on a log line does not grow its own
+/// writer.
+#[cfg(test)]
+pub(crate) mod log_capture {
+    use std::sync::{Arc, Mutex};
+
+    /// An in-memory `tracing` writer.
+    #[derive(Clone, Default)]
+    pub(crate) struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        /// Everything written so far, as text.
+        pub(crate) fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the log buffer lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+}
