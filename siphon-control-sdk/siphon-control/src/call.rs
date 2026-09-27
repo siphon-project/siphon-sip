@@ -180,6 +180,30 @@ impl Call {
         })
     }
 
+    /// Abandon this **un-answered** call with nothing on the wire — no final
+    /// response, no CANCEL — and release it.
+    ///
+    /// The third way out of a parked call, and the only silent one. `reject` and
+    /// an un-answered `hangup` both answer, and on a SIP port reachable from the
+    /// internet that answer is the prize: a `404` to an INVITE for a number
+    /// nobody claims confirms the number to an enumeration sweep, where silence
+    /// leaves it unable to tell a missing extension from a filtered one.
+    ///
+    /// Not a way to hang up: an answered dialog is owed a BYE (RFC 3261 §15), so
+    /// an answered call raises `ControlError` with `code == "invalid_state"` —
+    /// use `hangup` there. A call that has already ended is `"not_found"`.
+    ///
+    /// `reason` is for the record, not the wire: it reaches siphon's log and the
+    /// CDR (`sip_reason`, beside `disconnect_initiator: "control"` and no
+    /// response code).
+    #[pyo3(signature = (reason=None))]
+    fn drop<'py>(&self, py: Python<'py>, reason: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.drop(reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
     fn refer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

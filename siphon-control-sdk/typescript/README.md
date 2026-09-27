@@ -98,6 +98,7 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `reject(code, reason?)` | `reject` (`sip`) | final non-2xx + teardown |
 | `terminate(reason?)` | `hangup` (`sip`) | primary teardown name |
 | `hangup(reason?)` | `hangup` (`sip`) | alias for `terminate` |
+| `drop(reason?)` | `drop` (`sip`) | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL. Refused on an answered call, whose dialog is owed a BYE; the reason goes to the log and the CDR |
 | `refer(to)` | `refer` (`sip`) | in-dialog REFER (blind transfer) |
 | `transfer(to)` | `refer` (`sip`) | alias for `refer` |
 | `referReplaces(to, replaces)` | `refer` (`sip`) | attended transfer (RFC 3891) |

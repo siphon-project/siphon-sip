@@ -99,6 +99,8 @@ mod control_dial_branch_events_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
+mod control_drop_tests;
+#[cfg(test)]
 mod control_inbound_cancel_tests;
 #[cfg(test)]
 mod control_originate_tests;
@@ -192,8 +194,8 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_dial_call, b2bua_set_session_timer, dial_targets_for_aor, DialError, DialShaping,
-    DialTarget,
+    b2bua_dial_call, b2bua_drop_call, b2bua_set_session_timer, dial_targets_for_aor, DialError,
+    DialShaping, DialTarget, DropOutcome,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;

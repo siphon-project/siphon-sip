@@ -41,6 +41,7 @@ fn signatures_are_pinned() {
     let _: fn(&str, u16, &str) -> bool = super::b2bua_reject_refer_call;
     let _: fn(&str) -> Option<String> = super::b2bua_local_tag;
     let _: fn(&str, Option<&str>) -> bool = super::b2bua_cancel_originated_call;
+    let _: fn(&str, Option<&str>) -> super::DropOutcome = super::b2bua_drop_call;
     let _: fn(&str, Option<String>) = super::b2bua_media_set_ws_tee;
     let _: fn(&str, bool) = super::b2bua_media_set_ws_bridge_attached;
     // Named, because clippy's type_complexity refuses the bare fn-pointer type.
@@ -118,19 +119,20 @@ fn the_public_surface_is_pinned() {
             .count();
     }
 
-    // 47: the 39 the 1.9.0 split preserved, plus `b2bua_progress_call_anchored`
+    // 49: the 39 the 1.9.0 split preserved, plus `b2bua_progress_call_anchored`
     // and `b2bua_early_media_sdp` for anchored early media, plus the 4
     // crate-internal control-adapter entry points the dial verb needs, plus the
     // crate-internal `b2bua_set_session_timer` `call.answer()` needs to negotiate
     // a session timer set in the same handler, plus the crate-internal
-    // `DialShaping` carrying the dial verb's identity and media arguments. All
-    // additive, so a minor-compatible change — recorded here because that is the
-    // tripwire.
+    // `DialShaping` carrying the dial verb's identity and media arguments, plus
+    // the crate-internal `b2bua_drop_call` + `DropOutcome` the `drop` verb
+    // abandons an un-answered call through without answering it. All additive,
+    // so a minor-compatible change — recorded here because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        47,
+        49,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 47. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 49. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

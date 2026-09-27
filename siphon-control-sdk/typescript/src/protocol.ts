@@ -181,6 +181,19 @@ export const SipVerb = {
   Progress: "progress",
   Reject: "reject",
   Hangup: "hangup",
+  /**
+   * Abandon an **unanswered** call with nothing on the wire: no final response,
+   * no CANCEL, and the call released so the stack stops tracking it.
+   *
+   * The third way out of a parked call, and the only silent one. `reject` and an
+   * unanswered `hangup` both answer, and on a publicly reachable SIP port that
+   * answer is the prize: a `404` to an INVITE for a number nobody claims
+   * confirms the number to an enumeration sweep, where silence leaves it unable
+   * to tell a missing extension from a filtered one. Refused
+   * (`invalid_state`) on an answered call, whose dialog is owed a BYE
+   * (RFC 3261 §15) — that is {@link SipVerb.Hangup}'s job.
+   */
+  Drop: "drop",
   Refer: "refer",
   Route: "route",
   /**

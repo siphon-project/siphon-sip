@@ -367,6 +367,57 @@ pub(super) fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
     }
 }
 
+/// `drop` — abandon an un-answered call with **nothing on the wire**.
+///
+/// The third way out of a parked call, beside `reject` (a final non-2xx) and
+/// `hangup` (a BYE, or a reject when un-answered): both of those answer, and on
+/// a publicly reachable SIP port the answer is the whole prize — a `404` to an
+/// INVITE for a number nobody claims confirms the number to an enumeration
+/// sweep, where silence leaves it unable to tell a missing extension from a
+/// filtered one. The controller holds the only knowledge of which numbers are
+/// real, so it is the only thing that can decide an INVITE is unsolicited.
+///
+/// Not a way to hang up. An answered call's dialog is owed a BYE (RFC 3261
+/// §15), so an answered call is refused rather than orphaned — `invalid_state`,
+/// naming the verb and the state, so a controller that reached for the wrong one
+/// is told which.
+///
+/// `reason` reaches the log line and the CDR (`sip_reason`, with no response
+/// code, beside `disconnect_initiator: "control"`), so a dropped call reads as
+/// deliberate rather than as a leak.
+pub(super) fn drop_call(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let reason = args.get("reason").and_then(|value| value.as_str());
+    drop_result(
+        channel,
+        crate::dispatcher::b2bua_drop_call(&channel.call_actor_id, reason),
+    )
+}
+
+/// The reply for each [`crate::dispatcher::DropOutcome`]. Split out so the three
+/// wire answers are testable without a running dispatcher — the refusal on an
+/// answered call is the one a controller is most likely to meet, and it is
+/// unreachable from a test that has no call to answer.
+pub(super) fn drop_result(
+    channel: &ChannelRef,
+    outcome: crate::dispatcher::DropOutcome,
+) -> ControlResult {
+    match outcome {
+        crate::dispatcher::DropOutcome::Dropped => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "terminated",
+            "response_sent": false,
+        })),
+        crate::dispatcher::DropOutcome::Answered => ControlResult::error(
+            ControlErrorCode::InvalidState,
+            "drop cannot end this call: it is in state \"answered\", and an answered dialog is \
+             owed a BYE (RFC 3261 §15) — use hangup",
+        ),
+        crate::dispatcher::DropOutcome::Gone => {
+            ControlResult::error(ControlErrorCode::NotFound, "call is gone")
+        }
+    }
+}
+
 pub(super) fn set_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let (Some(name), Some(header_value)) = (
         args.get("name").and_then(|v| v.as_str()),

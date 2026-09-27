@@ -420,6 +420,130 @@ pub(crate) fn b2bua_reject_call_in(
     true
 }
 
+/// What [`b2bua_drop_call`] did with the call it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropOutcome {
+    /// The un-answered call was released, and nothing went on the wire.
+    Dropped,
+    /// The call is answered, so RFC 3261 §15 owes its dialog a BYE. Refused
+    /// rather than orphaned — that is what `hangup` is for.
+    Answered,
+    /// No such call: already gone, or the dispatcher is not running.
+    Gone,
+}
+
+/// Abandon a *controlled*, un-answered B2BUA call with **no message on the
+/// wire** — the control plane's `drop` verb.
+///
+/// `reject` and an un-answered `hangup` both answer the caller with a final
+/// response, and on a SIP port reachable from the internet that response is the
+/// one bit an enumeration sweep is after: a `404` separates "no such user here"
+/// from "filtered", and confirms the number it probed. A controller holds the
+/// only knowledge of which numbers are real, so it is the only thing that can
+/// decide an INVITE is unsolicited, and this is what it acts on that decision
+/// with.
+///
+/// Answering nothing is **not** the same as never replying. Never replying
+/// leaves the call parked until the application's own deadline, with the
+/// caller's INVITE retransmitting against state siphon is still holding
+/// (RFC 3261 §17.2.1). This releases everything the un-answered teardown
+/// releases, so nothing is left tracking the abandoned call:
+///
+/// - the caller's INVITE is no longer absorbed, because the call actor is what
+///   absorbs its retransmissions (the B2BUA intercepts the A-leg INVITE before
+///   an IST exists — see [`handle_b2bua_invite`]) and the actor is removed;
+/// - siphon's reliable provisionals to the caller stop being retransmitted
+///   (RFC 3262 §3), which is the one thing that would otherwise keep putting
+///   messages on the wire after the drop;
+/// - every B-leg a controller-issued `dial` left ringing is CANCELled
+///   (RFC 3261 §9.1) — a phone ringing for a call nobody is on is worse than
+///   the response this avoids;
+/// - the media session an anchored `answer`/`progress` allocated is deleted and
+///   any Ro reservation is closed;
+/// - the CDR is finalized carrying `reason`, with no response code, so the
+///   record says the call was dropped deliberately rather than looking like a
+///   leak.
+///
+/// Returns [`DropOutcome::Answered`] for an answered call (nothing is touched)
+/// and [`DropOutcome::Gone`] when the call is already gone. Never panics.
+pub fn b2bua_drop_call(internal_call_id: &str, reason: Option<&str>) -> DropOutcome {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return DropOutcome::Gone;
+    };
+    let _enter = control.runtime.enter();
+    b2bua_drop_call_in(&control.state, internal_call_id, reason)
+}
+
+/// [`b2bua_drop_call`] against an explicit dispatcher state, for a caller that
+/// already holds one — the tests, which cannot use the process-global
+/// `B2BUA_CONTROL` a `OnceLock` only lets one state occupy.
+pub(crate) fn b2bua_drop_call_in(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    reason: Option<&str>,
+) -> DropOutcome {
+    let Some((call_state, sip_call_id, caller_addr)) =
+        state.call_actors.get_call(internal_call_id).map(|call| {
+            (
+                call.state.clone(),
+                call.a_leg.dialog.call_id.clone(),
+                call.a_leg.transport.remote_addr,
+            )
+        })
+    else {
+        return DropOutcome::Gone;
+    };
+    if matches!(call_state, CallState::Answered) {
+        return DropOutcome::Answered;
+    }
+    let reason = reason.unwrap_or("dropped");
+
+    // Nothing more goes to the caller, so anything siphon is still sending it
+    // reliably stops here (RFC 3262 §3). Without this the drop is not silent:
+    // an un-PRACKed reliable provisional keeps going out for 64*T1.
+    end_a_leg_reliability(internal_call_id, state);
+
+    // A `dial` the controller issued before it changed its mind leaves callees
+    // ringing; removing the call alone would stop the actors without emitting
+    // the CANCELs, so they are issued explicitly (same reason as the shutdown
+    // pass).
+    super::shutdown::cancel_pending_branches(internal_call_id, state);
+
+    info!(
+        call_id = %internal_call_id,
+        sip_call_id = %sip_call_id,
+        source = %caller_addr,
+        %reason,
+        "B2BUA: dropping an un-answered controlled call — no response on the wire"
+    );
+
+    // No status went out, so the record keeps the tracked code (0) and carries
+    // the controller's reason instead: that pair is what tells an operator the
+    // call was dropped on purpose and why, and separates it from a call that
+    // was answered or refused.
+    if crate::cdr::auto_emit_enabled() {
+        cdr_finalize(
+            &state.cdr_sessions,
+            internal_call_id,
+            "control",
+            None,
+            Some(reason.to_string()),
+        );
+    }
+
+    // `StasisEnd` with no `code` / `response`: the control contract has those
+    // two present only when a SIP final response was part of the teardown, and
+    // here the whole point is that none was.
+    control_notify_terminated(&sip_call_id, reason);
+
+    release_failed_call_media(&sip_call_id, state);
+    spawn_ro_b2bua_stop(state, internal_call_id, None);
+
+    state.call_actors.remove_call(internal_call_id);
+    state.call_event_receivers.remove(internal_call_id);
+    DropOutcome::Dropped
+}
+
 /// Terminate a call due to session timer expiry (RFC 4028) — BYE both legs and
 /// run the full framework teardown (Rf ACR-STOP + CDR + SIPREC + media), the
 /// same funnel the imperative `b2bua.terminate` uses.

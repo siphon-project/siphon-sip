@@ -1,5 +1,5 @@
 use super::bridge::{bridge_error, bridge_with_bus, unbridge};
-use super::call::{answer, provisional_state, remove_header};
+use super::call::{answer, drop_result, provisional_state, remove_header};
 use super::media::{
     dtmf, media_error, parse_play_source, parse_stream_channels, parse_stream_mode, play,
     play_accept, play_source_kind, record_start, stream_start, StreamMode,
@@ -778,6 +778,7 @@ fn describe_lists_core_verbs() {
         "progress",
         "reject",
         "hangup",
+        "drop",
         "refer",
         "accept_refer",
         "reject_refer",
@@ -883,6 +884,83 @@ fn ring_and_progress_are_separate_verbs_in_the_schema() {
         progress.contains("early-media") || progress.contains("early media"),
         "progress must name early media as its job: {progress}"
     );
+}
+
+#[test]
+fn drop_is_advertised_as_the_verb_that_sends_nothing() {
+    // `drop` only earns its place next to `reject` and `hangup` if an app can
+    // discover *which* of the three puts nothing on the wire — that is the
+    // entire difference between them, and `describe` is the only place an app
+    // reads it from.
+    let schema = SipControlAdapter::new().describe();
+    let summary = schema
+        .verbs
+        .iter()
+        .find(|verb| verb.verb == "drop")
+        .map(|verb| verb.summary.clone())
+        .expect("the drop verb is advertised");
+    assert!(
+        summary.contains("NOTHING on the wire"),
+        "drop must say it sends nothing: {summary}"
+    );
+    assert!(
+        summary.contains("hangup"),
+        "drop must point an answered call at hangup: {summary}"
+    );
+    // And the classifier has to claim it, or `apply` answers unsupported_verb
+    // however complete the handler is (the `record_start` trap).
+    assert!(is_sip_verb("drop"));
+    assert!(!is_media_verb("drop") && !is_bridge_verb("drop"));
+}
+
+#[test]
+fn drop_refuses_an_answered_call_naming_the_verb_and_the_state() {
+    // The mistake this refusal exists for: reaching for `drop` on a call that is
+    // up. RFC 3261 §15 owes that dialog a BYE, so it must be refused rather than
+    // orphaned, and the message has to say which verb was wrong and what state
+    // the call is in — `invalid_state`, not `bad_request` (the frame is fine) and
+    // not `not_found` (the call exists).
+    let result = drop_result(&channel(), crate::dispatcher::DropOutcome::Answered);
+    let ControlResult::Error { code, message } = result else {
+        panic!("drop on an answered call must be refused");
+    };
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    assert!(message.contains("drop"), "{message}");
+    assert!(message.contains("answered"), "{message}");
+    assert!(
+        message.contains("hangup"),
+        "the refusal must point at the verb that does work: {message}"
+    );
+}
+
+#[test]
+fn a_dropped_call_reports_that_nothing_was_sent() {
+    // The reply is how an app confirms the whole point of the verb, so it says
+    // so in a field rather than only in the absence of a `code`.
+    let result = drop_result(&channel(), crate::dispatcher::DropOutcome::Dropped);
+    let ControlResult::Ok(body) = result else {
+        panic!("a dropped call must answer ok, got {result:?}");
+    };
+    assert_eq!(body["channel"], serde_json::json!("ch1"));
+    assert_eq!(body["state"], serde_json::json!("terminated"));
+    assert_eq!(body["response_sent"], serde_json::json!(false));
+    assert!(
+        body.get("code").is_none(),
+        "a drop sent no response, so it must claim no status code: {body}"
+    );
+}
+
+#[test]
+fn drop_on_a_call_that_is_gone_is_not_found() {
+    // With no dispatcher installed the call store is empty, which is the same
+    // shape as a call that ended while the controller was deciding: a typed
+    // not_found, never a hang and never a silent Ok for a call nobody dropped.
+    let result = sip_command("drop", serde_json::json!({ "reason": "unsolicited" }));
+    let ControlResult::Error { code, message } = result else {
+        panic!("drop on a missing call must be refused");
+    };
+    assert_eq!(code, ControlErrorCode::NotFound);
+    assert_eq!(message, "call is gone");
 }
 
 #[test]
@@ -1399,6 +1477,7 @@ fn every_dispatchable_verb_is_advertised() {
         "progress",
         "reject",
         "hangup",
+        "drop",
         "refer",
         "accept_refer",
         "reject_refer",
@@ -1440,6 +1519,7 @@ fn is_media_verb_splits_media_from_sip() {
         "progress",
         "reject",
         "hangup",
+        "drop",
         "refer",
         "accept_refer",
         "reject_refer",

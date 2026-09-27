@@ -174,6 +174,7 @@ def test_module_surface():
         "dial",
         "record_start",
         "record_stop",
+        "drop",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
@@ -449,6 +450,10 @@ def test_media_header_refer_verbs_roundtrip():
                 await call.hold()
                 await call.unhold()
                 await call.remove_header("X-Foo")
+                # The silent teardown: its own verb, with the reason only for
+                # the log and the CDR — nothing about it reaches the wire.
+                await call.drop()
+                await call.drop("no flow claims this number")
                 await call.accept_refer(
                     target="sip:c@pbx", next_hop="sip:sbc", mode="terminate"
                 )
@@ -510,6 +515,9 @@ def test_media_header_refer_verbs_roundtrip():
             assert by_verb["hold"] == {}
             assert by_verb["unhold"] == {}
             assert by_verb["remove_header"] == {"name": "X-Foo"}
+            drop_args = [f["args"] for f in recorded if f["verb"] == "drop"]
+            assert drop_args[0] == {}
+            assert drop_args[1] == {"reason": "no flow claims this number"}
             assert by_verb["accept_refer"] == {
                 "target": "sip:c@pbx",
                 "next_hop": "sip:sbc",

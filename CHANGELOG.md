@@ -444,6 +444,26 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **New control verb `drop`: abandon an unanswered call with nothing on the
+  wire.** `reject` and an unanswered `hangup` both put a final response on the
+  wire, and on a SIP port reachable from the internet that response is the
+  result an extension sweep is after: a `404` separates "no such user here" from
+  "filtered" and confirms the number it probed. A control application holds the
+  only knowledge of which numbers are real, so it was the one component that
+  could decide an INVITE was unsolicited and the one with no way to act on it.
+  `drop {reason?}` sends nothing — no final response, no CANCEL — and releases
+  the call, so the stack is not left absorbing retransmissions of a call it has
+  abandoned: every B-leg a `dial` left ringing is CANCELled (RFC 3261 §9.1),
+  siphon's reliable provisionals to the caller stop being retransmitted
+  (RFC 3262 §3), anchored media is deleted, the Ro reservation is closed, and
+  the call actor and its event receiver are removed. An **answered** call is
+  refused `invalid_state` — RFC 3261 §15 owes its dialog a BYE, which is
+  `hangup`'s job — and is left untouched so that BYE can still be sent. The
+  reason reaches the log and the CDR (`disconnect_initiator: "control"`,
+  `sip_reason`, `response_code: 0`), and `StasisEnd` carries it with no `code` /
+  `response` since nothing went on the wire. Wired through the verb schema
+  (`describe`), the `SipVerb` wire tokens, and all three control SDKs:
+  `call.drop(reason)` in Rust, Python and TypeScript.
 - **`request.set_ruri_param(name, value=None)` and
   `request.remove_ruri_param(name)`** add, replace or remove one Request-URI
   parameter (`;user=phone`, `;transport=tcp`, a flag such as `;lr`) without

@@ -129,8 +129,11 @@ pub(crate) fn tear_down_calls_in(state: &DispatcherState) -> TeardownReport {
 /// Issued explicitly rather than left to the store: removing a call sends its
 /// legs `LegMessage::Shutdown`, which stops the actor and emits nothing on the
 /// wire, so a callee that was ringing would keep ringing at a node that had
-/// already exited.
-fn cancel_pending_branches(call_id: &str, state: &DispatcherState) {
+/// already exited. Shared with the control plane's `drop`
+/// ([`b2bua_drop_call_in`](super::terminate::b2bua_drop_call_in)), which
+/// abandons an un-answered call for the same reason and owes its callees the
+/// same CANCELs.
+pub(super) fn cancel_pending_branches(call_id: &str, state: &DispatcherState) {
     let handle_txs: Vec<_> = match state.call_actors.get_call(call_id) {
         Some(call) => call
             .b_leg_handles

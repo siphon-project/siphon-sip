@@ -63,9 +63,10 @@ rather than crashing on them, but closing means there is nothing to drop.
 
 `Call` verbs: `answer()` / `answer_with(code, …)` /
 `answer_anchored(profile=None, ws_uri=None)`, `ring(reason=None)`, `progress()`,
-`reject(code, reason)`, `hangup(reason=None)`, `refer(to)` / `transfer(to)`,
-`set_header(name, value)` / `get_header(name)`, `set_var(key, value)` /
-`get_var(key)`, plus the generic `command(verb, args=None)` escape hatch and
+`reject(code, reason)`, `hangup(reason=None)`, `drop(reason=None)`,
+`refer(to)` / `transfer(to)`, `set_header(name, value)` / `get_header(name)`,
+`set_var(key, value)` / `get_var(key)`, plus the generic
+`command(verb, args=None)` escape hatch and
 `next_event()`. A rejected command raises `ControlError` carrying a stable
 `.code`.
 
@@ -285,6 +286,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `progress` | sip | `{code, reason?, body?, content_type?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress` |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
+| `drop` | sip | `{reason?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE. See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
@@ -340,14 +342,15 @@ mapping to learn rather than two.
 **`StasisEnd` carries the hangup cause and, where a final response was involved,
 the SIP status.** `reason` is always present and says why siphon ended the call
 (`bye`, `cancelled`, `failed`, `rejected`, `media_failed`, `transfer_failed`,
-`routed`, or a hangup reason the app supplied); `code` and `response` ride
-alongside it whenever a SIP final response was part of the teardown — `487` on a
-CANCEL either way round, `408` on the answer timeout (`503` when a `route`
-sequence ends on it with no carrier having sent a 101-199), the callee's own status on
-a rejected originated leg, and the status siphon sent on a `reject` / an
-unanswered `hangup` / the handoff deadline (`503`). A teardown with no SIP
-response — an ordinary BYE, a script-driven terminate — omits both keys rather
-than inventing one, so `code` present always means a real status was on the wire.
+`routed`, `dropped`, or a hangup / drop reason the app supplied); `code` and
+`response` ride alongside it whenever a SIP final response was part of the
+teardown — `487` on a CANCEL either way round, `408` on the answer timeout
+(`503` when a `route` sequence ends on it with no carrier having sent a 101-199),
+the callee's own status on a rejected originated leg, and the status siphon sent
+on a `reject` / an unanswered `hangup` / the handoff deadline (`503`). A teardown
+with no SIP response — an ordinary BYE, a script-driven terminate, a `drop` —
+omits both keys rather than inventing one, so `code` present always means a real
+status was on the wire.
 
 The media verbs (`play` / `stop` / `dtmf` / `hold` / `unhold` / `stream_start` /
 `stream_stop`) act on the controlled A-leg's anchored media session. They are
@@ -394,6 +397,52 @@ same way every other verb does — never a hang:
   (Previously an oversized blob reached the frame encoder and came back as
   `unavailable` — the code for an unreachable engine — so a controller retried a
   prompt that could never be played.)
+
+### `drop` — abandon a call without answering it
+
+```json
+{ "verb": "drop", "target": {"channel": "ch1"},
+  "args": { "reason": "no flow claims this number" } }
+```
+
+A PBX's SIP port is reachable from the internet by definition — carriers deliver
+to it — so it is swept continuously. `reject` and an unanswered `hangup` both put
+a final response on the wire, and to a scanner probing for extensions that
+response *is* the result: a `404` separates "no such user here" from "filtered",
+and confirms the number it guessed. Neither existing control covers it —
+`security.failed_auth_ban` scores authentication failures and an INVITE to an
+unknown number attempts none, the transport allow list is whitelist-only and so
+unusable where subscribers roam, and `security.apiban` covers *known* bad
+addresses, which by construction is not the first probe from a new one.
+
+The controller holds the only knowledge of which numbers are real, so it is the
+only thing that can decide an INVITE is unsolicited. `drop` is what it acts on
+that decision with: **nothing** goes to the caller, and the call is released.
+The `100 Trying` the transaction layer already sent stands — the open port
+disclosed that a server exists, which is all a `100` says.
+
+Not replying at all is **not** the same thing, which is why this is a verb and
+not a convention: the call would stay parked until the application's own
+deadline, with the caller's INVITE retransmitting against state siphon is still
+holding (RFC 3261 §17.2.1). The drop releases everything the unanswered teardown
+releases — every B-leg a `dial` left ringing is CANCELled (RFC 3261 §9.1),
+siphon's reliable provisionals to the caller stop being retransmitted
+(RFC 3262 §3), an anchored media session is deleted, the call actor and its event
+receiver are removed — so a sweep costs one dropped call apiece and leaves
+nothing behind.
+
+Replies `{channel, state: "terminated", response_sent: false}`, and pushes a
+`StasisEnd` carrying `reason` (the argument, or `dropped`) with **no** `code` or
+`response`, since no SIP final response was part of the teardown.
+
+- **An answered call is refused**, `invalid_state`: RFC 3261 §15 owes that dialog
+  a BYE, and the call is left exactly as it was so `hangup` can still send one.
+- `reason` is for the record, not the wire. It reaches siphon's log (one `info`
+  line naming the call, its `Call-ID`, the source address and the reason) and the
+  CDR, which records `disconnect_initiator: "control"`, the reason as
+  `sip_reason`, and `response_code: 0` — a dropped call must read as deliberate,
+  never as a leak.
+- A call that ended while the controller was deciding answers `not_found`.
 
 ### Recording
 

@@ -148,6 +148,12 @@ reported as a failure. That is damage control, not a substitute for closing.
   returns the `recording_id` that `await call.record_stop(recording_id=None)`
   addresses (no id stops every recording on the call). The reply is the accept;
   the `RecordingFinished` event says the file is closed. siphon-rtp backend only.
+- `await call.drop(reason=None)` abandons an **unanswered** call with nothing on
+  the wire — no final response, no CANCEL — and releases it. Use it for traffic
+  addressed to nothing your controller serves: a `404` confirms the number to an
+  enumeration sweep, silence does not. An answered call raises `ControlError` with
+  `code == "invalid_state"` (its dialog is owed a BYE — that is `hangup`); the
+  reason reaches siphon's log and the CDR, not the peer.
 - Media verbs `play_file(file)` / `dtmf(digits)` raise `ControlError` with
   `code == "unsupported_verb"` until the server implements media.
 
