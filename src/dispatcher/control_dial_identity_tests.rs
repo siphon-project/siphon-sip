@@ -143,6 +143,13 @@ fn from_header(sent: &Sent) -> &str {
         .expect("every INVITE carries a From")
 }
 
+/// The From header up to its tag. The tag is random hex, so a substring check
+/// for the caller's extension over the whole header fails whenever the tag
+/// happens to contain those digits.
+fn without_tag(from: &str) -> &str {
+    from.split(";tag=").next().unwrap_or(from)
+}
+
 /// The one thing a `From` rewrite must never lose: the dialog tag, which is the
 /// B-leg's own and not the caller's (RFC 3261 §8.1.1.3).
 fn assert_has_a_fresh_dialog_tag(sent: &Sent, label: &str) {
@@ -171,7 +178,7 @@ async fn a_dial_presents_the_identity_the_controller_named() {
         "the presented identity is not on the wire: {from}"
     );
     assert!(
-        !from.contains("203"),
+        !without_tag(from).contains("203"),
         "the caller's extension reached the trunk: {from}"
     );
     assert!(
@@ -304,7 +311,7 @@ async fn a_sequential_hunt_presents_the_identity_on_every_attempt() {
         "the second attempt presents {from}"
     );
     assert!(
-        !from.contains("203"),
+        !without_tag(from).contains("203"),
         "the second attempt leaked the caller's extension: {from}"
     );
     assert_has_a_fresh_dialog_tag(&sent[0], "second attempt");
@@ -478,7 +485,7 @@ async fn a_targets_own_from_pins_its_host_and_drops_the_callers_display() {
             "parallel={parallel}: the target's identity is not on the wire whole: {from}"
         );
         assert!(
-            !from.contains("203"),
+            !without_tag(from).contains("203"),
             "parallel={parallel}: the caller's display name or extension leaked: {from}"
         );
         assert_has_a_fresh_dialog_tag(&sent[0], "target identity");
