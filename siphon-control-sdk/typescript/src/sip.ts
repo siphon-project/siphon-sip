@@ -757,6 +757,32 @@ export class Call {
   }
 
   /**
+   * Abandon this **unanswered** call with nothing on the wire — no final
+   * response, no CANCEL — and release it.
+   *
+   * The third way out of a parked call, and the only silent one.
+   * {@link Call.reject} and an unanswered {@link Call.hangup} both answer, and
+   * on a SIP port reachable from the internet that answer is the prize: a `404`
+   * to an INVITE for a number nobody claims confirms the number to an
+   * enumeration sweep, where silence leaves it unable to tell a missing
+   * extension from a filtered one. Your controller holds the only knowledge of
+   * which numbers are real, so it is the only thing that can decide an INVITE is
+   * unsolicited.
+   *
+   * Not a way to hang up: an answered dialog is owed a BYE (RFC 3261 §15), so an
+   * answered call rejects with `code === "invalid_state"` rather than being
+   * orphaned — use {@link Call.hangup} there. A call that has already ended
+   * rejects with `code === "not_found"`.
+   *
+   * `reason` is for the record, not the wire: it reaches siphon's log and the
+   * CDR (`sip_reason`, beside `disconnect_initiator: "control"` and no response
+   * code), so a dropped call reads as deliberate rather than as a leak.
+   */
+  async drop(reason?: string): Promise<void> {
+    await this.sip(SipVerb.Drop, reason !== undefined ? { reason } : {});
+  }
+
+  /**
    * Send an in-dialog REFER on the A-leg (blind transfer).
    *
    * Resolves as soon as siphon has sent the REFER — that is *sent*, not

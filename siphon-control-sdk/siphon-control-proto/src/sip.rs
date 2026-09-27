@@ -39,6 +39,20 @@ pub enum SipVerb {
     Reject,
     /// BYE an answered call, or reject an unanswered one.
     Hangup,
+    /// Abandon an **un-answered** call with nothing on the wire: no final
+    /// response, no CANCEL, and the call released so the stack stops tracking
+    /// it.
+    ///
+    /// The third way out of a parked call, and the only silent one.
+    /// [`SipVerb::Reject`] and an un-answered [`SipVerb::Hangup`] both answer,
+    /// and on a publicly reachable SIP port that answer is the prize: a `404`
+    /// to an INVITE for a number nobody claims confirms the number to an
+    /// enumeration sweep, where silence leaves it unable to tell a missing
+    /// extension from a filtered one.
+    ///
+    /// Refused (`invalid_state`) on an answered call, whose dialog is owed a BYE
+    /// (RFC 3261 §15) — that is [`SipVerb::Hangup`]'s job.
+    Drop,
     /// Send an in-dialog REFER on the A-leg.
     Refer,
     /// Accept a pending inbound REFER (from a `TransferRequested` event).
@@ -114,6 +128,7 @@ impl SipVerb {
             SipVerb::Progress => "progress",
             SipVerb::Reject => "reject",
             SipVerb::Hangup => "hangup",
+            SipVerb::Drop => "drop",
             SipVerb::Refer => "refer",
             SipVerb::AcceptRefer => "accept_refer",
             SipVerb::RejectRefer => "reject_refer",
@@ -1253,6 +1268,11 @@ mod tests {
         assert_eq!(SipVerb::Dial.as_str(), "dial");
         assert_eq!(SipVerb::RecordStart.as_str(), "record_start");
         assert_eq!(SipVerb::RecordStop.to_string(), "record_stop");
+        // The silent teardown, distinct from `reject` and `hangup` — both of
+        // those put a final response on the wire.
+        assert_eq!(SipVerb::Reject.as_str(), "reject");
+        assert_eq!(SipVerb::Hangup.as_str(), "hangup");
+        assert_eq!(SipVerb::Drop.to_string(), "drop");
     }
 
     #[test]

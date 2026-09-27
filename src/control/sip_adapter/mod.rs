@@ -24,7 +24,7 @@ mod tests;
 mod transfer;
 
 use bridge::apply_bridge_verb;
-use call::{answer, get_header, hangup, reject, remove_header, ring, set_header};
+use call::{answer, drop_call, get_header, hangup, reject, remove_header, ring, set_header};
 use media::apply_media_verb;
 /// The media-error mapping and the `play` argument gate, reachable from the
 /// control plane's own tests: both are contract surface (which code a controller
@@ -94,6 +94,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress. With anchor (or a profile / ws_uri, which imply it) the SDP is the media engine's and a later answer repeats it — how ringback or an announcement plays before answering (args: code, reason, body, content_type, anchor, profile, ws_uri)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
+                verb("drop", "Abandon an unanswered call with NOTHING on the wire — no final response, no CANCEL — and release it, so an unsolicited INVITE costs a scanner silence instead of a 404 that confirms the number it probed (args: reason). Refused on an answered call, whose dialog is owed a BYE (RFC 3261 §15) — that is hangup. The reason reaches the log and the CDR, which records disconnect_initiator=control with no response code"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
                 verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode, profile, number_policy, format)"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
@@ -258,6 +259,7 @@ fn is_sip_verb(verb: &str) -> bool {
             | "progress"
             | "reject"
             | "hangup"
+            | "drop"
             | "refer"
             | "accept_refer"
             | "reject_refer"
@@ -306,6 +308,7 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "progress" => answer(&channel, &command.args, false),
         "reject" => reject(&channel, &command.args),
         "hangup" => hangup(&channel, &command.args),
+        "drop" => drop_call(&channel, &command.args),
         "refer" => refer(&channel, &command.args),
         "accept_refer" => accept_refer(&channel, &command.args),
         "reject_refer" => reject_refer(&channel, &command.args),

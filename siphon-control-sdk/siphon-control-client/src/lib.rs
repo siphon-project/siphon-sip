@@ -53,6 +53,7 @@
 
 mod client;
 mod dial;
+mod drop_call;
 mod error;
 mod originate;
 mod recording;

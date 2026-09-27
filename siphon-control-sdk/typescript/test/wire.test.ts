@@ -86,6 +86,8 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.Dial).toBe("dial");
     expect(SipVerb.RecordStart).toBe("record_start");
     expect(SipVerb.RecordStop).toBe("record_stop");
+    expect(SipVerb.Reject).toBe("reject");
+    expect(SipVerb.Drop).toBe("drop");
   });
 
   it("passes unknown + new event names through (forward-compatible)", () => {
@@ -320,6 +322,24 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     expect(transport.calls).toEqual([
       { module: MODULE_SIP, verb: "hangup", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "hangup", target: { channel: "ch1" }, args: { reason: "Q.850;cause=16" } },
+    ]);
+  });
+
+  it("drop sends the silent teardown verb, distinct from reject and hangup", async () => {
+    // The three teardowns must reach the wire as three different verbs: two of
+    // them answer the caller, and this one is the whole point of not doing that.
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.drop();
+    await call.drop("no flow claims this number");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "drop", target: { channel: "ch1" }, args: {} },
+      {
+        module: MODULE_SIP,
+        verb: "drop",
+        target: { channel: "ch1" },
+        args: { reason: "no flow claims this number" },
+      },
     ]);
   });
 
