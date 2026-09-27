@@ -733,7 +733,12 @@ impl AutoBanStore {
     /// this call newly banned the IP (so the caller can log/metric the
     /// transition once).
     pub fn record_failure(&self, source: IpAddr) -> bool {
-        self.record_failure_weighted_at(source, 1, Instant::now())
+        self.record_failure_weighted_at(
+            source,
+            1,
+            Instant::now(),
+            "repeated low-confidence failure signals",
+        )
     }
 
     /// Record a challenge issued because the request carried no credentials,
@@ -744,7 +749,12 @@ impl AutoBanStore {
     /// through a signal that is not being acted on anyway. Returns `true` if
     /// this call newly banned the IP.
     pub fn record_missing_credentials(&self, source: IpAddr) -> bool {
-        self.record_failure_weighted_at(source, self.missing_credentials_weight, Instant::now())
+        self.record_failure_weighted_at(
+            source,
+            self.missing_credentials_weight,
+            Instant::now(),
+            "repeated requests carrying no credentials",
+        )
     }
 
     /// Record one high-confidence abuse signal for `source`, weighted by
@@ -755,10 +765,25 @@ impl AutoBanStore {
     /// the subsequent [`Self::record_success`]). Returns `true` if this call
     /// newly banned the IP.
     pub fn record_strong_failure(&self, source: IpAddr) -> bool {
-        self.record_failure_weighted_at(source, self.strong_weight, Instant::now())
+        self.record_failure_weighted_at(
+            source,
+            self.strong_weight,
+            Instant::now(),
+            "repeated high-confidence abuse signals",
+        )
     }
 
-    fn record_failure_weighted_at(&self, source: IpAddr, weight: u32, now: Instant) -> bool {
+    /// `reason` names the class of signal being counted, for the log line each
+    /// connection closed by the resulting ban carries. The specific signal is
+    /// named by the caller's own ban-transition log; this is what the store
+    /// itself knows.
+    fn record_failure_weighted_at(
+        &self,
+        source: IpAddr,
+        weight: u32,
+        now: Instant,
+        reason: &str,
+    ) -> bool {
         // A zero-weight signal is not counted at all — and specifically does not
         // touch `failures`, so a policy that declines to act on a signal also
         // declines to allocate a per-source row for it.
@@ -809,6 +834,13 @@ impl AutoBanStore {
             if let Some(firewall) = self.firewall.get() {
                 firewall.ban(source, self.ban_duration);
             }
+            // Both of those only ever meet the source again at accept, which a
+            // peer that keeps the connection it already has never reaches: it
+            // went on trying passwords on that one connection for as long as the
+            // ban lasted, while every other client behind the same address was
+            // refused. Close what it holds open — after the ban is in `bans`, so
+            // the reconnect it makes next is already refused.
+            crate::transport::disconnect::close_banned_source(source, reason);
         }
         newly_banned
     }
@@ -878,7 +910,7 @@ impl AutoBanStore {
     /// Test-only weight-1 shim preserving the pre-weighting call shape.
     #[cfg(test)]
     fn record_failure_at(&self, source: IpAddr, now: Instant) -> bool {
-        self.record_failure_weighted_at(source, 1, now)
+        self.record_failure_weighted_at(source, 1, now, "a test signal")
     }
 
     /// Test-only shim preserving the pre-cap constructor shape, defaulting the
@@ -915,7 +947,9 @@ impl AutoBanStore {
         self.is_banned_at(source, Instant::now())
     }
 
-    fn is_banned_at(&self, source: IpAddr, now: Instant) -> bool {
+    /// [`Self::is_banned`] against a caller-supplied instant, so a test can ask
+    /// whether a ban still holds at a future one without sleeping through it.
+    pub(crate) fn is_banned_at(&self, source: IpAddr, now: Instant) -> bool {
         if self.is_trusted(source) {
             return false;
         }
@@ -1226,6 +1260,42 @@ mod tests {
         store.record_failure(source);
         assert!(!store.is_banned(source)); // only 2 since reset
         assert!(store.record_failure(source)); // now 3 -> ban
+    }
+
+    /// Every path that raises a ban closes the connections the source already
+    /// holds — the reason the close is wired to the ban transition rather than to
+    /// the call sites that report abuse. One left out is a source that goes on
+    /// abusing the connection it has while its address is refused for everyone
+    /// else behind it.
+    #[tokio::test]
+    async fn every_ban_raising_path_closes_the_source_open_connections() {
+        /// One abuse signal, as its caller reports it: returns whether it banned.
+        type Signal = fn(&AutoBanStore, IpAddr) -> bool;
+
+        let signals: [(&str, Signal); 3] = [
+            ("203.0.113.61", |store, source| store.record_failure(source)),
+            ("203.0.113.62", |store, source| {
+                store.record_strong_failure(source)
+            }),
+            ("203.0.113.63", |store, source| {
+                store.record_missing_credentials(source)
+            }),
+        ];
+        for (index, (address, signal)) in signals.into_iter().enumerate() {
+            // Threshold 1, and a missing-credentials weight of 1 so that path
+            // counts here (it is 0 by default, which counts nothing at all).
+            let store = AutoBanStore::for_test(1, 600, 3600, &[], 1, 1);
+            let source = ip(address);
+            let closer = crate::transport::disconnect::ConnectionCloser::register(
+                crate::transport::ConnectionId(8_000_100 + index as u64),
+                source,
+                crate::transport::Transport::Tls,
+            );
+            assert!(signal(&store, source), "{address} must ban on one signal");
+            tokio::time::timeout(Duration::from_secs(5), closer.closed())
+                .await
+                .expect("the ban must close the connection the source holds open");
+        }
     }
 
     #[test]

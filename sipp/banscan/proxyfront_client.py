@@ -8,7 +8,9 @@ going.
 Phase 1: open one connection to the proxy_protocol listener, assert a v1 header
 claiming an abuser address, then send unauthenticated REGISTERs. Each draws a
 401, which records a failure against whichever address siphon attributed the
-request to. Past the threshold (3) that address is banned.
+request to. At the threshold (3) that address is banned and the connection it
+holds is closed — which behind a front is only possible if the connection is
+matched by the address the header declared, not by the front's own.
 
 Phase 2: read GET /admin/bans and require BOTH halves — the abuser is banned,
 and the front is not. A build where the substitution never reaches the auth path
@@ -27,6 +29,9 @@ import urllib.request
 
 HOST, PORT = "127.0.0.1", 5564
 ADMIN = "http://127.0.0.1:5565/admin/bans"
+# security.failed_auth_ban.threshold in siphon-banscan.yaml, at
+# missing_credentials_weight 1 — so one REGISTER per count.
+THRESHOLD = 3
 
 # The abuser the header claims. The front is this client, on loopback.
 ABUSER = "203.0.113.9"
@@ -60,24 +65,66 @@ except OSError as error:
 
 conn.settimeout(5)
 conn.sendall(PROXY_HEADER)
-for index in range(1, 6):
-    register(conn, index)
-    try:
-        data = conn.recv(4096)
-        if b" 401 " in data:
-            challenges += 1
-    except socket.timeout:
-        break
-conn.close()
 
-print(f"phase1: {challenges} challenges received (ban trips at 3)", flush=True)
-if challenges < 3:
+
+def read(connection):
+    """One read: bytes, b"" for a connection that has ended, None for silence."""
+    try:
+        return connection.recv(4096)
+    except (ConnectionResetError, BrokenPipeError):
+        return b""
+    except socket.timeout:
+        return None
+
+
+# The counts before the last one: each draws a 401 and the connection stays up.
+for index in range(1, THRESHOLD):
+    register(conn, index)
+    data = read(conn)
+    if not data:
+        print(
+            f"phase1: connection ended after {index} REGISTER(s), before the "
+            f"threshold of {THRESHOLD} — setup broken",
+            flush=True,
+        )
+        sys.exit(2)
+    if b" 401 " in data:
+        challenges += 1
+
+print(f"phase1: {challenges} challenges received (ban trips at {THRESHOLD})", flush=True)
+if challenges != THRESHOLD - 1:
     print(
-        "phase1: fewer than 3 challenges — the header was rejected or the "
-        "listener is misconfigured, so the ban cannot be tripped",
+        f"phase1: {challenges} challenges before the threshold, expected "
+        f"{THRESHOLD - 1} — the header was rejected or the listener is "
+        "misconfigured, so the ban cannot be tripped",
         flush=True,
     )
     sys.exit(2)
+
+# The REGISTER that trips the ban closes the connection carrying it. Whether its
+# own 401 gets out ahead of the teardown is a race and not what this asserts.
+try:
+    register(conn, THRESHOLD)
+except (ConnectionResetError, BrokenPipeError):
+    print("phase1: the connection was already gone -> CLOSED (pass)", flush=True)
+else:
+    deadline = time.monotonic() + 10
+    while True:
+        if read(conn) == b"":
+            print(
+                f"phase1: the connection carrying {ABUSER} was closed (pass)",
+                flush=True,
+            )
+            break
+        if time.monotonic() > deadline:
+            print(
+                "phase1: the connection stayed open after the ban — behind a "
+                "front the abuser keeps the one connection nothing re-checks "
+                "(REGRESSION)",
+                flush=True,
+            )
+            sys.exit(1)
+conn.close()
 
 time.sleep(1)  # let the ban settle
 

@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod client_tls;
 pub mod crlf_keepalive;
+pub(crate) mod disconnect;
 pub mod flow;
 pub mod mux;
 pub mod pool;

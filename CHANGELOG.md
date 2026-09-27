@@ -93,6 +93,22 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An auto-ban left the banned source's open connections running.** Every ban
+  check was per *connection* — the transport ACL at accept, and the re-check once
+  a TLS/WebSocket handshake completes — so a client that never reconnects met
+  neither again: it kept the connection it already had and went on presenting
+  rejected credentials on it for as long as the ban lasted, each rejection
+  sliding the expiry further out, while every *other* client behind that address
+  was refused at accept. A REGISTER with correct credentials on that same
+  connection was then accepted and its binding stored, with the source still
+  banned. A newly raised ban now closes every stream connection the source holds
+  open (TCP, TLS, WS, WSS and SCTP, and both arms of a shared `tcp+ws` /
+  `tls+wss` listener), logging one line per connection at INFO with the source
+  and the signal that banned it; the source has to come back through accept,
+  where it is refused until the ban expires. UDP was never affected — it runs the
+  ACL per datagram. A connection whose write half ends also no longer leaves its
+  reader holding the socket until the 300 s idle timeout.
+
 - **siphon-bin's `http` extension moves to siphon-http 1.1.0.** `http.yaml`
   now gets the same `${VAR}` / `${VAR:-default}` expansion as `siphon.yaml`
   (it was documented but never applied), and if the script registers

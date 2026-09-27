@@ -114,6 +114,23 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     // guard drops at the end of this function (cancellation included).
     let _connection_gauge = crate::transport::ConnectionGauge::register(transport_variant);
 
+    // Registered before this connection owns anything else, and the ban re-read
+    // immediately after: either a ban raised from here on finds this connection,
+    // or this check finds the ban. The upgrade above is long enough for a sibling
+    // connection to have banned the source since the check at the top, and a
+    // WebSocket is where it matters most — it is client-initiated and long-lived
+    // (RFC 7118 §5), so a banned UE that never reconnects is never re-checked
+    // again (see [`crate::transport::disconnect`]).
+    let closer = crate::transport::disconnect::ConnectionCloser::register(
+        connection_id,
+        remote_addr.ip(),
+        transport_variant,
+    );
+    if crate::security::is_source_banned(remote_addr.ip()) {
+        debug!("{transport_variant} dropping {remote_addr}: source banned during its upgrade");
+        return;
+    }
+
     // Per-connection outbound channel
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
     connection_map.insert(connection_id, outbound_tx);
@@ -125,7 +142,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
 
     // Read task: WebSocket frames → InboundMessage (with idle timeout)
     let inbound_tx_clone = inbound_tx.clone();
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, ws_source.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
@@ -185,7 +202,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     });
 
     // Write task: per-connection channel → WebSocket text frames
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
             // SIP messages are text — send as text frame
             let text = String::from_utf8_lossy(&data).into_owned();
@@ -211,11 +228,25 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
         }
     });
 
-    // Wait for either half to close, then clean up.
+    // Wait for either half to close — or for the UE's source to be banned —
+    // then clean up.
     tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
+        _ = &mut read_task => {}
+        _ = &mut write_task => {}
+        // The source was banned while this connection was established. Nothing
+        // is sent to it, not even a close frame: the ban is the answer.
+        // `close_banned_source` already logged the connection and why.
+        _ = closer.closed() => {}
     }
+
+    // Both halves go, whichever arm ran. The split halves share the stream, so
+    // the socket lives until the last of them drops — leaving one detached, as
+    // dropping its `JoinHandle` here does, leaves a connection open that
+    // everything below has already forgotten: on the ban arm the very connection
+    // the ban exists to end, and on the write arm a reader holding the socket
+    // until the 300 s idle timeout.
+    read_task.abort();
+    write_task.abort();
 
     connection_map.remove(&connection_id);
     stream_connections.unregister(&remote_addr, transport_variant, connection_id);
@@ -625,6 +656,81 @@ mod tests {
             registry.get(&remote_addr, Transport::WebSocket),
             Some(ConnectionId(502)),
             "the old connection's cleanup unregistered the live connection that replaced it"
+        );
+    }
+
+    /// The WebSocket half of the ban close: a ban raised while a UE is holding
+    /// its connection open closes it, rather than leaving it to keep trying
+    /// passwords on a connection nothing re-checks.
+    ///
+    /// Drives `handle_connection` directly, which is also what the WSS listener
+    /// and the mux's WebSocket arm run, so all three are covered here; the raw
+    /// SIP transports go through `serve_sip_stream` and are covered in
+    /// [`crate::transport::stream`].
+    #[tokio::test]
+    async fn a_ban_closes_a_websocket_the_banned_ue_is_holding_open() {
+        // Threshold 1: the first rejected credential bans.
+        let store = Arc::new(crate::security::AutoBanStore::new(
+            1,
+            600,
+            300,
+            &[],
+            1,
+            0,
+            3600,
+        ));
+        let registry = StreamConnections::new();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let local_addr: SocketAddr = "127.0.0.1:5062".parse().expect("a test address");
+        let remote_addr: SocketAddr = "203.0.113.24:50462".parse().expect("a test address");
+        let connection_id = ConnectionId(601);
+
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let permit = crate::security::try_accept_connection(remote_addr.ip())
+            .expect("no connection limit applies to this test");
+        let served = tokio::spawn(handle_connection(
+            server,
+            Transport::WebSocket,
+            None,
+            connection_id,
+            local_addr,
+            remote_addr,
+            permit,
+            inbound_tx,
+            Arc::clone(&connection_map),
+            registry.clone(),
+            None,
+        ));
+        let (mut websocket, _) = tokio_tungstenite::client_async("ws://127.0.0.1:5062/", client)
+            .await
+            .expect("the WebSocket upgrade must succeed");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while registry.get(&remote_addr, Transport::WebSocket) != Some(connection_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection must register");
+
+        assert!(
+            store.record_strong_failure(remote_addr.ip()),
+            "one high-confidence signal against a threshold of 1 must ban"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            .await
+            .expect("the banned UE's open connection must be closed")
+            .expect("the connection task must not panic");
+        assert!(!connection_map.contains_key(&connection_id));
+        assert!(registry.get(&remote_addr, Transport::WebSocket).is_none());
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), websocket.next())
+            .await
+            .expect("the UE's end of the connection must not be left hanging");
+        assert!(
+            !matches!(ended, Some(Ok(_))),
+            "the UE must see its connection end, got {ended:?}"
         );
     }
 

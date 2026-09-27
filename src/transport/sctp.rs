@@ -103,13 +103,30 @@ pub async fn listen(
                             crate::transport::Transport::Sctp,
                         );
 
+                        // Registered before this association owns anything else,
+                        // and the ban re-read immediately after: either a ban
+                        // raised from here on finds this association, or this
+                        // check finds the ban (see
+                        // [`crate::transport::disconnect`]).
+                        let closer = crate::transport::disconnect::ConnectionCloser::register(
+                            connection_id,
+                            remote_addr.ip(),
+                            crate::transport::Transport::Sctp,
+                        );
+                        if crate::security::is_source_banned(remote_addr.ip()) {
+                            debug!(
+                                "SCTP dropping {remote_addr}: source banned before it was served"
+                            );
+                            return;
+                        }
+
                         // Per-connection outbound channel
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx);
 
                         // Read task — message-oriented: each recvmsg returns one SIP message
                         let inbound_tx_clone = inbound_tx.clone();
-                        let read_task = tokio::spawn(async move {
+                        let mut read_task = tokio::spawn(async move {
                             loop {
                                 let mut buffer = BytesMut::with_capacity(65536);
                                 // Idle-bounded, as the TCP/TLS/WS listeners are:
@@ -168,7 +185,7 @@ pub async fn listen(
                         });
 
                         // Write task
-                        let write_task = tokio::spawn(async move {
+                        let mut write_task = tokio::spawn(async move {
                             let options = SendOptions::default();
                             while let Some(data) = outbound_rx.recv().await {
                                 match tokio::time::timeout(
@@ -195,11 +212,22 @@ pub async fn listen(
                             }
                         });
 
-                        // Wait for either half to close, then clean up.
+                        // Wait for either half to close — or for the peer's source
+                        // to be banned — then clean up.
                         tokio::select! {
-                            _ = read_task => {}
-                            _ = write_task => {}
+                            _ = &mut read_task => {}
+                            _ = &mut write_task => {}
+                            // `close_banned_source` already logged which
+                            // association it is closing, and why.
+                            _ = closer.closed() => {}
                         }
+
+                        // Both halves go, whichever arm ran: the association
+                        // lives until the last of them drops, so leaving one
+                        // detached leaves it open after everything below has
+                        // forgotten it.
+                        read_task.abort();
+                        write_task.abort();
 
                         connection_map.remove(&connection_id);
                         info!("SCTP connection {:?} cleaned up", connection_id);

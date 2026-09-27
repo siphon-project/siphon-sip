@@ -454,6 +454,22 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // directions, and the registry also holds the pool's outbound TLS entries.
     let _connection_gauge = crate::transport::ConnectionGauge::register(transport);
 
+    // Registered before this connection owns anything else, and the ban re-read
+    // immediately after: either a ban raised from here on finds this connection,
+    // or this check finds the ban. Without that ordering a ban raised between the
+    // accept-path check and the registration would miss the connection entirely
+    // — and it is the connection a banned source keeps that the ban has to end
+    // (see [`crate::transport::disconnect`]).
+    let closer = crate::transport::disconnect::ConnectionCloser::register(
+        connection_id,
+        remote_addr.ip(),
+        transport,
+    );
+    if crate::security::is_source_banned(remote_addr.ip()) {
+        debug!("{transport} dropping {remote_addr}: source banned before it was served");
+        return;
+    }
+
     // Per-connection outbound channel. Cloned for the read task so it can write
     // RFC 5626 §4.4.1 pong (`\r\n`) responses back over the same connection.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
@@ -464,7 +480,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     let keepalive_writer = outbound_tx;
 
     // Read task: SIP stream framing (RFC 3261 §18.3) with an idle timeout.
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         let mut reader = reader;
         let mut accumulator = seed;
         let mut read_buf = [0u8; 8192];
@@ -606,9 +622,10 @@ pub(crate) async fn serve_sip_stream<R, W>(
         }
     });
 
-    // Wait for either half to close, then clean up.
+    // Wait for either half to close — or for the peer's source to be banned —
+    // then clean up.
     tokio::select! {
-        _ = read_task => {
+        _ = &mut read_task => {
             // The read half can queue a final response on its way out — a 513
             // for an oversized declaration, say. Dropping the write half here
             // would discard it and the peer would see a bare connection reset
@@ -619,7 +636,19 @@ pub(crate) async fn serve_sip_stream<R, W>(
             let _ = tokio::time::timeout(FINAL_WRITE_GRACE, &mut write_task).await;
         }
         _ = &mut write_task => {}
+        // The source was banned while this connection was established. Nothing
+        // is flushed to it: the ban is the answer. `close_banned_source` already
+        // logged the connection it is closing and why.
+        _ = closer.closed() => {}
     }
+
+    // Both halves go, whichever arm ran. The socket lives until the last of them
+    // drops, so leaving one detached — as dropping its `JoinHandle` here does —
+    // leaves a connection open that every registry below has already forgotten:
+    // on the ban arm the very connection the ban exists to end, and on the write
+    // arm a reader holding the socket until the 300 s idle timeout.
+    read_task.abort();
+    write_task.abort();
 
     connection_map.remove(&connection_id);
     if let Some(registry) = stream_connections.as_ref() {
@@ -1792,6 +1821,152 @@ mod tests {
         client.write_all(b"HELO example.com\r\n").await.unwrap();
         served.await.unwrap();
         assert!(!connection_map.contains_key(&ConnectionId(42)));
+    }
+
+    const REGISTER: &[u8] = concat!(
+        "REGISTER sip:ims.example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/TLS 203.0.113.9:51000;branch=z9hG4bK4021\r\n",
+        "From: <sip:001010000000001@ims.example.com>;tag=99a1\r\n",
+        "To: <sip:001010000000001@ims.example.com>\r\n",
+        "Call-ID: 7f2c1d40a8@203.0.113.9\r\n",
+        "CSeq: 1 REGISTER\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    )
+    .as_bytes();
+
+    /// A ban raised while its source is holding a connection open closes that
+    /// connection, and the reconnect the source then has to make is refused at
+    /// accept for as long as the ban lasts.
+    ///
+    /// The ACL runs at accept and the re-check runs once the handshake
+    /// completes, so a source that never reconnects meets neither again.
+    /// Observed in production over TLS: REGISTERs with rejected credentials kept
+    /// reaching the script for two minutes after the ban was raised, each one
+    /// sliding its expiry further out, while every other client behind the same
+    /// address was refused at accept for the whole time; eight minutes in, a
+    /// REGISTER carrying the *right* password came up that same connection and
+    /// its binding was stored, with the source still banned.
+    ///
+    /// Runs in a process of its own: it installs the process-wide ban store, and
+    /// so does another test in this binary.
+    #[test]
+    fn a_ban_closes_the_connection_its_source_already_holds_open() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::a_ban_closes_the_connection_its_source_already_holds_open"
+            ),
+            || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a tokio runtime for the connection under test");
+                runtime.block_on(a_banned_source_loses_the_connection_it_holds());
+            },
+        );
+    }
+
+    async fn a_banned_source_loses_the_connection_it_holds() {
+        // Three rejected credentials inside the window ban for 300 s, at weight
+        // 1 per signal so the count is exactly the number of REGISTERs sent.
+        let store = Arc::new(crate::security::AutoBanStore::new(
+            3,
+            600,
+            300,
+            &[],
+            1,
+            0,
+            3600,
+        ));
+        crate::security::set_auto_ban(Arc::clone(&store));
+
+        let source: SocketAddr = "203.0.113.9:51000".parse().expect("a test address");
+        let context = StreamContext {
+            transport: Transport::Tls,
+            remote_addr: source,
+            ..context()
+        };
+        let (mut client, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let registry = StreamConnections::new();
+        let (close_tx, close_rx) = flume::unbounded();
+        let served = tokio::spawn(serve_sip_stream(
+            reader,
+            writer,
+            context,
+            BytesMut::new(),
+            inbound_tx,
+            Arc::clone(&connection_map),
+            Some(registry.clone()),
+            None,
+            Some(close_tx),
+        ));
+
+        // One connection, three REGISTERs, each answered with a challenge the
+        // peer gets wrong — what the auth path reports per rejected credential.
+        for attempt in 1..=3 {
+            client
+                .write_all(REGISTER)
+                .await
+                .expect("the connection is still live");
+            let message = tokio::time::timeout(Duration::from_secs(10), inbound_rx.recv_async())
+                .await
+                .expect("the REGISTER must reach the dispatcher")
+                .expect("the inbound channel must stay open");
+            assert_eq!(&message.data[..], REGISTER);
+            assert_eq!(
+                store.record_strong_failure(source.ip()),
+                attempt == 3,
+                "attempt {attempt} of 3 against a threshold of 3",
+            );
+        }
+
+        // The connection is gone: the task returned, the peer sees the close,
+        // and both registries are clear.
+        tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the banned source's open connection must be closed")
+            .expect("the connection task must not panic");
+        let mut after_the_ban = [0u8; 1];
+        assert_eq!(
+            client
+                .read(&mut after_the_ban)
+                .await
+                .expect("reading a closed connection is EOF, not an error"),
+            0,
+            "the peer must see its connection close"
+        );
+        assert!(!connection_map.contains_key(&ConnectionId(42)));
+        assert!(registry.get(&source, Transport::Tls).is_none());
+        // RFC 5626 §4.2.2 flow failure: a binding that arrived over it goes too.
+        assert_eq!(
+            close_rx
+                .recv_async()
+                .await
+                .expect("the registrar must hear the flow fail"),
+            42
+        );
+
+        // What the peer does next is reconnect, and that is refused at accept
+        // for as long as the ban holds — the attempt carrying the right password
+        // included, which is the one that used to be accepted and stored.
+        let acl = crate::transport::acl::TransportAcl::new(vec![], vec![]);
+        assert!(!acl.is_allowed(source.ip()));
+        store.record_success(source.ip());
+        assert!(
+            !acl.is_allowed(source.ip()),
+            "valid credentials clear the failure count; they do not lift a ban"
+        );
+        let now = std::time::Instant::now();
+        assert!(store.is_banned_at(source.ip(), now + Duration::from_secs(290)));
+        assert!(
+            !store.is_banned_at(source.ip(), now + Duration::from_secs(310)),
+            "the ban must still lapse at its expiry"
+        );
     }
 
     // --- classify_sip_only (listeners that are not half of a mux) -----------

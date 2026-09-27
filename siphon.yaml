@@ -723,6 +723,11 @@ auth:
 #     # re-checked once a TLS/WebSocket handshake completes — so connections
 #     # already open from a source that a sibling connection just got banned are
 #     # dropped with it instead of being served out.
+#     # A new ban also CLOSES every stream connection (TCP/TLS/WS/WSS/SCTP) the
+#     # source already holds open, one INFO log line each. Both checks above run
+#     # once per connection, so a client that never reconnects kept the
+#     # connection it had and went on guessing passwords on it for the whole
+#     # ban, while every other client behind that address was refused at accept.
 #
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org
