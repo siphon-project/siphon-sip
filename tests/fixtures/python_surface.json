@@ -1973,8 +1973,13 @@
         "kind": "method_descriptor",
         "sig": "($self, tag)"
       },
+      "set_ruri": {
+        "doc": "Replace the whole Request-URI with a string or a SipUri object.",
+        "kind": "method_descriptor",
+        "sig": "($self, value)"
+      },
       "set_ruri_host": {
-        "doc": "Set the host part of the Request-URI.",
+        "doc": "Set the host part of the Request-URI: a domain, IPv4 address or IPv6",
         "kind": "method_descriptor",
         "sig": "($self, value)"
       },

@@ -148,6 +148,18 @@ entry, but a working config keeps working.
   `@b2bua.on_cancel` had the same race with a retransmitted CANCEL, which ran it
   twice and sent the caller a second 487; the copy now gets its 200 and
   nothing else.
+- **`request.set_ruri(uri)` exists.** Scripts calling it got
+  `AttributeError: 'builtins.Request' object has no attribute 'set_ruri'`: the
+  runtime only had the `request.ruri = ...` property setter, while the SDK mock
+  and the number-routing cookbook documented a method. Both forms now work and
+  take a full URI string or a `SipUri`; an unparseable string raises
+  `ValueError` and leaves the R-URI alone.
+- **`request.set_ruri_host(host)` refuses a value that is not a bare host.**
+  `"gw1.example.net:5080"` used to go out as the IPv6-bracketed
+  `[gw1.example.net:5080]`; it, a scheme, a user or a URI parameter now raise
+  `ValueError`. An IPv6 address is accepted with or without brackets and stored
+  bracketed, as the parser stores it. Change the port with `set_ruri()`.
+
 - **`@proxy.on_register_reply` handlers never ran.** The decorator registered
   the handler but the proxy response path never dispatched it, so a script that
   used it got no callback and no error. It is now shorthand for

@@ -164,8 +164,17 @@ class Request:
 
     @property
     def ruri(self) -> SipUri:
-        """Request-URI as a :class:`SipUri` object."""
+        """Request-URI as a :class:`SipUri` object.
+
+        Assignable, same as :meth:`set_ruri`::
+
+            request.ruri = "sip:bob@example.com"
+        """
         return self._ruri
+
+    @ruri.setter
+    def ruri(self, value: Union[str, SipUri]) -> None:
+        self.set_ruri(value)
 
     @property
     def from_uri(self) -> Optional[SipUri]:
@@ -1114,29 +1123,86 @@ class Request:
     def set_ruri(self, value: Union[str, SipUri]) -> None:
         """Replace the entire Request-URI.
 
+        The string is a complete URI (scheme included), parsed exactly as it
+        would be off the wire, so a port, userinfo parameters and URI
+        parameters all go out as written.  To change only one part, use
+        :meth:`set_ruri_user` or :meth:`set_ruri_host`.
+
         Args:
             value: New URI as a string or :class:`SipUri`.
+
+        Raises:
+            ValueError: The string is not a valid URI (runtime only; the
+                R-URI is left unchanged).
+
+        Example::
+
+            request.set_ruri("sip:bob@example.com")
+            request.set_ruri("sip:+15551234567@gw1.example.net:5080;user=phone")
+
+            # RFC 4694 number portability: npdi / rn sit in the userinfo,
+            # before the @.  ruri.user still reads "+15551234567".
+            request.set_ruri(
+                "sip:+15551234567;npdi;rn=+15559876543"
+                "@carrier.example.net;user=phone"
+            )
+
+            request.set_ruri("tel:+15551234567")
+
+            # Or pass a SipUri.
+            request.set_ruri(SipUri(user="bob", host="example.com"))
         """
         self._ruri = _parse_uri(value) or self._ruri
 
     def set_ruri_user(self, value: Optional[str]) -> None:
-        """Set the user part of the Request-URI.
+        """Set the user part of the Request-URI, keeping scheme, host and port.
 
         Args:
-            value: New user part, or ``None`` to clear.
+            value: New user part, just the user (no ``sip:``, no ``@``), or
+                ``None`` to clear it.
 
         Example::
 
-            request.set_ruri_user("bob")
+            # sip:1234@example.com -> sip:+15551234567@example.com
+            request.set_ruri_user("+15551234567")
+
+            # sip:alice@example.com -> sip:example.com
+            request.set_ruri_user(None)
         """
         self._ruri.user = value
 
     def set_ruri_host(self, value: str) -> None:
-        """Set the host part of the Request-URI.
+        """Set the host part of the Request-URI, keeping scheme, user and port.
 
         Args:
-            value: New host/domain string.
+            value: New host only: a domain, IPv4 address or bracketed IPv6
+                address.  No scheme, user or port; change the port with
+                :meth:`set_ruri` instead.
+
+        Example::
+
+            # sip:bob@example.com -> sip:bob@gw1.example.net
+            request.set_ruri_host("gw1.example.net")
+
+            request.set_ruri_host("192.0.2.10")
+            request.set_ruri_host("[2001:db8::10]")
+
+        Raises:
+            ValueError: ``value`` is not a bare host, e.g.
+                ``"gw1.example.net:5080"`` or ``"sip:gw1.example.net"``.
         """
+        unbracketed = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+        if ":" in unbracketed:
+            try:
+                ipaddress.IPv6Address(unbracketed)
+            except ValueError:
+                raise ValueError(f"invalid R-URI host {value!r}") from None
+            self._ruri.host = f"[{unbracketed}]"
+            return
+        if unbracketed != value or not value or not all(
+            c.isascii() and (c.isalnum() or c in "-.") for c in value
+        ):
+            raise ValueError(f"invalid R-URI host {value!r}")
         self._ruri.host = value
 
     # -- Display name / path / route -------------------------------------------
