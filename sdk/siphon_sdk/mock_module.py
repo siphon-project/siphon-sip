@@ -5755,7 +5755,10 @@ class MockRegistration:
             interval: Registration interval in seconds.
             realm: Optional realm hint (the home domain for IMS).
             contact: Optional Contact URI.
-            transport: Transport protocol: "udp" (default), "tcp", "tls".
+            transport: Transport protocol: "udp" (default), "tcp", "tls"
+                (case-insensitive). Anything else raises ValueError: siphon
+                dials no outbound SCTP association and no WebSocket, so a
+                trunk naming one could never register.
             auth: "digest" (default) or "aka" for IMS AKAv1-MD5
                 (RFC 3310 / 3GPP TS 33.203).
             k: Subscriber key K as 32 hex chars (required when auth="aka").
@@ -5774,10 +5777,16 @@ class MockRegistration:
             ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
 
         Raises:
-            ValueError: when auth="aka" but `k` or an operator key (`op`/`opc`)
-                is missing; or when ipsec=True without auth="aka" /
-                ue_port_c / ue_port_s — mirroring the Rust binding.
+            ValueError: when `transport` is not udp/tcp/tls; when auth="aka"
+                but `k` or an operator key (`op`/`opc`) is missing; or when
+                ipsec=True without auth="aka" / ue_port_c / ue_port_s —
+                mirroring the Rust binding.
         """
+        if transport is not None and transport.lower() not in ("udp", "tcp", "tls"):
+            raise ValueError(
+                f"registration.add(transport=): {transport!r} is not one siphon can "
+                "register over — use 'udp', 'tcp' or 'tls'"
+            )
         is_aka = auth is not None and auth.lower() == "aka"
         if is_aka:
             if not k:

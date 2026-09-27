@@ -74,8 +74,9 @@ pub use observability::{
     TracingConfig,
 };
 pub use registrant::{
-    RegistrantAkaConfig, RegistrantBackendType, RegistrantDatabaseConfig, RegistrantEntryConfig,
-    RegistrantHttpConfig, RegistrantImsConfig, RegistrantIpsecConfig, RegistrantYamlConfig,
+    parse_registrant_transport, registrant_transport_error, RegistrantAkaConfig,
+    RegistrantBackendType, RegistrantDatabaseConfig, RegistrantEntryConfig, RegistrantHttpConfig,
+    RegistrantImsConfig, RegistrantIpsecConfig, RegistrantYamlConfig,
 };
 pub use registrar::{
     LivenessDeregMode, PostgresBackendConfig, RedisBackendConfig, RegistrarBackendType,
@@ -424,6 +425,7 @@ impl Config {
         config.validate_control_apps()?;
         config.validate_control_inbound()?;
         config.validate_registrant_source()?;
+        config.validate_registrant_transports()?;
         config.validate_gateway_source()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
@@ -817,6 +819,29 @@ impl Config {
                  Query: {:?}",
                 database.query
             )));
+        }
+        Ok(())
+    }
+
+    /// Reject a `registrant.entries[].transport` siphon cannot register over.
+    ///
+    /// Refused at load because the alternative is worse than a dead trunk: the
+    /// startup path matched `"tcp"`/`"tls"` and sent everything else over UDP,
+    /// so a config asking for SCTP registered over UDP instead — quietly, and
+    /// looking like it worked. A typo and a mis-cased `"TLS"` took the same
+    /// path. See [`parse_registrant_transport`] for which transports an
+    /// outbound REGISTER can actually leave over, and why.
+    fn validate_registrant_transports(&self) -> Result<()> {
+        let Some(registrant) = &self.registrant else {
+            return Ok(());
+        };
+        for entry in &registrant.entries {
+            if parse_registrant_transport(&entry.transport).is_none() {
+                return Err(SiphonError::Config(registrant_transport_error(
+                    &format!("registrant.entries[{}].transport", entry.aor),
+                    &entry.transport,
+                )));
+            }
         }
         Ok(())
     }

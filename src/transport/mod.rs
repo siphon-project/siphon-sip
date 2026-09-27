@@ -846,7 +846,18 @@ pub struct OutboundRouter {
     pub tls: flume::Sender<OutboundMessage>,
     pub ws: flume::Sender<OutboundMessage>,
     pub wss: flume::Sender<OutboundMessage>,
-    pub sctp: flume::Sender<OutboundMessage>,
+    /// SCTP egress channel, present only when something serves it.
+    ///
+    /// `None` is the normal state: the SCTP transport writes to associations it
+    /// *accepted*, so its listener loop is the only consumer there is, and a
+    /// deployment with no `listen.sctp` (or a binary built without the `sctp`
+    /// feature) has nobody reading this channel at all. The option is what makes
+    /// that visible — handing out a sender regardless meant every
+    /// [`Transport::Sctp`] send landed in an unbounded queue that nothing ever
+    /// drained: the message never reached the wire, nothing was logged, and the
+    /// queue grew for the life of the process. `send` now refuses instead, and
+    /// says which destination it refused.
+    pub sctp: Option<flume::Sender<OutboundMessage>>,
 }
 
 impl OutboundRouter {
@@ -917,9 +928,53 @@ impl OutboundRouter {
             Transport::Tls => self.tls.send(message),
             Transport::WebSocket => self.ws.send(message),
             Transport::WebSocketSecure => self.wss.send(message),
-            Transport::Sctp => self.sctp.send(message),
+            Transport::Sctp => match &self.sctp {
+                Some(sender) => sender.send(message),
+                None => {
+                    // Loud, and at the one point every outbound message passes
+                    // through: several callers discard `send`'s Result, so a
+                    // refusal reported only through the return value would still
+                    // be a silent drop.
+                    tracing::error!(
+                        destination = %message.destination,
+                        "refusing an outbound SCTP message: this node serves no SCTP \
+                         egress. siphon's SCTP transport writes only to associations it \
+                         accepted, so there is no outbound association to send on."
+                    );
+                    if let Some(metrics) = crate::metrics::try_metrics() {
+                        metrics
+                            .outbound_unserved_total
+                            .with_label_values(&[Transport::Sctp.as_scheme()])
+                            .inc();
+                    }
+                    Err(flume::SendError(message))
+                }
+            },
         }
     }
+}
+
+/// The SCTP egress channel for this deployment, or nothing when no SCTP
+/// listener will read it.
+///
+/// The channel's only consumer is [`sctp::listen`]'s distributor task, which
+/// writes to associations the listener *accepted* — siphon has no outbound SCTP
+/// dialer. So a node with no `listen.sctp`, or a binary built without the `sctp`
+/// feature, has nobody to serve an outbound SCTP message, and this returns
+/// `(None, None)` so [`OutboundRouter::send`] refuses one out loud. Creating the
+/// channel unconditionally is what let those messages pile up in an unbounded
+/// queue nothing ever drained: never on the wire, never logged.
+pub fn sctp_egress_channel(
+    has_sctp_listener: bool,
+) -> (
+    Option<flume::Sender<OutboundMessage>>,
+    Option<flume::Receiver<OutboundMessage>>,
+) {
+    if !cfg!(feature = "sctp") || !has_sctp_listener {
+        return (None, None);
+    }
+    let (sender, receiver) = flume::unbounded();
+    (Some(sender), Some(receiver))
 }
 
 /// Cross-transport registry of live stream connections, keyed by the peer's
@@ -1632,7 +1687,7 @@ mod tests {
             tls: dummy.clone(),
             ws: dummy.clone(),
             wss: dummy.clone(),
-            sctp: dummy,
+            sctp: Some(dummy),
         };
 
         let make = |source: Option<SocketAddr>| OutboundMessage {
@@ -1708,7 +1763,7 @@ mod tests {
             tls: dummy.clone(),
             ws: dummy.clone(),
             wss: dummy.clone(),
-            sctp: dummy,
+            sctp: Some(dummy),
         };
 
         // MO INVITE over the SA: sourced from port_uc, addressed to the P-CSCF's
@@ -1754,7 +1809,7 @@ mod tests {
             tls: dummy.clone(),
             ws: dummy.clone(),
             wss: dummy.clone(),
-            sctp: dummy,
+            sctp: Some(dummy),
         };
 
         router
@@ -1770,6 +1825,155 @@ mod tests {
             .unwrap();
 
         assert!(default.1.try_recv().is_ok());
+    }
+
+    /// No SCTP listener means no consumer, so there must be no channel either —
+    /// this is what stops an SCTP-routed message queueing forever behind a reader
+    /// that does not exist.
+    #[test]
+    fn no_sctp_listener_means_no_sctp_egress_channel() {
+        let (sender, receiver) = sctp_egress_channel(false);
+        assert!(sender.is_none(), "nothing may hand out an unserved sender");
+        assert!(receiver.is_none());
+    }
+
+    /// With a listener (and the feature) the pair exists and is connected.
+    #[test]
+    #[cfg(feature = "sctp")]
+    fn an_sctp_listener_gets_a_connected_egress_channel() {
+        let (sender, receiver) = sctp_egress_channel(true);
+        let sender = sender.expect("a served egress must have a sender");
+        let receiver = receiver.expect("and the receiver that serves it");
+        sender
+            .send(OutboundMessage {
+                connection_id: ConnectionId(1),
+                transport: Transport::Sctp,
+                destination: addr("198.51.100.20:5060"),
+                data: Bytes::from_static(b"OPTIONS"),
+                source_local_addr: None,
+                server_name: None,
+                followups: None,
+            })
+            .expect("the receiver is alive");
+        assert_eq!(
+            receiver.try_recv().expect("delivered").connection_id,
+            ConnectionId(1)
+        );
+    }
+
+    /// Built without the `sctp` feature there is no listener loop to compile in,
+    /// so a configured `listen.sctp` still gets no channel — the block is warned
+    /// about at startup and ignored, and an SCTP send is refused rather than
+    /// queued.
+    #[test]
+    #[cfg(not(feature = "sctp"))]
+    fn without_the_sctp_feature_a_configured_listener_still_gets_no_channel() {
+        let (sender, receiver) = sctp_egress_channel(true);
+        assert!(sender.is_none());
+        assert!(receiver.is_none());
+    }
+
+    /// A node with no SCTP egress must REFUSE a `Transport::Sctp` send, not
+    /// swallow it.
+    ///
+    /// The router used to hold a sender whose only consumer was the SCTP
+    /// listener loop, created whether or not a listener existed. With none, every
+    /// SCTP-routed message went into an unbounded queue nothing drained: it never
+    /// reached the wire, nothing was logged, and the queue grew for the life of
+    /// the process. `None` now makes the refusal explicit, the message comes back
+    /// to the caller, and the counter records it.
+    #[test]
+    fn outbound_router_refuses_sctp_when_nothing_serves_it() {
+        crate::metrics::init().ok();
+        let before = crate::metrics::try_metrics()
+            .map(|metrics| {
+                metrics
+                    .outbound_unserved_total
+                    .with_label_values(&["sctp"])
+                    .get()
+            })
+            .unwrap_or_default();
+
+        let default = flume::unbounded::<OutboundMessage>();
+        let (dummy, dummy_rx) = flume::unbounded();
+        let router = OutboundRouter {
+            udp: default.0.clone().into(),
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: dummy.clone(),
+            tls: dummy.clone(),
+            ws: dummy.clone(),
+            wss: dummy.clone(),
+            sctp: None,
+        };
+
+        let destination = addr("198.51.100.20:5060");
+        let error = router
+            .send(OutboundMessage {
+                connection_id: ConnectionId(0),
+                transport: Transport::Sctp,
+                destination,
+                data: Bytes::from_static(b"REGISTER"),
+                source_local_addr: None,
+                server_name: None,
+                followups: None,
+            })
+            .expect_err("an unserved transport must refuse, not accept and discard");
+
+        // The un-sent message comes back, so a caller that wants to fail the
+        // procedure over it can.
+        assert_eq!(error.0.destination, destination);
+        assert_eq!(error.0.transport, Transport::Sctp);
+
+        // Nothing leaked onto another transport's channel.
+        assert!(default.1.try_recv().is_err());
+        assert!(dummy_rx.try_recv().is_err());
+
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            assert_eq!(
+                metrics
+                    .outbound_unserved_total
+                    .with_label_values(&["sctp"])
+                    .get(),
+                before + 1,
+                "a refused message must be counted"
+            );
+        }
+    }
+
+    /// With a listener serving it, the same send goes through untouched — the
+    /// refusal is about there being no consumer, not about SCTP.
+    #[test]
+    fn outbound_router_delivers_sctp_when_a_listener_serves_it() {
+        let default = flume::unbounded::<OutboundMessage>();
+        let sctp = flume::unbounded::<OutboundMessage>();
+        let (dummy, _) = flume::unbounded();
+        let router = OutboundRouter {
+            udp: default.0.clone().into(),
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: dummy.clone(),
+            tls: dummy.clone(),
+            ws: dummy.clone(),
+            wss: dummy.clone(),
+            sctp: Some(sctp.0.clone()),
+        };
+
+        router
+            .send(OutboundMessage {
+                connection_id: ConnectionId(7),
+                transport: Transport::Sctp,
+                destination: addr("198.51.100.20:5060"),
+                data: Bytes::from_static(b"REGISTER"),
+                source_local_addr: None,
+                server_name: None,
+                followups: None,
+            })
+            .expect("a served SCTP egress accepts the message");
+
+        assert_eq!(
+            sctp.1.try_recv().expect("delivered").connection_id,
+            ConnectionId(7)
+        );
+        assert!(default.1.try_recv().is_err());
     }
 
     #[test]

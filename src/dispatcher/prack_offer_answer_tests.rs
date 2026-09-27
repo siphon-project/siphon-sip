@@ -1030,7 +1030,7 @@ fn place_with_split_egress(
         tls: to_stream.clone(),
         ws: to_stream.clone(),
         wss: to_stream.clone(),
-        sctp: to_stream,
+        sctp: Some(to_stream),
     });
     let state = Arc::new(state);
     let raw = caller_invite(offer);

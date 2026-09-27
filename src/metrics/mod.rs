@@ -478,6 +478,18 @@ pub struct SiphonMetrics {
     /// fronts more registrations than the ceiling allows. `handshakes` rising is
     /// unambiguous — the box is at its concurrent-handshake ceiling.
     pub connections_refused_total: IntCounterVec,
+    /// Outbound SIP messages the router refused because no transport serves
+    /// that egress on this node, by `transport`.
+    ///
+    /// Only `sctp` can reach this today: siphon's SCTP transport writes to
+    /// associations it accepted, so a node with no `listen.sctp` (or a binary
+    /// built without the `sctp` feature) has no outbound SCTP path, and a
+    /// message routed at one is refused rather than queued for a reader that
+    /// does not exist. Any non-zero value is a configuration error — something
+    /// (a script `next_hop` carrying `;transport=sctp`, a stored binding, a
+    /// subscription's remote target) is steering traffic at a transport this
+    /// node cannot originate.
+    pub outbound_unserved_total: IntCounterVec,
     /// Inbound stream connections currently established across all sources.
     pub stream_connections_active: IntGauge,
     /// Inbound handshakes (TLS/WS) plus first-line sniffs currently in flight.
@@ -964,6 +976,14 @@ impl SiphonMetrics {
             &["reason"],
         )?;
 
+        let outbound_unserved_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_outbound_unserved_total",
+                "Total outbound SIP messages refused because no transport serves that egress on this node (SCTP without a listener, or built without the sctp feature)",
+            ),
+            &["transport"],
+        )?;
+
         let stream_connections_active = IntGauge::new(
             "siphon_stream_connections_active",
             "Inbound stream connections currently established across all sources",
@@ -1301,6 +1321,7 @@ impl SiphonMetrics {
         registry.register(Box::new(malformed_messages_total.clone()))?;
         registry.register(Box::new(non_sip_datagrams_dropped_total.clone()))?;
         registry.register(Box::new(connections_refused_total.clone()))?;
+        registry.register(Box::new(outbound_unserved_total.clone()))?;
         registry.register(Box::new(stream_connections_active.clone()))?;
         registry.register(Box::new(handshakes_in_flight.clone()))?;
         registry.register(Box::new(requests_without_branch_total.clone()))?;
@@ -1387,6 +1408,7 @@ impl SiphonMetrics {
             malformed_messages_total,
             non_sip_datagrams_dropped_total,
             connections_refused_total,
+            outbound_unserved_total,
             stream_connections_active,
             handshakes_in_flight,
             requests_without_branch_total,

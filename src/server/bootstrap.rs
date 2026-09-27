@@ -857,10 +857,18 @@ pub(super) fn init_registrant(
             .or_else(|| entry_config.registrar.strip_prefix("sips:"))
             .unwrap_or(&entry_config.registrar);
 
-        let transport_type = match entry_config.transport.as_str() {
-            "tcp" => transport::Transport::Tcp,
-            "tls" => transport::Transport::Tls,
-            _ => transport::Transport::Udp,
+        // Refused at load by `Config::validate_registrant_transports`, so an
+        // unparseable value reaches this only from a programmatically built
+        // `Config`. Skipped loudly rather than falling back to UDP, which is how
+        // an `sctp` or mis-cased trunk silently registered on a transport the
+        // operator never named.
+        let transport_token = &entry_config.transport;
+        let Some(transport_type) = crate::config::parse_registrant_transport(transport_token)
+        else {
+            let reason =
+                crate::config::registrant_transport_error("registrant transport", transport_token);
+            error!(aor = %entry_config.aor, "{reason}");
+            continue;
         };
 
         let default_port: u16 = if transport_type == transport::Transport::Tls {

@@ -384,6 +384,12 @@ registrar:
 #       interval: 1800                # optional — overrides default_interval
 #       contact: "sip:trunk1@1.2.3.4" # optional — auto-generated if omitted
 #       transport: "udp"              # "udp" (default), "tcp", "tls"
+#                                     # (case-insensitive). Anything else is
+#                                     # refused at load: a REGISTER leaves over
+#                                     # UDP or over a connection the outbound
+#                                     # pool opens, and the pool opens TCP and
+#                                     # TLS only — siphon dials no SCTP
+#                                     # association and no WebSocket.
 #
 #     - aor: "sip:trunk2@peer.net"
 #       registrar: "sip:peer.net:5060"

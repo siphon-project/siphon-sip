@@ -36,7 +36,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         tls: stream_sender.clone(),
         ws: stream_sender.clone(),
         wss: stream_sender.clone(),
-        sctp: stream_sender,
+        sctp: Some(stream_sender),
     });
     let timer_config = TimerConfig::default();
     let connection_pool = Arc::new(ConnectionPool::new(

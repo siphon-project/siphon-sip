@@ -1786,7 +1786,7 @@ mod tests {
             tls: tls_tx,
             ws: ws_tx,
             wss: wss_tx,
-            sctp: sctp_tx,
+            sctp: Some(sctp_tx),
         });
         let sender = Arc::new(UacSender::new(
             router,

@@ -91,3 +91,29 @@ def test_ipsec_requires_both_ports():
     with pytest.raises(ValueError, match="ue_port_s"):
         registration.add(AKA_AOR, PCSCF, user=IMPI, auth="aka", k=AKA_K,
                          opc=AKA_OPC, ipsec=True, ue_port_c=6100)
+
+
+# --- transport= ---
+#
+# siphon originates a REGISTER over UDP or over a connection the outbound pool
+# opens, and the pool opens TCP and TLS only. Anything else used to be accepted
+# and registered over UDP instead, so a trunk came up on a transport the script
+# never asked for.
+
+
+@pytest.mark.parametrize("transport", ["sctp", "SCTP", "ws", "wss", "tpc"])
+def test_add_refuses_a_transport_siphon_cannot_dial(transport):
+    registration = _fresh_registration()
+    with pytest.raises(ValueError, match="register over"):
+        registration.add("sip:trunk@carrier.example", "sip:198.51.100.20:5060",
+                         user="trunk", password="secret", transport=transport)
+    assert registration._entries == {}
+
+
+@pytest.mark.parametrize("transport", [None, "udp", "tcp", "tls", "TLS"])
+def test_add_accepts_the_dialable_transports_case_insensitively(transport):
+    registration = _fresh_registration()
+    registration.add("sip:trunk@carrier.example", "sip:198.51.100.20:5060",
+                     user="trunk", password="secret", transport=transport)
+    entry = registration._entries["sip:trunk@carrier.example"]
+    assert entry["transport"] == (transport or "udp")

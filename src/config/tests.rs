@@ -4868,3 +4868,113 @@ fn a_zero_crlf_keepalive_interval_is_refused_at_load() {
     base_yaml("nat:\n  crlf_keepalive:\n    enabled: false\n    interval_secs: 0\n")
         .expect("a disabled keepalive spawns nothing");
 }
+fn registrant_yaml(transport: &str) -> String {
+    format!(
+        "registrant:\n  entries:\n    - aor: \"sip:trunk@carrier.example\"\n      \
+         registrar: \"sip:198.51.100.20:5060\"\n      user: \"trunk\"\n      \
+         password: \"secret\"\n      transport: \"{transport}\"\n"
+    )
+}
+
+#[test]
+fn an_sctp_registrant_is_refused_at_load() {
+    let error = base_yaml(&registrant_yaml("sctp"))
+        .expect_err("an SCTP trunk has no outbound path, so it must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("registrant.entries[sip:trunk@carrier.example].transport"),
+        "the error must name the entry and the field: {message}"
+    );
+    assert!(
+        message.contains("no outbound SCTP association"),
+        "the error must name the cause: {message}"
+    );
+    assert!(
+        message.contains("udp, tcp or tls"),
+        "the error must say what to use instead: {message}"
+    );
+}
+
+/// Built without the `sctp` feature there is no SCTP transport at all, and the
+/// refusal says so on top of the missing-outbound-path reason.
+#[test]
+#[cfg(not(feature = "sctp"))]
+fn an_sctp_registrant_refusal_names_the_missing_feature() {
+    let error = base_yaml(&registrant_yaml("sctp")).expect_err("refused");
+    let message = error.to_string();
+    assert!(message.contains("without the `sctp` feature"), "{message}");
+}
+
+/// With the feature compiled in the transport exists — inbound only — so the
+/// refusal keeps the real reason and does not blame the build.
+#[test]
+#[cfg(feature = "sctp")]
+fn an_sctp_registrant_refusal_does_not_blame_the_build() {
+    let error = base_yaml(&registrant_yaml("sctp")).expect_err("refused");
+    let message = error.to_string();
+    assert!(!message.contains("without the `sctp` feature"), "{message}");
+}
+
+/// A configured `listen.sctp` does not rescue it: the SCTP listener writes only
+/// to associations it accepted, so a trunk siphon has to dial still has nowhere
+/// to go.
+#[test]
+fn an_sctp_listener_does_not_make_an_sctp_registrant_loadable() {
+    let yaml = format!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\n  sctp: [\"0.0.0.0:5060\"]\n\
+         domain:\n  local: [\"example.com\"]\n{}",
+        registrant_yaml("sctp")
+    );
+    let error = Config::from_str(&yaml).expect_err("still refused");
+    assert!(
+        error.to_string().contains("no outbound SCTP association"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unknown_registrant_transport_is_refused_at_load() {
+    let error =
+        base_yaml(&registrant_yaml("tpc")).expect_err("a typo must be refused, not ignored");
+    let message = error.to_string();
+    assert!(
+        message.contains("registrant.entries[sip:trunk@carrier.example].transport"),
+        "{message}"
+    );
+    assert!(message.contains("unknown transport \"tpc\""), "{message}");
+    assert!(message.contains("udp, tcp or tls"), "{message}");
+}
+
+/// A WebSocket is client-initiated, so siphon can never dial one for a trunk.
+#[test]
+fn a_websocket_registrant_is_refused_at_load() {
+    let error = base_yaml(&registrant_yaml("ws")).expect_err("refused");
+    assert!(
+        error.to_string().contains("unknown transport \"ws\""),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_registrant_transports_siphon_can_dial_load() {
+    for transport in ["udp", "tcp", "tls"] {
+        base_yaml(&registrant_yaml(transport))
+            .unwrap_or_else(|error| panic!("{transport} must load: {error}"));
+    }
+}
+
+/// Mixed case is accepted, as it already is on the database/HTTP trunk sources.
+/// It used to fall through to UDP here — a `"TLS"` trunk registered in the clear.
+#[test]
+fn a_mixed_case_registrant_transport_loads() {
+    let config = base_yaml(&registrant_yaml("TLS")).expect("case-insensitive");
+    let registrant = config.registrant.expect("registrant block");
+    assert_eq!(registrant.entries[0].transport, "TLS");
+}
+
+/// Only the entries list carries a transport, so a registrant with none at all
+/// has nothing to refuse.
+#[test]
+fn a_registrant_with_no_entries_loads() {
+    base_yaml("registrant:\n  default_interval: 600\n").expect("nothing to validate");
+}

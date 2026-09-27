@@ -53,7 +53,11 @@ impl PyRegistration {
     ///     realm: Optional realm hint (derived from 401 if omitted; the home
     ///         domain for IMS).
     ///     contact: Optional Contact URI (auto-generated if omitted).
-    ///     transport: Transport protocol: "udp" (default), "tcp", "tls".
+    ///     transport: Transport protocol: "udp" (default), "tcp", "tls"
+    ///         (case-insensitive). Anything else raises ``ValueError``: siphon
+    ///         dials no outbound SCTP association and no WebSocket, so a trunk
+    ///         naming one could never register. An unrecognised value used to
+    ///         register over UDP instead of being refused.
     ///     auth: "digest" (default) or "aka" for IMS AKAv1-MD5 (RFC 3310 / TS 33.203).
     ///     k: Subscriber key K as 32 hex chars (required when auth="aka").
     ///     op: Operator variant OP as 32 hex chars (supply op OR opc for AKA).
@@ -100,10 +104,17 @@ impl PyRegistration {
         imei: Option<String>,
         ims_features: Option<Vec<String>>,
     ) -> PyResult<()> {
+        // The same set, from the same function, as the YAML validator — refused
+        // rather than silently downgraded to UDP, which is how a script asking
+        // for one transport got another.
         let transport_type = match transport {
-            Some("tcp") => Transport::Tcp,
-            Some("tls") => Transport::Tls,
-            _ => Transport::Udp,
+            None => Transport::Udp,
+            Some(token) => crate::config::parse_registrant_transport(token).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(crate::config::registrant_transport_error(
+                    "registration.add(transport=)",
+                    token,
+                ))
+            })?,
         };
 
         // Resolve registrar address from URI — supports both IP:port and hostname
@@ -620,6 +631,88 @@ assert 'registration.on_change' in kinds, kinds
                         .expect("Rust registration namespace must expose on_change");
                 });
             },
+        );
+    }
+
+    /// `transport=` is the same narrow set the YAML validator enforces, and for
+    /// the same reason: an outbound REGISTER leaves over UDP or over a
+    /// connection the pool opens, and the pool opens TCP and TLS only.
+    fn add_with_transport(py_reg: &PyRegistration, transport: Option<&str>) -> PyResult<()> {
+        // IP:port registrar so the test never hits DNS.
+        py_reg.add(
+            "sip:trunk@carrier.example",
+            "sip:198.51.100.20:5060",
+            "trunk",
+            "secret",
+            None,
+            None,
+            None,
+            transport,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// siphon dials no outbound SCTP association, so this used to register over
+    /// UDP instead — a trunk on a transport the script never asked for. The
+    /// message itself is covered by `config::registrant::transport_tests`
+    /// (reading a `PyErr` needs an interpreter; the refusal does not).
+    #[test]
+    fn py_registration_add_refuses_sctp() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+        assert!(
+            add_with_transport(&py_reg, Some("sctp")).is_err(),
+            "sctp must be refused"
+        );
+        assert_eq!(py_reg.count(), 0, "a refused entry must not be added");
+    }
+
+    #[test]
+    fn py_registration_add_refuses_an_unknown_transport() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+        assert!(add_with_transport(&py_reg, Some("tpc")).is_err());
+        assert!(add_with_transport(&py_reg, Some("ws")).is_err());
+        assert_eq!(py_reg.count(), 0);
+    }
+
+    #[test]
+    fn py_registration_add_accepts_the_dialable_transports_case_insensitively() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        for transport in [None, Some("udp"), Some("tcp"), Some("TLS")] {
+            // The error is deliberately not formatted: rendering a `PyErr` needs
+            // an initialised interpreter, which this test does not want.
+            add_with_transport(&py_reg, transport)
+                .unwrap_or_else(|_| panic!("{transport:?} must be accepted"));
+        }
+        // One AoR, re-added each time; the last add won, so the entry is the
+        // mixed-case TLS one.
+        assert_eq!(py_reg.count(), 1);
+        let (_, _, _, transport) = manager
+            .build_register(
+                "sip:trunk@carrier.example",
+                "127.0.0.1:5060".parse().expect("local addr"),
+                &std::collections::HashMap::new(),
+                600,
+            )
+            .expect("the entry must be registrable");
+        assert_eq!(
+            transport,
+            Transport::Tls,
+            "a mixed-case token must not fall through to udp"
         );
     }
 
