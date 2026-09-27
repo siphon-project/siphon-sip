@@ -1027,7 +1027,13 @@ impl RegistrantManager {
 
     /// Get entries that are due for registration attempt.
     pub fn entries_due(&self) -> Vec<String> {
-        let now = Instant::now();
+        self.entries_due_at(Instant::now())
+    }
+
+    /// [`entries_due`](Self::entries_due) as of `now` — the schedule taken as a
+    /// parameter, so a test can assert what a trunk owes hours from now without
+    /// sleeping through it.
+    pub fn entries_due_at(&self, now: Instant) -> Vec<String> {
         self.entries
             .iter()
             .filter(|entry| entry.next_attempt <= now)
@@ -1175,6 +1181,11 @@ pub async fn registration_loop(
             send_registrant_message(&outbound, egress, message, destination, transport);
         }
 
+        // Stated before the liveness check below reads those connections, and
+        // before the first REGISTER of a trunk added since the last tick opens
+        // one.
+        exempt_trunk_connections_from_idle_reap(&manager, &connection_pool);
+
         // Connection loss on TLS/TCP: re-register on this tick instead of at
         // the refresh timer, which also re-opens the connection the registrar
         // reaches this trunk over.
@@ -1239,6 +1250,33 @@ pub async fn registration_loop(
             }
         }
     }
+}
+
+/// Keep every stream-transport trunk's pooled connection out of the pool's idle
+/// reaper. Returns the exempted destinations.
+///
+/// A trunk's connection is long-lived by definition and
+/// [`force_refresh_lost_connections`] judges the trunk from it, so the pool
+/// closing it after 30 s of silence had an *idle* trunk read as dead ~5 s later
+/// and re-registering roughly every 35 s whatever its interval said. Detection
+/// is untouched — [`ConnectionPool::set_idle_exempt_destinations`] has both
+/// halves.
+///
+/// Every entry counts, not only the Registered ones: a trunk mid-401 needs the
+/// connection its next response comes back on. The set is re-stated in full each
+/// tick, so a removed trunk releases its destination.
+fn exempt_trunk_connections_from_idle_reap(
+    manager: &RegistrantManager,
+    connection_pool: &ConnectionPool,
+) -> Vec<(SocketAddr, Transport)> {
+    let destinations: Vec<(SocketAddr, Transport)> = manager
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.transport, Transport::Tls | Transport::Tcp))
+        .map(|entry| (entry.destination, entry.transport))
+        .collect();
+    connection_pool.set_idle_exempt_destinations(destinations.iter().copied());
+    destinations
 }
 
 /// Force an immediate re-register for every Registered TLS/TCP entry whose
@@ -3211,5 +3249,174 @@ mod liveness_tests {
         let refreshed = force_refresh_lost_connections(&manager, &pool);
 
         assert_eq!(refreshed, vec![AOR.to_string()]);
+    }
+
+    /// An idle trunk keeps its connection, so it re-REGISTERs on its own
+    /// schedule and not on the pool's idle timeout.
+    ///
+    /// Without the exemption: the pool closed a connection that had been silent
+    /// for 30 s, the liveness check above read the trunk as dead on the next
+    /// 5 s tick, and it re-REGISTERed — about every 35 s, whatever the
+    /// configured interval said.
+    ///
+    /// A second, unexempted destination is the control: waiting for *its*
+    /// connection to be reaped proves the reaper ran, so the trunk's surviving
+    /// is an exemption rather than a test that did not wait long enough.
+    #[tokio::test]
+    async fn an_idle_tcp_trunk_is_not_re_registered_before_its_interval() {
+        let registry = StreamConnections::new();
+        let mut pool = pool(&registry);
+        pool.set_idle_timeout(Duration::from_millis(150));
+        let (registrar, _trunk_peer) = pooled_tcp_registrar(&pool).await;
+        let manager = registered_trunk(registrar, Transport::Tcp);
+        let registered_at = Instant::now();
+
+        assert_eq!(
+            exempt_trunk_connections_from_idle_reap(&manager, &pool),
+            vec![(registrar, Transport::Tcp)]
+        );
+        // Opened after the trunk's, so the trunk's window has passed by the time
+        // this one is reaped.  Neither peer ever sends a byte.
+        let (control, _control_peer) = pooled_tcp_registrar(&pool).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pool.has_live(control, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pool's idle timeout never fired, so nothing is being proven here");
+
+        assert!(
+            pool.has_live(registrar, Transport::Tcp),
+            "the trunk's connection was closed for idleness"
+        );
+        assert!(
+            force_refresh_lost_connections(&manager, &pool).is_empty(),
+            "an idle trunk was judged dead and re-registered"
+        );
+        assert_eq!(manager.state(AOR), Some(RegistrantState::Registered));
+
+        // The schedule is untouched: the registrar granted 3600 s, so the next
+        // REGISTER is owed at half of that and at nothing sooner.
+        assert!(
+            manager
+                .entries_due_at(registered_at + Duration::from_secs(1799))
+                .is_empty(),
+            "a REGISTER came due before the refresh point"
+        );
+        assert_eq!(
+            manager.entries_due_at(registered_at + Duration::from_secs(1801)),
+            vec![AOR.to_string()],
+            "the scheduled refresh stopped coming due"
+        );
+    }
+
+    /// Exempting the trunk's connection from the idle timeout does not make
+    /// siphon blind to a registrar that goes away: the pool still drops the
+    /// connection, and the trunk re-registers on the next tick.
+    #[tokio::test]
+    async fn an_exempt_tcp_trunk_whose_connection_dies_is_re_registered_at_once() {
+        let registry = StreamConnections::new();
+        let mut pool = pool(&registry);
+        pool.set_idle_timeout(Duration::from_millis(150));
+        let (registrar, held_open) = pooled_tcp_registrar(&pool).await;
+        let manager = registered_trunk(registrar, Transport::Tcp);
+        exempt_trunk_connections_from_idle_reap(&manager, &pool);
+        assert!(pool.is_idle_exempt(registrar, Transport::Tcp));
+
+        drop(held_open);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(registrar, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an exempt connection the registrar closed still reads as live");
+
+        let refreshed = force_refresh_lost_connections(&manager, &pool);
+
+        assert_eq!(refreshed, vec![AOR.to_string()]);
+        assert_eq!(manager.entries_due(), vec![AOR.to_string()]);
+    }
+
+    /// Only the stream transports are exempted — a UDP trunk has no connection
+    /// to keep, and the pool opens none for it.
+    #[test]
+    fn only_stream_transport_trunks_are_exempted() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        let manager = manager();
+        for (aor, transport, port) in [
+            ("sip:tcp@example.com", Transport::Tcp, 5060u16),
+            ("sip:tls@example.com", Transport::Tls, 5061),
+            ("sip:udp@example.com", Transport::Udp, 5062),
+        ] {
+            manager.add(RegistrantEntry::new(
+                aor.to_string(),
+                "sip:registrar.example.com".to_string(),
+                SocketAddr::new("192.0.2.10".parse().unwrap(), port),
+                transport,
+                RegistrantCredentials::password("trunk".to_string(), "secret".to_string(), None),
+                3600,
+                None,
+            ));
+        }
+
+        let exempted = exempt_trunk_connections_from_idle_reap(&manager, &pool);
+
+        assert_eq!(exempted.len(), 2, "exempted: {exempted:?}");
+        assert!(pool.is_idle_exempt("192.0.2.10:5060".parse().unwrap(), Transport::Tcp));
+        assert!(pool.is_idle_exempt("192.0.2.10:5061".parse().unwrap(), Transport::Tls));
+        assert!(!pool.is_idle_exempt("192.0.2.10:5062".parse().unwrap(), Transport::Udp));
+    }
+
+    /// Steady state: the exemption set the registrant keeps in the pool is one
+    /// entry per live trunk and returns to its starting size once the trunks are
+    /// gone, however many times trunks come and go.
+    #[test]
+    fn the_exemption_set_drains_to_its_starting_len_as_trunks_come_and_go() {
+        let registry = StreamConnections::new();
+        let pool = pool(&registry);
+        let manager = manager();
+        let baseline = pool.idle_exempt_len();
+
+        for cycle in 0..50u16 {
+            let aors: Vec<String> = (0..4u16)
+                .map(|index| format!("sip:trunk{index}@example.com"))
+                .collect();
+            for (index, aor) in aors.iter().enumerate() {
+                manager.add(RegistrantEntry::new(
+                    aor.clone(),
+                    "sip:registrar.example.com".to_string(),
+                    SocketAddr::new(
+                        format!("192.0.2.{}", index + 1).parse().unwrap(),
+                        5060 + cycle,
+                    ),
+                    Transport::Tcp,
+                    RegistrantCredentials::password(
+                        "trunk".to_string(),
+                        "secret".to_string(),
+                        None,
+                    ),
+                    3600,
+                    None,
+                ));
+            }
+            exempt_trunk_connections_from_idle_reap(&manager, &pool);
+            assert_eq!(pool.idle_exempt_len(), aors.len(), "cycle {cycle}");
+
+            for aor in &aors {
+                manager.remove(aor);
+            }
+            let _ = manager.take_pending_deregistrations();
+            exempt_trunk_connections_from_idle_reap(&manager, &pool);
+            assert_eq!(
+                pool.idle_exempt_len(),
+                baseline,
+                "the exemption set kept a destination whose trunk was removed, on cycle {cycle}"
+            );
+        }
+
+        assert_eq!(manager.entries.len(), 0);
     }
 }

@@ -7,9 +7,11 @@
 //! Architecture:
 //!   - Pool stores `mpsc::Sender<Bytes>` per destination (same pattern as inbound connections)
 //!   - Each pooled connection has a read task that feeds responses back to the inbound channel
-//!   - Idle connections are closed after `CONNECTION_IDLE_TIMEOUT`
+//!   - Idle connections are closed after [`POOL_IDLE_TIMEOUT`], except to a
+//!     destination named in [`ConnectionPool::set_idle_exempt_destinations`]
 //!   - Connections are removed on error and recreated on next use
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,9 +35,13 @@ use crate::transport::{
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
 ///
-/// Outbound pool connections are used for probes and registrant — if no
-/// response comes back within this window the connection is dead and should
-/// be torn down so the next send creates a fresh one.
+/// Outbound pool connections carry one-shot traffic — a gateway health probe, a
+/// relay to a peer siphon holds no standing relationship with — so a connection
+/// that has been silent this long is not worth an open socket and the next send
+/// opens a fresh one.
+///
+/// A destination siphon holds a *standing* relationship with is exempt via
+/// [`ConnectionPool::set_idle_exempt_destinations`] — see the rationale there.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fail-fast timeout for outbound TCP/TLS connection establishment.
@@ -137,6 +143,15 @@ pub struct ConnectionPool {
     /// Bound on handing a message to a writer task (defaults to
     /// [`ENQUEUE_TIMEOUT`]).  A field for the same reason.
     enqueue_timeout: Duration,
+    /// How long an outbound TCP connection may sit silent before its reader
+    /// closes it (defaults to [`POOL_IDLE_TIMEOUT`]).  A field for the same
+    /// reason as the three above: a test drives the reap in milliseconds rather
+    /// than waiting 30 s for it.
+    idle_timeout: Duration,
+    /// Destinations whose pooled connection must survive
+    /// [`idle_timeout`](Self::idle_timeout) — see
+    /// [`set_idle_exempt_destinations`](Self::set_idle_exempt_destinations).
+    idle_exempt: Arc<DashMap<(SocketAddr, Transport), ()>>,
 }
 
 /// A client identity siphon presents on OUTBOUND TLS connections when the
@@ -418,6 +433,8 @@ impl ConnectionPool {
             connect_timeout: TCP_CONNECT_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
             enqueue_timeout: ENQUEUE_TIMEOUT,
+            idle_timeout: POOL_IDLE_TIMEOUT,
+            idle_exempt: Arc::new(DashMap::new()),
         }
     }
 
@@ -688,11 +705,13 @@ impl ConnectionPool {
         let key_for_cleanup = key;
         let keepalive_writer = write_tx.clone();
         let crlf_pong_tracker = self.crlf_pong_tracker.clone();
+        let idle_timeout = self.idle_timeout;
+        let idle_exempt = Arc::clone(&self.idle_exempt);
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
             loop {
-                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
+                match tokio::time::timeout(idle_timeout, reader.read(&mut read_buf)).await {
                     Ok(Ok(0)) => {
                         info!(
                             "pool: TCP connection {:?} to {} closed by peer",
@@ -768,10 +787,24 @@ impl ConnectionPool {
                         break;
                     }
                     Err(_) => {
+                        // A destination siphon holds a standing relationship
+                        // with keeps its connection through any amount of
+                        // silence; only the peer, an error or the socket's own
+                        // keepalive ends it (see
+                        // `set_idle_exempt_destinations`).
+                        if idle_exempt.contains_key(&(destination, Transport::Tcp)) {
+                            debug!(
+                                connection_id = ?connection_id,
+                                destination = %destination,
+                                idle = ?idle_timeout,
+                                "pool: TCP connection idle but kept open (exempt destination)"
+                            );
+                            continue;
+                        }
                         info!(
                             "pool: TCP connection {:?} idle timeout ({}s)",
                             connection_id,
-                            POOL_IDLE_TIMEOUT.as_secs()
+                            idle_timeout.as_secs()
                         );
                         break;
                     }
@@ -1193,6 +1226,61 @@ impl ConnectionPool {
     /// (so the right interface is used) with an ephemeral port.
     fn default_tcp_bind(&self) -> SocketAddr {
         SocketAddr::new(self.local_addr.ip(), 0)
+    }
+
+    /// Replace the set of destinations whose pooled connection must not be
+    /// closed just for being idle.
+    ///
+    /// The pool's idle timeout suits traffic that ends when its answer arrives.
+    /// It is wrong for a destination siphon holds a *standing* relationship
+    /// with: an outbound registration keeps one connection to the registrar for
+    /// the life of the binding, because that is the connection the registrar
+    /// reaches this node over (RFC 5626 §4.1) and the one the registrant judges
+    /// the trunk's liveness from. Closing it after 30 s of silence and
+    /// re-opening it on the next refresh is pure churn — worse, the trunk read
+    /// as dead in between, so an idle trunk re-REGISTERed roughly every 35 s
+    /// instead of once per configured interval, which carriers rate-limit.
+    ///
+    /// Exemption removes only the *timer*, never the detection: an exempt
+    /// connection is still dropped the moment the peer closes it, the read or
+    /// write errors, or the socket's own keepalive gives up on a peer that
+    /// vanished without a FIN (`SO_KEEPALIVE` 60 s + 3 × 10 s and
+    /// `TCP_USER_TIMEOUT` 90 s, both set in
+    /// [`configure_tcp_socket`](crate::transport::configure_tcp_socket)).
+    ///
+    /// The whole set goes in one call, and `destinations` is the set afterwards:
+    /// anything not named is released, so a trunk that leaves the configuration
+    /// stops exempting its destination. One owner re-states its set on a timer
+    /// ([`crate::registrant::registration_loop`]); a second caller would fight
+    /// it for the map.
+    pub fn set_idle_exempt_destinations(
+        &self,
+        destinations: impl IntoIterator<Item = (SocketAddr, Transport)>,
+    ) {
+        let wanted: HashSet<(SocketAddr, Transport)> = destinations.into_iter().collect();
+        for key in &wanted {
+            self.idle_exempt.insert(*key, ());
+        }
+        self.idle_exempt.retain(|key, _| wanted.contains(key));
+    }
+
+    /// Whether a pooled connection to `destination` over `transport` is exempt
+    /// from the idle timeout.
+    pub fn is_idle_exempt(&self, destination: SocketAddr, transport: Transport) -> bool {
+        self.idle_exempt.contains_key(&(destination, transport))
+    }
+
+    /// Size of the idle-exemption set, for the drains-to-baseline leak test.
+    #[cfg(test)]
+    pub(crate) fn idle_exempt_len(&self) -> usize {
+        self.idle_exempt.len()
+    }
+
+    /// Drive a short idle timeout, so a test in another module of this crate can
+    /// make the reaper fire in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn set_idle_timeout(&mut self, idle_timeout: Duration) {
+        self.idle_timeout = idle_timeout;
     }
 
     /// Atomically swap the outbound TLS client config (e.g. after a renewed
@@ -2594,8 +2682,14 @@ mod tests {
             .split("let _establish_guard = connect_lock.lock().await;")
             .nth(1)
             .expect("the establishment lock is still taken");
+        // A closing brace followed by a semicolon, the brace escaped: the same
+        // two bytes to `split`, but not an unmatched brace in the source.
+        // Written literally it sent the brace walk in
+        // scripts/check_file_size.py off the end of this function instead of
+        // the end of the module, so every test below here counted as production
+        // code.
         let guarded = guarded
-            .split("};")
+            .split("\u{7d};")
             .next()
             .expect("the guarded block is still delimited");
 
@@ -2712,5 +2806,124 @@ mod tests {
         })
         .await
         .expect("a TLS connection the peer closed still reads as live");
+    }
+
+    /// A silent peer on a listening socket, for the idle-reap tests.
+    async fn silent_peer() -> (tokio::net::TcpListener, SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        (listener, destination)
+    }
+
+    /// An exempt destination's connection survives the idle timeout; a
+    /// destination that is not exempt still loses its connection to it.
+    ///
+    /// The non-exempt connection is the control: it is what proves the reaper
+    /// really ran, so the survivor is an exemption rather than a test that did
+    /// not wait long enough.
+    #[tokio::test]
+    async fn an_idle_exempt_destination_outlives_the_idle_timeout() {
+        let mut pool = test_pool();
+        pool.set_idle_timeout(Duration::from_millis(30));
+        let (trunk_listener, trunk) = silent_peer().await;
+        let (probe_listener, probe) = silent_peer().await;
+        pool.set_idle_exempt_destinations([(trunk, Transport::Tcp)]);
+
+        pool.send_tcp(trunk, Bytes::from_static(b"REGISTER"))
+            .await
+            .unwrap();
+        let (_trunk_peer, _) = trunk_listener.accept().await.unwrap();
+        pool.send_tcp(probe, Bytes::from_static(b"OPTIONS"))
+            .await
+            .unwrap();
+        let (_probe_peer, _) = probe_listener.accept().await.unwrap();
+
+        // Neither peer ever answers.  The trunk's window opened first, so it has
+        // passed by the time the probe's does.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(probe, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the idle timeout never closed the connection that is not exempt");
+
+        assert!(
+            pool.has_live(trunk, Transport::Tcp),
+            "an exempt destination's connection was closed for idleness"
+        );
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    /// Exemption drops the timer, not the detection: the peer closing still
+    /// takes the connection out of the pool at once.
+    #[tokio::test]
+    async fn an_idle_exempt_connection_still_goes_when_the_peer_closes() {
+        let mut pool = test_pool();
+        pool.set_idle_timeout(Duration::from_millis(30));
+        let (listener, trunk) = silent_peer().await;
+        pool.set_idle_exempt_destinations([(trunk, Transport::Tcp)]);
+
+        pool.send_tcp(trunk, Bytes::from_static(b"REGISTER"))
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(pool.has_live(trunk, Transport::Tcp));
+
+        drop(peer);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(trunk, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an exempt connection the peer closed still reads as live");
+    }
+
+    #[test]
+    fn idle_exemption_names_one_destination_and_transport() {
+        let pool = test_pool();
+        let trunk: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        let other: SocketAddr = "192.0.2.11:5060".parse().unwrap();
+        pool.set_idle_exempt_destinations([(trunk, Transport::Tcp)]);
+
+        assert!(pool.is_idle_exempt(trunk, Transport::Tcp));
+        assert!(!pool.is_idle_exempt(trunk, Transport::Tls));
+        assert!(!pool.is_idle_exempt(other, Transport::Tcp));
+    }
+
+    /// Steady state: the exemption set holds what the last call named and
+    /// nothing else, and returns to its starting size once nothing is exempt.
+    /// It is keyed per trunk, so an owner that restates a churning set must not
+    /// grow it.
+    #[test]
+    fn the_idle_exemption_set_drains_to_its_starting_len() {
+        let pool = test_pool();
+        let baseline = pool.idle_exempt_len();
+
+        for cycle in 0..50u16 {
+            let stated: Vec<(SocketAddr, Transport)> = (0..8u16)
+                .map(|index| {
+                    let destination: SocketAddr = format!("192.0.2.{}:{}", index + 1, 5060 + cycle)
+                        .parse()
+                        .unwrap();
+                    (destination, Transport::Tcp)
+                })
+                .collect();
+            pool.set_idle_exempt_destinations(stated.iter().copied());
+            assert_eq!(
+                pool.idle_exempt_len(),
+                stated.len(),
+                "restating the set on cycle {cycle} left earlier destinations behind"
+            );
+        }
+
+        pool.set_idle_exempt_destinations(std::iter::empty());
+        assert_eq!(
+            pool.idle_exempt_len(),
+            baseline,
+            "the exemption set did not drain once no destination was exempt"
+        );
     }
 }

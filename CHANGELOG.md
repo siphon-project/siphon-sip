@@ -126,6 +126,26 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An idle TCP trunk re-REGISTERed roughly every 35 seconds instead of once per
+  configured `interval`.** The outbound connection pool closes a connection that
+  has been silent for 30 s, and a trunk's liveness is judged from its own pool
+  connection, so an idle trunk was reaped, read as dead on the next 5 s tick and
+  re-registered — at a 300 s interval, about 2,470 REGISTERs a day per trunk
+  instead of 288, which upstream registrars rate-limit, answer `503` or blacklist
+  the source for. A registrant destination is now exempt from that idle timeout:
+  its connection is long-lived by design, since it is also the connection the
+  registrar reaches this node over (RFC 5626 §4.1), and closing it only to
+  re-open it on the next tick was pure churn. TLS trunks were never affected (the
+  pool's TLS reader has no idle timeout) and UDP trunks have no connection to
+  keep.
+
+  A registrar that genuinely goes away is still caught as fast as before: the
+  connection is still dropped the moment the peer closes it or the read or write
+  errors, and within ~90 s when a peer vanishes without a FIN (`SO_KEEPALIVE`
+  60 s + 3 × 10 s and `TCP_USER_TIMEOUT`, unchanged), each followed by a
+  re-REGISTER on the next 5 s tick. Nothing about the configured `interval`
+  changed, and the 30 s idle timeout still applies to every other outbound
+  connection (health probes, relays).
 - **A CANCEL for a call driven over the control plane was answered `481
   Call/Transaction Does Not Exist` and cancelled nothing.** The B2BUA route in
   `handle_cancel` was reached only when the *script* had registered a B2BUA
