@@ -244,117 +244,18 @@ fn default_registrant_transport() -> String {
     "udp".to_string()
 }
 
-/// The transports siphon can send an outbound REGISTER over, parsed
-/// case-insensitively. `None` for anything else.
-///
-/// A REGISTER leaves over UDP, or over a connection the outbound pool opens for
-/// it — and the pool opens TCP and TLS only. siphon dials no SCTP association
-/// (its SCTP transport writes only to associations it *accepted*) and no
-/// WebSocket (those are client-initiated), so a trunk naming either could never
-/// reach the wire.
-///
-/// One function because every caller used to keep its own copy that fell through
-/// to UDP on no match, so `transport: sctp` registered over UDP instead and a
-/// mis-cased `"TLS"` did the same. The database and HTTP trunk sources enforce
-/// the same three tokens in `crate::registrant::source`.
-pub fn parse_registrant_transport(token: &str) -> Option<crate::transport::Transport> {
-    match token.to_ascii_lowercase().as_str() {
-        "udp" => Some(crate::transport::Transport::Udp),
-        "tcp" => Some(crate::transport::Transport::Tcp),
-        "tls" => Some(crate::transport::Transport::Tls),
-        _ => None,
-    }
-}
-
-/// The refusal for a `token` that [`parse_registrant_transport`] rejected,
-/// prefixed with the `field` (or API name) that carried it.
-///
-/// `sctp` gets its own wording: it is a transport siphon really does speak, just
-/// never outbound, and an operator told "unknown" would go looking for a typo.
-pub fn registrant_transport_error(field: &str, token: &str) -> String {
-    if token.eq_ignore_ascii_case("sctp") {
-        let mut message = format!(
-            "{field}: siphon opens no outbound SCTP association — its SCTP transport writes only \
-             to associations it accepted, and the outbound connection pool has no SCTP path — so \
-             this trunk's REGISTER could never reach the wire. Use udp, tcp or tls."
-        );
-        if !cfg!(feature = "sctp") {
-            message.push_str(
-                " This binary was also built without the `sctp` feature, so it has no SCTP \
-                 transport at all.",
-            );
-        }
-        return message;
-    }
-    format!(
-        "{field}: unknown transport {token:?} — use udp, tcp or tls. An unrecognised value used \
-         to register over udp instead of being refused, so the trunk came up on a transport the \
-         config never named."
-    )
-}
-
-#[cfg(test)]
-mod transport_tests {
-    use super::*;
-    use crate::transport::Transport;
-
-    #[test]
-    fn the_dialable_transports_parse_case_insensitively() {
-        assert_eq!(parse_registrant_transport("udp"), Some(Transport::Udp));
-        assert_eq!(parse_registrant_transport("tcp"), Some(Transport::Tcp));
-        assert_eq!(parse_registrant_transport("tls"), Some(Transport::Tls));
-        assert_eq!(parse_registrant_transport("TLS"), Some(Transport::Tls));
-        assert_eq!(parse_registrant_transport("Tcp"), Some(Transport::Tcp));
-    }
-
-    /// The whole point: nothing falls through to UDP any more.
-    #[test]
-    fn everything_siphon_cannot_dial_is_rejected() {
-        for token in ["sctp", "SCTP", "ws", "wss", "tpc", "", "udp "] {
-            assert_eq!(
-                parse_registrant_transport(token),
-                None,
-                "{token:?} must not parse"
-            );
-        }
-    }
-
-    #[test]
-    fn the_sctp_refusal_names_the_missing_outbound_path_not_a_typo() {
-        let message = registrant_transport_error("registrant.entries[sip:a@b].transport", "sctp");
-        assert!(
-            message.contains("registrant.entries[sip:a@b].transport"),
-            "{message}"
-        );
-        assert!(
-            message.contains("no outbound SCTP association"),
-            "{message}"
-        );
-        assert!(message.contains("udp, tcp or tls"), "{message}");
-        assert!(
-            !message.contains("unknown transport"),
-            "sctp is not a typo: {message}"
-        );
-    }
-
-    #[test]
-    #[cfg(not(feature = "sctp"))]
-    fn the_sctp_refusal_also_names_the_missing_feature_when_it_is_off() {
-        let message = registrant_transport_error("f", "sctp");
-        assert!(message.contains("without the `sctp` feature"), "{message}");
-    }
-
-    #[test]
-    #[cfg(feature = "sctp")]
-    fn the_sctp_refusal_does_not_blame_the_build_when_the_feature_is_on() {
-        let message = registrant_transport_error("f", "sctp");
-        assert!(!message.contains("without the `sctp` feature"), "{message}");
-    }
-
-    #[test]
-    fn an_unknown_token_is_quoted_back_verbatim() {
-        let message = registrant_transport_error("f", "TPC");
-        assert!(message.contains("unknown transport \"TPC\""), "{message}");
-        assert!(message.contains("udp, tcp or tls"), "{message}");
+impl RegistrantEntryConfig {
+    /// The transport this trunk's REGISTER will leave over, or the refusal to
+    /// report under `field`.
+    ///
+    /// The one place the entry's transport string becomes a
+    /// [`Transport`](crate::transport::Transport), so nothing is left that can
+    /// match `"tcp"`/`"tls"` and register the rest over UDP.
+    pub fn outbound_transport(
+        &self,
+        field: &str,
+    ) -> std::result::Result<crate::transport::Transport, String> {
+        crate::config::parse_outbound_transport(&self.transport)
+            .ok_or_else(|| crate::config::outbound_transport_error(field, &self.transport))
     }
 }

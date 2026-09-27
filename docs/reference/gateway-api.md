@@ -72,7 +72,7 @@ destination; rows are gathered into groups by `group`.
 | `group` | string | — | The name `gateway.select()` takes |
 | `uri` | string | — | SIP URI to route to |
 | `address` | string | from the URI host | Socket address; a hostname is re-resolved each probe cycle |
-| `transport` | string | URI param, then `udp` | `udp`, `tcp` or `tls` |
+| `transport` | string | URI param, then `udp` | `udp`, `tcp` or `tls`, case-insensitive; anything else rejects the row, in the URI `;transport=` parameter too |
 | `weight` | int | `1` | Weighted round-robin weight |
 | `priority` | int | `1` | Lower is tried first; a higher tier is a failover pool |
 | `algorithm` | string | `"weighted"` | Group-wide: `weighted`, `round_robin`, `hash` |

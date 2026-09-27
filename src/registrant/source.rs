@@ -146,9 +146,10 @@ impl DesiredRegistrant {
             &row.ha1_algorithm,
         )?;
         let transport = row.transport.to_ascii_lowercase();
-        if !matches!(transport.as_str(), "udp" | "tcp" | "tls") {
-            return Err(format!(
-                "unknown `transport` {transport:?} — use udp, tcp or tls"
+        if crate::config::parse_outbound_transport(&transport).is_none() {
+            return Err(crate::config::outbound_transport_error(
+                "`transport` column",
+                &row.transport,
             ));
         }
         Ok(Some(Self {
@@ -259,11 +260,10 @@ pub fn entry_from_desired(
         .or_else(|| desired.registrar.strip_prefix("sips:"))
         .unwrap_or(&desired.registrar);
 
-    let transport = match desired.transport.as_str() {
-        "tcp" => crate::transport::Transport::Tcp,
-        "tls" => crate::transport::Transport::Tls,
-        _ => crate::transport::Transport::Udp,
-    };
+    // Narrowed to udp/tcp/tls by `DesiredRegistrant::from_row`, so the fallback
+    // is only ever reached by "udp" itself.
+    let transport = crate::config::parse_outbound_transport(&desired.transport)
+        .unwrap_or(crate::transport::Transport::Udp);
     let default_port: u16 = if transport == crate::transport::Transport::Tls {
         5061
     } else {
@@ -818,12 +818,25 @@ mod tests {
         assert!(error.contains("password"), "{error}");
     }
 
+    /// An `sctp` row is refused with the reason, not as a typo: siphon opens no
+    /// outbound SCTP association, so the trunk could never register.
     #[test]
-    fn a_row_with_an_unknown_transport_is_refused() {
+    fn a_row_asking_for_a_transport_siphon_cannot_dial_is_refused() {
         let mut odd = row("sip:a@carrier.example");
         odd.transport = "sctp".to_string();
-        let error = DesiredRegistrant::from_row(&odd).expect_err("unknown transport");
-        assert!(error.contains("sctp"), "{error}");
+        let error = DesiredRegistrant::from_row(&odd).expect_err("sctp must be refused");
+        assert!(error.contains("`transport` column"), "{error}");
+        assert!(error.contains("no outbound SCTP association"), "{error}");
+        assert!(error.contains("udp, tcp or tls"), "{error}");
+    }
+
+    /// A typo gets the generic wording, quoting what was written.
+    #[test]
+    fn a_row_with_a_misspelt_transport_is_refused() {
+        let mut typo = row("sip:a@carrier.example");
+        typo.transport = "TPC".to_string();
+        let error = DesiredRegistrant::from_row(&typo).expect_err("unknown transport");
+        assert!(error.contains("unknown transport \"TPC\""), "{error}");
     }
 
     #[test]

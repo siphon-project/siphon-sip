@@ -4978,3 +4978,198 @@ fn a_mixed_case_registrant_transport_loads() {
 fn a_registrant_with_no_entries_loads() {
     base_yaml("registrant:\n  default_interval: 600\n").expect("nothing to validate");
 }
+
+// --- The shared outbound-transport parser ---
+//
+// Every surface that names a transport siphon has to dial goes through this one
+// pair, so the case-insensitivity and the refusal cannot drift apart again.
+
+#[test]
+fn the_dialable_outbound_transports_parse_case_insensitively() {
+    use crate::config::parse_outbound_transport;
+    use crate::transport::Transport;
+    assert_eq!(parse_outbound_transport("udp"), Some(Transport::Udp));
+    assert_eq!(parse_outbound_transport("tcp"), Some(Transport::Tcp));
+    assert_eq!(parse_outbound_transport("tls"), Some(Transport::Tls));
+    assert_eq!(parse_outbound_transport("TLS"), Some(Transport::Tls));
+    assert_eq!(parse_outbound_transport("Tcp"), Some(Transport::Tcp));
+}
+
+/// The whole point: nothing falls through to UDP any more.
+#[test]
+fn everything_siphon_cannot_dial_outbound_is_rejected() {
+    use crate::config::parse_outbound_transport;
+    for token in ["sctp", "SCTP", "ws", "wss", "tpc", "", "udp "] {
+        assert_eq!(
+            parse_outbound_transport(token),
+            None,
+            "{token:?} must not parse"
+        );
+    }
+}
+
+#[test]
+fn the_sctp_refusal_names_the_missing_outbound_path_not_a_typo() {
+    let message =
+        crate::config::outbound_transport_error("registrant.entries[sip:a@b].transport", "sctp");
+    assert!(
+        message.contains("registrant.entries[sip:a@b].transport"),
+        "{message}"
+    );
+    assert!(
+        message.contains("no outbound SCTP association"),
+        "{message}"
+    );
+    assert!(message.contains("udp, tcp or tls"), "{message}");
+    assert!(
+        !message.contains("unknown transport"),
+        "sctp is not a typo: {message}"
+    );
+}
+
+/// Built without the `sctp` feature there is no SCTP transport at all, and the
+/// refusal says so on top of the missing-outbound-path reason.
+#[test]
+#[cfg(not(feature = "sctp"))]
+fn the_sctp_refusal_also_names_the_missing_feature_when_it_is_off() {
+    let message = crate::config::outbound_transport_error("f", "sctp");
+    assert!(message.contains("without the `sctp` feature"), "{message}");
+}
+
+/// With the feature compiled in the transport exists — inbound only — so the
+/// refusal keeps the real reason and does not blame the build.
+#[test]
+#[cfg(feature = "sctp")]
+fn the_sctp_refusal_does_not_blame_the_build_when_the_feature_is_on() {
+    let message = crate::config::outbound_transport_error("f", "sctp");
+    assert!(!message.contains("without the `sctp` feature"), "{message}");
+}
+
+#[test]
+fn an_unknown_outbound_token_is_quoted_back_verbatim() {
+    let message = crate::config::outbound_transport_error("f", "TPC");
+    assert!(message.contains("unknown transport \"TPC\""), "{message}");
+    assert!(message.contains("udp, tcp or tls"), "{message}");
+}
+
+// --- gateway.groups[].destinations[].transport ---
+//
+// Same defect as the registrant entries, one step out: the startup loop matched
+// "tcp"/"tls" and sent everything else over UDP, and `effective_transport()`
+// hands the explicit field back verbatim — so `transport: TLS` put a carrier's
+// traffic, credentials included, on the wire in the clear.
+
+fn gateway_yaml(transport_line: &str) -> String {
+    format!(
+        "gateway:\n  groups:\n    - name: \"carriers\"\n      destinations:\n        \
+         - uri: \"sip:gw1.carrier.example:5060\"\n          address: \"203.0.113.10:5060\"\n\
+         {transport_line}"
+    )
+}
+
+#[test]
+fn a_gateway_destination_transport_siphon_cannot_dial_is_refused_at_load() {
+    let error = base_yaml(&gateway_yaml("          transport: \"sctp\"\n"))
+        .expect_err("an SCTP destination has no outbound path, so it must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "gateway.groups[carriers].destinations[sip:gw1.carrier.example:5060].transport"
+        ),
+        "the error must name the group, the destination and the field: {message}"
+    );
+    assert!(
+        message.contains("no outbound SCTP association"),
+        "the error must name the cause: {message}"
+    );
+    assert!(message.contains("udp, tcp or tls"), "{message}");
+}
+
+#[test]
+fn an_unknown_gateway_destination_transport_is_refused_at_load() {
+    let error = base_yaml(&gateway_yaml("          transport: \"tpc\"\n"))
+        .expect_err("a typo must be refused, not routed over udp");
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "gateway.groups[carriers].destinations[sip:gw1.carrier.example:5060].transport"
+        ),
+        "{message}"
+    );
+    assert!(message.contains("unknown transport \"tpc\""), "{message}");
+}
+
+/// A WebSocket is client-initiated, so siphon can never dial a destination over
+/// one either.
+#[test]
+fn a_websocket_gateway_destination_is_refused_at_load() {
+    let error = base_yaml(&gateway_yaml("          transport: \"wss\"\n")).expect_err("refused");
+    assert!(
+        error.to_string().contains("unknown transport \"wss\""),
+        "{error}"
+    );
+}
+
+/// The `;transport=` parameter on the destination URI is the other way in, and
+/// the refusal says which of the two carried the bad token.
+#[test]
+fn a_gateway_destination_uri_transport_param_is_refused_and_named_as_the_uri() {
+    let yaml = "gateway:\n  groups:\n    - name: \"carriers\"\n      destinations:\n        \
+                - uri: \"sip:gw1.carrier.example:5060;transport=sctp\"\n          \
+                address: \"203.0.113.10:5060\"\n";
+    let error = base_yaml(yaml).expect_err("a URI-borne sctp must be refused too");
+    let message = error.to_string();
+    assert!(
+        message.contains(".uri (;transport= parameter)"),
+        "the error must say the token came from the URI, not a transport field: {message}"
+    );
+    assert!(
+        message.contains("no outbound SCTP association"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_gateway_destination_transports_siphon_can_dial_load() {
+    for transport in ["udp", "tcp", "tls"] {
+        base_yaml(&gateway_yaml(&format!(
+            "          transport: \"{transport}\"\n"
+        )))
+        .unwrap_or_else(|error| panic!("{transport} must load: {error}"));
+    }
+}
+
+/// Mixed case is accepted and yields the transport it names. This is the one that
+/// bit: `effective_transport()` returns the explicit field verbatim, so `"TLS"`
+/// matched neither `"tcp"` nor `"tls"` and the destination was dialled over
+/// plaintext UDP.
+#[test]
+fn a_mixed_case_gateway_destination_transport_loads_and_yields_tls() {
+    let config =
+        base_yaml(&gateway_yaml("          transport: \"TLS\"\n")).expect("case-insensitive");
+    let gateway = config.gateway.expect("gateway block");
+    let destination = &gateway.groups[0].destinations[0];
+    assert_eq!(destination.effective_transport(), "TLS");
+    assert_eq!(
+        destination.outbound_transport("f"),
+        Ok(crate::transport::Transport::Tls),
+        "a mixed-case token must not fall through to udp"
+    );
+}
+
+/// A destination naming no transport at all is UDP, as before.
+#[test]
+fn a_gateway_destination_with_no_transport_is_udp() {
+    let config = base_yaml(&gateway_yaml("")).expect("no transport is fine");
+    let gateway = config.gateway.expect("gateway block");
+    assert_eq!(
+        gateway.groups[0].destinations[0].outbound_transport("f"),
+        Ok(crate::transport::Transport::Udp)
+    );
+}
+
+/// Nothing to validate when there are no groups.
+#[test]
+fn a_gateway_with_no_groups_loads() {
+    base_yaml("gateway:\n  groups: []\n").expect("nothing to validate");
+}

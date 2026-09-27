@@ -117,7 +117,12 @@ impl PyGateway {
     ///
     /// Args:
     ///     name: Group name.
-    ///     destinations: List of dicts with keys: uri (required), address, weight, priority, transport, attrs.
+    ///     destinations: List of dicts with keys: uri (required), address,
+    ///         weight, priority, transport, attrs.  ``transport`` is "udp"
+    ///         (default), "tcp" or "tls", case-insensitive; anything else raises
+    ///         ``ValueError`` because siphon dials no outbound SCTP association
+    ///         and no WebSocket.  An unrecognised value used to fall through to
+    ///         udp, so a destination asked for over TLS was dialled in the clear.
     ///     algorithm: Load-balancing algorithm ("round_robin", "weighted", "hash"). Default: "weighted".
     ///     probe: Enable health probing. Default: false for dynamic groups.
     ///
@@ -175,11 +180,17 @@ impl PyGateway {
                 .transpose()?
                 .unwrap_or_else(|| "udp".to_string());
 
-            let transport = match transport_str.as_str() {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                _ => Transport::Udp,
-            };
+            // Same set, from the same function, as the YAML validator — refused
+            // rather than quietly downgraded to plaintext UDP.
+            let transport =
+                crate::config::parse_outbound_transport(&transport_str).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        crate::config::outbound_transport_error(
+                            &format!("gateway.add_group({name:?}) destination {uri:?} transport"),
+                            &transport_str,
+                        ),
+                    )
+                })?;
 
             let attrs: HashMap<String, String> = dict
                 .get_item("attrs")?
@@ -538,5 +549,57 @@ mod tests {
         );
         let py = PyDestination::from_destination(&dest);
         assert_eq!(py.uri, "sip:gw.example.com;transport=tcp");
+    }
+    // --- add_group(destinations=[{"transport": ...}]) ---
+    //
+    // The same set, from the same function, as the YAML validator. The wording of
+    // the refusal is covered in `config::tests`; these pin that the binding is
+    // wired to it and that a refused group is not created.
+
+    fn add_group_with_transport(gateway: &PyGateway, transport: Option<&str>) -> PyResult<()> {
+        Python::attach(|python| {
+            let destination = pyo3::types::PyDict::new(python);
+            destination.set_item("uri", "sip:gw1.carrier.example:5060")?;
+            destination.set_item("address", "203.0.113.10:5060")?;
+            if let Some(transport) = transport {
+                destination.set_item("transport", transport)?;
+            }
+            gateway.add_group("overflow", vec![destination], "weighted", false)
+        })
+    }
+
+    /// siphon dials no outbound SCTP association and no WebSocket, so these used
+    /// to be dialled over UDP instead — a destination asked for over TLS went out
+    /// in the clear.
+    #[test]
+    fn add_group_refuses_a_transport_siphon_cannot_dial() {
+        pyo3::Python::initialize();
+        let gateway = make_gateway();
+        for token in ["sctp", "ws", "wss", "tpc"] {
+            assert!(
+                add_group_with_transport(&gateway, Some(token)).is_err(),
+                "{token} must be refused"
+            );
+            assert!(
+                gateway.inner.get_group("overflow").is_none(),
+                "{token} must not create the group"
+            );
+        }
+    }
+
+    #[test]
+    fn add_group_accepts_the_dialable_transports_case_insensitively() {
+        pyo3::Python::initialize();
+        let gateway = make_gateway();
+        for token in [None, Some("udp"), Some("tcp"), Some("TLS")] {
+            add_group_with_transport(&gateway, token)
+                .unwrap_or_else(|_| panic!("{token:?} must be accepted"));
+        }
+        let destinations = gateway.inner.destinations_of("overflow");
+        assert_eq!(
+            destinations[0].transport,
+            Transport::Tls,
+            "a mixed-case token must not fall through to udp"
+        );
     }
 }

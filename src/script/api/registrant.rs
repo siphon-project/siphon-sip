@@ -109,8 +109,8 @@ impl PyRegistration {
         // for one transport got another.
         let transport_type = match transport {
             None => Transport::Udp,
-            Some(token) => crate::config::parse_registrant_transport(token).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(crate::config::registrant_transport_error(
+            Some(token) => crate::config::parse_outbound_transport(token).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(crate::config::outbound_transport_error(
                     "registration.add(transport=)",
                     token,
                 ))
@@ -666,7 +666,7 @@ assert 'registration.on_change' in kinds, kinds
 
     /// siphon dials no outbound SCTP association, so this used to register over
     /// UDP instead — a trunk on a transport the script never asked for. The
-    /// message itself is covered by `config::registrant::transport_tests`
+    /// message itself is covered by the shared parser tests in `config::tests`
     /// (reading a `PyErr` needs an interpreter; the refusal does not).
     #[test]
     fn py_registration_add_refuses_sctp() {

@@ -152,16 +152,29 @@ entry, but a working config keeps working.
   fall through to UDP, so a trunk configured for SCTP registered in the clear
   over UDP and a mis-cased `"TLS"` did the same — quietly, and looking like it
   worked. The refusal names the entry, the token and what to use instead; for
+- **BREAKING (config): a transport siphon cannot dial outbound is now refused at
+  load, wherever it is named.** Only `udp`, `tcp` and `tls` are accepted, and now
+  case-insensitively, on `registrant.entries[].transport`, on
+  `gateway.groups[].destinations[].transport` and on the `;transport=` parameter
+  of a gateway destination URI. Every one of those used to parse and then fall
+  through to UDP: a trunk configured for SCTP registered over UDP, a gateway
+  destination written `transport: TLS` matched neither `"tcp"` nor `"tls"` and
+  carried a carrier's traffic — credentials included — in the clear, and a typo
+  did the same. The refusal names the group, the entry or destination, the token,
+  and which key carried it (the `transport` field or the URI parameter); for
   `sctp` it names the real reason (siphon opens no outbound SCTP association: its
   SCTP transport writes only to associations it *accepted*, and the outbound
   connection pool has no SCTP path), and adds that the binary has no SCTP
   transport at all when built without the `sctp` feature. A configured
-  `listen.sctp` does not change this — there is still no outbound SCTP path, so
-  an SCTP registrant is not supported either way. `registration.add(transport=)`
-  raises `ValueError` for the same set, instead of silently registering over UDP;
-  the database and HTTP trunk sources already refused it. If you have one of
-  these in a config today it was not doing what it said, and the fix is to name
-  the transport the trunk actually uses.
+  `listen.sctp` does not change this — there is still no outbound SCTP path — so
+  neither an SCTP registrant nor an SCTP gateway destination is supported either
+  way. `registration.add(transport=)` and `gateway.add_group()` raise
+  `ValueError` for the same set, and the database/HTTP gateway source rejects the
+  row rather than downgrading it. One shared parser
+  (`config::parse_outbound_transport`) now backs all of them, so the
+  case-insensitivity and the refusal cannot drift apart again. **A config with
+  any of these loaded before and is refused now** — it was not doing what it
+  said, and the fix is to name the transport actually in use.
 
 - **An outbound message routed at a transport this node does not serve is now
   refused out loud instead of discarded.** The outbound router held an SCTP

@@ -5257,10 +5257,18 @@ class MockGateway:
             name: Group name.
             destinations: List of dicts with keys:
                 ``uri`` (required), ``address``, ``weight``, ``priority``,
-                ``transport``, ``attrs``.
+                ``transport``, ``attrs``.  ``transport`` is ``"udp"`` (default),
+                ``"tcp"`` or ``"tls"``, case-insensitive; anything else raises
+                ``ValueError`` because siphon dials no outbound SCTP association
+                and no WebSocket.
             algorithm: Load-balancing algorithm: ``"round_robin"``,
                 ``"weighted"`` (default), ``"hash"``.
             probe: Enable health probing (ignored in mock).
+
+        Raises:
+            ValueError: when a destination's ``transport`` is not udp/tcp/tls —
+                mirroring the Rust binding, which used to fall through to udp and
+                dial a TLS destination in the clear.
 
         Example::
 
@@ -5271,6 +5279,13 @@ class MockGateway:
         """
         dests = []
         for d in destinations:
+            transport = d.get("transport")
+            if transport is not None and transport.lower() not in ("udp", "tcp", "tls"):
+                raise ValueError(
+                    f"gateway.add_group({name!r}) destination {d['uri']!r}: "
+                    f"{transport!r} is not a transport siphon can dial — use "
+                    "'udp', 'tcp' or 'tls'"
+                )
             dests.append(MockDestination(
                 uri=d["uri"],
                 address=d.get("address", d["uri"]),

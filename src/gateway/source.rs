@@ -343,20 +343,17 @@ fn desired_destination(row: &GatewayRow) -> Result<DesiredDestination, String> {
         return Err("`uri` is empty".to_string());
     }
 
-    let transport = match row
-        .transport
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("tcp") => Transport::Tcp,
-        Some("tls") => Transport::Tls,
-        Some("udp") | None => transport_from_uri(&row.uri),
-        Some(other) => {
-            return Err(format!(
-                "unknown `transport` {other:?} — use udp, tcp or tls"
-            ))
+    // An explicit column wins; otherwise the URI's `;transport=` decides. Both
+    // go through the shared parser, so neither can fall through to udp: the
+    // explicit one was already refused, but a URI-borne `sctp` / `ws` / typo used
+    // to be downgraded silently and route a carrier over plaintext.
+    let transport = match row.transport.as_deref() {
+        Some(token) if !token.eq_ignore_ascii_case("udp") => {
+            crate::config::parse_outbound_transport(token).ok_or_else(|| {
+                crate::config::outbound_transport_error("`transport` column", token)
+            })?
         }
+        _ => transport_from_uri(&row.uri)?,
     };
 
     let address = row
@@ -402,19 +399,21 @@ fn desired_destination(row: &GatewayRow) -> Result<DesiredDestination, String> {
     })
 }
 
-fn transport_from_uri(uri: &str) -> Transport {
+/// The transport a destination URI's `;transport=` parameter names, defaulting to
+/// UDP when it carries none (RFC 3261 §19.1.1).
+///
+/// A parameter siphon cannot dial is an error rather than a silent UDP
+/// downgrade: this row provisions an *outbound* destination, so a `;transport=tls`
+/// read as UDP puts a carrier's traffic on the wire in the clear.
+fn transport_from_uri(uri: &str) -> Result<Transport, String> {
     let lowered = uri.to_ascii_lowercase();
-    match lowered.split(";transport=").nth(1) {
-        Some(rest) => {
-            let value = rest.split([';', '>', ' ']).next().unwrap_or("udp");
-            match value {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                _ => Transport::Udp,
-            }
-        }
-        None => Transport::Udp,
-    }
+    let Some(rest) = lowered.split(";transport=").nth(1) else {
+        return Ok(Transport::Udp);
+    };
+    let value = rest.split([';', '>', ' ']).next().unwrap_or("udp");
+    crate::config::parse_outbound_transport(value).ok_or_else(|| {
+        crate::config::outbound_transport_error("`;transport=` parameter in `uri`", value)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1068,66 @@ mod tests {
     fn the_transport_comes_from_the_uri_when_the_column_is_absent() {
         let row = row("carriers", "sip:gw1.carrier.example:5061;transport=tls");
         let (groups, _) = group_rows(&[row]);
+        assert_eq!(groups[0].destinations[0].transport, Transport::Tls);
+    }
+
+    /// A URI parameter naming a transport siphon cannot dial is a rejected row,
+    /// not a UDP downgrade: an explicit `transport` column was already refused,
+    /// but this way in put a carrier's traffic on the wire in the clear.
+    #[test]
+    fn an_undialable_uri_transport_param_rejects_the_row() {
+        for token in ["sctp", "ws", "wss", "tpc"] {
+            let row = row(
+                "carriers",
+                &format!("sip:gw1.carrier.example:5060;transport={token}"),
+            );
+            let (groups, rejected) = group_rows(&[row]);
+            assert!(groups.is_empty(), "{token} must not produce a destination");
+            assert_eq!(rejected, 1, "{token} must be rejected");
+        }
+    }
+
+    /// The refusal names the parameter rather than the column, so an operator
+    /// looks in the right place.
+    #[test]
+    fn the_uri_transport_refusal_names_the_parameter() {
+        let error = desired_destination(&row(
+            "carriers",
+            "sip:gw1.carrier.example:5060;transport=sctp",
+        ))
+        .expect_err("sctp must be refused");
+        assert!(error.contains("`;transport=`"), "{error}");
+        assert!(error.contains("udp, tcp or tls"), "{error}");
+    }
+
+    /// Mixed case in the URI parameter still resolves, as it always did (the URI
+    /// is lowercased before the parameter is read).
+    #[test]
+    fn a_mixed_case_uri_transport_param_still_resolves() {
+        let row = row("carriers", "sip:gw1.carrier.example:5061;transport=TLS");
+        let (groups, rejected) = group_rows(&[row]);
+        assert_eq!(rejected, 0);
+        assert_eq!(groups[0].destinations[0].transport, Transport::Tls);
+    }
+
+    /// An explicit column is case-insensitive too, and beats the URI parameter.
+    #[test]
+    fn a_mixed_case_transport_column_wins_over_the_uri_param() {
+        let mut shouty = row("carriers", "sip:gw1.carrier.example:5060;transport=udp");
+        shouty.transport = Some("TLS".to_string());
+        let (groups, rejected) = group_rows(&[shouty]);
+        assert_eq!(rejected, 0);
+        assert_eq!(groups[0].destinations[0].transport, Transport::Tls);
+    }
+
+    /// An explicit `udp` column defers to the URI parameter, which is what makes
+    /// the default column value harmless. Unchanged behaviour, pinned because the
+    /// refusal now runs through the same branch.
+    #[test]
+    fn an_explicit_udp_column_still_defers_to_the_uri_param() {
+        let mut plain = row("carriers", "sip:gw1.carrier.example:5061;transport=tls");
+        plain.transport = Some("udp".to_string());
+        let (groups, _) = group_rows(&[plain]);
         assert_eq!(groups[0].destinations[0].transport, Transport::Tls);
     }
 
