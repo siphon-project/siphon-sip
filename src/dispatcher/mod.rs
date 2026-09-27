@@ -82,6 +82,8 @@ mod a_leg_reliable_provisional_tests;
 #[cfg(test)]
 mod advertised_port_tests;
 #[cfg(test)]
+mod b2bua_conclude_once_tests;
+#[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_asserted_identity_tests;

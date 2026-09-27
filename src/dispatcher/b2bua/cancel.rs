@@ -47,6 +47,26 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         None => return,
     };
 
+    // A CANCEL retransmitted while the first one is still being handled (its
+    // @b2bua.on_cancel runs without the lock, and the call only reads as
+    // terminated after it): the call is already being cancelled, so the copy is
+    // answered 200 (RFC 3261 §9.2) and nothing more. Claimed below, under the
+    // same lock as the state check, so exactly one CANCEL tears the call down.
+    if call.cancel_claimed {
+        drop(call);
+        debug!(call_id = %call_id, "B2BUA CANCEL: the call is already being cancelled — answering the copy 200");
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
     // Only cancel if call is still in Calling or Ringing state
     if call.state != CallState::Calling && call.state != CallState::Ringing {
         // Unless the callee answered and the caller's 2xx is still held for a
@@ -80,6 +100,8 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         }
         return;
     }
+
+    call.cancel_claimed = true;
 
     // Send 200 OK to CANCEL (on the socket the CANCEL arrived on — the same
     // listener the INVITE landed on, per RFC 3261 §9: the caller sends CANCEL to
