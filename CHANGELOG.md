@@ -148,6 +148,29 @@ entry, but a working config keeps working.
   `@b2bua.on_cancel` had the same race with a retransmitted CANCEL, which ran it
   twice and sent the caller a second 487; the copy now gets its 200 and
   nothing else.
+- **`request.set_ruri(uri)` exists.** Scripts calling it got
+  `AttributeError: 'builtins.Request' object has no attribute 'set_ruri'`: the
+  runtime only had the `request.ruri = ...` property setter, while the SDK mock
+  and the number-routing cookbook documented a method. Both forms now work and
+  take a full URI string or a `SipUri`.
+- **`request.ruri.user = ...` (and `.host`, `.port`) rewrites the request.** It
+  changed a copy, so the request was relayed unchanged and the script got no
+  error.
+- **Every Request-URI change is checked the same way.** `set_ruri`, the `ruri`
+  property, `set_ruri_user`, `set_ruri_host`, the new parameter methods and
+  assignment on `request.ruri` all go through one check and raise `ValueError`
+  instead of sending a malformed R-URI: trailing text after the URI
+  (`"sip:bob@host garbage"` was accepted, the tail dropped), a host with a port
+  or scheme (`set_ruri_host("gw1.example.net:5080")` went out as
+  `[gw1.example.net:5080]`), anything but an IPv6 address in brackets, a user
+  holding `@`, `:`, `;` or whitespace, or a parameter outside RFC 3261
+  `token` / `paramchar`. Service codes such as `*21#` still pass. An IPv6 host
+  is stored bracketed with or without brackets on input. A refused change
+  leaves the R-URI as it was.
+- **An absoluteURI with a colon in it survives serialization.**
+  `urn:service:sos` (RFC 5031) was written as `urn:[service:sos]`: the IPv6
+  bracketing for a SIP host was applied to the opaque part.
+
 - **`@proxy.on_register_reply` handlers never ran.** The decorator registered
   the handler but the proxy response path never dispatched it, so a script that
   used it got no callback and no error. It is now shorthand for
@@ -318,6 +341,17 @@ entry, but a working config keeps working.
   transport, and `transport::tcp::listen` takes the registry.
 
 ### Added
+
+- **`request.set_ruri_param(name, value=None)` and
+  `request.remove_ruri_param(name)`** add, replace or remove one Request-URI
+  parameter (`;user=phone`, `;transport=tcp`, a flag such as `;lr`) without
+  rebuilding the URI. Names match case-insensitively (RFC 3261 §19.1.4).
+- **`SipUri.user_params`** reads the parameters inside the userinfo, between
+  the user and `@`, as a dict (`params` never included them). RFC 4694 number
+  portability is readable at last: `"npdi" in request.ruri.user_params`,
+  `request.ruri.user_params.get("rn")`. The number-routing example now skips
+  the dip when `npdi` is already present and marks a not-ported number with
+  `npdi` too.
 
 - **`siphon::config::expand_env_vars` is public.** Extensions that load their
   own config file can expand `${VAR}` / `${VAR:-default}` with exactly the rules

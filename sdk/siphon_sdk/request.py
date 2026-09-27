@@ -11,7 +11,7 @@ import ipaddress
 import uuid
 from typing import Callable, Optional, Union
 
-from siphon_sdk.types import Action, Contact, Flow, SipUri
+from siphon_sdk.types import Action, Contact, Flow, SipUri, _check_param, parse_uri
 
 _SEND_SOCKET_TRANSPORTS = {"udp", "tcp", "tls", "ws", "wss", "sctp"}
 
@@ -54,29 +54,7 @@ def _parse_uri(value: Union[str, SipUri, None]) -> Optional[SipUri]:
         return None
     if isinstance(value, SipUri):
         return value
-    # Minimal parser: sip:user@host:port or sip:host:port
-    s = str(value)
-    scheme = "sip"
-    if s.startswith("sips:"):
-        scheme = "sips"
-        s = s[5:]
-    elif s.startswith("sip:"):
-        s = s[4:]
-    elif s.startswith("tel:"):
-        return SipUri(scheme="tel", user=s[4:], host="")
-    user = None
-    if "@" in s:
-        user, s = s.split("@", 1)
-    port = None
-    if ":" in s:
-        host, port_str = s.rsplit(":", 1)
-        try:
-            port = int(port_str)
-        except ValueError:
-            host = s
-    else:
-        host = s
-    return SipUri(scheme=scheme, user=user, host=host, port=port)
+    return parse_uri(str(value))
 
 
 class Request:
@@ -164,8 +142,20 @@ class Request:
 
     @property
     def ruri(self) -> SipUri:
-        """Request-URI as a :class:`SipUri` object."""
+        """Request-URI as a :class:`SipUri` object.
+
+        Assigning to its ``user``, ``host`` or ``port`` rewrites the request,
+        checked like :meth:`set_ruri_user` / :meth:`set_ruri_host`.
+        Assigning the property itself is the same as :meth:`set_ruri`::
+
+            request.ruri.user = "+15551234567"
+            request.ruri = "sip:bob@example.com"
+        """
         return self._ruri
+
+    @ruri.setter
+    def ruri(self, value: Union[str, SipUri]) -> None:
+        self.set_ruri(value)
 
     @property
     def from_uri(self) -> Optional[SipUri]:
@@ -1114,30 +1104,145 @@ class Request:
     def set_ruri(self, value: Union[str, SipUri]) -> None:
         """Replace the entire Request-URI.
 
+        The string is a complete URI (scheme included), parsed exactly as it
+        would be off the wire, so a port, user parameters and URI parameters
+        all go out as written.  To change one part, use :meth:`set_ruri_user`,
+        :meth:`set_ruri_host` or :meth:`set_ruri_param`.
+
+        Every Request-URI change (these methods, the ``ruri`` property,
+        assigning on ``request.ruri``) passes the same checks.
+
         Args:
             value: New URI as a string or :class:`SipUri`.
-        """
-        self._ruri = _parse_uri(value) or self._ruri
 
-    def set_ruri_user(self, value: Optional[str]) -> None:
-        """Set the user part of the Request-URI.
-
-        Args:
-            value: New user part, or ``None`` to clear.
+        Raises:
+            ValueError: Not one valid URI: trailing text, a host that is not
+                a domain or address, a malformed parameter.  The R-URI is
+                left unchanged.
 
         Example::
 
-            request.set_ruri_user("bob")
+            request.set_ruri("sip:bob@example.com")
+            request.set_ruri("sip:+15551234567@gw1.example.net:5080;user=phone")
+
+            # RFC 4694 number portability: npdi / rn sit in the userinfo,
+            # before the @.  ruri.user still reads "+15551234567".
+            request.set_ruri(
+                "sip:+15551234567;npdi;rn=+15559876543"
+                "@carrier.example.net;user=phone"
+            )
+
+            request.set_ruri("tel:+15551234567")
+            request.set_ruri("urn:service:sos")
+
+            # Or edit a copy and set it back.
+            uri = request.ruri
+            uri.user = "carol"
+            request.set_ruri(uri)
+        """
+        text = str(value)
+        self._ruri._assign(parse_uri(text, strict=True))
+
+    def set_ruri_user(self, value: Optional[str]) -> None:
+        """Set the user part of the Request-URI, keeping everything else.
+
+        Args:
+            value: Just the user, no ``sip:``, ``@`` or host.  ``None``
+                removes the user part and any user parameters.
+
+        Raises:
+            ValueError: ``value`` holds ``@``, ``:``, ``;`` or whitespace.
+                A user with parameters (RFC 4694 ``npdi`` / ``rn``) is
+                written as a whole URI with :meth:`set_ruri`.
+
+        Example::
+
+            # sip:1234@example.com -> sip:+15551234567@example.com
+            request.set_ruri_user("+15551234567")
+
+            request.set_ruri_user("*21#")        # service codes are fine
+
+            # sip:alice@example.com -> sip:example.com
+            request.set_ruri_user(None)
         """
         self._ruri.user = value
 
     def set_ruri_host(self, value: str) -> None:
-        """Set the host part of the Request-URI.
+        """Set the host part of the Request-URI, keeping scheme, user and port.
 
         Args:
-            value: New host/domain string.
+            value: New host only: a domain, IPv4 address or IPv6 address
+                (brackets optional).  No scheme, user or port; change the
+                port with :meth:`set_ruri`.
+
+        Raises:
+            ValueError: ``value`` is not a bare host, e.g.
+                ``"gw1.example.net:5080"`` or ``"sip:gw1.example.net"``.
+
+        Example::
+
+            # sip:bob@example.com -> sip:bob@gw1.example.net
+            request.set_ruri_host("gw1.example.net")
+
+            request.set_ruri_host("192.0.2.10")
+            request.set_ruri_host("2001:db8::10")      # stored as [2001:db8::10]
         """
         self._ruri.host = value
+
+    def set_ruri_param(self, name: str, value: Optional[str] = None) -> None:
+        """Add or replace one Request-URI parameter, leaving the others alone.
+
+        URI parameters are the ones after the host and port.  Names match
+        case-insensitively (RFC 3261 §19.1.4); a duplicated name collapses
+        to the one replaced.
+
+        Args:
+            name: Parameter name (an RFC 3261 token).
+            value: Parameter value, or ``None`` for a flag parameter.
+
+        Raises:
+            ValueError: ``name`` is not a token, or ``value`` is empty or has
+                a character outside RFC 3261 ``paramchar`` (``;``, ``?``,
+                ``=``, whitespace).  User parameters before the ``@``
+                (RFC 4694 ``npdi`` / ``rn``) are written with :meth:`set_ruri`.
+
+        Example::
+
+            request.set_ruri_param("user", "phone")      # ;user=phone
+            request.set_ruri_param("transport", "tcp")   # ;transport=tcp
+            request.set_ruri_param("lr")                 # ;lr
+        """
+        _check_param(name, value)
+        params, replaced = [], False
+        for existing, existing_value in self._ruri._params:
+            if existing.lower() == name.lower():
+                if replaced:
+                    continue
+                replaced = True
+                params.append((existing, value))
+            else:
+                params.append((existing, existing_value))
+        if not replaced:
+            params.append((name, value))
+        self._ruri._params = params
+        self._ruri._sync_tel_host()
+
+    def remove_ruri_param(self, name: str) -> bool:
+        """Remove a Request-URI parameter by name (case-insensitive).
+
+        Returns:
+            ``True`` if it was present.
+
+        Example::
+
+            request.remove_ruri_param("transport")
+        """
+        kept = [(n, v) for n, v in self._ruri._params if n.lower() != name.lower()]
+        if len(kept) == len(self._ruri._params):
+            return False
+        self._ruri._params = kept
+        self._ruri._sync_tel_host()
+        return True
 
     # -- Display name / path / route -------------------------------------------
 

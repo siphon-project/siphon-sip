@@ -312,7 +312,15 @@ impl fmt::Display for SipUri {
                 write!(f, "@")?;
             }
 
-            write!(f, "{}", format_sip_host(&self.host))?;
+            // IPv6 brackets belong to the SIP `hostport` grammar (RFC 3261
+            // §25.1). An absoluteURI keeps its opaque part in `host`, and a
+            // colon there is structure, not an address: `urn:service:sos`
+            // (RFC 5031) must not go out as `urn:[service:sos]`.
+            if matches!(self.scheme, Scheme::Other(_)) {
+                write!(f, "{}", self.host)?;
+            } else {
+                write!(f, "{}", format_sip_host(&self.host))?;
+            }
 
             if let Some(port) = self.port {
                 write!(f, ":{port}")?;

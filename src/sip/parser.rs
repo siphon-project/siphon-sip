@@ -295,6 +295,18 @@ pub fn parse_uri_standalone(input: &str) -> Result<SipUri, String> {
     }
 }
 
+/// Parse a URI that must be the whole of `input`: [`parse_uri_standalone`]
+/// stops at the first character the grammar cannot take and drops the rest,
+/// which is right for a URI cut out of a header and wrong for one a script
+/// hands over to become the Request-URI (`"sip:bob@host garbage"` would pass).
+pub fn parse_uri_complete(input: &str) -> Result<SipUri, String> {
+    match parse_uri(input) {
+        Ok(("", uri)) => Ok(uri),
+        Ok((rest, _)) => Err(format!("unexpected {rest:?} after the URI in {input:?}")),
+        Err(error) => Err(format!("failed to parse SIP URI {input:?}: {error}")),
+    }
+}
+
 /// Parse SIP URI: sip:user@host:port;params?headers
 fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     // tel: URIs (RFC 3966) — common in IMS
@@ -1091,6 +1103,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_uri_complete_takes_a_whole_uri() {
+        for input in [
+            "sip:bob@example.com",
+            "sips:bob@example.com:5061;transport=tcp",
+            "sip:+15551234567;npdi;rn=+15559876543@carrier.example.net;user=phone",
+            "sip:[2001:db8::10]:5060",
+            "tel:+15551234567",
+            "urn:service:sos",
+        ] {
+            let uri = parse_uri_complete(input).expect(input);
+            assert_eq!(uri.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn parse_uri_complete_refuses_trailing_input() {
+        for input in [
+            "sip:bob@example.com garbage",
+            "sip:bob@example.com>",
+            " sip:bob@example.com",
+            "sip:bob@example.com:50x60",
+            "",
+        ] {
+            assert!(
+                parse_uri_complete(input).is_err(),
+                "{input:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn parse_uri_no_user_params_unchanged() {
         // Normal URI without user params should parse identically to before.
         let input = "sip:alice@example.com;transport=tcp";
@@ -1174,6 +1217,9 @@ mod tests {
                 "//192.0.2.103",
                 Some(3002),
             ),
+            // RFC 5031 service URN: a colon in the opaque part, which the
+            // serializer used to read as an IPv6 host and bracket.
+            ("urn:service:sos", "urn", "service:sos", None),
         ] {
             let raw = format!(
                 "OPTIONS {raw_uri} SIP/2.0\r\n\

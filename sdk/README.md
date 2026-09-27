@@ -256,8 +256,11 @@ harness.reset()
 | `remove_header(name)` | Remove header |
 | `has_header(name) -> bool` | Check header exists |
 | `has_body(content_type) -> bool` | Check body type |
-| `set_ruri_user(value)` | Set R-URI user part |
-| `set_ruri_host(value)` | Set R-URI host |
+| `set_ruri(uri)` | Replace the whole R-URI (`"sip:bob@example.com:5080;user=phone"`) |
+| `set_ruri_user(value)` | Set R-URI user part (`"+15551234567"`, `None` to drop) |
+| `set_ruri_host(value)` | Set R-URI host (`"gw1.example.net"`, `"192.0.2.10"`, `"2001:db8::10"`; no port) |
+| `set_ruri_param(name, value=None)` | Add or replace one R-URI parameter (`None` = flag) |
+| `remove_ruri_param(name) -> bool` | Remove an R-URI parameter |
 | `source_ip_in(cidrs) -> bool` | CIDR membership check |
 | `generate_icid() -> str` | Generate charging ID |
 | `add_path(uri)` | Prepend Path header |

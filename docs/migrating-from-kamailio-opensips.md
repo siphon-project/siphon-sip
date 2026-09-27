@@ -38,7 +38,9 @@ a debugger, `pytest` — not an expression language.
 | `failure_route[...]` | `@proxy.on_failure` (and per-relay `on_failure=`) |
 | `onreply_route[...]` | `@proxy.on_reply` |
 | `sl_send_reply()` / `t_reply()` | `request.reply(code, reason)` |
-| `$ru`, `$rU`, `$rd` | `request.ruri`, `request.ruri.user`, `request.ruri.host` |
+| `$ru`, `$rU`, `$rd` (read) | `request.ruri`, `request.ruri.user`, `request.ruri.host` |
+| `$ru = ...`, `$rU = ...`, `$rd = ...` | `request.set_ruri(uri)`, `request.set_ruri_user(user)`, `request.set_ruri_host(host)` |
+| `add_uri_param()` / `uri_param_rm()` | `request.set_ruri_param(name, value)` / `request.remove_ruri_param(name)` |
 | `$fU`/`$tU`, `$ft`/`$tt` | `request.from_uri`/`to_uri`, `request.from_tag`/`to_tag` |
 | `is_method("INVITE")` | `request.method == "INVITE"` inside one handler — **not** `@proxy.on_request("INVITE")`, see the note below |
 | `has_totag()` / loose-route dialog check | `request.in_dialog` |
