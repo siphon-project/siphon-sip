@@ -160,6 +160,13 @@ one of them trips the threshold, and every sibling already past `accept()` would
 otherwise be served to completion because nothing looks at the ban again. The
 re-check drops the rest of the burst with the connection that earned the ban.
 
+And a **new ban closes the connections its source already holds open** — every live
+TCP, TLS, WS, WSS and SCTP connection from that address, logged one line each. Both
+checks above run once per connection, so a client that never reconnects used to keep
+the connection it had and go on guessing passwords on it for the whole ban, while
+every other client behind the same address was refused at `accept()`. A banned source
+now has to come back through `accept()`, where it is refused until the ban expires.
+
 !!! tip "Drop bans in the kernel"
     With [`security.firewall`](../kernel-firewall.md), every ban is also pushed to a
     kernel nf_tables set, so abusive sources are dropped **before they reach
