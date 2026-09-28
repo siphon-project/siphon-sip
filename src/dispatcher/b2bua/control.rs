@@ -955,7 +955,9 @@ pub enum DialError {
     /// A strategy siphon does not implement.
     UnsupportedStrategy(String),
     /// The call is already answered, so there is no unanswered caller to hold.
-    AlreadyAnswered,
+    /// `call_state` is the state the call was found in, which the control
+    /// adapter hands the controller as a typed detail.
+    AlreadyAnswered { call_state: CallState },
     /// An AoR with no registered contact.
     NoContacts(String),
     /// The requested media path cannot be allocated safely.
@@ -971,7 +973,7 @@ impl std::fmt::Display for DialError {
             DialError::UnsupportedStrategy(strategy) => {
                 write!(formatter, "unsupported dial strategy '{strategy}'")
             }
-            DialError::AlreadyAnswered => write!(
+            DialError::AlreadyAnswered { .. } => write!(
                 formatter,
                 "the call is already answered — dial rings a caller that is still waiting"
             ),
@@ -1053,13 +1055,13 @@ pub(crate) fn b2bua_dial_call_with_state(
     // anyone picks up and denies the caller the callee's own ringback — so a
     // call that is already answered is a caller error, not something to paper
     // over by dialling anyway.
-    if state
+    if let Some(call_state) = state
         .call_actors
         .get_call(&internal_call_id)
-        .map(|call| matches!(call.state, CallState::Answered))
-        .unwrap_or(false)
+        .map(|call| call.state.clone())
+        .filter(|call_state| matches!(call_state, CallState::Answered))
     {
-        return Err(DialError::AlreadyAnswered);
+        return Err(DialError::AlreadyAnswered { call_state });
     }
 
     let mut template = {

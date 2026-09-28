@@ -8,7 +8,7 @@ use super::originate::{
     originate, originate_error, originate_with_bus, parse_originate_media, parse_privacy,
     parse_session_timer,
 };
-use super::routing::{parse_dial_target, parse_route_target, route};
+use super::routing::{dial_error, parse_dial_target, parse_route_target, route};
 use super::transfer::{
     accept_refer, parse_refer_mode, parse_replaces_arg, refer, reject_refer, replace_error,
     replace_peer,
@@ -2389,6 +2389,79 @@ fn reject_refer_without_pending_is_not_found() {
             ..
         }
     ));
+}
+
+#[test]
+fn dial_on_an_answered_call_carries_typed_details() {
+    // A controller must be able to tell "this call is already answered" from
+    // every other invalid_state without matching the prose, so the refusal
+    // names the verb, the reason and the state the call was found in.
+    let result = dial_error(crate::dispatcher::DialError::AlreadyAnswered {
+        call_state: crate::b2bua::actor::CallState::Answered,
+    });
+    let ControlResult::Error {
+        code,
+        message,
+        details,
+    } = result
+    else {
+        panic!("dial on an answered call must be refused");
+    };
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    assert_eq!(
+        message, "the call is already answered — dial rings a caller that is still waiting",
+        "the prose is unchanged; details ride beside it"
+    );
+    assert_eq!(
+        details,
+        Some(serde_json::json!({
+            "verb": "dial",
+            "reason": "already_answered",
+            "call_state": "answered",
+        }))
+    );
+}
+
+#[test]
+fn other_dial_refusals_do_not_claim_already_answered() {
+    // The positive control: a refusal for any other cause keeps its own code
+    // and never carries the already-answered reason a controller branches on.
+    let refusals = [
+        (
+            crate::dispatcher::DialError::UnsupportedStrategy("ring-all".to_string()),
+            ControlErrorCode::UnsupportedVerb,
+        ),
+        (
+            crate::dispatcher::DialError::NoTargets,
+            ControlErrorCode::BadRequest,
+        ),
+        (
+            crate::dispatcher::DialError::NoContacts("sip:1001@example.com".to_string()),
+            ControlErrorCode::NotFound,
+        ),
+        (
+            crate::dispatcher::DialError::Media("no media engine".to_string()),
+            ControlErrorCode::Unavailable,
+        ),
+        (
+            crate::dispatcher::DialError::InvalidIdentity("bad from".to_string()),
+            ControlErrorCode::BadRequest,
+        ),
+    ];
+    for (refusal, expected) in refusals {
+        let described = refusal.to_string();
+        let ControlResult::Error { code, details, .. } = dial_error(refusal) else {
+            panic!("{described} must be refused");
+        };
+        assert_eq!(code, expected, "{described}");
+        assert!(
+            details
+                .as_ref()
+                .and_then(|details| details.get("reason"))
+                .is_none_or(|reason| reason != "already_answered"),
+            "{described}: {details:?}"
+        );
+    }
 }
 
 #[test]

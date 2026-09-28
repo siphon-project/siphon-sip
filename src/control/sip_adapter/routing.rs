@@ -159,25 +159,36 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
             "timeout": timeout_secs,
         })),
         Ok(false) => ControlResult::error(ControlErrorCode::NotFound, "call is gone"),
-        Err(error @ crate::dispatcher::DialError::UnsupportedStrategy(_)) => {
-            ControlResult::error(ControlErrorCode::UnsupportedVerb, error.to_string())
-        }
-        Err(error @ crate::dispatcher::DialError::AlreadyAnswered) => {
-            ControlResult::error(ControlErrorCode::InvalidState, error.to_string())
-        }
-        Err(error @ crate::dispatcher::DialError::NoContacts(_)) => {
-            ControlResult::error(ControlErrorCode::NotFound, error.to_string())
-        }
-        Err(error @ crate::dispatcher::DialError::NoTargets) => {
-            ControlResult::error(ControlErrorCode::BadRequest, error.to_string())
-        }
-        Err(error @ crate::dispatcher::DialError::Media(_)) => {
-            ControlResult::error(ControlErrorCode::Unavailable, error.to_string())
-        }
-        Err(error @ crate::dispatcher::DialError::InvalidIdentity(_)) => {
-            ControlResult::error(ControlErrorCode::BadRequest, error.to_string())
-        }
+        Err(error) => dial_error(error),
     }
+}
+
+/// Map a refused `dial` onto its wire code.
+///
+/// The already-answered refusal also carries `details` (`verb`, `reason`,
+/// `call_state`): `invalid_state` alone cannot tell a controller that this call
+/// is answered, as opposed to any other invalid state, without it matching the
+/// prose.
+pub(super) fn dial_error(error: crate::dispatcher::DialError) -> ControlResult {
+    use crate::dispatcher::DialError;
+    let code = match &error {
+        DialError::AlreadyAnswered { call_state } => {
+            return ControlResult::error_with_details(
+                ControlErrorCode::InvalidState,
+                error.to_string(),
+                serde_json::json!({
+                    "verb": "dial",
+                    "reason": "already_answered",
+                    "call_state": crate::control::call_state_str(call_state),
+                }),
+            );
+        }
+        DialError::UnsupportedStrategy(_) => ControlErrorCode::UnsupportedVerb,
+        DialError::NoContacts(_) => ControlErrorCode::NotFound,
+        DialError::NoTargets | DialError::InvalidIdentity(_) => ControlErrorCode::BadRequest,
+        DialError::Media(_) => ControlErrorCode::Unavailable,
+    };
+    ControlResult::error(code, error.to_string())
 }
 
 /// Parse one `dial` target into the branches it stands for.

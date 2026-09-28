@@ -13,6 +13,17 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **The control-plane `dial` refusal on an answered call now carries typed
+  details.** It was a prose-only `invalid_state`, so a controller could not tell
+  "this call is already answered" from any other invalid state without matching
+  the message. The error now carries
+  `error.details: {"verb": "dial", "reason": "already_answered", "call_state": "answered"}`,
+  with `call_state` the state the call was found in. The code and the message
+  are unchanged. The control-plane reference also now lists `anchor`, `profile`
+  and `ws_uri` on `progress`, which it already accepted.
+
 ## [1.11.0] — 2026-09-27
 
 ### Removed
