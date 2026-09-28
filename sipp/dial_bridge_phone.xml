@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The registered phone of the `dial-bridge` acceptance test — rung by
+  `dial {on_answer: "bridge"}` for a caller the controller already answered.
+
+  recv INVITE (offerless, the caller's From) -> 180 -> (1.5 s) -> 200 (our offer)
+       -> recv ACK (the engine's answer)
+       -> recv re-INVITE (the bridge, on the engine) -> 200 -> ACK
+       -> recv BYE (the caller left: the bridge's peer-hangup policy) -> 200
+
+  Asserted here, where nothing on the controller's rail can see it: the phone is
+  rung as a call of its own (offerless, answered on the ACK), it is shown the
+  caller's identity, and the bridge re-offers it onto the engine. The pause
+  after 180 is the window in which the caller hears ringback.
+-->
+<scenario name="dial-bridge phone">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="15550000009"
+            search_in="hdr" header="From:" check_it="true" assign_to="caller_shown" />
+      <ereg regexp="m=audio"
+            search_in="msg" check_it_inverse="true" assign_to="offerless" />
+      <log message="phone INVITE: caller shown=[$caller_shown] offerless=[$offerless]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:2001@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1500" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:2001@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="answer_on_ack" />
+      <log message="answer rode the ACK, anchored on the engine: [$answer_on_ack]" />
+    </action>
+  </recv>
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="bridge_anchored" />
+      <log message="bridge re-INVITE on the engine: [$bridge_anchored]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:2001@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" />
+
+  <recv request="BYE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

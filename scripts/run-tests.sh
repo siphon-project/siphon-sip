@@ -36,6 +36,7 @@ RUN_RTPPROXY=false
 RUN_VOICE_AI=false
 RUN_CONTROL=false
 RUN_BRIDGE=false
+RUN_DIAL_BRIDGE=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_REOFFER=false
@@ -71,6 +72,7 @@ for arg in "$@"; do
     --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
     --control)    RUN_CONTROL=true;    SELECTED_MODES+=("$arg") ;;
     --bridge)     RUN_BRIDGE=true;     SELECTED_MODES+=("$arg") ;;
+    --dial-bridge) RUN_DIAL_BRIDGE=true; SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
@@ -95,7 +97,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
-      echo "  --voice-ai --refer-single-leg --reoffer --control --bridge"
+      echo "  --voice-ai --refer-single-leg --reoffer --control --bridge --dial-bridge"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --nohandler --banscan --reload --shutdown"
       echo "  --security --rfc4475 --webrtc"
@@ -387,6 +389,54 @@ if [[ "$RUN_BRIDGE" == true ]]; then
   docker compose -f "$COMPOSE_FILE" --profile bridge rm -sf \
     sipp-bridge-uac sipp-bridge-uas bridge-app 2>/dev/null || true
   echo "Bridge logs: $BRIDGE_LOG_DIR"
+fi
+
+# ── Step 7a3: `dial {on_answer: "bridge"}` — ring a phone for an answered caller
+# The phone registers, the controller answers the caller anchored, rings the
+# phone's AoR and siphon bridges the two when it picks up. The SIPp scenarios
+# decide the run; the application's verdict covers the verb contract.
+if [[ "$RUN_DIAL_BRIDGE" == true ]]; then
+  echo "=== SIPp dial-bridge test (answered caller, registered phone, bridged on answer) ==="
+  docker compose -f "$COMPOSE_FILE" --profile dial-bridge up -d --force-recreate --wait \
+    siphon-rtp-engine siphon-dial-bridge dial-bridge-app
+  # The phone registers first (its dependency runs to completion), then
+  # listens on the same address.
+  docker compose -f "$COMPOSE_FILE" --profile dial-bridge up -d --force-recreate sipp-dial-bridge-phone
+
+  # The caller finishes last (its trailing pause), so it decides the set.
+  # --no-deps: the register one-shot shares the phone's address and must not
+  # be started again while the phone holds it.
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile dial-bridge up --no-deps \
+    --abort-on-container-exit --exit-code-from sipp-dial-bridge-uac sipp-dial-bridge-uac
+
+  # The phone ran detached: its assertions, including the BYE the peer-hangup
+  # policy sends it, are checked here or not at all.
+  DIAL_BRIDGE_PHONE_CODE="$(docker wait sipp-dial-bridge-phone)"
+  if [[ "$DIAL_BRIDGE_PHONE_CODE" != "0" ]]; then
+    echo "FAILED: the phone scenario exited $DIAL_BRIDGE_PHONE_CODE"
+    docker compose -f "$COMPOSE_FILE" logs sipp-dial-bridge-phone | tail -60
+    exit 1
+  fi
+  echo "  ✓ phone scenario passed"
+
+  DIAL_BRIDGE_LOG_DIR="$(mktemp -d)"
+  docker compose -f "$COMPOSE_FILE" logs dial-bridge-app > "$DIAL_BRIDGE_LOG_DIR/dial-bridge-app.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs sipp-dial-bridge-phone > "$DIAL_BRIDGE_LOG_DIR/sipp-dial-bridge-phone.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs siphon-dial-bridge > "$DIAL_BRIDGE_LOG_DIR/siphon-dial-bridge.log" 2>&1 || true
+  if ! grep -q 'DIAL-BRIDGE-VERDICT' "$DIAL_BRIDGE_LOG_DIR/dial-bridge-app.log"; then
+    echo "FAILED: no DIAL-BRIDGE-VERDICT — the control application never completed"
+    exit 1
+  fi
+  if grep -q '"pass": false' "$DIAL_BRIDGE_LOG_DIR/dial-bridge-app.log"; then
+    echo "FAILED: dial-bridge acceptance checks:"
+    grep 'DIAL-BRIDGE-VERDICT' "$DIAL_BRIDGE_LOG_DIR/dial-bridge-app.log"
+    exit 1
+  fi
+  grep 'DIAL-BRIDGE-VERDICT' "$DIAL_BRIDGE_LOG_DIR/dial-bridge-app.log"
+
+  docker compose -f "$COMPOSE_FILE" --profile dial-bridge rm -sf \
+    sipp-dial-bridge-uac sipp-dial-bridge-phone sipp-dial-bridge-register dial-bridge-app 2>/dev/null || true
+  echo "Dial-bridge logs: $DIAL_BRIDGE_LOG_DIR"
 fi
 
 # ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────

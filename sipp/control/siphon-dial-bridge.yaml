@@ -1,0 +1,58 @@
+# siphon config for the `dial-bridge` acceptance harness
+# (sipp/control/dial_bridge_app.py + sipp/control/dial_bridge_routes.py +
+# sipp/dial_bridge_register.xml + sipp/dial_bridge_phone.xml +
+# sipp/dial_bridge_uac.xml).
+#
+# The end of an IVR flow: the controller answers the caller anchored on the
+# engine, then rings a phone registered here with `dial {on_answer: "bridge"}`
+# and siphon bridges the caller to it when it picks up. Against the REAL
+# siphon-rtp engine, since the ringback is a tone the engine plays and the
+# bridge re-points both legs' media on it.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "dialbridge.test"
+    - "172.20.0.230"
+
+advertised_address: "172.20.0.230"
+
+script:
+  path: "/etc/siphon/scripts/dial_bridge_routes.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+
+  profiles:
+    # The caller is anchored with this at its answer, and the phone with it when
+    # it picks up. Plain RTP, no ICE and no DTLS, so SIPp answers the engine's
+    # SDP without help.
+    bridge_relay:
+      offer: &bridge_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *bridge_flags
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "dial-bridge-app"
+      token: "dial-bridge-app-token"
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    event_queue_depth: 256
+    slow_consumer: drop_oldest
+    reattach_grace_secs: 10
+    handoff_deadline_ms: 20000
+
+log:
+  level: info
