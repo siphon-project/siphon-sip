@@ -627,3 +627,37 @@ async fn a_bare_asserted_identity_goes_out_in_angle_brackets() {
         }
     }
 }
+
+/// `dial` on an answered call is refused before anything is built, and the
+/// refusal carries the state the call was found in, so the control adapter can
+/// hand a controller a typed `call_state` rather than prose alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_on_an_answered_call_is_refused_carrying_the_call_state() {
+    let dispatcher = test_dispatcher();
+    let call_id = park(&dispatcher);
+    dispatcher
+        .state
+        .call_actors
+        .set_state(&call_id, CallState::Answered);
+
+    let refused = dial(&dispatcher, &[FIRST_TARGET], true, &DialShaping::default());
+    match refused {
+        Err(DialError::AlreadyAnswered { call_state }) => {
+            assert_eq!(call_state, CallState::Answered);
+        }
+        other => panic!("dial on an answered call must be refused, got {other:?}"),
+    }
+    assert!(wire(&dispatcher).is_empty(), "a refused dial sends nothing");
+}
+
+/// The positive control: the same parked call, still unanswered, dials.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_on_an_unanswered_call_is_not_refused_as_answered() {
+    let dispatcher = test_dispatcher();
+    park(&dispatcher);
+    let dialled = dial(&dispatcher, &[FIRST_TARGET], true, &DialShaping::default());
+    assert!(
+        matches!(dialled, Ok(true)),
+        "an unanswered call dials: {dialled:?}"
+    );
+}
