@@ -413,6 +413,8 @@ fn originate_aor(
         targets,
         strategy: request.strategy,
         total_timeout_secs,
+        // `originate {aor}`: the first phone to answer is the call.
+        answers: crate::dispatcher::OriginateGroupAnswers::First,
     };
     let sink = Arc::new(ChannelGroupSink {
         bus: Arc::clone(bus),

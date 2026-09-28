@@ -1118,12 +1118,28 @@ the phones are still ringing. (That needs an engine that reports a playback's
 end, siphon-rtp; with rtpengine a prompt that ends on its own is not seen to
 end, so the ringback is held until the dial ends.) It stops before the bridge
 re-points the caller's media, before `DialFailed`, and with the caller when it
-hangs up. Its `PlayStarted` and `PlayFinished` carry `origin: "ringback"`, so
+hangs up; when a bridge fails and phones still ring, it starts again. Its
+`PlayStarted` and `PlayFinished` carry `origin: "ringback"`, so
 the app can tell them from its own. With `ringback: false` the caller hears
 whatever the app leaves playing — its own tone or music on hold.
 
 A phone's early media is **not** relayed to the caller in this version: the two
 are not joined until one answers, and the ringback covers the wait.
+
+**An answer is kept only once its phone is bridged.** When a phone picks up it
+is ACKed and the bridge to it starts, but every other phone keeps ringing until
+`ChannelBridged`; only then are they CANCELled. A phone that answers while a
+bridge is in motion waits as a standby, ACKed and silent. When a bridge fails —
+the phone rejects the bridge's re-INVITE, or the bridge cannot start (the caller
+has a re-INVITE of its own in flight) — that phone is hung up with
+`Reason: Q.850;cause=41`, reported as `DialBranchFailed` with cause
+`bridge_failed`, and the dial goes on: the standbys are bridged next in the
+order they answered, the phones still ringing ring on, and a sequential dial
+rings its next target. When the bridge forms, every standby is hung up
+(`Reason: Q.850;cause=16`) and reported, with the phones still ringing, as
+`DialBranchFailed` with cause `cancelled`. The dial's deadline still applies:
+when it passes, the phones still ringing are CANCELled, but an answer already
+being bridged is seen through. `DialFailed` comes only once nothing is left.
 
 **Events**, all on the caller's channel:
 
@@ -1131,24 +1147,22 @@ are not joined until one answers, and the ringback covers the wait.
 |---|---|---|
 | `DialBranch` | `{leg_id, leg_sip_call_id, target, aor?}` | a phone's INVITE goes out |
 | `PlayStarted` | `{source: "tone", origin: "ringback", play_id?, duration_ms?}` | a phone is alerting and the ringback started |
-| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a phone ended without answering (or was CANCELled because another answered) |
-| `DialAnswered` | `{leg_id, leg_sip_call_id, target, code, aor?, channel}` | a phone answered. `channel` is a channel siphon minted for it, registered to this app and connection with the caller's `on_lost` policy; the phone's own events follow on it |
-| `ChannelBridged` / `BridgeFailed` | as for `bridge`, on both channels | the bridge formed, or failed |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a phone ended without being kept: it never answered, it was CANCELled or released once another was bridged (`cancelled`), or it answered and its bridge failed (`bridge_failed`) |
+| `BridgeFailed` | as for `bridge` | a bridge to a phone that answered failed. On the caller's channel only, since the phone was never given one; `stage: "setup"` with a `reason` when the bridge never started |
+| `DialAnswered` | `{leg_id, leg_sip_call_id, target, code, aor?, channel}` | the phone that was **bridged**, sent once, when the bridge forms and just before `ChannelBridged`: an answer is not reported until it is kept. `channel` is a channel siphon minted for it, registered to this app and connection with the caller's `on_lost` policy (`null` when that channel has no live owner); the phone's own events follow on it |
+| `ChannelBridged` | as for `bridge`, on both channels | the bridge formed |
 | `DialFailed` | `{code, reason, cause, timed_out, branches}` | nobody answered; the ringback is already stopped, and nothing was sent to the caller |
 
 `cause` on `DialFailed` says how the dial ended: `rejected`, `ring timeout`,
-`unsent`, or `caller_hangup` when the caller went away while the phones rang.
+`unsent`, `bridge_failed`, or `caller_hangup` when the caller went away while
+the phones rang.
 In that last case every phone is CANCELled (RFC 3261 §9.1) and `DialFailed`
 precedes the caller's `StasisEnd`. After `DialFailed` the caller is still
 answered and owned: play the voicemail prompt, or dial again.
 
-**When the bridge fails** — the phone rejects the bridge's re-INVITE, or the
-bridge cannot start (the caller has a re-INVITE of its own in flight, or went
-away) — the phone is hung up with `Reason: Q.850;cause=41` and the app gets
-`BridgeFailed` on both channels (`stage: "setup"` with a `reason` when it never
-started). The caller is left answered and owned for the app to decide on. A
-phone that answered while the caller's controller had no live connection is hung
-up the same way.
+A phone that hangs up while its bridge is in motion takes the caller with it,
+as a bridged party does (`on_peer_hangup: "hangup"`); the fallback covers a
+bridge that is refused or cannot start, not a phone that leaves.
 
 Refused, each with `error.details` `{verb: "dial", reason, …}`:
 

@@ -49,9 +49,12 @@ entry, but a working config keeps working.
   cadence, default `ringback_eu`, or `false`) from the first 180-183 on, never
   over a prompt still playing, and its `PlayStarted` / `PlayFinished` carry
   `origin: "ringback"`. The first phone to answer gets `DialAnswered` with a
-  channel of its own (same app, connection and `on_lost` as the caller's) and is
-  bridged to the caller; if that bridge fails the phone is hung up and the caller
-  kept. Nobody answering is `DialFailed`, with the ringback stopped first and the
+  channel of its own (same app, connection and `on_lost` as the caller's) once it
+  is bridged to the caller: an answer is kept only when its bridge forms, so the
+  other phones ring on until then, a phone answering meanwhile waits as a
+  standby, and a bridge that fails hangs its phone up (`DialBranchFailed`,
+  cause `bridge_failed`) and the dial carries on with the standbys, the phones
+  still ringing or a sequential dial's next target. Nobody answering is `DialFailed`, with the ringback stopped first and the
   caller still answered and owned; the caller hanging up CANCELs every phone. A
   second bridge dial on the same caller, or one for a bridged caller, is
   `invalid_state`, and every refusal carries `error.details`. A phone's early

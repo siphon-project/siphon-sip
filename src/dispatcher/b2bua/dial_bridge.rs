@@ -75,18 +75,36 @@ pub enum DialBridgeSignal {
     /// A playback on the caller ended, so a ringback held back behind it may
     /// start.
     PromptFinished,
-    /// A phone answered. `channel` is the channel it was registered under, or
-    /// `None` when the caller's channel had no live owner to register it to.
-    Answered {
-        winner: OriginateGroupWinner,
-        channel: Option<String>,
-    },
-    /// Nobody answered.
+    /// A phone answered, provisionally: it is ACKed and anchored, and the
+    /// other phones keep ringing until it is bridged.
+    Answered(OriginateGroupWinner),
+    /// The bridge to this phone failed after it was put in motion: the phone
+    /// is already hung up and its answer refused, so the dial goes on.
+    BridgeFailed(OriginateGroupWinner),
+    /// The bridge formed: the dial is over.
+    Bridged,
+    /// Nobody answered, or no answer could be bridged.
     Failed(OriginateGroupFailure),
 }
 
 /// Where a bridge dial's signals go.
 pub type DialBridgeSender = tokio::sync::mpsc::UnboundedSender<DialBridgeSignal>;
+
+/// Told, synchronously, that a bridge dial's phone is bridged to its caller —
+/// before the bridge's own `ChannelBridged` goes out, so a channel minted for
+/// the phone here receives it.
+pub trait DialBridgeListener: Send + Sync {
+    fn bridged(&self, winner: &OriginateGroupWinner);
+}
+
+/// A phone whose bridge to its caller is in motion.
+struct PendingBridge {
+    /// The caller's SIP Call-ID.
+    caller: String,
+    winner: OriginateGroupWinner,
+    signals: DialBridgeSender,
+    listener: Arc<dyn DialBridgeListener>,
+}
 
 /// A caller with a group ringing for it.
 struct RingingDial {
@@ -110,8 +128,9 @@ struct RingbackPlay {
 #[derive(Default)]
 pub struct DialBridgeStore {
     ringing: DashMap<String, RingingDial>,
-    /// Answered phone → its caller, from the answer until the bridge settles.
-    bridging: DashMap<String, String>,
+    /// Answered phone → its bridge, from the moment the bridge is put in
+    /// motion until it settles.
+    bridging: DashMap<String, PendingBridge>,
     ringback: DashMap<String, RingbackPlay>,
 }
 
@@ -153,6 +172,11 @@ impl DialBridgeStore {
     /// Whether `caller` has a dial ringing for it.
     pub fn is_ringing(&self, caller: &str) -> bool {
         self.ringing.contains_key(caller)
+    }
+
+    /// The group ringing for `caller`, once created.
+    pub fn group_of(&self, caller: &str) -> Option<String> {
+        self.ringing.get(caller)?.group_id.clone()
     }
 
     /// Take `caller` for a new dial. `false` when it already has one.
@@ -211,13 +235,14 @@ impl DialBridgeStore {
         matched
     }
 
-    /// The phone `winner` answered for `caller` and is about to be bridged.
-    pub fn await_bridge(&self, winner: &str, caller: &str) {
-        self.bridging.insert(winner.to_string(), caller.to_string());
+    /// A phone's bridge is about to be put in motion.
+    fn await_bridge(&self, pending: PendingBridge) {
+        self.bridging
+            .insert(pending.winner.internal_call_id.clone(), pending);
     }
 
-    /// The bridge of `winner` never got going; nothing waits on it.
-    pub fn forget_bridge(&self, winner: &str) {
+    /// The bridge of the phone `winner` never got going; nothing waits on it.
+    fn forget_bridge(&self, winner: &str) {
         self.bridging.remove(winner);
     }
 }
@@ -410,6 +435,9 @@ pub fn dial_bridge_spec(
         targets: plan.targets,
         strategy: plan.strategy,
         total_timeout_secs: plan.total_timeout_secs,
+        // An answer is only kept once the phone is bridged: until then the
+        // other phones ring on, to fall back on when the bridge fails.
+        answers: OriginateGroupAnswers::Confirmed,
     })
 }
 
@@ -457,20 +485,27 @@ pub(crate) fn resolve_bridge_leg_identities(
     Ok(())
 }
 
-/// Bridge the phone that answered to its caller, the caller keeping its media
+/// Bridge a phone that answered to its caller, the caller keeping its media
 /// session (the anchor) — the `bridge` verb's own path. The phone waits on the
-/// bridge from here until it settles ([`dial_bridge_settled`]); when the
-/// bridge cannot even start, it waits on nothing and the error is returned.
+/// bridge from here until it settles ([`dial_bridge_settled`]), which tells
+/// `listener` and sends [`DialBridgeSignal::Bridged`] or
+/// [`DialBridgeSignal::BridgeFailed`] on `signals`; when the bridge cannot even
+/// start, it waits on nothing and the error is returned instead.
 pub async fn dial_bridge_join(
     state: &DispatcherState,
     caller_sip_call_id: &str,
     winner: &OriginateGroupWinner,
+    signals: DialBridgeSender,
+    listener: Arc<dyn DialBridgeListener>,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
     // Before the re-INVITE is on the wire: a phone that rejects it at once
     // must find itself awaited.
-    state
-        .dial_bridges
-        .await_bridge(&winner.internal_call_id, caller_sip_call_id);
+    state.dial_bridges.await_bridge(PendingBridge {
+        caller: caller_sip_call_id.to_string(),
+        winner: winner.clone(),
+        signals,
+        listener,
+    });
     let joined = bridge_calls_with_state(
         state,
         BridgeParams {
@@ -577,35 +612,78 @@ pub fn dial_bridge_call_ended(sip_call_id: &str, state: &DispatcherState) {
     if let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) {
         store.bridging.remove(&internal_call_id);
     }
-    store.bridging.retain(|_, caller| caller != sip_call_id);
+    store
+        .bridging
+        .retain(|_, pending| pending.caller != sip_call_id);
 }
 
-/// A bridge between `call_id` and `peer_call_id` settled. When one of them is
-/// a phone a bridge dial rang, it no longer waits on it — and when the bridge
-/// failed, the phone is released: it was answered only to be joined to the
-/// caller, and a phone left up with nobody on it is a user listening to
-/// silence. The caller is left as it is, answered and with its controller,
-/// which has the `BridgeFailed` to decide on.
+/// A bridge between `call_id` and `peer_call_id` settled — `failed` carries
+/// the status that refused it. When one of them is a phone a bridge dial rang,
+/// it no longer waits on it, and:
+///
+/// * bridged: its answer is kept. The group CANCELs every phone still ringing
+///   and releases every other answered one, the listener is told (before the
+///   bridge's `ChannelBridged`, which the caller of this sends after it), and
+///   the dial is over;
+/// * failed: the phone is released and its answer refused
+///   ([`dial_bridge_refuse_phone`]), and the dial goes on with the rest.
 pub fn dial_bridge_settled(
     state: &DispatcherState,
     call_id: &str,
     peer_call_id: &str,
-    failed: bool,
+    failed: Option<u16>,
 ) {
     for leg in [call_id, peer_call_id] {
-        if state.dial_bridges.bridging.remove(leg).is_some() && failed {
-            warn!(
-                phone = %leg,
-                "control plane: dial — the bridge to the caller failed, releasing the phone"
-            );
-            dial_bridge_release_phone(state, leg);
+        let Some((_, pending)) = state.dial_bridges.bridging.remove(leg) else {
+            continue;
+        };
+        match failed {
+            Some(code) => {
+                warn!(
+                    phone = %leg,
+                    status = code,
+                    "control plane: dial — the bridge to the caller failed, releasing the phone"
+                );
+                dial_bridge_refuse_phone(state, &pending.winner, code);
+                let _ = pending
+                    .signals
+                    .send(DialBridgeSignal::BridgeFailed(pending.winner));
+            }
+            None => {
+                confirm_originate_group_answer(
+                    state,
+                    &pending.winner.group_id,
+                    &pending.winner.internal_call_id,
+                );
+                pending.listener.bridged(&pending.winner);
+                let _ = pending.signals.send(DialBridgeSignal::Bridged);
+            }
         }
     }
 }
 
-/// Hang up a phone a bridge dial answered, with a `Reason` saying why.
-pub fn dial_bridge_release_phone(state: &DispatcherState, internal_call_id: &str) {
-    b2bua_terminate_call_inner(internal_call_id, Some(BRIDGE_FAILED_REASON), "b2bua", state);
+/// A phone that answered could not be bridged to its caller: hang it up, with
+/// a `Reason` saying why, and refuse its answer so its group carries on — the
+/// other phones ring on, a sequential dial moves to the next, and the dial
+/// fails only once nothing is left. Reported as a `DialBranchFailed` with
+/// cause `bridge_failed` and `code`.
+pub fn dial_bridge_refuse_phone(state: &DispatcherState, winner: &OriginateGroupWinner, code: u16) {
+    b2bua_terminate_call_inner(
+        &winner.internal_call_id,
+        Some(BRIDGE_FAILED_REASON),
+        "b2bua",
+        state,
+    );
+    reject_originate_group_answer(
+        state,
+        &winner.group_id,
+        &winner.internal_call_id,
+        crate::b2bua::actor::DialBranchOutcome::new(
+            code,
+            "Bridge Failed",
+            crate::b2bua::actor::DialBranchCause::BridgeFailed,
+        ),
+    );
 }
 
 /// The engine reported playback `play_id` on a leg ended. `true` when it was a
@@ -704,8 +782,29 @@ mod tests {
 
     #[test]
     fn an_awaited_bridge_is_forgotten() {
+        struct Nobody;
+        impl DialBridgeListener for Nobody {
+            fn bridged(&self, _: &OriginateGroupWinner) {}
+        }
         let store = DialBridgeStore::new();
-        store.await_bridge("phone-call", CALLER);
+        let (signals, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        store.await_bridge(PendingBridge {
+            caller: CALLER.to_string(),
+            winner: OriginateGroupWinner {
+                group_id: "group".to_string(),
+                internal_call_id: "phone-call".to_string(),
+                sip_call_id: "phone@192.0.2.20".to_string(),
+                branch: crate::b2bua::actor::DialBranch {
+                    leg_id: "leg".to_string(),
+                    leg_sip_call_id: "phone@192.0.2.20".to_string(),
+                    target: "sip:201@192.0.2.20".to_string(),
+                    aor: None,
+                    outcome: None,
+                },
+            },
+            signals,
+            listener: Arc::new(Nobody),
+        });
         assert_eq!(store.bridging_count(), 1);
         store.forget_bridge("phone-call");
         assert_eq!(store.bridging_count(), 0);

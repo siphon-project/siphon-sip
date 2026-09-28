@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use super::control_originate_tests::{controller_on, Controller};
-use super::originate_test_harness::{drain, socket, Sent};
+use super::originate_test_harness::{drain, requests_to, socket, Sent};
 use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use crate::control::protocol::EventFrame;
@@ -367,4 +367,45 @@ pub(super) async fn eventually(check: impl Fn() -> bool) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     check()
+}
+
+/// Whether a request is inside a dialog: its To carries the far end's tag
+/// (RFC 3261 §12.2.1.1).
+pub(super) fn in_dialog(message: &SipMessage) -> bool {
+    message.headers.to().is_some_and(|to| to.contains(";tag="))
+}
+
+/// The one INVITE to `phone` among `sent` that opens a dialog.
+pub(super) fn invite_to(sent: &[Sent], phone: &str) -> SipMessage {
+    let mut invites: Vec<_> = requests_to(sent, socket(phone), Method::Invite)
+        .into_iter()
+        .filter(|sent| !in_dialog(&sent.message))
+        .collect();
+    assert_eq!(invites.len(), 1, "one dialog-opening INVITE to {phone}");
+    invites.remove(0).message
+}
+
+/// The re-INVITEs among `sent` to `address`.
+pub(super) fn reinvites_to(sent: &[Sent], address: &str) -> Vec<SipMessage> {
+    requests_to(sent, socket(address), Method::Invite)
+        .into_iter()
+        .filter(|sent| in_dialog(&sent.message))
+        .map(|sent| sent.message)
+        .collect()
+}
+
+/// Nothing a bridge dial keeps is left behind.
+pub(super) fn assert_drained(state: &DispatcherState) {
+    assert_eq!(
+        state.dial_bridges.ringing_count(),
+        0,
+        "a ringing dial leaked"
+    );
+    assert_eq!(
+        state.dial_bridges.bridging_count(),
+        0,
+        "an awaited bridge leaked"
+    );
+    assert_eq!(state.originate_groups.group_count(), 0, "a group leaked");
+    assert_eq!(state.originate_groups.leg_count(), 0, "a group leg leaked");
 }

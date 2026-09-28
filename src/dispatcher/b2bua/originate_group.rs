@@ -78,6 +78,25 @@ pub struct OriginateGroupSpec {
     /// The deadline of the group as a whole, in seconds from its start. `0`
     /// sets none, leaving each leg's own ring timeout as the only bound.
     pub total_timeout_secs: u32,
+    /// Whether the first answer is final.
+    pub answers: OriginateGroupAnswers,
+}
+
+/// When an answer settles a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginateGroupAnswers {
+    /// The first leg to answer wins: every other leg is CANCELled at once and
+    /// the sink's `answered` is its last call. What `originate {aor}` does.
+    First,
+    /// Each answer is provisional. Every answered leg is ACKed and reported to
+    /// the sink's `answered`, while the legs still ringing keep ringing; the
+    /// creator then either confirms one ([`confirm_originate_group_answer`]),
+    /// which CANCELs the rest and releases every other answered leg, or rejects
+    /// it ([`reject_originate_group_answer`]), and the group carries on as if
+    /// that leg had failed. For a creator that has to do something with an
+    /// answer before it can keep it — bridging it to a caller already on the
+    /// line — and must fall back to the other legs when that fails.
+    Confirmed,
 }
 
 /// A provisional response one leg of a group received.
@@ -128,8 +147,12 @@ pub struct OriginateGroupFailure {
 ///
 /// Called outside every lock the group store holds, in the order things
 /// happen, from whichever thread handled the response that moved the group.
-/// For one group, `answered` or `failed` is called exactly once and last; the
-/// branch calls before it name the legs in the order they were placed.
+/// For a group whose first answer is final, `answered` or `failed` is called
+/// exactly once and last; the branch calls before it name the legs in the order
+/// they were placed. For a group whose answers are confirmed, `answered` is
+/// called once per leg that answers, and `failed` — only once no leg is ringing
+/// or answered and awaiting its creator — is the last call when nothing is
+/// confirmed; a confirmed group reports the legs it releases, and no more.
 pub trait OriginateGroupSink: Send + Sync {
     /// A leg's INVITE was built and is about to go out.
     fn branch_created(&self, group_id: &str, branch: &DialBranch);
@@ -186,11 +209,20 @@ impl OriginateGroupEnd {
 struct GroupLeg {
     internal_call_id: String,
     branch: DialBranch,
+    /// Answered, and awaiting its creator's confirmation (a group whose
+    /// answers are confirmed).
+    answered: bool,
 }
 
 impl GroupLeg {
+    /// Still ringing.
     fn is_live(&self) -> bool {
-        self.branch.outcome.is_none()
+        self.branch.outcome.is_none() && !self.answered
+    }
+
+    /// Answered, not yet confirmed or rejected.
+    fn is_pending(&self) -> bool {
+        self.branch.outcome.is_none() && self.answered
     }
 }
 
@@ -214,6 +246,11 @@ struct OriginateGroup {
     deadline: Option<Instant>,
     /// Why the last target that could not be placed was refused.
     last_refusal: Option<OriginateError>,
+    answers: OriginateGroupAnswers,
+    /// The deadline passed while an answer awaited confirmation: the ringing
+    /// legs were CANCELled and nothing more is placed, but the answers already
+    /// in are still the creator's to confirm or reject.
+    expired: bool,
 }
 
 impl OriginateGroup {
@@ -222,11 +259,16 @@ impl OriginateGroup {
         if self.concluded {
             return Next::Nothing;
         }
-        if self.legs.iter().any(GroupLeg::is_live) {
+        if self
+            .legs
+            .iter()
+            .any(|leg| leg.is_live() || leg.is_pending())
+        {
             return Next::Continue;
         }
         if self.strategy == OriginateGroupStrategy::Sequential
             && self.next_target < self.targets.len()
+            && !self.expired
         {
             self.placing = true;
             return Next::Place;
@@ -270,6 +312,7 @@ fn failure_from_branches(group_id: &str, branches: Vec<DialBranch>) -> Originate
                 DialBranchCause::Timeout => "ring timeout",
                 DialBranchCause::Cancelled => "cancelled",
                 DialBranchCause::Unsent => "unsent",
+                DialBranchCause::BridgeFailed => "bridge_failed",
             }
             .to_string(),
             outcome.code,
@@ -314,6 +357,9 @@ struct EndedLeg {
 enum LegRole {
     /// Ringing for the group named.
     Member(String),
+    /// Answered, for a group whose answers are confirmed: awaiting its
+    /// creator's confirmation or rejection.
+    Answered(String),
     /// Answered first; its 2xx is being carried out.
     Winner,
     /// Being released: CANCELled when another leg won or the group ended, or
@@ -340,13 +386,30 @@ struct GroupClaimed {
     sink: Arc<dyn OriginateGroupSink>,
     winner: DialBranch,
     losers: Vec<GroupLeg>,
+    /// The group's answers are confirmed: this one is provisional, nothing was
+    /// released and the group stays in the store.
+    provisional: bool,
 }
 
-/// A group ended from outside: what the ending has to CANCEL and report.
+/// A group ended from outside: what the ending has to CANCEL, release and
+/// report.
 struct GroupEnded {
     sink: Arc<dyn OriginateGroupSink>,
+    /// Ringing legs, to CANCEL.
     live: Vec<GroupLeg>,
-    failure: OriginateGroupFailure,
+    /// Answered legs awaiting confirmation, to release (a cancelled group).
+    answered: Vec<GroupLeg>,
+    /// The group's failure; `None` when it timed out with answers still
+    /// awaiting confirmation, and so carries on without its ringing legs.
+    failure: Option<OriginateGroupFailure>,
+}
+
+/// An answer a group's creator confirmed: what the confirmation CANCELs and
+/// releases.
+struct GroupConfirmed {
+    sink: Arc<dyn OriginateGroupSink>,
+    live: Vec<GroupLeg>,
+    answered: Vec<GroupLeg>,
 }
 
 /// Every originate group siphon is ringing, and the index from each leg's
@@ -397,7 +460,9 @@ impl OriginateGroupStore {
         self.groups
             .iter()
             .filter(|group| {
-                !group.concluded && group.deadline.is_some_and(|deadline| deadline <= now)
+                !group.concluded
+                    && !group.expired
+                    && group.deadline.is_some_and(|deadline| deadline <= now)
             })
             .map(|group| group.key().clone())
             .collect()
@@ -423,7 +488,7 @@ impl OriginateGroupStore {
     fn member_group(&self, internal_call_id: &str) -> Option<String> {
         match self.legs.get(internal_call_id)?.value() {
             LegRole::Member(group_id) => Some(group_id.clone()),
-            LegRole::Winner | LegRole::Loser => None,
+            LegRole::Answered(_) | LegRole::Winner | LegRole::Loser => None,
         }
     }
 
@@ -488,6 +553,7 @@ impl OriginateGroupStore {
         group.legs.push(GroupLeg {
             internal_call_id: internal_call_id.to_string(),
             branch,
+            answered: false,
         });
         self.legs.insert(
             internal_call_id.to_string(),
@@ -573,7 +639,7 @@ impl OriginateGroupStore {
         };
         let group_id = match role {
             LegRole::Member(group_id) => group_id,
-            LegRole::Winner => return Claim::Duplicate,
+            LegRole::Answered(_) | LegRole::Winner => return Claim::Duplicate,
             LegRole::Loser => return Claim::Lost,
         };
         let Some(mut group) = self.groups.get_mut(&group_id) else {
@@ -587,6 +653,7 @@ impl OriginateGroupStore {
                 .insert(internal_call_id.to_string(), LegRole::Loser);
             return Claim::Lost;
         }
+        let provisional = group.answers == OriginateGroupAnswers::Confirmed;
         let Some(winner) = group
             .legs
             .iter_mut()
@@ -596,11 +663,26 @@ impl OriginateGroupStore {
                 .insert(internal_call_id.to_string(), LegRole::Loser);
             return Claim::Lost;
         };
-        winner.branch.outcome = Some(DialBranchOutcome::new(
-            code,
-            "OK",
-            DialBranchCause::Answered,
-        ));
+        let answered = DialBranchOutcome::new(code, "OK", DialBranchCause::Answered);
+        if provisional {
+            // Provisional: the leg is answered but not the group's until its
+            // creator says so, and every other leg keeps ringing meanwhile.
+            winner.answered = true;
+            let mut reported = winner.branch.clone();
+            reported.outcome = Some(answered);
+            self.legs.insert(
+                internal_call_id.to_string(),
+                LegRole::Answered(group_id.clone()),
+            );
+            return Claim::Won(GroupClaimed {
+                sink: Arc::clone(&group.sink),
+                group_id,
+                winner: reported,
+                losers: Vec::new(),
+                provisional: true,
+            });
+        }
+        winner.branch.outcome = Some(answered);
         let winner = winner.branch.clone();
         self.legs
             .insert(internal_call_id.to_string(), LegRole::Winner);
@@ -619,17 +701,22 @@ impl OriginateGroupStore {
             group_id,
             winner,
             losers,
+            provisional: false,
         })
     }
 
-    /// End a group from outside: conclude it and settle every live leg on
-    /// `end`'s outcome. `None` for a group that is gone or already concluded.
+    /// End a group from outside: settle every live leg on `end`'s outcome.
+    /// The group concludes, except when it times out with answers still
+    /// awaiting their creator: those stay the creator's to confirm or reject,
+    /// and only its ringing legs end (the group is marked expired so nothing
+    /// more is placed). A cancel also settles the answers awaiting
+    /// confirmation, to be released. `None` for a group that is gone or
+    /// already concluded.
     fn end(&self, group_id: &str, end: &OriginateGroupEnd) -> Option<GroupEnded> {
         let mut group = self.groups.get_mut(group_id)?;
-        if group.concluded {
+        if group.concluded || (group.expired && *end == OriginateGroupEnd::TimedOut) {
             return None;
         }
-        group.concluded = true;
         let outcome = end.leg_outcome();
         let mut live = Vec::new();
         for leg in group.legs.iter_mut().filter(|leg| leg.is_live()) {
@@ -638,16 +725,111 @@ impl OriginateGroupStore {
                 .insert(leg.internal_call_id.clone(), LegRole::Loser);
             live.push(leg.clone());
         }
+        let awaiting = group.legs.iter().any(GroupLeg::is_pending);
+        if awaiting && *end == OriginateGroupEnd::TimedOut {
+            group.expired = true;
+            return Some(GroupEnded {
+                sink: Arc::clone(&group.sink),
+                live,
+                answered: Vec::new(),
+                failure: None,
+            });
+        }
+        let released =
+            DialBranchOutcome::new(487, "Request Terminated", DialBranchCause::Cancelled);
+        let mut answered = Vec::new();
+        for leg in group.legs.iter_mut().filter(|leg| leg.is_pending()) {
+            leg.branch.outcome = Some(released.clone());
+            self.legs
+                .insert(leg.internal_call_id.clone(), LegRole::Loser);
+            answered.push(leg.clone());
+        }
+        group.concluded = true;
         Some(GroupEnded {
             sink: Arc::clone(&group.sink),
-            failure: OriginateGroupFailure {
+            failure: Some(OriginateGroupFailure {
                 group_id: group_id.to_string(),
                 reason: end.reason(),
                 code: outcome.code,
                 response: outcome.reason.clone(),
                 branches: group.branches(),
-            },
+            }),
             live,
+            answered,
+        })
+    }
+
+    /// Confirm `internal_call_id`'s answer: the group concludes, won by it,
+    /// and every other leg — ringing, or answered and awaiting confirmation —
+    /// is settled as cancelled, for the caller to CANCEL or release. `None`
+    /// unless that leg's answer is awaiting confirmation.
+    fn confirm(&self, group_id: &str, internal_call_id: &str) -> Option<GroupConfirmed> {
+        let mut group = self.groups.get_mut(group_id)?;
+        if group.concluded {
+            return None;
+        }
+        let winner = group
+            .legs
+            .iter_mut()
+            .find(|leg| leg.internal_call_id == internal_call_id && leg.is_pending())?;
+        winner.branch.outcome = Some(DialBranchOutcome::new(200, "OK", DialBranchCause::Answered));
+        self.legs.remove(internal_call_id);
+        let cancelled =
+            DialBranchOutcome::new(487, "Request Terminated", DialBranchCause::Cancelled);
+        let (mut live, mut answered) = (Vec::new(), Vec::new());
+        for leg in group
+            .legs
+            .iter_mut()
+            .filter(|leg| leg.is_live() || leg.is_pending())
+        {
+            let pending = leg.is_pending();
+            leg.branch.outcome = Some(cancelled.clone());
+            self.legs
+                .insert(leg.internal_call_id.clone(), LegRole::Loser);
+            if pending {
+                answered.push(leg.clone());
+            } else {
+                live.push(leg.clone());
+            }
+        }
+        group.concluded = true;
+        Some(GroupConfirmed {
+            sink: Arc::clone(&group.sink),
+            live,
+            answered,
+        })
+    }
+
+    /// Reject `internal_call_id`'s answer: the leg ends on `outcome` and the
+    /// group moves on as if it had failed. `None` unless that leg's answer is
+    /// awaiting confirmation.
+    fn reject(
+        &self,
+        group_id: &str,
+        internal_call_id: &str,
+        outcome: DialBranchOutcome,
+    ) -> Option<EndedLeg> {
+        let mut group = self.groups.get_mut(group_id)?;
+        if group.concluded {
+            return None;
+        }
+        let leg = group
+            .legs
+            .iter_mut()
+            .find(|leg| leg.internal_call_id == internal_call_id && leg.is_pending())?;
+        leg.branch.outcome = Some(outcome);
+        let branch = leg.branch.clone();
+        self.legs.remove(internal_call_id);
+        let next = if group.placing {
+            Next::Continue
+        } else {
+            group.next_step(group_id)
+        };
+        Some(EndedLeg {
+            sink: Arc::clone(&group.sink),
+            group_id: group_id.to_string(),
+            branch,
+            next,
         })
     }
 }
@@ -687,6 +869,8 @@ pub fn create_originate_group(
             concluded: false,
             deadline: None,
             last_refusal: None,
+            answers: spec.answers,
+            expired: false,
         },
     );
     Ok(group_id)
@@ -716,8 +900,11 @@ pub fn start_originate_group(
     Ok(placed)
 }
 
-/// End a group from outside it: CANCEL every leg still ringing (RFC 3261 §9.1)
-/// and report the failure. `false` for a group that is gone or already ended.
+/// End a group from outside it: CANCEL every leg still ringing (RFC 3261 §9.1),
+/// release every answer awaiting confirmation (BYE, §15) and report the
+/// failure. A group whose deadline passes while an answer awaits confirmation
+/// only loses its ringing legs; it fails once no answer is left. `false` for a
+/// group that is gone or already ended.
 pub fn cancel_originate_group(
     state: &DispatcherState,
     group_id: &str,
@@ -726,22 +913,103 @@ pub fn cancel_originate_group(
     let Some(ended) = state.originate_groups.end(group_id, &end) else {
         return false;
     };
-    // Gone from the store before its legs are CANCELled, so each leg ending
-    // below finds no group to move.
-    state.originate_groups.remove(group_id);
+    let reason = end.reason();
+    if ended.failure.is_some() {
+        // Gone from the store before its legs are CANCELled, so each leg
+        // ending below finds no group to move.
+        state.originate_groups.remove(group_id);
+    }
     info!(
         group_id,
-        reason = %ended.failure.reason,
+        %reason,
         legs = ended.live.len(),
-        "B2BUA: originate group ended before anyone answered"
+        answered = ended.answered.len(),
+        concluded = ended.failure.is_some(),
+        "B2BUA: originate group ended before an answer was kept"
     );
-    let reason = ended.failure.reason.clone();
     for leg in &ended.live {
         abandon_leg(state, leg, &reason);
         state.originate_groups.forget_leg(&leg.internal_call_id);
         ended.sink.branch_ended(group_id, &leg.branch);
     }
-    ended.sink.failed(&ended.failure);
+    for leg in &ended.answered {
+        release_answered_leg(state, leg);
+        ended.sink.branch_ended(group_id, &leg.branch);
+    }
+    if let Some(failure) = &ended.failure {
+        ended.sink.failed(failure);
+    }
+    true
+}
+
+/// The `Reason` an answered leg is released with when its group keeps another
+/// answer, or is abandoned (RFC 3326; Q.850 16, normal clearing).
+const RELEASED_REASON: &str = q850_reason!(16, "answered elsewhere");
+
+/// BYE an answered leg the group will not keep, and forget it.
+fn release_answered_leg(state: &DispatcherState, leg: &GroupLeg) {
+    b2bua_terminate_call_inner(&leg.internal_call_id, Some(RELEASED_REASON), "b2bua", state);
+    state.originate_groups.forget_leg(&leg.internal_call_id);
+}
+
+/// Keep `internal_call_id`'s answer, for a group whose answers are confirmed:
+/// the group is won by it, every leg still ringing is CANCELled (RFC 3261
+/// §9.1) and every other answered leg is released (BYE, §15), each reported as
+/// cancelled. The sink gets no further call. `false` unless that leg's answer
+/// is awaiting confirmation.
+pub fn confirm_originate_group_answer(
+    state: &DispatcherState,
+    group_id: &str,
+    internal_call_id: &str,
+) -> bool {
+    let Some(confirmed) = state.originate_groups.confirm(group_id, internal_call_id) else {
+        return false;
+    };
+    state.originate_groups.remove(group_id);
+    info!(
+        group_id,
+        call_id = %internal_call_id,
+        cancelled = confirmed.live.len(),
+        released = confirmed.answered.len(),
+        "B2BUA: originate group answer kept"
+    );
+    for leg in &confirmed.live {
+        abandon_leg(state, leg, "answered elsewhere");
+        state.originate_groups.forget_leg(&leg.internal_call_id);
+        confirmed.sink.branch_ended(group_id, &leg.branch);
+    }
+    for leg in &confirmed.answered {
+        release_answered_leg(state, leg);
+        confirmed.sink.branch_ended(group_id, &leg.branch);
+    }
+    true
+}
+
+/// Refuse `internal_call_id`'s answer, for a group whose answers are
+/// confirmed: the leg ends on `outcome`, reported to the sink, and the group
+/// carries on as if it had failed — the next target of a sequential group, or
+/// its failure once no leg is ringing or answered. Releasing the answered call
+/// itself is the caller's. `false` unless that leg's answer is awaiting
+/// confirmation.
+pub fn reject_originate_group_answer(
+    state: &DispatcherState,
+    group_id: &str,
+    internal_call_id: &str,
+    outcome: DialBranchOutcome,
+) -> bool {
+    let Some(ended) = state
+        .originate_groups
+        .reject(group_id, internal_call_id, outcome)
+    else {
+        return false;
+    };
+    ended.sink.branch_ended(&ended.group_id, &ended.branch);
+    if let Err(refusal) = drive(state, &ended.group_id, ended.next) {
+        error!(
+            group_id = %ended.group_id,
+            "B2BUA: originate group reported placing nothing after an answer was refused: {refusal}"
+        );
+    }
     true
 }
 
@@ -961,6 +1229,9 @@ pub struct OriginateGroupWin {
     winner: DialBranch,
     losers: Vec<DialBranch>,
     store: Arc<OriginateGroupStore>,
+    /// The group's answers are confirmed: this one is provisional and the
+    /// group is still in the store.
+    provisional: bool,
 }
 
 impl OriginateGroupWin {
@@ -975,9 +1246,19 @@ impl OriginateGroupWin {
     }
 
     /// The winner answered but its media could not be anchored: the call it
-    /// would have become has already been released, and with the other legs
-    /// CANCELled when it won, the group fails.
-    pub fn media_failed(self, code: u16, reason: &str) {
+    /// would have become has already been released. With the other legs
+    /// CANCELled when it won, the group fails; a provisional answer is refused
+    /// instead, and the group carries on with its other legs.
+    pub fn media_failed(self, state: &DispatcherState, code: u16, reason: &str) {
+        if self.provisional {
+            reject_originate_group_answer(
+                state,
+                &self.group_id,
+                &self.internal_call_id,
+                DialBranchOutcome::new(code, reason, DialBranchCause::Rejected),
+            );
+            return;
+        }
         let mut branches = self.losers.clone();
         branches.push(self.winner.clone());
         self.sink.failed(&OriginateGroupFailure {
@@ -1012,12 +1293,16 @@ pub fn originate_group_claim_answer(
         Claim::Duplicate => return OriginateGroupClaim::Duplicate,
         Claim::Lost => return OriginateGroupClaim::Lost,
     };
-    state.originate_groups.remove(&claimed.group_id);
+    // A provisional answer leaves the group ringing, in the store.
+    if !claimed.provisional {
+        state.originate_groups.remove(&claimed.group_id);
+    }
     info!(
         group_id = %claimed.group_id,
         call_id = %internal_call_id,
         target = %claimed.winner.target,
         losers = claimed.losers.len(),
+        provisional = claimed.provisional,
         "B2BUA: originate group answered"
     );
     for loser in &claimed.losers {
@@ -1032,6 +1317,7 @@ pub fn originate_group_claim_answer(
         winner: claimed.winner,
         losers: claimed.losers.into_iter().map(|leg| leg.branch).collect(),
         store: Arc::clone(&state.originate_groups),
+        provisional: claimed.provisional,
     }))
 }
 
@@ -1123,6 +1409,8 @@ mod tests {
             concluded: false,
             deadline: None,
             last_refusal: None,
+            answers: OriginateGroupAnswers::First,
+            expired: false,
         }
     }
 
@@ -1140,6 +1428,128 @@ mod tests {
             ));
         }
         store
+    }
+
+    /// [`store_with`] for a group whose answers are confirmed.
+    fn confirmed_store(strategy: OriginateGroupStrategy, legs: usize) -> OriginateGroupStore {
+        let store = store_with(strategy, legs);
+        if let Some(mut group) = store.groups.get_mut("group") {
+            group.answers = OriginateGroupAnswers::Confirmed;
+        }
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        store
+    }
+
+    fn bridge_failed() -> DialBranchOutcome {
+        DialBranchOutcome::new(488, "Bridge Failed", DialBranchCause::BridgeFailed)
+    }
+
+    #[test]
+    fn a_provisional_answer_leaves_every_other_leg_ringing() {
+        let store = confirmed_store(OriginateGroupStrategy::Parallel, 3);
+        let Claim::Won(first) = store.claim_answer("leg-0", 200) else {
+            panic!("an answer is claimed");
+        };
+        assert!(first.provisional);
+        assert!(first.losers.is_empty(), "nobody is CANCELled yet");
+        assert!(store.contains("group"), "the group rings on");
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Duplicate));
+        // A second answer is claimed too: a standby.
+        let Claim::Won(second) = store.claim_answer("leg-1", 200) else {
+            panic!("a second answer is claimed");
+        };
+        assert!(second.provisional);
+        // Positive control: the group whose first answer is final releases.
+        let final_store = store_with(OriginateGroupStrategy::Parallel, 3);
+        let Claim::Won(won) = final_store.claim_answer("leg-0", 200) else {
+            panic!("the first claim wins");
+        };
+        assert_eq!(won.losers.len(), 2);
+        assert!(!won.provisional);
+    }
+
+    #[test]
+    fn confirming_an_answer_releases_the_ringing_and_the_standbys() {
+        let store = confirmed_store(OriginateGroupStrategy::Parallel, 3);
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
+        assert!(matches!(store.claim_answer("leg-1", 200), Claim::Won(_)));
+        assert!(store.confirm("group", "leg-2").is_none(), "not answered");
+        let confirmed = store.confirm("group", "leg-0").expect("an answer to keep");
+        assert_eq!(confirmed.live.len(), 1, "leg-2 is CANCELled");
+        assert_eq!(confirmed.answered.len(), 1, "leg-1 is released");
+        assert!(!store.contains("group"));
+        assert!(store.confirm("group", "leg-1").is_none(), "once");
+    }
+
+    #[test]
+    fn a_refused_answer_moves_the_group_on_and_fails_it_only_when_nothing_is_left() {
+        let store = confirmed_store(OriginateGroupStrategy::Parallel, 2);
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
+        let refused = store
+            .reject("group", "leg-0", bridge_failed())
+            .expect("an answer to refuse");
+        assert!(matches!(refused.next, Next::Continue), "leg-1 still rings");
+        assert_eq!(
+            refused.branch.outcome.map(|outcome| outcome.cause),
+            Some(DialBranchCause::BridgeFailed)
+        );
+        assert!(matches!(store.claim_answer("leg-1", 200), Claim::Won(_)));
+        let last = store
+            .reject("group", "leg-1", bridge_failed())
+            .expect("an answer to refuse");
+        assert!(matches!(last.next, Next::Failed(_, _)), "nothing is left");
+        assert!(store.reject("group", "leg-1", bridge_failed()).is_none());
+    }
+
+    #[test]
+    fn a_sequential_group_places_the_next_target_after_a_refused_answer() {
+        let store = OriginateGroupStore::new();
+        store.insert(
+            "group".to_string(),
+            group(OriginateGroupStrategy::Sequential, 2),
+        );
+        if let Some(mut group) = store.groups.get_mut("group") {
+            group.answers = OriginateGroupAnswers::Confirmed;
+        }
+        assert!(store.start("group", Instant::now()));
+        let _ = store.targets_to_place("group");
+        assert!(store.attach_leg("group", "leg-0", branch("a", None)));
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
+        let refused = store
+            .reject("group", "leg-0", bridge_failed())
+            .expect("an answer to refuse");
+        assert!(matches!(refused.next, Next::Place), "the next target");
+    }
+
+    #[test]
+    fn a_deadline_keeps_the_answers_awaiting_confirmation() {
+        let store = confirmed_store(OriginateGroupStrategy::Parallel, 2);
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
+        let ended = store
+            .end("group", &OriginateGroupEnd::TimedOut)
+            .expect("the deadline ends the ringing");
+        assert_eq!(ended.live.len(), 1, "leg-1 stops ringing");
+        assert!(ended.failure.is_none(), "leg-0 is still to be decided");
+        assert!(store.take_timed_out(Instant::now()).is_empty(), "once");
+        // Refused, the answer leaves nothing: the group fails.
+        let refused = store
+            .reject("group", "leg-0", bridge_failed())
+            .expect("an answer to refuse");
+        assert!(matches!(refused.next, Next::Failed(_, _)));
+        // A cancel still releases an answer awaiting confirmation.
+        let store = confirmed_store(OriginateGroupStrategy::Parallel, 1);
+        assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
+        let cancelled = store
+            .end(
+                "group",
+                &OriginateGroupEnd::Cancelled {
+                    reason: "gone".to_string(),
+                },
+            )
+            .expect("a cancel ends the group");
+        assert_eq!(cancelled.answered.len(), 1);
+        assert!(cancelled.failure.is_some());
     }
 
     #[test]

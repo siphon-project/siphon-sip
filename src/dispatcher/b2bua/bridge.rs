@@ -916,6 +916,9 @@ pub fn bridge_complete(anchor_call_id: &str, response: &SipMessage, state: &Disp
         .get_call(anchor_call_id)
         .map(|call| call.a_leg.dialog.call_id.clone());
     let anchored = context.media_call_id.is_some();
+    // A phone a bridge dial rang is kept now, and given its channel before the
+    // ChannelBridged below, so that channel receives it.
+    dial_bridge_settled(state, anchor_call_id, &peer_call_id, None);
     if let Some(anchor_sip_call_id) = anchor_sip_call_id {
         control_notify_channel_event(
             &anchor_sip_call_id,
@@ -939,7 +942,6 @@ pub fn bridge_complete(anchor_call_id: &str, response: &SipMessage, state: &Disp
         );
     }
     info!(%anchor_call_id, %peer_call_id, anchored, "B2BUA bridge: formed — media meets");
-    dial_bridge_settled(state, anchor_call_id, &peer_call_id, false);
 }
 
 /// A bridge step was refused. Drop both halves, release both re-INVITE slots and
@@ -975,6 +977,7 @@ pub fn bridge_fail(call_id: &str, stage: &str, status_code: u16, state: &Dispatc
         "B2BUA bridge: failed — both legs left as they were"
     );
     // Unless one of them is a phone a bridge dial rang: it was only answered
-    // to be joined to the caller, so it is released rather than left up.
-    dial_bridge_settled(state, call_id, &peer_call_id, true);
+    // to be joined to the caller, so it is released rather than left up, and
+    // the dial goes on with its other phones.
+    dial_bridge_settled(state, call_id, &peer_call_id, Some(status_code));
 }

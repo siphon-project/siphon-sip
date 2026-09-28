@@ -135,13 +135,15 @@ fn the_public_surface_is_pinned() {
     // rings phones for an answered caller through: its caller check, spec,
     // start, join and phone release, their types and signals, the dispatcher
     // handle a coordinator task holds, and the two labels its events share
-    // with the dispatcher. All additive, so a minor-compatible change —
-    // recorded here because that is the tripwire.
+    // with the dispatcher, plus 2 for keeping an answer only once the phone
+    // is bridged: the group's answer mode and the listener a bridged phone is
+    // reported to. All additive, so a minor-compatible change — recorded here
+    // because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        75,
+        77,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 75. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 77. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

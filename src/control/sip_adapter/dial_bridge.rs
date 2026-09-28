@@ -10,18 +10,24 @@
 //! the `bridge` verb's own path. The caller's own dialog is not touched until
 //! the bridge re-INVITEs it.
 //!
+//! An answer is provisional until its bridge forms: the other phones ring on,
+//! a phone answering meanwhile waits as a standby, and a bridge that fails
+//! hangs its phone up and the dial carries on — the standbys in answer order,
+//! then whatever still rings.
+//!
 //! On the caller's channel, in order:
 //!
 //! * `DialBranch` as each phone's INVITE goes out, and `DialBranchFailed` as
-//!   each ends unanswered — the payloads a connecting dial reports;
+//!   each ends without being kept — the payloads a connecting dial reports,
+//!   with cause `bridge_failed` for a phone whose bridge failed;
 //! * `PlayStarted` with `origin: "ringback"` once a phone is alerting, unless
 //!   the controller turned ringback off (and `PlayFinished` with the same
 //!   origin when it ends);
-//! * `DialAnswered` naming the answered phone's branch and the `channel` it is
-//!   now owned under — a channel siphon minted, registered to the same app and
-//!   connection as the caller's, with the caller's control-loss policy; then
-//!   `ChannelBridged` on both channels once the media meets, or `BridgeFailed`,
-//!   after which the phone is hung up and the caller stays answered;
+//! * `BridgeFailed` for each bridge that failed;
+//! * `DialAnswered` for the phone that was bridged, naming its branch and the
+//!   `channel` it is now owned under — a channel siphon minted, registered to
+//!   the same app and connection as the caller's, with the caller's
+//!   control-loss policy — and then `ChannelBridged` on both channels;
 //! * or `DialFailed`, with the ringback stopped first, the caller untouched.
 //!
 //! A phone's early media is not relayed to the caller in this version: the two
@@ -35,9 +41,10 @@ use crate::control::protocol::{ControlErrorCode, ControlResult};
 use crate::control::registry::{ChannelRef, ControlBus};
 use crate::control::AdapterCommand;
 use crate::dispatcher::{
-    DialBridgeCaller, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError,
-    DialError, DialShaping, DialTarget, DispatcherHandle, OriginateGroupFailure,
-    OriginateGroupSink, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
+    DialBridgeCaller, DialBridgeListener, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
+    DialBridgeStartError, DialError, DialShaping, DialTarget, DispatcherHandle,
+    OriginateGroupFailure, OriginateGroupSink, OriginateGroupStrategy, OriginateGroupWinner,
+    OriginateLegProgress,
 };
 use crate::rtpengine::client::PlayMediaSource;
 
@@ -203,12 +210,20 @@ pub(super) fn dial_bridge(
         });
     runtime.spawn(
         Coordinator {
+            listener: Arc::new(BridgedReporter {
+                bus: Arc::clone(&bus),
+                caller_channel: channel.channel_id.clone(),
+            }),
             bus,
             dispatcher: Arc::clone(&dispatcher),
             caller_channel: channel.channel_id.clone(),
             caller: caller.clone(),
             ringback: request.ringback,
             phase: Ringback::Idle,
+            signals: signals.downgrade(),
+            bridging: None,
+            standby: std::collections::VecDeque::new(),
+            alerted: false,
         }
         .run(receiver),
     );
@@ -274,30 +289,12 @@ fn dial_failed_payload(failure: &OriginateGroupFailure) -> serde_json::Value {
 /// the media engine or the bridge to the coordinator.
 ///
 /// Called by the originate group outside its locks, in order, from whichever
-/// thread moved the group; `answered` or `failed` exactly once and last.
+/// thread moved the group. Its answers are confirmed ones: `answered` is
+/// called for every phone that picks up, each provisional until bridged.
 struct BridgeDialSink {
     bus: Arc<ControlBus>,
     caller_channel: String,
     signals: DialBridgeSender,
-}
-
-impl BridgeDialSink {
-    /// Register the phone that answered under a channel of its own, owned
-    /// exactly as the caller's is. `None` when the caller's channel has no live
-    /// owner — nobody would be there to drive the phone.
-    fn register_winner(&self, winner: &OriginateGroupWinner) -> Option<String> {
-        let (connection, on_lost) = self.bus.channel_owner(&self.caller_channel)?;
-        let channel_id = format!("dial-{}", uuid::Uuid::new_v4().simple());
-        self.bus.register_channel(
-            &channel_id,
-            &connection,
-            &winner.internal_call_id,
-            &winner.sip_call_id,
-            &on_lost,
-            HashMap::new(),
-        );
-        Some(channel_id)
-    }
 }
 
 impl OriginateGroupSink for BridgeDialSink {
@@ -331,21 +328,10 @@ impl OriginateGroupSink for BridgeDialSink {
     }
 
     fn answered(&self, winner: &OriginateGroupWinner) {
-        // Registered here, before the phone's own answered state change is
-        // published, so that event reaches the new channel.
-        let channel = self.register_winner(winner);
-        if let Some(channel_id) = &channel {
-            let mut payload = crate::dispatcher::dial_answered_payload(&winner.branch);
-            if let Some(fields) = payload.as_object_mut() {
-                fields.insert("channel".into(), channel_id.clone().into());
-            }
-            self.bus
-                .publish_channel_event(&self.caller_channel, "DialAnswered", payload);
-        }
-        let _ = self.signals.send(DialBridgeSignal::Answered {
-            winner: winner.clone(),
-            channel,
-        });
+        // Provisional: nothing is reported until the phone is bridged.
+        let _ = self
+            .signals
+            .send(DialBridgeSignal::Answered(winner.clone()));
     }
 
     fn failed(&self, failure: &OriginateGroupFailure) {
@@ -364,23 +350,68 @@ impl OriginateGroupSink for BridgeDialSink {
     }
 }
 
+/// Reports the phone a bridge dial kept: told synchronously once it is
+/// bridged, before the bridge's `ChannelBridged` goes out.
+struct BridgedReporter {
+    bus: Arc<ControlBus>,
+    caller_channel: String,
+}
+
+impl DialBridgeListener for BridgedReporter {
+    /// Register the phone under a channel of its own, owned exactly as the
+    /// caller's is, and report it with `DialAnswered` — the one answer the dial
+    /// kept. `channel` is `null` when the caller's channel had no live owner to
+    /// register it to.
+    fn bridged(&self, winner: &OriginateGroupWinner) {
+        let channel = self
+            .bus
+            .channel_owner(&self.caller_channel)
+            .map(|(connection, on_lost)| {
+                let channel_id = format!("dial-{}", uuid::Uuid::new_v4().simple());
+                self.bus.register_channel(
+                    &channel_id,
+                    &connection,
+                    &winner.internal_call_id,
+                    &winner.sip_call_id,
+                    &on_lost,
+                    HashMap::new(),
+                );
+                channel_id
+            });
+        let mut payload = crate::dispatcher::dial_answered_payload(&winner.branch);
+        if let Some(fields) = payload.as_object_mut() {
+            fields.insert(
+                "channel".into(),
+                channel.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+        self.bus
+            .publish_channel_event(&self.caller_channel, "DialAnswered", payload);
+    }
+}
+
 /// Where the caller's ringback stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ringback {
-    /// Nothing is alerting yet.
+    /// Not playing: nothing is alerting yet, or a bridge stopped it.
     Idle,
     /// A phone is alerting, but the caller was still hearing a playback of the
     /// controller's; the ringback starts when that ends.
     Held,
     /// Playing, under this `play_id` when the engine named one.
     Playing { play_id: Option<u64> },
-    /// Stopped, never wanted, or refused by the engine.
+    /// Never wanted, refused by the engine, or the dial is over.
     Done,
 }
 
-/// Runs one bridge dial past its start: the ringback, the bridge, and the two
-/// events that need the engine first. One task per dial, handling its signals
-/// in order, so a ringback being started and the dial failing can never cross.
+/// Runs one bridge dial past its start: the ringback, the bridges, and the
+/// events that need the engine or the bridge first. One task per dial,
+/// handling its signals in order, so a ringback being started, a bridge being
+/// put in motion and the dial failing can never cross.
+///
+/// Phones are bridged one at a time, in the order they answered. A phone that
+/// answers while another's bridge is in motion waits as a standby: bridged
+/// next when that bridge fails, released by the group when it forms.
 struct Coordinator {
     bus: Arc<ControlBus>,
     dispatcher: Arc<dyn DispatcherHandle>,
@@ -388,6 +419,17 @@ struct Coordinator {
     caller: DialBridgeCaller,
     ringback: Option<PlayMediaSource>,
     phase: Ringback,
+    /// What a bridge's settlement is signalled on. Weak, so the dial's senders
+    /// (the group's sink, the caller's entry, a bridge in motion) are what keep
+    /// this task alive, never the task itself.
+    signals: tokio::sync::mpsc::WeakUnboundedSender<DialBridgeSignal>,
+    listener: Arc<BridgedReporter>,
+    /// The phone whose bridge is in motion.
+    bridging: Option<String>,
+    /// Phones that answered meanwhile, in answer order.
+    standby: std::collections::VecDeque<OriginateGroupWinner>,
+    /// A phone has alerted, so the caller is owed ringback while any rings.
+    alerted: bool,
 }
 
 impl Coordinator {
@@ -396,10 +438,34 @@ impl Coordinator {
         // never started, or the caller hung up and took it with it.
         while let Some(signal) = signals.recv().await {
             match signal {
-                DialBridgeSignal::Alerting => self.start_ringback(Ringback::Idle).await,
-                DialBridgeSignal::PromptFinished => self.start_ringback(Ringback::Held).await,
-                DialBridgeSignal::Answered { winner, channel } => {
-                    self.answered(&winner, channel).await;
+                DialBridgeSignal::Alerting => {
+                    self.alerted = true;
+                    if self.bridging.is_none() {
+                        self.start_ringback(Ringback::Idle).await;
+                    }
+                }
+                DialBridgeSignal::PromptFinished => {
+                    if self.bridging.is_none() {
+                        self.start_ringback(Ringback::Held).await;
+                    }
+                }
+                DialBridgeSignal::Answered(winner) => {
+                    self.standby.push_back(winner);
+                    if self.bridging.is_none() {
+                        self.bridge_next().await;
+                    }
+                }
+                DialBridgeSignal::BridgeFailed(winner) => {
+                    if self.bridging.as_deref() == Some(winner.internal_call_id.as_str()) {
+                        self.bridging = None;
+                    }
+                    self.bridge_next().await;
+                }
+                DialBridgeSignal::Bridged => {
+                    // The group released every standby when it kept the answer.
+                    self.standby.clear();
+                    self.phase = Ringback::Done;
+                    self.release();
                     break;
                 }
                 DialBridgeSignal::Failed(failure) => {
@@ -407,6 +473,63 @@ impl Coordinator {
                     break;
                 }
             }
+        }
+    }
+
+    /// Bridge the next phone that answered, in answer order; a phone whose
+    /// bridge cannot even start is released and the next one tried. With none
+    /// left, the ringback resumes while phones still ring.
+    async fn bridge_next(&mut self) {
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let Some(state) = dispatcher.state() else {
+            return;
+        };
+        while let Some(winner) = self.standby.pop_front() {
+            let Some(signals) = self.signals.upgrade() else {
+                return;
+            };
+            // The bridge re-points the caller's media; the ringback stops first,
+            // so a bridge that fails early leaves nothing half-played.
+            self.stop_ringback().await;
+            self.phase = Ringback::Idle;
+            self.bridging = Some(winner.internal_call_id.clone());
+            let listener: Arc<dyn DialBridgeListener> = self.listener.clone();
+            match crate::dispatcher::dial_bridge_join(
+                state,
+                &self.caller.sip_call_id,
+                &winner,
+                signals,
+                listener,
+            )
+            .await
+            {
+                // In motion: its settlement is signalled.
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        caller = %self.caller.sip_call_id,
+                        phone = %winner.sip_call_id,
+                        %error,
+                        "control plane: dial — a phone answered but could not be bridged; releasing it"
+                    );
+                    self.bridging = None;
+                    self.bus.publish_channel_event(
+                        &self.caller_channel,
+                        "BridgeFailed",
+                        serde_json::json!({
+                            "stage": "setup",
+                            "reason": error.to_string(),
+                            "peer_sip_call_id": winner.sip_call_id,
+                        }),
+                    );
+                    crate::dispatcher::dial_bridge_refuse_phone(state, &winner, 500);
+                }
+            }
+        }
+        // Nobody left to bridge: the caller waits on the phones still ringing,
+        // and hears ringback again once one has alerted.
+        if self.alerted {
+            self.start_ringback(Ringback::Idle).await;
         }
     }
 
@@ -425,7 +548,13 @@ impl Coordinator {
         let Some(state) = self.dispatcher.state() else {
             return;
         };
-        if !state.dial_bridges.is_ringing(&self.caller.sip_call_id) {
+        // Only while phones still ring: not once the dial has concluded, even
+        // before its outcome reaches this task.
+        let ringing = state
+            .dial_bridges
+            .group_of(&self.caller.sip_call_id)
+            .is_some_and(|group_id| state.originate_groups.contains(&group_id));
+        if !ringing {
             return;
         }
         if crate::rtpengine::MediaBackend::playback_started(
@@ -484,7 +613,6 @@ impl Coordinator {
     /// Stop the ringback, if it is playing — only it, when the engine named it.
     async fn stop_ringback(&mut self) {
         let Ringback::Playing { play_id } = self.phase else {
-            self.phase = Ringback::Done;
             return;
         };
         self.phase = Ringback::Done;
@@ -507,65 +635,17 @@ impl Coordinator {
         }
     }
 
-    /// Nobody answered: the ringback stops before the controller hears so, so
-    /// the prompt it plays next is not mixed with it. The caller is left
-    /// answered and owned.
+    /// Nobody answered, or no answer could be bridged: the ringback stops
+    /// before the controller hears so, so the prompt it plays next is not mixed
+    /// with it. The caller is left answered and owned.
     async fn failed(&mut self, failure: &OriginateGroupFailure) {
         self.stop_ringback().await;
+        self.phase = Ringback::Done;
         self.bus.publish_channel_event(
             &self.caller_channel,
             "DialFailed",
             dial_failed_payload(failure),
         );
-        self.release();
-    }
-
-    /// A phone answered: bridge it to the caller. The bridge stops the ringback
-    /// itself before it re-points the caller's media.
-    async fn answered(&mut self, winner: &OriginateGroupWinner, channel: Option<String>) {
-        let dispatcher = Arc::clone(&self.dispatcher);
-        let Some(state) = dispatcher.state() else {
-            return;
-        };
-        let Some(winner_channel) = channel else {
-            // The caller's controller is gone: nobody could drive the phone.
-            self.stop_ringback().await;
-            crate::dispatcher::dial_bridge_release_phone(state, &winner.internal_call_id);
-            self.release();
-            return;
-        };
-        match crate::dispatcher::dial_bridge_join(state, &self.caller.sip_call_id, winner).await {
-            Ok(_) => self.phase = Ringback::Done,
-            Err(error) => {
-                tracing::warn!(
-                    caller = %self.caller.sip_call_id,
-                    phone = %winner.sip_call_id,
-                    %error,
-                    "control plane: dial — the phone answered but could not be bridged; releasing it"
-                );
-                self.stop_ringback().await;
-                let reason = error.to_string();
-                self.bus.publish_channel_event(
-                    &self.caller_channel,
-                    "BridgeFailed",
-                    serde_json::json!({
-                        "stage": "setup",
-                        "reason": reason,
-                        "peer_sip_call_id": winner.sip_call_id,
-                    }),
-                );
-                self.bus.publish_channel_event(
-                    &winner_channel,
-                    "BridgeFailed",
-                    serde_json::json!({
-                        "stage": "setup",
-                        "reason": reason,
-                        "peer_sip_call_id": self.caller.sip_call_id,
-                    }),
-                );
-                crate::dispatcher::dial_bridge_release_phone(state, &winner.internal_call_id);
-            }
-        }
         self.release();
     }
 

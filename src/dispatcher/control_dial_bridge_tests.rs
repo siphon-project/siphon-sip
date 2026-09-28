@@ -9,58 +9,18 @@
 //! what the engine was asked to do off the engine's own log.
 
 use super::dial_bridge_test_harness::{
-    answered_caller, bridging_dispatcher, caller_sends, controller_owning, dial, events,
-    eventually, in_dialog_response, names, register, sent_until, Caller, CALLER,
+    answered_caller, assert_drained, bridging_dispatcher, caller_sends, controller_owning, dial,
+    events, eventually, in_dialog_response, invite_to, names, register, reinvites_to, sent_until,
+    Caller, CALLER,
 };
 use super::originate_test_harness::{
-    drain, phone_offer, phone_response, phone_sends, requests_to, socket, Sent,
+    drain, phone_offer, phone_response, phone_sends, requests_to, socket,
 };
 use super::*;
 use crate::rtpengine::test_native_engine::{NativeTestEngine, NATIVE_ENGINE_OFFER};
 
-/// Whether a request is inside a dialog: its To carries the far end's tag
-/// (RFC 3261 §12.2.1.1).
-fn in_dialog(message: &SipMessage) -> bool {
-    message.headers.to().is_some_and(|to| to.contains(";tag="))
-}
-
-/// The one INVITE to `phone` among `sent` that opens a dialog.
-fn invite_to(sent: &[Sent], phone: &str) -> SipMessage {
-    let mut invites: Vec<_> = requests_to(sent, socket(phone), Method::Invite)
-        .into_iter()
-        .filter(|sent| !in_dialog(&sent.message))
-        .collect();
-    assert_eq!(invites.len(), 1, "one dialog-opening INVITE to {phone}");
-    invites.remove(0).message
-}
-
-/// The re-INVITEs among `sent` to `address`.
-fn reinvites_to(sent: &[Sent], address: &str) -> Vec<SipMessage> {
-    requests_to(sent, socket(address), Method::Invite)
-        .into_iter()
-        .filter(|sent| in_dialog(&sent.message))
-        .map(|sent| sent.message)
-        .collect()
-}
-
 fn body_text(message: &SipMessage) -> &str {
     std::str::from_utf8(&message.body).expect("a text body")
-}
-
-/// Nothing a bridge dial keeps is left behind.
-fn assert_drained(state: &DispatcherState) {
-    assert_eq!(
-        state.dial_bridges.ringing_count(),
-        0,
-        "a ringing dial leaked"
-    );
-    assert_eq!(
-        state.dial_bridges.bridging_count(),
-        0,
-        "an awaited bridge leaked"
-    );
-    assert_eq!(state.originate_groups.group_count(), 0, "a group leaked");
-    assert_eq!(state.originate_groups.leg_count(), 0, "a group leg leaked");
 }
 
 /// The caller is still up, still answered and still its controller's.
@@ -166,8 +126,8 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
     assert_eq!(heard[0].payload["source"], "tone");
     assert!(heard[0].payload["play_id"].is_u64());
 
-    // The mobile answers: ACKed, the desk CANCELled, the bridge begins with
-    // a re-INVITE to the mobile.
+    // The mobile answers: ACKed, and the bridge begins with a re-INVITE to it.
+    // Its answer is provisional until the bridge forms, so the desk rings on.
     phone_sends(
         state,
         socket(MOBILE),
@@ -185,8 +145,10 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
     })
     .await;
     assert_eq!(requests_to(&sent, socket(MOBILE), Method::Ack).len(), 1);
-    assert_eq!(requests_to(&sent, socket(DESK), Method::Cancel).len(), 1);
-    assert!(requests_to(&sent, socket(MOBILE), Method::Cancel).is_empty());
+    assert!(
+        requests_to(&sent, socket(DESK), Method::Cancel).is_empty(),
+        "the desk rings on while the mobile's bridge is in motion"
+    );
     let offer = reinvites_to(&sent, MOBILE);
     assert_eq!(offer.len(), 1, "the bridge offers the phone first");
     // The engine's relay side, under siphon's own session origin.
@@ -199,11 +161,58 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
         sent.iter().all(|frame| frame.destination != socket(CALLER)),
         "nothing reaches the caller before the bridge's own re-INVITE"
     );
-    // The bridge stopped the ringback before it re-pointed the caller's media.
+    // The ringback is stopped, by its own play_id, before the caller's media
+    // is re-pointed.
     let stops = engine.commands("stop_media");
     assert_eq!(stops.len(), 1, "the ringback is stopped at the bridge");
     assert_eq!(stops[0].call_id, caller.call_id);
+    assert!(stops[0].detail.is_some());
+    assert!(
+        events(&controller).await.is_empty(),
+        "nothing is reported for a provisional answer"
+    );
 
+    // The mobile accepts: the caller is re-INVITEd with the engine's answer.
+    phone_sends(
+        state,
+        socket(MOBILE),
+        &in_dialog_response(
+            &offer[0],
+            200,
+            "OK",
+            &format!("sip:bd3201@{MOBILE}"),
+            Some(&phone_offer("198.51.100.142")),
+        ),
+    );
+    let sent = sent_until(&controller.dispatcher.udp, |sent| {
+        !reinvites_to(sent, CALLER).is_empty()
+    })
+    .await;
+    let to_caller = reinvites_to(&sent, CALLER);
+    assert_eq!(to_caller.len(), 1, "then the caller");
+    assert!(
+        requests_to(&sent, socket(DESK), Method::Cancel).is_empty(),
+        "still ringing until the bridge forms"
+    );
+    phone_sends(
+        state,
+        socket(CALLER),
+        &in_dialog_response(
+            &to_caller[0],
+            200,
+            "OK",
+            "sip:15550100001@192.0.2.10:5060",
+            Some(&phone_offer("192.0.2.10")),
+        ),
+    );
+    // Bridged: only now is the desk CANCELled and the mobile reported.
+    let sent = drain(&controller.dispatcher.udp);
+    assert_eq!(
+        requests_to(&sent, socket(DESK), Method::Cancel).len(),
+        1,
+        "the desk is CANCELled once the bridge formed"
+    );
+    assert!(requests_to(&sent, socket(MOBILE), Method::Cancel).is_empty());
     let answered = events(&controller).await;
     assert_eq!(names(&answered), ["DialBranchFailed", "DialAnswered"]);
     assert_eq!(answered[0].payload["target"], format!("sip:bd3201@{DESK}"));
@@ -229,36 +238,6 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
             .iter()
             .any(|channel| channel.channel_id == winner_channel),
         "owned by the caller's controller"
-    );
-
-    // The mobile accepts: the caller is re-INVITEd with the engine's answer.
-    phone_sends(
-        state,
-        socket(MOBILE),
-        &in_dialog_response(
-            &offer[0],
-            200,
-            "OK",
-            &format!("sip:bd3201@{MOBILE}"),
-            Some(&phone_offer("198.51.100.142")),
-        ),
-    );
-    let sent = sent_until(&controller.dispatcher.udp, |sent| {
-        !reinvites_to(sent, CALLER).is_empty()
-    })
-    .await;
-    let to_caller = reinvites_to(&sent, CALLER);
-    assert_eq!(to_caller.len(), 1, "then the caller");
-    phone_sends(
-        state,
-        socket(CALLER),
-        &in_dialog_response(
-            &to_caller[0],
-            200,
-            "OK",
-            "sip:15550100001@192.0.2.10:5060",
-            Some(&phone_offer("192.0.2.10")),
-        ),
     );
     assert!(
         crate::control::channel_event_capture::take(&caller.call_id)
@@ -645,6 +624,13 @@ async fn a_phone_whose_bridge_fails_is_hung_up_and_the_caller_kept() {
     assert!(crate::control::channel_event_capture::take(&caller.call_id)
         .iter()
         .any(|(event, payload)| event == "BridgeFailed" && payload["code"] == 488));
+    // With no other phone to fall back on, the dial fails; the phone that
+    // answered was never kept, so it is never reported as DialAnswered.
+    let heard = events(&controller).await;
+    assert_eq!(names(&heard), ["DialBranchFailed", "DialFailed"]);
+    assert_eq!(heard[0].payload["cause"], "bridge_failed");
+    assert_eq!(heard[0].payload["code"], 488);
+    assert_eq!(heard[1].payload["cause"], "bridge_failed");
     assert_caller_untouched(&controller, &caller, "caller-refused");
     assert_drained(state);
 }
@@ -720,7 +706,12 @@ async fn a_phone_whose_bridge_cannot_start_is_hung_up_and_the_caller_kept() {
         })
         .expect("BridgeFailed on the caller's channel");
     assert_eq!(failed.payload["stage"], "setup");
-    assert!(heard.iter().any(|event| event.event == "DialAnswered"));
+    assert_eq!(
+        names(&heard),
+        ["BridgeFailed", "DialBranchFailed", "DialFailed"],
+        "a phone never bridged is never reported as DialAnswered"
+    );
+    assert_eq!(heard[1].payload["cause"], "bridge_failed");
     assert!(
         requests_to(&sent, socket(CALLER), Method::Bye).is_empty(),
         "the caller is kept"
@@ -797,6 +788,85 @@ async fn the_bridge_dial_stores_drain_after_complete_dials() {
                 "OK",
                 &format!("sip:bd3299@{MOBILE}"),
                 Some(&phone_offer("198.51.100.192")),
+            ),
+        );
+        let sent = sent_until(&controller.dispatcher.udp, |sent| {
+            !reinvites_to(sent, CALLER).is_empty()
+        })
+        .await;
+        let to_caller = reinvites_to(&sent, CALLER);
+        phone_sends(
+            state,
+            socket(CALLER),
+            &in_dialog_response(
+                &to_caller[0],
+                200,
+                "OK",
+                "sip:15550100001@192.0.2.10:5060",
+                Some(&phone_offer("192.0.2.10")),
+            ),
+        );
+        caller_sends(state, &caller, "BYE", "3 BYE");
+        drain(&controller.dispatcher.udp);
+
+        // The mobile answers and refuses its bridge, the desk answers as a
+        // standby meanwhile and is bridged; then the caller hangs up.
+        let caller = answered_caller(
+            &controller.dispatcher,
+            &format!("bridge-leak-s{round}@192.0.2.10"),
+        );
+        register_caller(&controller, &caller, &format!("leak-s{round}"));
+        let (reply, _) = dial(&controller, &format!("leak-s{round}"), dial_args.clone()).await;
+        assert_eq!(reply["status"], "ok", "{reply}");
+        let sent = drain(&controller.dispatcher.udp);
+        let (desk, mobile) = (invite_to(&sent, DESK), invite_to(&sent, MOBILE));
+        for (phone, invite, host) in [
+            (MOBILE, &mobile, "198.51.100.192"),
+            (DESK, &desk, "198.51.100.191"),
+        ] {
+            phone_sends(
+                state,
+                socket(phone),
+                &phone_response(
+                    invite,
+                    200,
+                    "OK",
+                    &format!("s{round}"),
+                    &format!("sip:bd3299@{phone}"),
+                    Some(&phone_offer(host)),
+                ),
+            );
+        }
+        let sent = sent_until(&controller.dispatcher.udp, |sent| {
+            !reinvites_to(sent, MOBILE).is_empty()
+        })
+        .await;
+        let offer = reinvites_to(&sent, MOBILE);
+        phone_sends(
+            state,
+            socket(MOBILE),
+            &in_dialog_response(
+                &offer[0],
+                488,
+                "Not Acceptable Here",
+                &format!("sip:bd3299@{MOBILE}"),
+                None,
+            ),
+        );
+        let sent = sent_until(&controller.dispatcher.udp, |sent| {
+            !reinvites_to(sent, DESK).is_empty()
+        })
+        .await;
+        let offer = reinvites_to(&sent, DESK);
+        phone_sends(
+            state,
+            socket(DESK),
+            &in_dialog_response(
+                &offer[0],
+                200,
+                "OK",
+                &format!("sip:bd3299@{DESK}"),
+                Some(&phone_offer("198.51.100.191")),
             ),
         );
         let sent = sent_until(&controller.dispatcher.udp, |sent| {
