@@ -126,13 +126,18 @@ fn the_public_surface_is_pinned() {
     // a session timer set in the same handler, plus the crate-internal
     // `DialShaping` carrying the dial verb's identity and media arguments, plus
     // the crate-internal `b2bua_drop_call` + `DropOutcome` the `drop` verb
-    // abandons an un-answered call through without answering it. All additive,
-    // so a minor-compatible change — recorded here because that is the tripwire.
+    // abandons an un-answered call through without answering it, plus the 11
+    // crate-internal items `originate {aor}` rings a registered AoR's phones
+    // through: the originate group's create and start entry points, its spec,
+    // strategy, sink trait and the three reports the sink receives, and the
+    // three `Dial*` event payload builders its channel events share with
+    // `dial`. All additive, so a minor-compatible change — recorded here
+    // because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        49,
+        60,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 49. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 60. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

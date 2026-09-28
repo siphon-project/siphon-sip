@@ -41,6 +41,20 @@ fn identity(branch: &DialBranch) -> serde_json::Map<String, serde_json::Value> {
     fields
 }
 
+/// A branch's identity as every branch event carries it (`DialBranch`).
+pub fn dial_branch_identity(branch: &DialBranch) -> serde_json::Value {
+    serde_json::Value::Object(identity(branch))
+}
+
+/// A branch as `DialAnswered` reports it: its identity and the answer's status.
+pub fn dial_answered_payload(branch: &DialBranch) -> serde_json::Value {
+    let mut fields = identity(branch);
+    if let Some(outcome) = &branch.outcome {
+        fields.insert("code".into(), outcome.code.into());
+    }
+    serde_json::Value::Object(fields)
+}
+
 /// A branch as `DialFailed` lists it: its identity and how it ended.
 pub fn dial_branch_summary(branch: &DialBranch) -> serde_json::Value {
     let mut fields = identity(branch);
@@ -61,11 +75,7 @@ fn publish_settled(settled: Option<SettledDialBranches>) {
             continue;
         };
         let event = match outcome.cause {
-            DialBranchCause::Answered => {
-                let mut fields = identity(branch);
-                fields.insert("code".into(), outcome.code.into());
-                ("DialAnswered", serde_json::Value::Object(fields))
-            }
+            DialBranchCause::Answered => ("DialAnswered", dial_answered_payload(branch)),
             _ => ("DialBranchFailed", dial_branch_summary(branch)),
         };
         control_notify_channel_event(&sip_call_id, event.0, event.1);
@@ -85,11 +95,7 @@ pub fn control_dial_branch_created(
 ) {
     if let Some((sip_call_id, branch)) = state.call_actors.record_dial_branch(call_id, leg, target)
     {
-        control_notify_channel_event(
-            &sip_call_id,
-            "DialBranch",
-            serde_json::Value::Object(identity(&branch)),
-        );
+        control_notify_channel_event(&sip_call_id, "DialBranch", dial_branch_identity(&branch));
     }
 }
 

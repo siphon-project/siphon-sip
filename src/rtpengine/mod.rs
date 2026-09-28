@@ -20,6 +20,8 @@ pub mod session;
 pub mod siphon_rtp;
 #[cfg(test)]
 pub(crate) mod test_engine;
+#[cfg(test)]
+pub(crate) mod test_native_engine;
 
 pub use backend::{reap_orphaned_sessions, MediaBackend};
 pub use client::{RtpEngineClient, RtpEngineSet};

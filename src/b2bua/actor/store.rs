@@ -1266,10 +1266,16 @@ impl CallActorStore {
             // §15).
             if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
                 if let Some(invite) = call.a_leg_invite.as_ref() {
+                    // The leg keeps the INVITE it sent, as a B-leg does: a 2xx
+                    // that raced the CANCEL carries the offer when the INVITE
+                    // went out offerless, and its ACK is then owed an answer
+                    // (RFC 3261 §13.2.2.4), which is decided from this.
+                    let mut leg = call.a_leg.clone();
+                    leg.b_leg_invite = Some(Arc::clone(invite));
                     self.zombie_cancelled.insert(
                         call.a_leg.branch.clone(),
                         ZombieCancelledLeg {
-                            leg: call.a_leg.clone(),
+                            leg,
                             invite_ruri: request_uri_of(invite),
                             byed: false,
                         },

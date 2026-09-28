@@ -44,6 +44,35 @@ pub fn send_b2bua_to_bleg_checked(
     state: &DispatcherState,
 ) -> bool {
     let data = Bytes::from(message.to_bytes());
+    // A leg dialled over a phone's captured TCP flow is reachable on that
+    // connection alone: behind NAT, a fresh connection to the address it came
+    // from reaches nothing (RFC 5626 §5.3). TLS and WebSocket already reuse the
+    // live connection in `send_to_target`; the TCP arm there always goes
+    // through the connection pool, which is right for a trunk and wrong here.
+    if transport == Transport::Tcp {
+        if let Some(local_addr) = source_local_addr {
+            if let Some(connection_id) = state.stream_connections.reuse(destination, transport) {
+                let call_id = message.headers.call_id().cloned().unwrap_or_default();
+                return match send_over_flow(
+                    &call_id,
+                    data,
+                    CapturedFlow {
+                        local_addr,
+                        connection_id,
+                    },
+                    transport,
+                    destination,
+                    state,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        error!(%destination, %transport, "B2BUA: flow send failed: {error}");
+                        false
+                    }
+                };
+            }
+        }
+    }
     let target = RelayTarget {
         address: destination,
         transport: Some(transport),

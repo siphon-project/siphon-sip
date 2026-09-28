@@ -5591,6 +5591,98 @@ fn b_leg_flow_yields_to_a_path_route_set() {
     assert!(b_leg_flow(None, &route).is_none());
 }
 
+fn registered_flow(transport: &str) -> crate::script::api::registrar::PyFlow {
+    crate::script::api::registrar::PyFlow {
+        transport: transport.to_string(),
+        source_addr: "198.51.100.40:50000".parse().unwrap(),
+        local_addr: "192.0.2.1:5061".parse().unwrap(),
+        connection_id: 0xc0ffee,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leg_with_only_a_flow_goes_to_the_flow() {
+    let resolver = test_resolver();
+    let flow = registered_flow("tls");
+    let resolved = resolve_leg_destination(
+        "sip:2001@203.0.113.9:5061;transport=tls",
+        None,
+        Some(&flow),
+        &[],
+        &resolver,
+    )
+    .expect("a flow is a destination");
+    assert!(resolved.flow.is_some());
+    assert_eq!(resolved.destination, flow.source_addr);
+    assert_eq!(resolved.transport, Transport::Tls);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_route_set_outranks_the_flow_and_names_the_next_hop() {
+    let resolver = test_resolver();
+    let flow = registered_flow("tcp");
+    let route = vec!["<sip:token@198.51.100.50:5070;lr>".to_string()];
+    let resolved = resolve_leg_destination(
+        "sip:2001@203.0.113.9:5061",
+        None,
+        Some(&flow),
+        &route,
+        &resolver,
+    )
+    .expect("the topmost Route resolves");
+    assert!(resolved.flow.is_none(), "RFC 3327 §5.3: the Path wins");
+    assert_eq!(resolved.destination, "198.51.100.50:5070".parse().unwrap());
+    assert_eq!(resolved.routing_uri, "sip:token@198.51.100.50:5070;lr");
+    assert_eq!(resolved.transport, Transport::Udp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_next_hop_outranks_the_route_set() {
+    let resolver = test_resolver();
+    let route = vec!["<sip:token@198.51.100.50:5070;lr>".to_string()];
+    let resolved = resolve_leg_destination(
+        "sip:2001@203.0.113.9:5061",
+        Some("sip:198.51.100.60:5080"),
+        None,
+        &route,
+        &resolver,
+    )
+    .expect("the next hop resolves");
+    assert_eq!(resolved.destination, "198.51.100.60:5080".parse().unwrap());
+    // Positive control: with no next hop the same route set is followed.
+    let followed =
+        resolve_leg_destination("sip:2001@203.0.113.9:5061", None, None, &route, &resolver)
+            .expect("the topmost Route resolves");
+    assert_eq!(followed.destination, "198.51.100.50:5070".parse().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flow_on_a_transport_no_leg_can_use_is_refused() {
+    let resolver = test_resolver();
+    let flow = registered_flow("sctp");
+    assert_eq!(
+        resolve_leg_destination("sip:2001@203.0.113.9", None, Some(&flow), &[], &resolver)
+            .expect_err("sctp is not a leg transport"),
+        LegDestinationError::UnknownFlowTransport("sctp".to_string())
+    );
+    // Positive control: the same target with no flow resolves.
+    assert!(resolve_leg_destination("sip:2001@203.0.113.9", None, None, &[], &resolver).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_that_resolves_nowhere_is_refused() {
+    let resolver = test_resolver();
+    let error = resolve_leg_destination("sip:2001@nowhere.invalid", None, None, &[], &resolver)
+        .expect_err("an .invalid host resolves to nothing");
+    assert_eq!(
+        error,
+        LegDestinationError::Unresolvable {
+            routing_uri: "sip:2001@nowhere.invalid".to_string()
+        }
+    );
+    assert!(error.to_string().contains("nowhere.invalid"));
+}
+
 #[test]
 fn b_leg_routing_uri_prefers_next_hop_then_route_then_target() {
     let target = "sip:bob@ue.example.com";

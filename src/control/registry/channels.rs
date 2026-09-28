@@ -48,6 +48,42 @@ impl ControlBus {
         });
     }
 
+    /// Bind a channel to another call, keeping everything else it has: its
+    /// owner, its control-loss policy and its variables. Returns whether the
+    /// channel was there to bind.
+    ///
+    /// For a channel whose call is decided after the channel exists: an
+    /// `originate` to an AoR rings several phones under the controller's one
+    /// channel id, and the channel becomes the call of the phone that answers.
+    /// Not a registration — the channel was counted once, when it was
+    /// registered, and stays one channel.
+    pub fn rebind_channel(&self, channel_id: &str, call_actor_id: &str, sip_call_id: &str) -> bool {
+        let Some(mut entry) = self.channels.get_mut(channel_id) else {
+            return false;
+        };
+        let current = entry.value();
+        let vars = match current.vars.lock() {
+            Ok(vars) => vars.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let outbound_transfer = match current.outbound_transfer.lock() {
+            Ok(transfer) => transfer.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let rebound = Arc::new(ChannelEntry {
+            app: current.app.clone(),
+            conn_id: AtomicU64::new(current.conn_id.load(Ordering::SeqCst)),
+            call_actor_id: call_actor_id.to_string(),
+            sip_call_id: sip_call_id.to_string(),
+            on_lost: current.on_lost.clone(),
+            vars: Mutex::new(vars),
+            outbound_transfer: Mutex::new(outbound_transfer),
+        });
+        *entry.value_mut() = rebound;
+        debug!(%channel_id, %call_actor_id, %sip_call_id, "control plane: channel bound to its call");
+        true
+    }
+
     /// Remove a channel and drop it from the app index. Returns whether it was
     /// present.
     pub fn remove_channel(&self, channel_id: &str) -> bool {

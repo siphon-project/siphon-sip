@@ -468,8 +468,12 @@ pub(super) fn relay_request(
     // in) and is updated below for TCP/TLS once the connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
-    let retransmit_source =
-        client_retransmit_source(outbound_transport, destination, flow, send_socket);
+    let retransmit_source = client_retransmit_source(
+        outbound_transport,
+        destination,
+        flow.map(|flow| flow.local_addr),
+        send_socket,
+    );
     let mut inserted_session_arc: Option<Arc<RwLock<ProxySession>>> = None;
     let client_key_opt = match state.transaction_manager.new_client_transaction(
         &relayed,
@@ -1052,8 +1056,12 @@ pub(super) fn relay_fork_branch(
     // connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
-    let retransmit_source =
-        client_retransmit_source(outbound_transport, destination, flow, send_socket);
+    let retransmit_source = client_retransmit_source(
+        outbound_transport,
+        destination,
+        flow.map(|flow| flow.local_addr),
+        send_socket,
+    );
     let client_key_opt = match state.transaction_manager.new_client_transaction(
         &relayed,
         data.clone(),

@@ -1215,3 +1215,58 @@ fn no_app_wants_dialog_events_unless_one_asks() {
     let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
     assert!(!bus.wants_app_class("dialog"));
 }
+
+/// A channel bound to another call keeps its owner, its policy and its
+/// variables, stays counted once, and its events carry the new call.
+#[test]
+fn a_rebound_channel_keeps_everything_but_its_call() {
+    let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+    let conn = bus.register_connection("ivr-app");
+    let mut vars = HashMap::new();
+    vars.insert("campaign".to_string(), "spring".to_string());
+    bus.register_channel("og-1", &conn, "group-1", "group-1", "continue", vars);
+    assert_eq!(bus.channel_count(), 1);
+
+    assert!(bus.publish_channel_event("og-1", "DialBranch", serde_json::json!({ "leg": 1 })));
+    assert!(bus.rebind_channel("og-1", "call-2", "leg-2@siphon"));
+    assert!(bus.publish_channel_event("og-1", "DialAnswered", serde_json::json!({ "leg": 2 })));
+
+    assert_eq!(bus.channel_count(), 1, "still one channel");
+    assert_eq!(
+        bus.sip_call_id_for_channel("og-1").as_deref(),
+        Some("leg-2@siphon")
+    );
+    assert_eq!(
+        bus.channel_id_for_sip_call_id("leg-2@siphon").as_deref(),
+        Some("og-1")
+    );
+    assert_eq!(bus.channel_id_for_sip_call_id("group-1"), None);
+    assert_eq!(bus.get_var("og-1", "campaign").as_deref(), Some("spring"));
+    assert!(matches!(
+        bus.owns("og-1", "ivr-app", conn.id),
+        Ownership::Owned(_)
+    ));
+
+    let frames = futures_executor_block_on_recv(&conn);
+    let events: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            OutboundFrame::Event(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].sip_call_id.as_deref(), Some("group-1"));
+    assert_eq!(events[0].call_id.as_deref(), Some("group-1"));
+    assert_eq!(events[1].sip_call_id.as_deref(), Some("leg-2@siphon"));
+    assert_eq!(events[1].call_id.as_deref(), Some("call-2"));
+    assert!(events
+        .iter()
+        .all(|event| event.channel.as_deref() == Some("og-1")));
+
+    // Nothing to bind or publish to once the channel is gone.
+    assert!(bus.remove_channel("og-1"));
+    assert!(!bus.rebind_channel("og-1", "call-3", "leg-3@siphon"));
+    assert!(!bus.publish_channel_event("og-1", "DialAnswered", serde_json::json!({})));
+    assert_eq!(bus.channel_count(), 0);
+}

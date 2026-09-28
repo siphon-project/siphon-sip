@@ -63,17 +63,17 @@ pub(super) fn udp_egress_source(
 /// pinned `None` and quietly downgraded every retry.
 ///
 /// A captured flow wins outright — that branch bypasses [`send_to_target`] and
-/// writes to `flow.local_addr` directly. Everything else defers to
+/// writes to the flow's socket (`flow_local_addr`) directly. Everything else defers to
 /// [`udp_egress_source`].
 pub(super) fn client_retransmit_source(
     outbound_transport: Transport,
     destination: SocketAddr,
-    flow: Option<&crate::script::api::registrar::PyFlow>,
+    flow_local_addr: Option<SocketAddr>,
     send_socket: Option<&crate::transport::SendSocket>,
 ) -> Option<SocketAddr> {
     if outbound_transport == Transport::Udp {
-        if let Some(flow) = flow {
-            return Some(flow.local_addr);
+        if let Some(local) = flow_local_addr {
+            return Some(local);
         }
     }
     udp_egress_source(

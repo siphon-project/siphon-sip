@@ -35,6 +35,11 @@ pub fn check_b2bua_answer_timeouts_at(state: &DispatcherState, now: std::time::I
     for timed_out in state.call_actors.take_timed_out_calls(now) {
         fail_b2bua_call_on_timeout(&timed_out, state);
     }
+    // An originate group's overall deadline bounds the whole hunt, however
+    // many of its legs are still ringing on their own timeouts.
+    for group_id in state.originate_groups.take_timed_out(now) {
+        cancel_originate_group(state, &group_id, OriginateGroupEnd::TimedOut);
+    }
 }
 
 /// Tear down every answered B2BUA call that has been up longer than its
@@ -222,7 +227,17 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             %sip_call_id,
             "originate: ring timeout — CANCELling the INVITE"
         );
-        b2bua_cancel_originated_call(&sip_call_id, Some("ring timeout"));
+        abandon_originated_call(
+            state,
+            call_id,
+            &sip_call_id,
+            Some("ring timeout"),
+            crate::b2bua::actor::DialBranchOutcome::new(
+                408,
+                "Request Timeout",
+                crate::b2bua::actor::DialBranchCause::Timeout,
+            ),
+        );
         return;
     }
 

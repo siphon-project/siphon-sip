@@ -46,6 +46,40 @@ impl ControlBus {
         )
     }
 
+    /// Push an event to channel `channel_id`, whatever call it is bound to: the
+    /// envelope carries the call the channel names right now.
+    ///
+    /// The by-channel twin of [`forward_channel_event`](Self::forward_channel_event),
+    /// for a channel whose call is not one SIP dialog yet — an `originate` to an
+    /// AoR, bound to its group while several phones ring. Returns whether an
+    /// event was queued: `false` when the channel is unknown or orphaned.
+    pub fn publish_channel_event(
+        &self,
+        channel_id: &str,
+        event: &str,
+        payload: serde_json::Value,
+    ) -> bool {
+        let (app, call_actor_id, sip_call_id) = match self.channels.get(channel_id) {
+            Some(entry) => (
+                entry.app.clone(),
+                entry.call_actor_id.clone(),
+                entry.sip_call_id.clone(),
+            ),
+            None => return false,
+        };
+        self.publish_to_channel(
+            channel_id,
+            EventFrame::new(
+                event,
+                channel_id,
+                &app,
+                &call_actor_id,
+                &sip_call_id,
+                payload,
+            ),
+        )
+    }
+
     /// Publish an event to a channel's owning connection (non-blocking).
     /// Returns `false` if the channel is unknown or currently orphaned.
     ///

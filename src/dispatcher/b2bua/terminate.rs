@@ -428,6 +428,11 @@ pub enum DropOutcome {
     /// The call is answered, so RFC 3261 §15 owes its dialog a BYE. Refused
     /// rather than orphaned — that is what `hangup` is for.
     Answered,
+    /// The id names an originate group whose phones are still ringing. siphon
+    /// is their caller, not the answerer of anyone's INVITE, so there is no
+    /// response to withhold; leaving the INVITEs unCANCELled would leave the
+    /// phones ringing for nobody. Refused — `hangup` CANCELs them.
+    Ringing,
     /// No such call: already gone, or the dispatcher is not running.
     Gone,
 }
@@ -482,6 +487,9 @@ pub(crate) fn b2bua_drop_call_in(
     internal_call_id: &str,
     reason: Option<&str>,
 ) -> DropOutcome {
+    if state.originate_groups.contains(internal_call_id) {
+        return DropOutcome::Ringing;
+    }
     let Some((call_state, sip_call_id, caller_addr)) =
         state.call_actors.get_call(internal_call_id).map(|call| {
             (
@@ -625,6 +633,12 @@ pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
+    // A controller's channel is bound to its originate group's id while the
+    // group rings; ending it then means CANCELling every leg (RFC 3261 §9.1).
+    if control.state.originate_groups.contains(sip_call_id) {
+        let _enter = control.runtime.enter();
+        return cancel_originated_call(&control.state, sip_call_id, reason);
+    }
     let Some(internal_call_id) = control.state.call_actors.find_by_sip_call_id(sip_call_id) else {
         return false;
     };

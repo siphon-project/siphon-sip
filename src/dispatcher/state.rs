@@ -267,6 +267,10 @@ pub struct DispatcherState {
     /// The B2BUA path needs no entry: it already answers 200 to a CANCEL for a
     /// call that is no longer Calling/Ringing.
     pub cancelled_invites: Arc<DashMap<TransactionKey, ()>>,
+    /// Originate groups still ringing: several contacts rung as calls siphon
+    /// placed itself, the first to answer kept. Each group and each of its
+    /// legs' index entries goes when the group ends, however it ends.
+    pub originate_groups: Arc<crate::dispatcher::b2bua::OriginateGroupStore>,
     /// Shared drain state — the server flips `drain.is_draining` on
     /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
