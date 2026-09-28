@@ -287,6 +287,44 @@ pub(super) fn play_accept(
     (ControlResult::Ok(reply), Some(started))
 }
 
+/// Everything a `play` names besides its source.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PlayOptions {
+    pub(super) repeat: Option<u64>,
+    pub(super) start_ms: Option<u64>,
+    pub(super) duration_ms: Option<u64>,
+    pub(super) to_tag: Option<String>,
+    pub(super) gain_decibels: Option<i32>,
+}
+
+/// Start `source` on a leg the way the `play` verb does: a supersede, never an
+/// overlay, and fire-and-forget, returning on the engine's accept. Shared with
+/// the ringback a bridge dial plays, so the two reach the engine identically.
+pub(super) async fn start_playback(
+    backend: &crate::rtpengine::MediaBackend,
+    call_id: &str,
+    from_tag: &str,
+    source: &crate::rtpengine::client::PlayMediaSource,
+    options: &PlayOptions,
+) -> Result<crate::rtpengine::siphon_rtp::PlayMediaOutcome, crate::rtpengine::RtpEngineError> {
+    backend
+        .play_media(
+            call_id,
+            from_tag,
+            source,
+            options.repeat,
+            options.start_ms,
+            options.duration_ms,
+            options.to_tag.as_deref(),
+            // The control plane's `play` is a supersede, matching its documented
+            // "start an announcement" shape; overlays are a scripting-API verb.
+            false,
+            options.gain_decibels,
+            false,
+        )
+        .await
+}
+
 /// `play` — start an announcement on the A-leg's media. Fire-and-forget: `wait`
 /// is false, so this returns on the backend's *accept*, never blocking on
 /// playback completion (the far-end result is not the command reply).
@@ -307,36 +345,25 @@ pub(super) async fn play(channel: &ChannelRef, args: &serde_json::Value) -> Cont
     if let Some(refusal) = play_blob_refusal(&source) {
         return refusal;
     }
-    let repeat = args.get("repeat").and_then(|value| value.as_u64());
-    let start_ms = args.get("start_ms").and_then(|value| value.as_u64());
-    let duration_ms = args.get("duration_ms").and_then(|value| value.as_u64());
-    let to_tag = args
-        .get("to_tag")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
+    let options = PlayOptions {
+        repeat: args.get("repeat").and_then(|value| value.as_u64()),
+        start_ms: args.get("start_ms").and_then(|value| value.as_u64()),
+        duration_ms: args.get("duration_ms").and_then(|value| value.as_u64()),
+        to_tag: args
+            .get("to_tag")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        gain_decibels: args
+            .get("gain_decibels")
+            .and_then(|value| value.as_i64())
+            .and_then(|value| i32::try_from(value).ok()),
+    };
 
     let (backend, call_id, from_tag) = match media_target(channel) {
         Ok(target) => target,
         Err(result) => return result,
     };
-    let result = backend
-        .play_media(
-            &call_id,
-            &from_tag,
-            &source,
-            repeat,
-            start_ms,
-            duration_ms,
-            to_tag.as_deref(),
-            // The control plane's `play` is a supersede, matching its documented
-            // "start an announcement" shape; overlays are a scripting-API verb.
-            false,
-            args.get("gain_decibels")
-                .and_then(|value| value.as_i64())
-                .and_then(|value| i32::try_from(value).ok()),
-            false,
-        )
-        .await;
+    let result = start_playback(&backend, &call_id, &from_tag, &source, &options).await;
     let (reply, started) = play_accept(&channel.channel_id, &source, result);
     if let Some(payload) = started {
         crate::control::notify_channel_event(&channel.sip_call_id, "PlayStarted", payload);

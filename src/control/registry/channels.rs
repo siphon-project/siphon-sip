@@ -167,6 +167,21 @@ impl ControlBus {
         true
     }
 
+    /// The live connection that owns a channel now, with the channel's
+    /// control-loss policy — what a channel siphon mints on the owner's behalf
+    /// is registered to, so it has the same owner and the same fate when that
+    /// owner goes. `None` for an unknown channel and for one whose owner is
+    /// gone (orphaned, waiting for a reattach).
+    pub fn channel_owner(&self, channel_id: &str) -> Option<(Arc<ConnHandle>, String)> {
+        let entry = self.channels.get(channel_id)?;
+        let conn_id = entry.conn_id.load(Ordering::SeqCst);
+        if conn_id == 0 {
+            return None;
+        }
+        let conn = self.connection(&entry.app, conn_id)?;
+        Some((conn, entry.on_lost.clone()))
+    }
+
     /// Whether the given connection owns the channel (authZ for a command).
     pub fn owns(&self, channel_id: &str, app: &str, conn_id: u64) -> Ownership {
         match self.channels.get(channel_id) {

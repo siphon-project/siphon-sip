@@ -65,10 +65,13 @@ impl OriginateGroupStrategy {
 pub struct OriginateGroupSpec {
     /// What every leg's INVITE carries. `to` is each leg's To — the AoR the
     /// contacts are registered at — while each leg's Request-URI is its own
-    /// target. `timeout_secs` is each leg's own ring timeout (`0`: none).
+    /// target; left empty, a leg's To is its target's AoR or, failing that,
+    /// its URI. `timeout_secs` is each leg's own ring timeout (`0`: none).
     pub params: OriginateParams,
     /// One per leg, in the order a sequential group tries them. A target's
-    /// `uri`, `next_hop`, `flow`, `route`, `headers` and `aor` apply to its leg.
+    /// `uri`, `next_hop`, `flow`, `route`, `headers` and `aor` apply to its
+    /// leg, and so do the calling identity fields it names
+    /// (`from`, `from_display`, `p_asserted_identity`, `privacy`).
     pub targets: Vec<DialTarget>,
     /// Parallel or sequential.
     pub strategy: OriginateGroupStrategy,
@@ -800,6 +803,51 @@ fn drive(
     }
 }
 
+/// What one leg's INVITE carries: the group's, with the target's own over it.
+///
+/// * The To is the AoR the target is a contact of, when it names one; the
+///   group's `to` otherwise, and the target's own URI when the group names
+///   none either (a group of URIs dialled as written, each its own callee).
+/// * A target's `next_hop` and headers (in a stable order) replace the
+///   group's.
+/// * A target that names a calling identity presents it: `from` and
+///   `from_display` together (an empty display name presents none), and its
+///   `p_asserted_identity` and `privacy` where it names them. A contact an AoR
+///   resolved to names none, so every leg of an `originate {aor}` presents the
+///   group's.
+fn leg_params(template: &OriginateParams, target: &DialTarget) -> OriginateParams {
+    let mut params = template.clone();
+    if let Some(aor) = &target.aor {
+        params.to = aor.clone();
+    } else if params.to.is_empty() {
+        params.to = target.uri.clone();
+    }
+    if target.next_hop.is_some() {
+        params.next_hop = target.next_hop.clone();
+    }
+    if target.from.is_some() || target.from_display.is_some() {
+        if target.from.is_some() {
+            params.from = target.from.clone();
+        }
+        params.from_display = target.from_display.clone();
+    }
+    if target.p_asserted_identity.is_some() {
+        params.p_asserted_identity = target.p_asserted_identity.clone();
+    }
+    if target.privacy.is_some() {
+        params.privacy = target.privacy;
+    }
+    let mut headers: Vec<(&String, &String)> = target.headers.iter().collect();
+    headers.sort();
+    for (name, value) in headers {
+        params
+            .headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        params.headers.push((name.clone(), value.clone()));
+    }
+    params
+}
+
 /// Stage one leg, attach it to its group, and send its INVITE. `None` when
 /// the target could not be staged (the refusal is recorded on the group) or
 /// the group ended meanwhile.
@@ -810,19 +858,7 @@ fn place_leg(
     template: &OriginateParams,
     sink: &Arc<dyn OriginateGroupSink>,
 ) -> Option<DialBranch> {
-    let mut params = template.clone();
-    if target.next_hop.is_some() {
-        params.next_hop = target.next_hop.clone();
-    }
-    // A target's own headers, over the group's, in a stable order.
-    let mut headers: Vec<(&String, &String)> = target.headers.iter().collect();
-    headers.sort();
-    for (name, value) in headers {
-        params
-            .headers
-            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-        params.headers.push((name.clone(), value.clone()));
-    }
+    let params = leg_params(template, target);
     let route = OriginateRoute {
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),
@@ -1332,5 +1368,74 @@ mod tests {
         assert!(store
             .take_timed_out(now + std::time::Duration::from_secs(61))
             .is_empty());
+    }
+
+    #[test]
+    fn a_contact_of_an_aor_is_called_as_the_aor_with_the_groups_identity() {
+        let template = group(OriginateGroupStrategy::Parallel, 0).params;
+        let contact = DialTarget {
+            uri: "sip:201@198.51.100.7:5070".to_string(),
+            aor: Some("sip:201@siphon.example.com".to_string()),
+            ..Default::default()
+        };
+        let params = leg_params(&template, &contact);
+        assert_eq!(params.to, "sip:201@siphon.example.com");
+        // Nothing of its own: the group's identity stands.
+        assert_eq!(params.from, template.from);
+        assert_eq!(params.from_display, template.from_display);
+        assert_eq!(params.privacy, None);
+    }
+
+    #[test]
+    fn a_uri_target_in_a_group_with_no_callee_is_its_own_callee() {
+        let mut template = group(OriginateGroupStrategy::Parallel, 0).params;
+        template.to = String::new();
+        let target = DialTarget {
+            uri: "sip:3000@198.51.100.8".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(leg_params(&template, &target).to, "sip:3000@198.51.100.8");
+        // Positive control: a group that names its callee keeps it.
+        let named = group(OriginateGroupStrategy::Parallel, 0).params;
+        assert_eq!(leg_params(&named, &target).to, "sip:201@example.com");
+    }
+
+    #[test]
+    fn a_target_that_names_an_identity_presents_it_over_the_groups() {
+        let mut template = group(OriginateGroupStrategy::Parallel, 0).params;
+        template.from = Some("sip:1000@siphon.example.com".to_string());
+        template.from_display = Some("Reception".to_string());
+        template.headers = vec![("X-Queue".to_string(), "sales".to_string())];
+        let target = DialTarget {
+            uri: "sip:3000@198.51.100.8".to_string(),
+            next_hop: Some("sip:198.51.100.9:5070".to_string()),
+            from: Some("sip:5550100@siphon.example.com".to_string()),
+            // Empty: present no display name at all.
+            from_display: Some(String::new()),
+            p_asserted_identity: Some("sip:5550100@siphon.example.com".to_string()),
+            privacy: Some(crate::sip::privacy::CallerIdPresentation::Restricted),
+            headers: [("x-queue".to_string(), "support".to_string())].into(),
+            ..Default::default()
+        };
+        let params = leg_params(&template, &target);
+        assert_eq!(
+            params.from.as_deref(),
+            Some("sip:5550100@siphon.example.com")
+        );
+        assert_eq!(params.from_display.as_deref(), Some(""));
+        assert_eq!(
+            params.p_asserted_identity.as_deref(),
+            Some("sip:5550100@siphon.example.com")
+        );
+        assert_eq!(
+            params.privacy,
+            Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+        );
+        assert_eq!(params.next_hop.as_deref(), Some("sip:198.51.100.9:5070"));
+        assert_eq!(
+            params.headers,
+            vec![("x-queue".to_string(), "support".to_string())],
+            "the target's header replaces the group's of the same name"
+        );
     }
 }

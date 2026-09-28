@@ -1058,6 +1058,28 @@ fn connection_for_command_resolves_only_a_live_owner() {
     );
 }
 
+#[tokio::test]
+async fn a_channels_owner_is_its_live_connection_and_its_control_loss_policy() {
+    let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+    let conn = bus.register_connection("ivr-app");
+    bus.register_channel(
+        "caller-1",
+        &conn,
+        "call-uuid",
+        "sipcid",
+        "continue",
+        HashMap::new(),
+    );
+    let (owner, on_lost) = bus.channel_owner("caller-1").expect("a live owner");
+    assert_eq!(owner.id, conn.id);
+    assert_eq!(on_lost, "continue");
+    assert!(bus.channel_owner("no-such-channel").is_none());
+    // Orphaned by its owner's disconnect: nothing may be registered to it.
+    bus.unregister_connection(&conn);
+    assert!(bus.channel_exists("caller-1"), "orphaned, not torn down");
+    assert!(bus.channel_owner("caller-1").is_none());
+}
+
 #[test]
 fn forward_channel_event_reaches_the_owner_by_sip_call_id() {
     let bus = test_bus(16, SlowConsumerPolicy::DropOldest);

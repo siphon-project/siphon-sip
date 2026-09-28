@@ -748,6 +748,9 @@ pub(crate) mod staged {
     /// Where an app's originates are placed, and the bus that owns their channels.
     pub(crate) struct OriginateRail {
         pub(crate) bus: Arc<ControlBus>,
+        /// The dispatcher itself, for a `dial` that rings phones for an
+        /// answered caller: it runs a task that outlives the command.
+        pub(crate) dispatcher: Arc<dyn crate::dispatcher::DispatcherHandle>,
         pub(crate) prepare: Prepare,
         pub(crate) dial: Dial,
         pub(crate) create_group: CreateGroup,

@@ -3,6 +3,7 @@
 
 use crate::control::protocol::{ControlErrorCode, ControlResult};
 use crate::control::registry::ChannelRef;
+use crate::control::AdapterCommand;
 
 /// Return control to siphon with a routing decision (the `route` verb). Un-parks
 /// the deferred-handover call and dials the B-leg via siphon's LCR sequential
@@ -80,7 +81,20 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
 /// digest is. `From` is framework-managed on a B-leg, so an injected
 /// `headers: {"From": …}` cannot do this — see
 /// [`crate::dispatcher::DialShaping`].
-pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+///
+/// `on_answer: "bridge"` is the other half: a caller siphon already answered
+/// (and anchored, typically after an IVR's prompts) is not connected by the
+/// phone's answer but bridged to it. See [`super::dial_bridge`].
+pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
+    let args = &command.args;
+    let on_answer = match parse_on_answer(args.get("on_answer")) {
+        Ok(on_answer) => on_answer,
+        Err(refusal) => return refusal,
+    };
+    let ringback = match super::dial_bridge::parse_ringback(args.get("ringback"), on_answer) {
+        Ok(ringback) => ringback,
+        Err(refusal) => return refusal,
+    };
     let profile = match args.get("profile") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
@@ -143,6 +157,21 @@ pub(super) fn dial(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
 
+    if on_answer == OnAnswer::Bridge {
+        return super::dial_bridge::dial_bridge(
+            channel,
+            command,
+            super::dial_bridge::BridgeDialRequest {
+                targets,
+                shaping,
+                headers: extra_headers,
+                strategy: strategy.to_string(),
+                timeout_secs,
+                ringback,
+            },
+        );
+    }
+
     match crate::dispatcher::b2bua_dial_call(
         &channel.sip_call_id,
         targets,
@@ -189,6 +218,49 @@ pub(super) fn dial_error(error: crate::dispatcher::DialError) -> ControlResult {
         DialError::Media(_) => ControlErrorCode::Unavailable,
     };
     ControlResult::error(code, error.to_string())
+}
+
+/// What a `dial` does when a phone answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnAnswer {
+    /// Answer the caller with the phone's answer: the pair becomes an ordinary
+    /// two-leg call. For a caller that is still ringing.
+    Connect,
+    /// Bridge the phone to a caller siphon already answered.
+    Bridge,
+}
+
+impl OnAnswer {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
+/// Parse `args.on_answer`: absent is `connect`, today's dial. Anything that is
+/// not one of the two names is refused rather than read as the default — a
+/// controller that meant `bridge` and got `connect` would find its answered
+/// caller refused for a reason it did not ask about.
+pub(super) fn parse_on_answer(
+    value: Option<&serde_json::Value>,
+) -> Result<OnAnswer, ControlResult> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(OnAnswer::Connect),
+        Some(serde_json::Value::String(name)) if name == "connect" => Ok(OnAnswer::Connect),
+        Some(serde_json::Value::String(name)) if name == "bridge" => Ok(OnAnswer::Bridge),
+        Some(other) => Err(ControlResult::error_with_details(
+            ControlErrorCode::BadRequest,
+            format!("dial args.on_answer must be \"connect\" or \"bridge\", got {other}"),
+            serde_json::json!({
+                "verb": "dial",
+                "argument": "on_answer",
+                "reason": "unknown_value",
+                "value": other,
+            }),
+        )),
+    }
 }
 
 /// Parse one `dial` target into the branches it stands for.

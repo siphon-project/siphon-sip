@@ -359,6 +359,40 @@ async fn on_ws_tee_started(
     .await;
 }
 
+/// The engine's end of a playback, as siphon records and reports it: the leg
+/// stops counting as playing, the controller gets `PlayFinished` (with
+/// `origin: "ringback"` when it was a bridge dial's ringback), and a ringback
+/// waiting for this prompt to end may start.
+pub(super) fn publish_play_finished(
+    state: &DispatcherState,
+    play: &crate::rtpengine::events::PlayFinishedEvent,
+) {
+    crate::rtpengine::MediaBackend::playback_finished(&play.call_id, &play.from_tag, play.play_id);
+    let ringback =
+        dial_bridge_ringback_finished(state, &play.call_id, &play.from_tag, play.play_id);
+    let mut payload = serde_json::json!({
+        "from_tag": play.from_tag,
+        "to_tag": play.to_tag,
+        // Correlates with the play_id the accept and the
+        // PlayStarted event both carry.
+        "play_id": play.play_id,
+        "reason": play.reason.as_str(),
+        // Only `completed` means the prompt was heard in
+        // full — a stop, a supersede and an error all end
+        // a playback without that being true, and an app
+        // queueing its next step needs the difference.
+        "completed": play.reason.is_completed(),
+        "played_ms": play.played_ms,
+    });
+    if let (true, Some(fields)) = (ringback, payload.as_object_mut()) {
+        fields.insert("origin".into(), DIAL_RINGBACK_ORIGIN.into());
+    }
+    crate::control::notify_channel_event(&play.call_id, "PlayFinished", payload);
+    // After the event, so a controller sees its prompt end before the ringback
+    // that follows it starts.
+    dial_bridge_prompt_finished(state, &play.call_id, &play.from_tag);
+}
+
 async fn on_play_finished(
     state: &Arc<DispatcherState>,
     play: crate::rtpengine::events::PlayFinishedEvent,
@@ -371,24 +405,7 @@ async fn on_play_finished(
         played_ms = ?play.played_ms,
         "media engine finished a playback"
     );
-    crate::control::notify_channel_event(
-        &play.call_id,
-        "PlayFinished",
-        serde_json::json!({
-            "from_tag": play.from_tag,
-            "to_tag": play.to_tag,
-            // Correlates with the play_id the accept and the
-            // PlayStarted event both carry.
-            "play_id": play.play_id,
-            "reason": play.reason.as_str(),
-            // Only `completed` means the prompt was heard in
-            // full — a stop, a supersede and an error all end
-            // a playback without that being true, and an app
-            // queueing its next step needs the difference.
-            "completed": play.reason.is_completed(),
-            "played_ms": play.played_ms,
-        }),
-    );
+    publish_play_finished(state, &play);
     let engine_state = state.engine.state();
     let handlers = engine_state.play_finished_handlers(&play.call_id, &play.from_tag);
     if handlers.is_empty() {

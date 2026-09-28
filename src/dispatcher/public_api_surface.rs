@@ -131,13 +131,17 @@ fn the_public_surface_is_pinned() {
     // through: the originate group's create and start entry points, its spec,
     // strategy, sink trait and the three reports the sink receives, and the
     // three `Dial*` event payload builders its channel events share with
-    // `dial`. All additive, so a minor-compatible change — recorded here
-    // because that is the tripwire.
+    // `dial`, plus the 15 crate-internal items `dial {on_answer: "bridge"}`
+    // rings phones for an answered caller through: its caller check, spec,
+    // start, join and phone release, their types and signals, the dispatcher
+    // handle a coordinator task holds, and the two labels its events share
+    // with the dispatcher. All additive, so a minor-compatible change —
+    // recorded here because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        60,
+        75,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 60. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 75. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

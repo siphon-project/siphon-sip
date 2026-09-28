@@ -43,32 +43,49 @@ pub enum MediaBackend {
     RtpProxy(Arc<RtpProxyClientSet>),
 }
 
-/// Legs with a playback siphon started and has not stopped, keyed
-/// `(engine call-id, leg tag)`. Read through
+/// Legs with a playback siphon started and has not seen end, keyed
+/// `(engine call-id, leg tag)`, each with the `play_id` of every playback on it
+/// (`None` for an engine that assigns none). Read through
 /// [`MediaBackend::playback_started`]; written only by `play_media` /
-/// `stop_media` / `delete` below, so every path that ends a session also drops
-/// its entry and the set cannot outgrow the calls it describes.
-static ACTIVE_PLAYBACKS: std::sync::LazyLock<dashmap::DashSet<(String, String)>> =
-    std::sync::LazyLock::new(dashmap::DashSet::new);
+/// `stop_media` / `delete` below and by [`MediaBackend::playback_finished`], so
+/// every path that ends a session also drops its entry and the map cannot
+/// outgrow the calls it describes.
+static ACTIVE_PLAYBACKS: std::sync::LazyLock<PlaybackRecords> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// `(engine call-id, leg tag)` → the `play_id` of each playback on that leg.
+type PlaybackRecords = dashmap::DashMap<(String, String), Vec<Option<u64>>>;
 
 impl MediaBackend {
-    /// Whether siphon started a playback on this leg and has not stopped it.
+    /// Whether siphon started a playback on this leg and has not seen it end.
     ///
     /// For a caller that only needs the *guarantee* that nothing is playing —
     /// the bridge, before it re-points a leg's media — so it can skip a stop
     /// that would otherwise be the engine answering "this call has no active
     /// media playback". The engine counts that answer in
     /// `control_errors_total`, a counter operators alert on; a verb that bumps
-    /// it every time it runs on an idle leg trains them to ignore it.
+    /// it every time it runs on an idle leg trains them to ignore it. And for a
+    /// bridge dial's ringback, which must not talk over a prompt.
     ///
     /// Conservative in one direction only. The entry is written before the
     /// caller sees its `play_media` return, so this never says "nothing is
-    /// playing" while something is. It can say the opposite: a prompt that ends
-    /// on its own leaves its entry, because siphon does not subscribe to the
-    /// engine's end-of-playback event. The cost is one redundant stop on a
-    /// session that really did play something — the safe direction.
+    /// playing" while something is. It can say the opposite: a playback on an
+    /// engine that reports no end (rtpengine, rtpproxy) keeps its entry until a
+    /// stop or the session's delete, and so does one whose end event raced its
+    /// own accept. The cost is one redundant stop — the safe direction.
     pub fn playback_started(call_id: &str, from_tag: &str) -> bool {
-        ACTIVE_PLAYBACKS.contains(&(call_id.to_string(), from_tag.to_string()))
+        ACTIVE_PLAYBACKS.contains_key(&(call_id.to_string(), from_tag.to_string()))
+    }
+
+    /// The engine reported that playback `play_id` on this leg ended — played
+    /// out, stopped, superseded or failed. The leg stops counting as playing
+    /// once nothing else siphon started on it is left.
+    pub fn playback_finished(call_id: &str, from_tag: &str, play_id: u64) {
+        let key = (call_id.to_string(), from_tag.to_string());
+        if let Some(mut plays) = ACTIVE_PLAYBACKS.get_mut(&key) {
+            plays.retain(|play| *play != Some(play_id));
+        }
+        ACTIVE_PLAYBACKS.remove_if(&key, |_, plays| plays.is_empty());
     }
 
     /// Which engine this is, as the `media.backend` config spells it.
@@ -241,8 +258,16 @@ impl MediaBackend {
                 wait,
             )
             .await;
-        if outcome.is_ok() {
-            ACTIVE_PLAYBACKS.insert((call_id.to_string(), from_tag.to_string()));
+        if let Ok(accepted) = &outcome {
+            let mut plays = ACTIVE_PLAYBACKS
+                .entry((call_id.to_string(), from_tag.to_string()))
+                .or_default();
+            // A playback that is not an overlay supersedes whatever the leg was
+            // playing, so it is the only one left.
+            if !overlay {
+                plays.clear();
+            }
+            plays.push(accepted.play_id);
         }
         outcome
     }
@@ -425,10 +450,15 @@ impl MediaBackend {
             }
         };
         // A blanket stop ends everything on the leg, so the leg is no longer
-        // playing. A targeted one (`play_id`) leaves whatever else is running,
-        // so the record stands.
-        if play_id.is_none() && outcome.is_ok() {
-            ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
+        // playing. A targeted one (`play_id`) ends that playback alone and
+        // leaves whatever else is running on the record.
+        if outcome.is_ok() {
+            match play_id {
+                None => {
+                    ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
+                }
+                Some(play_id) => Self::playback_finished(call_id, from_tag, play_id),
+            }
         }
         outcome
     }
@@ -1057,7 +1087,7 @@ mod tests {
         let backend = dead_native_backend();
         for index in 0..64 {
             let call_id = format!("leak-delete-{index}");
-            ACTIVE_PLAYBACKS.insert((call_id.clone(), "tag-a".to_string()));
+            ACTIVE_PLAYBACKS.insert((call_id.clone(), "tag-a".to_string()), vec![Some(7)]);
             assert!(MediaBackend::playback_started(&call_id, "tag-a"));
             // The engine is unreachable — the record still has to go, because
             // the call is over either way.
@@ -1072,18 +1102,37 @@ mod tests {
     }
 
     #[test]
-    fn a_targeted_stop_leaves_the_leg_playing() {
-        // `stop_media(play_id=…)` ends one playback of several, so the leg is
-        // still playing and a bridge still has something to stop. Only a
-        // blanket stop clears the record — asserted through the same helper the
-        // bridge reads.
+    fn a_leg_plays_until_every_playback_on_it_has_ended() {
+        // One playback of several ending (a targeted stop, or the engine's end
+        // event) leaves the leg playing, so a bridge still has something to
+        // stop and a ringback still has something not to talk over. The last
+        // one ending clears the record — asserted through the same helper both
+        // read.
         let key = ("leak-targeted".to_string(), "tag-a".to_string());
-        ACTIVE_PLAYBACKS.insert(key.clone());
+        ACTIVE_PLAYBACKS.insert(key.clone(), vec![Some(1), Some(2)]);
+        assert!(MediaBackend::playback_started("leak-targeted", "tag-a"));
+        MediaBackend::playback_finished("leak-targeted", "tag-a", 1);
         assert!(MediaBackend::playback_started("leak-targeted", "tag-a"));
         assert_eq!(playback_records_for("leak-targeted"), 1);
-        ACTIVE_PLAYBACKS.remove(&key);
+        // An end for a playback the record never held changes nothing.
+        MediaBackend::playback_finished("leak-targeted", "tag-a", 9);
+        assert!(MediaBackend::playback_started("leak-targeted", "tag-a"));
+        MediaBackend::playback_finished("leak-targeted", "tag-a", 2);
         assert!(!MediaBackend::playback_started("leak-targeted", "tag-a"));
         assert_eq!(playback_records_for("leak-targeted"), 0);
+    }
+
+    #[test]
+    fn a_playback_with_no_id_is_ended_only_by_a_stop_or_a_delete() {
+        // rtpengine and rtpproxy assign no play_id and report no end, so no end
+        // event can match their record: it stands until the leg is stopped or
+        // deleted — never read as "nothing is playing" while it may be.
+        let key = ("leak-anonymous".to_string(), "tag-a".to_string());
+        ACTIVE_PLAYBACKS.insert(key.clone(), vec![None]);
+        MediaBackend::playback_finished("leak-anonymous", "tag-a", 0);
+        assert!(MediaBackend::playback_started("leak-anonymous", "tag-a"));
+        ACTIVE_PLAYBACKS.remove(&key);
+        assert_eq!(playback_records_for("leak-anonymous"), 0);
     }
 
     #[tokio::test]

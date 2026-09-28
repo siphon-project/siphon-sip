@@ -276,17 +276,24 @@ pub async fn bridge_run_media_step(
 pub async fn b2bua_bridge_calls(
     params: BridgeParams,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err(crate::b2bua::bridge::BridgeError::Unavailable(
+            "b2bua is not running — nothing to bridge".to_string(),
+        ));
+    };
+    bridge_calls_with_state(&control.state, params).await
+}
+
+/// [`b2bua_bridge_calls`] on a dispatcher already in hand: the running
+/// B2BUA's, or the one a bridge dial rang its phones on.
+pub(crate) async fn bridge_calls_with_state(
+    state: &DispatcherState,
+    params: BridgeParams,
+) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
     use crate::b2bua::bridge::{
         bridge_media_plan, set_media_direction, BridgeContext, BridgeError, BridgeRole,
         BridgeStage, MediaDirection,
     };
-
-    let Some(control) = B2BUA_CONTROL.get() else {
-        return Err(BridgeError::Unavailable(
-            "b2bua is not running — nothing to bridge".to_string(),
-        ));
-    };
-    let state = &control.state;
 
     if params.anchor_sip_call_id == params.peer_sip_call_id {
         return Err(BridgeError::SameLeg(params.anchor_sip_call_id));
@@ -932,6 +939,7 @@ pub fn bridge_complete(anchor_call_id: &str, response: &SipMessage, state: &Disp
         );
     }
     info!(%anchor_call_id, %peer_call_id, anchored, "B2BUA bridge: formed — media meets");
+    dial_bridge_settled(state, anchor_call_id, &peer_call_id, false);
 }
 
 /// A bridge step was refused. Drop both halves, release both re-INVITE slots and
@@ -966,4 +974,7 @@ pub fn bridge_fail(call_id: &str, stage: &str, status_code: u16, state: &Dispatc
         status = status_code,
         "B2BUA bridge: failed — both legs left as they were"
     );
+    // Unless one of them is a phone a bridge dial rang: it was only answered
+    // to be joined to the caller, so it is released rather than left up.
+    dial_bridge_settled(state, call_id, &peer_call_id, true);
 }

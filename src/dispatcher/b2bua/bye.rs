@@ -148,6 +148,9 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // A bridged partner loses its other half here — before the StasisEnd, so
     // the controller sees the bridge end before the channel does.
     b2bua_bridge_peer_left(&a_leg_call_id, state);
+    // Phones a bridge dial is ringing for this caller stop ringing (RFC 3261
+    // §9.1), also before the StasisEnd, so its DialFailed precedes it.
+    dial_bridge_call_ended(&a_leg_call_id, state);
 
     // Control plane: emit StasisEnd if this call was controlled (keyed on the
     // A-leg Call-ID, so a BYE from either leg reaches the owning app). No-op
