@@ -773,6 +773,31 @@ impl AutoBanStore {
         )
     }
 
+    /// Record a call a controller dropped as unwanted (the control plane's
+    /// `drop` with `ban: true`). Returns `true` if this call newly banned the IP.
+    ///
+    /// The verdict is the controller's, and it is a strong one: it knows which
+    /// numbers and peers are real, so a source it keeps refusing is probing.
+    /// How much one verdict weighs still depends on whether the source address
+    /// can be believed. Over a stream transport (`verified_source`) the
+    /// handshake proved it and this is a strong signal. Over UDP one datagram
+    /// can name any address, so it counts once, the same as a rejected
+    /// credential over UDP: a threshold's worth of forged INVITEs is then what
+    /// it takes to ban an innocent address, never a single one.
+    pub fn record_unwanted_call(&self, source: IpAddr, verified_source: bool) -> bool {
+        let weight = if verified_source {
+            self.strong_weight
+        } else {
+            1
+        };
+        self.record_failure_weighted_at(
+            source,
+            weight,
+            Instant::now(),
+            "repeated calls the controller dropped as unwanted",
+        )
+    }
+
     /// `reason` names the class of signal being counted, for the log line each
     /// connection closed by the resulting ban carries. The specific signal is
     /// named by the caller's own ban-transition log; this is what the store
@@ -1617,6 +1642,46 @@ mod tests {
         }
         assert!(store.record_missing_credentials(prober));
         assert!(store.is_banned(prober));
+    }
+
+    /// A controller's `drop` with `ban` over UDP counts once per call, like the
+    /// other signals on a source a datagram can forge: a burst of forged INVITEs
+    /// must take a full threshold's worth to cost the named address anything.
+    #[test]
+    fn an_unwanted_call_over_udp_counts_as_a_low_confidence_signal() {
+        let store = AutoBanStore::for_test(3, 600, 3600, &[], 3, 0);
+        let prober = ip("203.0.113.50");
+
+        assert!(!store.record_unwanted_call(prober, false));
+        assert!(!store.record_unwanted_call(prober, false));
+        assert!(!store.is_banned(prober), "two calls banned at threshold 3");
+        assert!(store.record_unwanted_call(prober, false));
+        assert!(store.is_banned(prober));
+    }
+
+    /// Over a stream transport the handshake proved the source, so the same
+    /// verdict carries the strong weight and bans in fewer calls.
+    #[test]
+    fn an_unwanted_call_over_a_stream_counts_as_a_strong_signal() {
+        let store = AutoBanStore::for_test(6, 600, 3600, &[], 3, 0);
+        let prober = ip("203.0.113.51");
+
+        assert!(!store.record_unwanted_call(prober, true));
+        assert!(!store.is_banned(prober));
+        assert!(store.record_unwanted_call(prober, true));
+        assert!(store.is_banned(prober));
+    }
+
+    /// A trunk is in `trusted_cidrs`, and a controller that misroutes one of its
+    /// calls must not be able to ban the carrier through this verb.
+    #[test]
+    fn an_unwanted_call_from_a_trusted_source_is_never_counted() {
+        let store = AutoBanStore::for_test(1, 600, 3600, &["203.0.113.0/24".to_string()], 3, 0);
+        let trunk = ip("203.0.113.52");
+
+        assert!(!store.record_unwanted_call(trunk, true));
+        assert!(!store.is_banned(trunk));
+        assert_eq!(store.failures.len(), 0);
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn signatures_are_pinned() {
     let _: fn(&str, u16, &str) -> bool = super::b2bua_reject_refer_call;
     let _: fn(&str) -> Option<String> = super::b2bua_local_tag;
     let _: fn(&str, Option<&str>) -> bool = super::b2bua_cancel_originated_call;
-    let _: fn(&str, Option<&str>) -> super::DropOutcome = super::b2bua_drop_call;
+    let _: fn(&str, Option<&str>, bool) -> super::DropOutcome = super::b2bua_drop_call;
     let _: fn(&str, Option<String>) = super::b2bua_media_set_ws_tee;
     let _: fn(&str, bool) = super::b2bua_media_set_ws_bridge_attached;
     // Named, because clippy's type_complexity refuses the bare fn-pointer type.

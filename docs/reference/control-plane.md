@@ -286,7 +286,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `progress` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
-| `drop` | sip | `{reason?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
+| `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
@@ -402,7 +402,7 @@ same way every other verb does — never a hang:
 
 ```json
 { "verb": "drop", "target": {"channel": "ch1"},
-  "args": { "reason": "no flow claims this number" } }
+  "args": { "reason": "no flow claims this number", "ban": true } }
 ```
 
 A PBX's SIP port is reachable from the internet by definition — carriers deliver
@@ -443,6 +443,29 @@ Replies `{channel, state: "terminated", response_sent: false}`, and pushes a
   `sip_reason`, and `response_code: 0` — a dropped call must read as deliberate,
   never as a leak.
 - A call that ended while the controller was deciding answers `not_found`.
+
+**`ban: true` makes the verdict stick.** Silence alone costs a scanner nothing:
+it gets no answer and moves on to the next number at the same rate, which on a
+public port can be several INVITEs a second, indefinitely, below any sensible
+`rate_limit`. With `ban`, siphon also scores the caller's source address in the
+`security.failed_auth_ban` store, so a source the controller keeps dropping is
+banned and refused at the transport before its next INVITE is parsed.
+
+- The weight follows how far the source address can be believed. Over TCP, TLS,
+  WS or WSS the handshake proved it, and one drop counts as a strong signal
+  (`strong_signal_weight`). Over UDP a single datagram can name any address, so
+  one drop counts once, the same as a rejected credential over UDP: forging a
+  ban onto somebody else's address takes a full `threshold` of spoofed INVITEs,
+  never one.
+- `trusted_cidrs` are never scored, so a trunk whose call the controller
+  misroutes cannot be banned through this verb.
+- A no-op without `security.failed_auth_ban`, which is what holds the ban store.
+- Only a successful drop scores: a refused one (`invalid_state`, `not_found`)
+  leaves the source alone.
+- `ban` must be a boolean; anything else is `bad_request`, since a `"true"`
+  string read as false would drop the call and ban nothing.
+- A ban is logged once, at `warn`, when the source crosses the threshold, and
+  shows up in `GET /admin/bans` like any other.
 
 ### Recording
 

@@ -61,6 +61,16 @@ entry, but a working config keeps working.
   §13.2.2.4). When the callee retransmitted that 2xx because the ACK was lost,
   siphon re-ACKed it with no body, leaving the callee's offer unanswered. The
   answer is now kept on the call and the re-sent ACK carries it again.
+### Added
+
+- **The control plane's `drop` verb takes `ban: true`**, which also scores the
+  caller's source in the `security.failed_auth_ban` store. A controller that
+  keeps dropping unsolicited INVITEs from one address now gets it banned,
+  where before the scanner heard nothing and simply went on to the next number
+  below the rate limit. One drop weighs as a strong signal over a stream
+  transport and as a single failure over UDP, where the source can be forged;
+  `trusted_cidrs` are never scored. A non-boolean `ban` is refused with
+  `bad_request`.
 
 ## [1.11.0] — 2026-09-27
 
