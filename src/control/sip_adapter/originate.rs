@@ -413,6 +413,8 @@ fn originate_aor(
         targets,
         strategy: request.strategy,
         total_timeout_secs,
+        // `originate {aor}`: the first phone to answer is the call.
+        answers: crate::dispatcher::OriginateGroupAnswers::First,
     };
     let sink = Arc::new(ChannelGroupSink {
         bus: Arc::clone(bus),
@@ -748,6 +750,9 @@ pub(crate) mod staged {
     /// Where an app's originates are placed, and the bus that owns their channels.
     pub(crate) struct OriginateRail {
         pub(crate) bus: Arc<ControlBus>,
+        /// The dispatcher itself, for a `dial` that rings phones for an
+        /// answered caller: it runs a task that outlives the command.
+        pub(crate) dispatcher: Arc<dyn crate::dispatcher::DispatcherHandle>,
         pub(crate) prepare: Prepare,
         pub(crate) dial: Dial,
         pub(crate) create_group: CreateGroup,

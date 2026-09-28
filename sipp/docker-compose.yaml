@@ -6363,6 +6363,7 @@ services:
       - siphon-rtp-ng
       - voice-ai-real
       - bridge
+      - dial-bridge
 
   # Readiness gate for the distroless engine: exits 0 once /readyz answers.
   siphon-rtp-engine-ready:
@@ -6393,6 +6394,7 @@ services:
       - siphon-rtp-ng
       - voice-ai-real
       - bridge
+      - dial-bridge
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
@@ -7796,6 +7798,165 @@ services:
       - /var/log/siphon/cdr.jsonl
     profiles:
       - bridge
+
+  # ── `dial {on_answer: "bridge"}`: ring a phone for an answered caller ──────
+  # The end of an IVR flow. The phone registers; the caller calls `ivr@` and is
+  # parked for the application, which answers it anchored on the engine, rings
+  # the phone's AoR with `dial {on_answer: "bridge"}` and lets siphon bridge the
+  # two when the phone picks up. The caller hangs up and the phone follows.
+  #
+  # The SIPp scenarios assert the wire (the phone rung offerless and shown the
+  # caller, both legs re-INVITEd onto the engine by the bridge, the BYE the
+  # phone gets from the peer-hangup policy); the application asserts the verb's
+  # contract (refusals, ringback, DialAnswered's channel, ChannelBridged on both
+  # channels).
+  #
+  # IP map: .230 siphon  .231 app  .232 phone (register, then UAS)  .233 caller
+  siphon-dial-bridge:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: sipp-siphon-dial-bridge
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./control/siphon-dial-bridge.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.230
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; t=socket.create_connection(('127.0.0.1',9092),2); t.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:dialbridge.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@dialbridge.test>;tag=hc\\r\\nTo: <sip:dialbridge.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    profiles:
+      - dial-bridge
+
+  dial-bridge-app:
+    image: python:3.12-slim
+    container_name: sipp-dial-bridge-app
+    depends_on:
+      siphon-dial-bridge:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./control:/app:ro
+    environment:
+      CONTROL_URL: "ws://172.20.0.230:9092/control/ws"
+      CONTROL_TOKEN: "dial-bridge-app-token"
+      CONTROL_APP: "dial-bridge-app"
+      DIAL_BRIDGE_AOR: "sip:2001@dialbridge.test"
+      CONTROL_READY_FILE: "/tmp/dial-bridge-app.ready"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.231
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir websockets && exec python3 dial_bridge_app.py"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/dial-bridge-app.ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    profiles:
+      - dial-bridge
+
+  # Registers the phone's AoR from the address the phone then answers on. The
+  # two never run at once: the phone waits for this to complete.
+  sipp-dial-bridge-register:
+    image: ctaloi/sipp:latest
+    container_name: sipp-dial-bridge-register
+    depends_on:
+      siphon-dial-bridge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.232
+    entrypoint:
+      - sipp
+      - "172.20.0.230:5060"
+      - -sf
+      - /sipp/scenarios/dial_bridge_register.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - dial-bridge
+
+  # The phone. Started detached; its exit code is checked explicitly afterwards
+  # so its assertions (and the final BYE) are not silently skipped.
+  sipp-dial-bridge-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-dial-bridge-phone
+    depends_on:
+      sipp-dial-bridge-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.232
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/dial_bridge_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.232"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - dial-bridge
+
+  sipp-dial-bridge-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-dial-bridge-uac
+    depends_on:
+      siphon-dial-bridge:
+        condition: service_healthy
+      dial-bridge-app:
+        condition: service_healthy
+      sipp-dial-bridge-phone:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.233
+    entrypoint:
+      - sipp
+      - "172.20.0.230:5060"
+      - -sf
+      - /sipp/scenarios/dial_bridge_uac.xml
+      - -mi
+      - "172.20.0.233"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - dial-bridge
 
   # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ────────────────────
   # One siphon, eight callees each scripted for a single branch outcome, and one

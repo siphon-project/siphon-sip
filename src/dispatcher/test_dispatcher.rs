@@ -15,6 +15,18 @@ pub(super) struct TestDispatcher {
     pub(super) udp: flume::Receiver<OutboundMessage>,
 }
 
+/// A test's dispatcher, reached by a task that outlives the command that
+/// started it — a bridge dial's coordinator — on the runtime the test runs on.
+impl DispatcherHandle for TestDispatcher {
+    fn state(&self) -> Option<&DispatcherState> {
+        Some(&self.state)
+    }
+
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        tokio::runtime::Handle::try_current().ok()
+    }
+}
+
 /// Build a [`TestDispatcher`] bound to `192.0.2.1:5060`.
 pub(super) fn test_dispatcher() -> TestDispatcher {
     test_dispatcher_with_script("")
@@ -123,6 +135,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
+        dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
         is_draining: Arc::new(DrainState::new()),
         rf_charger: None,
         rf_sessions: Arc::new(DashMap::new()),

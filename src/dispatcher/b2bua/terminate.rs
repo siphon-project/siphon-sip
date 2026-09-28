@@ -186,6 +186,8 @@ pub fn b2bua_terminate_call_inner(
     // A bridged partner loses its other half here (idempotent: the half is
     // already gone when this teardown *is* the peer-hangup policy acting).
     b2bua_bridge_peer_left(&sip_call_id, state);
+    // A bridge dial ringing phones for this call is cancelled with it.
+    dial_bridge_call_ended(&sip_call_id, state);
 
     // Control plane: emit StasisEnd + drop the channel if this call was
     // controlled (no-op otherwise).
@@ -251,6 +253,7 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
     }
 
     b2bua_stop_siprec(internal_call_id, state);
+    dial_bridge_call_ended(&sip_call_id, state);
     control_notify_terminated(&sip_call_id, "transfer_failed");
 
     state

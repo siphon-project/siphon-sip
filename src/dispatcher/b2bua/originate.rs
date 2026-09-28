@@ -931,10 +931,11 @@ pub fn handle_originated_call_response(
                         );
                         state.call_actors.remove_call(internal_call_id);
                         state.call_event_receivers.remove(internal_call_id);
-                        // The group's winner cannot carry audio, and the others
-                        // were released when it won: the group fails with it.
+                        // The group's winner cannot carry audio: a group whose
+                        // first answer was final fails with it, one whose
+                        // answers are confirmed carries on with its other legs.
                         if let Some(win) = group_win {
-                            win.media_failed(status_code, &reason);
+                            win.media_failed(state, status_code, &reason);
                         }
                         return;
                     }

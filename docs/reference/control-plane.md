@@ -293,7 +293,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
-| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?}` (identity fields also per target) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits) |
+| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -1067,7 +1067,115 @@ starts billing before anyone picks up and denies the caller the callee's own
 ringback. That refusal carries
 `error.details: {"verb": "dial", "reason": "already_answered", "call_state": "answered"}`,
 where `call_state` is the state the call was found in, so a controller can tell
-it from any other `invalid_state` without reading the message.
+it from any other `invalid_state` without reading the message. A caller the app answered on purpose, to play it prompts first, is
+what `on_answer: "bridge"` is for.
+
+### `dial {on_answer: "bridge"}` — ring phones for an answered caller
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "on_answer": "bridge", "targets": [ {"aor": "sip:204@pbx.example"} ],
+            "strategy": "parallel", "timeout": 20, "ringback": "ringback_eu" } }
+```
+
+The end of every IVR flow: greeting, menu, then ring the department. The caller
+is already answered and anchored on the media engine (`answer {anchor: true}`),
+which is what let the app `play` to it, so a connecting `dial` refuses it.
+`on_answer` says what happens when a phone picks up:
+
+- `"connect"` (the default) — today's dial: the phone's answer answers the
+  caller. Refused on an answered call, as above.
+- `"bridge"` — accepted **only** on an answered caller with an anchored media
+  session. Each phone is rung as a call siphon places itself (every contact of
+  an `{aor}` over its own flow and Path, a URI as written, one phone per leg),
+  and the one that answers first is **bridged** to the caller the way the
+  [`bridge`](#joining-two-legs-bridge) verb joins two channels, with its
+  default `on_peer_hangup: "hangup"` (when either party hangs up, the other is
+  hung up too). The caller's own dialog is not touched until the bridge
+  re-INVITEs it.
+
+The targets, `strategy` (`parallel`, `sequential`), per-target `next_hop` and
+`headers`, the dial's `headers`, and every identity argument — `from`,
+`from_display`, `p_asserted_identity`, `privacy`, on the dial and per target —
+apply as they do for a connecting dial. A leg that names no identity shows the
+phone the **caller's** `From`, display name included; a named one is shaped by
+the same rules as above. Unlike a connecting dial, none of the caller's other
+INVITE headers reach the phones: each leg is a fresh call. `timeout` is how long
+each phone rings; the dial as a whole rings for `timeout` (parallel) or
+`timeout` × the number of phones (sequential). `profile` names the media profile
+each phone is anchored with, the caller's own by default.
+
+**Ringback.** `ringback` is a tone preset or cadence (`"ringback_eu"`,
+`"425/1000,0/4000*inf"`, anything [`play {tone}`](#phase-1-verb-set) takes),
+`true` for the default, or `false` for none; it defaults to `"ringback_eu"`.
+Any other value is `bad_request`, and naming one on a connecting dial is too.
+The ringback starts on the first `180`-`183` from any phone — a phone is
+actually alerting (RFC 3960) — not when the dial starts, and plays on the
+caller's anchor through the same engine path as `play {tone}`. A playback the
+app started is never talked over: when a phone alerts while a prompt still
+plays, the ringback waits for that prompt's `PlayFinished` and starts only if
+the phones are still ringing. (That needs an engine that reports a playback's
+end, siphon-rtp; with rtpengine a prompt that ends on its own is not seen to
+end, so the ringback is held until the dial ends.) It stops before the bridge
+re-points the caller's media, before `DialFailed`, and with the caller when it
+hangs up; when a bridge fails and phones still ring, it starts again. Its
+`PlayStarted` and `PlayFinished` carry `origin: "ringback"`, so
+the app can tell them from its own. With `ringback: false` the caller hears
+whatever the app leaves playing — its own tone or music on hold.
+
+A phone's early media is **not** relayed to the caller in this version: the two
+are not joined until one answers, and the ringback covers the wait.
+
+**An answer is kept only once its phone is bridged.** When a phone picks up it
+is ACKed and the bridge to it starts, but every other phone keeps ringing until
+`ChannelBridged`; only then are they CANCELled. A phone that answers while a
+bridge is in motion waits as a standby, ACKed and silent. When a bridge fails —
+the phone rejects the bridge's re-INVITE, or the bridge cannot start (the caller
+has a re-INVITE of its own in flight) — that phone is hung up with
+`Reason: Q.850;cause=41`, reported as `DialBranchFailed` with cause
+`bridge_failed`, and the dial goes on: the standbys are bridged next in the
+order they answered, the phones still ringing ring on, and a sequential dial
+rings its next target. When the bridge forms, every standby is hung up
+(`Reason: Q.850;cause=16`) and reported, with the phones still ringing, as
+`DialBranchFailed` with cause `cancelled`. The dial's deadline still applies:
+when it passes, the phones still ringing are CANCELled, but an answer already
+being bridged is seen through. `DialFailed` comes only once nothing is left.
+
+**Events**, all on the caller's channel:
+
+| event | payload | when |
+|---|---|---|
+| `DialBranch` | `{leg_id, leg_sip_call_id, target, aor?}` | a phone's INVITE goes out |
+| `PlayStarted` | `{source: "tone", origin: "ringback", play_id?, duration_ms?}` | a phone is alerting and the ringback started |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a phone ended without being kept: it never answered, it was CANCELled or released once another was bridged (`cancelled`), or it answered and its bridge failed (`bridge_failed`) |
+| `BridgeFailed` | as for `bridge` | a bridge to a phone that answered failed. On the caller's channel only, since the phone was never given one; `stage: "setup"` with a `reason` when the bridge never started |
+| `DialAnswered` | `{leg_id, leg_sip_call_id, target, code, aor?, channel}` | the phone that was **bridged**, sent once, when the bridge forms and just before `ChannelBridged`: an answer is not reported until it is kept. `channel` is a channel siphon minted for it, registered to this app and connection with the caller's `on_lost` policy (`null` when that channel has no live owner); the phone's own events follow on it |
+| `ChannelBridged` | as for `bridge`, on both channels | the bridge formed |
+| `DialFailed` | `{code, reason, cause, timed_out, branches}` | nobody answered; the ringback is already stopped, and nothing was sent to the caller |
+
+`cause` on `DialFailed` says how the dial ended: `rejected`, `ring timeout`,
+`unsent`, `bridge_failed`, or `caller_hangup` when the caller went away while
+the phones rang.
+In that last case every phone is CANCELled (RFC 3261 §9.1) and `DialFailed`
+precedes the caller's `StasisEnd`. After `DialFailed` the caller is still
+answered and owned: play the voicemail prompt, or dial again.
+
+A phone that hangs up while its bridge is in motion takes the caller with it,
+as a bridged party does (`on_peer_hangup: "hangup"`); the fallback covers a
+bridge that is refused or cannot start, not a phone that leaves.
+
+Refused, each with `error.details` `{verb: "dial", reason, …}`:
+
+| code | `reason` | when |
+|---|---|---|
+| `bad_request` | `unknown_value` (`argument: "on_answer"`) | `on_answer` is not `"connect"` or `"bridge"` |
+| `bad_request` | `invalid_value` / `requires_bridge` (`argument: "ringback"`) | `ringback` is not a non-empty string or a boolean; or it is named on a connecting dial |
+| `invalid_state` | `already_answered` (with `call_state`) | a connecting dial (no `on_answer`, or `"connect"`) on an answered caller |
+| `invalid_state` | `not_answered` (with `call_state`) | `bridge` on a caller that is not answered |
+| `invalid_state` | `not_anchored` | `bridge` on an answered caller with no media session on the engine |
+| `invalid_state` | `already_bridged` | the caller is already bridged |
+| `invalid_state` | `dial_in_progress` | the caller already has phones ringing for it |
+| `not_found` | `call_gone` | the caller is gone |
 
 ### Presenting an identity
 

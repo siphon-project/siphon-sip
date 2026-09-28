@@ -773,7 +773,7 @@ impl DialTarget {
     /// Resolved per field rather than all-or-nothing, so a target naming only
     /// a `from` still inherits the dial's `privacy`. Same precedence as
     /// `headers`, which a target already layers over the command's.
-    fn shaping_over(&self, dial: &DialShaping) -> DialShaping {
+    pub(super) fn shaping_over(&self, dial: &DialShaping) -> DialShaping {
         DialShaping {
             // Media is allocated once for the whole dial, so a branch cannot
             // pick its own profile.
@@ -823,9 +823,9 @@ pub struct DialShaping {
 
 /// The `From` a dial's identity arguments shaped.
 #[derive(Debug, Clone)]
-struct ShapedFrom {
+pub(super) struct ShapedFrom {
     /// The whole header value, dialog tag included.
-    header: String,
+    pub(super) header: String,
     /// The host to pin, when `from` named one.
     host: Option<String>,
 }
@@ -852,7 +852,10 @@ fn apply_dial_identity(
 
 /// The `From` `shaping` presents over `template`'s own, or `None` when it names
 /// no identity and the template's stands.
-fn shape_from(template: &SipMessage, shaping: &DialShaping) -> Result<Option<ShapedFrom>, String> {
+pub(super) fn shape_from(
+    template: &SipMessage,
+    shaping: &DialShaping,
+) -> Result<Option<ShapedFrom>, String> {
     if shaping.from.is_none() && shaping.from_display.is_none() {
         return Ok(None);
     }
@@ -1855,5 +1858,84 @@ mod tests {
             dial_headers_with_asserted_identity(&given, None),
             given.to_vec()
         );
+    }
+
+    /// A bridge dial that names no identity shows each phone the caller; one
+    /// that names one shows it, shaped as a connecting dial shapes it; and a
+    /// target's own wins over the dial's, field by field.
+    #[test]
+    fn a_bridge_dial_settles_each_legs_identity_over_the_callers() {
+        let template = from_template("\"Caller One\" <sip:15550100001@pbx.example.com>;tag=t");
+        let target = |uri: &str| DialTarget {
+            uri: uri.to_string(),
+            ..Default::default()
+        };
+
+        let mut targets = vec![target("sip:201@192.0.2.30")];
+        resolve_bridge_leg_identities(&template, &DialShaping::default(), &mut targets)
+            .expect("the caller's From resolves");
+        assert_eq!(
+            targets[0].from.as_deref(),
+            Some("sip:15550100001@pbx.example.com"),
+            "the caller, without its dialog tag"
+        );
+        assert_eq!(targets[0].from_display.as_deref(), Some("Caller One"));
+        assert_eq!(targets[0].privacy, None);
+
+        let shaping = DialShaping {
+            from: Some("sip:5550100@pbx.example.com".to_string()),
+            privacy: Some(crate::sip::privacy::CallerIdPresentation::Restricted),
+            ..Default::default()
+        };
+        let mut targets = vec![
+            target("sip:201@192.0.2.30"),
+            DialTarget {
+                from_display: Some("Overflow".to_string()),
+                privacy: Some(crate::sip::privacy::CallerIdPresentation::Allowed),
+                ..target("sip:202@192.0.2.31")
+            },
+        ];
+        resolve_bridge_leg_identities(&template, &shaping, &mut targets)
+            .expect("the identities resolve");
+        assert_eq!(
+            targets[0].from.as_deref(),
+            Some("sip:5550100@pbx.example.com")
+        );
+        assert_eq!(
+            targets[0].from_display.as_deref(),
+            Some(""),
+            "a named URI drops the caller's display name"
+        );
+        assert_eq!(
+            targets[0].privacy,
+            Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+        );
+        assert_eq!(
+            targets[1].from.as_deref(),
+            Some("sip:5550100@pbx.example.com")
+        );
+        assert_eq!(targets[1].from_display.as_deref(), Some("Overflow"));
+        assert_eq!(
+            targets[1].privacy,
+            Some(crate::sip::privacy::CallerIdPresentation::Allowed)
+        );
+    }
+
+    /// An identity siphon cannot put on the wire refuses the dial.
+    #[test]
+    fn a_bridge_dial_with_an_unparseable_identity_is_refused() {
+        let template = from_template("<sip:15550100001@pbx.example.com>;tag=t");
+        let mut targets = vec![DialTarget {
+            uri: "sip:201@192.0.2.30".to_string(),
+            ..Default::default()
+        }];
+        let shaping = DialShaping {
+            from: Some("not a uri".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_bridge_leg_identities(&template, &shaping, &mut targets),
+            Err(DialError::InvalidIdentity(_))
+        ));
     }
 }

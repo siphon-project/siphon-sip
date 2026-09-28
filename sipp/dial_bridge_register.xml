@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone of the `dial-bridge` acceptance test registers its AoR before the
+  caller calls: `dial {aor}` rings the registered contact, so an AoR nobody
+  registered would be refused `not_found` and nothing after it would run. It
+  registers from the address and port the UAS scenario then listens on
+  (sipp/dial_bridge_phone.xml), so the binding points at the phone.
+-->
+<scenario name="dial-bridge phone REGISTER">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:dialbridge.test SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:2001@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:2001@dialbridge.test>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:2001@[local_ip]:[local_port];transport=[transport]>;expires=3600
+Max-Forwards: 70
+User-Agent: SIPp/dial-bridge-phone
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" />
+
+</scenario>

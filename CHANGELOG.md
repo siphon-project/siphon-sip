@@ -39,6 +39,35 @@ entry, but a working config keeps working.
   AoR with nobody registered is `not_found` (`details.reason: "no_contacts"`)
   with nothing on the wire. `hangup` while the phones ring CANCELs every leg;
   `drop` is refused (`invalid_state`) there, since the INVITEs are owed a CANCEL.
+- **`dial {on_answer: "bridge"}` rings phones for a caller the controller
+  already answered.** Greeting, menu, then ring the department could not be
+  expressed: `play` needs an answered, anchored caller and `dial` refused one.
+  With `on_answer: "bridge"` (accepted only on an answered caller with a media
+  session on the engine) each target is rung as its own outbound leg, `{aor}`
+  contacts over their own flow and Path, showing the phone the caller's From or
+  the dial's identity arguments. The caller hears `ringback` (a tone preset or
+  cadence, default `ringback_eu`, or `false`) from the first 180-183 on, never
+  over a prompt still playing, and its `PlayStarted` / `PlayFinished` carry
+  `origin: "ringback"`. The first phone to answer gets `DialAnswered` with a
+  channel of its own (same app, connection and `on_lost` as the caller's) once it
+  is bridged to the caller: an answer is kept only when its bridge forms, so the
+  other phones ring on until then, a phone answering meanwhile waits as a
+  standby, and a bridge that fails hangs its phone up (`DialBranchFailed`,
+  cause `bridge_failed`) and the dial carries on with the standbys, the phones
+  still ringing or a sequential dial's next target. Nobody answering is `DialFailed`, with the ringback stopped first and the
+  caller still answered and owned; the caller hanging up CANCELs every phone. A
+  second bridge dial on the same caller, or one for a bridged caller, is
+  `invalid_state`, and every refusal carries `error.details`. A phone's early
+  media is not relayed yet.
+
+### Changed
+
+- **A leg's playback counts as ended once the engine reports it ended.**
+  siphon tracked "is something playing on this leg" only until a stop or the
+  session's delete, so a prompt that played out left the leg looking busy. The
+  engine's `PlayFinished` (siphon-rtp) now clears that playback, which spares
+  the bridge a redundant stop and lets a bridge dial's ringback start after a
+  prompt. rtpengine and rtpproxy report no end, so theirs is unchanged.
 
 ### Fixed
 

@@ -23,6 +23,10 @@ pub enum DialBranchCause {
     Cancelled,
     /// Its INVITE was built but could not be handed to the transport.
     Unsent,
+    /// It answered, but could not be bridged to the caller it was rung for
+    /// (`dial {on_answer: "bridge"}`), so it was hung up and the dial went on
+    /// without it.
+    BridgeFailed,
 }
 
 impl DialBranchCause {
@@ -34,6 +38,7 @@ impl DialBranchCause {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::Unsent => "unsent",
+            Self::BridgeFailed => "bridge_failed",
         }
     }
 }

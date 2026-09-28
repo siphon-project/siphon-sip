@@ -139,6 +139,7 @@ fn ring(
             targets,
             strategy,
             total_timeout_secs,
+            answers: OriginateGroupAnswers::First,
         },
         Arc::clone(&recorder) as Arc<dyn OriginateGroupSink>,
     )
@@ -914,6 +915,7 @@ async fn a_group_that_can_dial_nothing_is_refused_with_nothing_on_the_wire() {
             }],
             strategy: OriginateGroupStrategy::Sequential,
             total_timeout_secs: 30,
+            answers: OriginateGroupAnswers::First,
         },
         Arc::clone(&recorder) as Arc<dyn OriginateGroupSink>,
     )

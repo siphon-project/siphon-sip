@@ -271,6 +271,11 @@ pub struct DispatcherState {
     /// placed itself, the first to answer kept. Each group and each of its
     /// legs' index entries goes when the group ends, however it ends.
     pub originate_groups: Arc<crate::dispatcher::b2bua::OriginateGroupStore>,
+    /// Bridge dials in flight: the callers with phones ringing for them, the
+    /// answered phones waiting on their bridge, and the ringbacks playing.
+    /// Every entry goes when its dial, bridge or ringback ends, or with the
+    /// call it belongs to.
+    pub dial_bridges: Arc<crate::dispatcher::b2bua::DialBridgeStore>,
     /// Shared drain state — the server flips `drain.is_draining` on
     /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
