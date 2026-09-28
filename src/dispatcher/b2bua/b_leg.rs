@@ -738,14 +738,24 @@ pub fn b2bua_send_b_leg_invite(
         &data,
         outbound_transport,
         destination,
-        client_retransmit_source(outbound_transport, destination, flow, send_socket),
+        client_retransmit_source(
+            outbound_transport,
+            destination,
+            flow.map(|flow| flow.local_addr),
+            send_socket,
+        ),
         state,
     );
 
     if let Some(flow) = flow {
-        if let Err(error) =
-            send_over_flow(call_id, data, flow, outbound_transport, destination, state)
-        {
+        if let Err(error) = send_over_flow(
+            call_id,
+            data,
+            CapturedFlow::from(flow),
+            outbound_transport,
+            destination,
+            state,
+        ) {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
             // The leg is registered and its actor spawned by this point, but the
             // INVITE is not on the wire and nothing will ever answer it. Report

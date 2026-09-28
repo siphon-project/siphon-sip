@@ -362,6 +362,25 @@ pub(super) fn resolve_leg_destination<'a>(
     }
 }
 
+/// The two halves of a captured flow a send needs: the listener socket the
+/// phone registered on, and the connection it registered over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CapturedFlow {
+    /// The listener the frame leaves from.
+    pub(super) local_addr: SocketAddr,
+    /// The connection it goes over.
+    pub(super) connection_id: ConnectionId,
+}
+
+impl From<&crate::script::api::registrar::PyFlow> for CapturedFlow {
+    fn from(flow: &crate::script::api::registrar::PyFlow) -> Self {
+        CapturedFlow {
+            local_addr: flow.local_addr,
+            connection_id: ConnectionId(flow.connection_id),
+        }
+    }
+}
+
 /// Write `data` straight to a captured flow's socket: the connection the phone
 /// registered on, bypassing DNS and the connection pool (the proxy's
 /// `relay(flow=…)` twin, RFC 5626 §5.3).
@@ -372,7 +391,7 @@ pub(super) fn resolve_leg_destination<'a>(
 pub(super) fn send_over_flow(
     call_id: &str,
     data: Bytes,
-    flow: &crate::script::api::registrar::PyFlow,
+    flow: CapturedFlow,
     transport: Transport,
     destination: SocketAddr,
     state: &DispatcherState,
@@ -397,7 +416,7 @@ pub(super) fn send_over_flow(
         .outbound
         .send(OutboundMessage {
             followups: None,
-            connection_id: ConnectionId(flow.connection_id),
+            connection_id: flow.connection_id,
             transport,
             destination,
             data,

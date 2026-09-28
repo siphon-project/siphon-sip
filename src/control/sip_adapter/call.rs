@@ -327,36 +327,39 @@ pub(super) fn reject(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
 
 pub(super) fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let reason = args.get("reason").and_then(|v| v.as_str());
-    let (answered, originated) = crate::b2bua::actor::global_call_store()
-        .and_then(|store| {
-            store.get_call(&channel.call_actor_id).map(|call| {
-                (
-                    matches!(call.state, crate::b2bua::actor::CallState::Answered),
-                    call.originated,
-                )
-            })
+    let call = crate::b2bua::actor::global_call_store().and_then(|store| {
+        store.get_call(&channel.call_actor_id).map(|call| {
+            (
+                matches!(call.state, crate::b2bua::actor::CallState::Answered),
+                call.originated,
+            )
         })
-        .unwrap_or((false, false));
+    });
 
-    let ok = if answered {
+    let ok = match call {
         // Answered: BYE both legs via the full teardown funnel (Rf/Ro/CDR/media).
-        crate::dispatcher::b2bua_terminate_call(&channel.sip_call_id, reason)
-    } else if originated {
+        Some((true, _)) => crate::dispatcher::b2bua_terminate_call(&channel.sip_call_id, reason),
         // A call siphon placed that has not answered: abandon it with a CANCEL on
         // our own INVITE (RFC 3261 §9.1). The arm below sends a final *response*,
         // which a UAC has no business sending to the party it is calling.
-        crate::dispatcher::b2bua_cancel_originated_call(
+        Some((false, true)) => crate::dispatcher::b2bua_cancel_originated_call(
             &channel.sip_call_id,
             Some(reason.unwrap_or("cancelled")),
-        )
-    } else {
+        ),
         // Unanswered/parked: send a final non-2xx and tear down (no B-leg to CANCEL
         // in Phase 1's single-CallActor model).
-        crate::dispatcher::b2bua_reject_call(
+        Some((false, false)) => crate::dispatcher::b2bua_reject_call(
             &channel.call_actor_id,
             603,
             reason.unwrap_or("Decline"),
-        )
+        ),
+        // No call behind the channel: an `originate` to an AoR whose phones are
+        // still ringing is bound to its group, and ending it CANCELs every leg.
+        // `false` when there is no such group either — the call is gone.
+        None => crate::dispatcher::b2bua_cancel_originated_call(
+            &channel.sip_call_id,
+            Some(reason.unwrap_or("cancelled")),
+        ),
     };
     if ok {
         ControlResult::Ok(
@@ -411,6 +414,13 @@ pub(super) fn drop_result(
             ControlErrorCode::InvalidState,
             "drop cannot end this call: it is in state \"answered\", and an answered dialog is \
              owed a BYE (RFC 3261 §15) — use hangup",
+        ),
+        crate::dispatcher::DropOutcome::Ringing => ControlResult::error(
+            ControlErrorCode::InvalidState,
+            "drop cannot end this channel: it is an originate whose phones are still ringing, \
+             and siphon is their caller, so there is no response to withhold. Leaving the \
+             INVITEs standing would ring the phones for nobody — use hangup, which CANCELs \
+             them (RFC 3261 §9.1)",
         ),
         crate::dispatcher::DropOutcome::Gone => {
             ControlResult::error(ControlErrorCode::NotFound, "call is gone")

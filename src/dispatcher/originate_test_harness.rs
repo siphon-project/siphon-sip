@@ -1,5 +1,10 @@
 //! Shared fixtures for the tests that place calls with `originate` and read
 //! what siphon put on the wire.
+//!
+//! A frame is kept with the socket it was pinned to and the connection it was
+//! addressed on, not only its destination: a phone registered over a captured
+//! flow is reachable only on that flow, so where an INVITE *left from* is as
+//! much the assertion as where it went.
 
 use std::sync::Arc;
 
@@ -11,6 +16,11 @@ use crate::rtpengine::test_native_engine::NativeTestEngine;
 #[derive(Debug, Clone)]
 pub(super) struct Sent {
     pub(super) destination: SocketAddr,
+    pub(super) transport: Transport,
+    /// The local socket the frame was pinned to, if any.
+    pub(super) source: Option<SocketAddr>,
+    /// The connection the frame was addressed on.
+    pub(super) connection_id: ConnectionId,
     pub(super) message: SipMessage,
 }
 
@@ -27,6 +37,9 @@ pub(super) fn drain(receiver: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
         for frame in outbound.frames() {
             sent.push(Sent {
                 destination: outbound.destination,
+                transport: outbound.transport,
+                source: outbound.source_local_addr,
+                connection_id: outbound.connection_id,
                 message: crate::sip::parser::parse_sip_message_bytes(frame)
                     .expect("siphon sent a message that parses"),
             });
@@ -57,6 +70,27 @@ pub(super) fn anchored_dispatcher(engine: &NativeTestEngine) -> TestDispatcher {
     dispatcher.state.rtpengine_sessions =
         Some(Arc::new(crate::rtpengine::MediaSessionStore::new()));
     dispatcher
+}
+
+/// Replace the dispatcher's egress with fresh channels and return the one the
+/// stream transports (TCP, TLS, WS, WSS) write to. `dispatcher.udp` is the new
+/// UDP channel.
+pub(super) fn with_stream_egress(
+    mut dispatcher: TestDispatcher,
+) -> (TestDispatcher, flume::Receiver<OutboundMessage>) {
+    let (udp_sender, udp) = flume::unbounded();
+    let (stream_sender, stream) = flume::unbounded();
+    dispatcher.state.outbound = Arc::new(OutboundRouter {
+        udp: udp_sender.into(),
+        udp_by_local: std::collections::HashMap::new(),
+        tcp: stream_sender.clone(),
+        tls: stream_sender.clone(),
+        ws: stream_sender.clone(),
+        wss: stream_sender,
+        sctp: None,
+    });
+    dispatcher.udp = udp;
+    (dispatcher, stream)
 }
 
 /// What an originate carries when siphon anchors its media: an offerless

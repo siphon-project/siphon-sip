@@ -79,6 +79,30 @@ pub struct OriginateParams {
     pub session_timer: Option<crate::script::api::call::SessionTimerOverride>,
 }
 
+/// Where an originate goes when it rings a registered contact rather than a
+/// URI siphon resolves itself: the contact it rings, the flow the phone
+/// registered over and the route set its Path names.
+///
+/// Kept apart from [`OriginateParams`], which is part of the published API and
+/// is built field by field: a field added there would break every embedder
+/// that builds one. This is crate-internal, reached through
+/// [`prepare_originate_routed`].
+#[derive(Debug, Clone, Default)]
+pub struct OriginateRoute {
+    /// The Request-URI: the registered contact. `None` rings
+    /// [`OriginateParams::to`], which then names the call's R-URI and its To.
+    /// When set, `to` stays the To (the AoR the phone registered) and this is
+    /// where the INVITE is addressed (RFC 3261 §8.1.1.1, §10.3 retargeting).
+    pub request_uri: Option<String>,
+    /// The flow the phone registered over (RFC 5626 §5.3). A phone behind NAT
+    /// on TCP, TLS or WSS is reachable on that connection alone.
+    pub flow: Option<crate::script::api::registrar::PyFlow>,
+    /// The route set the binding's Path names (RFC 3327 §5.3), carried as the
+    /// INVITE's Route headers; its topmost entry is the next hop. Outranks the
+    /// flow, as for a dialled B-leg.
+    pub route: Vec<String>,
+}
+
 /// Why an originate was refused. Each variant maps to its own control-plane
 /// error code — a caller must be able to tell "your URI is wrong" from "no
 /// route" from "this backend cannot do that".
@@ -165,12 +189,29 @@ pub fn prepare_originate(
     state: &DispatcherState,
     params: OriginateParams,
 ) -> Result<PreparedOriginate, OriginateError> {
+    prepare_originate_routed(state, params, &OriginateRoute::default())
+}
+
+/// [`prepare_originate`] to a registered contact: the INVITE is addressed to
+/// `route.request_uri`, carries `route.route` as its Route headers and goes
+/// over `route.flow`, resolved exactly as a dialled B-leg is
+/// ([`resolve_leg_destination`]).
+pub fn prepare_originate_routed(
+    state: &DispatcherState,
+    params: OriginateParams,
+    route: &OriginateRoute,
+) -> Result<PreparedOriginate, OriginateError> {
+    let (request_uri, request_uri_field) = match route.request_uri.as_deref() {
+        Some(contact) => (contact, "contact"),
+        None => (params.to.as_str(), "to"),
+    };
     let target_uri =
-        parse_uri_standalone(&params.to).map_err(|error| OriginateError::InvalidUri {
-            field: "to",
+        parse_uri_standalone(request_uri).map_err(|error| OriginateError::InvalidUri {
+            field: request_uri_field,
             detail: error.to_string(),
         })?;
     for (field, value) in [
+        ("to", route.request_uri.as_ref().map(|_| params.to.as_str())),
         ("from", params.from.as_deref()),
         ("next_hop", params.next_hop.as_deref()),
         ("p_asserted_identity", params.p_asserted_identity.as_deref()),
@@ -193,20 +234,34 @@ pub fn prepare_originate(
     // Resolve the wire destination. `next_hop` steers egress without touching
     // the R-URI (the called party's shape is preserved on the wire) — the same
     // split `call.dial(next_hop=…)` and `proxy.send_request(next_hop=…)` make.
-    let routing_uri = params.next_hop.as_deref().unwrap_or(&params.to);
-    let relay_target = resolve_target(routing_uri, &state.dns_resolver).ok_or_else(|| {
-        OriginateError::Unroutable(format!("cannot resolve a destination for '{routing_uri}'"))
-    })?;
-    let destination = relay_target.address;
-    let transport = relay_target.transport.unwrap_or(Transport::Udp);
+    // A registered contact goes over its Path, or else its flow, exactly as a
+    // dialled B-leg does.
+    let LegDestination {
+        flow,
+        routing_uri,
+        destination,
+        transport,
+    } = resolve_leg_destination(
+        request_uri,
+        params.next_hop.as_deref(),
+        route.flow.as_ref(),
+        &route.route,
+        &state.dns_resolver,
+    )
+    .map_err(|error| OriginateError::Unroutable(error.to_string()))?;
+    let flow_local_addr = flow.map(|flow| flow.local_addr);
 
     let sip_call_id = crate::b2bua::actor::generate_call_id();
     let from_tag = crate::b2bua::actor::generate_tag();
     let branch = TransactionKey::generate_branch();
-    let (via_host, via_port) = (state.via_host(&transport), state.via_port(&transport));
+    // The socket the INVITE leaves from is the one it advertises, Via and
+    // Contact alike, or the phone answers somewhere siphon is not listening on
+    // its flow. A wildcard listener's flow names that socket's advertised
+    // identity, never `0.0.0.0` (see `pinned_sent_by`).
+    let (via_host, via_port) = b_leg_sent_by(flow_local_addr, state, &transport);
 
     let contact = build_b_leg_contact(&via_host, via_port, transport, None, None);
-    let invite = build_originate_invite(
+    let mut invite = build_originate_invite(
         &params,
         target_uri,
         OriginateIdentity {
@@ -224,17 +279,26 @@ pub fn prepare_originate(
         },
         session_timer_policy_for(state, params.session_timer.as_ref()),
     )?;
+    // The binding's Path, as the route set the INVITE carries (RFC 3261
+    // §8.1.2, RFC 3327 §5.3). Its CANCEL copies it (§9.1).
+    if !route.route.is_empty() {
+        invite.headers.set_all("Route", route.route.clone());
+    }
 
     let mut leg = crate::b2bua::actor::Leg::new_originating_leg(
         sip_call_id.clone(),
         from_tag.clone(),
-        params.to.clone(),
+        request_uri.to_string(),
         branch.clone(),
         LegTransport {
             remote_addr: destination,
-            connection_id: ConnectionId::default(),
+            connection_id: flow
+                .map(|flow| ConnectionId(flow.connection_id))
+                .unwrap_or_default(),
             transport,
-            local_addr: None,
+            // Anchored on the flow's socket, so the ACK, CANCEL and BYE leave
+            // from where the INVITE did.
+            local_addr: flow_local_addr,
         },
     );
     leg.dialog.local_contact = Some(contact);
@@ -280,7 +344,7 @@ pub fn prepare_originate(
         // challenges with its credentials. The `originate` verb carries none of
         // its own — a controller should not be shipping trunk passwords over
         // the control rail when the gateway already holds them.
-        call.outbound_credentials = originate_gateway_credentials(routing_uri, destination);
+        call.outbound_credentials = originate_gateway_credentials(&routing_uri, destination);
     }
     state
         .call_event_receivers
@@ -289,9 +353,10 @@ pub fn prepare_originate(
     info!(
         call_id = %internal_call_id,
         %sip_call_id,
-        target = %params.to,
+        target = %request_uri,
         %destination,
         %transport,
+        source = ?flow_local_addr,
         "B2BUA: originate staged"
     );
     Ok(PreparedOriginate {
@@ -554,13 +619,26 @@ pub fn b2bua_originate_dial(prepared: &PreparedOriginate) -> bool {
 /// tokio runtime: the dial half of [`prepare_originate`], and what lets a test
 /// place a staged originate the way the control plane does.
 pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> bool {
-    if state
-        .call_actors
-        .get_call(&prepared.internal_call_id)
-        .is_none()
-    {
+    // The flow the INVITE is pinned to, when it rings a phone over the
+    // connection it registered on: the leg was anchored on it at prepare.
+    let Some((pinned, branch)) =
+        state
+            .call_actors
+            .get_call(&prepared.internal_call_id)
+            .map(|call| {
+                let pinned = call
+                    .a_leg
+                    .transport
+                    .local_addr
+                    .map(|local_addr| CapturedFlow {
+                        local_addr,
+                        connection_id: call.a_leg.transport.connection_id,
+                    });
+                (pinned, call.a_leg.branch.clone())
+            })
+    else {
         return false;
-    }
+    };
 
     // A call placed to a registered phone is that phone's dialog: watched
     // before the INVITE goes, so no response can overtake it.
@@ -572,22 +650,59 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
         &data,
         prepared.transport,
         prepared.destination,
-        udp_egress_source(prepared.transport, prepared.destination, None),
+        client_retransmit_source(
+            prepared.transport,
+            prepared.destination,
+            pinned.map(|flow| flow.local_addr),
+            None,
+        ),
         state,
     );
-    let relay_target = RelayTarget {
-        address: prepared.destination,
-        transport: Some(prepared.transport),
-        server_name: None,
-    };
-    send_to_target(
-        data,
-        &relay_target,
-        prepared.transport,
-        ConnectionId::default(),
-        None,
-        state,
-    );
+    match pinned {
+        Some(flow) => {
+            if let Err(error) = send_over_flow(
+                &prepared.internal_call_id,
+                data,
+                flow,
+                prepared.transport,
+                prepared.destination,
+                state,
+            ) {
+                // Nothing will answer an INVITE that never left: say so now,
+                // rather than at the ring timeout.
+                error!(
+                    call_id = %prepared.internal_call_id,
+                    destination = %prepared.destination,
+                    transport = %prepared.transport,
+                    "originate: the flow would not take the INVITE: {error}"
+                );
+                // The call exists only for this INVITE; it goes with it, the
+                // way a call torn down before dialling is gone, so a `false`
+                // here leaves nothing behind for the caller to clean up.
+                state.b2bua_retransmits.disarm_branch(&branch);
+                state.call_actors.remove_call(&prepared.internal_call_id);
+                state
+                    .call_event_receivers
+                    .remove(&prepared.internal_call_id);
+                return false;
+            }
+        }
+        None => {
+            let relay_target = RelayTarget {
+                address: prepared.destination,
+                transport: Some(prepared.transport),
+                server_name: None,
+            };
+            send_to_target(
+                data,
+                &relay_target,
+                prepared.transport,
+                ConnectionId::default(),
+                None,
+                state,
+            );
+        }
+    }
     set_b2bua_answer_deadline(&prepared.internal_call_id, prepared.timeout_secs, state);
     debug!(
         call_id = %prepared.internal_call_id,
@@ -700,6 +815,15 @@ pub fn handle_originated_call_response(
                 "sdp": originate_body_text(message),
             }),
         );
+        originate_group_leg_progress(
+            state,
+            internal_call_id,
+            OriginateLegProgress {
+                code: status_code,
+                early_media,
+                sdp: originate_body_text(message),
+            },
+        );
         debug!(
             call_id = %internal_call_id,
             status = status_code,
@@ -723,6 +847,22 @@ pub fn handle_originated_call_response(
             originate_ack_2xx(&leg, message, answer.as_deref(), state);
             return;
         }
+
+        // A leg of an originate group answers only if it is the first to: the
+        // claim is taken before anything is anchored, so a leg that lost the
+        // race costs no media session. The loser's dialog is real and is
+        // released, ACK then BYE (RFC 3261 §13.2.2.4, §15).
+        let group_win = match originate_group_claim_answer(state, internal_call_id, status_code) {
+            OriginateGroupClaim::Ungrouped => None,
+            OriginateGroupClaim::Won(win) => Some(win),
+            // The first copy of this 2xx is still being carried out; it ACKs.
+            OriginateGroupClaim::Duplicate => return,
+            OriginateGroupClaim::Lost => {
+                originate_release_losing_answer(internal_call_id, message, state);
+                originate_group_leg_released(state, internal_call_id);
+                return;
+            }
+        };
 
         // Confirm the dialog from the 2xx (RFC 3261 §12.1.2).
         let remote_tag = crate::b2bua::actor::extract_to_tag(message);
@@ -791,6 +931,11 @@ pub fn handle_originated_call_response(
                         );
                         state.call_actors.remove_call(internal_call_id);
                         state.call_event_receivers.remove(internal_call_id);
+                        // The group's winner cannot carry audio, and the others
+                        // were released when it won: the group fails with it.
+                        if let Some(win) = group_win {
+                            win.media_failed(status_code, &reason);
+                        }
                         return;
                     }
                 }
@@ -824,6 +969,11 @@ pub fn handle_originated_call_response(
         originate_ack_2xx(&leg, message, anchor_answer.as_deref(), state);
         if crate::cdr::auto_emit_enabled() {
             cdr_mark_answer(state, internal_call_id, status_code);
+        }
+        // The group's winner is handed to whoever drives the group before its
+        // answer is published, so the answer reaches the channel it now owns.
+        if let Some(win) = group_win {
+            win.answered(&sip_call_id);
         }
         control_notify_channel_event(
             &sip_call_id,
@@ -866,7 +1016,7 @@ pub fn handle_originated_call_response(
         via_port,
     );
     send_b2bua_to_bleg(
-        ack,
+        with_invite_route_set(ack, internal_call_id, state),
         leg.transport.transport,
         leg.transport.remote_addr,
         leg.transport.local_addr,
@@ -905,6 +1055,41 @@ pub fn handle_originated_call_response(
     originate_delete_media(&sip_call_id, state);
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
+    // A leg of an originate group: the group decides what its rejection means.
+    originate_group_leg_ended(
+        state,
+        internal_call_id,
+        crate::b2bua::actor::DialBranchOutcome::new(
+            status_code,
+            &reason_phrase,
+            crate::b2bua::actor::DialBranchCause::Rejected,
+        ),
+    );
+}
+
+/// `ack` with the Route headers of the INVITE it acknowledges. RFC 3261
+/// §17.1.1.3: an ACK to a non-2xx final carries the INVITE's Route header
+/// fields, so an originate routed through a binding's Path has its ACK take the
+/// same path. A no-op for an INVITE that carried none.
+fn with_invite_route_set(
+    mut ack: SipMessage,
+    internal_call_id: &str,
+    state: &DispatcherState,
+) -> SipMessage {
+    let routes = state
+        .call_actors
+        .get_call(internal_call_id)
+        .and_then(|call| call.a_leg_invite.clone())
+        .and_then(|invite| {
+            invite
+                .lock()
+                .ok()
+                .and_then(|invite| invite.headers.get_all("Route").cloned())
+        });
+    if let Some(routes) = routes.filter(|routes| !routes.is_empty()) {
+        ack.headers.set_all("Route", routes);
+    }
+    ack
 }
 
 /// The credentials of the configured gateway an originate is aimed at, if any.
@@ -1045,7 +1230,7 @@ fn retry_originate_with_credentials(
         via_port,
     );
     send_b2bua_to_bleg(
-        ack,
+        with_invite_route_set(ack, internal_call_id, state),
         leg.transport.transport,
         leg.transport.remote_addr,
         leg.transport.local_addr,
@@ -1179,113 +1364,6 @@ pub fn originate_ack_2xx(
     send_b2bua_to_bleg(ack, transport, destination, leg.transport.local_addr, state);
 }
 
-/// Answer the callee's 2xx offer locally on the media backend and record the
-/// media session under this leg's SIP Call-ID, so every media verb resolves
-/// against it through [`b2bua_media_target`].
-///
-/// Returns the answer SDP for the ACK, or a short human reason on failure —
-/// never a silent no-op, because an offerless INVITE with no answer is a
-/// connected call with no audio.
-pub fn originate_anchor_2xx(
-    sip_call_id: &str,
-    remote_tag: &str,
-    response: &SipMessage,
-    anchor: &crate::b2bua::actor::OriginateAnchor,
-    state: &DispatcherState,
-) -> Result<String, String> {
-    let backend = state
-        .rtpengine_set
-        .as_ref()
-        .ok_or_else(|| "no media backend configured".to_string())?;
-    let registry = state
-        .rtpengine_profiles
-        .as_ref()
-        .ok_or_else(|| "no media profiles configured".to_string())?;
-    let entry = registry
-        .get(&anchor.profile)
-        .ok_or_else(|| format!("unknown media profile '{}'", anchor.profile))?;
-    let mut flags = entry.answer.clone();
-
-    let offer_sdp = std::str::from_utf8(&response.body)
-        .map_err(|_| "the callee's 2xx body is not valid UTF-8 SDP".to_string())?
-        .to_string();
-    if offer_sdp.trim().is_empty() {
-        return Err("the callee answered with no SDP offer — nothing to anchor".to_string());
-    }
-
-    // ws_uri precedence: explicit per-call arg → the profile's own → none.
-    let template = anchor.ws_uri.clone().or_else(|| flags.ws_uri.clone());
-    if let Some(template) = template {
-        let context = crate::script::api::rtpengine::WsUriContext {
-            call_id: sip_call_id,
-            from_tag: remote_tag,
-            from_user: None,
-            to_user: None,
-        };
-        flags.ws_uri = Some(
-            crate::script::api::rtpengine::expand_ws_uri(&template, &context)
-                .map_err(|error| format!("ws_uri templating failed: {error:?}"))?,
-        );
-    }
-    let unsupported = backend.unsupported_flags(&flags);
-    if !unsupported.is_empty() {
-        return Err(format!(
-            "media profile '{}' sets {} which the {} backend cannot honour",
-            anchor.profile,
-            unsupported.join(", "),
-            backend.kind().as_str()
-        ));
-    }
-
-    // The offerer here is the *callee* (it offered in its 2xx), so the engine's
-    // monologue is keyed on the callee's tag — the same "key on the offerer's
-    // tag" convention the inbound answer-first anchor uses.
-    let answer = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer_local(
-            sip_call_id,
-            remote_tag,
-            &offer_sdp,
-            &flags,
-        ))
-    })
-    .map_err(|error| format!("answer_local failed: {error}"))?;
-
-    if let Some(sessions) = state.rtpengine_sessions.as_ref() {
-        sessions.insert(crate::rtpengine::session::MediaSession {
-            rtpengine_call_id: sip_call_id.to_string(),
-            call_id: sip_call_id.to_string(),
-            from_tag: remote_tag.to_string(),
-            to_tag: None,
-            profile: anchor.profile.clone(),
-            ws_uri: flags.ws_uri.clone(),
-            ws_tee: flags.ws_tee.clone(),
-            ws_bridge_attached: false,
-            created_at: std::time::Instant::now(),
-        });
-    }
-    Ok(answer)
-}
-
-/// Drop any media session anchored for an originated call that failed before it
-/// could be torn down the ordinary way.
-pub fn originate_delete_media(sip_call_id: &str, state: &DispatcherState) {
-    if let (Some(backend), Some(sessions)) = (&state.rtpengine_set, &state.rtpengine_sessions) {
-        if let Some(session) = sessions.remove(sip_call_id) {
-            let backend = Arc::clone(backend);
-            tokio::spawn(async move {
-                if let Err(error) = backend
-                    .delete(session.rtpengine_id(), &session.from_tag)
-                    .await
-                {
-                    if !error.is_call_not_found() {
-                        warn!(call_id = %session.call_id, "originate: media delete failed: {error}");
-                    }
-                }
-            });
-        }
-    }
-}
-
 /// Fire `@b2bua.on_answer(call, reply)` for an originated call, so an in-process
 /// script driving `b2bua.originate()` sees the answer through the same handler
 /// an inbound-driven call uses.
@@ -1344,79 +1422,4 @@ pub fn originate_fire_answer_handlers(
             }
         }
     });
-}
-
-/// Abandon an originated call that has not been answered: CANCEL the INVITE
-/// (RFC 3261 §9.1 — same Via branch and CSeq sequence as the request it
-/// cancels), stop retransmitting it, emit `StasisEnd`, and tear the call down.
-///
-/// This is what `hangup` means on an un-answered leg siphon placed. The
-/// inbound-call path answers its A-leg with a final non-2xx there, which is
-/// exactly wrong here: siphon is the UAC, and sending a *response* to the party
-/// it is calling is not a thing (RFC 3261 §8.1 — a UAC answers nothing).
-/// Returns `false`, never panics, when the call is already gone.
-pub fn b2bua_cancel_originated_call(sip_call_id: &str, reason: Option<&str>) -> bool {
-    let Some(control) = B2BUA_CONTROL.get() else {
-        return false;
-    };
-    let state = &control.state;
-    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
-        return false;
-    };
-    let _enter = control.runtime.enter();
-
-    let staged = match state.call_actors.get_call(&internal_call_id) {
-        Some(call) => call.a_leg_invite.clone().map(|invite| {
-            (
-                invite,
-                call.a_leg.transport.transport,
-                call.a_leg.transport.remote_addr,
-                call.a_leg.transport.local_addr,
-                call.a_leg.branch.clone(),
-            )
-        }),
-        None => return false,
-    };
-    let Some((invite_arc, transport, destination, local_addr, branch)) = staged else {
-        return false;
-    };
-
-    // Stop the INVITE's own retransmit schedule first: we are giving up on it,
-    // and `arm_b2bua_retransmit` disarms it again when the CANCEL is armed —
-    // this also covers a leg whose CANCEL cannot be built.
-    state.b2bua_retransmits.disarm_branch(&branch);
-    let cancel = match invite_arc.lock() {
-        Ok(invite) => build_cancel_from_invite(&invite),
-        Err(_) => {
-            error!(call_id = %internal_call_id, "originate cancel: stored INVITE mutex poisoned");
-            None
-        }
-    };
-    if let Some(cancel) = cancel {
-        send_b2bua_to_bleg(cancel, transport, destination, local_addr, state);
-    }
-
-    if crate::cdr::auto_emit_enabled() {
-        cdr_finalize_b2bua_fail(state, &internal_call_id, 487);
-    }
-    // RFC 3261 §9.1: the callee answers a CANCELled INVITE `487 Request
-    // Terminated`. We abandoned this leg before it was answered, so 487 is the
-    // status that ends it — reported here because a controller driving a leg
-    // siphon placed has no response frame of its own to read it off.
-    control_notify_terminated_with_cause(
-        sip_call_id,
-        reason.unwrap_or("cancelled"),
-        Some(487),
-        Some("Request Terminated"),
-    );
-    // Keep the leg alive as a zombie so a 2xx that raced our CANCEL is still
-    // ACKed + BYEd (RFC 3261 §9.1 glare) rather than left ringing on the callee.
-    if state
-        .call_actors
-        .remove_call_after_cancel(&internal_call_id)
-    {
-        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
-    }
-    state.call_event_receivers.remove(&internal_call_id);
-    true
 }

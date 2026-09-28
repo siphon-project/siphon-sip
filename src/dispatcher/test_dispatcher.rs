@@ -122,6 +122,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         is_draining: Arc::new(DrainState::new()),
         rf_charger: None,
         rf_sessions: Arc::new(DashMap::new()),

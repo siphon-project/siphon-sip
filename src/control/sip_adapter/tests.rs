@@ -5,8 +5,8 @@ use super::media::{
     play_accept, play_source_kind, record_start, stream_start, StreamMode,
 };
 use super::originate::{
-    originate, originate_error, originate_with_bus, parse_originate_media, parse_privacy,
-    parse_session_timer,
+    default_total_timeout, originate, originate_error, originate_with_bus, parse_originate_media,
+    parse_originate_target, parse_privacy, parse_session_timer, OriginateTarget,
 };
 use super::routing::{dial_error, parse_dial_target, parse_route_target, route};
 use super::transfer::{
@@ -931,6 +931,17 @@ fn drop_refuses_an_answered_call_naming_the_verb_and_the_state() {
         message.contains("hangup"),
         "the refusal must point at the verb that does work: {message}"
     );
+}
+
+#[test]
+fn drop_refuses_a_ringing_originate_group_pointing_at_hangup() {
+    let result = drop_result(&channel(), crate::dispatcher::DropOutcome::Ringing);
+    let ControlResult::Error { code, message, .. } = result else {
+        panic!("drop on a ringing originate group must be refused");
+    };
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    assert!(message.contains("hangup"), "{message}");
+    assert!(message.contains("CANCEL"), "{message}");
 }
 
 #[test]
@@ -2479,4 +2490,97 @@ fn reject_refer_dispatches_through_apply_sip() {
             ..
         }
     ));
+}
+
+#[test]
+fn originate_target_is_exactly_one_of_to_and_aor() {
+    assert_eq!(
+        parse_originate_target(&serde_json::json!({ "to": "sip:1@198.51.100.1" })),
+        Ok(OriginateTarget::Uri("sip:1@198.51.100.1".to_string()))
+    );
+    assert_eq!(
+        parse_originate_target(&serde_json::json!({ "aor": "sip:201@example.com" })),
+        Ok(OriginateTarget::Aor {
+            aor: "sip:201@example.com".to_string(),
+            strategy: crate::dispatcher::OriginateGroupStrategy::Parallel,
+            total_timeout_secs: None,
+        })
+    );
+    assert_eq!(
+        parse_originate_target(&serde_json::json!({
+            "aor": "sip:201@example.com",
+            "strategy": "Sequential",
+            "total_timeout": 45,
+        })),
+        Ok(OriginateTarget::Aor {
+            aor: "sip:201@example.com".to_string(),
+            strategy: crate::dispatcher::OriginateGroupStrategy::Sequential,
+            total_timeout_secs: Some(45),
+        })
+    );
+    for refused in [
+        serde_json::json!({}),
+        serde_json::json!({ "to": "sip:1@198.51.100.1", "aor": "sip:201@example.com" }),
+        serde_json::json!({ "to": "" }),
+        serde_json::json!({ "aor": 201 }),
+        serde_json::json!({ "to": "sip:1@198.51.100.1", "strategy": "parallel" }),
+        serde_json::json!({ "to": "sip:1@198.51.100.1", "total_timeout": 10 }),
+        serde_json::json!({ "aor": "sip:201@example.com", "strategy": "hunt" }),
+        serde_json::json!({ "aor": "sip:201@example.com", "total_timeout": "10" }),
+        serde_json::json!({ "aor": "sip:201@example.com", "total_timeout": -1 }),
+    ] {
+        assert!(
+            parse_originate_target(&refused).is_err(),
+            "{refused} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_group_deadline_defaults_to_the_time_its_legs_can_ring() {
+    use crate::dispatcher::OriginateGroupStrategy::{Parallel, Sequential};
+    assert_eq!(default_total_timeout(Parallel, 30, 3), 30);
+    assert_eq!(default_total_timeout(Sequential, 30, 3), 90);
+    assert_eq!(
+        default_total_timeout(Sequential, 0, 3),
+        0,
+        "no ring timeout, no deadline"
+    );
+    assert_eq!(default_total_timeout(Sequential, u32::MAX, 2), u32::MAX);
+}
+
+#[test]
+fn an_aor_originate_with_no_dispatcher_registers_no_channel() {
+    // The AoR has a phone, but the B2BUA is not running in this process: the
+    // group cannot be created and the id stays free.
+    crate::script::api::test_registrar()
+        .save(
+            "sip:3201@siphon.example.com",
+            crate::sip::uri::SipUri::new("198.51.100.120".to_string()),
+            3600,
+            1.0,
+            "register-3201".to_string(),
+            1,
+        )
+        .expect("the binding saves");
+    let bus = test_bus();
+    let conn = bus.register_connection("ivr-app");
+    let mut command = originate_command(serde_json::json!({
+        "channel": "cb-aor",
+        "aor": "sip:3201@siphon.example.com",
+        "media": true,
+    }));
+    command.origin.conn_id = conn.id;
+    let result = originate_with_bus(&bus, command);
+    assert!(!bus.channel_exists("cb-aor"));
+    assert!(
+        matches!(
+            result,
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
+        ),
+        "got {result:?}"
+    );
 }

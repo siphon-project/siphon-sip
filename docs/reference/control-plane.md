@@ -280,13 +280,13 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 
 | verb | module | args | notes |
 |---|---|---|---|
-| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
+| `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
 | `answer` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
 | `ring` | sip | `{reason?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
 | `progress` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
-| `drop` | sip | `{reason?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE. See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
+| `drop` | sip | `{reason?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
@@ -791,6 +791,73 @@ args, unparseable URI, bad `privacy` or `session_timer`), `conflict` (the id is 
 (no route to the target), `unsupported_verb` (the backend cannot serve the media
 plan), `unavailable` (the B2BUA is not running, or the commanding connection has
 gone — nothing would own the call).
+
+### Ringing a registered AoR: `originate {aor}`
+
+`to` is one URI, resolved as written. A phone registered over TCP, TLS or WSS
+behind NAT is reachable only on the connection it registered over, and one
+registered through an edge proxy only through the Path its binding carries, so
+resolving its Contact reaches nothing. `aor` in place of `to` rings every phone
+registered at the AoR, each over its own flow and Path (RFC 5626 §5.3,
+RFC 3327 §5.3; a Path outranks the flow), exactly as a `dial` to `{aor}` does:
+
+```json
+{ "id":"c-8", "type":"command", "module":"sip", "verb":"originate",
+  "args": { "channel": "wake-201", "aor": "sip:201@example.com",
+            "from": "sip:reception@example.com", "media": true,
+            "strategy": "parallel", "timeout": 25 } }
+```
+
+```json
+{ "id":"c-8", "type":"reply", "status":"ok",
+  "result": { "channel":"wake-201", "group_id":"originate-group-<id>",
+              "aor":"sip:201@example.com", "strategy":"parallel",
+              "total_timeout":25, "state":"calling",
+              "branches":[ {"leg_id":"<id>", "leg_sip_call_id":"<cid>",
+                            "target":"sip:201@203.0.113.7:5060", "aor":"sip:201@example.com"} ] } }
+```
+
+`to` and `aor` are mutually exclusive, and one is required: both, or neither, is
+`bad_request`. An AoR with nobody registered is `not_found` with
+`error.details: {verb:"originate", reason:"no_contacts", aor}`, and nothing goes
+on the wire. `strategy` and `total_timeout` apply to `aor` only and are
+`bad_request` beside `to`.
+
+Each phone is rung as its own originated call: its own INVITE (Request-URI the
+registered Contact, To the AoR) with every other argument applied as for `to`.
+A single registered phone is simply a group of one.
+
+- `strategy: "parallel"` (default) rings every phone at once; `"sequential"`
+  rings them one at a time, in registration q-value order, moving on when one
+  declines or rings out its own `timeout`.
+- The first phone to answer wins. Every other phone still ringing is CANCELled
+  (RFC 3261 §9.1); one that answers anyway is ACKed with every stream rejected
+  and BYEd (§13.2.2.4, §15).
+- `total_timeout` bounds the whole group; when it passes, every phone still
+  ringing is CANCELled. It defaults to `timeout` for a parallel group and to
+  `timeout` times the number of phones for a sequential one (`0` for none).
+
+The events arrive on your channel id:
+
+| event | payload | when |
+|---|---|---|
+| `DialBranch` | `{leg_id, leg_sip_call_id, target, aor}` | a phone's INVITE was built (the later phones of a sequential group included) |
+| `ChannelStateChange` | `{state:"ringing"\|"progress", code, early_media, sdp?, leg_id, leg_sip_call_id, target, aor}` | a phone sent a 1xx, as a plain originate reports its callee's, naming the phone |
+| `DialBranchFailed` | `{…identity, code, reason, cause}` | a phone ended without answering: `rejected`, `timeout`, `cancelled` (another answered, or the group ended) or `unsent` |
+| `DialAnswered` | `{…identity, code}` | a phone answered and won |
+| `ChannelStateChange` | `{state:"answered", code, sdp?}` | right after `DialAnswered`, as for a plain originate |
+| `StasisEnd` | `{reason, code, response}` | nobody answered: `rejected` with the best of the phones' statuses (RFC 3261 §16.7 step 6), `ring timeout` (408), `cancelled` (487), `unsent`, or `media_failed` when the winner's media could not be anchored |
+
+While the phones ring, the channel is bound to the group: an event's `call_id`
+and `sip_call_id` carry the `group_id`, since no single dialog is the call yet,
+and each leg's own Call-ID is in the payload as `leg_sip_call_id`. From
+`DialAnswered` on, the channel **is** the winning phone's call — its envelope
+carries that leg's own ids, and every verb works on it exactly as on a plain
+originate's channel. `hangup` while the phones ring CANCELs every one of them,
+and so does losing the controller connection past its grace window under
+`on_lost: "hangup"`. `drop` is refused (`invalid_state`) while they ring: siphon
+is their caller, so there is no response to withhold, and the INVITEs would be
+left ringing.
 
 In-process, the same primitive is
 [`b2bua.originate(...)`](call.md#placing-a-call-b2buaoriginate), which returns the

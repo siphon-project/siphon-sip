@@ -23,7 +23,37 @@ entry, but a working config keeps working.
   with `call_state` the state the call was found in. The code and the message
   are unchanged. The control-plane reference also now lists `anchor`, `profile`
   and `ws_uri` on `progress`, which it already accepted.
+### Added
+
+- **`originate {aor}` rings every phone registered at an AoR.** A phone
+  registered over TCP, TLS or WSS behind NAT is reachable only on the connection
+  it registered over, and one behind an edge proxy only through its Path, so
+  `originate {to}` at its Contact reached nothing. `aor` (mutually exclusive
+  with `to`) rings each registered contact as its own originated call over its
+  own flow and Path, `parallel` or `sequential` (`strategy`), bounded by
+  `total_timeout`. The first phone to answer becomes the channel's call and the
+  rest are CANCELled; one that answers anyway is ACKed with every stream
+  rejected and BYEd. Each phone is reported on the channel as `DialBranch` /
+  `DialBranchFailed` / `DialAnswered`, its ringing as `ChannelStateChange`, and
+  a group nobody answers ends in `StasisEnd` with the best of their statuses. An
+  AoR with nobody registered is `not_found` (`details.reason: "no_contacts"`)
+  with nothing on the wire. `hangup` while the phones ring CANCELs every leg;
+  `drop` is refused (`invalid_state`) there, since the INVITEs are owed a CANCEL.
+
 ### Fixed
+
+- **An ACK or BYE on a leg dialled over a phone's TCP flow goes over that
+  connection.** A B-leg or originate to a phone registered over TCP sent its
+  INVITE on the phone's own connection, but the ACK, CANCEL and BYE that
+  followed went through the outbound connection pool, which opens a new
+  connection to the phone's address and reaches nothing behind NAT. They now
+  reuse the phone's live connection, as TLS and WebSocket already did.
+- **The ACK to a 2xx that raced siphon's CANCEL of an offerless originate
+  answers its offer.** It is released at once, but RFC 3261 §13.2.2.4 still owes
+  the offer an answer: the ACK now carries one with every stream rejected, as it
+  already did for a B-leg.
+- **An originate's ACK to a final failure carries the INVITE's Route headers**
+  (RFC 3261 §17.1.1.3), so one routed through a Path is ACKed along it.
 
 - **A retransmitted 2xx to an anchored `originate` is re-ACKed with the SDP
   answer.** An originate that anchors its media sends an offerless INVITE, so

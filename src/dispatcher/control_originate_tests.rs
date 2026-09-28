@@ -20,17 +20,24 @@ use crate::control::{ConnHandle, ControlAdapter, ControlBus, OutboundFrame, Slow
 
 /// A controller connected to a control plane whose SIP adapter places its calls
 /// on `dispatcher`.
-struct Controller {
-    bus: Arc<ControlBus>,
-    connection: Arc<ConnHandle>,
-    dispatcher: Arc<TestDispatcher>,
+pub(super) struct Controller {
+    pub(super) bus: Arc<ControlBus>,
+    pub(super) connection: Arc<ConnHandle>,
+    pub(super) dispatcher: Arc<TestDispatcher>,
 }
 
 /// Connect a controller as `app`, a name no other test uses, to a control plane
 /// running the real command consumer and SIP adapter, with `config` as the
 /// dispatcher's `session_timer:` block.
 fn controller(app: &str, config: Option<&str>) -> Controller {
-    let dispatcher = Arc::new(timer_dispatcher(config));
+    controller_on(app, timer_dispatcher(config))
+}
+
+/// Connect a controller as `app`, a name no other test uses, to a control plane
+/// running the real command consumer and SIP adapter, placing its calls on
+/// `dispatcher`.
+pub(super) fn controller_on(app: &str, dispatcher: TestDispatcher) -> Controller {
+    let dispatcher = Arc::new(dispatcher);
     let (command_tx, command_rx) = flume::unbounded();
     let bus = ControlBus::new(
         command_tx,
@@ -50,12 +57,20 @@ fn controller(app: &str, config: Option<&str>) -> Controller {
     );
     let staged_on = Arc::clone(&dispatcher);
     let dialled_on = Arc::clone(&dispatcher);
+    let grouped_on = Arc::clone(&dispatcher);
+    let started_on = Arc::clone(&dispatcher);
     stage(
         app,
         OriginateRail {
             bus: Arc::clone(&bus),
             prepare: Box::new(move |params| prepare_originate(&staged_on.state, params)),
             dial: Box::new(move |prepared| dial_originate(&dialled_on.state, prepared)),
+            create_group: Box::new(move |spec, sink| {
+                create_originate_group(&grouped_on.state, spec, sink)
+            }),
+            start_group: Box::new(move |group_id| {
+                start_originate_group(&started_on.state, group_id)
+            }),
         },
     );
     let mut adapters: HashMap<String, Arc<dyn ControlAdapter>> = HashMap::new();
@@ -92,7 +107,10 @@ fn originate_args(channel: &str, session_timer: Option<serde_json::Value>) -> se
 
 /// Send `args` in the `originate` frame an SDK sends and return the reply frame
 /// siphon queues for the controller, as JSON.
-async fn originate(controller: &Controller, args: serde_json::Value) -> serde_json::Value {
+pub(super) async fn originate(
+    controller: &Controller,
+    args: serde_json::Value,
+) -> serde_json::Value {
     let frame = serde_json::json!({
         "id": "c-1",
         "type": "command",

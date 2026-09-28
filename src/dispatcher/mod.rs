@@ -103,6 +103,8 @@ mod control_drop_tests;
 #[cfg(test)]
 mod control_inbound_cancel_tests;
 #[cfg(test)]
+mod control_originate_aor_tests;
+#[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
@@ -126,6 +128,8 @@ mod lcr_route_bookkeeping_tests;
 mod originate_ack_retransmit_tests;
 #[cfg(test)]
 mod originate_auth_tests;
+#[cfg(test)]
+mod originate_group_tests;
 #[cfg(test)]
 mod originate_test_harness;
 #[cfg(test)]
@@ -198,8 +202,11 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_dial_call, b2bua_drop_call, b2bua_set_session_timer, dial_targets_for_aor, DialError,
-    DialShaping, DialTarget, DropOutcome,
+    b2bua_dial_call, b2bua_drop_call, b2bua_originate_group_create, b2bua_originate_group_start,
+    b2bua_set_session_timer, dial_answered_payload, dial_branch_identity, dial_branch_summary,
+    dial_targets_for_aor, DialError, DialShaping, DialTarget, DropOutcome, OriginateGroupFailure,
+    OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner,
+    OriginateLegProgress,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
@@ -546,6 +553,7 @@ pub async fn run(
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
