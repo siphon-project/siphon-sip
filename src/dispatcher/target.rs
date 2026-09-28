@@ -252,6 +252,161 @@ pub(super) fn b_leg_routing_uri<'a>(
     next_hop.or(route_next_hop).unwrap_or(target_uri)
 }
 
+/// Where an INVITE siphon sends toward a callee goes on the wire: over the
+/// callee's captured flow, or to a destination resolved from its route set, an
+/// explicit next hop or its URI. What [`resolve_leg_destination`] decides.
+#[derive(Debug)]
+pub(super) struct LegDestination<'a> {
+    /// The captured flow the INVITE goes over, once a Path route set has had
+    /// its say ([`b_leg_flow`]). `None` for a resolved destination.
+    pub(super) flow: Option<&'a crate::script::api::registrar::PyFlow>,
+    /// The URI the destination was resolved from ([`b_leg_routing_uri`]). Every
+    /// later decision about the host this leg is going to (gateway
+    /// credentials, the over-MTU TCP re-probe) has to use this one.
+    pub(super) routing_uri: String,
+    /// Where the INVITE goes: the flow's source address, or the resolved one.
+    pub(super) destination: SocketAddr,
+    /// The transport it goes over.
+    pub(super) transport: Transport,
+}
+
+/// Why [`resolve_leg_destination`] found nowhere to send an INVITE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LegDestinationError {
+    /// The captured flow names a transport siphon cannot send a leg over.
+    UnknownFlowTransport(String),
+    /// The routing URI resolves to no address.
+    Unresolvable {
+        /// The URI that did not resolve.
+        routing_uri: String,
+    },
+}
+
+impl std::fmt::Display for LegDestinationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LegDestinationError::UnknownFlowTransport(transport) => {
+                write!(formatter, "the captured flow's transport '{transport}' is not one a call leg can be sent over")
+            }
+            LegDestinationError::Unresolvable { routing_uri } => {
+                write!(
+                    formatter,
+                    "cannot resolve a destination for '{routing_uri}'"
+                )
+            }
+        }
+    }
+}
+
+/// Decide where an INVITE toward `target_uri` goes, for every call leg siphon
+/// dials: a B-leg ([`b2bua_send_b_leg_invite`]) and a call it places itself
+/// ([`prepare_originate`]). One function so the two cannot disagree about how a
+/// registered phone is reached.
+///
+/// In order:
+///
+/// 1. A Path route set outranks the captured flow ([`b_leg_flow`], RFC 3327
+///    §5.3): the edge proxy said terminating traffic comes back through it.
+/// 2. With a route set and no explicit `next_hop`, the INVITE goes to the
+///    topmost Route (RFC 3261 §16.6 step 6), not to the Request-URI. The Route
+///    headers themselves are the caller's to put on the message.
+/// 3. A flow left standing is where the INVITE goes, over the connection the
+///    phone registered on (RFC 5626 §5.3, and the only way to reach a WebSocket
+///    phone, RFC 7118 §5).
+/// 4. Otherwise the routing URI ([`b_leg_routing_uri`]) is resolved (RFC 3263).
+///
+/// The Request-URI is not decided here: it stays `target_uri` in every case, so
+/// the called party's shape survives on the wire.
+pub(super) fn resolve_leg_destination<'a>(
+    target_uri: &str,
+    next_hop: Option<&str>,
+    flow: Option<&'a crate::script::api::registrar::PyFlow>,
+    route: &[String],
+    resolver: &SipResolver,
+) -> Result<LegDestination<'a>, LegDestinationError> {
+    let flow = b_leg_flow(flow, route);
+    let route_next_hop = if next_hop.is_none() && !route.is_empty() {
+        let mut route_headers = crate::sip::headers::SipHeaders::new();
+        route_headers.set("Route", route.join(", "));
+        core::next_hop_from_route(&route_headers)
+    } else {
+        None
+    };
+    let routing_uri =
+        b_leg_routing_uri(next_hop, route_next_hop.as_deref(), target_uri).to_string();
+
+    if let Some(flow) = flow {
+        let transport = match flow.transport.as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            other => return Err(LegDestinationError::UnknownFlowTransport(other.to_string())),
+        };
+        return Ok(LegDestination {
+            flow: Some(flow),
+            routing_uri,
+            destination: flow.source_addr,
+            transport,
+        });
+    }
+    match resolve_target(&routing_uri, resolver) {
+        Some(resolved) => Ok(LegDestination {
+            flow: None,
+            destination: resolved.address,
+            transport: resolved.transport.unwrap_or(Transport::Udp),
+            routing_uri,
+        }),
+        None => Err(LegDestinationError::Unresolvable { routing_uri }),
+    }
+}
+
+/// Write `data` straight to a captured flow's socket: the connection the phone
+/// registered on, bypassing DNS and the connection pool (the proxy's
+/// `relay(flow=…)` twin, RFC 5626 §5.3).
+///
+/// This path skips [`send_to_target`], so it does that function's HEP capture
+/// itself, or a flow-pinned INVITE would be the one request that never reaches
+/// Homer. Returns the transport's refusal when it would not take the frame.
+pub(super) fn send_over_flow(
+    call_id: &str,
+    data: Bytes,
+    flow: &crate::script::api::registrar::PyFlow,
+    transport: Transport,
+    destination: SocketAddr,
+    state: &DispatcherState,
+) -> Result<(), String> {
+    if let Some(ref hep) = state.hep_sender {
+        hep.capture_outbound(
+            state.hep_local_addr(flow.local_addr, transport),
+            destination,
+            transport,
+            &data,
+        );
+    }
+    debug!(
+        call_id = %call_id,
+        destination = %destination,
+        source = %flow.local_addr,
+        transport = %transport,
+        size = data.len(),
+        "sending an INVITE over the callee's captured flow"
+    );
+    state
+        .outbound
+        .send(OutboundMessage {
+            followups: None,
+            connection_id: ConnectionId(flow.connection_id),
+            transport,
+            destination,
+            data,
+            source_local_addr: Some(flow.local_addr),
+            server_name: None,
+        })
+        .map_err(|error| error.to_string())
+}
+
 /// Apply the RFC 3261 §18.1.1 over-MTU UDP→TCP decision for one outbound
 /// request.  Given the current transport, the serialised (pre-Via) request
 /// length and its next hop, returns `Some((Tcp, tcp_addr))` when the request is

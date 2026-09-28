@@ -126,67 +126,38 @@ pub fn b2bua_send_b_leg_invite(
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
-    // Shadowed rather than branched so every flow-derived decision below — MTU
-    // bias, egress pin, Via sent-by, Contact, leg connection id — treats a
-    // Path-routed B-leg as the freshly-resolved leg it now is.
-    let flow = b_leg_flow(flow, b_leg_route);
-
-    // RFC 3261 §16.6 step 6: with a route set and no explicit next-hop, the
-    // request goes to the topmost Route — not to the Request-URI.  Without this
-    // the B-leg carried the Route header but was still *sent* to the target URI,
-    // so a `route=` set was decorative: an INVITE for a UE registered through an
-    // edge proxy went to the UE's own Contact, which is exactly the address that
-    // is unreachable (NAT, IPsec, a userless or `.invalid` contact) and is why
-    // the binding has a Path at all.
-    let route_next_hop = if next_hop.is_none() && !b_leg_route.is_empty() {
-        let mut route_headers = crate::sip::headers::SipHeaders::new();
-        route_headers.set("Route", b_leg_route.join(", "));
-        core::next_hop_from_route(&route_headers)
-    } else {
-        None
+    // Where the INVITE goes: over the captured flow, or to the topmost Route of
+    // a Path route set, an explicit next hop or the target. The same decision
+    // an originate to a registered phone makes (`resolve_leg_destination`).
+    //
+    // `flow` is shadowed rather than branched so every flow-derived decision
+    // below — MTU bias, egress pin, Via sent-by, Contact, leg connection id —
+    // treats a Path-routed B-leg as the freshly-resolved leg it now is. The
+    // routing URI is the single URI every destination decision below resolves
+    // from — the gateway credentials and the over-MTU TCP re-probe alike, so
+    // the two can never disagree about which host this B-leg is going to. The
+    // R-URI built further down still uses `target_uri` unconditionally — that
+    // split is the whole point of next_hop.
+    let LegDestination {
+        flow,
+        routing_uri,
+        mut destination,
+        transport: mut outbound_transport,
+    } = match resolve_leg_destination(target_uri, next_hop, flow, b_leg_route, &state.dns_resolver)
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            warn!(
+                call_id = %call_id,
+                target = %target_uri,
+                next_hop = ?next_hop,
+                route = ?b_leg_route,
+                "B2BUA: cannot dial the B-leg: {error}",
+            );
+            return false;
+        }
     };
-    // The single URI every destination decision below resolves from — both the
-    // initial resolve and the over-MTU TCP re-probe.  One binding on purpose:
-    // the two must never disagree about which host this B-leg is going to.
-    let routing_uri = b_leg_routing_uri(next_hop, route_next_hop.as_deref(), target_uri);
-
-    // Resolve the wire destination: over the captured inbound flow (RFC 5626
-    // §5.3 connection reuse — the only way to reach a WebSocket callee, RFC
-    // 7118 §5) when one is attached, else from `routing_uri`.  R-URI
-    // construction below still uses target_uri unconditionally — that split is
-    // the whole point of next_hop.
-    let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
-        let transport = match flow.transport.as_str() {
-            "udp" => Transport::Udp,
-            "tcp" => Transport::Tcp,
-            "tls" => Transport::Tls,
-            "ws" => Transport::WebSocket,
-            "wss" => Transport::WebSocketSecure,
-            other => {
-                warn!(call_id = %call_id, transport = %other, "B2BUA: unknown flow transport");
-                return false;
-            }
-        };
-        (flow.source_addr, transport)
-    } else {
-        let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
-            Some(t) => t,
-            None => {
-                warn!(
-                    call_id = %call_id,
-                    target = %target_uri,
-                    next_hop = ?next_hop,
-                    route_next_hop = ?route_next_hop,
-                    "B2BUA: cannot resolve destination",
-                );
-                return false;
-            }
-        };
-        (
-            relay_target.address,
-            relay_target.transport.unwrap_or(Transport::Udp),
-        )
-    };
+    let routing_uri = routing_uri.as_str();
 
     // A B-leg going to a configured gateway that challenges answers with that
     // gateway's own credentials, so a trunk authenticates without a script
@@ -772,38 +743,9 @@ pub fn b2bua_send_b_leg_invite(
     );
 
     if let Some(flow) = flow {
-        // This branch bypasses `send_to_target`/`send_outbound_from`, so it has
-        // to do their HEP capture itself — otherwise a flow-pinned B-leg INVITE
-        // is the one request that never reaches Homer.
-        if let Some(ref hep) = state.hep_sender {
-            hep.capture_outbound(
-                state.hep_local_addr(flow.local_addr, outbound_transport),
-                destination,
-                outbound_transport,
-                &data,
-            );
-        }
-        // ...and log the send. Nothing on this path logged before, so an absent
-        // "sending message" line was never evidence the INVITE had not been
-        // handed to the transport — it simply was never logged.
-        debug!(
-            call_id = %call_id,
-            destination = %destination,
-            source = %flow.local_addr,
-            transport = %outbound_transport,
-            size = data.len(),
-            "B2BUA: sending B-leg INVITE over captured flow"
-        );
-        let outbound_message = OutboundMessage {
-            followups: None,
-            connection_id: ConnectionId(flow.connection_id),
-            transport: outbound_transport,
-            destination,
-            data,
-            source_local_addr: Some(flow.local_addr),
-            server_name: None,
-        };
-        if let Err(error) = state.outbound.send(outbound_message) {
+        if let Err(error) =
+            send_over_flow(call_id, data, flow, outbound_transport, destination, state)
+        {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
             // The leg is registered and its actor spawned by this point, but the
             // INVITE is not on the wire and nothing will ever answer it. Report
