@@ -975,6 +975,32 @@ fn drop_on_a_call_that_is_gone_is_not_found() {
 }
 
 #[test]
+fn drop_refuses_a_ban_that_is_not_a_boolean() {
+    // `"true"` read as false would drop the call and ban nothing while the
+    // controller believed it had banned the source.
+    let result = sip_command(
+        "drop",
+        serde_json::json!({ "reason": "unsolicited", "ban": "true" }),
+    );
+    let ControlResult::Error { code, message, .. } = result else {
+        panic!("a non-boolean ban must be refused, got {result:?}");
+    };
+    assert_eq!(code, ControlErrorCode::BadRequest);
+    assert_eq!(message, "ban must be a boolean");
+
+    // Positive control: a boolean ban gets past the argument check and reaches
+    // the dispatcher, which reports the (absent) call as gone.
+    let result = sip_command(
+        "drop",
+        serde_json::json!({ "reason": "unsolicited", "ban": true }),
+    );
+    let ControlResult::Error { code, .. } = result else {
+        panic!("drop on a missing call must be refused");
+    };
+    assert_eq!(code, ControlErrorCode::NotFound);
+}
+
+#[test]
 fn refer_reply_reports_only_local_acceptance() {
     // The command/event split, asserted rather than assumed: the `refer`
     // verb's summary must promise the outcome as an event, because the reply

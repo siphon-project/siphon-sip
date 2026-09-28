@@ -85,7 +85,7 @@ async fn dropping_an_unanswered_call_puts_nothing_on_the_wire() {
     let (state, udp, call_id) = parked();
     drain(&udp);
 
-    let outcome = b2bua_drop_call_in(&state, &call_id, Some("no flow claims 10000"));
+    let outcome = b2bua_drop_call_in(&state, &call_id, Some("no flow claims 10000"), None);
 
     assert_eq!(outcome, DropOutcome::Dropped);
     let sent = drain(&udp);
@@ -131,7 +131,7 @@ async fn dropping_a_ringing_call_cancels_the_callee_and_still_tells_the_caller_n
         "the dialled INVITE is under retransmission before the drop"
     );
 
-    let outcome = b2bua_drop_call_in(&call.state, &call.call_id, Some("abandoned"));
+    let outcome = b2bua_drop_call_in(&call.state, &call.call_id, Some("abandoned"), None);
 
     assert_eq!(outcome, DropOutcome::Dropped);
     let sent = call.wire();
@@ -185,7 +185,7 @@ async fn drop_is_refused_on_an_answered_call_and_changes_nothing() {
         Some(CallState::Answered)
     ));
 
-    let outcome = b2bua_drop_call_in(&call.state, &call.call_id, Some("wrong verb"));
+    let outcome = b2bua_drop_call_in(&call.state, &call.call_id, Some("wrong verb"), None);
 
     assert_eq!(outcome, DropOutcome::Answered);
     assert!(
@@ -207,7 +207,7 @@ async fn drop_on_a_call_that_is_already_gone_is_reported() {
     drain(&udp);
 
     assert_eq!(
-        b2bua_drop_call_in(&state, &call_id, None),
+        b2bua_drop_call_in(&state, &call_id, None, None),
         DropOutcome::Gone
     );
     assert!(drain(&udp).is_empty());
@@ -225,7 +225,7 @@ async fn a_retransmitted_invite_after_a_drop_is_not_answered_either() {
     let (state, udp, call_id) = parked();
     drain(&udp);
     assert_eq!(
-        b2bua_drop_call_in(&state, &call_id, Some("unsolicited")),
+        b2bua_drop_call_in(&state, &call_id, Some("unsolicited"), None),
         DropOutcome::Dropped
     );
     drain(&udp);
@@ -282,7 +282,7 @@ async fn the_reason_reaches_the_cdr_with_no_response_code() {
     }
 
     assert_eq!(
-        b2bua_drop_call_in(&state, &call_id, Some("no flow claims 10000")),
+        b2bua_drop_call_in(&state, &call_id, Some("no flow claims 10000"), None),
         DropOutcome::Dropped
     );
 
@@ -311,4 +311,75 @@ async fn the_reason_reaches_the_cdr_with_no_response_code() {
         state.cdr_sessions.get(&call_id).is_none(),
         "the CDR session outlived the call it belongs to"
     );
+}
+
+/// A ban store that bans on the first weight-1 signal, so one drop is enough to
+/// tell a scored caller from an unscored one.
+fn ban_on_first_signal() -> crate::security::AutoBanStore {
+    crate::security::AutoBanStore::new(1, 600, 3600, &[], 3, 0, 3600)
+}
+
+/// Silence alone costs a scanner nothing: it moves on to the next number at the
+/// same rate. With `ban`, the caller's source is scored, and it still hears
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_with_ban_scores_the_caller_and_still_puts_nothing_on_the_wire() {
+    let store = ban_on_first_signal();
+    let (state, udp, call_id) = parked();
+    drain(&udp);
+
+    let outcome = b2bua_drop_call_in(&state, &call_id, Some("unsolicited"), Some(&store));
+
+    assert_eq!(outcome, DropOutcome::Dropped);
+    assert!(
+        store.is_banned(caller().ip()),
+        "the caller's source was not scored"
+    );
+    assert!(
+        drain(&udp).is_empty(),
+        "a banning drop put a message on the wire"
+    );
+    assert!(state.call_actors.get_call(&call_id).is_none());
+}
+
+/// Without `ban` the drop scores nothing: the ban is the controller's opt-in,
+/// not a side effect of every drop. The positive control is the test above,
+/// against the same store shape and the same caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_without_ban_scores_nothing() {
+    let store = ban_on_first_signal();
+    let (state, udp, call_id) = parked();
+    drain(&udp);
+
+    assert_eq!(
+        b2bua_drop_call_in(&state, &call_id, Some("unsolicited"), None),
+        DropOutcome::Dropped
+    );
+    assert!(!store.is_banned(caller().ip()));
+
+    // Positive control on the same store: a banning drop of a second call from
+    // the same caller does score it, so the assertion above is not vacuous.
+    let second = state.call_actors.create_call(caller_leg());
+    assert_eq!(
+        b2bua_drop_call_in(&state, &second, Some("unsolicited"), Some(&store)),
+        DropOutcome::Dropped
+    );
+    assert!(store.is_banned(caller().ip()));
+}
+
+/// A refused drop is refused whole: an answered call is not dropped, so its
+/// caller is not scored either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_drop_scores_nothing() {
+    let store = ban_on_first_signal();
+    let call = Call::bridged();
+    call.callee_answers("");
+    call.wire();
+
+    assert_eq!(
+        b2bua_drop_call_in(&call.state, &call.call_id, Some("wrong verb"), Some(&store)),
+        DropOutcome::Answered
+    );
+    assert!(!store.is_banned(caller().ip()));
+    assert_eq!(store.active_bans(), 0);
 }

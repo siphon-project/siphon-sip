@@ -528,7 +528,7 @@ async fn cancelling_a_ringing_group_cancels_every_leg() {
     // `drop` is refused while the phones ring: there is no response to
     // withhold, and the INVITEs would be left standing. Nothing is sent.
     assert_eq!(
-        b2bua_drop_call_in(&dispatcher.state, &group_id, None),
+        b2bua_drop_call_in(&dispatcher.state, &group_id, None, None),
         DropOutcome::Ringing
     );
     assert!(drain(&dispatcher.udp).is_empty());
@@ -565,7 +565,7 @@ async fn cancelling_a_ringing_group_cancels_every_leg() {
     assert_drained(&dispatcher);
     // Nothing is left to cancel a second time, or to drop.
     assert_eq!(
-        b2bua_drop_call_in(&dispatcher.state, &group_id, None),
+        b2bua_drop_call_in(&dispatcher.state, &group_id, None, None),
         DropOutcome::Gone
     );
     assert!(!cancel_originated_call(&dispatcher.state, &group_id, None));

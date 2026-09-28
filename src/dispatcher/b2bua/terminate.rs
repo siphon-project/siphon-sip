@@ -469,33 +469,49 @@ pub enum DropOutcome {
 ///   record says the call was dropped deliberately rather than looking like a
 ///   leak.
 ///
+/// With `ban`, the caller's source is also scored in the auto-ban store
+/// ([`crate::security::AutoBanStore::record_unwanted_call`]), so a source the
+/// controller keeps dropping is banned and refused before the next INVITE
+/// reaches it. Silence alone costs a scanner nothing: it moves on to the next
+/// number at the same rate. A no-op when `security.failed_auth_ban` is not
+/// configured, and `trusted_cidrs` are never scored.
+///
 /// Returns [`DropOutcome::Answered`] for an answered call (nothing is touched)
 /// and [`DropOutcome::Gone`] when the call is already gone. Never panics.
-pub fn b2bua_drop_call(internal_call_id: &str, reason: Option<&str>) -> DropOutcome {
+pub fn b2bua_drop_call(internal_call_id: &str, reason: Option<&str>, ban: bool) -> DropOutcome {
     let Some(control) = B2BUA_CONTROL.get() else {
         return DropOutcome::Gone;
     };
     let _enter = control.runtime.enter();
-    b2bua_drop_call_in(&control.state, internal_call_id, reason)
+    let ban_store = if ban {
+        crate::security::auto_ban().map(|store| store.as_ref())
+    } else {
+        None
+    };
+    b2bua_drop_call_in(&control.state, internal_call_id, reason, ban_store)
 }
 
-/// [`b2bua_drop_call`] against an explicit dispatcher state, for a caller that
-/// already holds one — the tests, which cannot use the process-global
-/// `B2BUA_CONTROL` a `OnceLock` only lets one state occupy.
+/// [`b2bua_drop_call`] against an explicit dispatcher state and ban store, for a
+/// caller that already holds them — the tests, which cannot use the
+/// process-global `B2BUA_CONTROL` and `AUTO_BAN` a `OnceLock` only lets one
+/// value occupy. `ban_store` is `Some` exactly when the caller's source is to be
+/// scored.
 pub(crate) fn b2bua_drop_call_in(
     state: &DispatcherState,
     internal_call_id: &str,
     reason: Option<&str>,
+    ban_store: Option<&crate::security::AutoBanStore>,
 ) -> DropOutcome {
     if state.originate_groups.contains(internal_call_id) {
         return DropOutcome::Ringing;
     }
-    let Some((call_state, sip_call_id, caller_addr)) =
+    let Some((call_state, sip_call_id, caller_addr, caller_transport)) =
         state.call_actors.get_call(internal_call_id).map(|call| {
             (
                 call.state.clone(),
                 call.a_leg.dialog.call_id.clone(),
                 call.a_leg.transport.remote_addr,
+                call.a_leg.transport.transport,
             )
         })
     else {
@@ -549,6 +565,18 @@ pub(crate) fn b2bua_drop_call_in(
 
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
+
+    // Scored after the call is released, so a ban that closes the caller's
+    // stream connection finds nothing of this call left to tear down.
+    if let Some(store) = ban_store {
+        if store.record_unwanted_call(caller_addr.ip(), caller_transport.is_stream()) {
+            warn!(
+                source = %caller_addr.ip(),
+                transport = %caller_transport,
+                "auto-ban: source banned (repeated calls the controller dropped as unwanted)"
+            );
+        }
+    }
     DropOutcome::Dropped
 }
 

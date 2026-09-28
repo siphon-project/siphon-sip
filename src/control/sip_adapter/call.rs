@@ -388,11 +388,23 @@ pub(super) fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
 /// `reason` reaches the log line and the CDR (`sip_reason`, with no response
 /// code, beside `disconnect_initiator: "control"`), so a dropped call reads as
 /// deliberate rather than as a leak.
+///
+/// `ban: true` also scores the caller's source in the auto-ban store, so a
+/// source the controller keeps dropping is banned rather than left to probe the
+/// next number. Refused when it is not a boolean: a `"true"` string quietly read
+/// as `false` would look wired and ban nothing.
 pub(super) fn drop_call(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let reason = args.get("reason").and_then(|value| value.as_str());
+    let ban = match args.get("ban") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(ban)) => *ban,
+        Some(_) => {
+            return ControlResult::error(ControlErrorCode::BadRequest, "ban must be a boolean")
+        }
+    };
     drop_result(
         channel,
-        crate::dispatcher::b2bua_drop_call(&channel.call_actor_id, reason),
+        crate::dispatcher::b2bua_drop_call(&channel.call_actor_id, reason, ban),
     )
 }
 
