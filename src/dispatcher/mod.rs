@@ -123,7 +123,11 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod originate_ack_retransmit_tests;
+#[cfg(test)]
 mod originate_auth_tests;
+#[cfg(test)]
+mod originate_test_harness;
 #[cfg(test)]
 mod originate_tests;
 #[cfg(test)]

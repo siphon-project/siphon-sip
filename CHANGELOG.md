@@ -23,6 +23,14 @@ entry, but a working config keeps working.
   with `call_state` the state the call was found in. The code and the message
   are unchanged. The control-plane reference also now lists `anchor`, `profile`
   and `ws_uri` on `progress`, which it already accepted.
+### Fixed
+
+- **A retransmitted 2xx to an anchored `originate` is re-ACKed with the SDP
+  answer.** An originate that anchors its media sends an offerless INVITE, so
+  the callee offers in its 2xx and siphon answers in the ACK (RFC 3261
+  §13.2.2.4). When the callee retransmitted that 2xx because the ACK was lost,
+  siphon re-ACKed it with no body, leaving the callee's offer unanswered. The
+  answer is now kept on the call and the re-sent ACK carries it again.
 
 ## [1.11.0] — 2026-09-27
 

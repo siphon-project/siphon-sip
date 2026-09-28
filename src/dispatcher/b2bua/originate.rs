@@ -712,9 +712,15 @@ pub fn handle_originated_call_response(
     if (200..300).contains(&status_code) {
         // A retransmitted 200 (our ACK was lost) must be re-ACKed and nothing
         // else — the dialog is already confirmed and the controller has already
-        // been told (RFC 3261 §13.2.2.4).
+        // been told (RFC 3261 §13.2.2.4). The ACK re-sent is the one that was
+        // lost, so an offerless originate's carries its answer again: without
+        // it the callee's offer in the 2xx would stay unanswered.
         if already_answered {
-            originate_ack_2xx(&leg, message, None, state);
+            let answer = state
+                .call_actors
+                .get_call(internal_call_id)
+                .and_then(|call| call.originate_answer_sdp.clone());
+            originate_ack_2xx(&leg, message, answer.as_deref(), state);
             return;
         }
 
@@ -806,6 +812,9 @@ pub fn handle_originated_call_response(
             // The INVITE used CSeq 1; every later in-dialog request (BYE,
             // re-INVITE) must exceed it (RFC 3261 §12.2.1.1).
             call.a_leg.dialog.local_cseq = 2;
+            // Kept for the ACK a retransmitted 2xx is owed, which has to be
+            // this one.
+            call.originate_answer_sdp = anchor_answer.clone();
             leg = call.a_leg.clone();
         }
         originate_answered_session(internal_call_id, message, anchor_answer.as_deref(), state);

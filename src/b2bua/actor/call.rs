@@ -488,6 +488,12 @@ pub struct CallActor {
     /// answer on the ACK (RFC 3261 §13.2.2.4). `None` for a call originated with
     /// a controller-supplied offer, and for every inbound call.
     pub originate_anchor: Option<OriginateAnchor>,
+    /// The SDP answer the ACK to an anchored originate's 2xx carried. A callee
+    /// that retransmits the 2xx did not get that ACK, and the one it is re-sent
+    /// has to carry the same answer (RFC 3261 §13.2.2.4, RFC 3264 §5): without
+    /// it the callee's offer stays unanswered. `None` until the 2xx is answered,
+    /// and for every call whose INVITE carried the offer.
+    pub originate_answer_sdp: Option<String>,
     /// The media anchor an early-media response opened on the A-leg, and the
     /// SDP answer that response carried. The 2xx that follows repeats that
     /// answer (RFC 3264 §4) instead of anchoring again. `None` until a
@@ -612,6 +618,7 @@ impl CallActor {
             handoff_pending: false,
             originated: false,
             originate_anchor: None,
+            originate_answer_sdp: None,
             early_media_anchor: None,
             bridge: None,
             fork_dispatching: false,
