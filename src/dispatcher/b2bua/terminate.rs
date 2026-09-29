@@ -298,28 +298,6 @@ pub fn control_notify_channel_event(sip_call_id: &str, event: &str, payload: ser
     crate::control::notify_channel_event(sip_call_id, event, payload);
 }
 
-/// Forward an in-band DTMF digit the media engine detected on a controlled
-/// B2BUA call's leg to the owning control connection as a `ChannelDtmfReceived`
-/// event, so an external IVR / AI app collects digits off the event stream.
-///
-/// **Additive** — this runs *next to*, never in place of, the Python
-/// `@rtpengine.on_dtmf` dispatch, and fires independently of whether any Python
-/// handler is registered. A no-op when the control plane isn't configured or the
-/// call isn't controlled. `dtmf.call_id` is the media call-id, which equals the
-/// SIP Call-ID the control bus keys the channel on for every control-anchored
-/// call (see [`crate::control::ControlBus::forward_dtmf`]).
-pub fn control_forward_dtmf(dtmf: &crate::rtpengine::events::DtmfEvent) {
-    if let Some(bus) = crate::control::ControlBus::global() {
-        bus.forward_dtmf(
-            &dtmf.call_id,
-            &dtmf.digit,
-            dtmf.duration_ms,
-            dtmf.volume,
-            &dtmf.from_tag,
-        );
-    }
-}
-
 /// Imperatively reject / tear down a *controlled* B2BUA call that has not been
 /// answered (a parked call the app declined, the handoff deadline elapsing, or a
 /// hangup of an unanswered call). Sends a final non-2xx to the A-leg (tagged to

@@ -54,6 +54,7 @@ pub(crate) mod b2bua;
 mod cancel_ack;
 mod cdr;
 mod charging;
+mod engine_channel_events;
 mod failure;
 mod identity;
 mod in_dialog;
@@ -92,6 +93,8 @@ mod b_leg_asserted_identity_tests;
 mod b_leg_capability_tests;
 #[cfg(test)]
 mod bad_extension_tests;
+#[cfg(test)]
+mod bridged_pair_media_events_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
@@ -240,6 +243,7 @@ use b2bua::*;
 use cancel_ack::*;
 use cdr::*;
 use charging::*;
+use engine_channel_events::*;
 use failure::*;
 use identity::*;
 use in_dialog::*;

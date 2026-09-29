@@ -53,6 +53,21 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Media events on a bridged pair reach the leg they are about.** A formed
+  pair relays both legs through one engine call on an id of its own, and every
+  event the engine reported for it named that id, which no channel is keyed
+  on: a digit either party pressed, and the pair's `PlayFinished`,
+  `RecordingFinished`, `WsTeeStarted` / `WsTeeEnded` and `WsBridgeStarted` /
+  `WsBridgeEnded`, reached no controller. Each now goes to the channel of the
+  party whose tag it carries, and to that one only. A media timeout on a pair
+  also left the anchor's media record behind, so its teardown deleted the call
+  again; it is now cleared. The pair's `MEDIA` CDR, written once under the
+  engine id and so joining neither leg's call record, is now written once per
+  leg on that leg's `call_id`. Every `MEDIA` record also carries
+  `media_call_id` (the engine call; equal to `call_id` on an ordinary call) and
+  `media_parties` (`2` for a pair), so a collector counts a pair's figures
+  once. `CallDetailRecord.media_call_id` / `media_parties` / `is_shared_media`
+  in the Python SDK read them.
 - **A re-offer on a formed controller bridge reaches the other leg.** Each leg
   of a bridge is a call of its own, so an in-dialog re-INVITE or UPDATE on one
   never reached the other: the target's was answered by the media engine

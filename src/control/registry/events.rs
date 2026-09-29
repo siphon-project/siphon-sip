@@ -199,16 +199,13 @@ impl ControlBus {
     /// of, the in-process `@rtpengine.on_dtmf` dispatch; a controlled channel
     /// gets the event *in addition*.
     ///
-    /// `sip_call_id` is the media call-id the DTMF event carries. For every
-    /// control-anchored call that is byte-identical to the SIP Call-ID the
-    /// channel is keyed on: the ordinary anchored path records the media session
-    /// with `rtpengine_call_id == call_id == SIP Call-ID`, and the answer-first
-    /// (AI-park) path anchors on the INVITE's Call-ID for both the media session
-    /// and the channel. The only path that decouples the media call-id from the
-    /// SIP Call-ID is a siphon-terminated REFER re-anchor, which never applies to
-    /// a control-owned channel. So the direct
-    /// [`channel_id_for_sip_call_id`](Self::channel_id_for_sip_call_id) lookup is
-    /// correct for every controlled call.
+    /// `sip_call_id` is the SIP Call-ID of the leg that sent the digit, already
+    /// resolved by the caller: the engine names a call by the engine call-id
+    /// siphon offered it, which is not always a SIP Call-ID. A bridged pair
+    /// relays both legs through one engine call on an id of its own, so the
+    /// dispatcher maps that id and the digit's `from_tag` to the one leg whose
+    /// media is on that tag (`MediaSessionStore::event_party`) before calling
+    /// this. A digit is the pressing party's alone: it never goes to both legs.
     ///
     /// Idempotent no-op — never panics — when the call is uncontrolled (the
     /// common case), the channel is orphaned, or the owning connection is gone.

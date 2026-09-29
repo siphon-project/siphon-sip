@@ -20,7 +20,7 @@ pub fn spawn_rtpengine_events(
                         on_dtmf(&state_for_events, dtmf).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::RecordingFinished(recording) => {
-                        on_recording_finished(recording);
+                        on_recording_finished(&state_for_events, recording);
                     }
                     crate::rtpengine::events::RtpEngineEvent::MediaTimeout {
                         call_id,
@@ -86,7 +86,8 @@ pub async fn dispatch_dtmf_event(
     state: Arc<DispatcherState>,
     dtmf: crate::rtpengine::events::DtmfEvent,
 ) {
-    on_dtmf(&state, dtmf).await
+    control_forward_signalled_dtmf(&dtmf);
+    run_dtmf_handlers(&state, dtmf).await
 }
 
 async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::DtmfEvent) {
@@ -95,8 +96,16 @@ async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::D
     // external IVR / AI app collects digits from the event
     // stream. Runs before the Python-handler short-circuit so
     // it fires whether or not @rtpengine.on_dtmf is registered.
-    control_forward_dtmf(&dtmf);
+    control_forward_dtmf(state, &dtmf);
+    run_dtmf_handlers(state, dtmf).await
+}
 
+/// The `@rtpengine.on_dtmf` handlers for one digit, keyed on the call-id and
+/// tag the digit carries.
+async fn run_dtmf_handlers(
+    state: &Arc<DispatcherState>,
+    dtmf: crate::rtpengine::events::DtmfEvent,
+) {
     let engine_state = state.engine.state();
     let handlers = engine_state.dtmf_handlers(&dtmf.call_id, &dtmf.from_tag);
     if handlers.is_empty() {
@@ -215,21 +224,24 @@ async fn on_call_summary(
 ) {
     // The media engine reports the end-of-call byte/packet
     // counters and (when a userspace actor measured them) the
-    // RFC 3550 loss/jitter + ITU-T G.107 MOS shape. Write a
-    // media CDR keyed on the SIP Call-ID so a collector joins
-    // it to the SIP-side CDR — the structured twin of the
-    // engine's `siphon_rtp::cdr` log, no log scraping. Gated
-    // on auto-emit, same as the proxy/b2bua lifecycle CDRs.
+    // RFC 3550 loss/jitter + ITU-T G.107 MOS shape.
     tracing::debug!(
         call_id = %summary.call_id,
         reason = %summary.reason,
         legs = summary.legs.len(),
         "media engine reported end-of-call summary"
     );
-    if crate::cdr::auto_emit_enabled() {
-        crate::cdr::write(media_summary_to_cdr(&summary));
-    }
     publish_media_summary(state, &summary);
+}
+
+/// The SIP Call-IDs the summary for engine call `engine_call_id` belongs to:
+/// both legs of a bridged pair, the call a re-anchored session serves, and
+/// otherwise the engine call-id itself, which is then the SIP Call-ID.
+pub(super) fn media_summary_parties(state: &DispatcherState, engine_call_id: &str) -> Vec<String> {
+    match state.rtpengine_sessions.as_ref() {
+        Some(store) => store.summary_parties(engine_call_id),
+        None => vec![engine_call_id.to_string()],
+    }
 }
 
 /// The control plane's `MediaSummary` payload for an engine summary: why the
@@ -268,15 +280,24 @@ pub(super) fn publish_media_summary(
 }
 
 /// [`publish_media_summary`] handing each SIP Call-ID's payload to `deliver`.
+///
+/// Also writes the media CDR, one per SIP Call-ID the engine call carried, so
+/// each leg's SIP-side CDR joins it on `call_id` — the structured twin of the
+/// engine's `siphon_rtp::cdr` log, no log scraping. Gated on auto-emit, same as
+/// the proxy/b2bua lifecycle CDRs.
 pub(super) fn deliver_media_summary(
     state: &DispatcherState,
     summary: &crate::rtpengine::events::CallSummary,
     deliver: impl Fn(&str, serde_json::Value),
 ) {
-    let parties = match state.rtpengine_sessions.as_ref() {
-        Some(store) => store.summary_parties(&summary.call_id),
-        None => vec![summary.call_id.clone()],
-    };
+    // Resolved once: an engine call reports one summary, and resolving spends
+    // what the store kept for it.
+    let parties = media_summary_parties(state, &summary.call_id);
+    if crate::cdr::auto_emit_enabled() {
+        for cdr in media_summary_to_cdrs(summary, &parties) {
+            crate::cdr::write(cdr);
+        }
+    }
     let payload = media_summary_payload(summary);
     for sip_call_id in &parties {
         deliver(sip_call_id, payload.clone());
@@ -349,21 +370,7 @@ async fn on_ws_tee_started(
         sample_rate = tee.sample_rate,
         "media engine started a websocket tee"
     );
-    // Same rail as the bridge's lifecycle: a controller
-    // that started this stream over the control plane has
-    // no other way to learn its shape or that it died.
-    crate::control::notify_channel_event(
-        &tee.call_id,
-        "WsTeeStarted",
-        serde_json::json!({
-            "from_tag": tee.from_tag,
-            "stream_id": tee.stream_id,
-            "ws_uri": tee.ws_uri,
-            "direction": tee.direction.as_str(),
-            "channels": tee.channels,
-            "sample_rate": tee.sample_rate,
-        }),
-    );
+    publish_ws_tee_started(state, &tee);
     let engine_state = state.engine.state();
     let handlers = engine_state.ws_tee_started_handlers(&tee.call_id, &tee.from_tag);
     if handlers.is_empty() {
@@ -439,7 +446,13 @@ pub(super) fn publish_play_finished(
     if let (true, Some(fields)) = (ringback, payload.as_object_mut()) {
         fields.insert("origin".into(), DIAL_RINGBACK_ORIGIN.into());
     }
-    crate::control::notify_channel_event(&play.call_id, "PlayFinished", payload);
+    publish_engine_event(
+        state,
+        &play.call_id,
+        &play.from_tag,
+        "PlayFinished",
+        payload,
+    );
     // After the event, so a controller sees its prompt end before the ringback
     // that follows it starts.
     dial_bridge_prompt_finished(state, &play.call_id, &play.from_tag);
@@ -515,18 +528,7 @@ async fn on_ws_bridge_started(
         sample_rate = bridge.sample_rate,
         "media engine started a websocket takeover bridge"
     );
-    // The media session is keyed on the leg's SIP Call-ID,
-    // which is what the control rail addresses channels by.
-    crate::control::notify_channel_event(
-        &bridge.call_id,
-        "WsBridgeStarted",
-        serde_json::json!({
-            "from_tag": bridge.from_tag,
-            "stream_id": bridge.stream_id,
-            "ws_uri": bridge.ws_uri,
-            "sample_rate": bridge.sample_rate,
-        }),
-    );
+    publish_ws_bridge_started(state, &bridge);
     let engine_state = state.engine.state();
     let handlers = engine_state.ws_bridge_started_handlers(&bridge.call_id, &bridge.from_tag);
     if handlers.is_empty() {
@@ -599,19 +601,7 @@ async fn on_ws_bridge_ended(
             "websocket takeover bridge ended"
         );
     }
-    crate::control::notify_channel_event(
-        &bridge.call_id,
-        "WsBridgeEnded",
-        serde_json::json!({
-            "from_tag": bridge.from_tag,
-            "stream_id": bridge.stream_id,
-            "reason": bridge.reason.as_str(),
-            // Only `detached` and `call_ended` are orderly. A
-            // controller that branches on nothing else still
-            // has to be able to see that this one needs acting on.
-            "unexpected": bridge.reason.is_unexpected(),
-        }),
-    );
+    publish_ws_bridge_ended(state, &bridge);
     let engine_state = state.engine.state();
     let handlers = engine_state.ws_bridge_ended_handlers(&bridge.call_id, &bridge.from_tag);
     if handlers.is_empty() {
@@ -684,25 +674,7 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
             "websocket tee ended"
         );
     }
-    crate::control::notify_channel_event(
-        &tee.call_id,
-        "WsTeeEnded",
-        serde_json::json!({
-            "from_tag": tee.from_tag,
-            "stream_id": tee.stream_id,
-            "reason": tee.reason.as_str(),
-            // `detached` and `call_ended` are the orderly
-            // ends; anything else means audio stopped reaching
-            // the consumer while the call carried on.
-            "unexpected": tee.reason.is_unexpected(),
-            // Non-zero means the consumer could not keep
-            // up. The call was never affected — this is the
-            // one number that tells a controller its own
-            // side is the bottleneck.
-            "frames_sent": tee.frames_sent,
-            "frames_dropped": tee.frames_dropped,
-        }),
-    );
+    publish_ws_tee_ended(state, &tee);
     let engine_state = state.engine.state();
     let handlers = engine_state.ws_tee_ended_handlers(&tee.call_id, &tee.from_tag);
     if handlers.is_empty() {
@@ -910,7 +882,10 @@ async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::even
 /// attaching the audio to an email on the `record_stop` reply would race a
 /// half-written one. Forwarded to the channel owner, which is the only thing
 /// that knows what the recording was for.
-fn on_recording_finished(recording: crate::rtpengine::events::RecordingFinished) {
+fn on_recording_finished(
+    state: &DispatcherState,
+    recording: crate::rtpengine::events::RecordingFinished,
+) {
     tracing::info!(
         call_id = %recording.call_id,
         recording_id = %recording.recording_id,
@@ -918,14 +893,5 @@ fn on_recording_finished(recording: crate::rtpengine::events::RecordingFinished)
         path = recording.path.as_deref().unwrap_or("<none>"),
         "media engine finished a recording"
     );
-    crate::control::notify_channel_event(
-        &recording.call_id,
-        "RecordingFinished",
-        serde_json::json!({
-            "recording_id": recording.recording_id,
-            "path": recording.path,
-            "reason": recording.reason,
-            "duration_ms": recording.duration_ms,
-        }),
-    );
+    publish_recording_finished(state, &recording);
 }

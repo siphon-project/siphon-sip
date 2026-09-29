@@ -51,6 +51,21 @@ fields and drop all of them before your code runs.
 
 `is_media` / `is_register` tell them apart.
 
+## Media records of a bridged pair
+
+A `MEDIA` record comes from the media engine's end-of-call summary, which names
+the engine call. On an ordinary call that is the SIP Call-ID. A bridged pair (a
+controller's `bridge`, or `dial {on_answer: "bridge"}`) relays both legs
+through one engine call on an id of its own, so siphon writes **one `MEDIA`
+record per leg**, each on that leg's `call_id`: every leg's call record joins
+its media record the usual way.
+
+Both records of a pair carry the same figures. Every `MEDIA` record names the
+engine call in `media_call_id` (equal to `call_id` on an ordinary call) and
+says how many records were written from it in `media_parties` (`1`, or `2` for
+a pair). A collector that sums media across records counts each
+`media_call_id` once; `is_shared_media` is true on a pair's records.
+
 ## Which egress address is which
 
 A call record's `destination_ip` is the **signalling** next hop — where siphon

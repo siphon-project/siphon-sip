@@ -1157,13 +1157,18 @@ pub fn bridge_adopt_media(
         session.bridge_sides = bridge_sides;
         store.insert(session);
     }
-    // Both parties relay through the pair's engine call now, and its summary
-    // names that call, not either leg: record both, so each leg's owner gets it.
+    // Both parties relay through the pair's engine call now, and every event
+    // the engine reports names that call, not either leg: record both, with
+    // the tag each party's media is on, so the summary reaches each leg's owner
+    // and a party's own event (a digit it pressed) reaches that party's alone.
     if let Some(pair) = store.get(&anchor_key) {
         store.record_parties(
             &anchor_key,
             pair.rtpengine_id(),
-            &[anchor_key.as_str(), context.peer_sip_call_id.as_str()],
+            &[
+                (anchor_key.as_str(), Some(pair.from_tag.as_str())),
+                (context.peer_sip_call_id.as_str(), pair.to_tag.as_deref()),
+            ],
         );
     }
     bridge_delete_sessions(state, retired, "the bridge formed");
