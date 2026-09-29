@@ -15,6 +15,16 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`MediaSummary` on the control rail.** The media engine's summary of a
+  session it ended (per-leg packet and byte counters, loss, jitter, RTT and
+  MOS where measured) is now published on the channel that owns the call, as
+  well as written to the media CDR. It arrives only while the channel exists:
+  a session reaped on media timeout or replaced by a `bridge`. The end-of-call
+  summary of an ordinary hang-up comes from the engine after `StasisEnd` has
+  removed the channel, so it still reaches only the CDR. Typed as
+  `SipEvent::MediaSummary` / `MediaSummaryPayload` in the Rust proto crate and
+  `MediaSummaryPayload` in the TypeScript SDK.
+
 - **`bridge {profile}` names one media profile for the pair.** Its `offer` half
   shapes what the `with` leg is offered and its `answer` half what the target
   is re-INVITEd with, the way one profile describes both parties of a

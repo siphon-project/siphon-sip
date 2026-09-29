@@ -518,6 +518,40 @@ digits does not have to know which wire carried them. The INFO itself is relayed
 to the far leg on a two-leg call and answered `200` on a one-legged one; an INFO
 body that is not DTMF is relayed or answered but produces no event.
 
+### Media summary
+
+When the media engine ends a media session it reports what the session
+carried, and siphon publishes that on the channel whose SIP Call-ID the session
+was keyed on as `MediaSummary {reason, duration_ms, legs}` (siphon-rtp only).
+`reason` is `delete` or `media_timeout`; `duration_ms` has about one-second
+grain. `legs` has one entry per party, matched on `tag` (the offerer's
+From-tag, the answerer's To-tag): `packets_in`, `bytes_in`, `packets_out`,
+`bytes_out` and `packets_dropped` (the engine's own drops, not network loss)
+always, and, where the engine measured them, `codec`, `payload_type`, `ssrc`,
+`egress_ssrc`, `packets_lost`, `loss_percent`, `jitter_ms`, `rtt_ms`,
+`mos_average` / `mos_min` / `mos_max` with `mos_basis` (`full` or
+`loss+jitter`), `text` (RFC 4103 counters), `local_address` and
+`remote_address`. A figure the engine did not measure (a leg on the in-kernel
+relay, or one that never received media) is **absent**, not zero.
+
+It reaches a channel only while the channel exists, and that decides when you
+see it:
+
+- A session the engine reaped on **media timeout**, or a single-party session a
+  **`bridge`** replaced with the pair's, ends while the call goes on; its
+  summary arrives on the channel.
+- The end-of-call summary of an **ordinary hang-up** does not. Every teardown
+  (a BYE, `hangup`, a failure) emits `StasisEnd` and removes the channel at
+  once, while the media delete runs on its own task, and the engine produces
+  the summary only after that delete. By then there is no channel, so nothing
+  is published; the figures are still written to the media CDR (`method:
+  MEDIA`, joined on the Call-ID) when CDRs are enabled. Holding `StasisEnd`
+  for the engine's answer is what delivering it would take, and siphon does
+  not do that.
+
+A call no controller owns publishes nothing. There is no event for media
+*starting* on a leg: the engine reports none.
+
 ### Application-level events
 
 Most events belong to a channel and reach its owner. `RegistrationChanged` does

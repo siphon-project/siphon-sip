@@ -246,6 +246,12 @@ pub enum SipEvent {
     /// `detached`) followed by a fresh started. Any reason other than
     /// `detached` leaves a live call with no media far side.
     WsBridgeEnded,
+    /// The media engine's summary of a media session it ended on this channel
+    /// ([`MediaSummaryPayload`]): per-leg counters and measured quality. Sent
+    /// only while the channel exists — a session reaped on media timeout, or
+    /// one a bridge replaced — so never for an ordinary hang-up, whose summary
+    /// the engine produces after `StasisEnd`.
+    MediaSummary,
     /// A branch of a `dial` was created ([`DialBranchPayload`]): its INVITE is
     /// about to go out. Every fork branch, and each attempt of a sequential
     /// hunt when the hunt places it.
@@ -290,6 +296,7 @@ impl SipEvent {
             SipEvent::WsTeeEnded => "WsTeeEnded",
             SipEvent::WsBridgeStarted => "WsBridgeStarted",
             SipEvent::WsBridgeEnded => "WsBridgeEnded",
+            SipEvent::MediaSummary => "MediaSummary",
             SipEvent::DialBranch => "DialBranch",
             SipEvent::DialBranchFailed => "DialBranchFailed",
             SipEvent::DialAnswered => "DialAnswered",
@@ -323,6 +330,7 @@ impl From<&str> for SipEvent {
             "WsTeeEnded" => SipEvent::WsTeeEnded,
             "WsBridgeStarted" => SipEvent::WsBridgeStarted,
             "WsBridgeEnded" => SipEvent::WsBridgeEnded,
+            "MediaSummary" => SipEvent::MediaSummary,
             "DialBranch" => SipEvent::DialBranch,
             "DialBranchFailed" => SipEvent::DialBranchFailed,
             "DialAnswered" => SipEvent::DialAnswered,
@@ -1219,6 +1227,75 @@ pub struct WsTeeEndedPayload {
     pub frames_dropped: Option<u64>,
 }
 
+/// Payload of [`SipEvent::MediaSummary`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaSummaryPayload {
+    /// Why the engine ended the session: `delete` or `media_timeout`.
+    #[serde(default)]
+    pub reason: String,
+    /// How long the session lived, in milliseconds (about one-second grain).
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// One entry per party, matched on `tag`; iterate rather than index.
+    #[serde(default)]
+    pub legs: Vec<MediaLegSummary>,
+}
+
+/// One party's figures in a [`MediaSummaryPayload`]. The quality fields are
+/// `None` when the engine did not measure them (an in-kernel relay, or a leg
+/// that never received media), which is not the same as perfect.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaLegSummary {
+    /// The leg's tag: the offerer's From-tag or the answerer's To-tag.
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub packets_in: u64,
+    #[serde(default)]
+    pub bytes_in: u64,
+    #[serde(default)]
+    pub packets_out: u64,
+    #[serde(default)]
+    pub bytes_out: u64,
+    /// Dropped on the engine's side of the leg, not network loss.
+    #[serde(default)]
+    pub packets_dropped: u64,
+    #[serde(default)]
+    pub ssrc: Option<u32>,
+    /// RFC 3550 cumulative network loss on the inbound stream.
+    #[serde(default)]
+    pub packets_lost: Option<u32>,
+    #[serde(default)]
+    pub loss_percent: Option<f64>,
+    #[serde(default)]
+    pub jitter_ms: Option<f64>,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+    /// ITU-T G.107 MOS across the session.
+    #[serde(default)]
+    pub mos_average: Option<f64>,
+    #[serde(default)]
+    pub mos_min: Option<f64>,
+    #[serde(default)]
+    pub mos_max: Option<f64>,
+    /// `full` or `loss+jitter`: how the MOS was derived.
+    #[serde(default)]
+    pub mos_basis: Option<String>,
+    /// RFC 4103 real-time text counters, when a text stream was observed.
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
+    #[serde(default)]
+    pub local_address: Option<String>,
+    #[serde(default)]
+    pub remote_address: Option<String>,
+    #[serde(default)]
+    pub egress_ssrc: Option<u32>,
+    #[serde(default)]
+    pub payload_type: Option<u8>,
+}
+
 /// Payload of [`SipEvent::WsBridgeStarted`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WsBridgeStartedPayload {
@@ -1765,6 +1842,7 @@ mod tests {
             ("WsTeeEnded", SipEvent::WsTeeEnded),
             ("WsBridgeStarted", SipEvent::WsBridgeStarted),
             ("WsBridgeEnded", SipEvent::WsBridgeEnded),
+            ("MediaSummary", SipEvent::MediaSummary),
         ] {
             let parsed = SipEvent::from(wire);
             assert_eq!(parsed, expected, "{wire} must parse to its own variant");
@@ -1778,6 +1856,31 @@ mod tests {
                 "{wire} fell through to Other"
             );
         }
+    }
+
+    /// A counters-only leg omits what the engine did not measure; it must read
+    /// as `None`, not as a perfect zero.
+    #[test]
+    fn media_summary_payload_keeps_unmeasured_quality_absent() {
+        let summary: MediaSummaryPayload = serde_json::from_value(serde_json::json!({
+            "reason": "media_timeout", "duration_ms": 42000,
+            "legs": [
+                {"tag": "a", "codec": "PCMU", "packets_in": 10, "bytes_in": 1600,
+                 "packets_out": 9, "bytes_out": 1440, "packets_dropped": 1,
+                 "mos_average": 4.25, "remote_address": "198.51.100.20:40000"},
+                {"tag": "b", "packets_in": 9, "bytes_in": 1440, "packets_out": 10,
+                 "bytes_out": 1600, "packets_dropped": 0}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(summary.reason, "media_timeout");
+        assert_eq!(summary.legs[0].mos_average, Some(4.25));
+        assert_eq!(
+            summary.legs[0].remote_address.as_deref(),
+            Some("198.51.100.20:40000")
+        );
+        assert_eq!(summary.legs[1].mos_average, None);
+        assert_eq!(summary.legs[1].codec, None);
     }
 
     /// The end payloads carry `unexpected` because `detached` and `call_ended`
