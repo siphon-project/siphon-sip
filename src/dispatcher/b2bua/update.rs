@@ -390,9 +390,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                             return;
                         };
                         let mut offer_flags = profile.offer.clone();
-                        if offer_flags.carry_received_from {
-                            offer_flags.received_from = Some(inbound.remote_addr.ip());
-                        }
+                        offer_flags.stamp_received_from(inbound.remote_addr.ip());
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
                                 session.rtpengine_id(),

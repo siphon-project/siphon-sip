@@ -802,6 +802,16 @@ pub struct NgFlags {
 }
 
 impl NgFlags {
+    /// Fill in the per-call [`NgFlags::received_from`] with `source`, the
+    /// signalling source of the party whose SDP this command carries — only
+    /// when the profile's [`NgFlags::carry_received_from`] policy asks for it,
+    /// so an opted-out profile's command stays byte-identical.
+    pub fn stamp_received_from(&mut self, source: std::net::IpAddr) {
+        if self.carry_received_from {
+            self.received_from = Some(source);
+        }
+    }
+
     /// Build from the YAML config representation.
     ///
     /// [`NgFlags::received_from`] is deliberately left `None`: the config only
@@ -1221,6 +1231,20 @@ mod tests {
                 "{half}: a built-in must never carry a per-call address"
             );
         }
+    }
+
+    #[test]
+    fn received_from_is_stamped_only_where_the_profile_asks_for_it() {
+        let source: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let mut opted_out = NgFlags::default();
+        opted_out.stamp_received_from(source);
+        assert_eq!(opted_out.received_from, None);
+        let mut opted_in = NgFlags {
+            carry_received_from: true,
+            ..NgFlags::default()
+        };
+        opted_in.stamp_received_from(source);
+        assert_eq!(opted_in.received_from, Some(source));
     }
 
     #[test]

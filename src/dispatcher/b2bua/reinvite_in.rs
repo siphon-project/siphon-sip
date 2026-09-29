@@ -755,9 +755,7 @@ pub fn answer_one_legged_reoffer(
     let mut answer_flags = profile.answer.clone();
     // Pin media ingress where this request actually came from, as the offer path
     // does: a handset that changed network re-offers from a new public address.
-    if answer_flags.carry_received_from {
-        answer_flags.received_from = Some(inbound.remote_addr.ip());
-    }
+    answer_flags.stamp_received_from(inbound.remote_addr.ip());
 
     let answer_sdp = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(rtpengine_set.answer_local(
@@ -874,9 +872,7 @@ pub fn reoffer_through_media_engine(
     // Pin media ingress to where the offer actually came from, the way the initial
     // offer does: a client that changed network re-offers from a new public
     // address, and the engine gates the leg on the last hint it was given.
-    if offer_flags.carry_received_from {
-        offer_flags.received_from = Some(received_from);
-    }
+    offer_flags.stamp_received_from(received_from);
     match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
             session.rtpengine_id(),

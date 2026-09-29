@@ -442,9 +442,7 @@ pub fn answer_first_prepare(
     }
 
     // received_from gate: pin media ingress to the caller's real source IP.
-    if flags.carry_received_from {
-        flags.received_from = Some(source_ip);
-    }
+    flags.stamp_received_from(source_ip);
 
     // Final backend-capability guard (mirrors finalise_flags) — should pass on
     // siphon-rtp, but never answer a call whose flags the engine cannot honour.

@@ -51,9 +51,7 @@ pub fn control_dial_media_offer(
         .and_then(|value| value.tag)
         .ok_or("dial offer has no From tag")?;
     let mut flags = profile.offer.clone();
-    if flags.carry_received_from {
-        flags.received_from = Some(source_ip);
-    }
+    flags.stamp_received_from(source_ip);
     for half in [&flags, &profile.answer] {
         let unsupported = backend.unsupported_flags(half);
         if !unsupported.is_empty() {
@@ -152,9 +150,7 @@ pub fn control_dial_media_answer(
         .and_then(|value| value.tag)
         .ok_or("dial answer has no To tag")?;
     let mut flags = profile.answer.clone();
-    if flags.carry_received_from {
-        flags.received_from = Some(source_ip);
-    }
+    flags.stamp_received_from(source_ip);
     let body = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.answer(
             session.rtpengine_id(),
