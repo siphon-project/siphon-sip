@@ -34,13 +34,14 @@ pub use crate::originate::{
     AorRing, OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, OriginatedGroup,
     SessionRefresher, SessionTimer,
 };
-// `dial` and the recording pair hang their verbs off `Call` from their own
+// `dial`, the recording pair and the stream pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
 // reachable under one path.
 pub use crate::dial::{DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback};
 pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
+pub use crate::stream::{StreamChannels, StreamDirection, StreamMode, StreamOptions};
 
 mod app_event;
 pub use app_event::{AppEvent, AppEventStream};
@@ -634,6 +635,8 @@ impl Call {
     /// `profile` names a media profile (default `voice_ai`) and `ws_uri`
     /// overrides that profile's WebSocket bridge URI for this call, with
     /// `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` templating.
+    /// `{call_id}` is the call's SIP Call-ID (its `sip_call_id`), not the
+    /// control-plane `call_id`.
     ///
     /// Synthesizing the RFC 3264 answer against the media engine is a
     /// siphon-rtp capability, so on rtpengine / rtpproxy this answers
@@ -1062,34 +1065,6 @@ impl Call {
     /// Resume the A-leg media after a [`Call::hold`].
     pub async fn unhold(&self) -> Result<(), ControlError> {
         self.sip(SipVerb::Unhold, json!({})).await.map(drop)
-    }
-
-    /// Attach a WebSocket audio tee — stream a copy of the call's decoded audio
-    /// to `ws_uri` while the call keeps relaying.
-    ///
-    /// `direction` is one of `"both"` (default) / `"caller"` / `"callee"`;
-    /// `channels` is `1` (mixed mono) or `2` (caller/callee stereo, only
-    /// meaningful with `"both"`). siphon-rtp backend only: rtpengine / rtpproxy
-    /// answer [`ControlError::is_unsupported_verb`].
-    pub async fn stream_start(
-        &self,
-        ws_uri: &str,
-        direction: Option<&str>,
-        channels: Option<u8>,
-    ) -> Result<(), ControlError> {
-        let mut args = json!({ "ws_uri": ws_uri });
-        if let Some(direction) = direction {
-            args["direction"] = json!(direction);
-        }
-        if let Some(channels) = channels {
-            args["channels"] = json!(channels);
-        }
-        self.sip(SipVerb::StreamStart, args).await.map(drop)
-    }
-
-    /// Detach the WebSocket audio tee (idempotent on siphon-rtp).
-    pub async fn stream_stop(&self) -> Result<(), ControlError> {
-        self.sip(SipVerb::StreamStop, json!({})).await.map(drop)
     }
 
     // --- escape hatch + events --------------------------------------------
@@ -2004,9 +1979,14 @@ mod tests {
         assert_eq!(by_verb("unhold"), json!({}));
         assert_eq!(
             by_verb("stream_start"),
-            json!({ "ws_uri": "ws://ai:9000/stream", "direction": "both", "channels": 2 })
+            json!({
+                "ws_uri": "ws://ai:9000/stream",
+                "mode": "tee",
+                "direction": "both",
+                "channels": 2,
+            })
         );
-        assert_eq!(by_verb("stream_stop"), json!({}));
+        assert_eq!(by_verb("stream_stop"), json!({ "mode": "tee" }));
     }
 
     #[tokio::test]
@@ -2558,5 +2538,116 @@ mod tests {
         // Absent, not null — which is what makes the server stop every
         // recording on the call rather than one named `null`.
         assert_eq!(calls[1].args, json!({}));
+    }
+
+    fn streaming_result() -> serde_json::Value {
+        json!({ "channel": "ch1", "state": "streaming" })
+    }
+
+    #[tokio::test]
+    async fn stream_start_with_a_tee_sends_its_mode_and_wire_shape() {
+        let recorder = recorder(streaming_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with(
+            "wss://ai.example/stream",
+            StreamOptions::tee()
+                .direction(StreamDirection::Caller)
+                .channels(StreamChannels::Mono)
+                .sample_rate(16_000),
+        )
+        .await
+        .expect("stream_start");
+
+        let recorded = lock(&recorder.calls)[0].clone();
+        assert_eq!(recorded.module.as_deref(), Some("sip"));
+        assert_eq!(recorded.verb, "stream_start");
+        assert_eq!(recorded.target, json!({ "channel": "ch1" }));
+        assert_eq!(
+            recorded.args,
+            json!({
+                "ws_uri": "wss://ai.example/stream",
+                "mode": "tee",
+                "direction": "caller",
+                "channels": 1,
+                "sample_rate": 16_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_start_with_a_bridge_asks_for_the_takeover() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "bridged" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with("wss://ai.example/agent", StreamOptions::bridge())
+            .await
+            .expect("stream_start");
+        assert_eq!(
+            lock(&recorder.calls)[0].args,
+            json!({ "ws_uri": "wss://ai.example/agent", "mode": "bridge" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unshaped_stream_start_still_names_the_tee() {
+        // A tee and a bridge are opposites, not two shapes of one stream, so
+        // the mode goes out even when the caller asked for nothing: a server
+        // whose default moved must not turn a transcription into a takeover.
+        // The tee's shaping (direction, channels, rate) stays the server's.
+        let recorder = recorder(streaming_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with("wss://ai.example/stream", StreamOptions::default())
+            .await
+            .expect("stream_start_with");
+        call.stream_start("wss://ai.example/stream", None, None)
+            .await
+            .expect("stream_start");
+        let calls = lock(&recorder.calls).clone();
+        for recorded in &calls {
+            assert_eq!(
+                recorded.args,
+                json!({ "ws_uri": "wss://ai.example/stream", "mode": "tee" })
+            );
+        }
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_stop_names_the_stream_it_detaches() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "detached" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_stop_with(StreamMode::Bridge)
+            .await
+            .expect("stream_stop bridge");
+        call.stream_stop_with(StreamMode::Tee)
+            .await
+            .expect("stream_stop tee");
+        call.stream_stop().await.expect("stream_stop");
+        let calls = lock(&recorder.calls).clone();
+        assert_eq!(calls[0].verb, "stream_stop");
+        assert_eq!(calls[0].args, json!({ "mode": "bridge" }));
+        assert_eq!(calls[1].args, json!({ "mode": "tee" }));
+        assert_eq!(calls[2].args, json!({ "mode": "tee" }));
+    }
+
+    #[test]
+    fn stream_selectors_parse_their_wire_names() {
+        assert_eq!(StreamMode::default(), StreamMode::Tee);
+        assert_eq!(StreamMode::from_name("BRIDGE"), Some(StreamMode::Bridge));
+        assert_eq!(StreamMode::from_name("tee"), Some(StreamMode::Tee));
+        assert_eq!(StreamMode::from_name("takeover"), None);
+        assert_eq!(StreamMode::Bridge.as_str(), "bridge");
+        assert_eq!(
+            StreamDirection::from_name("Callee"),
+            Some(StreamDirection::Callee)
+        );
+        assert_eq!(StreamDirection::from_name("inbound"), None);
+        assert_eq!(StreamDirection::Both.as_str(), "both");
+        assert_eq!(StreamChannels::from_count(2), Some(StreamChannels::Stereo));
+        assert_eq!(StreamChannels::from_count(3), None);
+        assert_eq!(StreamChannels::Mono.count(), 1);
     }
 }

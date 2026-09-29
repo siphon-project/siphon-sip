@@ -1514,3 +1514,97 @@ def test_originate_aor_roundtrip():
             client.close()
 
     asyncio.run(scenario())
+
+
+def test_stream_verbs_roundtrip():
+    """`call.stream_start(...)` / `call.stream_stop(...)` always name the mode on
+    the wire, carry a tee's sample rate, and ask for a bridge only when told."""
+
+    async def scenario():
+        frames = []
+        refused = []
+
+        def reply(frame):
+            return {"channel": "ch1", "state": "streaming"}
+
+        stub = _verb_stub({"stream_start", "stream_stop"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                await call.stream_start("wss://ai.example/stream")
+                await call.stream_start(
+                    "wss://ai.example/stream",
+                    direction="caller",
+                    channels=1,
+                    mode="tee",
+                    sample_rate=16_000,
+                )
+                await call.stream_start("wss://ai.example/agent", mode="bridge")
+                await call.stream_stop()
+                await call.stream_stop(mode="bridge")
+                for kwargs in (
+                    {"mode": "takeover"},
+                    {"direction": "inbound"},
+                    {"channels": 3},
+                ):
+                    try:
+                        call.stream_start("wss://ai.example/stream", **kwargs)
+                    except ValueError as error:
+                        refused.append(str(error))
+                try:
+                    call.stream_stop(mode="takeover")
+                except ValueError as error:
+                    refused.append(str(error))
+                if not done.done():
+                    done.set_result(True)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=5)
+
+            for frame in frames:
+                assert frame["module"] == "sip"
+                assert frame["target"]["channel"] == "ch1"
+            assert [frame["verb"] for frame in frames] == [
+                "stream_start",
+                "stream_start",
+                "stream_start",
+                "stream_stop",
+                "stream_stop",
+            ]
+            # A tee and a bridge are opposites, so the plain call names the tee
+            # rather than leaning on whatever the server defaults to.
+            assert frames[0]["args"] == {
+                "ws_uri": "wss://ai.example/stream",
+                "mode": "tee",
+            }
+            assert frames[1]["args"] == {
+                "ws_uri": "wss://ai.example/stream",
+                "mode": "tee",
+                "direction": "caller",
+                "channels": 1,
+                "sample_rate": 16_000,
+            }
+            assert frames[2]["args"] == {
+                "ws_uri": "wss://ai.example/agent",
+                "mode": "bridge",
+            }
+            assert frames[3]["args"] == {"mode": "tee"}
+            assert frames[4]["args"] == {"mode": "bridge"}
+            # Refused before a frame goes out: nothing past the five above.
+            assert len(refused) == 4, refused
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())

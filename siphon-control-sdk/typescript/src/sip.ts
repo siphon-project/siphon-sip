@@ -115,7 +115,9 @@ export interface AnchoredAnswerOptions {
   profile?: string;
   /**
    * Per-call WebSocket bridge URI, overriding the profile's own. Supports
-   * `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` templating.
+   * `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` templating;
+   * `{call_id}` is the call's SIP Call-ID (`sipCallId`), not the control-plane
+   * `callId`.
    */
   wsUri?: string;
 }
@@ -724,12 +726,43 @@ export interface DtmfOptions {
   toTag?: string;
 }
 
-/** Options for {@link Call.streamStart} (the WebSocket audio tee). */
+/**
+ * Which kind of WebSocket stream {@link Call.streamStart} /
+ * {@link Call.streamStop} address. The two are opposites: a `"tee"` is
+ * additive (a copy streams out, the call keeps relaying), a `"bridge"` is a
+ * takeover (the server becomes the leg's far side and the call's own media
+ * path is unwired).
+ */
+export type StreamMode = "tee" | "bridge";
+
+/** Options for {@link Call.streamStart}. */
 export interface StreamOptions {
-  /** Which leg(s) to tee — `"both"` (default), `"caller"`, or `"callee"`. */
+  /**
+   * `"tee"` (default) or `"bridge"`. Always sent, the default included, so a
+   * server whose default moved can never turn a transcription into a takeover.
+   */
+  mode?: StreamMode;
+  /**
+   * Which leg(s) a tee streams — `"both"` (default), `"caller"`, or `"callee"`.
+   * Tee only: the server refuses it alongside `mode: "bridge"`.
+   */
   direction?: "both" | "caller" | "callee";
-  /** `1` = mixed mono, `2` = caller/callee stereo (only with `"both"`). */
+  /**
+   * `1` = mixed mono, `2` = caller/callee stereo (only with `"both"`). Tee
+   * only.
+   */
   channels?: 1 | 2;
+  /**
+   * A tee's L16 sample rate in Hz: a multiple of 1000 within 8000–48000 (the
+   * engine's default when unset). Tee only; the server refuses anything else.
+   */
+  sampleRate?: number;
+}
+
+/** Options for {@link Call.streamStop}. */
+export interface StreamStopOptions {
+  /** Which stream to detach: `"tee"` (default, always sent) or `"bridge"`. */
+  mode?: StreamMode;
 }
 
 function playArgs(source: PlaySource, options?: PlayOptions): Record<string, unknown> {
@@ -1306,24 +1339,51 @@ export class Call {
   }
 
   /**
-   * Attach a WebSocket audio tee — stream a copy of the call's decoded audio to
-   * `wsUri` while the call keeps relaying. siphon-rtp backend only: rtpengine /
-   * rtpproxy reject with `code === "unsupported_verb"` (`error.isUnsupportedVerb()`).
+   * Attach a WebSocket audio stream to `wsUri`: an additive tee (the default)
+   * or a takeover bridge, as `options.mode` says.
+   *
+   * ```ts
+   * // Transcribe the caller at 16 kHz; the call keeps relaying.
+   * // The URI is built here: `stream_start` does not expand placeholders.
+   * await call.streamStart(`wss://ai.example/stream/${call.sipCallId}`, {
+   *   direction: "caller",
+   *   sampleRate: 16000,
+   * });
+   * // Hand the leg to a voice agent; the agent is now the far side.
+   * await call.streamStart("wss://ai.example/agent", { mode: "bridge" });
+   * ```
+   *
+   * A bridge on a leg that already has one re-points it in place. `wsUri` is
+   * sent as written: placeholders such as `{call_id}` are not expanded on
+   * `stream_start` at present, so pass a concrete URI (built from
+   * {@link Call.sipCallId}, say). siphon-rtp backend only: rtpengine / rtpproxy
+   * reject with `code === "unsupported_verb"` (`error.isUnsupportedVerb()`).
    */
   async streamStart(wsUri: string, options?: StreamOptions): Promise<void> {
-    const args: Record<string, unknown> = { ws_uri: wsUri };
+    const args: Record<string, unknown> = {
+      ws_uri: wsUri,
+      mode: options?.mode ?? "tee",
+    };
     if (options?.direction !== undefined) {
       args.direction = options.direction;
     }
     if (options?.channels !== undefined) {
       args.channels = options.channels;
     }
+    if (options?.sampleRate !== undefined) {
+      args.sample_rate = options.sampleRate;
+    }
     await this.sip(SipVerb.StreamStart, args);
   }
 
-  /** Detach the WebSocket audio tee (idempotent on siphon-rtp). */
-  async streamStop(): Promise<void> {
-    await this.sip(SipVerb.StreamStop, {});
+  /**
+   * Detach the WebSocket stream of `options.mode` (`"tee"` by default, sent
+   * explicitly). A tee detach is idempotent. A bridge detach is not: the
+   * engine refuses one where there is no relay to hand the call back to, and
+   * that rejects rather than leaving a live call with no audio path.
+   */
+  async streamStop(options?: StreamStopOptions): Promise<void> {
+    await this.sip(SipVerb.StreamStop, { mode: options?.mode ?? "tee" });
   }
 
   /**

@@ -119,6 +119,25 @@ entry, but a working config keeps working.
   `total_timeout`, `ringback` and the `branches` rung, and the event payloads
   gain `DialAnswered.channel`, `DialFailed.cause`, `PlayStarted.origin` and the
   `bridge_failed` branch cause.
+- **Control SDKs: `stream_start` can ask for a bridge, a sample rate, and
+  always names the mode.** The typed `stream_start` could send neither `mode`
+  nor `sample_rate`, so a controller got a tee only by leaning on the server's
+  default and could never ask for a takeover bridge without writing the frame
+  by hand. A tee and a bridge are opposites (a copy streams out and the call
+  relays on, versus the server replacing the call's media path), so every SDK
+  now sends `mode` on every `stream_start` and `stream_stop`, `tee` included:
+  a server whose default moved can no longer turn a transcription into a
+  takeover. Rust adds `Call::stream_start_with(ws_uri, StreamOptions)` (with
+  `StreamMode`, `StreamDirection`, `StreamChannels`) and
+  `Call::stream_stop_with(StreamMode)`; the existing `stream_start` /
+  `stream_stop` keep their signatures and send `mode: "tee"`. Python takes
+  `stream_start(..., mode="tee", sample_rate=None)` and
+  `stream_stop(mode="tee")`, refusing a bad mode, direction or channel count
+  with `ValueError` before sending. TypeScript adds `mode` and `sampleRate` to
+  `StreamOptions` and `streamStop({ mode })`. The SDK docs now say that
+  `{call_id}` in an anchored answer's `ws_uri` is the SIP Call-ID, not the
+  control-plane `call_id`, and that `stream_start` does not expand
+  placeholders at present, so its `ws_uri` must be a concrete URI.
 
 ## [1.11.1] — 2026-09-28
 
