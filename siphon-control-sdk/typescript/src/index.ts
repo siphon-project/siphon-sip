@@ -156,5 +156,7 @@ export type {
   PlaySource,
   PlayOptions,
   DtmfOptions,
+  StreamMode,
   StreamOptions,
+  StreamStopOptions,
 } from "./sip";

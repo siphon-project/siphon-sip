@@ -300,8 +300,8 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
 | `hold` / `unhold` | sip | — | media hold via silence |
-| `stream_start` | sip | `{ws_uri, direction?, channels?}` | attach a WebSocket audio tee (siphon-rtp backend only) |
-| `stream_stop` | sip | — | detach the WebSocket audio tee |
+| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only) |
+| `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
 | `describe` | — | — | list the registered adapters + their verb/event schema |
@@ -382,8 +382,14 @@ same way every other verb does — never a hang:
   an *additive* copy of the live call's audio for transcription / agent-assist /
   compliance, not a takeover of the media path. This is a `siphon-rtp`-backend
   feature: on rtpengine / rtpproxy it answers `unsupported_verb` rather than a
-  hollow success. `direction` is `both` (default) / `caller` / `callee`, and
-  `channels` is `1` (mixed mono) or `2` (caller/callee stereo).
+  hollow success. `direction` is `both` (default) / `caller` / `callee`,
+  `channels` is `1` (mixed mono) or `2` (caller/callee stereo), and
+  `sample_rate` is the L16 rate in Hz (a multiple of 1000 within 8000–48000).
+  `mode: bridge` is the opposite operation, a takeover that makes the
+  WebSocket server the leg's far side; it takes none of the tee's shaping
+  arguments and refuses them with `bad_request`. An absent `mode` means `tee`,
+  but the SDKs always send it, so a controller that asked for a tee never gets
+  a takeover from a server whose default differs.
 - A call with no anchored media session answers `not_found`; a backend that
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.

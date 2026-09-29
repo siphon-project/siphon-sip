@@ -9,12 +9,14 @@ use pyo3::prelude::*;
 
 use siphon_control_client::sip::{
     Call as RustCall, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions, Ringback,
+    StreamOptions,
 };
 
 use crate::args::{
     build_play_source, extract_dial_on_answer, extract_dial_strategy, extract_dial_targets,
     extract_headers, extract_privacy, extract_record_channels, extract_record_direction,
-    extract_route_target, parse_peer_hangup,
+    extract_route_target, extract_stream_channels, extract_stream_direction, extract_stream_mode,
+    parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
@@ -128,7 +130,8 @@ impl Call {
     /// ``profile`` names a media profile (default ``voice_ai``) and ``ws_uri``
     /// overrides that profile's WebSocket bridge URI for this call, with
     /// ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` / ``{to_user}``
-    /// templating.
+    /// templating. ``{call_id}`` is the call's SIP Call-ID (``sip_call_id``),
+    /// not the control-plane ``call_id``.
     ///
     /// Synthesizing the RFC 3264 answer against the media engine is a
     /// siphon-rtp capability, so on rtpengine / rtpproxy this raises with
@@ -619,31 +622,74 @@ impl Call {
         })
     }
 
-    /// Attach a WebSocket audio tee streaming a copy of the call's audio to
-    /// `ws_uri`. `direction` is `"both"` (default) / `"caller"` / `"callee"`;
-    /// `channels` is `1` (mono) or `2` (stereo). siphon-rtp backend only:
-    /// rtpengine / rtpproxy raise `ControlError` (`code == "unsupported_verb"`).
-    #[pyo3(signature = (ws_uri, direction=None, channels=None))]
+    /// Attach a WebSocket audio stream to ``ws_uri``.
+    ///
+    /// ``mode`` picks one of two opposite operations:
+    ///
+    /// - ``"tee"`` (default) is additive: a copy of the call's decoded audio
+    ///   streams to ``ws_uri`` while the call keeps relaying. Use it for
+    ///   transcription, agent assist and compliance.
+    /// - ``"bridge"`` is a takeover: the WebSocket server becomes the leg's far
+    ///   side and the call's own media path is unwired. On a leg that already
+    ///   has a bridge it re-points in place.
+    ///
+    /// ``mode`` always goes on the wire, ``"tee"`` included, so a server whose
+    /// default moved can never turn a transcription into a takeover.
+    ///
+    /// The rest shape a **tee** only (the server refuses them alongside
+    /// ``mode="bridge"``): ``direction`` is ``"both"`` (default) / ``"caller"`` /
+    /// ``"callee"``; ``channels`` is ``1`` (mixed mono) or ``2`` (caller/callee
+    /// stereo, only with ``"both"``); ``sample_rate`` is the L16 rate in Hz, a
+    /// multiple of 1000 within 8000-48000. A bad ``mode`` / ``direction`` /
+    /// ``channels`` raises ``ValueError`` before anything is sent.
+    ///
+    /// ``ws_uri`` is sent as written: placeholders such as ``{call_id}`` are
+    /// not expanded on ``stream_start`` at present, so pass a concrete URI
+    /// (built from ``call.sip_call_id``, say). siphon-rtp backend
+    /// only: rtpengine / rtpproxy raise ``ControlError``
+    /// (``code == "unsupported_verb"``).
+    ///
+    /// .. code-block:: python
+    ///
+    ///     await call.stream_start(f"wss://ai.example/stream/{call.sip_call_id}",
+    ///                             direction="caller", sample_rate=16000)
+    ///     await call.stream_start("wss://ai.example/agent", mode="bridge")
+    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None))]
     fn stream_start<'py>(
         &self,
         py: Python<'py>,
         ws_uri: String,
         direction: Option<String>,
         channels: Option<u8>,
+        mode: &str,
+        sample_rate: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let options = StreamOptions {
+            mode: extract_stream_mode(mode)?,
+            direction: extract_stream_direction(direction)?,
+            channels: extract_stream_channels(channels)?,
+            sample_rate,
+        };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.stream_start(&ws_uri, direction.as_deref(), channels)
+            call.stream_start_with(&ws_uri, options)
                 .await
                 .map_err(to_pyerr)
         })
     }
 
-    /// Detach the WebSocket audio tee (idempotent on siphon-rtp).
-    fn stream_stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Detach the WebSocket stream of ``mode`` (``"tee"`` by default, sent
+    /// explicitly).
+    ///
+    /// A tee detach is idempotent. A bridge detach is not: the engine refuses
+    /// one where there is no relay to hand the call back to, and that raises
+    /// ``ControlError`` rather than leaving a live call with no audio path.
+    #[pyo3(signature = (*, mode="tee"))]
+    fn stream_stop<'py>(&self, py: Python<'py>, mode: &str) -> PyResult<Bound<'py, PyAny>> {
+        let mode = extract_stream_mode(mode)?;
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.stream_stop().await.map_err(to_pyerr)
+            call.stream_stop_with(mode).await.map_err(to_pyerr)
         })
     }
 

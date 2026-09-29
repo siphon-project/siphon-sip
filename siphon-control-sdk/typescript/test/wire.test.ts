@@ -579,8 +579,37 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#", duration_ms: 100, volume_dbm0: -8 } },
       { module: MODULE_SIP, verb: "hold", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "unhold", target: { channel: "ch1" }, args: {} },
-      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "ws://ai:9000/stream", direction: "both", channels: 2 } },
-      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: {} },
+      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "ws://ai:9000/stream", mode: "tee", direction: "both", channels: 2 } },
+      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "tee" } },
+    ]);
+  });
+
+  it("stream — the mode always rides the frame, a tee carries its sample rate", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.streamStart("wss://ai.example/stream");
+    await call.streamStart("wss://ai.example/stream", {
+      mode: "tee",
+      direction: "caller",
+      channels: 1,
+      sampleRate: 16000,
+    });
+    await call.streamStart("wss://ai.example/agent", { mode: "bridge" });
+    await call.streamStop();
+    await call.streamStop({ mode: "bridge" });
+    expect(transport.calls).toEqual([
+      // A tee and a bridge are opposites, so the plain call names the tee
+      // rather than leaning on whatever the server defaults to.
+      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "wss://ai.example/stream", mode: "tee" } },
+      {
+        module: MODULE_SIP,
+        verb: "stream_start",
+        target: { channel: "ch1" },
+        args: { ws_uri: "wss://ai.example/stream", mode: "tee", direction: "caller", channels: 1, sample_rate: 16000 },
+      },
+      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "wss://ai.example/agent", mode: "bridge" } },
+      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "tee" } },
+      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "bridge" } },
     ]);
   });
 

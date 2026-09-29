@@ -10,6 +10,7 @@ use siphon_control_client::proto::sip::PeerHangupPolicy;
 use siphon_control_client::sip::{
     AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
     RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
+    StreamChannels, StreamDirection, StreamMode,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -252,6 +253,41 @@ pub(crate) fn extract_record_channels(
         Some(name) => RecordChannels::from_name(&name).map(Some).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "record channels must be \"mono\" or \"stereo\", not {name:?}"
+            ))
+        }),
+    }
+}
+
+/// Parse `stream_start(mode=...)` / `stream_stop(mode=...)`.
+pub(crate) fn extract_stream_mode(mode: &str) -> PyResult<StreamMode> {
+    StreamMode::from_name(mode).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "stream mode must be \"tee\" or \"bridge\", not {mode:?}"
+        ))
+    })
+}
+
+/// Parse `stream_start(direction=...)`.
+pub(crate) fn extract_stream_direction(
+    direction: Option<String>,
+) -> PyResult<Option<StreamDirection>> {
+    match direction {
+        None => Ok(None),
+        Some(name) => StreamDirection::from_name(&name).map(Some).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "stream direction must be \"both\", \"caller\" or \"callee\", not {name:?}"
+            ))
+        }),
+    }
+}
+
+/// Parse `stream_start(channels=...)`.
+pub(crate) fn extract_stream_channels(channels: Option<u8>) -> PyResult<Option<StreamChannels>> {
+    match channels {
+        None => Ok(None),
+        Some(count) => StreamChannels::from_count(count).map(Some).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "stream channels must be 1 (mono) or 2 (stereo), not {count}"
             ))
         }),
     }
