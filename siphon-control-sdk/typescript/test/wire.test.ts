@@ -18,7 +18,9 @@ import {
   SipVerb,
   transferOutcome,
   MODULE_SIP,
+  SipClient,
   originateArgs,
+  originateAorArgs,
   dialArgs,
   recordStartArgs,
   recordStopArgs,
@@ -33,6 +35,7 @@ import type {
   DialBranchPayload,
   DialFailedPayload,
   DialogStateChangedPayload,
+  PlayStartedPayload,
   TransferOutcomePayload,
 } from "../src/index";
 import type { CommandTransport } from "../src/session";
@@ -222,6 +225,41 @@ describe("SipVerb wire tokens + event names", () => {
     );
     expect(failed.timed_out).toBe(true);
     expect(failed.branches?.[0]?.leg_sip_call_id).toBe("b1@host");
+    expect(failed.cause).toBeUndefined();
+  });
+
+  it("decodes the bridge-dial additions to the dial and play payloads", () => {
+    // Byte-identical to what a `dial {on_answer: "bridge"}` pushes.
+    const answered: DialAnsweredPayload = JSON.parse(
+      '{"leg_id":"leg-2","leg_sip_call_id":"b2@host","target":"sip:205@192.0.2.7:5060",' +
+        '"code":200,"aor":"sip:205@example.com","channel":"dial-bridge-leg-2"}',
+    );
+    expect(answered.channel).toBe("dial-bridge-leg-2");
+    const orphaned: DialAnsweredPayload = JSON.parse(
+      '{"leg_id":"leg-2","leg_sip_call_id":"b2@host","target":"sip:205@example.com",' +
+        '"code":200,"channel":null}',
+    );
+    expect(orphaned.channel).toBeNull();
+
+    const refused: DialBranchOutcome = JSON.parse(
+      '{"leg_id":"leg-3","leg_sip_call_id":"b3@host","target":"sip:206@example.com",' +
+        '"code":488,"reason":"Not Acceptable Here","cause":"bridge_failed"}',
+    );
+    expect(refused.cause).toBe("bridge_failed");
+
+    const failed: DialFailedPayload = JSON.parse(
+      '{"code":487,"reason":"Request Terminated","cause":"caller_hangup",' +
+        '"timed_out":false,"branches":[]}',
+    );
+    expect(failed.cause).toBe("caller_hangup");
+    expect(failed.timed_out).toBe(false);
+
+    const ringback: PlayStartedPayload = JSON.parse(
+      '{"source":"tone","origin":"ringback","play_id":7}',
+    );
+    expect(ringback.origin).toBe("ringback");
+    const own: PlayStartedPayload = JSON.parse('{"source":"file","play_id":8}');
+    expect(own.origin).toBeUndefined();
   });
 
   it("decodes a transfer verdict payload", () => {
@@ -341,6 +379,24 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
         args: { reason: "no flow claims this number" },
       },
     ]);
+  });
+
+  it("drop sends ban only when it is true", async () => {
+    // Off is the server's default; sending `ban: false` would be noise, and a
+    // string would be refused as bad_request.
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.drop("scanner", { ban: true });
+    await call.drop(undefined, { ban: true });
+    await call.drop("scanner", { ban: false });
+    await call.drop("scanner", {});
+    expect(transport.calls.map((recorded) => recorded.args)).toEqual([
+      { reason: "scanner", ban: true },
+      { ban: true },
+      { reason: "scanner" },
+      { reason: "scanner" },
+    ]);
+    expect(transport.calls.every((recorded) => recorded.verb === "drop")).toBe(true);
   });
 
   it("refer / transfer / referReplaces", async () => {
@@ -599,6 +655,75 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("dial reads a bridge dial's reply", async () => {
+    // Byte-identical to the server's reply to `dial {on_answer: "bridge"}`.
+    const transport = new RecordingTransport({
+      channel: "ch1",
+      state: "dialing",
+      on_answer: "bridge",
+      group_id: "originate-group-9",
+      targets: 2,
+      strategy: "sequential",
+      timeout: 20,
+      total_timeout: 40,
+      ringback: "ringback_eu",
+      branches: [
+        {
+          leg_id: "leg-1",
+          leg_sip_call_id: "b1@host",
+          target: "sip:204@192.0.2.7:5060",
+          aor: "sip:204@pbx.example",
+        },
+      ],
+    });
+    const call = makeCall(transport);
+    const dialing = await call.dial([{ aor: "sip:204@pbx.example" }], {
+      onAnswer: "bridge",
+      strategy: "sequential",
+      timeout: 20,
+      ringback: "ringback_eu",
+    });
+    expect(dialing).toEqual({
+      channel: "ch1",
+      targets: 2,
+      strategy: "sequential",
+      timeout: 20,
+      onAnswer: "bridge",
+      groupId: "originate-group-9",
+      totalTimeout: 40,
+      ringback: "ringback_eu",
+      branches: [
+        {
+          leg_id: "leg-1",
+          leg_sip_call_id: "b1@host",
+          target: "sip:204@192.0.2.7:5060",
+          aor: "sip:204@pbx.example",
+        },
+      ],
+    });
+    expect(transport.calls[0]?.args).toEqual({
+      targets: [{ aor: "sip:204@pbx.example" }],
+      strategy: "sequential",
+      timeout: 20,
+      on_answer: "bridge",
+      ringback: "ringback_eu",
+    });
+
+    // A connecting dial's reply carries none of the bridge fields.
+    const plain = await makeCall(
+      new RecordingTransport({ channel: "ch1", state: "dialing", targets: 1 }),
+    ).dial([{ uri: "sip:1001@pbx.example" }]);
+    expect(plain.onAnswer).toBeUndefined();
+    expect(plain.groupId).toBeUndefined();
+    expect(plain.branches).toBeUndefined();
+
+    // `ringback: false` is a real value, not an absent one.
+    const silent = await makeCall(
+      new RecordingTransport({ channel: "ch1", on_answer: "bridge", ringback: false }),
+    ).dial([{ aor: "sip:204@pbx.example" }], { onAnswer: "bridge", ringback: false });
+    expect(silent.ringback).toBe(false);
+  });
+
   it("removeHeader emits the remove_header verb", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
@@ -708,6 +833,99 @@ describe("originate args map to the names the server parses", () => {
   });
 });
 
+describe("originate {aor} args and reply", () => {
+  it("sends aor in place of to, with the same options and the ring shaping", () => {
+    // `to` beside `aor` is bad_request server-side, as is strategy /
+    // total_timeout beside `to`; the two builders keep them apart.
+    expect(
+      originateAorArgs(
+        "wake-201",
+        "sip:201@pbx.example",
+        { anchor: true },
+        { from: "sip:reception@pbx.example", timeout: 25, onLost: "hangup" },
+        { strategy: "sequential", totalTimeout: 60 },
+      ),
+    ).toEqual({
+      channel: "wake-201",
+      aor: "sip:201@pbx.example",
+      media: true,
+      from: "sip:reception@pbx.example",
+      timeout: 25,
+      on_lost: "hangup",
+      strategy: "sequential",
+      total_timeout: 60,
+    });
+    const bare = originateAorArgs("wake-201", "sip:201@pbx.example", { sdp: "v=0\r\n" });
+    expect(bare).toEqual({ channel: "wake-201", aor: "sip:201@pbx.example", sdp: "v=0\r\n" });
+    expect("to" in bare).toBe(false);
+    expect("to" in originateArgs("out-1", "sip:1001@pbx.example", { anchor: true })).toBe(true);
+    expect("aor" in originateArgs("out-1", "sip:1001@pbx.example", { anchor: true })).toBe(false);
+  });
+
+  it("is module-level and reads the group reply", async () => {
+    const recorded: Recorded[] = [];
+    const reply = {
+      channel: "wake-201",
+      group_id: "originate-group-3",
+      aor: "sip:201@pbx.example",
+      strategy: "parallel",
+      total_timeout: 25,
+      state: "calling",
+      branches: [
+        {
+          leg_id: "leg-1",
+          leg_sip_call_id: "l1@host",
+          target: "sip:201@192.0.2.7:5060",
+          aor: "sip:201@pbx.example",
+        },
+        {
+          leg_id: "leg-2",
+          leg_sip_call_id: "l2@host",
+          target: "sip:201@198.51.100.4:5060",
+          aor: "sip:201@pbx.example",
+        },
+      ],
+    };
+    const fakeControl = {
+      commander: () => ({}),
+      onEvent: () => undefined,
+      command: (module: string | null, verb: string, target: unknown, args: unknown) => {
+        recorded.push({ module, verb, target, args });
+        return Promise.resolve(reply);
+      },
+    };
+    const client = SipClient.wrap(fakeControl as never);
+    const group = await client.originateAor(
+      "wake-201",
+      "sip:201@pbx.example",
+      { anchor: true },
+      undefined,
+      { strategy: "parallel" },
+    );
+    expect(recorded).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "originate",
+        target: null,
+        args: {
+          channel: "wake-201",
+          aor: "sip:201@pbx.example",
+          media: true,
+          strategy: "parallel",
+        },
+      },
+    ]);
+    expect(group).toEqual({
+      channel: "wake-201",
+      groupId: "originate-group-3",
+      aor: "sip:201@pbx.example",
+      strategy: "parallel",
+      totalTimeout: 25,
+      branches: reply.branches,
+    });
+  });
+});
+
 describe("dial args map to the target shapes the server parses", () => {
   it("sends a bare URI target as a string and an AoR as an object", () => {
     // The distinction the union exists for: `{aor}` forks to every registered
@@ -789,6 +1007,40 @@ describe("dial args map to the target shapes the server parses", () => {
     expect(Object.keys(dialArgs([{ aor: "sip:204@pbx.example" }], {}))).toEqual([
       "targets",
     ]);
+  });
+
+  it("sends on_answer and every ringback form on a bridge dial", () => {
+    const target = [{ aor: "sip:204@pbx.example" }];
+    expect(dialArgs(target, { onAnswer: "bridge", ringback: "425/1000,0/4000*inf" })).toEqual({
+      targets: [{ aor: "sip:204@pbx.example" }],
+      on_answer: "bridge",
+      ringback: "425/1000,0/4000*inf",
+    });
+    expect(dialArgs(target, { onAnswer: "bridge", ringback: true }).ringback).toBe(true);
+    // `false` is "no ringback", not "unset": it must reach the wire.
+    expect(dialArgs(target, { onAnswer: "bridge", ringback: false }).ringback).toBe(false);
+    // Left out, the server's own ringback_eu default applies.
+    expect(dialArgs(target, { onAnswer: "bridge" })).toEqual({
+      targets: [{ aor: "sip:204@pbx.example" }],
+      on_answer: "bridge",
+    });
+    expect(dialArgs(target, { onAnswer: "connect" }).on_answer).toBe("connect");
+  });
+
+  it("refuses a ringback without a bridge before anything is sent", () => {
+    // The server answers bad_request / requires_bridge on a connecting dial.
+    const target = [{ aor: "sip:204@pbx.example" }];
+    expect(() => dialArgs(target, { ringback: "ringback_eu" })).toThrow(TypeError);
+    expect(() => dialArgs(target, { ringback: false })).toThrow(/bridge/);
+    expect(() => dialArgs(target, { onAnswer: "connect", ringback: true })).toThrow(TypeError);
+  });
+
+  it("refuses a ringback without a bridge on the call verb too", async () => {
+    const transport = new RecordingTransport();
+    await expect(
+      makeCall(transport).dial([{ aor: "sip:204@pbx.example" }], { ringback: true }),
+    ).rejects.toThrow(TypeError);
+    expect(transport.calls).toEqual([]);
   });
 });
 

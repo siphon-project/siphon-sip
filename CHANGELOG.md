@@ -59,6 +59,22 @@ entry, but a working config keeps working.
   with it. The bridge dial resumes its ringback on the caller's intact session,
   and a ringback that cannot start because the caller is being torn down is
   logged as that, not as an engine fault.
+- **The control SDKs carry `drop {ban}`, `dial {on_answer, ringback}` and
+  `originate {aor}`.** All three shipped server-side in 1.11.1 but no SDK
+  wrapped them, so an IVR had to reach for the raw `command()` escape hatch to
+  ring phones for a caller it had already answered. In Rust `Call::drop_and_ban`
+  sits beside `drop`, `DialOptions::on_answer(DialOnAnswer::bridge_with(..))`
+  carries the ringback inside the bridge variant (the server refuses a ringback
+  on a connecting dial, and the type cannot express one there), and
+  `SipClient::originate_aor` takes its `strategy` / `total_timeout` as a
+  separate `AorRing` for the same reason. Python takes `drop(ban=True)`,
+  `dial(on_answer=, ringback=)` and `originate(channel, aor=...)`, refusing
+  both or neither of `to` / `aor` before a frame goes out; TypeScript takes
+  `drop(reason, {ban})`, `DialOptions.onAnswer` / `ringback` and
+  `SipClient.originateAor`. A bridge dial's reply returns its `group_id`,
+  `total_timeout`, `ringback` and the `branches` rung, and the event payloads
+  gain `DialAnswered.channel`, `DialFailed.cause`, `PlayStarted.origin` and the
+  `bridge_failed` branch cause.
 
 ## [1.11.1] — 2026-09-28
 

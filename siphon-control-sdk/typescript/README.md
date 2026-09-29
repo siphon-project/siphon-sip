@@ -98,7 +98,7 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `reject(code, reason?)` | `reject` (`sip`) | final non-2xx + teardown |
 | `terminate(reason?)` | `hangup` (`sip`) | primary teardown name |
 | `hangup(reason?)` | `hangup` (`sip`) | alias for `terminate` |
-| `drop(reason?)` | `drop` (`sip`) | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL. Refused on an answered call, whose dialog is owed a BYE; the reason goes to the log and the CDR |
+| `drop(reason?, options?)` | `drop` (`sip`) | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL. Refused on an answered call, whose dialog is owed a BYE; the reason goes to the log and the CDR. `{ ban: true }` also scores the caller's source toward `security.failed_auth_ban` (strong over TCP/TLS/WS/WSS, weight 1 over UDP; a no-op without the ban store) |
 | `refer(to)` | `refer` (`sip`) | in-dialog REFER (blind transfer) |
 | `transfer(to)` | `refer` (`sip`) | alias for `refer` |
 | `referReplaces(to, replaces)` | `refer` (`sip`) | attended transfer (RFC 3891) |
@@ -111,7 +111,7 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `rejectRefer(code, reason?)` | `reject_refer` (`sip`) | ‡ |
 | `bridge(withChannel, options?)` | `bridge` (`sip`) | join two answered legs; the verdict arrives as `ChannelBridged` / `BridgeFailed` |
 | `unbridge(reason?)` | `unbridge` (`sip`) | break the bridge — both legs stay answered, owned and held |
-| `dial(targets, options?)` | `dial` (`sip`) | ring B-legs while the caller stays **unanswered** and this app keeps the channel. A target is `{uri}` (dialed as written) or `{aor}` (forked to every registered contact over its own flow); one naming both, or neither, throws |
+| `dial(targets, options?)` | `dial` (`sip`) | ring B-legs while the caller stays **unanswered** and this app keeps the channel. A target is `{uri}` (dialed as written) or `{aor}` (forked to every registered contact over its own flow); one naming both, or neither, throws. `onAnswer: "bridge"` rings phones for an **answered**, anchored caller and bridges the first to pick up, with `ringback` playing meanwhile; `ringback` without it throws |
 | `recordStart(options?)` | `record_start` (`sip`) | record the call's decoded audio to a wav file; the reply names the `recordingId`, `RecordingFinished` says the file is closed. siphon-rtp only |
 | `recordStop(recordingId?)` | `record_stop` (`sip`) | stop one recording, or every recording on the call when no id is given |
 | `playFile(file)` | `play` (`sip`) | ‡ media |
@@ -121,6 +121,14 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 
 Identity/context getters: `channelId`, `callId`, `sipCallId`, `app`, `payload`,
 `reattached`.
+
+Placing a call lives on `SipClient`, since it creates a channel rather than
+addressing one:
+
+| Method | Wire verb (`module`) | Notes |
+| --- | --- | --- |
+| `originate(channel, to, media, options?)` | `originate` (`sip`) | one URI, resolved as written; resolves once the INVITE is on the wire |
+| `originateAor(channel, aor, media, options?, ring?)` | `originate` (`sip`) | ring every phone registered at `aor` over its own flow and Path; first to answer wins. `ring` is `{ strategy?, totalTimeout? }`. Nobody registered is `not_found` (`no_contacts`); `drop` is refused while the phones ring, use `hangup` |
 
 ‡ Accepted verb names the Phase-1 server answers with a `ControlError` whose
 `.code === "unsupported_verb"` (`error.isUnsupportedVerb()`) until it implements

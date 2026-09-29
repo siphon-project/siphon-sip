@@ -247,6 +247,100 @@ impl DialStrategy {
     }
 }
 
+/// The tone a [`DialOnAnswer::Bridge`] dial plays the caller while its phones
+/// alert.
+///
+/// It starts on the first `180`-`183` from any phone (RFC 3960), not when the
+/// dial starts, never talks over a prompt the app is still playing, and stops
+/// before the bridge re-points the caller's media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ringback {
+    /// The server's default tone (`ringback_eu`).
+    Default,
+    /// No ringback: the caller hears whatever the app leaves playing, its own
+    /// tone or music on hold.
+    Silent,
+    /// A tone preset or cadence, anything `play {tone}` takes:
+    /// `"ringback_eu"`, `"425/1000,0/4000*inf"`.
+    Tone(String),
+}
+
+impl Ringback {
+    /// Play this tone preset or cadence.
+    pub fn tone(tone: impl Into<String>) -> Self {
+        Self::Tone(tone.into())
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Ringback::Default => json!(true),
+            Ringback::Silent => json!(false),
+            Ringback::Tone(tone) => json!(tone),
+        }
+    }
+
+    /// The ringback a bridge dial's reply echoes: the tone in force, or
+    /// `false` for none.
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::Bool(true) => Some(Ringback::Default),
+            serde_json::Value::Bool(false) => Some(Ringback::Silent),
+            serde_json::Value::String(tone) => Some(Ringback::Tone(tone.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// What happens when a phone of a [`Call::dial`] picks up.
+///
+/// An enum rather than a flag plus a ringback, because the ringback only means
+/// something to a bridge: the server refuses one on a connecting dial, and here
+/// it cannot be written there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialOnAnswer {
+    /// The phone's answer answers the caller: the ordinary dial, refused on a
+    /// caller that is already answered.
+    Connect,
+    /// Ring phones for a caller the app already **answered** and anchored on
+    /// the media engine (the end of every IVR flow: greeting, menu, then ring
+    /// the department), and bridge the first phone to pick up to it.
+    ///
+    /// Each phone is a call siphon places itself, over its own flow and Path,
+    /// and none of the caller's INVITE headers reach it. An answer is kept only
+    /// once its phone is bridged: until `ChannelBridged` every other phone
+    /// keeps ringing, and a phone whose bridge fails is hung up (its
+    /// `DialBranchFailed` cause is `bridge_failed`) while the dial goes on.
+    /// `DialAnswered` names the bridged phone and the channel siphon minted for
+    /// it; `DialFailed` leaves the caller answered and owned.
+    Bridge {
+        /// The tone the caller hears while phones alert; `None` takes the
+        /// server's default, `ringback_eu`.
+        ringback: Option<Ringback>,
+    },
+}
+
+impl DialOnAnswer {
+    /// Bridge the phone that picks up, with the server's default ringback.
+    pub fn bridge() -> Self {
+        Self::Bridge { ringback: None }
+    }
+
+    /// Bridge the phone that picks up, playing this ringback meanwhile.
+    pub fn bridge_with(ringback: Ringback) -> Self {
+        Self::Bridge {
+            ringback: Some(ringback),
+        }
+    }
+
+    /// The wire token the server parses.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            DialOnAnswer::Connect => "connect",
+            DialOnAnswer::Bridge { .. } => "bridge",
+        }
+    }
+}
+
 /// Optional shaping for [`Call::dial`]; every field left `None` takes the
 /// server's own default rather than a copy of it pinned here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -286,6 +380,9 @@ pub struct DialOptions {
     /// takes. `Restricted` anonymises From and asserts `Privacy: id`, keeping
     /// the real identity in `p_asserted_identity` for the trusted next hop.
     pub privacy: Option<OriginatePrivacy>,
+    /// What happens when a phone picks up: connect the caller (the default) or
+    /// bridge an already-answered caller to it.
+    pub on_answer: Option<DialOnAnswer>,
 }
 
 impl DialOptions {
@@ -337,6 +434,12 @@ impl DialOptions {
         self
     }
 
+    /// Decide what a phone's answer does.
+    pub fn on_answer(mut self, on_answer: DialOnAnswer) -> Self {
+        self.on_answer = Some(on_answer);
+        self
+    }
+
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         if let Some(strategy) = self.strategy {
             args.insert("strategy".to_string(), json!(strategy.as_str()));
@@ -360,6 +463,15 @@ impl DialOptions {
         if let Some(privacy) = self.privacy {
             args.insert("privacy".to_string(), json!(privacy.as_str()));
         }
+        if let Some(on_answer) = &self.on_answer {
+            args.insert("on_answer".to_string(), json!(on_answer.as_str()));
+            if let DialOnAnswer::Bridge {
+                ringback: Some(ringback),
+            } = on_answer
+            {
+                args.insert("ringback".to_string(), ringback.to_json());
+            }
+        }
     }
 }
 
@@ -376,6 +488,21 @@ pub struct Dialing {
     pub strategy: Option<String>,
     /// The ring timeout in force, in seconds.
     pub timeout_secs: Option<u32>,
+    /// `bridge` for a [`DialOnAnswer::Bridge`] dial, `None` for a connecting
+    /// one.
+    pub on_answer: Option<String>,
+    /// The id of the group of calls a bridge dial places, one per phone.
+    pub group_id: Option<String>,
+    /// How long a bridge dial rings as a whole, in seconds: `timeout` for a
+    /// parallel dial, `timeout` times the number of phones for a sequential
+    /// one.
+    pub total_timeout_secs: Option<u32>,
+    /// The ringback a bridge dial plays.
+    pub ringback: Option<Ringback>,
+    /// The phones a bridge dial rang at once, each named as its `DialBranch`
+    /// event names it. Empty for a connecting dial, which reports its branches
+    /// only as events.
+    pub branches: Vec<DialBranchPayload>,
 }
 
 impl Call {
@@ -429,6 +556,31 @@ impl Call {
     /// a SIP URI, a privacy siphon does not recognise), `unsupported_verb` (a
     /// strategy siphon does not implement), `unavailable` (the media profile
     /// could not be allocated — nothing was sent and the caller stays parked).
+    ///
+    /// # Ringing phones for an answered caller
+    ///
+    /// With [`DialOnAnswer::Bridge`] the caller must instead already be answered
+    /// and anchored on the media engine (`answer_anchored`), which is what lets
+    /// the app play it a greeting and a menu first. The phones ring with the
+    /// ringback, and the first to pick up is bridged to the caller.
+    ///
+    /// ```no_run
+    /// # use siphon_control_client::sip::{Call, DialOnAnswer, DialOptions, DialTarget, Ringback};
+    /// # async fn example(call: &Call) -> Result<(), siphon_control_client::ControlError> {
+    /// call.dial(
+    ///     vec![DialTarget::aor("sip:204@pbx.example")],
+    ///     DialOptions::default()
+    ///         .timeout(20)
+    ///         .on_answer(DialOnAnswer::bridge_with(Ringback::tone("ringback_eu"))),
+    /// )
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Its refusals carry `error.details.reason`: `invalid_state` for a caller
+    /// that is `not_answered`, `not_anchored`, `already_bridged` or has a
+    /// `dial_in_progress`; `not_found` (`call_gone`) when the caller is gone.
     pub async fn dial(
         &self,
         targets: Vec<DialTarget>,
@@ -444,25 +596,57 @@ impl Call {
         let result = self
             .sip(SipVerb::Dial, serde_json::Value::Object(args))
             .await?;
-        Ok(Dialing {
+        Ok(Dialing::from_reply(&result, self.channel_id()))
+    }
+}
+
+impl Dialing {
+    /// The typed reply, `channel` being the one the dial addressed.
+    fn from_reply(result: &serde_json::Value, channel: &str) -> Self {
+        Dialing {
             // The server echoes the channel back; fall back to the one addressed
             // rather than handing back an empty id.
-            channel: result
-                .get("channel")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| self.channel_id().to_string()),
+            channel: string(result, "channel").unwrap_or_else(|| channel.to_string()),
             targets: result.get("targets").and_then(|value| value.as_u64()),
-            strategy: result
-                .get("strategy")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            timeout_secs: result
-                .get("timeout")
-                .and_then(|value| value.as_u64())
-                .and_then(|value| u32::try_from(value).ok()),
-        })
+            strategy: string(result, "strategy"),
+            timeout_secs: seconds(result, "timeout"),
+            on_answer: string(result, "on_answer"),
+            group_id: string(result, "group_id"),
+            total_timeout_secs: seconds(result, "total_timeout"),
+            ringback: result.get("ringback").and_then(Ringback::from_json),
+            branches: branches(result),
+        }
     }
+}
+
+fn string(result: &serde_json::Value, name: &str) -> Option<String> {
+    result
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn seconds(result: &serde_json::Value, name: &str) -> Option<u32> {
+    result
+        .get(name)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// The `branches` a group reply lists, each in the shape of a `DialBranch`
+/// payload. A branch that does not parse is skipped rather than failing the
+/// verb, whose INVITEs are already on the wire.
+pub(crate) fn branches(result: &serde_json::Value) -> Vec<DialBranchPayload> {
+    result
+        .get("branches")
+        .and_then(|value| value.as_array())
+        .map(|branches| {
+            branches
+                .iter()
+                .filter_map(|branch| serde_json::from_value(branch.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Typed views over the events a `dial` produces. Each branch it rings is its
@@ -641,6 +825,98 @@ mod tests {
             json.get("privacy").and_then(|v| v.as_str()),
             Some(OriginatePrivacy::Restricted.as_str())
         );
+    }
+
+    fn wire(options: &DialOptions) -> serde_json::Value {
+        let mut args = serde_json::Map::new();
+        options.insert_into(&mut args);
+        serde_json::Value::Object(args)
+    }
+
+    /// A connecting dial says nothing about `on_answer` unless asked, so a
+    /// server that predates it reads the same arguments it always did.
+    #[test]
+    fn a_connecting_dial_sends_no_on_answer_and_no_ringback() {
+        assert_eq!(wire(&DialOptions::default()), json!({}));
+        assert_eq!(
+            wire(&DialOptions::default().on_answer(DialOnAnswer::Connect)),
+            json!({ "on_answer": "connect" })
+        );
+    }
+
+    /// A bridge without a ringback leaves the server's default in force rather
+    /// than pinning a copy of it here.
+    #[test]
+    fn a_bridge_dial_sends_on_answer_and_its_ringback() {
+        assert_eq!(
+            wire(&DialOptions::default().on_answer(DialOnAnswer::bridge())),
+            json!({ "on_answer": "bridge" })
+        );
+        for (ringback, expected) in [
+            (Ringback::Default, json!(true)),
+            (Ringback::Silent, json!(false)),
+            (
+                Ringback::tone("425/1000,0/4000*inf"),
+                json!("425/1000,0/4000*inf"),
+            ),
+        ] {
+            assert_eq!(
+                wire(&DialOptions::default().on_answer(DialOnAnswer::bridge_with(ringback))),
+                json!({ "on_answer": "bridge", "ringback": expected })
+            );
+        }
+    }
+
+    #[test]
+    fn a_bridge_dial_reply_names_its_group_and_phones() {
+        let dialing = Dialing::from_reply(
+            &json!({
+                "channel": "ch_caller",
+                "state": "dialing",
+                "on_answer": "bridge",
+                "group_id": "originate-group-1",
+                "targets": 2,
+                "strategy": "sequential",
+                "timeout": 20,
+                "total_timeout": 40,
+                "ringback": "ringback_eu",
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:204@203.0.113.7:5060",
+                    "aor": "sip:204@pbx.example"
+                }]
+            }),
+            "ch_caller",
+        );
+        assert_eq!(dialing.on_answer.as_deref(), Some("bridge"));
+        assert_eq!(dialing.group_id.as_deref(), Some("originate-group-1"));
+        assert_eq!(dialing.timeout_secs, Some(20));
+        assert_eq!(dialing.total_timeout_secs, Some(40));
+        assert_eq!(dialing.ringback, Some(Ringback::tone("ringback_eu")));
+        assert_eq!(dialing.branches.len(), 1);
+        assert_eq!(
+            dialing.branches[0].aor.as_deref(),
+            Some("sip:204@pbx.example")
+        );
+
+        let silent = Dialing::from_reply(&json!({ "ringback": false }), "ch_caller");
+        assert_eq!(silent.ringback, Some(Ringback::Silent));
+        assert_eq!(silent.channel, "ch_caller");
+    }
+
+    /// A connecting dial's reply has none of the group fields.
+    #[test]
+    fn a_connecting_dial_reply_has_no_group() {
+        let dialing = Dialing::from_reply(
+            &json!({ "channel": "ch1", "state": "dialing", "targets": 3, "strategy": "parallel", "timeout": 30 }),
+            "ch1",
+        );
+        assert_eq!(dialing.targets, Some(3));
+        assert!(dialing.on_answer.is_none());
+        assert!(dialing.group_id.is_none());
+        assert!(dialing.ringback.is_none());
+        assert!(dialing.branches.is_empty());
     }
 
     /// An AoR target carries its identity to every branch it expands to.

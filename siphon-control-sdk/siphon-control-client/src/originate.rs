@@ -8,12 +8,13 @@ use serde_json::json;
 
 use std::sync::Arc;
 
-use siphon_control_proto::sip::SipVerb;
+use siphon_control_proto::sip::{DialBranchPayload, SipVerb};
 use siphon_control_proto::verbs::MODULE_SIP;
 
+use crate::dial::{branches, DialStrategy};
 use crate::error::ControlError;
 use crate::session::CommandTransport;
-use crate::sip::headers_to_json;
+use crate::sip::{headers_to_json, SipClient};
 
 /// The media plan for [`SipClient::originate`] — what the outbound INVITE
 /// offers.
@@ -316,6 +317,155 @@ pub struct Originated {
     pub sip_call_id: Option<String>,
 }
 
+/// How [`SipClient::originate_aor`] rings the phones registered at the AoR.
+///
+/// Separate from [`OriginateOptions`] because the server takes these beside
+/// `aor` only and refuses them beside `to`; here they cannot be written there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AorRing {
+    /// Every phone at once (`parallel`, the server's default), or one at a
+    /// time in registration q-value order, moving on when one declines or
+    /// rings out its own `timeout` (`sequential`).
+    pub strategy: Option<DialStrategy>,
+    /// How long the whole group rings, in seconds, before every phone still
+    /// ringing is CANCELled. The server defaults it to `timeout` for a parallel
+    /// group and to `timeout` times the number of phones for a sequential one;
+    /// `0` is no bound.
+    pub total_timeout_secs: Option<u64>,
+}
+
+impl AorRing {
+    /// Ring the phones this way.
+    pub fn strategy(mut self, strategy: DialStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
+    /// Bound the whole group to this many seconds.
+    pub fn total_timeout(mut self, seconds: u64) -> Self {
+        self.total_timeout_secs = Some(seconds);
+        self
+    }
+
+    fn insert_into(self, args: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(strategy) = self.strategy {
+            args.insert("strategy".to_string(), json!(strategy.as_str()));
+        }
+        if let Some(total_timeout) = self.total_timeout_secs {
+            args.insert("total_timeout".to_string(), json!(total_timeout));
+        }
+    }
+}
+
+/// What the server answers an accepted `originate {aor}` with: every phone is
+/// ringing, none has answered.
+///
+/// Until one does, the channel is bound to the group: its events carry
+/// `group_id` as their `call_id` and `sip_call_id`, since no single dialog is
+/// the call yet, and each phone's own Call-ID is in their payload. From
+/// `DialAnswered` on, the channel is the winning phone's call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginatedGroup {
+    /// The caller-supplied channel id the call is addressed by.
+    pub channel: String,
+    /// The group's id, standing in for the call until a phone answers.
+    pub group_id: Option<String>,
+    /// The AoR as the registrar keys it.
+    pub aor: Option<String>,
+    /// The strategy in force.
+    pub strategy: Option<String>,
+    /// The group's bound in force, in seconds.
+    pub total_timeout_secs: Option<u64>,
+    /// The phones rung so far (all of them for a parallel group, the first for a
+    /// sequential one), each named as its `DialBranch` event names it.
+    pub branches: Vec<DialBranchPayload>,
+}
+
+impl SipClient {
+    /// Place an outbound call under a caller-supplied channel id.
+    ///
+    /// The one verb that *creates* a channel rather than addressing one, which
+    /// is why it lives here and not on [`Call`]. It returns as soon as the
+    /// INVITE is on the wire — the call is `calling`, and the answer, failure or
+    /// timeout arrives later as an event on the channel, exactly as a handed-over
+    /// call's does.
+    ///
+    /// The channel id is yours to choose so the call is addressable before it is
+    /// answered (and before any server-assigned id could have reached you). A id
+    /// already in use is a `conflict`, never silently reused.
+    ///
+    /// ```no_run
+    /// # use siphon_control_client::sip::{OriginateMedia, OriginateOptions, SipClient};
+    /// # async fn example(client: &SipClient) -> Result<(), siphon_control_client::ControlError> {
+    /// let call = client
+    ///     .originate(
+    ///         "wake-up-42",
+    ///         "sip:1001@pbx.example",
+    ///         OriginateMedia::anchor(),
+    ///         OriginateOptions::default()
+    ///             .from("sip:alarm@pbx.example")
+    ///             .timeout(20),
+    ///     )
+    ///     .await?;
+    /// println!("ringing on {}", call.channel);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn originate(
+        &self,
+        channel: &str,
+        to: &str,
+        media: OriginateMedia,
+        options: OriginateOptions,
+    ) -> Result<Originated, ControlError> {
+        originate_on(&self.client.commander(), channel, to, media, options).await
+    }
+
+    /// Place an outbound call to every phone registered at `aor`, under a
+    /// caller-supplied channel id; the first to answer becomes the channel's
+    /// call.
+    ///
+    /// [`SipClient::originate`] resolves its `to` as written, which reaches
+    /// nothing for a phone registered over TCP, TLS or WSS behind NAT (only the
+    /// connection it registered over reaches it) or through an edge proxy (only
+    /// its Path does). This rings each registered contact over its own flow and
+    /// Path (RFC 5626 §5.3, RFC 3327 §5.3), as a `dial` to an AoR does, with
+    /// every [`OriginateOptions`] applied to each phone's INVITE. Every other
+    /// phone still ringing is CANCELled once one answers.
+    ///
+    /// An AoR with nobody registered is `not_found` with
+    /// `error.details.reason == "no_contacts"`, and nothing goes on the wire.
+    /// While the phones ring, `hangup` CANCELs every one of them and `drop` is
+    /// refused (`invalid_state`), since their INVITEs are owed a CANCEL.
+    ///
+    /// ```no_run
+    /// # use siphon_control_client::sip::{AorRing, DialStrategy, OriginateMedia, OriginateOptions, SipClient};
+    /// # async fn example(client: &SipClient) -> Result<(), siphon_control_client::ControlError> {
+    /// let group = client
+    ///     .originate_aor(
+    ///         "wake-201",
+    ///         "sip:201@pbx.example",
+    ///         OriginateMedia::anchor(),
+    ///         OriginateOptions::default().from("sip:reception@pbx.example").timeout(25),
+    ///         AorRing::default().strategy(DialStrategy::Parallel),
+    ///     )
+    ///     .await?;
+    /// println!("ringing {} phones", group.branches.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn originate_aor(
+        &self,
+        channel: &str,
+        aor: &str,
+        media: OriginateMedia,
+        options: OriginateOptions,
+        ring: AorRing,
+    ) -> Result<OriginatedGroup, ControlError> {
+        originate_aor_on(&self.client.commander(), channel, aor, media, options, ring).await
+    }
+}
+
 /// Build and send an `originate`, split from [`SipClient::originate`] so the
 /// argument shaping is exercised against a recording transport.
 ///
@@ -336,21 +486,8 @@ pub(crate) async fn originate_on(
     media.insert_into(&mut args);
     options.insert_into(&mut args);
 
-    let result = transport
-        .command(
-            Some(MODULE_SIP.to_string()),
-            SipVerb::Originate.as_str().to_string(),
-            serde_json::Value::Null,
-            serde_json::Value::Object(args),
-        )
-        .await?;
-
-    let string = |name: &str| {
-        result
-            .get(name)
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    };
+    let result = send(transport, args).await?;
+    let string = |name: &str| string(&result, name);
     Ok(Originated {
         // The server echoes the id back; fall back to the one we asked for
         // rather than inventing an empty channel a caller cannot address.
@@ -358,4 +495,180 @@ pub(crate) async fn originate_on(
         call_id: string("call_id"),
         sip_call_id: string("sip_call_id"),
     })
+}
+
+/// Build and send an `originate {aor}`: [`originate_on`] with `aor` in place of
+/// `to`, which the server takes as mutually exclusive.
+pub(crate) async fn originate_aor_on(
+    transport: &Arc<dyn CommandTransport>,
+    channel: &str,
+    aor: &str,
+    media: OriginateMedia,
+    options: OriginateOptions,
+    ring: AorRing,
+) -> Result<OriginatedGroup, ControlError> {
+    let mut args = serde_json::Map::new();
+    args.insert("channel".to_string(), json!(channel));
+    args.insert("aor".to_string(), json!(aor));
+    media.insert_into(&mut args);
+    options.insert_into(&mut args);
+    ring.insert_into(&mut args);
+
+    let result = send(transport, args).await?;
+    Ok(OriginatedGroup {
+        channel: string(&result, "channel").unwrap_or_else(|| channel.to_string()),
+        group_id: string(&result, "group_id"),
+        aor: string(&result, "aor"),
+        strategy: string(&result, "strategy"),
+        total_timeout_secs: result.get("total_timeout").and_then(|value| value.as_u64()),
+        branches: branches(&result),
+    })
+}
+
+/// `originate` is module-level: it creates the channel, so it carries no
+/// channel target for the substrate to resolve.
+async fn send(
+    transport: &Arc<dyn CommandTransport>,
+    args: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, ControlError> {
+    transport
+        .command(
+            Some(MODULE_SIP.to_string()),
+            SipVerb::Originate.as_str().to_string(),
+            serde_json::Value::Null,
+            serde_json::Value::Object(args),
+        )
+        .await
+}
+
+fn string(result: &serde_json::Value, name: &str) -> Option<String> {
+    result
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use std::sync::Mutex;
+
+    /// One command as sent: module, verb, target, args.
+    type Sent = (Option<String>, String, serde_json::Value, serde_json::Value);
+
+    /// Records the one command sent and answers it with a canned result.
+    struct Recorder {
+        sent: Mutex<Vec<Sent>>,
+        result: serde_json::Value,
+    }
+
+    impl CommandTransport for Recorder {
+        fn command(
+            &self,
+            module: Option<String>,
+            verb: String,
+            target: serde_json::Value,
+            args: serde_json::Value,
+        ) -> BoxFuture<'_, Result<serde_json::Value, ControlError>> {
+            self.sent.lock().unwrap().push((module, verb, target, args));
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    fn group_result() -> serde_json::Value {
+        json!({
+            "channel": "wake-201",
+            "group_id": "originate-group-1",
+            "aor": "sip:201@example.com",
+            "strategy": "sequential",
+            "total_timeout": 50,
+            "state": "calling",
+            "branches": [{
+                "leg_id": "leg-1",
+                "leg_sip_call_id": "b1@host",
+                "target": "sip:201@203.0.113.7:5060",
+                "aor": "sip:201@example.com"
+            }]
+        })
+    }
+
+    /// `aor` replaces `to`: the server refuses an originate naming both, and one
+    /// sent as `to` would be DNS-resolved and reach none of the phones.
+    #[tokio::test]
+    async fn originate_aor_sends_aor_in_place_of_to_with_its_ring_options() {
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: group_result(),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let group = originate_aor_on(
+            &transport,
+            "wake-201",
+            "sip:201@example.com",
+            OriginateMedia::anchor(),
+            OriginateOptions::default()
+                .from("sip:reception@example.com")
+                .timeout(25),
+            AorRing::default()
+                .strategy(DialStrategy::Sequential)
+                .total_timeout(50),
+        )
+        .await
+        .expect("originate aor");
+
+        let (module, verb, target, args) = recorder.sent.lock().unwrap()[0].clone();
+        assert_eq!(module.as_deref(), Some("sip"));
+        assert_eq!(verb, "originate");
+        assert_eq!(target, serde_json::Value::Null);
+        assert_eq!(
+            args,
+            json!({
+                "channel": "wake-201",
+                "aor": "sip:201@example.com",
+                "media": true,
+                "from": "sip:reception@example.com",
+                "timeout": 25,
+                "strategy": "sequential",
+                "total_timeout": 50,
+            })
+        );
+
+        assert_eq!(group.channel, "wake-201");
+        assert_eq!(group.group_id.as_deref(), Some("originate-group-1"));
+        assert_eq!(group.aor.as_deref(), Some("sip:201@example.com"));
+        assert_eq!(group.strategy.as_deref(), Some("sequential"));
+        assert_eq!(group.total_timeout_secs, Some(50));
+        assert_eq!(group.branches.len(), 1);
+        assert_eq!(group.branches[0].leg_sip_call_id, "b1@host");
+    }
+
+    /// Ring options left unset take the server's defaults rather than a copy.
+    #[tokio::test]
+    async fn originate_aor_omits_ring_options_it_was_not_given() {
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({}),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let group = originate_aor_on(
+            &transport,
+            "wake-201",
+            "sip:201@example.com",
+            OriginateMedia::sdp("v=0\r\n"),
+            OriginateOptions::default(),
+            AorRing::default(),
+        )
+        .await
+        .expect("originate aor");
+
+        let args = recorder.sent.lock().unwrap()[0].3.clone();
+        assert!(args.get("to").is_none());
+        assert!(args.get("strategy").is_none());
+        assert!(args.get("total_timeout").is_none());
+        // The id asked for stands in when the reply does not echo one.
+        assert_eq!(group.channel, "wake-201");
+        assert!(group.branches.is_empty());
+    }
 }

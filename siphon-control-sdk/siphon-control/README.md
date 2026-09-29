@@ -106,7 +106,7 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.connect()` / `await client.run()` — connect / drive (reconnect + resync).
 - `await client.command(verb, module=None, target=None, args=None)` — the generic
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
-- `await client.originate(channel, to, *, media=False, sdp=None, body=None, content_type=None, …, session_timer=None)`
+- `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None)`
   — place an outbound call under a channel id you choose; resolves to
   `{"channel", "call_id", "sip_call_id"}` once the INVITE is on the wire. Exactly one
   media plan (`media=True`, `sdp=` or `body=`). `session_timer={"expires", "min_se",
@@ -143,17 +143,29 @@ reported as a failure. That is damage control, not a substitute for closing.
   registered contact over that contact's own captured flow, which is the only way to
   reach a phone registered on TCP, TLS or WSS behind NAT. A bare string is refused,
   because it does not say which of the two was meant.
+  With `on_answer="bridge"` it instead rings phones for a caller the app already
+  answered and anchored (after a greeting or a menu), plays `ringback` (a tone
+  preset or cadence, `True` for the default, `False` for none) while they alert, and
+  bridges the first to pick up; the result adds `group_id`, `total_timeout` and the
+  `branches` rung.
+- `await client.originate(channel, aor=..., strategy=None, total_timeout=None, …)`
+  rings every phone registered at the AoR, each over its own flow and Path; the first
+  to answer becomes the channel's call. Exactly one of `to` and `aor`, and
+  `strategy` / `total_timeout` only with `aor`. Resolves to `{"channel", "group_id",
+  "aor", "strategy", "total_timeout", "branches"}`.
 - `await call.record_start(direction=None, channels=None, max_duration_ms=None,
   silence_ms=None, path=None)` records the call's decoded audio to a wav file and
   returns the `recording_id` that `await call.record_stop(recording_id=None)`
   addresses (no id stops every recording on the call). The reply is the accept;
   the `RecordingFinished` event says the file is closed. siphon-rtp backend only.
-- `await call.drop(reason=None)` abandons an **unanswered** call with nothing on
+- `await call.drop(reason=None, *, ban=False)` abandons an **unanswered** call with nothing on
   the wire — no final response, no CANCEL — and releases it. Use it for traffic
   addressed to nothing your controller serves: a `404` confirms the number to an
   enumeration sweep, silence does not. An answered call raises `ControlError` with
   `code == "invalid_state"` (its dialog is owed a BYE — that is `hangup`); the
-  reason reaches siphon's log and the CDR, not the peer.
+  reason reaches siphon's log and the CDR, not the peer. `ban=True` also scores the
+  caller's source toward an auto-ban (`security.failed_auth_ban`), so a source the
+  controller keeps dropping is refused at the transport.
 - Media verbs `play_file(file)` / `dtmf(digits)` raise `ControlError` with
   `code == "unsupported_verb"` until the server implements media.
 

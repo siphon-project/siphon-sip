@@ -296,6 +296,11 @@ export interface PlayStartedPayload {
   play_id?: number | null;
   /** The playback's length in ms, when the engine knew it at accept time. */
   duration_ms?: number | null;
+  /**
+   * Who started it, when siphon did rather than a `play`: `"ringback"` for the
+   * ringback of a `dial {on_answer: "bridge"}`. Absent for the app's own.
+   */
+  origin?: string;
 }
 
 /** The RFC 3891 `Replaces` triple embedded in a {@link TransferRequestedPayload}. */
@@ -519,7 +524,9 @@ export interface DialBranchPayload {
  * How a `dial` branch ended without answering: `rejected` (the far end's final
  * non-2xx), `timeout` (`408`, it rang out), `cancelled` (`487`, the server
  * CANCELled it: another branch answered, a 6xx ended the fork, or the caller
- * hung up) or `unsent` (`503`, the INVITE never reached the transport). Unknown
+ * hung up; on a bridge dial also a phone released once another was bridged),
+ * `unsent` (`503`, the INVITE never reached the transport) or `bridge_failed`
+ * (a bridge dial's phone answered and its bridge to the caller failed). Unknown
  * tokens pass through verbatim (forward-compatible).
  */
 export type DialBranchCause =
@@ -527,6 +534,7 @@ export type DialBranchCause =
   | "timeout"
   | "cancelled"
   | "unsent"
+  | "bridge_failed"
   | (string & {});
 
 /**
@@ -546,6 +554,13 @@ export interface DialBranchOutcome extends DialBranchPayload {
 export interface DialAnsweredPayload extends DialBranchPayload {
   /** The 2xx it answered with. */
   code: number;
+  /**
+   * On a `dial {on_answer: "bridge"}`, the channel siphon minted for the
+   * bridged phone, registered to this app and connection with the caller's
+   * `on_lost` policy; the phone's own events follow on it. `null` when that
+   * channel has no live owner; absent on a connecting dial.
+   */
+  channel?: string | null;
 }
 
 /**
@@ -559,6 +574,12 @@ export interface DialFailedPayload {
   reason: string;
   /** Whether it ended at the ring timeout. */
   timed_out: boolean;
+  /**
+   * How a `dial {on_answer: "bridge"}` ended: `rejected`, `ring timeout`,
+   * `unsent`, `bridge_failed`, or `caller_hangup` when the caller went away
+   * while the phones rang. Absent on a connecting dial.
+   */
+  cause?: string;
   /** Every branch the dial rang, each with its outcome. Absent from a server that predates branch reporting. */
   branches?: DialBranchOutcome[];
 }
