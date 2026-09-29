@@ -3252,6 +3252,31 @@ mod tests {
         assert_eq!(flags.sip_call_id.as_deref(), Some(longest.as_str()));
     }
 
+    /// The engine refuses the whole offer over a `sip_call_id` it will not
+    /// keep, and RFC 3261 bounds neither a Call-ID's length nor, as parsed,
+    /// its bytes. So anything past the limit or outside visible ASCII is left
+    /// off, and the call still sets up on the engine's own call-id.
+    #[test]
+    fn a_call_id_the_engine_would_refuse_is_not_stamped() {
+        let mut flags = NgFlags::default();
+        flags.stamp_sip_call_id(&format!("{}@example.test", "a".repeat(300)));
+        assert_eq!(flags.sip_call_id, None, "a 300-byte Call-ID was stamped");
+        for refused in [
+            "has space@example.test",
+            "tab\there@example.test",
+            "caf\u{e9}@example.test",
+            "nul\0byte@example.test",
+        ] {
+            flags.stamp_sip_call_id(refused);
+            assert_eq!(flags.sip_call_id, None, "{refused:?} was stamped");
+        }
+        // Positive control: an ordinary Call-ID with the punctuation RFC 3261
+        // `word` allows is still stamped.
+        let ordinary = "a84b4c76e66710!%*_+`'~()<>:\\\"/[]?{}@pc33.example.test";
+        flags.stamp_sip_call_id(ordinary);
+        assert_eq!(flags.sip_call_id.as_deref(), Some(ordinary));
+    }
+
     #[test]
     fn convert_event_call_summary() {
         // A measured near leg (actor quality present) + a counters-only far leg

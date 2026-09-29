@@ -818,18 +818,23 @@ impl NgFlags {
     /// Fill in [`NgFlags::sip_call_id`] with the Call-ID of the dialog whose SDP
     /// this command carries.
     ///
-    /// RFC 3261 §8.1.1.4 sets no length bound; the native engine refuses one
-    /// past [`siphon_rtp_proto::MAX_SIP_CALL_ID_LEN`] bytes and would fail the
-    /// whole offer over a correlation label. Such a Call-ID is left out instead,
-    /// and the engine falls back to its own call-id for the leg.
+    /// RFC 3261 §8.1.1.4 sets no length bound, and the parser does not police
+    /// a Call-ID's bytes; the native engine refuses the *whole* offer, answer or
+    /// answer_local over a `sip_call_id` that is empty, past
+    /// [`siphon_rtp_proto::MAX_SIP_CALL_ID_LEN`] bytes, or holds anything but
+    /// visible ASCII. Failing call setup over a correlation label is the wrong
+    /// trade, so such a Call-ID is left out and the engine files the leg's
+    /// captures under its own call-id instead.
     pub fn stamp_sip_call_id(&mut self, sip_call_id: &str) {
         if sip_call_id.is_empty() {
             return;
         }
-        if sip_call_id.len() > siphon_rtp_proto::MAX_SIP_CALL_ID_LEN {
+        if sip_call_id.len() > siphon_rtp_proto::MAX_SIP_CALL_ID_LEN
+            || !sip_call_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
             tracing::debug!(
                 length = sip_call_id.len(),
-                "Call-ID longer than the media engine keeps, its captures are filed under the engine call-id"
+                "Call-ID the media engine would refuse, its captures are filed under the engine call-id"
             );
             return;
         }
