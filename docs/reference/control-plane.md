@@ -521,8 +521,8 @@ body that is not DTMF is relayed or answered but produces no event.
 ### Media summary
 
 When the media engine ends a media session it reports what the session
-carried, and siphon publishes that on the channel whose SIP Call-ID the session
-was keyed on as `MediaSummary {reason, duration_ms, legs}` (siphon-rtp only).
+carried, and siphon publishes that on each channel whose media the session
+carried as `MediaSummary {reason, duration_ms, legs}` (siphon-rtp only).
 `reason` is `delete` or `media_timeout`; `duration_ms` has about one-second
 grain. `legs` has one entry per party, matched on `tag` (the offerer's
 From-tag, the answerer's To-tag): `packets_in`, `bytes_in`, `packets_out`,
@@ -548,6 +548,16 @@ When you see it:
   longer exists. After 30 seconds, or once that connection has disconnected,
   a late summary is dropped (it is still in the media CDR, `method: MEDIA`,
   when CDRs are enabled). No other connection or app ever receives it.
+- A **bridged pair** (`bridge`, or `dial {on_answer: "bridge"}`) relays
+  through one engine session of its own, which carries both legs, so its
+  summary goes to **both** channels, once each, and its `legs` cover both
+  parties. Each channel gets it under its own `channel` id, from its own
+  owner's 30-second window: a leg that ended more than 30 seconds before the
+  pair's session did (a peer that hung up while the anchor was held) misses it.
+  An `unbridge` does not change this: the parted legs stay on the pair's
+  session, held, until they hang up. A bridged channel therefore hears one
+  `MediaSummary` per engine session it was on: its own, replaced when the
+  bridge formed, and the pair's.
 
 **Events after `StasisEnd`.** `MediaSummary` is the only event that can follow
 a channel's `StasisEnd`, at most once, and only after a teardown (never after

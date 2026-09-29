@@ -250,7 +250,8 @@ pub enum SipEvent {
     /// ([`MediaSummaryPayload`]): per-leg counters and measured quality. On an
     /// ordinary hang-up it arrives **after** `StasisEnd`, within 30 s, under the
     /// channel id the call had; it is the only event that can follow
-    /// `StasisEnd`, so accept it for a channel already ended.
+    /// `StasisEnd`, so accept it for a channel already ended. A bridged pair's
+    /// session carries both legs: its summary goes to both channels, once each.
     MediaSummary,
     /// A branch of a `dial` was created ([`DialBranchPayload`]): its INVITE is
     /// about to go out. Every fork branch, and each attempt of a sequential

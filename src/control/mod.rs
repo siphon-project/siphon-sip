@@ -193,7 +193,7 @@ pub(crate) mod channel_event_capture {
         store.insert(sip_call_id.to_string(), Vec::new());
     }
 
-    pub(super) fn record(sip_call_id: &str, event: &str, payload: &serde_json::Value) {
+    pub(crate) fn record(sip_call_id: &str, event: &str, payload: &serde_json::Value) {
         let mut store = store().lock().unwrap_or_else(|error| error.into_inner());
         if let Some(captured) = store.get_mut(sip_call_id) {
             captured.push((event.to_string(), payload.clone()));

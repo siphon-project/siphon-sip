@@ -134,7 +134,10 @@ pub struct DtmfEvent {
 /// being native-only).
 #[derive(Debug, Clone)]
 pub struct CallSummary {
-    /// SIP Call-ID the media session was keyed on — correlates to the SIP CDR.
+    /// The engine call-id siphon addressed the session by: the SIP Call-ID,
+    /// except for a bridged pair or a re-anchored session, which have one of
+    /// their own ([`crate::rtpengine::MediaSessionStore::summary_parties`]
+    /// resolves it).
     pub call_id: String,
     /// Why the call ended: `"delete"` (controller teardown) or `"media_timeout"`
     /// (dead-path reap).

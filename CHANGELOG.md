@@ -22,7 +22,10 @@ entry, but a working config keeps working.
   produces it after `StasisEnd` has removed the channel, so siphon keeps the
   owning connection reachable for 30 s and delivers it there under the channel
   id the call had. It is the only event that can follow `StasisEnd`; a
-  controller must accept it for a channel it already considers ended. Dropped
+  controller must accept it for a channel it already considers ended. A
+  bridged pair's summary names the pair's own engine call, not either leg, so
+  siphon keeps which legs that call carries and delivers it to both channels,
+  once each, including after an `unbridge`. Dropped
   past the window or once the owner has disconnected. Typed as
   `SipEvent::MediaSummary` / `MediaSummaryPayload` in the Rust proto crate and
   `MediaSummaryPayload` in the TypeScript SDK.

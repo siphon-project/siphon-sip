@@ -209,18 +209,151 @@ mod media_session_tests {
 /// Thread-safe store of active media sessions, keyed by SIP Call-ID.
 pub struct MediaSessionStore {
     sessions: DashMap<String, MediaSession>,
+    /// Who an engine call's end-of-call summary belongs to, for each engine
+    /// call not simply named by its own SIP Call-ID. See
+    /// [`MediaSessionStore::summary_parties`].
+    parties: std::sync::Arc<DashMap<String, EngineParties>>,
+}
+
+/// The SIP Call-IDs an engine call carries media for, and until when they are
+/// kept once no stored session is on it.
+#[derive(Debug)]
+struct EngineParties {
+    sip_call_ids: Vec<String>,
+    /// `None` while a stored session is on the engine call; set when it
+    /// leaves the store, since the engine's summary follows that delete.
+    expires_at: Option<tokio::time::Instant>,
 }
 
 impl MediaSessionStore {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            parties: Default::default(),
         }
     }
 
     /// Insert or update a media session.
+    ///
+    /// A session on an engine call of its own (a bridged pair, a re-anchor) is
+    /// recorded as that call's party, so the call's summary still finds the SIP
+    /// Call-ID. A session it replaces on another engine call has its parties
+    /// released, as [`MediaSessionStore::remove`] releases them.
     pub fn insert(&self, session: MediaSession) {
-        self.sessions.insert(session.call_id.clone(), session);
+        let engine_call_id = session.rtpengine_id().to_string();
+        let call_id = session.call_id.clone();
+        if engine_call_id != call_id {
+            match self.parties.get_mut(&engine_call_id) {
+                Some(mut parties) => parties.expires_at = None,
+                None => {
+                    self.parties.insert(
+                        engine_call_id.clone(),
+                        EngineParties {
+                            sip_call_ids: vec![call_id.clone()],
+                            expires_at: None,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(replaced) = self.sessions.insert(call_id, session) {
+            if replaced.rtpengine_id() != engine_call_id {
+                self.release_parties(replaced.rtpengine_id());
+            }
+        }
+    }
+
+    /// Record that the engine call `engine_call_id`, which the session stored
+    /// under `call_id` is on, carries the media of each SIP Call-ID in
+    /// `sip_call_ids`: a bridged pair's anchor and peer. Replaces what was
+    /// recorded, and keeps a Call-ID listed twice once. Nothing is recorded
+    /// unless the stored session is on that engine call, so nothing is recorded
+    /// that no removal would ever release.
+    pub fn record_parties(&self, call_id: &str, engine_call_id: &str, sip_call_ids: &[&str]) {
+        let stored = self
+            .sessions
+            .get(call_id)
+            .is_some_and(|session| session.rtpengine_id() == engine_call_id);
+        if !stored {
+            return;
+        }
+        let mut unique: Vec<String> = Vec::with_capacity(sip_call_ids.len());
+        for sip_call_id in sip_call_ids {
+            if !unique.iter().any(|kept| kept == sip_call_id) {
+                unique.push((*sip_call_id).to_string());
+            }
+        }
+        self.parties.insert(
+            engine_call_id.to_string(),
+            EngineParties {
+                sip_call_ids: unique,
+                expires_at: None,
+            },
+        );
+    }
+
+    /// The SIP Call-IDs the engine's end-of-call summary for `engine_call_id`
+    /// belongs to, each once: both parties of a bridged pair, the call a
+    /// re-anchored session serves, and otherwise `engine_call_id` itself, which
+    /// is then the SIP Call-ID.
+    ///
+    /// An engine call reports one summary, so what was recorded for it is spent
+    /// here. It is found while a stored session is on the call and for
+    /// [`crate::control::CHANNEL_TOMBSTONE_GRACE`] after it left the store: the
+    /// summary follows the engine delete a teardown issues, and the owners it
+    /// goes to stay reachable for that same window.
+    pub fn summary_parties(&self, engine_call_id: &str) -> Vec<String> {
+        match self.parties.remove(engine_call_id) {
+            Some((_, parties))
+                if parties
+                    .expires_at
+                    .map_or(true, |expires_at| expires_at > tokio::time::Instant::now()) =>
+            {
+                parties.sip_call_ids
+            }
+            _ => vec![engine_call_id.to_string()],
+        }
+    }
+
+    /// Number of engine calls with recorded parties (drains to baseline — leak
+    /// gate).
+    pub fn engine_parties_count(&self) -> usize {
+        self.parties.len()
+    }
+
+    /// No stored session is on `engine_call_id` any more: keep its parties for
+    /// the summary that follows the delete, then let them go. Expiry is a timer
+    /// on the current runtime; with none (never the case in the running
+    /// server) expired entries are swept here instead, so none is left behind.
+    fn release_parties(&self, engine_call_id: &str) {
+        let expires_at = tokio::time::Instant::now() + crate::control::CHANNEL_TOMBSTONE_GRACE;
+        match self.parties.get_mut(engine_call_id) {
+            Some(mut parties) if parties.expires_at.is_none() => {
+                parties.expires_at = Some(expires_at);
+            }
+            _ => return,
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let parties = std::sync::Arc::clone(&self.parties);
+                let engine_call_id = engine_call_id.to_string();
+                runtime.spawn(async move {
+                    tokio::time::sleep_until(expires_at).await;
+                    // Only this release: an engine call stored again since
+                    // keeps its entry.
+                    parties.remove_if(&engine_call_id, |_, parties| {
+                        parties
+                            .expires_at
+                            .is_some_and(|expiry| expiry <= expires_at)
+                    });
+                });
+            }
+            Err(_) => {
+                let now = tokio::time::Instant::now();
+                self.parties
+                    .retain(|_, parties| parties.expires_at.map_or(true, |expiry| expiry > now));
+            }
+        }
     }
 
     /// Look up a session by Call-ID.
@@ -230,7 +363,9 @@ impl MediaSessionStore {
 
     /// Remove a session by Call-ID. Returns the removed session, if any.
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
-        self.sessions.remove(call_id).map(|(_, session)| session)
+        let (_, session) = self.sessions.remove(call_id)?;
+        self.release_parties(session.rtpengine_id());
+        Some(session)
     }
 
     /// Update the to_tag for an existing session.
@@ -269,8 +404,17 @@ impl MediaSessionStore {
     /// Remove sessions older than `max_age`.
     pub fn sweep_stale(&self, max_age: std::time::Duration) {
         let cutoff = Instant::now() - max_age;
-        self.sessions
-            .retain(|_, session| session.created_at > cutoff);
+        let mut swept = Vec::new();
+        self.sessions.retain(|_, session| {
+            let keep = session.created_at > cutoff;
+            if !keep {
+                swept.push(session.rtpengine_id().to_string());
+            }
+            keep
+        });
+        for engine_call_id in swept {
+            self.release_parties(&engine_call_id);
+        }
     }
 
     /// The engine-side call-ids of every session siphon currently holds.
@@ -296,6 +440,10 @@ impl MediaSessionStore {
         self.sessions.is_empty()
     }
 }
+
+#[cfg(test)]
+#[path = "session_parties_tests.rs"]
+mod session_parties_tests;
 
 impl Default for MediaSessionStore {
     fn default() -> Self {

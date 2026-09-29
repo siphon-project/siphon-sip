@@ -145,7 +145,10 @@ fn the_payload_carries_each_legs_counters_and_quality() {
 fn a_summary_is_published_for_its_sip_call_id() {
     let call_id = "ms-published@example.test";
     crate::control::channel_event_capture::watch(call_id);
-    publish_media_summary(&summary(call_id));
+    publish_media_summary(
+        &super::test_dispatcher::test_dispatcher().state,
+        &summary(call_id),
+    );
     let captured = crate::control::channel_event_capture::take(call_id);
     assert_eq!(captured.len(), 1, "{captured:?}");
     assert_eq!(captured[0].0, "MediaSummary");

@@ -137,6 +137,8 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod media_summary_bridge_tests;
+#[cfg(test)]
 mod media_summary_event_tests;
 #[cfg(test)]
 mod originate_ack_retransmit_tests;
