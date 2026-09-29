@@ -165,7 +165,13 @@ fn callee_answers(
         endpoint_sdp("198.51.100.20").into_bytes(),
         "application/sdp",
     );
-    handle_originated_call_response(call_id, &answer, 200, &controller.dispatcher.state);
+    handle_originated_call_response(
+        call_id,
+        &answer,
+        200,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
+        &controller.dispatcher.state,
+    );
 }
 
 /// RFC 4028 §7.1, §7.2, §10: a controller's originate with `session_timer` asks

@@ -202,3 +202,23 @@ pub(super) fn phone_sends(state: &DispatcherState, from: SocketAddr, response: &
         state,
     );
 }
+
+/// A profile that pins media ingress to the signalling source on both halves.
+pub(super) const PINNED_INGRESS: &str = "pinned_ingress";
+
+/// The built-in profiles plus [`PINNED_INGRESS`].
+pub(super) fn pinned_ingress_profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+    let half = crate::config::NgFlagsConfig {
+        received_from: true,
+        ..Default::default()
+    };
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        PINNED_INGRESS.to_string(),
+        crate::config::MediaProfileConfig {
+            offer: half.clone(),
+            answer: half,
+        },
+    );
+    Arc::new(crate::rtpengine::ProfileRegistry::from_config(&custom))
+}

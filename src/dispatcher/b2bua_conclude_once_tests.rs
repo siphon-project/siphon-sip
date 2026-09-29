@@ -283,7 +283,15 @@ async fn a_retransmitted_rejection_of_an_originated_call_runs_on_failure_once() 
         .expect("the A-leg INVITE lock")
         .clone();
     let rejection = carrier_response(&invite, 486, "Busy Here");
-    let reject = || handle_originated_call_response(&sequence.call_id, &rejection, 486, state);
+    let reject = || {
+        handle_originated_call_response(
+            &sequence.call_id,
+            &rejection,
+            486,
+            std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
+            state,
+        )
+    };
 
     interleave(&gate, reject, reject);
 

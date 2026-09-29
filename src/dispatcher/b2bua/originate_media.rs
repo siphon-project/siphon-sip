@@ -7,6 +7,11 @@ use crate::dispatcher::*;
 /// media session under this leg's SIP Call-ID, so every media verb resolves
 /// against it through [`b2bua_media_target`].
 ///
+/// `response_source` is where the 2xx arrived from. It is what a profile that
+/// carries `received_from` pins the leg's media ingress to, the same source
+/// every other B-leg answer is pinned by: the signalling peer siphon actually
+/// heard from, not the address the callee's SDP names (wrong behind NAT).
+///
 /// Returns the answer SDP for the ACK, or a short human reason on failure —
 /// never a silent no-op, because an offerless INVITE with no answer is a
 /// connected call with no audio.
@@ -15,6 +20,7 @@ pub fn originate_anchor_2xx(
     remote_tag: &str,
     response: &SipMessage,
     anchor: &crate::b2bua::actor::OriginateAnchor,
+    response_source: SocketAddr,
     state: &DispatcherState,
 ) -> Result<String, String> {
     let backend = state
@@ -51,6 +57,7 @@ pub fn originate_anchor_2xx(
                 .map_err(|error| format!("ws_uri templating failed: {error:?}"))?,
         );
     }
+    flags.stamp_received_from(response_source.ip());
     let unsupported = backend.unsupported_flags(&flags);
     if !unsupported.is_empty() {
         return Err(format!(

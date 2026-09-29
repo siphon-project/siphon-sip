@@ -96,6 +96,7 @@ async fn an_originate_answers_a_401_with_a_credentialed_re_invite() {
         &prepared.internal_call_id,
         &challenge(&prepared, 401),
         401,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
         &dispatcher.state,
     );
 
@@ -144,6 +145,7 @@ async fn a_407_is_answered_with_proxy_authorization() {
         &prepared.internal_call_id,
         &challenge(&prepared, 407),
         407,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
         &dispatcher.state,
     );
 
@@ -176,6 +178,7 @@ async fn the_retry_is_a_new_transaction() {
         &prepared.internal_call_id,
         &challenge(&prepared, 401),
         401,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
         &dispatcher.state,
     );
 
@@ -199,6 +202,7 @@ async fn the_retry_branch_is_indexed_so_its_answer_comes_back() {
         &prepared.internal_call_id,
         &challenge(&prepared, 401),
         401,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
         &dispatcher.state,
     );
 
@@ -234,6 +238,7 @@ async fn a_challenge_without_credentials_still_fails_the_call() {
         &prepared.internal_call_id,
         &challenge(&prepared, 401),
         401,
+        std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
         &dispatcher.state,
     );
 
@@ -270,6 +275,7 @@ async fn a_trunk_that_challenges_every_attempt_stops_at_the_retry_cap() {
             &prepared.internal_call_id,
             &challenge(&prepared, 401),
             401,
+            std::net::SocketAddr::from(([192, 0, 2, 99], 5060)),
             &dispatcher.state,
         );
         if find_invite(&wire(&dispatcher)).is_some() {
