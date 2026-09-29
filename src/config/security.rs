@@ -14,6 +14,20 @@ pub struct SecurityConfig {
     /// Source IPs/CIDRs that bypass rate limiting (e.g. internal AS, monitoring).
     #[serde(default)]
     pub trusted_cidrs: Vec<String>,
+    /// Treat every source a gateway group admits like a `trusted_cidrs` entry:
+    /// exempt from `rate_limit`, `scanner_block`, `failed_auth_ban`, the
+    /// connection ceilings and APIBAN. Default `false`.
+    ///
+    /// "Admits" is exactly what `request.from_gateway()` answers from and the
+    /// kernel gateway allow set holds — resolved destination addresses plus
+    /// `source_networks` — across siphon.yaml, script and `gateway.backend`
+    /// groups. It exists for carriers provisioned through `gateway.backend`,
+    /// which a static `trusted_cidrs` list cannot follow: the carrier is
+    /// trusted at the reconcile that provisions it (an APIBAN entry or an
+    /// auto-ban already held against its address is lifted then) and back
+    /// under every policy at the reconcile that removes it.
+    #[serde(default)]
+    pub trust_gateways: bool,
     /// Block source IP after N consecutive failed authentication attempts.
     pub failed_auth_ban: Option<FailedAuthBanConfig>,
     /// APIBAN community blocklist integration.

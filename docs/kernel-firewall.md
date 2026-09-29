@@ -30,6 +30,12 @@ userspace ACL or the kernel set sees them. This matters more for the feed than
 it looks — the kernel drop is port-agnostic, so a management address that landed
 on a community blocklist would take ssh down with the trunk.
 
+With `security.trust_gateways: true` the same holds for every source a gateway
+group admits (see [below](#trusting-gateways)), and for a carrier provisioned
+*after* its address was banned the ban is lifted rather than left to run out:
+the reconcile that provisions it removes the address from the auto-ban store,
+the APIBAN store and the kernel set, each with a `warn` naming the group.
+
 Because the poll only fetches *forward* from the last seen id, an address whose
 TTL expires while it is still abusive returns to the set when the feed re-lists
 it, not immediately. That is how the feed publishes; it isn't a full
@@ -174,7 +180,8 @@ ip6 saddr @gateways6 udp dport 5060 accept
 That is deliberate. An `accept` inside SIPhon's own chain would also make a
 gateway immune to the ban drops above, and whether a known carrier can be
 auto-banned is your policy call, not a side effect of SIPhon keeping a set
-current. The sets are declared even before anything is published into them, so
+current. `security.trust_gateways` is where you make that call for SIPhon's own
+abuse controls. The sets are declared even before anything is published into them, so
 an `nft -f` referencing them loads on a fresh node.
 
 ### What goes in
@@ -259,15 +266,59 @@ What that leaves you to plan for:
   floor tick (60 s) at the latest. With a `gateway.backend` source, close it at
   once by following the reload with
   `curl -X POST http://127.0.0.1:9091/admin/gateways/refresh`.
-- **Bans placed before the reload are enforced in userspace only.** The ban
-  sets come back empty, and SIPhon does not replay its active bans into them;
-  bans placed after the recovery reach the kernel as usual.
+- **Bans are put back.** The ban sets come back empty, so the re-declaration
+  re-adds every live auto-ban and APIBAN entry **in the same transaction** that
+  re-creates the sets, each with the time it has left (a permanent APIBAN entry
+  stays permanent). Nothing lapsed is replayed, and nothing trusted since it was
+  banned. The `warn` carries `replayed_bans`. If the kernel refuses the replay,
+  SIPhon declares the sets alone and says so; those bans are then enforced in
+  userspace only until they expire, which is what every ban was before this.
 - **A set flushed rather than deleted is not noticed.** `nft flush set` keeps
   the set and its handle, so nothing tells SIPhon; the next change to the
   gateway view refills it. Reload by redefining the table, not by flushing.
 
 The same recovery covers `nft flush ruleset` underneath a running node, with
 SIPhon's own `siphon` table.
+
+## Trusting gateways
+
+`security.trusted_cidrs` is the list the abuse controls leave alone. A carrier
+provisioned through [`gateway.backend`](reference/gateway-api.md) is not on it,
+so it is admitted by the allow set and answered by `from_gateway()`, but still
+rate-limited, auto-banned and APIBAN-listed like a stranger: a busy carrier's
+BYEs past `rate_limit` are dropped and it gets banned. Copying its address into
+`trusted_cidrs` by hand defeats the point of the source.
+
+```yaml
+security:
+  trust_gateways: true   # default false
+```
+
+With it on, a source is trusted if `trusted_cidrs` holds it **or** a gateway
+group admits it. "Admits" has one definition, the one this page's allow set and
+`request.from_gateway()` already use: every resolved destination address plus
+`source_networks`, for siphon.yaml, script and `gateway.backend` groups alike.
+Every abuse control consults it: `rate_limit`, `scanner_block` (and its
+escalation to a ban), `failed_auth_ban`, `connection_limits` and APIBAN.
+
+- **Provisioned:** trusted at the reconcile that adds it. A ban already held
+  against the address (auto-ban or APIBAN) is lifted then, from userspace and
+  from the kernel set, with a `warn` naming the group. Lifted rather than left
+  to expire because userspace already stops honouring it the moment the source
+  is trusted; leaving the kernel element would only keep dropping a carrier
+  SIPhon is dialling.
+- **Removed:** back under every policy at the reconcile that removes it,
+  counted from zero. It is not retroactively banned for what it sent while
+  trusted.
+- **Over `rate_limit` while trusted:** allowed, and logged once per window
+  (`rate_limit: gateway source is over the limit and not dropped`), so a limit
+  sized below a carrier's real traffic is visible.
+
+Off (the default), behaviour is exactly as before. The gateway view is a
+snapshot rebuilt when membership changes (a reconcile, a script's
+`gateway.add_group()`, a probe cycle re-resolving a group, the floor tick) and
+read lock-free with a binary search, so the request-path check stays cheap with
+thousands of gateways.
 
 ### CIDRs go in as written
 

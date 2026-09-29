@@ -27,8 +27,8 @@ pub mod gateways;
 pub mod nftables;
 
 /// A command for the firewall actor.
-#[derive(Debug)]
-enum Command {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Command {
     /// Add `ip` to the kernel ban set. `ttl_ms == 0` means permanent.
     Ban { ip: IpAddr, ttl_ms: u64 },
     /// Remove `ip` (optional — timed elements self-expire in the kernel).
@@ -77,6 +77,63 @@ impl KernelFirewall {
             }
         }
     }
+
+    /// A handle whose commands land in the returned receiver instead of the
+    /// kernel, so a test can assert what would have been programmed.
+    #[cfg(test)]
+    pub(crate) fn capturing() -> (Self, mpsc::Receiver<Command>) {
+        let (sender, receiver) = mpsc::channel(1024);
+        (Self { sender }, receiver)
+    }
+}
+
+/// One ban to put back into a recreated ban set: the address and the time it
+/// has left, in milliseconds. `0` is the kernel's "never expires", which only
+/// a permanent APIBAN entry (`ban_ttl_secs: 0`) carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayedBan {
+    pub address: IpAddr,
+    pub ttl_ms: u64,
+}
+
+/// Merge the live auto-bans and APIBAN entries into what a re-declaration
+/// replays: one element per address, the longer lifetime winning (permanent
+/// beats any timeout), sorted so the transaction is deterministic.
+///
+/// Remaining times are clamped to at least 1 ms for the same reason
+/// [`KernelFirewall::ban`] does it: a sub-millisecond remainder must never
+/// round to 0 and turn into a permanent ban. The inputs already leave out
+/// anything lapsed or trusted.
+pub(crate) fn replay_set(
+    auto_bans: Vec<(IpAddr, Duration)>,
+    blocklist: Vec<(IpAddr, Option<Duration>)>,
+) -> Vec<ReplayedBan> {
+    fn timed_ms(remaining: Duration) -> u64 {
+        remaining.as_millis().clamp(1, u128::from(u64::MAX)) as u64
+    }
+    let mut merged: std::collections::BTreeMap<IpAddr, u64> = std::collections::BTreeMap::new();
+    let entries = auto_bans
+        .into_iter()
+        .map(|(address, remaining)| (address, timed_ms(remaining)))
+        .chain(
+            blocklist
+                .into_iter()
+                .map(|(address, remaining)| (address, remaining.map_or(0, timed_ms))),
+        );
+    for (address, ttl_ms) in entries {
+        merged
+            .entry(address)
+            .and_modify(|held| {
+                if *held != 0 && (ttl_ms == 0 || ttl_ms > *held) {
+                    *held = ttl_ms;
+                }
+            })
+            .or_insert(ttl_ms);
+    }
+    merged
+        .into_iter()
+        .map(|(address, ttl_ms)| ReplayedBan { address, ttl_ms })
+        .collect()
 }
 
 /// Build the kernel firewall: ensure the nf_tables sets exist, then spawn the
@@ -132,13 +189,24 @@ pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<Ke
 /// both the start-up path and the recovery after a ruleset reload.
 #[cfg(target_os = "linux")]
 pub async fn declare(config: &crate::config::FirewallConfig) -> std::io::Result<()> {
-    nftables::ensure_firewall(
+    declare_replaying(config, &[]).await
+}
+
+/// [`declare`], putting `replay` back into the ban sets in the same
+/// transaction — the recovery after a ruleset reload recreated them empty.
+#[cfg(target_os = "linux")]
+pub async fn declare_replaying(
+    config: &crate::config::FirewallConfig,
+    replay: &[ReplayedBan],
+) -> std::io::Result<()> {
+    nftables::ensure_firewall_replaying(
         &config.table,
         &config.chain,
         &config.set_v4,
         &config.set_v6,
         config.manage_rule,
         gateway_sets(config),
+        replay,
     )
     .await
 }
@@ -174,4 +242,74 @@ pub async fn start(_config: &crate::config::FirewallConfig) -> std::io::Result<K
     Err(std::io::Error::other(
         "firewall: the nf_tables backend is Linux-only",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("test address")
+    }
+
+    #[test]
+    fn replay_keeps_each_ban_with_its_remaining_time() {
+        let replay = replay_set(
+            vec![(ip("192.0.2.1"), Duration::from_secs(90))],
+            vec![
+                (ip("2001:db8::1"), Some(Duration::from_secs(600))),
+                (ip("198.51.100.1"), None),
+            ],
+        );
+        assert_eq!(
+            replay,
+            vec![
+                ReplayedBan {
+                    address: ip("192.0.2.1"),
+                    ttl_ms: 90_000
+                },
+                ReplayedBan {
+                    address: ip("198.51.100.1"),
+                    ttl_ms: 0
+                },
+                ReplayedBan {
+                    address: ip("2001:db8::1"),
+                    ttl_ms: 600_000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_of_an_address_in_both_stores_keeps_the_longer_ban() {
+        let replay = replay_set(
+            vec![
+                (ip("192.0.2.1"), Duration::from_secs(90)),
+                (ip("192.0.2.2"), Duration::from_secs(900)),
+            ],
+            vec![
+                (ip("192.0.2.1"), Some(Duration::from_secs(600))),
+                (ip("192.0.2.2"), None),
+            ],
+        );
+        assert_eq!(
+            replay,
+            vec![
+                ReplayedBan {
+                    address: ip("192.0.2.1"),
+                    ttl_ms: 600_000
+                },
+                ReplayedBan {
+                    address: ip("192.0.2.2"),
+                    ttl_ms: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_never_rounds_a_timed_ban_into_a_permanent_one() {
+        let replay = replay_set(vec![(ip("192.0.2.1"), Duration::from_micros(300))], vec![]);
+        assert_eq!(replay[0].ttl_ms, 1);
+    }
 }

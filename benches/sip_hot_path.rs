@@ -453,6 +453,54 @@ fn bench_traffic_counters(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The trusted-source check the request filter runs on every inbound request
+/// (`security.trusted_cidrs`, plus the gateway view under
+/// `security.trust_gateways`).
+///
+/// `configured_only` is the check with the key off — a scan of a short CIDR
+/// list, what every request paid before. The gateway cases run against 10 000
+/// merged host ranges, far more carriers than any estate holds, so the binary
+/// search's cost is visible: a miss (a stranger, the common case) and a hit.
+fn bench_source_trust(criterion: &mut Criterion) {
+    use siphon::gateway::view::{AdmittedRange, GatewayView};
+    use siphon::security::trust::SourceTrust;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    let configured = vec!["198.51.100.0/24".to_string(), "203.0.113.0/24".to_string()];
+    // Documentation space (2001:db8::/32): 10 000 distinct, non-adjacent hosts.
+    let host = |index: u128| {
+        IpAddr::V6(std::net::Ipv6Addr::from(
+            (0x2001_0db8_u128 << 96) | (index * 3),
+        ))
+    };
+    let view = Arc::new(GatewayView::new());
+    view.publish(|| {
+        (0..10_000u32)
+            .map(|index| AdmittedRange {
+                network: ipnet::IpNet::new(host(u128::from(index)), 128).expect("host prefix"),
+                group: Arc::from("carriers"),
+            })
+            .collect()
+    });
+    let off = SourceTrust::from_cidrs(&configured);
+    let on = SourceTrust::from_cidrs(&configured).with_gateways(Some(view));
+    let stranger: IpAddr = "2001:db8:ffff::77".parse().expect("address");
+    let gateway = host(4_242);
+
+    let mut group = criterion.benchmark_group("source_trust");
+    group.bench_function("configured_only", |bencher| {
+        bencher.iter(|| off.is_trusted(black_box(stranger)));
+    });
+    group.bench_function("gateways_10k_miss", |bencher| {
+        bencher.iter(|| on.is_trusted(black_box(stranger)));
+    });
+    group.bench_function("gateways_10k_hit", |bencher| {
+        bencher.iter(|| on.is_trusted(black_box(gateway)));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -465,6 +513,7 @@ criterion_group!(
     bench_headers,
     bench_txn_key,
     bench_framing,
-    bench_traffic_counters
+    bench_traffic_counters,
+    bench_source_trust
 );
 criterion_main!(benches);

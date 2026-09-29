@@ -29,7 +29,10 @@
 //! wake-up therefore checks that siphon's objects are still the ones it
 //! declared, and re-declares and republishes when they are not. Without that,
 //! a reload leaves siphon dialling carriers whose answers the kernel drops,
-//! with the cache below reporting everything published.
+//! with the cache below reporting everything published. The same reload
+//! empties the ban sets, so the re-declaration also puts every live auto-ban
+//! and APIBAN entry back, with the time each has left, in the same
+//! transaction.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -207,7 +210,7 @@ impl GatewayAllowSet {
             }
             Declaration::Replaced => {}
         }
-        self.declare().await?;
+        let replayed = self.declare().await?;
         let declared = self.kernel_fingerprint().await?.ok_or_else(|| {
             std::io::Error::other(
                 "kernel firewall: objects still missing straight after declaring them",
@@ -224,9 +227,10 @@ impl GatewayAllowSet {
         tracing::warn!(
             table = %self.table,
             missing = current.is_none(),
+            replayed_bans = replayed,
             "kernel firewall: siphon's sets were deleted or recreated underneath it (a ruleset \
-             reload?) — re-declared them; the gateway allow set is republished now; bans placed \
-             before the reload are enforced in userspace only"
+             reload?) — re-declared them with the live bans put back; the gateway allow set is \
+             republished now"
         );
         Ok(true)
     }
@@ -243,13 +247,35 @@ impl GatewayAllowSet {
         ))
     }
 
+    /// Re-declare, putting the live bans back. Returns how many were.
+    ///
+    /// A replay the kernel refuses — a blocklist too large for one
+    /// transaction, say — must not cost the declaration itself, which is what
+    /// keeps the allow set and the drop rules in place: it falls back to
+    /// declaring alone, and says what that leaves enforced in userspace only.
     #[cfg(target_os = "linux")]
-    async fn declare(&self) -> std::io::Result<()> {
-        super::declare(&self.firewall).await
+    async fn declare(&self) -> std::io::Result<usize> {
+        let replay = live_bans(std::time::Instant::now());
+        if replay.is_empty() {
+            return super::declare(&self.firewall).await.map(|()| 0);
+        }
+        match super::declare_replaying(&self.firewall, &replay).await {
+            Ok(()) => Ok(replay.len()),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    bans = replay.len(),
+                    "kernel firewall: the live bans could not be put back into the re-declared \
+                     ban sets — declaring the sets alone; those bans are enforced in userspace \
+                     only until they expire"
+                );
+                super::declare(&self.firewall).await.map(|()| 0)
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
-    async fn declare(&self) -> std::io::Result<()> {
+    async fn declare(&self) -> std::io::Result<usize> {
         Err(std::io::Error::other(
             "firewall: the nf_tables backend is Linux-only",
         ))
@@ -314,6 +340,20 @@ impl GatewayAllowSet {
     }
 }
 
+/// Every ban siphon holds right now, as the re-declaration replays it: the
+/// auto-ban store and the APIBAN blocklist, each already leaving out lapsed
+/// entries and any source trusted since it was banned.
+#[cfg(target_os = "linux")]
+fn live_bans(now: std::time::Instant) -> Vec<super::ReplayedBan> {
+    let auto_bans = crate::security::auto_ban()
+        .map(|store| store.live_bans_at(now))
+        .unwrap_or_default();
+    let blocklist = crate::apiban::installed()
+        .map(|list| list.live_bans_at(now))
+        .unwrap_or_default();
+    super::replay_set(auto_bans, blocklist)
+}
+
 /// Install the process-wide publisher. Idempotent; a second call is ignored.
 pub fn install(allow_set: Arc<GatewayAllowSet>) {
     let _ = ALLOW_SET.set(allow_set);
@@ -333,32 +373,14 @@ pub fn request_publish() {
 /// An nf_tables interval set rejects an element overlapping one already in it,
 /// and the same address reaches here from several places: two groups naming one
 /// carrier, a gateway inside a `trusted_cidrs` range, the same host in
-/// `source_networks` and in the resolved members. CIDR ranges are either
-/// disjoint or nested — a partial overlap is not expressible — so dropping the
-/// contained one is exact, not an approximation, and needs no range arithmetic.
+/// `source_networks` and in the resolved members. The merge is the one the
+/// gateway view uses ([`crate::gateway::view::normalise_by`]), so the kernel set
+/// and the view can never merge the same inputs differently.
 ///
 /// The result is sorted so an unchanged view compares equal to the last
 /// published one and issues no transaction.
-fn normalise(mut networks: Vec<IpNet>) -> Vec<IpNet> {
-    // Broadest first, so a container is always seen before what it contains.
-    networks.sort_by(|left, right| {
-        left.prefix_len()
-            .cmp(&right.prefix_len())
-            .then_with(|| left.network().cmp(&right.network()))
-    });
-    let mut kept: Vec<IpNet> = Vec::with_capacity(networks.len());
-    for network in networks {
-        if kept.iter().any(|held| held.contains(&network)) {
-            continue;
-        }
-        kept.push(network);
-    }
-    kept.sort_by(|left, right| {
-        left.network()
-            .cmp(&right.network())
-            .then_with(|| left.prefix_len().cmp(&right.prefix_len()))
-    });
-    kept
+fn normalise(networks: Vec<IpNet>) -> Vec<IpNet> {
+    crate::gateway::view::normalise_by(networks, |network| *network)
 }
 
 #[cfg(test)]

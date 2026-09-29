@@ -1139,8 +1139,13 @@ impl SiphonServer {
         // --- Gateway allow set ---
         init_gateway_allow_set(&config, gateway_manager.as_ref(), kernel_firewall.is_some()).await;
 
+        // --- security.trust_gateways: the gateway view every abuse control consults ---
+        let gateway_trust =
+            crate::security::trust::gateway_view_for(&config, gateway_manager.as_ref());
+
         // --- Build transport ACL ---
-        let transport_acl = build_transport_acl(&config, kernel_firewall.clone());
+        let transport_acl =
+            build_transport_acl(&config, kernel_firewall.clone(), gateway_trust.clone());
 
         // --- Stream message-size ceiling ---
         // Always installed (unlike the opt-in guards below): a stream reader
@@ -1172,10 +1177,10 @@ impl SiphonServer {
             .map(|sec| sec.trusted_cidrs.clone())
             .unwrap_or_default();
         let connection_limits = crate::security::ConnectionLimits::from(&connection_limits_config);
-        crate::security::set_connection_limiter(Arc::new(crate::security::ConnectionLimiter::new(
-            connection_limits,
-            &trusted_cidrs,
-        )));
+        crate::security::set_connection_limiter(Arc::new(
+            crate::security::ConnectionLimiter::new(connection_limits, &trusted_cidrs)
+                .with_gateway_trust(gateway_trust.clone()),
+        ));
         info!(
             max_handshakes_per_source = connection_limits.max_handshakes_per_source,
             max_handshakes = connection_limits.max_handshakes,
@@ -1198,15 +1203,19 @@ impl SiphonServer {
                 let max_ban_duration_secs = fab
                     .max_ban_duration_secs
                     .unwrap_or_else(|| fab.ban_duration_secs.saturating_mul(24));
-                let store = Arc::new(crate::security::AutoBanStore::new(
-                    fab.threshold,
-                    fab.window_secs,
-                    fab.ban_duration_secs,
-                    &sec.trusted_cidrs,
-                    fab.strong_signal_weight,
-                    fab.missing_credentials_weight,
-                    max_ban_duration_secs,
-                ));
+                let store = Arc::new(
+                    crate::security::AutoBanStore::new(
+                        fab.threshold,
+                        fab.window_secs,
+                        fab.ban_duration_secs,
+                        &sec.trusted_cidrs,
+                        fab.strong_signal_weight,
+                        fab.missing_credentials_weight,
+                        max_ban_duration_secs,
+                    )
+                    .with_gateway_trust(gateway_trust.clone()),
+                );
+                store.follow_gateway_view();
                 crate::security::set_auto_ban(Arc::clone(&store));
                 if let Some(ref firewall) = kernel_firewall {
                     store.set_firewall(firewall.clone());
@@ -1241,7 +1250,10 @@ impl SiphonServer {
             // consults it on every inbound request (before transaction/dialog
             // processing) via crate::security::security_filter(). trusted_cidrs
             // are exempt from both checks.
-            if let Some(filter) = crate::security::SecurityFilter::from_config(sec) {
+            if let Some(filter) = crate::security::SecurityFilter::from_config_with_gateways(
+                sec,
+                gateway_trust.clone(),
+            ) {
                 crate::security::set_security_filter(Arc::clone(&filter));
                 info!(
                     rate_limit = sec.rate_limit.is_some(),

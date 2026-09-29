@@ -24,6 +24,7 @@ use ipnet::IpNet;
 use tracing::{debug, error, info, warn};
 
 pub mod source;
+pub mod view;
 
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
@@ -660,7 +661,10 @@ pub fn parse_source_network(spec: &str) -> Option<IpNet> {
 
 /// Manager for multiple dispatcher groups.
 pub struct DispatcherManager {
-    groups: DashMap<String, Arc<DispatcherGroup>>,
+    groups: Arc<DashMap<String, Arc<DispatcherGroup>>>,
+    /// Every source any group admits, merged into one lock-free snapshot and
+    /// republished whenever membership changes — see [`view`].
+    view: Arc<view::GatewayView>,
     /// One health-prober task per group, so a group added or removed at run time
     /// starts and stops probing with it.
     ///
@@ -685,7 +689,8 @@ struct ProberRuntime {
 impl DispatcherManager {
     pub fn new() -> Self {
         Self {
-            groups: DashMap::new(),
+            groups: Arc::new(DashMap::new()),
+            view: Arc::new(view::GatewayView::new()),
             probers: DashMap::new(),
             prober_runtime: std::sync::OnceLock::new(),
         }
@@ -697,6 +702,7 @@ impl DispatcherManager {
         let name = group.name.clone();
         let group = Arc::new(group);
         self.groups.insert(name.clone(), Arc::clone(&group));
+        self.republish_view();
         self.start_prober(name, &group);
     }
 
@@ -707,7 +713,30 @@ impl DispatcherManager {
     /// Remove a group by name, stopping its health prober.
     pub fn remove_group(&self, name: &str) -> bool {
         self.stop_prober(name);
-        self.groups.remove(name).is_some()
+        let removed = self.groups.remove(name).is_some();
+        if removed {
+            self.republish_view();
+        }
+        removed
+    }
+
+    /// The published gateway view: every source any group admits, whichever
+    /// created the group. What `security.trust_gateways` consults.
+    pub fn gateway_view(&self) -> Arc<view::GatewayView> {
+        Arc::clone(&self.view)
+    }
+
+    /// Rebuild the gateway view from the live groups. Returns whether it
+    /// changed.
+    fn republish_view(&self) -> bool {
+        self.membership().republish()
+    }
+
+    fn membership(&self) -> Membership {
+        Membership {
+            groups: Arc::clone(&self.groups),
+            view: Arc::clone(&self.view),
+        }
     }
 
     /// Names of the groups a `gateway.backend` source created.
@@ -769,6 +798,7 @@ impl DispatcherManager {
         let handle = spawn_prober(
             Arc::clone(group),
             Arc::clone(&prober_runtime.uac_sender),
+            self.membership(),
             &prober_runtime.runtime,
         );
         self.probers.insert(name, handle);
@@ -805,9 +835,9 @@ impl DispatcherManager {
     /// set (see [`crate::firewall::gateways`]). Ranges may overlap or repeat
     /// across groups; the publisher normalises.
     pub fn admitted_sources(&self) -> Vec<IpNet> {
-        self.groups
-            .iter()
-            .flat_map(|entry| entry.value().admitted_sources())
+        admitted_by_group(&self.groups)
+            .into_iter()
+            .map(|range| range.network)
             .collect()
     }
 
@@ -828,6 +858,7 @@ impl DispatcherManager {
                 entry.value().refresh_member_ips();
             }
         }
+        self.republish_view();
     }
 
     /// The probe-maintained resolved address for a next-hop `host:port`, if it
@@ -934,6 +965,38 @@ impl Default for DispatcherManager {
     }
 }
 
+/// What rebuilds the gateway view: the live groups and the view they feed.
+/// Cloned into each prober, which re-resolves a group without going through
+/// the manager.
+#[derive(Clone)]
+struct Membership {
+    groups: Arc<DashMap<String, Arc<DispatcherGroup>>>,
+    view: Arc<view::GatewayView>,
+}
+
+impl Membership {
+    fn republish(&self) -> bool {
+        self.view.publish(|| admitted_by_group(&self.groups))
+    }
+}
+
+/// Every source every group admits, with the group admitting it — the single
+/// definition of "who is a gateway" ([`DispatcherGroup::admitted_sources`]),
+/// taken across all groups whoever created them.
+fn admitted_by_group(groups: &DashMap<String, Arc<DispatcherGroup>>) -> Vec<view::AdmittedRange> {
+    let mut sources = Vec::new();
+    for entry in groups.iter() {
+        let group: Arc<str> = Arc::from(entry.key().as_str());
+        for network in entry.value().admitted_sources() {
+            sources.push(view::AdmittedRange {
+                network,
+                group: Arc::clone(&group),
+            });
+        }
+    }
+    sources
+}
+
 // ---------------------------------------------------------------------------
 // Health probing
 // ---------------------------------------------------------------------------
@@ -965,6 +1028,7 @@ pub fn spawn_health_probers(manager: Arc<DispatcherManager>, uac_sender: Arc<Uac
 fn spawn_prober(
     group: Arc<DispatcherGroup>,
     uac_sender: Arc<UacSender>,
+    membership: Membership,
     runtime: &tokio::runtime::Handle,
 ) -> tokio::task::AbortHandle {
     let interval = group.probe_config.interval;
@@ -987,6 +1051,7 @@ fn spawn_prober(
                 probe_group(
                     &group,
                     &uac_sender,
+                    &membership,
                     threshold,
                     from_user.as_deref(),
                     from_domain.as_deref(),
@@ -1000,6 +1065,7 @@ fn spawn_prober(
 async fn probe_group(
     group: &Arc<DispatcherGroup>,
     uac_sender: &UacSender,
+    membership: &Membership,
     failure_threshold: u32,
     from_user: Option<&str>,
     from_domain: Option<&str>,
@@ -1007,9 +1073,13 @@ async fn probe_group(
     // Refresh the cached member-IP set so `from_gateway` tracks DNS changes on
     // the probe interval. `refresh_member_ips` does blocking DNS, so run it off
     // the tokio worker; the request hot path only ever reads the cached set.
+    // The gateway view is rebuilt in the same blocking hop, so a re-resolved
+    // carrier is trusted (security.trust_gateways) in the cycle that found it.
     let group_for_refresh = Arc::clone(group);
+    let membership = membership.clone();
     if let Err(error) = tokio::task::spawn_blocking(move || {
         group_for_refresh.refresh_member_ips();
+        membership.republish();
     })
     .await
     {
@@ -1737,7 +1807,7 @@ pub(crate) mod tests {
 
         // Probe with threshold=1 — first failure should mark down
         let group = manager.get_group("test").unwrap();
-        probe_group(&group, &uac_sender, 1, None, None).await;
+        probe_group(&group, &uac_sender, &manager.membership(), 1, None, None).await;
 
         let status = group.status();
         assert!(!status[0].1);
@@ -2766,5 +2836,124 @@ pub(crate) mod tests {
         // Still down after the short window would have elapsed is implied by the
         // long deadline; we just assert it is still cooling.
         assert!(!dest.is_healthy());
+    }
+
+    // --- The gateway view (security.trust_gateways) ---
+
+    fn destination_at(address: &str) -> Destination {
+        Destination::new(
+            format!("sip:{address}"),
+            address.parse().expect("test socket address"),
+            Transport::Udp,
+            1,
+            1,
+        )
+    }
+
+    /// Every way a group comes to exist feeds the one view: siphon.yaml, a
+    /// script's `gateway.add_group()`, and a `gateway.backend` source.
+    #[test]
+    fn the_view_holds_static_script_and_source_groups_alike() {
+        let manager = DispatcherManager::new();
+        let view = manager.gateway_view();
+        let yaml = DispatcherGroup::new(
+            "yaml".to_string(),
+            Algorithm::Weighted,
+            vec![destination_at("192.0.2.10:5060")],
+        )
+        .from_yaml();
+        let script = DispatcherGroup::new(
+            "script".to_string(),
+            Algorithm::Weighted,
+            vec![destination_at("192.0.2.20:5060")],
+        );
+        let source = DispatcherGroup::new(
+            "source".to_string(),
+            Algorithm::Weighted,
+            vec![destination_at("[2001:db8::30]:5060")],
+        )
+        .with_source_networks(vec![parse_source_network("198.51.100.0/24").unwrap()])
+        .from_source();
+
+        for (group, address) in [
+            (yaml, "192.0.2.10"),
+            (script, "192.0.2.20"),
+            (source, "2001:db8::30"),
+        ] {
+            let name = group.name.clone();
+            let address: IpAddr = address.parse().unwrap();
+            assert!(
+                !view.contains(address),
+                "{name}: admitted before it was added"
+            );
+            manager.add_group(group);
+            assert_eq!(view.group_of(address).as_deref(), Some(name.as_str()));
+        }
+        // source_networks count, exactly as they do for from_gateway().
+        assert_eq!(
+            view.group_of("198.51.100.77".parse().unwrap()).as_deref(),
+            Some("source")
+        );
+        // Positive control for the negatives above: a stranger is not a gateway.
+        assert!(!view.contains("203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_view_agrees_with_from_gateway() {
+        // One definition of "gateway": whatever source_in_group admits, the
+        // view admits, and the other way round.
+        let manager = DispatcherManager::new();
+        manager.add_group(
+            DispatcherGroup::new(
+                "carriers".to_string(),
+                Algorithm::Weighted,
+                vec![destination_at("192.0.2.10:5060")],
+            )
+            .with_source_networks(vec![parse_source_network("198.51.100.0/28").unwrap()]),
+        );
+        let view = manager.gateway_view();
+        for probe in ["192.0.2.10", "192.0.2.11", "198.51.100.15", "198.51.100.16"] {
+            let address: IpAddr = probe.parse().unwrap();
+            assert_eq!(
+                view.contains(address),
+                manager.source_in_group("carriers", address),
+                "{probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_group_takes_it_out_of_the_view() {
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![destination_at("192.0.2.10:5060")],
+        ));
+        let address: IpAddr = "192.0.2.10".parse().unwrap();
+        assert!(manager.gateway_view().contains(address));
+        assert!(manager.remove_group("carriers"));
+        assert!(!manager.gateway_view().contains(address));
+    }
+
+    #[test]
+    fn a_re_resolved_destination_moves_the_view() {
+        // What a probe cycle does: refresh member IPs, then republish.
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![destination_at("192.0.2.10:5060")],
+        ));
+        let group = manager.get_group("carriers").unwrap();
+        group.all_destinations()[0].set_address("192.0.2.99:5060".parse().unwrap());
+        group.refresh_member_ips();
+        assert!(
+            manager.membership().republish(),
+            "a moved address changes the view"
+        );
+        let view = manager.gateway_view();
+        assert!(view.contains("192.0.2.99".parse().unwrap()));
+        assert!(!view.contains("192.0.2.10".parse().unwrap()));
     }
 }

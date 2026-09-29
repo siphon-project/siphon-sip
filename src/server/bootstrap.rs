@@ -1208,6 +1208,7 @@ pub(super) async fn spawn_li_tasks(li_state: Option<LiState>, config: &Config) {
 pub(super) fn build_transport_acl(
     config: &Config,
     firewall: Option<crate::firewall::KernelFirewall>,
+    gateway_trust: Option<Arc<crate::gateway::view::GatewayView>>,
 ) -> Arc<transport::acl::TransportAcl> {
     use transport::acl::TransportAcl;
 
@@ -1218,7 +1219,9 @@ pub(super) fn build_transport_acl(
             // kernel set. Doing it here would only cover the former.
             match crate::apiban::ApiBanClient::new(apiban_config, &sec.trusted_cidrs) {
                 Ok(client) => {
-                    let client = client.with_firewall(firewall.clone());
+                    let client = client
+                        .with_firewall(firewall.clone())
+                        .with_gateway_trust(gateway_trust);
                     let banned = client.banned();
                     client.start();
                     info!("APIBAN blocklist poller started");

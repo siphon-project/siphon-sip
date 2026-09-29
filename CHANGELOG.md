@@ -23,6 +23,19 @@ entry, but a working config keeps working.
   caller). An unknown profile, or one that is not a non-empty string, is
   `bad_request` with `details: {verb: "bridge", argument: "profile", reason}`
   and touches nothing. The reply echoes the `profile` it used.
+- **`security.trust_gateways` exempts provisioned carriers from the abuse
+  controls.** A carrier provisioned through `gateway.backend` was admitted by
+  the gateway allow set and answered by `from_gateway()`, but still
+  rate-limited, auto-banned, capped by the connection ceilings and dropped
+  when APIBAN listed it, because every one of those read only
+  `trusted_cidrs`. With the key on (default off, behaviour unchanged) a
+  source is also trusted when any gateway group admits it: the same resolved
+  addresses and `source_networks` `from_gateway()` answers from, across
+  siphon.yaml, script and source groups. The reconcile that provisions a
+  carrier lifts any auto-ban or APIBAN entry already held on its address,
+  kernel set included; the one that removes it puts it back under every
+  policy, counted from zero. A trusted gateway over `rate_limit` is logged
+  once per window, never dropped.
 
 ### Fixed
 
@@ -63,6 +76,13 @@ entry, but a working config keeps working.
   could honour, is documented with the `420`/`494` it comes with. The `drop`
   section and its `describe` text now say that the `100 Trying` siphon sends on
   every INVITE's arrival has already gone: `drop` withholds the final response.
+- **A ruleset reload no longer drops siphon's kernel bans.** When the table
+  holding siphon's sets was reloaded, the ban sets came back empty and bans
+  placed before the reload were enforced in userspace only. The
+  re-declaration now puts every live auto-ban and APIBAN entry back in the
+  same transaction, each with the time it has left, skipping lapsed and
+  now-trusted entries.
+
 - **A bridge offers each leg the media its own profile describes.** A bridge
   offered the `with` leg media built from the *anchor's* profile, so a
   `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still

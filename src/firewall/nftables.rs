@@ -28,6 +28,8 @@ use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr};
 
 use ipnet::IpNet;
 
+use super::ReplayedBan;
+
 /// Upper bound on waiting for a kernel ack (`SO_RCVTIMEO`). Netlink to the
 /// local kernel is reliable, so this never fires in practice — it exists so a
 /// lost ack can never park a `spawn_blocking` thread forever.
@@ -457,6 +459,37 @@ fn build_interval_setelems(table: &str, set: &str, networks: &[IpNet], seq: u32)
     nlmsg(nft_type(NFT_MSG_NEWSETELEM), OBJECT_FLAGS, seq, &body)
 }
 
+/// Most elements one replay message carries. An element's nested list rides
+/// in one attribute whose length field is 16 bits, and the largest element
+/// (an IPv6 key plus a timeout) is 40 bytes, so 1024 of them stay well inside
+/// it.
+const REPLAY_ELEMENTS_PER_MESSAGE: usize = 1024;
+
+/// `NFT_MSG_NEWSETELEM` messages putting `bans` back into a timeout set, each
+/// element with its own remaining lifetime, at most
+/// [`REPLAY_ELEMENTS_PER_MESSAGE`] per message. Seqs run from `first_seq`.
+fn build_ban_setelems(
+    table: &str,
+    set: &str,
+    bans: &[ReplayedBan],
+    first_seq: u32,
+) -> Vec<Vec<u8>> {
+    bans.chunks(REPLAY_ELEMENTS_PER_MESSAGE)
+        .zip(first_seq..)
+        .map(|(chunk, seq)| {
+            let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+            push_nla_str(&mut body, NFTA_SET_ELEM_LIST_TABLE, table);
+            push_nla_str(&mut body, NFTA_SET_ELEM_LIST_SET, set);
+            let mut elements = Vec::new();
+            for ban in chunk {
+                elements.extend_from_slice(&encode_element(&ban.address, Some(ban.ttl_ms)));
+            }
+            push_nla_nested(&mut body, NFTA_SET_ELEM_LIST_ELEMENTS, &elements);
+            nlmsg(nft_type(NFT_MSG_NEWSETELEM), OBJECT_FLAGS, seq, &body)
+        })
+        .collect()
+}
+
 /// Empty a set: `NFT_MSG_DELSETELEM` with no element list, which is what
 /// `nft flush set` sends and what the kernel reads as "flush", not "delete
 /// nothing".
@@ -650,6 +683,38 @@ const ENOENT: i32 = 2;
 /// error instead of parking the thread forever. `netlink-sys` exposes no
 /// timeout setter, so this goes through `libc::setsockopt` on the raw fd
 /// (`libc` is already in the tree as a hard dependency of `netlink-sys`).
+/// Make room for a batch larger than the socket's default send buffer, which
+/// a netlink send refuses outright (`EMSGSIZE`) rather than splitting — a ban
+/// replay of a large APIBAN list is the batch that needs it. `SO_SNDBUFFORCE`
+/// passes the `wmem_max` cap and needs `CAP_NET_ADMIN`, which a firewall
+/// socket has by definition; `SO_SNDBUF` is the fallback. Not fatal either
+/// way: a send that still does not fit fails with its own error.
+fn grow_send_buffer(socket: &Socket, needed: usize) {
+    use std::os::fd::AsRawFd;
+    // The kernel doubles the value for bookkeeping; asking for the batch size
+    // leaves that headroom on top.
+    let size = libc::c_int::try_from(needed).unwrap_or(libc::c_int::MAX);
+    for option in [libc::SO_SNDBUFFORCE, libc::SO_SNDBUF] {
+        // SAFETY: plain setsockopt on a socket fd we own, passing a properly
+        // sized and initialized c_int — no aliasing, no retained pointers.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const size).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            return;
+        }
+    }
+}
+
+/// Batches up to this size fit the default netlink send buffer.
+const DEFAULT_SEND_BUFFER: usize = 128 * 1024;
+
 fn set_recv_timeout(socket: &Socket, timeout: Duration) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let timeval = libc::timeval {
@@ -690,6 +755,9 @@ async fn send(buffer: Vec<u8>, object_count: usize, benign_errno: Option<i32>) -
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let socket = Socket::new(NETLINK_NETFILTER)?;
         set_recv_timeout(&socket, ACK_RECV_TIMEOUT)?;
+        if expected > DEFAULT_SEND_BUFFER {
+            grow_send_buffer(&socket, expected);
+        }
         socket.connect(&SocketAddr::new(0, 0))?;
         let sent = socket.send(&buffer, 0)?;
         if sent != expected {
@@ -912,6 +980,55 @@ pub async fn ensure_firewall(
     manage_rule: bool,
     gateway_sets: Option<(&str, &str)>,
 ) -> io::Result<()> {
+    ensure_firewall_replaying(table, chain, set_v4, set_v6, manage_rule, gateway_sets, &[]).await
+}
+
+/// [`ensure_firewall`], also putting `replay` back into the ban sets in the
+/// same transaction.
+///
+/// A ruleset reload that deletes the table holding siphon's sets brings the
+/// ban sets back empty, so every source siphon had banned walks straight back
+/// in at the kernel while userspace still refuses it. Re-adding the live bans
+/// inside the re-declaration closes that with no window: the sets and their
+/// elements appear together. An element already present (a set that survived
+/// the reload) is not an error — `NLM_F_CREATE` without `NLM_F_EXCL` makes the
+/// add idempotent — so a partial reload converges too.
+#[allow(clippy::too_many_arguments)] // the declaration's own six, plus what to put back
+pub async fn ensure_firewall_replaying(
+    table: &str,
+    chain: &str,
+    set_v4: &str,
+    set_v6: &str,
+    manage_rule: bool,
+    gateway_sets: Option<(&str, &str)>,
+    replay: &[ReplayedBan],
+) -> io::Result<()> {
+    let messages = declaration_messages(
+        table,
+        chain,
+        set_v4,
+        set_v6,
+        manage_rule,
+        gateway_sets,
+        replay,
+    );
+    let object_count = messages.len();
+    // No benign errno: every object is declared with `NLM_F_CREATE` (existing
+    // objects ack errno-0, never `EEXIST`), so ANY errno here is a real,
+    // batch-aborting failure that must reach the caller.
+    send(wrap_batch(&messages), object_count, None).await
+}
+
+/// Every object message of one declaration, in batch order.
+fn declaration_messages(
+    table: &str,
+    chain: &str,
+    set_v4: &str,
+    set_v6: &str,
+    manage_rule: bool,
+    gateway_sets: Option<(&str, &str)>,
+    replay: &[ReplayedBan],
+) -> Vec<Vec<u8>> {
     // Object seqs run 1..=N within the batch (BATCH_END is N+1, set by
     // `wrap_batch`). The kernel resolves the rules' set/chain references against
     // the objects staged earlier in the same transaction, so table → sets →
@@ -922,6 +1039,16 @@ pub async fn ensure_firewall(
         build_new_set(table, set_v6, 2, SetFamily::V6, 3),
     ];
     let mut seq = 4;
+    // The live bans go straight into the sets just declared.
+    let (replay_v4, replay_v6): (Vec<ReplayedBan>, Vec<ReplayedBan>) = replay
+        .iter()
+        .partition(|ban| SetFamily::of(&ban.address) == SetFamily::V4);
+    for (set, bans) in [(set_v4, &replay_v4), (set_v6, &replay_v6)] {
+        for message in build_ban_setelems(table, set, bans, seq) {
+            messages.push(message);
+            seq += 1;
+        }
+    }
     // The allow sets are declared whenever the firewall is enabled, so an
     // operator's own `nft -f` referencing them loads on a fresh node — before
     // siphon has published anything into them. siphon writes no rule for them
@@ -956,11 +1083,7 @@ pub async fn ensure_firewall(
         seq += 1;
         messages.push(build_drop_rule(table, chain, set_v6, SetFamily::V6, seq));
     }
-    let object_count = messages.len();
-    // No benign errno: every object is declared with `NLM_F_CREATE` (existing
-    // objects ack errno-0, never `EEXIST`), so ANY errno here is a real,
-    // batch-aborting failure that must reach the caller.
-    send(wrap_batch(&messages), object_count, None).await
+    messages
 }
 
 /// The kernel identity of everything [`ensure_firewall`] declares with the same
@@ -1276,6 +1399,202 @@ mod tests {
             attr(&elem, NFTA_SET_ELEM_TIMEOUT, "timeout"),
             &60_000u64.to_be_bytes()
         );
+    }
+
+    // --- Ban replay on re-declaration ---
+
+    /// Every `(address, timeout_ms)` element the NEWSETELEM messages of `batch`
+    /// put into `set`, in order, and how many messages carried them.
+    fn replayed_into(batch: &[Vec<u8>], set: &str) -> (Vec<(IpAddr, u64)>, usize) {
+        let wanted = format!("{set}\0");
+        let mut elements_found = Vec::new();
+        let mut messages = 0;
+        for message in batch {
+            if u16_at(message, 4) != nft_type(NFT_MSG_NEWSETELEM) {
+                continue;
+            }
+            let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+            if attr(&attrs, NFTA_SET_ELEM_LIST_SET, "set") != wanted.as_bytes() {
+                continue;
+            }
+            messages += 1;
+            let list = attr(&attrs, NFTA_SET_ELEM_LIST_ELEMENTS, "elements");
+            for (kind, element) in walk_attrs(list) {
+                assert_eq!(kind, NFTA_LIST_ELEM);
+                let element = walk_attrs(element);
+                let key = walk_attrs(attr(&element, NFTA_SET_ELEM_KEY, "key"));
+                let value = attr(&key, NFTA_DATA_VALUE, "key value");
+                let address = match value.len() {
+                    4 => IpAddr::from(<[u8; 4]>::try_from(value).expect("v4 key")),
+                    16 => IpAddr::from(<[u8; 16]>::try_from(value).expect("v6 key")),
+                    other => panic!("key of {other} bytes"),
+                };
+                let timeout = attr(&element, NFTA_SET_ELEM_TIMEOUT, "timeout");
+                let timeout = u64::from_be_bytes(timeout.try_into().expect("be64 timeout"));
+                elements_found.push((address, timeout));
+            }
+        }
+        (elements_found, messages)
+    }
+
+    fn declaration_with(replay: &[ReplayedBan]) -> Vec<Vec<u8>> {
+        declaration_messages(
+            "siphon",
+            "input",
+            "banned4",
+            "banned6",
+            true,
+            Some(("gateways4", "gateways6")),
+            replay,
+        )
+    }
+
+    #[test]
+    fn a_declaration_without_bans_to_replay_adds_no_elements() {
+        let batch = declaration_with(&[]);
+        assert!(batch
+            .iter()
+            .all(|message| u16_at(message, 4) != nft_type(NFT_MSG_NEWSETELEM)));
+    }
+
+    #[test]
+    fn replayed_bans_land_in_their_family_set_with_their_own_timeouts() {
+        let v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let v6: IpAddr = "2001:db8::5".parse().unwrap();
+        let permanent: IpAddr = "198.51.100.9".parse().unwrap();
+        let batch = declaration_with(&[
+            ReplayedBan {
+                address: v4,
+                ttl_ms: 1_234_000,
+            },
+            ReplayedBan {
+                address: v6,
+                ttl_ms: 42_000,
+            },
+            ReplayedBan {
+                address: permanent,
+                ttl_ms: 0,
+            },
+        ]);
+
+        assert_eq!(
+            replayed_into(&batch, "banned4"),
+            (vec![(v4, 1_234_000), (permanent, 0)], 1)
+        );
+        assert_eq!(replayed_into(&batch, "banned6"), (vec![(v6, 42_000)], 1));
+        // In the same transaction as the declaration, after the sets it fills
+        // and with the object seqs still running 1..=N.
+        let kinds: Vec<u16> = batch.iter().map(|message| u16_at(message, 4)).collect();
+        let first_element = kinds
+            .iter()
+            .position(|kind| *kind == nft_type(NFT_MSG_NEWSETELEM))
+            .expect("replay present");
+        assert!(
+            kinds[..first_element]
+                .iter()
+                .filter(|kind| **kind == nft_type(NFT_MSG_NEWSET))
+                .count()
+                >= 2
+        );
+        let seqs: Vec<u32> = batch.iter().map(|message| u32_at(message, 8)).collect();
+        assert_eq!(seqs, (1..=batch.len() as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_large_replay_is_split_so_each_element_list_fits_its_attribute() {
+        let bans: Vec<ReplayedBan> = (0..2500u32)
+            .map(|index| ReplayedBan {
+                address: IpAddr::V6(Ipv6Addr::from((0x2001_0db8_u128 << 96) | u128::from(index))),
+                ttl_ms: 60_000,
+            })
+            .collect();
+        let batch = declaration_with(&bans);
+        let (elements, messages) = replayed_into(&batch, "banned6");
+        assert_eq!(elements.len(), 2500);
+        assert_eq!(messages, 3);
+        for message in &batch {
+            let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+            if let Some((_, list)) = attrs
+                .iter()
+                .find(|(kind, _)| *kind == NFTA_SET_ELEM_LIST_ELEMENTS)
+            {
+                assert!(list.len() + 4 <= usize::from(u16::MAX));
+            }
+        }
+    }
+
+    /// The whole path a re-declaration takes: what the auto-ban store and the
+    /// APIBAN blocklist hold at the moment of the reload becomes the elements
+    /// of the recreated sets, each with its remaining lifetime, and nothing
+    /// expired or trusted since is put back.
+    #[test]
+    fn a_redeclaration_replays_exactly_the_live_untrusted_bans() {
+        use crate::gateway::view::{AdmittedRange, GatewayView};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let view = Arc::new(GatewayView::new());
+        // threshold 1: one strong signal bans.
+        let long = crate::security::AutoBanStore::new(1, 600, 3600, &[], 1, 0, 86_400)
+            .with_gateway_trust(Some(Arc::clone(&view)));
+        let short = crate::security::AutoBanStore::new(1, 600, 60, &[], 1, 0, 86_400);
+        let banned_v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let banned_v6: IpAddr = "2001:db8::5".parse().unwrap();
+        let now_a_gateway: IpAddr = "192.0.2.10".parse().unwrap();
+        let expired: IpAddr = "203.0.113.6".parse().unwrap();
+        assert!(long.record_strong_failure(banned_v4));
+        assert!(long.record_strong_failure(banned_v6));
+        assert!(long.record_strong_failure(now_a_gateway));
+        assert!(short.record_strong_failure(expired));
+        view.publish(|| {
+            vec![AdmittedRange {
+                network: "192.0.2.10/32".parse().unwrap(),
+                group: Arc::from("carriers"),
+            }]
+        });
+
+        let blocklist = Arc::new(crate::apiban::ApiBanStore::new());
+        let listed: IpAddr = "198.51.100.9".parse().unwrap();
+        blocklist.insert(listed, Some(Duration::from_secs(7200)));
+        let installed = crate::apiban::InstalledBlocklist::for_test(
+            blocklist,
+            crate::security::trust::SourceTrust::from_cidrs(&[]),
+        );
+
+        // The reload, ten minutes on.
+        let reload = Instant::now() + Duration::from_secs(600);
+        let mut auto_bans = long.live_bans_at(reload);
+        auto_bans.extend(short.live_bans_at(reload));
+        let replay = super::super::replay_set(auto_bans, installed.live_bans_at(reload));
+        let batch = declaration_with(&replay);
+
+        let (v4, _) = replayed_into(&batch, "banned4");
+        let (v6, _) = replayed_into(&batch, "banned6");
+        let addresses: Vec<IpAddr> = v4.iter().chain(&v6).map(|(address, _)| *address).collect();
+        assert!(
+            !addresses.contains(&now_a_gateway),
+            "a now-trusted source was replayed"
+        );
+        assert!(!addresses.contains(&expired), "an expired ban was replayed");
+        let within = |timeout: u64, remaining_secs: u64| {
+            timeout <= remaining_secs * 1000 && timeout > (remaining_secs - 5) * 1000
+        };
+        let timeout_of = |elements: &[(IpAddr, u64)], wanted: IpAddr| {
+            elements
+                .iter()
+                .find(|(address, _)| *address == wanted)
+                .map(|(_, timeout)| *timeout)
+                .unwrap_or_else(|| panic!("{wanted} not replayed"))
+        };
+        // Each timeout is what was left at the reload, not the full duration.
+        assert!(within(timeout_of(&v4, banned_v4), 3000));
+        assert!(within(timeout_of(&v6, banned_v6), 3000));
+        let listed_timeout = timeout_of(&v4, listed);
+        assert!(
+            (6_595_000..=6_600_000).contains(&listed_timeout),
+            "{listed_timeout}"
+        );
+        assert_eq!(addresses.len(), 3);
     }
 
     #[test]

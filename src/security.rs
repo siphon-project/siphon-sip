@@ -44,7 +44,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use ipnet::IpNet;
+
+pub mod trust;
+
+use trust::SourceTrust;
 
 /// Process-wide auto-ban store. `None` until installed at startup (only when
 /// `security.failed_auth_ban` is configured), so the whole feature is opt-in and
@@ -350,8 +353,9 @@ pub fn try_accept_connection(source: IpAddr) -> Result<AcceptPermit, RefusedReas
 /// Per-source and global counters behind [`try_accept_connection`].
 pub struct ConnectionLimiter {
     limits: ConnectionLimits,
-    /// Sources exempt from every ceiling (trunks, monitoring, own infra).
-    trusted: Vec<IpNet>,
+    /// Sources exempt from every ceiling (trunks, monitoring, own infra, and
+    /// gateways under `trust_gateways`).
+    trust: SourceTrust,
     /// IP → in-flight handshakes. Only populated when the per-source handshake
     /// ceiling is enabled, so an unlimited policy allocates nothing per source.
     handshakes: DashMap<IpAddr, u32>,
@@ -368,10 +372,7 @@ impl ConnectionLimiter {
     pub fn new(limits: ConnectionLimits, trusted_cidrs: &[String]) -> Self {
         Self {
             limits,
-            trusted: trusted_cidrs
-                .iter()
-                .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-                .collect(),
+            trust: SourceTrust::from_cidrs(trusted_cidrs),
             handshakes: DashMap::new(),
             connections: DashMap::new(),
             handshakes_total: AtomicU32::new(0),
@@ -379,8 +380,18 @@ impl ConnectionLimiter {
         }
     }
 
+    /// Also exempt every source a gateway group admits
+    /// (`security.trust_gateways`). `None` changes nothing.
+    pub fn with_gateway_trust(
+        mut self,
+        gateways: Option<Arc<crate::gateway::view::GatewayView>>,
+    ) -> Self {
+        self.trust = self.trust.with_gateways(gateways);
+        self
+    }
+
     fn is_trusted(&self, source: IpAddr) -> bool {
-        self.trusted.iter().any(|net| net.contains(&source))
+        self.trust.is_trusted(source)
     }
 
     /// Take one established-connection slot and one handshake slot, or say
@@ -641,7 +652,7 @@ pub struct AutoBanStore {
     /// IP → active ban (sliding expiry + fixed hard deadline).
     bans: DashMap<IpAddr, BanEntry>,
     /// Sources that are never counted and never banned.
-    trusted: Vec<IpNet>,
+    trust: SourceTrust,
     threshold: u32,
     window: Duration,
     ban_duration: Duration,
@@ -686,16 +697,12 @@ impl AutoBanStore {
         missing_credentials_weight: u32,
         max_ban_duration_secs: u32,
     ) -> Self {
-        let trusted = trusted_cidrs
-            .iter()
-            .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-            .collect();
         let threshold = threshold.max(1);
         let ban_duration = Duration::from_secs(u64::from(ban_duration_secs.max(1)));
         Self {
             failures: DashMap::new(),
             bans: DashMap::new(),
-            trusted,
+            trust: SourceTrust::from_cidrs(trusted_cidrs),
             // Guard against a zero policy disabling the feature by accident.
             threshold,
             window: Duration::from_secs(u64::from(window_secs.max(1))),
@@ -722,8 +729,89 @@ impl AutoBanStore {
         let _ = self.firewall.set(firewall);
     }
 
+    /// Also exempt every source a gateway group admits
+    /// (`security.trust_gateways`). `None` changes nothing. Pair with
+    /// [`Self::follow_gateway_view`] once the store is shared, so a ban held
+    /// against an address before it became a gateway is lifted, not left to
+    /// run out in the kernel.
+    pub fn with_gateway_trust(
+        mut self,
+        gateways: Option<Arc<crate::gateway::view::GatewayView>>,
+    ) -> Self {
+        self.trust = self.trust.with_gateways(gateways);
+        self
+    }
+
     fn is_trusted(&self, source: IpAddr) -> bool {
-        self.trusted.iter().any(|net| net.contains(&source))
+        self.trust.is_trusted(source)
+    }
+
+    /// Lift every ban and failure count held against a source the gateway view
+    /// just started admitting. A no-op without `trust_gateways`.
+    ///
+    /// Why lift rather than let it run out: [`Self::is_banned`] already stops
+    /// honouring the ban the moment the view admits the source, so the only
+    /// thing left enforcing it is the kernel element — which would go on
+    /// dropping a carrier siphon now dials and trusts until its TTL. Lifting
+    /// keeps the kernel and userspace agreeing, which is the same reason the
+    /// admin unban removes both.
+    pub fn follow_gateway_view(self: &Arc<Self>) {
+        let Some(gateways) = self.trust.gateways() else {
+            return;
+        };
+        let store = Arc::downgrade(self);
+        gateways.subscribe(Arc::new(move |_snapshot, added| {
+            if let Some(store) = store.upgrade() {
+                store.lift_for_gateways(added);
+            }
+        }));
+    }
+
+    /// Lift bans and failure windows on every source inside `added`. Returns
+    /// how many bans were lifted.
+    fn lift_for_gateways(&self, added: &[crate::gateway::view::AdmittedRange]) -> usize {
+        if added.is_empty() {
+            return 0;
+        }
+        let admitted = crate::gateway::view::GatewaySnapshot::build(added.to_vec());
+        self.failures
+            .retain(|source, _| !admitted.contains(*source));
+        let lifted: Vec<(IpAddr, Arc<str>)> = self
+            .bans
+            .iter()
+            .filter_map(|entry| {
+                admitted
+                    .group_of(*entry.key())
+                    .map(|group| (*entry.key(), Arc::clone(group)))
+            })
+            .collect();
+        for (source, group) in &lifted {
+            if self.bans.remove(source).is_some() {
+                if let Some(firewall) = self.firewall.get() {
+                    firewall.unban(*source);
+                }
+                tracing::warn!(
+                    source = %source,
+                    gateway_group = %group,
+                    "auto-ban: ban lifted, the source is now a gateway (security.trust_gateways)"
+                );
+            }
+        }
+        lifted.len()
+    }
+
+    /// Every live ban with the time it has left, skipping lapsed ones and any
+    /// source now trusted. What the kernel set is refilled from after a
+    /// ruleset reload recreated it empty.
+    pub(crate) fn live_bans_at(&self, now: Instant) -> Vec<(IpAddr, Duration)> {
+        self.bans
+            .iter()
+            .filter_map(|entry| {
+                let remaining = entry.value().expiry.saturating_duration_since(now);
+                (!remaining.is_zero() && !self.is_trusted(*entry.key()))
+                    .then_some((*entry.key(), remaining))
+            })
+            .collect()
     }
 
     /// Record one low-confidence failure for `source` (weight 1) — a signal that
@@ -975,12 +1063,15 @@ impl AutoBanStore {
     /// [`Self::is_banned`] against a caller-supplied instant, so a test can ask
     /// whether a ban still holds at a future one without sleeping through it.
     pub(crate) fn is_banned_at(&self, source: IpAddr, now: Instant) -> bool {
-        if self.is_trusted(source) {
-            return false;
-        }
         // Copy the expiry out so we never hold the shard read guard across the
         // `remove()` below (would deadlock on the same shard).
         let expiry = self.bans.get(&source).map(|entry| entry.value().expiry);
+        // Trust is checked only for a source that holds a ban, so the ACL's
+        // per-packet check pays for the gateway lookup only when it matters.
+        // Same answer as checking first: a trusted source is never banned.
+        if expiry.is_some() && self.is_trusted(source) {
+            return false;
+        }
         match expiry {
             Some(exp) if exp > now => true,
             Some(_) => {
@@ -1067,6 +1158,13 @@ struct RateLimitState {
     windows: DashMap<IpAddr, FailureWindow>,
     /// IP → ban expiry instant.
     bans: DashMap<IpAddr, Instant>,
+    /// IP → request-count window for gateway sources exempted by
+    /// `trust_gateways`. Counted apart from `windows` so the only thing it can
+    /// do is say, once per window, that a carrier went over the limit it is
+    /// exempt from — and so a carrier removed from the source starts back
+    /// under the policy at zero rather than with the count it ran up while
+    /// trusted. Pruned with the rest; one row per busy gateway at most.
+    exempt_windows: DashMap<IpAddr, FailureWindow>,
     max_requests: u32,
     window: Duration,
     ban_duration: Duration,
@@ -1119,6 +1217,22 @@ impl RateLimitState {
         true
     }
 
+    /// Count one request from an exempt gateway source. Returns `true` exactly
+    /// once per window: on the request that takes it past the limit. Never
+    /// bans and never drops.
+    fn count_exempt_at(&self, source: IpAddr, now: Instant) -> bool {
+        let mut entry = self.exempt_windows.entry(source).or_insert(FailureWindow {
+            count: 0,
+            window_start: now,
+        });
+        if now.duration_since(entry.window_start) > self.window {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count = entry.count.saturating_add(1);
+        entry.count == self.max_requests.saturating_add(1)
+    }
+
     fn active_bans(&self) -> usize {
         self.bans.len()
     }
@@ -1127,6 +1241,19 @@ impl RateLimitState {
         self.bans.retain(|_, expiry| *expiry > now);
         self.windows
             .retain(|_, window| now.duration_since(window.window_start) <= self.window);
+        self.exempt_windows
+            .retain(|_, window| now.duration_since(window.window_start) <= self.window);
+    }
+
+    /// Rows held across the three maps. Test-only: each is keyed by a live
+    /// source, so all three must drain once their windows lapse.
+    #[cfg(test)]
+    fn tracked_sources(&self) -> (usize, usize, usize) {
+        (
+            self.windows.len(),
+            self.bans.len(),
+            self.exempt_windows.len(),
+        )
     }
 }
 
@@ -1142,8 +1269,9 @@ pub struct SecurityFilter {
     /// Lower-cased `User-Agent` substrings to block. Empty = scanner blocking off.
     scanner_user_agents: Vec<String>,
     /// Sources exempt from both rate limiting and scanner blocking (own
-    /// infrastructure: AS, trunks, monitoring).
-    trusted: Vec<IpNet>,
+    /// infrastructure: AS, trunks, monitoring — and gateways, under
+    /// `trust_gateways`).
+    trust: SourceTrust,
 }
 
 impl SecurityFilter {
@@ -1151,9 +1279,19 @@ impl SecurityFilter {
     /// neither `rate_limit` nor `scanner_block` is set (feature is opt-in, so
     /// the dispatcher check is a no-op). Invalid `trusted_cidrs` are ignored.
     pub fn from_config(config: &crate::config::SecurityConfig) -> Option<Arc<Self>> {
+        Self::from_config_with_gateways(config, None)
+    }
+
+    /// [`Self::from_config`], also exempting every source `gateways` admits —
+    /// what start-up passes when `security.trust_gateways` is on.
+    pub fn from_config_with_gateways(
+        config: &crate::config::SecurityConfig,
+        gateways: Option<Arc<crate::gateway::view::GatewayView>>,
+    ) -> Option<Arc<Self>> {
         let rate_limit = config.rate_limit.as_ref().map(|policy| RateLimitState {
             windows: DashMap::new(),
             bans: DashMap::new(),
+            exempt_windows: DashMap::new(),
             // Guard against a zero policy permitting nothing / dividing by zero.
             max_requests: policy.max_requests.max(1),
             window: Duration::from_secs(u64::from(policy.window_secs.max(1))),
@@ -1176,21 +1314,11 @@ impl SecurityFilter {
             return None;
         }
 
-        let trusted = config
-            .trusted_cidrs
-            .iter()
-            .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-            .collect();
-
         Some(Arc::new(Self {
             rate_limit,
             scanner_user_agents,
-            trusted,
+            trust: SourceTrust::from_cidrs(&config.trusted_cidrs).with_gateways(gateways),
         }))
-    }
-
-    fn is_trusted(&self, source: IpAddr) -> bool {
-        self.trusted.iter().any(|net| net.contains(&source))
     }
 
     /// Whether `user_agent` matches a configured scanner signature
@@ -1224,7 +1352,11 @@ impl SecurityFilter {
         user_agent: Option<&str>,
         now: Instant,
     ) -> SecurityVerdict {
-        if self.is_trusted(source) {
+        if self.trust.is_configured(source) {
+            return SecurityVerdict::Allow;
+        }
+        if self.trust.is_gateway(source) {
+            self.note_exempt_gateway(source, now);
             return SecurityVerdict::Allow;
         }
         if self.is_scanner(user_agent) {
@@ -1236,6 +1368,25 @@ impl SecurityFilter {
             }
         }
         SecurityVerdict::Allow
+    }
+
+    /// Count a request from a gateway that `trust_gateways` exempts, and say so
+    /// once per window when it goes over the limit that would otherwise have
+    /// dropped it and banned it. Nothing else: the request is allowed.
+    fn note_exempt_gateway(&self, source: IpAddr, now: Instant) {
+        let Some(ref rate) = self.rate_limit else {
+            return;
+        };
+        if rate.count_exempt_at(source, now) {
+            let group = self.trust.gateways().and_then(|view| view.group_of(source));
+            tracing::warn!(
+                source = %source,
+                gateway_group = %group.as_deref().unwrap_or("-"),
+                max_requests = rate.max_requests,
+                window_secs = rate.window.as_secs(),
+                "rate_limit: gateway source is over the limit and not dropped (security.trust_gateways)"
+            );
+        }
     }
 
     /// Drop expired rate-limit bans and stale windows. Call periodically to keep
@@ -1826,6 +1977,7 @@ mod tests {
                 })
             },
             trusted_cidrs: trusted_cidrs.into_iter().map(String::from).collect(),
+            trust_gateways: false,
             failed_auth_ban: None,
             apiban: None,
             firewall: None,

@@ -10,7 +10,10 @@
 //!   address that lands on a community feed would otherwise lose its trunk (or
 //!   its ssh, since the kernel drop is port-agnostic) with no config able to
 //!   save it. `security.trusted_cidrs` is applied at insert, so neither the
-//!   userspace set nor the kernel set ever receives a trusted address.
+//!   userspace set nor the kernel set ever receives a trusted address. With
+//!   `security.trust_gateways`, so is every source a gateway group admits, and
+//!   an address the feed listed before its carrier was provisioned is evicted
+//!   from both sets at the reconcile that provisions it.
 //! - **Entries expire.** APIBAN releases an address after 7 days; siphon used
 //!   to insert permanently, so a false positive stayed blocked for the life of
 //!   the process and the only levers were a restart (which drops every
@@ -24,15 +27,16 @@
 //! API docs: <https://apiban.org/doc.html>
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use ipnet::IpNet;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ApiBanConfig;
+use crate::gateway::view::{AdmittedRange, GatewaySnapshot};
+use crate::security::trust::{Exemption, SourceTrust};
 
 /// Batch size returned by APIBAN per request.
 const APIBAN_BATCH_SIZE: usize = 250;
@@ -114,6 +118,82 @@ impl ApiBanStore {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Remove every entry `admitted` holds, returning each with the gateway
+    /// group that admits it.
+    fn evict_admitted(&self, admitted: &GatewaySnapshot) -> Vec<(IpAddr, Arc<str>)> {
+        let listed: Vec<(IpAddr, Arc<str>)> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                admitted
+                    .group_of(*entry.key())
+                    .map(|group| (*entry.key(), Arc::clone(group)))
+            })
+            .collect();
+        listed
+            .into_iter()
+            .filter(|(source, _)| self.entries.remove(source).is_some())
+            .collect()
+    }
+
+    /// Every entry still in force, with the time it has left (`None` =
+    /// permanent). Lapsed entries not yet swept are skipped.
+    fn live_at(&self, now: Instant) -> Vec<(IpAddr, Option<Duration>)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match *entry.value() {
+                None => Some((*entry.key(), None)),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(now);
+                    (!remaining.is_zero()).then_some((*entry.key(), Some(remaining)))
+                }
+            })
+            .collect()
+    }
+}
+
+/// The running blocklist, for the kernel firewall to refill its ban sets from
+/// after a ruleset reload recreated them empty. Set once, by
+/// [`ApiBanClient::start`].
+static INSTALLED: OnceLock<InstalledBlocklist> = OnceLock::new();
+
+/// The running blocklist, or `None` when APIBAN is not configured.
+pub(crate) fn installed() -> Option<&'static InstalledBlocklist> {
+    INSTALLED.get()
+}
+
+/// The blocklist together with the trust it was filtered by.
+pub(crate) struct InstalledBlocklist {
+    store: Arc<ApiBanStore>,
+    trust: SourceTrust,
+}
+
+impl InstalledBlocklist {
+    /// A blocklist that is not the process-wide one, for a test driving the
+    /// replay without starting a poller.
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Arc<ApiBanStore>, trust: SourceTrust) -> Self {
+        Self { store, trust }
+    }
+
+    /// Every entry in force at `now` with its remaining lifetime (`None` =
+    /// permanent), leaving out any source trusted since it was listed.
+    pub(crate) fn live_bans_at(&self, now: Instant) -> Vec<(IpAddr, Option<Duration>)> {
+        live_untrusted(&self.store, &self.trust, now)
+    }
+}
+
+fn live_untrusted(
+    store: &ApiBanStore,
+    trust: &SourceTrust,
+    now: Instant,
+) -> Vec<(IpAddr, Option<Duration>)> {
+    store
+        .live_at(now)
+        .into_iter()
+        .filter(|(source, _)| !trust.is_trusted(*source))
+        .collect()
 }
 
 /// JSON response from the APIBAN `/banned` endpoint.
@@ -131,8 +211,9 @@ pub struct ApiBanClient {
     /// How long a fetched entry stays blocked. `None` = never expires.
     ban_ttl: Option<Duration>,
     /// Sources that must never be blocked no matter what the feed says
-    /// (`security.trusted_cidrs`): own trunks, monitoring, management.
-    trusted: Vec<IpNet>,
+    /// (`security.trusted_cidrs`, and gateways under `trust_gateways`): own
+    /// trunks, monitoring, management.
+    trust: SourceTrust,
     banned: Arc<ApiBanStore>,
     client: reqwest::Client,
     /// Optional kernel-firewall handle — fetched IPs are also pushed to the
@@ -150,11 +231,6 @@ impl ApiBanClient {
             .connect_timeout(Duration::from_secs(10))
             .build()?;
 
-        let trusted = trusted_cidrs
-            .iter()
-            .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-            .collect();
-
         Ok(Self {
             api_key: config.api_key.clone(),
             interval: Duration::from_secs(config.interval_secs),
@@ -163,7 +239,7 @@ impl ApiBanClient {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
-            trusted,
+            trust: SourceTrust::from_cidrs(trusted_cidrs),
             banned: Arc::new(ApiBanStore::new()),
             client,
             firewall: None,
@@ -182,13 +258,63 @@ impl ApiBanClient {
         self
     }
 
+    /// Also exempt every source a gateway group admits
+    /// (`security.trust_gateways`). `None` changes nothing.
+    pub fn with_gateway_trust(
+        mut self,
+        gateways: Option<Arc<crate::gateway::view::GatewayView>>,
+    ) -> Self {
+        self.trust = self.trust.with_gateways(gateways);
+        self
+    }
+
     /// Whether `source` is exempt from the feed.
+    #[cfg(test)]
     fn is_trusted(&self, source: IpAddr) -> bool {
-        self.trusted.iter().any(|net| net.contains(&source))
+        self.trust.is_trusted(source)
+    }
+
+    /// Evict, at every publish of the gateway view, each listed address the
+    /// view has just started admitting — from the store and from the kernel
+    /// set. A no-op without `trust_gateways`.
+    ///
+    /// Ingest keeps a gateway out; this is the other order, a carrier
+    /// provisioned after the feed listed its address. Without it the address
+    /// stays blackholed in the kernel, on every port, for the entry's TTL.
+    pub(crate) fn follow_gateway_view(&self) {
+        let Some(gateways) = self.trust.gateways() else {
+            return;
+        };
+        let store = Arc::downgrade(&self.banned);
+        let firewall = self.firewall.clone();
+        gateways.subscribe(Arc::new(move |_snapshot, added: &[AdmittedRange]| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            if added.is_empty() || store.is_empty() {
+                return;
+            }
+            let admitted = GatewaySnapshot::build(added.to_vec());
+            for (source, group) in store.evict_admitted(&admitted) {
+                if let Some(firewall) = &firewall {
+                    firewall.unban(source);
+                }
+                warn!(
+                    ip = %source,
+                    gateway_group = %group,
+                    "APIBAN: listed address is now a gateway (security.trust_gateways), evicted"
+                );
+            }
+        }));
     }
 
     /// Spawn the background polling task. Returns a `JoinHandle` for the poll loop.
     pub fn start(self) -> tokio::task::JoinHandle<()> {
+        self.follow_gateway_view();
+        let _ = INSTALLED.set(InstalledBlocklist {
+            store: Arc::clone(&self.banned),
+            trust: self.trust.clone(),
+        });
         tokio::spawn(async move {
             self.poll_loop().await;
         })
@@ -200,7 +326,8 @@ impl ApiBanClient {
         info!(
             interval_secs = self.interval.as_secs(),
             ban_ttl_secs = self.ban_ttl.map(|ttl| ttl.as_secs()).unwrap_or(0),
-            trusted_cidrs = self.trusted.len(),
+            trusted_cidrs = self.trust.configured_len(),
+            trust_gateways = self.trust.gateways().is_some(),
             "APIBAN client started"
         );
 
@@ -239,7 +366,7 @@ impl ApiBanClient {
     ///
     /// Split out of [`Self::fetch_all`] so the trusted filter and the TTL are
     /// exercised on the path that actually runs, not on a re-creation of it.
-    fn ingest(&self, addresses: &[String]) -> usize {
+    pub(crate) fn ingest(&self, addresses: &[String]) -> usize {
         let mut added = 0;
 
         for ip_str in addresses {
@@ -252,12 +379,23 @@ impl ApiBanClient {
             // and the kernel set, so a listed trunk or management address is
             // never dropped anywhere. Doing it at the ACL alone would still
             // leave the kernel set blackholing the address on every port.
-            if self.is_trusted(ip_address) {
-                warn!(
-                    ip = %ip_address,
-                    "APIBAN: listed address is in trusted_cidrs, not banning"
-                );
-                continue;
+            match self.trust.exemption(ip_address) {
+                Some(Exemption::Configured) => {
+                    warn!(
+                        ip = %ip_address,
+                        "APIBAN: listed address is in trusted_cidrs, not banning"
+                    );
+                    continue;
+                }
+                Some(Exemption::Gateway(group)) => {
+                    warn!(
+                        ip = %ip_address,
+                        gateway_group = %group,
+                        "APIBAN: listed address is a gateway (security.trust_gateways), not banning"
+                    );
+                    continue;
+                }
+                None => {}
             }
 
             if self.banned.insert(ip_address, self.ban_ttl) {
@@ -570,5 +708,119 @@ mod tests {
         let far_future = now + Duration::from_secs(86_400 * 365);
         assert!(client.banned.contains_at(&ip("198.51.100.7"), far_future));
         assert_eq!(client.banned.sweep_at(far_future), 0);
+    }
+
+    // --- security.trust_gateways ---
+
+    fn gateway_view(spec: &str) -> Arc<crate::gateway::view::GatewayView> {
+        let view = Arc::new(crate::gateway::view::GatewayView::new());
+        publish(&view, spec);
+        view
+    }
+
+    fn publish(view: &crate::gateway::view::GatewayView, spec: &str) {
+        view.publish(|| {
+            vec![AdmittedRange {
+                network: spec.parse().expect("test CIDR"),
+                group: Arc::from("carriers"),
+            }]
+        });
+    }
+
+    #[tokio::test]
+    async fn ingest_never_bans_a_gateway_and_says_so() {
+        let (firewall, mut commands) = crate::firewall::KernelFirewall::capturing();
+        let client = client_with(&[], 604_800)
+            .with_firewall(Some(firewall))
+            .with_gateway_trust(Some(gateway_view("192.0.2.10/32")));
+
+        let log = crate::log_capture::LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log.clone())
+            .finish();
+        let added = tracing::subscriber::with_default(subscriber, || {
+            client.ingest(&feed(&["192.0.2.10", "198.51.100.7"]))
+        });
+
+        assert_eq!(added, 1);
+        assert!(!client.banned.contains(&ip("192.0.2.10")));
+        // Positive control: the stranger in the same batch is banned, in
+        // userspace and in the kernel — and only it reaches the kernel.
+        assert!(client.banned.contains(&ip("198.51.100.7")));
+        assert_eq!(
+            commands.try_recv().ok(),
+            Some(crate::firewall::Command::Ban {
+                ip: ip("198.51.100.7"),
+                ttl_ms: 604_800_000
+            })
+        );
+        assert!(commands.try_recv().is_err());
+        let rendered = log.rendered();
+        assert!(
+            rendered.contains("listed address is a gateway")
+                && rendered.contains("ip=192.0.2.10")
+                && rendered.contains("gateway_group=carriers"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_bans_a_gateway_when_trust_gateways_is_off() {
+        let _view = gateway_view("192.0.2.10/32");
+        let client = client_with(&[], 604_800);
+        assert_eq!(client.ingest(&feed(&["192.0.2.10"])), 1);
+        assert!(client.banned.contains(&ip("192.0.2.10")));
+    }
+
+    #[tokio::test]
+    async fn a_listed_address_is_evicted_when_it_becomes_a_gateway() {
+        let (firewall, mut commands) = crate::firewall::KernelFirewall::capturing();
+        let view = Arc::new(crate::gateway::view::GatewayView::new());
+        let client = client_with(&[], 604_800)
+            .with_firewall(Some(firewall))
+            .with_gateway_trust(Some(Arc::clone(&view)));
+        client.follow_gateway_view();
+
+        assert_eq!(client.ingest(&feed(&["192.0.2.10", "198.51.100.7"])), 2);
+        assert!(commands.try_recv().is_ok());
+        assert!(commands.try_recv().is_ok());
+
+        publish(&view, "192.0.2.10/32");
+
+        assert!(!client.banned.contains(&ip("192.0.2.10")));
+        assert!(client.banned.contains(&ip("198.51.100.7")), "stranger kept");
+        assert_eq!(
+            commands.try_recv().ok(),
+            Some(crate::firewall::Command::Unban {
+                ip: ip("192.0.2.10")
+            })
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_bans_leave_out_lapsed_permanent_aside_and_trusted_entries() {
+        let view = Arc::new(crate::gateway::view::GatewayView::new());
+        let store = ApiBanStore::new();
+        let trust = SourceTrust::from_cidrs(&[]).with_gateways(Some(Arc::clone(&view)));
+        let now = Instant::now();
+        store.insert(ip("198.51.100.1"), Some(Duration::from_secs(3600)));
+        store.insert(ip("198.51.100.2"), Some(Duration::from_millis(1)));
+        store.insert(ip("198.51.100.3"), None);
+        store.insert(ip("192.0.2.10"), Some(Duration::from_secs(3600)));
+        publish(&view, "192.0.2.10/32");
+
+        let mut live = live_untrusted(&store, &trust, now + Duration::from_secs(600));
+        live.sort();
+        assert_eq!(live.len(), 2, "{live:?}");
+        assert_eq!(live[0].0, ip("198.51.100.1"));
+        let remaining = live[0].1.expect("timed");
+        assert!(
+            remaining >= Duration::from_secs(3000) && remaining < Duration::from_secs(3010),
+            "{remaining:?}"
+        );
+        assert_eq!(live[1], (ip("198.51.100.3"), None));
     }
 }
